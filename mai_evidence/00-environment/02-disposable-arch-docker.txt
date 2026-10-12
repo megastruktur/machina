@@ -1,0 +1,38 @@
+# 02 — Docker daemon + disposable Arch target (verbatim, 2026-10-12)
+
+$ docker info | grep -E 'Server Version|Storage Driver|Cgroup|Docker Root Dir|Total Memory|CPUs'
+Server Version: 29.8.2
+Storage Driver: overlayfs
+Cgroup Driver: systemd
+Cgroup Version: 2
+CPUs: 32
+Total Memory: 121.5GiB
+Docker Root Dir: /var/lib/docker
+
+$ docker compose version
+Docker Compose version v5.5.0
+
+## Disposable Arch target — verified
+
+$ docker run --rm archlinux:latest cat /etc/os-release
+NAME="Arch Linux"
+PRETTY_NAME="Arch Linux"
+ID=arch
+BUILD_ID=rolling
+VERSION_ID=20261011.0.609700
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://archlinux.org/"
+DOCUMENTATION_URL="https://wiki.archlinux.org/"
+SUPPORT_URL="https://bbs.archlinux.org/"
+BUG_REPORT_URL="https://gitlab.archlinux.org/groups/archlinux/-/issues"
+PRIVACY_POLICY_URL="https://terms.archlinux.org/docs/privacy-policy/"
+LOGO=archlinux-logo
+
+$ docker ps -a --format '{{.Names}}' | grep mai-fxt || echo 'no mai-fxt containers remain'
+no mai-fxt containers remain        (container self-removed via --rm)
+
+## Residue
+
+Pulled images intentionally retained as local cache (not fixtures):
+  archlinux:latest, panubo/sshd:latest
+Removal is a cache decision for a later phase, not a cleanup obligation of this probe.

@@ -1,0 +1,58 @@
+# 04 — Disposable SSH identity probe (2026-10-12)
+
+## Attempt 1 — FAILED, preserved
+
+First fixture start used a space-separated `SSH_USERS='maiprobe 1000 1000'`; panubo/sshd requires
+colon-separated `user:uid:gid`. sshd never came up inside the container, so the readiness loop
+(against `ss`, which is itself MISSING — see 01) timed out, keyscan collected nothing, and the
+connect attempt was refused:
+
+  ssh: connect to host 127.0.0.1 port 2222: Connection refused
+  ssh-exit=255
+
+That attempt's container self-removed (`--rm`); no state persisted. Recorded because the corrected
+command below is the producer-verified form.
+
+## Attempt 2 — corrected fixture, successful probe (verbatim)
+
+$ docker run --rm -d --name mai-fxt-sshd -p 127.0.0.1:2222:22 -e SSH_USERS='maiprobe:1000:1000' panubo/sshd:latest
+d5cd164174a273082dea33e935ac93dac908760e42698eb3339824bef8fc08d8
+$ docker ps --filter name=mai-fxt-sshd --format '{{.Names}} {{.Status}} {{.Ports}}'
+mai-fxt-sshd Up 2 seconds 127.0.0.1:2222->22/tcp
+
+### Host identity
+
+$ ssh-keyscan -p 2222 -t ed25519,ecdsa,rsa 127.0.0.1 2>/dev/null > /tmp/mai-fxt-p00-known-hosts   # 3 lines
+$ while read -r line; do printf '%s\n' "$line" | ssh-keygen -lf -; done < /tmp/mai-fxt-p00-known-hosts
+256 SHA256:vkKV2jWrQoYWc6Rlye8cLa+J7JiTrcL47rU8arpv9x0 [127.0.0.1]:2222 (ED25519)
+3072 SHA256:sfw+FdRDsnjJSOPB27elkWkwQXjomuTFTMhRTZjT6+E [127.0.0.1]:2222 (RSA)
+256 SHA256:jV9GXQTbcXllegjLS0VdhShezWetogXaVnrD7bGI7t4 [127.0.0.1]:2222 (ECDSA)
+
+These fingerprints belong to the disposable fixture container only. The runtime host exposes no
+sshd (no listener on :22; no systemd to run one). Nothing here provisions or authorizes access to
+any persistent machine.
+
+### Disposable client identity
+
+$ ssh-keygen -q -t ed25519 -N '' -f /tmp/mai-fxt-p00-key -C mai-fxt-p00-disposable-probe
+$ ssh-keygen -lf /tmp/mai-fxt-p00-key.pub
+256 SHA256:l8PhbPdrfL25DNVpr73nevFpnw3si1tMo748HcQ6/Oo mai-fxt-p00-disposable-probe (ED25519)
+
+### Connect attempt with the UNPROVISIONED key (expected denial; proves no provisioning happened)
+
+$ ssh -p 2222 -i /tmp/mai-fxt-p00-key -o IdentitiesOnly=yes -o BatchMode=yes \
+      -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/mai-fxt-p00-known-hosts \
+      maiprobe@127.0.0.1 id
+maiprobe@127.0.0.1: Permission denied (publickey,keyboard-interactive).
+ssh-exit=255
+
+Reading: transport + host-key verification work end to end; the disposable identity was accepted by
+the server for verification and correctly rejected for auth because it was never installed
+anywhere. No authorized_keys, account, or host config was touched (the fixture is throwaway).
+
+## Cleanup (proof continued in 06)
+
+$ docker stop -t 1 mai-fxt-sshd     # --rm auto-removal raced the next check; see 06 for final proof
+$ rm -f /tmp/mai-fxt-p00-key /tmp/mai-fxt-p00-key.pub /tmp/mai-fxt-p00-known-hosts
+$ ls /tmp/mai-fxt-p00-*
+ls: cannot access '/tmp/mai-fxt-p00-*': No such file or directory

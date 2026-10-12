@@ -1,0 +1,33 @@
+# 03 — Provider/credential surface, names only (2026-10-12)
+
+Policy: secret VALUES were never read or printed. Only environment variable NAMES were collected.
+
+$ env | cut -d= -f1 | grep -Ei 'KEY|TOKEN|SECRET|API|PASS|CRED' | sort -u
+BRAVE_API_KEY
+GIT_ASKPASS
+GIT_CONFIG_KEY_0
+GIT_CONFIG_KEY_1
+ORCA_AGENT_HOOK_TOKEN
+ORCA_PANE_KEY
+PI_LITELLM_KEY
+SSH_ASKPASS
+
+## Local OpenAI-compatible endpoint reachability (unauthenticated GET, no credentials sent)
+
+$ for p in 11434/api/tags 1234/v1/models 4000/v1/models 8080/health 8000/v1/models; do code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$p"); echo "127.0.0.1:${p%%/*} -> HTTP $code"; done
+127.0.0.1:11434 -> HTTP 000      (nothing listening; not ollama)
+127.0.0.1:1234 -> HTTP 000      (nothing listening; not LM Studio)
+127.0.0.1:4000 -> HTTP 401      (litellm-style proxy alive, auth REQUIRED)
+127.0.0.1:8080 -> HTTP 404      (something listening, not a recognized LLM API)
+127.0.0.1:8000 -> HTTP 404      (something listening, not a recognized LLM API)
+
+Capability reading: provider-test traffic has a reachable gateway at 127.0.0.1:4000 that requires
+authentication; a credential under the env NAME `PI_LITELLM_KEY` exists for it. Tests must obtain
+credentials through configuration, never from this repository.
+
+## Package indexes (for future dependency decisions only — no installs performed in P00)
+
+$ curl -s -o /dev/null -m 5 -w '%{http_code}' https://pypi.org/simple/
+200
+$ curl -s -o /dev/null -m 5 -w '%{http_code}' https://registry.npmjs.org/
+200
