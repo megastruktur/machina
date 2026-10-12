@@ -1,0 +1,83 @@
+# 01 — Host identity, resources, toolchain (verbatim probe output, 2026-10-12)
+
+$ uname -a
+Linux megaserver 7.2.8-1-cachyos #1 SMP PREEMPT_DYNAMIC Sat, 26 Sep 2026 15:14:17 +0000 x86_64 GNU/Linux
+
+$ grep PRETTY_NAME /etc/os-release
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+
+$ nproc
+32
+
+$ free -h | grep -E 'Mem|Swap'
+Mem:           121Gi        85Gi        10Gi       503Mi        26Gi        35Gi
+Swap:          121Gi        26Gi        95Gi
+
+$ df -h /
+Filesystem      Size  Used Avail Use% Mounted on
+overlay         1.9T  1.3T  569G  70% /
+
+NOTE: kernel is CachyOS but userland is Debian 12 inside an overlay-root container (no systemd:
+"System has not been booted with systemd as init system (PID 1). Can't operate."). This is the
+coordinator/dev runtime host, not the future Arch installation host of IDEA.md §1.
+
+## Binary inventory
+
+$ for b in git python3 pip3 uv pytest node npm pnpm bun deno docker jq curl ssh ssh-keygen ssh-keyscan scp rsync; do printf '%-14s %s\n' "$b" "$(command -v $b 2>/dev/null || echo MISSING)"; done
+git            /usr/bin/git
+python3        /home/megastruktur/.local/bin/python3
+pip3           MISSING
+uv             /home/megastruktur/.local/bin/uv
+pytest         /home/megastruktur/.local/bin/pytest
+node           /home/megastruktur/.local/bin/node
+npm            /home/megastruktur/.local/bin/npm
+pnpm           /home/megastruktur/.local/bin/pnpm
+bun            MISSING
+deno           MISSING
+docker         /usr/bin/docker
+jq             jq            <- resolved via shim/alias, not a binary path
+curl           /usr/bin/curl
+ssh            /usr/bin/ssh
+ssh-keygen     /usr/bin/ssh-keygen
+ssh-keyscan    /usr/bin/ssh-keyscan
+scp            /usr/bin/scp
+rsync          MISSING
+
+## Versions
+
+git version 2.39.5
+Python 3.14.6
+uv 0.11.26 (x86_64-unknown-linux-gnu)
+v22.22.3          (node)
+10.9.8            (npm)
+Docker version 29.8.1, build 4a63305
+OpenSSH_9.2p1 Debian-2+deb12u10, OpenSSL 3.0.22 25 Aug 2026
+
+$ pytest --version
+error: command not found: pytest
+$ python3 -m pytest --version
+rtk: Failed to run pytest: Failed to spawn process: No such file or directory (os error 2)
+$ ls -la /home/megastruktur/.local/bin/pytest
+755  /home/megastruktur/.local/bin/pytest  168B
+
+ANOMALY: ~/.local/bin is an rtk shim layer. The `pytest` shim target is missing, so global pytest
+is broken even though `command -v pytest` resolves. `jq` resolves to `jaq 2.3.0` through the same
+layer. Consequence recorded in the ADR: Python tooling must run inside uv-managed project venvs
+(`uv run pytest`), not through global shims. (No dependencies were installed for this probe.)
+
+$ git config user.name / user.email
+megastruktur / astromortis@gmail.com
+
+## Orca / OMP
+
+$ command -v orca; orca --version
+/home/megastruktur/.local/bin/orca
+1.4.219
+$ command -v omp; omp --version
+/home/megastruktur/.local/bin/omp
+omp/18.6.0
+
+## ss(8)
+
+$ command -v ss
+ss: MISSING   (first-pass "no listener on :22" check was therefore unreliable; corrected in 04)

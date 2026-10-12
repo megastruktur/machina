@@ -1,0 +1,23 @@
+# 06 — Cleanup proof (final state, 2026-10-12)
+
+After the probe sequence (including the stop/--rm removal race caught in 04):
+
+$ docker ps -a --filter name=mai-fxt-sshd --format '{{.Names}} {{.Status}}'
+(empty — container gone)
+$ docker rm -f mai-fxt-sshd
+(no such container; idempotent)
+$ docker ps -a --format '{{.Names}}' | grep mai-fxt && echo 'LEAK' || echo 'no mai-fxt containers remain'
+no mai-fxt containers remain
+$ ls /tmp/mai-fxt-p00-*
+/usr/bin/ls: cannot access '/tmp/mai-fxt-p00-*': No such file or directory
+$ docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'archlinux|panubo'
+archlinux:latest
+panubo/sshd:latest
+
+State accounting:
+- Containers named mai-fxt-*: none.
+- /tmp/mai-fxt-* files (disposable ed25519 keypair, known_hosts): none.
+- Retained: the two pulled images, deliberately kept as local cache (not fixtures; removable later
+  without affecting any record here).
+- Persistent host config touched by probes: none (no sshd, no authorized_keys, no systemd units,
+  no global packages installed).
