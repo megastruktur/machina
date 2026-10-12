@@ -12,6 +12,11 @@ dependencies = [
     # SvelteKit / Docker Compose / PostgreSQL"). ASGI server choice belongs to
     # the api/compose cards, not the package lane.
     "fastapi",
+    # Schema migration harness owner (card 01-db allowlists backend/alembic.ini
+    # and backend/migrations/env.py; SERVICES locks the migration chain to one
+    # linear Alembic chain). Bounded <2 so major-version chain rewrites are a
+    # deliberate reconciliation, not a silent upgrade.
+    "alembic>=1.16,<2",
 ]
 
 [dependency-groups]
