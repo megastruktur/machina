@@ -20,7 +20,7 @@
 |---|---|---|
 | `docs/architecture/runtime-environment.md` | `89b6532cdd51dc4abdbfdf6a1d5b723e2769dcf9` | disposable targets, fixtures, toolchain rules (§C10) |
 | `docs/architecture/auth-and-origin.md` | `3e79449b1a7b661c6773f13203ff13f5334e2a80` | identity, session, CSRF/origin, TLS/exposure, G1/G2 (§C08) |
-| `docs/architecture/knowledge-packaging.md` | `5d6e0a1d354acfe9e1e991139302890294dee72b` | Hindsight, SearXNG, embeddings, pgvector (§C07) |
+| `docs/architecture/knowledge-packaging.md` | `5d6e0a1` + fix-round-1 `563fccb` (pg_trgm owed-confirmation reword) | Hindsight, SearXNG, embeddings, pgvector (§C07) |
 | `docs/architecture/windowed-workspace.md` | `e2cde76b0067d42892688c56c2b1c82d1084ac31` | windowed desktop UI (§C11) |
 | `docs/architecture/job-engine.md` | `bc8d264b1fb83061112cb7d61bcecfee459f5d15` | DBOS durable engine + 10 guard rules (§C05) |
 | `docs/architecture/host-supervision.md` | `1ce8181aa7783428197ae3ab79e19b687de6bfda` | target-side command ownership + receipt contract (§C04) |
