@@ -64,7 +64,7 @@ Repository `vectorize-io/hindsight`: **MIT** (`LICENSE`, "Copyright (c) 2025 Vec
 
 ### 2.5 Persistent stores and required auxiliary services
 
-- Store: PostgreSQL + pgvector (Hindsight's default `HINDSIGHT_API_VECTOR_EXTENSION=pgvector`, HNSW). Iterative-scan support requires pgvector ≥ 0.8.0; current release is v0.8.7. Entity resolution also uses `pg_trgm` thresholds (`pg_trgm` is a standard PostgreSQL contrib extension; presence in the selected Postgres image is confirmed by the 00-verify smoke in §5).
+- Store: PostgreSQL + pgvector (Hindsight's default `HINDSIGHT_API_VECTOR_EXTENSION=pgvector`, HNSW). Iterative-scan support requires pgvector ≥ 0.8.0; current release is v0.8.7. Entity resolution also uses `pg_trgm` thresholds (`pg_trgm` is a standard PostgreSQL contrib extension; presence in the selected Postgres image is owed confirmation by the 00-verify smoke in §5 — scenario KB-V1 in the runtime-scenarios registry, design-frozen, not yet executed).
 - Alternative store backends (pgvectorscale, vchord, scann, Oracle 23ai) exist upstream and are **not adopted**; switching later is a migration event with its own rebuild semantics (upstream: extension switch with existing data errors out and needs explicit migration).
 - Auxiliary services required:
   1. PostgreSQL (already in the stack) with pgvector — via `pgvector/pgvector:pg<MAJOR>` image or a distribution with the extension; the pgvector-based image is what Hindsight's own external-Postgres compose template uses (`pgvector/pgvector:pg18` default).
