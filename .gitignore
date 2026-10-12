@@ -1,0 +1,23 @@
+# Local planning/research notes; IDEA.md is the public project specification.
+/plans/
+
+# Runtime management data must not enter the source repository.
+/.mai/
+
+# Environment credentials (keep sanitized templates publishable).
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Private credential material; ignores are not a secret-scanning guarantee.
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+secrets.yaml
+secrets.yml
