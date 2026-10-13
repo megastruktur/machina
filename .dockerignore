@@ -1,0 +1,26 @@
+# Build contexts are the repository root (both Dockerfiles live under their
+# service dirs). Everything is excluded first; only the real image inputs are
+# re-included. Later patterns win, so re-exclusions follow the negations.
+*
+
+!backend/
+backend/tests/
+backend/.venv/
+backend/__pycache__/
+
+!frontend/
+frontend/tests/
+# src/routes/+page.svelte imports tests/fixtures/component-host.svelte directly
+# (01-web component host is part of the shipped D4 shell), so the fixture rides
+# along; the spec files stay out of the image.
+!frontend/tests/fixtures/
+frontend/tests/fixtures/*
+!frontend/tests/fixtures/component-host.svelte
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/test-results/
+frontend/playwright-report/
+frontend/__pycache__/
+
+**/__pycache__/
+*.py[cod]

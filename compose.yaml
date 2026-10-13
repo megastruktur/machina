@@ -1,0 +1,113 @@
+# MAI core topology (card 01-compose, P01).
+#
+# Contracts honored here (docs/architecture/contracts.md):
+# - C08 rule 3 / auth ADR §6: `mai-api` and `mai-web` are Compose-internal; the
+#   single TLS-terminating reverse proxy (a later platform card) is the only
+#   component that may publish host ports. No service below defines `ports:` —
+#   nothing here is reachable from the host by default.
+# - SERVICES `postgres` row: persistent volume, internal only by default.
+#   KB-V1 / C07 rule 7: the image is pgvector-enabled (pgvector/pgvector,
+#   ≥ 0.8.0; pg_trgm ships in the image's contrib).
+# - SERVICES `mai-worker` row: same backend image/package as `mai-api`; no
+#   public listener. The worker is an explicit, HONEST placeholder: its command
+#   is spelled out and exits nonzero until 05-engine-adapter implements it
+#   (C05). It is held out of the default start set via the `worker` profile, so
+#   `docker compose up` never fakes a healthy daemon.
+# - C02 rule 1: the data root is configured explicitly (`MAI_DATA_ROOT`); the
+#   canonical file store (02-file-store) reads this parameter. C03 rule 6 /
+#   auth ADR §3: credentials come from the Compose `.env` only — this file
+#   references `MAI_POSTGRES_PASSWORD` as a REQUIRED variable and fails closed
+#   (render/up error) when it is unset; no default secret exists anywhere.
+#
+# Build contexts are the repository root; the single root `.dockerignore`
+# re-includes only the real image inputs.
+name: mai
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg18
+    environment:
+      POSTGRES_USER: mai
+      POSTGRES_DB: mai
+      POSTGRES_PASSWORD: "${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}"
+    volumes:
+      # Postgres 18 images keep PGDATA under /var/lib/postgresql/<major>/docker;
+      # mounting the parent directory persists all of it (verified in evidence).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mai -d mai"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - mai
+
+  mai-api:
+    image: mai-backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
+      MAI_DATA_ROOT: /var/lib/mai
+    volumes:
+      - mai-data:/var/lib/mai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Liveness only: /api/v1/health never probes dependencies (app.py), so a
+      # transient database outage does not get the API killed. Readiness truth
+      # stays on /api/v1/health/ready.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - mai
+
+  mai-worker:
+    # Same backend image/package (SERVICES row). Not built separately: reuses
+    # the mai-api image. Held disabled: only `docker compose --profile worker …`
+    # may start it, and until the durable-engine adapter card (05) implements
+    # the worker entrypoint this command exits nonzero with that fact — it is
+    # never a fake healthy daemon.
+    image: mai-backend
+    profiles:
+      - worker
+    command: ["python", "-c", "import sys; sys.exit('mai-worker is not implemented yet: the durable engine adapter (contracts.md C05, card 05-engine-adapter) owns this entrypoint')"]
+    environment:
+      MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
+      MAI_DATA_ROOT: /var/lib/mai
+    volumes:
+      - mai-data:/var/lib/mai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mai
+
+  mai-web:
+    image: mai-web
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - mai
+
+networks:
+  mai:
+
+volumes:
+  postgres-data:
+  mai-data:
