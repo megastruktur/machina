@@ -1,0 +1,190 @@
+"""MAI API application: ASGI entrypoint, ``/api/v1`` prefix, truthful health.
+
+Ownership map (contracts.md C01/C08; auth ADR ``3e79449`` §8 G1; SERVICES
+``mai-api`` row: "unhealthy dependencies reported accurately"):
+
+- :func:`create_app` is the single ASGI application factory (uvicorn factory
+  form: ``uvicorn mai.api.app:create_app --factory``). The lifespan starts
+  the one app-side engine owned by :mod:`mai.database` and disposes it at
+  shutdown. Database unavailability never blocks startup or liveness: the
+  app serves, readiness reports the truth. The durable DBOS engine is
+  launched later by its owning adapter card (C05), never here.
+- ``GET /api/v1/health`` is liveness: it never touches a dependency, so it
+  answers while PostgreSQL is down. G1 (auth ADR §8) serves it
+  unauthenticated in setup state; it grants no privilege.
+- ``GET /api/v1/health/ready`` is readiness: one classified probe through
+  :func:`mai.database.check_database` → ``200`` when dependencies are ok,
+  ``503`` carrying the stable health class otherwise. The response body
+  never contains the URL, credentials, or server error text (C01: no secret
+  material in any error body).
+- Every error response uses the C01 structured envelope
+  ``{"error": {"code", "message", "request_id", "fields"}}``; unhandled
+  exceptions collapse to a generic ``internal_error`` with no traceback.
+
+The two GET health routes are the whole route table at P01. Authentication,
+origin/CSRF enforcement, and privileged routes arrive with their owning
+cards (02-auth-api, 05-jobs-api, ...) registered under the same
+``/api/v1`` prefix; no route may bypass that prefix or the envelope.
+Public docs/OpenAPI listeners stay off (G1 minimal unauthenticated surface);
+the schema is produced in-process via ``app.openapi()`` for the central
+exporter owned by the ``openapi-client`` resource.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.datastructures import State
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.status import HTTP_200_OK, HTTP_503_SERVICE_UNAVAILABLE
+
+from mai.database import (
+    DatabaseConfigError,
+    DatabaseHealth,
+    DatabaseStatus,
+    check_database,
+    create_app_engine,
+    resolve_database_url,
+)
+
+API_PREFIX = "/api/v1"
+HEALTH_PATH = f"{API_PREFIX}/health"
+READINESS_PATH = f"{API_PREFIX}/health/ready"
+
+# Stable, browser-safe messages only; exception payloads are never echoed.
+_SAFE_MESSAGES: dict[int, tuple[str, str]] = {
+    404: ("not_found", "resource not found"),
+    405: ("method_not_allowed", "method not allowed"),
+}
+
+
+def _error_response(
+    request: Request, status_code: int, code: str, message: str
+) -> JSONResponse:
+    """Render the C01 structured error envelope for one request."""
+    request_id = getattr(request.state, "request_id", "")
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request_id,
+                "fields": {},
+            }
+        },
+    )
+
+
+async def _database_state(state: State) -> DatabaseStatus:
+    """Classified dependency truth for readiness; never raises."""
+    config_error = getattr(state, "database_config_error", None)
+    if isinstance(config_error, DatabaseHealth):
+        return DatabaseStatus(
+            config_error, "configured database URL was rejected at startup"
+        )
+    return await check_database(getattr(state, "database_url", None))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Start/stop the app-side database engine (the P01 dependency set).
+
+    A missing or rejected ``MAI_DATABASE_URL`` is recorded and reported by
+    readiness (``not_configured``/``invalid_config``); it does not prevent
+    the app from serving liveness and truthful readiness.
+    """
+    try:
+        url = resolve_database_url(app.state.env)
+    except DatabaseConfigError as exc:
+        app.state.database_url = None
+        app.state.database_config_error = exc.health
+    else:
+        app.state.database_url = url
+        app.state.database_config_error = None
+        app.state.engine, app.state.session_factory = create_app_engine(url)
+    try:
+        yield
+    finally:
+        engine = getattr(app.state, "engine", None)
+        if engine is not None:
+            await engine.dispose()
+
+
+def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
+    """Build the MAI ASGI application.
+
+    ``env`` overrides the environment for database URL resolution (test
+    seam, mirroring :func:`mai.database.resolve_database_url`); ``None``
+    reads the process environment.
+    """
+    app = FastAPI(
+        title="MAI controller API",
+        version="0.1.0",
+        lifespan=_lifespan,
+        # G1 minimal unauthenticated surface: no public docs/OpenAPI listeners.
+        # The schema is still generated in-process (app.openapi()).
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.state.env = env
+
+    @app.middleware("http")
+    async def attach_request_id(request: Request, call_next):  # noqa: ANN202
+        request.state.request_id = uuid.uuid4().hex
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
+
+    @app.get(HEALTH_PATH, tags=["health"], summary="Liveness")
+    async def liveness() -> dict[str, str]:
+        """Process liveness; never checks dependencies (auth ADR §8 G1)."""
+        return {"status": "ok"}
+
+    @app.get(
+        READINESS_PATH,
+        tags=["health"],
+        summary="Readiness",
+        responses={
+            HTTP_503_SERVICE_UNAVAILABLE: {
+                "description": "At least one dependency is unhealthy"
+            }
+        },
+    )
+    async def readiness(request: Request) -> JSONResponse:
+        """Classified, secret-free dependency readiness; never raises."""
+        status = await _database_state(request.app.state)
+        body = {
+            "status": "ok" if status.ok else "unhealthy",
+            "database": str(status.health),
+        }
+        return JSONResponse(
+            status_code=HTTP_200_OK if status.ok else HTTP_503_SERVICE_UNAVAILABLE,
+            content=body,
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        if exc.status_code >= 500:
+            code, message = "internal_error", "internal server error"
+        else:
+            code, message = _SAFE_MESSAGES.get(
+                exc.status_code, ("request_rejected", "request rejected")
+            )
+        return _error_response(request, exc.status_code, code, message)
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        # C01: no traceback, stack frame, or secret material in any body.
+        return _error_response(request, 500, "internal_error", "internal server error")
+
+    return app

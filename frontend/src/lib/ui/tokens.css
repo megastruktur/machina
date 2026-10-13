@@ -1,0 +1,190 @@
+/*
+ * MAI shared desktop visual tokens + safe base styles.
+ *
+ * Card 01-ui-tokens (P01). Authority: docs/architecture/windowed-workspace.md
+ * (ADR-0001) §2 layer table ("backed by design tokens"), §6 ("Token values
+ * (contrast, focus ring, target sizes) are owned by 01-ui-tokens"), §10.2 NT3
+ * (frozen 64×32 title-bar minimum), and brief acceptance 1–2 (single shared
+ * spacing/color/type/focus layer loaded once; readable active/focus/error
+ * states; scoped global reset; reduced-motion baseline; no theme catalogue).
+ *
+ * This file is the ONLY theme source in the frontend. Routes and panels
+ * consume the custom properties below; nothing redeclares theme rules.
+ * Loaded exactly once via frontend/src/routes/+layout.svelte.
+ *
+ * Palette note: every text pair here meets WCAG 2.1 AA (≥ 4.5:1 normal text);
+ * the focus ring meets the ≥ 3:1 non-text requirement on bg and surface.
+ * Ratios were machine-verified pre-commit and are re-asserted in the browser
+ * by frontend/tests/ui-tokens.spec.ts.
+ */
+
+:root {
+	color-scheme: light;
+
+	/* ---- Color: surfaces and text ------------------------------------ */
+	--mai-color-bg: #f6f7f9;
+	--mai-color-surface: #ffffff;
+	--mai-color-surface-raised: #ffffff;
+	--mai-color-border: #d1d5db;
+	--mai-color-border-strong: #9ca3af;
+	--mai-color-text: #101828;            /* 16.6:1 on bg, 17.8:1 on surface */
+	--mai-color-text-muted: #4b5563;      /*  7.1:1 on bg,  7.6:1 on surface */
+
+	/* ---- Color: primary / interactive -------------------------------- */
+	--mai-color-primary: #1d4ed8;         /* 6.7:1 with primary-contrast */
+	--mai-color-primary-hover: #1e40af;
+	--mai-color-primary-active: #1e3a8a;
+	--mai-color-primary-contrast: #ffffff;
+
+	/* ---- Color: status (readable text / tint pairs + solid badges) ---- */
+	--mai-status-info-text: #175cd3;      /* 5.6:1 on tint */
+	--mai-status-info-bg: #eff8ff;
+	--mai-status-info-border: #b2ddff;
+	--mai-status-info-solid: #175cd3;     /* 6.0:1 with solid-contrast */
+	--mai-status-success-text: #067647;   /* 5.4:1 on tint */
+	--mai-status-success-bg: #ecfdf3;
+	--mai-status-success-border: #a6f4c5;
+	--mai-status-success-solid: #067647;  /* 5.7:1 with solid-contrast */
+	--mai-status-warning-text: #b54708;   /* 5.2:1 on tint */
+	--mai-status-warning-bg: #fffaeb;
+	--mai-status-warning-border: #fec84b;
+	--mai-status-warning-solid: #b54708;  /* 5.4:1 with solid-contrast */
+	--mai-status-danger-text: #b42318;    /* 6.1:1 on tint */
+	--mai-status-danger-bg: #fef3f2;
+	--mai-status-danger-border: #fecdca;
+	--mai-status-danger-solid: #b42318;   /* 6.6:1 with solid-contrast */
+	--mai-status-solid-contrast: #ffffff;
+	--mai-status-neutral-text: #4b5563;   /* = text-muted, 7.6:1 on surface */
+	--mai-status-neutral-bg: #f2f4f7;
+	--mai-status-neutral-border: #d1d5db;
+
+	/* ---- Color: focus -------------------------------------------------- */
+	--mai-focus-ring-color: #1d4ed8;      /* 6.3:1 on bg — ≥ 3:1 required */
+	--mai-focus-ring-width: 2px;
+	--mai-focus-ring-offset: 2px;
+
+	/* ---- Type ---------------------------------------------------------- */
+	--mai-font-sans:
+		system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		sans-serif;
+	--mai-font-mono:
+		ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas,
+		monospace;
+	--mai-text-xs: 0.75rem;
+	--mai-text-sm: 0.875rem;
+	--mai-text-base: 1rem;
+	--mai-text-lg: 1.125rem;
+	--mai-text-xl: 1.25rem;
+	--mai-text-2xl: 1.5rem;
+	--mai-leading-tight: 1.25;
+	--mai-leading-normal: 1.5;
+	--mai-weight-normal: 400;
+	--mai-weight-medium: 500;
+	--mai-weight-semibold: 600;
+
+	/* ---- Spacing / radii / borders ------------------------------------- */
+	--mai-space-1: 4px;
+	--mai-space-2: 8px;
+	--mai-space-3: 12px;
+	--mai-space-4: 16px;
+	--mai-space-5: 24px;
+	--mai-space-6: 32px;
+	--mai-space-7: 40px;
+	--mai-space-8: 48px;
+	--mai-radius-sm: 4px;
+	--mai-radius-md: 6px;
+	--mai-radius-lg: 8px;
+	--mai-border-width: 1px;
+	--mai-shadow-window: 0 8px 24px rgb(16 24 40 / 0.14), 0 2px 6px rgb(16 24 40 / 0.08);
+
+	/* ---- Size invariants ------------------------------------------------ */
+	/* Minimum interactive target (WCAG 2.5.8 AA). */
+	--mai-target-min: 24px;
+	/* windowed-workspace ADR §10.2 NT3 — FROZEN minimum visible title-bar area.
+	   The value is contractual; window producers consume these variables and
+	   never redeclare their own numbers. */
+	--mai-titlebar-min-w: 64px;
+	--mai-titlebar-min-h: 32px;
+
+	/* ---- Motion ---------------------------------------------------------- */
+	--mai-motion-fast: 120ms;
+	--mai-motion-base: 180ms;
+}
+
+/* ---- Safe global reset ------------------------------------------------
+   Deliberately minimal: nothing here may break scrolling, text selection or
+   form input (brief acceptance 2; P01 scenario). No overflow, height or
+   user-select rules are set anywhere in this file. */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+* {
+	margin: 0;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+body {
+	background: var(--mai-color-bg);
+	color: var(--mai-color-text);
+	font-family: var(--mai-font-sans);
+	font-size: var(--mai-text-base);
+	line-height: var(--mai-leading-normal);
+	overflow-wrap: break-word;
+	-webkit-font-smoothing: antialiased;
+}
+
+img,
+svg,
+video,
+canvas {
+	display: block;
+	max-width: 100%;
+}
+
+/* Form controls inherit the document voice instead of UA defaults, so panels
+   do not need per-component font fixes. */
+button,
+input,
+optgroup,
+select,
+textarea {
+	font: inherit;
+	letter-spacing: inherit;
+	color: inherit;
+}
+
+a {
+	color: var(--mai-color-primary);
+}
+
+::placeholder {
+	color: var(--mai-color-text-muted);
+	opacity: 1;
+}
+
+/* Visible keyboard focus everywhere (ADR §6: chrome controls reachable and
+   operable by keyboard with visible focus indicators). Pointer clicks are
+   unaffected: this matches only keyboard-triggered focus. */
+:focus-visible {
+	outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+	outline-offset: var(--mai-focus-ring-offset);
+}
+
+/* ---- Reduced-motion baseline (ADR §6) ---------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+		scroll-behavior: auto !important;
+	}
+}

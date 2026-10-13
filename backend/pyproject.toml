@@ -1,0 +1,30 @@
+[project]
+name = "mai"
+version = "0.1.0"
+description = "MAI controller backend package"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    # Durable engine: exact pin frozen by docs/architecture/contracts.md C05 and
+    # docs/architecture/job-engine.md ("Tested exactly: dbos==3.2.0").
+    "dbos==3.2.0",
+    # API framework of the controller backend (traceability: "Python FastAPI /
+    # SvelteKit / Docker Compose / PostgreSQL"). ASGI server choice belongs to
+    # the api/compose cards, not the package lane.
+    "fastapi",
+    # Schema migration harness owner (card 01-db allowlists backend/alembic.ini
+    # and backend/migrations/env.py; SERVICES locks the migration chain to one
+    # linear Alembic chain). Bounded <2 so major-version chain rewrites are a
+    # deliberate reconciliation, not a silent upgrade.
+    "alembic>=1.16,<2",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mai"]
