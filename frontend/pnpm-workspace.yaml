@@ -1,0 +1,7 @@
+# Coordinator addendum 2 (card mai-01-web): esbuild's postinstall is consciously
+# skipped — vite ships prebuilt esbuild binaries, so no build step is needed.
+# Decided in the pnpm-10 spelling (ignoredBuiltDependencies: [esbuild]); that
+# setting was removed in pnpm v11, and `allowBuilds: esbuild: false` is its
+# exact replacement under strictDepBuilds (default true).
+allowBuilds:
+  esbuild: false
