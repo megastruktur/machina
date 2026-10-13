@@ -1,0 +1,364 @@
+<script lang="ts">
+	/**
+	 * WindowFrame — reusable non-modal window chrome (card 01-window-frame, P01).
+	 *
+	 * Layer: window chrome (windowed-workspace ADR-0001 §2). Renders one live
+	 * window from its validated schema-v1 descriptor: contextual title bar,
+	 * control region and body region. It owns nothing else:
+	 *
+	 *  - No drag/resize pointer logic. The pointer adapter is owned by
+	 *    `01-window-drag` / `01-window-resize`; this component contains no
+	 *    pointermove/setPointerCapture code and no geometry clamping (NT1–NT3
+	 *    belong to those producers). The only pointer handling here is
+	 *    activation + deterministic keyboard-focus placement on the title bar
+	 *    (ADR §6, PT2), and it never prevents default or stops propagation,
+	 *    so controls, text selection and future adapters keep working (NT2).
+	 *  - No presentation transitions (01-window-presentation applies them via
+	 *    the workspace state); the frame renders `descriptor.presentation` as
+	 *    data and emits minimize/maximize intents only.
+	 *  - No panel/chat/SSH/domain logic and no domain channel (no fetch/XHR/
+	 *    WebSocket/EventSource): close is view-only intent emission — the
+	 *    owning controller decides whether, and when, the window leaves the
+	 *    workspace. Closing/focusing never starts, cancels or retargets
+	 *    backend work (ADR §7.2, NT6; contracts.md C08 rule 5, C11).
+	 *  - No stores and no module-level state: everything enters through props
+	 *    and leaves through callbacks, so instances share nothing, no hidden
+	 *    global "current server" mutation target can exist (ADR §2, NT5), and
+	 *    the module is safe to evaluate per SSR request (ADR §5).
+	 *
+	 * Controlled-component contract: `descriptor` and `focused` come from the
+	 * owning workspace controller (already validated by the state layer);
+	 * mutations are requested through the `on*` intent callbacks, each
+	 * receiving the stable opaque `window_id` (view identity only, ADR §3.1).
+	 * Emission is idempotent-safe: focusing the already-focused window is a
+	 * no-op at the controller, so click and focusin may both emit for one
+	 * interaction. Activation emits on click COMPLETION, never on
+	 * pointerdown — a synchronous raise reparents the frame in the stacking
+	 * order, which cancels an in-flight pointer gesture (see onPointerDown).
+	 *
+	 * Accessibility (ADR §6): `role="dialog"`, `aria-modal="false"`,
+	 * `aria-labelledby` pointing at the title heading, which carries the
+	 * accessible name "«panel title» — «server/context label»"; a global
+	 * scope always reads "Global", never a caller-supplied server name (ADR
+	 * §3.2). The title bar is focusable, every chrome control is a labeled
+	 * native button (native Enter/Space activation and the token-layer
+	 * `:focus-visible` ring), and there is no focus trap: tab order follows
+	 * DOM order.
+	 *
+	 * Positioning: absolutely positioned inside the owning desktop region (a
+	 * positioned ancestor) from `descriptor.geometry`/`descriptor.z`, rendered
+	 * as given — viewport/min-size clamping is upstream (drag/resize/restore
+	 * paths hold the viewport). The `min-width`/`min-height` floors keep the
+	 * chrome above the frozen NT3 visible title-bar area in CSS.
+	 *
+	 * Tokens: colors, spacing, type and motion come only from ui/tokens.css
+	 * (including the frozen `--mai-titlebar-min-*` floors); no theme value is
+	 * redeclared here and no dependency is added (ADR §4.3).
+	 */
+	import type { Snippet } from 'svelte';
+	import type { WindowDescriptor, WindowId } from './types.js';
+
+	interface Props {
+		/** Validated live descriptor from the workspace state (schema v1). */
+		descriptor: WindowDescriptor;
+		/** Display title (registry vocabulary is a later card; display-only). */
+		title: string;
+		/**
+		 * Display-only context label for server-scoped windows. Ignored for
+		 * global scope, which always reads "Global" (ADR §3.2).
+		 */
+		contextLabel?: string;
+		/** Whether this window is the focused one (drives active styling). */
+		focused?: boolean;
+		/** Activation intent: bring this window to front (click/keyboard). */
+		onactivate?: (windowId: WindowId) => void;
+		/** Minimize intent (the transition itself stays with the controller). */
+		onminimize?: (windowId: WindowId) => void;
+		/** Maximize/restore toggle intent. */
+		ontogglemaximize?: (windowId: WindowId) => void;
+		/** Close intent — view-only; the controller performs the close. */
+		onclose?: (windowId: WindowId) => void;
+		/** Extra chrome controls, rendered before the default window controls. */
+		controls?: Snippet;
+		/** Panel content (the window body). */
+		children?: Snippet;
+		class?: string;
+	}
+
+	let {
+		descriptor,
+		title,
+		contextLabel = '',
+		focused = false,
+		onactivate,
+		onminimize,
+		ontogglemaximize,
+		onclose,
+		controls,
+		children,
+		class: className = ''
+	}: Props = $props();
+
+	const titleId = $props.id();
+
+	let titleHeading = $state<HTMLHeadingElement | null>(null);
+
+	/** A `title_override` replaces the registry display title (ADR §8). */
+	const displayTitle = $derived(descriptor.title_override ?? title);
+	/** Global scope always reads Global — never a last-selected server name. */
+	const contextText = $derived(
+		descriptor.scope.kind === 'global' ? 'Global' : contextLabel !== '' ? contextLabel : 'Server'
+	);
+	const maximizeLabel = $derived(descriptor.presentation === 'maximized' ? 'Restore' : 'Maximize');
+
+	/**
+	 * Interactive descendants: a pointerdown on one of them is a control/body
+	 * interaction, so keyboard focus must stay with the control the user
+	 * clicked (native focus), not be moved to the title bar over their head.
+	 */
+	const INTERACTIVE_SELECTOR =
+		'button, input, select, textarea, a[href], [contenteditable], [tabindex]';
+
+	/**
+	 * True between pointerdown and pointerup. Raising a window reparents it
+	 * in the stacking order; doing that MID-GESTURE makes Chromium cancel the
+	 * in-flight click (observed 2026-10-13: mousedown retargeted, click never
+	 * dispatched). So activation emits on click completion, and focusin
+	 * caused by the pointer gesture stays silent (its click emits instead).
+	 */
+	let pointerGesture = false;
+
+	function onPointerDown(event: PointerEvent): void {
+		pointerGesture = true;
+		const target = event.target;
+		if (!(target instanceof Element) || !target.closest(INTERACTIVE_SELECTOR)) {
+			titleHeading?.focus();
+		}
+	}
+
+	function onPointerUp(): void {
+		pointerGesture = false;
+	}
+
+	function onClick(): void {
+		// PT2: activating an inactive window (click anywhere) raises it.
+		if (!focused) onactivate?.(descriptor.window_id);
+	}
+
+	function onFocusIn(): void {
+		// PT2 keyboard half: tabbing into an inactive window raises it.
+		if (!pointerGesture && !focused) onactivate?.(descriptor.window_id);
+	}
+</script>
+
+<!-- role="dialog" on a plain div (APG dialog pattern): a <section> would
+     trip a11y_no_noninteractive_element_to_interactive_role while the dialog
+     role is exactly the frozen contract (ADR §6). -->
+<!-- Click-to-activate on the window surface has a complete keyboard
+     equivalent (title bar and every control are tab-reachable; focusin
+     raises the window), so no extra key handler belongs on the container
+     (ADR §6: no focus traps, no shortcut suite). -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<div
+	class="mai-window-frame {className}"
+	class:mai-window-frame--focused={focused}
+	role="dialog"
+	aria-modal="false"
+	aria-labelledby={titleId}
+	tabindex="-1"
+	data-window-id={descriptor.window_id}
+	data-panel-kind={descriptor.panel_kind}
+	data-presentation={descriptor.presentation}
+	data-focused={focused ? 'true' : 'false'}
+	style:left="{descriptor.geometry.x}px"
+	style:top="{descriptor.geometry.y}px"
+	style:width="{descriptor.geometry.width}px"
+	style:height="{descriptor.geometry.height}px"
+	style:z-index={descriptor.z}
+	onpointerdown={onPointerDown}
+	onpointerup={onPointerUp}
+	onclick={onClick}
+	onfocusin={onFocusIn}
+>
+	<header class="mai-window-frame__titlebar">
+		<!-- The title bar is keyboard-focusable by frozen contract (ADR §6:
+		     "Title bar is focusable") even though a heading is not itself an
+		     interactive widget — tabbing to it is the keyboard activation
+		     path (focusin raises the window), so a positive tabindex on the
+		     heading is required, not a typo. -->
+		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+		<h2 class="mai-window-frame__title" id={titleId} tabindex="0" bind:this={titleHeading}>
+			<span class="mai-window-frame__title-text">{displayTitle}</span>
+			<span class="mai-window-frame__title-sep">—</span>
+			<span class="mai-window-frame__title-context">{contextText}</span>
+		</h2>
+		<div class="mai-window-frame__window-controls">
+			{@render controls?.()}
+			<button
+				type="button"
+				class="mai-window-frame__control"
+				aria-label="Minimize"
+				onclick={() => onminimize?.(descriptor.window_id)}
+			>
+				<svg viewBox="0 0 10 10" aria-hidden="true">
+					<path d="M1.5 8.5h7" />
+				</svg>
+			</button>
+			<button
+				type="button"
+				class="mai-window-frame__control"
+				aria-label={maximizeLabel}
+				onclick={() => ontogglemaximize?.(descriptor.window_id)}
+			>
+				<svg viewBox="0 0 10 10" aria-hidden="true">
+					<rect x="1.5" y="1.5" width="7" height="7" />
+				</svg>
+			</button>
+			<button
+				type="button"
+				class="mai-window-frame__control mai-window-frame__control--close"
+				aria-label="Close"
+				onclick={() => onclose?.(descriptor.window_id)}
+			>
+				<svg viewBox="0 0 10 10" aria-hidden="true">
+					<path d="M1.5 1.5l7 7M8.5 1.5l-7 7" />
+				</svg>
+			</button>
+		</div>
+	</header>
+	<div class="mai-window-frame__body">
+		{@render children?.()}
+	</div>
+</div>
+
+<style>
+	.mai-window-frame {
+		position: absolute;
+		display: flex;
+		flex-direction: column;
+		/* NT3 floor: chrome never renders below the frozen visible title-bar
+		   area; viewport clamping itself stays with drag/resize/restore. */
+		min-width: var(--mai-titlebar-min-w);
+		min-height: var(--mai-titlebar-min-h);
+		background: var(--mai-color-surface);
+		color: var(--mai-color-text);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+		box-shadow: var(--mai-shadow-window);
+		font-family: var(--mai-font-sans);
+		overflow: hidden;
+	}
+
+	/* Active focus styling: border, title voice and context badge all come
+	   from token pairs, so the state difference is visible, not color-only. */
+	.mai-window-frame--focused {
+		border-color: var(--mai-color-primary);
+	}
+
+	.mai-window-frame__titlebar {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		flex: none;
+		min-height: var(--mai-titlebar-min-h);
+		padding: var(--mai-space-1) var(--mai-space-2) var(--mai-space-1) var(--mai-space-3);
+		background: var(--mai-color-bg);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: calc(var(--mai-radius-lg) - var(--mai-border-width))
+			calc(var(--mai-radius-lg) - var(--mai-border-width)) 0 0;
+	}
+
+	.mai-window-frame__title {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		min-width: 0;
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		line-height: var(--mai-leading-tight);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-window-frame--focused .mai-window-frame__title {
+		color: var(--mai-color-text);
+	}
+
+	.mai-window-frame__title-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.mai-window-frame__title-sep {
+		color: var(--mai-color-border-strong);
+	}
+
+	.mai-window-frame__title-context {
+		flex: none;
+		padding: 0 var(--mai-space-2);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		color: var(--mai-status-neutral-text);
+		background: var(--mai-status-neutral-bg);
+		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
+		border-radius: var(--mai-radius-sm);
+		white-space: nowrap;
+	}
+
+	.mai-window-frame--focused .mai-window-frame__title-context {
+		color: var(--mai-status-info-text);
+		background: var(--mai-status-info-bg);
+		border-color: var(--mai-status-info-border);
+	}
+
+	.mai-window-frame__window-controls {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1);
+		margin-left: auto;
+	}
+
+	.mai-window-frame__control {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: var(--mai-target-min);
+		height: var(--mai-target-min);
+		padding: 0;
+		border: none;
+		border-radius: var(--mai-radius-sm);
+		background: transparent;
+		color: var(--mai-color-text-muted);
+		cursor: pointer;
+	}
+
+	.mai-window-frame--focused .mai-window-frame__control {
+		color: var(--mai-color-text);
+	}
+
+	.mai-window-frame__control:hover {
+		background: var(--mai-status-neutral-bg);
+		color: var(--mai-color-text);
+	}
+
+	.mai-window-frame__control--close:hover {
+		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
+	}
+
+	.mai-window-frame__control svg {
+		width: 10px;
+		height: 10px;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.5;
+		stroke-linecap: round;
+	}
+
+	.mai-window-frame__body {
+		flex: 1 1 auto;
+		min-height: 0;
+		overflow: auto;
+		padding: var(--mai-space-3);
+	}
+</style>
