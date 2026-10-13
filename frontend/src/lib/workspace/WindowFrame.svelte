@@ -6,10 +6,12 @@
 	 * window from its validated schema-v1 descriptor: contextual title bar,
 	 * control region and body region. It owns nothing else:
 	 *
-	 *  - No drag/resize pointer logic. The pointer adapter is owned by
+	 *  - No drag/resize pointer logic. The pointer adapters are owned by
 	 *    `01-window-drag` / `01-window-resize`; this component contains no
 	 *    pointermove/setPointerCapture code and no geometry clamping (NT1–NT3
-	 *    belong to those producers). The only pointer handling here is
+	 *    belong to those producers) — it only BINDS the drag action to the
+	 *    title bar and the resize action to the edge/corner handles. The only
+	 *    pointer handling here is
 	 *    activation + deterministic keyboard-focus placement on the title bar
 	 *    (ADR §6, PT2), and it never prevents default or stops propagation,
 	 *    so controls, text selection and future adapters keep working (NT2).
@@ -57,7 +59,13 @@
 	 */
 	import type { Snippet } from 'svelte';
 	import { windowDrag } from './drag.js';
-	import type { WindowDescriptor, WindowGeometry, WindowId } from './types.js';
+	import { RESIZE_DIRECTIONS, windowResize, type MinGeometry } from './resize.js';
+	import {
+		DEFAULT_MIN_GEOMETRY,
+		type WindowDescriptor,
+		type WindowGeometry,
+		type WindowId
+	} from './types.js';
 
 	interface Props {
 		/** Validated live descriptor from the workspace state (schema v1). */
@@ -84,8 +92,17 @@
 		 * (`01-window-drag`, PT1/NT1/NT3): live clamped moves and interrupt
 		 * reverts. The controller applies them through the workspace `move`
 		 * transition — the frame never mutates the shared state itself.
+		 * The resize adapter (`01-window-resize`, PT3/NT1/NT3) emits through
+		 * the same single geometry intent channel.
 		 */
 		ongeometry?: (windowId: WindowId, geometry: WindowGeometry) => void;
+		/**
+		 * Per-entry minimum size clamp for the resize handles (ADR §10.1
+		 * PT3: "per-entry `min_geometry` clamp, global default 320×200 when
+		 * unset"). Registry wiring passes the entry's `min_geometry`; the
+		 * frozen `DEFAULT_MIN_GEOMETRY` applies when omitted.
+		 */
+		minGeometry?: MinGeometry;
 		/** Extra chrome controls, rendered before the default window controls. */
 		controls?: Snippet;
 		/** Panel content (the window body). */
@@ -103,6 +120,7 @@
 		ontogglemaximize,
 		onclose,
 		ongeometry,
+		minGeometry = DEFAULT_MIN_GEOMETRY,
 		controls,
 		children,
 		class: className = ''
@@ -111,6 +129,8 @@
 	const titleId = $props.id();
 
 	let titleHeading = $state<HTMLHeadingElement | null>(null);
+	/** Measured by the resize adapter at gesture start (NT3 viewport origin). */
+	let titlebarElement = $state<HTMLElement | null>(null);
 
 	/** A `title_override` replaces the registry display title (ADR §8). */
 	const displayTitle = $derived(descriptor.title_override ?? title);
@@ -194,6 +214,7 @@
 	     geometry intents; interactive descendants are excluded inside the
 	     action, so chrome controls keep their native behavior (NT2). -->
 	<header
+		bind:this={titlebarElement}
 		class="mai-window-frame__titlebar"
 		use:windowDrag={{
 			windowId: descriptor.window_id,
@@ -249,6 +270,32 @@
 	<div class="mai-window-frame__body">
 		{@render children?.()}
 	</div>
+	<!-- Resize handles (PT3): one reusable pointer adapter per direction,
+	     bound to edge/corner hit strips. They exist only in `normal`
+	     presentation — a maximized frame's geometry belongs to the
+	     presentation owner (01-window-presentation), not to a pointer
+	     gesture. Handles are display affordances, hidden from the a11y
+	     tree; the keyboard Resize mode (ADR §6) is the frozen accessibility
+	     equivalent and stays with the phase-gate a11y work, like keyboard
+	     Move. Being outside the title bar they structurally cannot initiate
+	     a drag, and chrome controls stack above the strips (NT2). -->
+	{#if descriptor.presentation === 'normal'}
+		{#each RESIZE_DIRECTIONS as direction (direction)}
+			<div
+				class="mai-window-frame__resize-handle"
+				data-resize-direction={direction}
+				aria-hidden="true"
+				use:windowResize={{
+					windowId: descriptor.window_id,
+					direction,
+					geometry: () => descriptor.geometry,
+					min: minGeometry,
+					titleBar: () => titlebarElement?.getBoundingClientRect() ?? null,
+					onGeometry: ongeometry
+				}}
+			></div>
+		{/each}
+	{/if}
 </div>
 
 <style>
@@ -350,6 +397,10 @@
 		background: transparent;
 		color: var(--mai-color-text-muted);
 		cursor: pointer;
+		/* Chrome controls stack above the edge/corner resize strips, so a
+		   press anywhere on a control is always a control interaction (NT2). */
+		position: relative;
+		z-index: 3;
 	}
 
 	.mai-window-frame--focused .mai-window-frame__control {
@@ -380,5 +431,82 @@
 		min-height: 0;
 		overflow: auto;
 		padding: var(--mai-space-3);
+	}
+
+	/* Resize hit strips (PT3). Inside the frame box: the frame's
+	   `overflow: hidden` clips anything past the border, and strips outside
+	   it would be dead area. Corners (12×12) sit above the edge strips'
+	   ends, so the corner gesture always wins at a corner. The 6px
+	   east/south strips overlay the body edge incl. its scrollbar rim —
+	   the standard overlay-handle tradeoff; the scrollbar thumb keeps a
+	   usable grab area beside the strip. Keyboard resize is the ADR §6
+	   accessibility path and does not live on these pointer strips. */
+	.mai-window-frame__resize-handle {
+		position: absolute;
+		z-index: 2;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='n'] {
+		top: 0;
+		right: 10px;
+		left: 10px;
+		height: 6px;
+		cursor: ns-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='s'] {
+		right: 10px;
+		bottom: 0;
+		left: 10px;
+		height: 6px;
+		cursor: ns-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='e'] {
+		top: 10px;
+		right: 0;
+		bottom: 10px;
+		width: 6px;
+		cursor: ew-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='w'] {
+		top: 10px;
+		bottom: 10px;
+		left: 0;
+		width: 6px;
+		cursor: ew-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='ne'] {
+		top: 0;
+		right: 0;
+		width: 12px;
+		height: 12px;
+		cursor: nesw-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='se'] {
+		right: 0;
+		bottom: 0;
+		width: 12px;
+		height: 12px;
+		cursor: nwse-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='sw'] {
+		bottom: 0;
+		left: 0;
+		width: 12px;
+		height: 12px;
+		cursor: nesw-resize;
+	}
+
+	.mai-window-frame__resize-handle[data-resize-direction='nw'] {
+		top: 0;
+		left: 0;
+		width: 12px;
+		height: 12px;
+		cursor: nwse-resize;
 	}
 </style>
