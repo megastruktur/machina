@@ -1,0 +1,329 @@
+import { expect, test, type Locator, type Page } from '@playwright/test';
+
+/**
+ * 01-desktop-shell — real-browser proofs for the composed desktop shell on
+ * the ACTUAL app route (frontend/src/routes/+page.svelte rendering
+ * DesktopShell): no virtual fixtures, no backend — the production build the
+ * webServer serves is the exercised entrypoint.
+ *
+ * Scenario coverage (brief "feature-gate coverage", runtime owner 01-verify;
+ * windowed-workspace ADR §10.1 PT1/PT2/PT5, §10.2 NT5, §5 SSR isolation,
+ * contracts.md C08 rule 5, C11):
+ *  - the SvelteKit route mounts the shell: SSR renders the empty desktop
+ *    (launcher only), hydration mounts the shell inside the reviewed
+ *    01-web component host;
+ *  - open two labeled fixture panels from the desktop; independent
+ *    draggable frames + panel hosts with explicit target labels;
+ *  - drag/focus/close/reopen with keyboard and pointer (interactions
+ *    counters prove content stays mounted across focus/drag and remounts
+ *    fresh on reopen);
+ *  - changing the selected server fixture never retargets open windows;
+ *  - workspace state is per-session (second browser context starts empty);
+ *  - only benign fixtures: the journey performs zero API requests.
+ *
+ * Known limits (recorded in the card evidence): minimize/maximize chrome is
+ * rendered by WindowFrame but its transitions belong to 01-window-presentation
+ * and are deliberately not wired here; keyboard Move mode is a later card.
+ */
+
+const NOTES = 'fixture-notes';
+const PREFS = 'fixture-prefs';
+const SERVER_ALPHA_ID = '8c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
+
+/** A window frame locator for one panel kind (frames carry role="dialog"). */
+function frame(page: Page, kind: string) {
+	return page.locator(`.mai-window-frame[data-panel-kind="${kind}"]`);
+}
+
+async function openPanel(page: Page, kind: string): Promise<void> {
+	await page.getByTestId(`open-${kind}`).click();
+	await expect(frame(page, kind)).toHaveCount(1);
+}
+
+test('the route server-renders the empty desktop shell and mounts it client-side', async ({
+	page
+}) => {
+	// D4/§5: the SSR document is the shell with an EMPTY workspace — launcher
+	// markup present, zero window/panel DOM, no domain content in the route.
+	const ssr = await (await page.request.get('/')).text();
+	expect(ssr).toContain('data-testid="desktop"');
+	expect(ssr).toContain('Open panels');
+	expect(ssr).not.toContain('data-panel-kind');
+	expect(ssr).not.toContain('mai-fixture-panel');
+
+	await page.goto('/');
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('MAI');
+	await expect(page.getByTestId('component-host')).toHaveAttribute('data-mounted', 'true');
+
+	const select = page.getByTestId('server-select');
+	await expect(select).toBeVisible();
+	await expect(select.locator('option')).toHaveText(['Server Alpha', 'Server Beta']);
+	await expect(page.getByTestId('open-' + NOTES)).toHaveText('Open Notes — Server Alpha');
+	await expect(page.getByTestId('open-' + PREFS)).toHaveText('Open Preferences — Global');
+	await expect(frame(page, NOTES)).toHaveCount(0);
+	await expect(frame(page, PREFS)).toHaveCount(0);
+});
+
+test('opens two labeled fixture panels with independent frames and panel hosts', async ({
+	page
+}) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	await openPanel(page, PREFS);
+
+	const notes = frame(page, NOTES);
+	const prefs = frame(page, PREFS);
+	await expect(notes.getByRole('heading')).toHaveText('Notes — Server Alpha');
+	await expect(prefs.getByRole('heading')).toHaveText('Preferences — Global');
+
+	// Explicit target labels at open time (launcher status mirrors them).
+	await expect(page.getByTestId('desktop-status')).toHaveText('Opened Preferences — Global.');
+
+	// Independent panel hosts: one mounted fixture body per frame.
+	const notesId = await notes.getAttribute('data-window-id');
+	const prefsId = await prefs.getAttribute('data-window-id');
+	expect(notesId).toBeTruthy();
+	expect(prefsId).toBeTruthy();
+	expect(notesId).not.toBe(prefsId);
+	await expect(notes.getByTestId('fixture-panel')).toHaveAttribute('data-fixture-panel', NOTES);
+	await expect(prefs.getByTestId('fixture-panel')).toHaveAttribute('data-fixture-panel', PREFS);
+	await expect(notes.getByTestId('fixture-panel')).toContainText(
+		'benign placeholder, no live data.'
+	);
+	await expect(notes.getByTestId('fixture-panel')).toContainText(`Pinned target: server ${SERVER_ALPHA_ID}`);
+	await expect(prefs.getByTestId('fixture-panel')).toContainText('Pinned target: global');
+
+	// Open focuses: prefs (opened last) is on top, notes below.
+	await expect(prefs).toHaveAttribute('data-focused', 'true');
+	await expect(notes).toHaveAttribute('data-focused', 'false');
+	await expect
+		.poll(() => prefs.evaluate((el) => el.style.zIndex))
+		.toBe(await notes.evaluate((el) => String(Number(el.style.zIndex) + 1)));
+});
+
+test('activation by pointer and keyboard raises windows without remounting content', async ({
+	page
+}) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	await openPanel(page, PREFS);
+	const notes = frame(page, NOTES);
+	const prefs = frame(page, PREFS);
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+
+	// Pointer: clicking the inactive window's body raises it (PT2).
+	await notes.getByTestId('fixture-panel').click();
+	await expect(notes).toHaveAttribute('data-focused', 'true');
+	await expect(prefs).toHaveAttribute('data-focused', 'false');
+
+	// Keyboard: Tab from the body control to the other window's focusable
+	// title bar — focusin raises that window (PT2 keyboard half) and focus
+	// STAYS on the title (the stable DOM order must not reparent the focused
+	// frame, which would drop focus to the document).
+	await notes.getByTestId('fixture-interactions').click();
+	await page.keyboard.press('Tab');
+	await expect(prefs.getByRole('heading')).toBeFocused();
+	await expect(prefs).toHaveAttribute('data-focused', 'true');
+	await expect(notes).toHaveAttribute('data-focused', 'false');
+
+	// Raising never remounts panel content: counters survive both raises.
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 1');
+	await expect(prefs.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+});
+
+test('title-bar drag moves a window through the shell and clamps at the viewport', async ({
+	page
+}) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	const notes = frame(page, NOTES);
+	const bar = notes.locator('.mai-window-frame__titlebar');
+	await expect(notes).toHaveAttribute('data-focused', 'true');
+
+	// PT1 through the composed shell: drag commits geometry via state.move.
+	await expect(notes).toHaveAttribute('data-focused', 'true');
+	const before = await bar.boundingBox();
+	expect(before).not.toBeNull();
+	await page.mouse.move(before!.x + before!.width / 2, before!.y + before!.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(before!.x + before!.width / 2 + 90, before!.y + before!.height / 2 + 70, {
+		steps: 5
+	});
+	await page.mouse.up();
+	await expect(notes).toHaveAttribute('data-focused', 'true');
+	await expect
+		.poll(() => notes.evaluate((el) => ({ x: el.style.left, y: el.style.top })))
+		.toEqual({ x: '114px', y: '94px' });
+
+	// Content stayed mounted through the gesture.
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+
+	// NT3: dragging far past every edge clamps so a ≥64×32 title-bar area
+	// stays visible and hit-testable inside the viewport.
+	const width = page.viewportSize()?.width ?? 1280;
+	const height = page.viewportSize()?.height ?? 720;
+	await page.mouse.move(before!.x + before!.width / 2, before!.y + before!.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(-2000, -2000, { steps: 5 });
+	await page.mouse.up();
+	const box = await notes.boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.x).toBeLessThanOrEqual(width - 64);
+	expect(box!.x + box!.width).toBeGreaterThanOrEqual(64);
+	expect(box!.y).toBeLessThanOrEqual(height - 32);
+	expect(box!.y + box!.height).toBeGreaterThanOrEqual(32);
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+});
+
+test('close removes the window and its host; reopen mounts a fresh instance', async ({
+	page
+}) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	const notes = frame(page, NOTES);
+	const firstId = await notes.getAttribute('data-window-id');
+	await notes.getByTestId('fixture-interactions').click();
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 1');
+
+	// PT5: close removes frame + panel host; the workspace keeps running.
+	await notes.getByRole('button', { name: 'Close' }).click();
+	await expect(frame(page, NOTES)).toHaveCount(0);
+	await expect(page.getByTestId('fixture-panel')).toHaveCount(0);
+	await expect(page.getByTestId('desktop-status')).toHaveText('Opened Notes — Server Alpha.');
+
+	// Reopen: a NEW view identity with fresh (remounted) content.
+	await page.getByTestId('open-' + NOTES).click();
+	await expect(frame(page, NOTES)).toHaveCount(1);
+	const reopened = frame(page, NOTES);
+	expect(await reopened.getAttribute('data-window-id')).not.toBe(firstId);
+	await expect(reopened.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+});
+
+test('keyboard close via the frame control; launcher reopens with the keyboard', async ({
+	page
+}) => {
+	await page.goto('/');
+	await openPanel(page, PREFS);
+	await openPanel(page, NOTES);
+
+	/**
+	 * Walks REAL Tab presses until `target` has focus (bounded; no
+	 * programmatic focus() — the keyboard path is the behavior under test).
+	 */
+	async function tabUntil(target: Locator, maxHops: number): Promise<void> {
+		for (let hop = 0; hop < maxHops; hop += 1) {
+			if (await target.evaluate((el) => document.activeElement === el)) return;
+			await page.keyboard.press('Tab');
+		}
+		await expect(target).toBeFocused();
+	}
+
+	const prefs = frame(page, PREFS);
+
+	// Keyboard: Tab order reaches the prefs title bar; focusin raises the
+	// window (PT2 keyboard half).
+	await tabUntil(prefs.getByRole('heading'), 8);
+	await expect(prefs).toHaveAttribute('data-focused', 'true');
+
+	// Three controls follow the title: Minimize, Maximize, Close.
+	await tabUntil(prefs.getByRole('button', { name: 'Close' }), 4);
+	await page.keyboard.press('Enter');
+	await expect(frame(page, PREFS)).toHaveCount(0);
+
+	// Notes was never touched by the prefs close (independent hosts).
+	const notes = frame(page, NOTES);
+	await expect(notes).toHaveCount(1);
+	await expect(notes.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+
+	// Reopen prefs from the launcher with the keyboard. Arrival: this
+	// headless Chromium drops the sequential-navigation start point after a
+	// focused control is removed, so Tab-from-body into the launcher is
+	// unreliable here (quirk recorded in the card evidence); .focus() stands
+	// in for the Tab arrival while Enter stays the real keyboard activation.
+	const openPrefs = page.getByTestId('open-' + PREFS);
+	await openPrefs.focus();
+	await page.keyboard.press('Enter');
+	await expect(frame(page, PREFS)).toHaveCount(1);
+	await expect(frame(page, PREFS).getByTestId('fixture-interactions')).toHaveText(
+		'Fixture interactions: 0'
+	);
+});
+
+test('singleton open focuses the live instance instead of duplicating it', async ({ page }) => {
+	await page.goto('/');
+	await openPanel(page, PREFS);
+	const prefs = frame(page, PREFS);
+	const id = await prefs.getAttribute('data-window-id');
+
+	await page.getByTestId('open-' + PREFS).click();
+	await expect(frame(page, PREFS)).toHaveCount(1);
+	await expect(prefs).toHaveAttribute('data-window-id', id!);
+	await expect(prefs).toHaveAttribute('data-focused', 'true');
+	await expect(page.getByTestId('desktop-status')).toHaveText('Opened Preferences — Global.');
+});
+
+test('changing the launcher server never retargets open windows (NT5)', async ({ page }) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	// DOM order = stacking order: alpha is opened first and is never raised,
+	// so it stays the first notes frame even after the beta window opens.
+	const alpha = frame(page, NOTES).first();
+	const alphaId = await alpha.getAttribute('data-window-id');
+	await alpha.getByTestId('fixture-interactions').click();
+	await expect(alpha.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 1');
+
+	// The launcher selection changes; existing windows are not rewritten.
+	await page.getByTestId('server-select').selectOption({ label: 'Server Beta' });
+	await expect(page.getByTestId('open-' + NOTES)).toHaveText('Open Notes — Server Beta');
+	await expect(alpha.getByRole('heading')).toHaveText('Notes — Server Alpha');
+	await expect(alpha.getByTestId('fixture-panel')).toContainText(
+		`Pinned target: server ${SERVER_ALPHA_ID}`
+	);
+	await expect(alpha).toHaveAttribute('data-window-id', alphaId!);
+
+	// A subsequent open pins the NEW selection as its own explicit scope.
+	await page.getByTestId('open-' + NOTES).click();
+	await expect(frame(page, NOTES)).toHaveCount(2);
+	const beta = frame(page, NOTES).last();
+	await expect(beta).not.toHaveAttribute('data-window-id', alphaId!);
+	await expect(beta.getByRole('heading')).toHaveText('Notes — Server Beta');
+	await expect(beta.getByTestId('fixture-panel')).toContainText(
+		'Pinned target: server b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60'
+	);
+	await expect(beta).toHaveAttribute('data-focused', 'true');
+
+	// The alpha window kept its scope AND its live content throughout.
+	await expect(alpha.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 1');
+	await expect(beta.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 0');
+});
+
+test('workspace state is per-session: a second browser context starts empty', async ({
+	page,
+	browser
+}) => {
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	await expect(frame(page, NOTES)).toHaveCount(1);
+
+	const other = await browser.newContext();
+	const otherPage = await other.newPage();
+	await otherPage.goto('/');
+	await expect(otherPage.getByTestId('component-host')).toHaveAttribute('data-mounted', 'true');
+	await expect(frame(otherPage, NOTES)).toHaveCount(0);
+	await expect(frame(page, NOTES)).toHaveCount(1);
+	await other.close();
+});
+
+test('the fixture desktop performs no API requests', async ({ page }) => {
+	const urls: string[] = [];
+	page.on('request', (request) => urls.push(request.url()));
+
+	await page.goto('/');
+	await openPanel(page, NOTES);
+	await openPanel(page, PREFS);
+	await frame(page, NOTES).getByRole('button', { name: 'Close' }).click();
+	await page.getByTestId('open-' + NOTES).click();
+
+	expect(urls.length).toBeGreaterThan(0);
+	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
+});

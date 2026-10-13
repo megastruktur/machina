@@ -1,10 +1,12 @@
 <script lang="ts">
-	// Thin route shell (windowed-workspace ADR §2: routes own entry only, no feature
-	// logic). The only rendered element is the reusable labeled component host
-	// (the empty-workspace region of the D4 shell); the workspace itself mounts
-	// client-side in later cards. tests/component-host.spec.ts proves this host
-	// really mounts in a browser after hydration.
+	// Thin route shell (windowed-workspace ADR §2: routes own entry only, no
+	// feature logic, no window state, no drag logic, no stores). The reviewed
+	// labeled component host stays the mounted landmark of the D4 SSR shell;
+	// the composed desktop workspace (fixture registry, workspace state,
+	// frames, panel hosts) mounts inside it and lives entirely in the
+	// workspace layer. No domain content is embedded here.
 	import ComponentHost from '../../tests/fixtures/component-host.svelte';
+	import DesktopShell from '$lib/workspace/DesktopShell.svelte';
 </script>
 
 <svelte:head>
@@ -13,6 +15,8 @@
 
 <main>
 	<h1>MAI</h1>
-	<p>Desktop workspace shell — no panels are implemented yet.</p>
-	<ComponentHost label="MAI workspace" />
+	<p>Desktop workspace shell — labeled fixture panels only; no live data.</p>
+	<ComponentHost label="MAI workspace">
+		<DesktopShell />
+	</ComponentHost>
 </main>
