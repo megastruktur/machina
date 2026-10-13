@@ -125,6 +125,18 @@
 				singleton: true,
 				default_geometry: { x: 560, y: 88, width: 360, height: 260 },
 				component: () => Promise.resolve(fixturePanel('fixture-prefs', 'Preferences'))
+			},
+			{
+				// Error-lifecycle fixture (brief acceptance 2): a deterministic
+				// failing loader. The window still opens; the failure is
+				// contained by the panel host's safe error view (Retry offered,
+				// frame close intact, siblings unaffected, zero network use).
+				// Retry re-invokes this same loader and keeps failing — the
+				// honest composed-surface behavior for a broken panel.
+				panel_kind: 'fixture-broken',
+				title: 'Broken',
+				scope_types: ['global'],
+				component: () => Promise.reject(new Error('fixture-broken loader always fails'))
 			}
 		]);
 		if (!result.ok) {
@@ -143,31 +155,44 @@
 <script lang="ts">
 	/**
 	 * Instance scope: the scoped controller of one desktop (brief
-	 * acceptance 3). One `createWorkspaceState` per shell instance — no
-	 * module-level store, nothing shared between sessions or SSR requests
-	 * (ADR §5). The shell wires the produced layers together and owns no
+	 * acceptance 3). One composition per shell instance — no module-level
+	 * store, nothing shared between sessions or SSR requests (ADR §5). The
+	 * shell wires the produced adapters together and owns no
 	 * geometry/drag/presentation logic of its own:
 	 *
 	 *  - open: registry scope check → pinned explicit scope → workspace.open
 	 *    (the frozen open path proven in panel-host.spec's composed test);
-	 *  - focus: frame activation intent → workspace.focus (PT2);
-	 *  - move: the title-bar drag adapter's clamped geometry intents →
-	 *    workspace.move (PT1) — the shell adds no pointer code;
+	 *  - focus: frame activation intent → presentation.focus (PT2, raises a
+	 *    VISIBLE window only — a minimize control's bubbled activation must
+	 *    never resurrect the just-hidden window); taskbar entries →
+	 *    presentation.activate (PT4, restore+focus);
+	 *  - move/resize: the frame's drag/resize adapters emit clamped geometry
+	 *    intents → workspace.move (PT1/PT3) — the shell adds no pointer code;
+	 *    the commit is suppressed while the frame is not `normal`, because a
+	 *    maximized frame's bounds belong to the presentation overlay;
+	 *  - minimize/maximize: frame control intents → the presentation
+	 *    controller (PT4). The maximized OVERLAY is CSS drawn here over the
+	 *    committed geometry, which the descriptor keeps untouched;
+	 *  - persistence: the stored effective layout restores once on mount and
+	 *    every transition persists (PT6), re-entering through the same open
+	 *    path; same-browser only, cleared on session-identity change;
+	 *  - reflow: the responsive controller re-clamps live windows on
+	 *    viewport resize/zoom (NT3) through the same move transition;
 	 *  - close: frame close intent → workspace.close (PT5); view-only, the
 	 *    state layer runs release hooks and nothing here can touch any
 	 *    backend (NT6; contracts.md C08 rule 5, C11).
-	 *
-	 * Not wired on purpose: minimize/maximize. Their transitions belong to
-	 * `01-window-presentation` (the state layer exposes no presentation
-	 * transition yet); the frame renders those controls but the shell gives
-	 * them no handler — recorded as this slice's known limitation, not a
-	 * silent dead feature.
 	 */
-	import { createWorkspaceState, type WorkspaceSnapshot } from './state.js';
+	import { createWorkspaceState } from './state.js';
+	import { createPresentationController } from './presentation.js';
+	import { createLayoutPersistence, type RestoredLayoutReport } from './layout.js';
+	import { createResponsiveController } from './responsive.js';
 	import { clampDraggedGeometry } from './drag.js';
 	import type { WindowId, WindowScope } from './types.js';
+	import type { PresentationSnapshot } from './presentation.js';
+	import type { SwitcherEntry } from './WindowSwitcher.svelte';
 	import WindowFrame from './WindowFrame.svelte';
 	import PanelHost from './PanelHost.svelte';
+	import WindowSwitcher from './WindowSwitcher.svelte';
 	import Button from '$lib/ui/Button.svelte';
 
 	const registry = createDesktopRegistry();
@@ -181,8 +206,36 @@
 		}
 	});
 
-	let snapshot = $state<WorkspaceSnapshot>(workspace.snapshot());
-	$effect(() => workspace.subscribe((next) => (snapshot = next)));
+	/** Effective presentation view: minimize/maximize/hidden projection. */
+	const presentation = createPresentationController(workspace);
+
+	/**
+	 * Same-browser persistence of the EFFECTIVE layout (PT6). The anonymous
+	 * session binding keeps one browser's layout across reloads and lets a
+	 * later auth identity (P02) clear it via handleSessionChange instead of
+	 * carrying desktop geometry across sessions.
+	 */
+	const persistence = createLayoutPersistence({
+		state: workspace,
+		presentation,
+		registry,
+		session: null
+	});
+
+	/** Viewport reflow (NT3): re-clamps live windows on resize/zoom. */
+	const responsive = createResponsiveController({
+		state: workspace,
+		registry,
+		origin: () => {
+			// The frames' positioned ancestor — the same measured reference the
+			// drag adapter uses at gesture start.
+			const rect = desktopEl?.getBoundingClientRect();
+			return { left: Math.round(rect?.left ?? 0), top: Math.round(rect?.top ?? 0) };
+		}
+	});
+
+	let snapshot = $state<PresentationSnapshot>(presentation.snapshot());
+	$effect(() => presentation.subscribe((next) => (snapshot = next)));
 
 	/**
 	 * Stable render order — the open sequence, NOT the stacking order.
@@ -197,9 +250,23 @@
 	let openSeq = 0;
 
 	const renderOrder = $derived.by(() =>
-		[...snapshot.windows].sort(
-			(a, b) => (openOrder.get(a.window_id) ?? 0) - (openOrder.get(b.window_id) ?? 0)
-		)
+		[...snapshot.windows]
+			// Hidden windows render no frame (this composition uses the default
+			// keep_mounted_when_hidden: false policy, ADR §7.1); their taskbar
+			// entries remain.
+			.filter((win) => win.presentation !== 'minimized')
+			.sort((a, b) => (openOrder.get(a.window_id) ?? 0) - (openOrder.get(b.window_id) ?? 0))
+	);
+
+	/** Taskbar projection (PT4): one entry per live window, hidden included. */
+	const switcherEntries = $derived.by<SwitcherEntry[]>(() =>
+		snapshot.windows.map((win) => ({
+			window_id: win.window_id,
+			title: registry.entry(win.panel_kind)?.title ?? win.panel_kind,
+			context_label: switcherContextFor(win),
+			minimized: win.presentation === 'minimized',
+			focused: snapshot.focused_id === win.window_id
+		}))
 	);
 
 	/**
@@ -283,6 +350,67 @@
 	function contextLabelFor(descriptor: WindowDescriptor): string {
 		return descriptor.scope.kind === 'server' ? serverLabel(descriptor.scope.server_id) : '';
 	}
+
+	/**
+	 * Taskbar context label: the pinned server's label, or the literal
+	 * "Global" for a global scope (ADR §6 taskbar naming).
+	 */
+	function switcherContextFor(descriptor: WindowDescriptor): string {
+		return descriptor.scope.kind === 'server'
+			? serverLabel(descriptor.scope.server_id)
+			: 'Global';
+	}
+
+	/**
+	 * Single geometry commit path for the frame's drag/resize adapters. A
+	 * maximized frame's bounds belong to the presentation overlay (ADR
+	 * §7.2): dragging its title bar is not a restore gesture (no
+	 * snapping/tiling exists) and must not silently rewrite the geometry the
+	 * frame returns to on restore.
+	 */
+	function commitGeometry(windowId: WindowId, geometry: WindowGeometry): void {
+		const live = snapshot.windows.find((win) => win.window_id === windowId);
+		if (!live || live.presentation !== 'normal') return;
+		workspace.move(windowId, geometry);
+	}
+
+	/** Launcher-safe notice for one restore run — codes only, never data. */
+	function restoreNotice(report: RestoredLayoutReport): string | null {
+		// A whole-document discard reports BOTH discarded and empty — the
+		// discard reason must win over the quiet "nothing stored" case.
+		if (report.discarded !== null) {
+			return `Stored workspace layout was discarded (${report.discarded}).`;
+		}
+		if (report.skipped || report.empty) return null;
+		const restored = report.restored.length;
+		const dropped = report.dropped.length;
+		const suffix =
+			dropped > 0 ? `; dropped ${dropped} stored window${dropped === 1 ? '' : 's'}` : '';
+		return `Restored ${restored} window${restored === 1 ? '' : 's'}${suffix}.`;
+	}
+
+	/**
+	 * Mount path (browser only — $effect never runs during SSR): restore the
+	 * stored layout once, re-key the stable DOM order from the restored
+	 * stacking order (windows opened later append after them), surface a
+	 * notice when a restore dropped or discarded anything, then persist
+	 * every effective transition until the shell unmounts. The effect reads
+	 * no reactive state, so it runs exactly once per mount.
+	 */
+	$effect(() => {
+		const report = persistence.restore();
+		let seq = 0;
+		for (const win of workspace.snapshot().windows) {
+			openOrder.set(win.window_id, seq);
+			seq += 1;
+		}
+		openSeq = seq;
+		status = restoreNotice(report);
+		return persistence.start();
+	});
+
+	/** Viewport listener; detached again when the shell unmounts. */
+	$effect(() => responsive.start());
 </script>
 
 <div class="mai-desktop-shell">
@@ -325,11 +453,13 @@
 				title={registry.entry(win.panel_kind)?.title ?? win.panel_kind}
 				contextLabel={contextLabelFor(win)}
 				focused={snapshot.focused_id === win.window_id}
-				onactivate={(windowId) => workspace.focus(windowId)}
+				onactivate={(windowId) => presentation.focus(windowId)}
+				onminimize={(windowId) => presentation.minimize(windowId)}
+				ontogglemaximize={(windowId) => presentation.toggleMaximize(windowId)}
 				onclose={closeWindow}
-				ongeometry={(windowId, geometry) => {
-					workspace.move(windowId, geometry);
-				}}
+				minGeometry={registry.entry(win.panel_kind)?.min_geometry ?? undefined}
+				class={win.presentation === 'maximized' ? 'mai-desktop-shell__frame--maximized' : ''}
+				ongeometry={commitGeometry}
 			>
 				<PanelHost
 					registry={registry}
@@ -340,6 +470,13 @@
 			</WindowFrame>
 		{/each}
 	</div>
+
+	<!-- PT4 taskbar: entries persist for hidden windows and disappear on
+	     close; a visible entry focuses, a hidden one restores+focuses. -->
+	<WindowSwitcher
+		entries={switcherEntries}
+		onactivate={(windowId) => presentation.activate(windowId)}
+	/>
 </div>
 
 <style>
@@ -396,6 +533,19 @@
 		min-height: 60vh;
 		border: var(--mai-border-width) dashed var(--mai-color-border-strong);
 		border-radius: var(--mai-radius-md);
+	}
+
+	/* PT4 maximize overlay — owned by this composition (the presentation
+	   card's recorded limit): a maximized frame keeps its committed geometry
+	   inline in the descriptor and the overlay is CSS drawn over it, so
+	   restore cannot lose geometry by construction. `!important` is required
+	   to beat the frame's inline geometry styles. */
+	:global(.mai-desktop-shell__frame--maximized) {
+		left: 0 !important;
+		top: 0 !important;
+		width: 100% !important;
+		height: 100% !important;
+		border-radius: 0;
 	}
 
 	/* Fixture panels are raw-DOM clients, so their styles are global but
