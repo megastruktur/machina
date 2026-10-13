@@ -56,7 +56,8 @@
 	 * redeclared here and no dependency is added (ADR §4.3).
 	 */
 	import type { Snippet } from 'svelte';
-	import type { WindowDescriptor, WindowId } from './types.js';
+	import { windowDrag } from './drag.js';
+	import type { WindowDescriptor, WindowGeometry, WindowId } from './types.js';
 
 	interface Props {
 		/** Validated live descriptor from the workspace state (schema v1). */
@@ -78,6 +79,13 @@
 		ontogglemaximize?: (windowId: WindowId) => void;
 		/** Close intent — view-only; the controller performs the close. */
 		onclose?: (windowId: WindowId) => void;
+		/**
+		 * Drag geometry intent from the title-bar pointer adapter
+		 * (`01-window-drag`, PT1/NT1/NT3): live clamped moves and interrupt
+		 * reverts. The controller applies them through the workspace `move`
+		 * transition — the frame never mutates the shared state itself.
+		 */
+		ongeometry?: (windowId: WindowId, geometry: WindowGeometry) => void;
 		/** Extra chrome controls, rendered before the default window controls. */
 		controls?: Snippet;
 		/** Panel content (the window body). */
@@ -94,6 +102,7 @@
 		onminimize,
 		ontogglemaximize,
 		onclose,
+		ongeometry,
 		controls,
 		children,
 		class: className = ''
@@ -180,7 +189,18 @@
 	onclick={onClick}
 	onfocusin={onFocusIn}
 >
-	<header class="mai-window-frame__titlebar">
+	<!-- Title bar = the only drag origin (PT1): the reviewed pointer adapter
+	     owns the gesture (capture, NT1 cleanup, NT3 clamp) and emits
+	     geometry intents; interactive descendants are excluded inside the
+	     action, so chrome controls keep their native behavior (NT2). -->
+	<header
+		class="mai-window-frame__titlebar"
+		use:windowDrag={{
+			windowId: descriptor.window_id,
+			geometry: () => descriptor.geometry,
+			onGeometry: ongeometry
+		}}
+	>
 		<!-- The title bar is keyboard-focusable by frozen contract (ADR §6:
 		     "Title bar is focusable") even though a heading is not itself an
 		     interactive widget — tabbing to it is the keyboard activation
