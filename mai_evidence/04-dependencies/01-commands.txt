@@ -1,0 +1,17 @@
+# 04-dependencies evidence — fix round (2026-10-14), host megaserver
+## ssh -V
+OpenSSH_9.2p1 Debian-2+deb12u10, OpenSSL 3.0.22 25 Aug 2026
+
+## git diff HEAD --stat (fix diff vs failed asyncssh round 2ad8a7c)
+ backend/pyproject.toml                       |  15 ++-
+ backend/tests/test_execution_dependencies.py | 153 +++++++++++++++++----------
+ backend/uv.lock                              |  78 --------------
+ 3 files changed, 101 insertions(+), 145 deletions(-)
+
+## uv lock --check
+Resolved 36 packages in 0.79ms
+rc=0
+
+## uv sync --frozen (clean locked install from lock only)
+Checked 34 packages in 0.37ms
+rc=0

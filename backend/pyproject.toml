@@ -17,6 +17,12 @@ dependencies = [
     # linear Alembic chain). Bounded <2 so major-version chain rewrites are a
     # deliberate reconciliation, not a silent upgrade.
     "alembic>=1.16,<2",
+    # SSH/host-execution transport is the SYSTEM OpenSSH client driven via
+    # subprocess — the P00 ssh-spike decision (docs/architecture/host-supervision.md,
+    # probe experiments/ssh_supervision_probe.py) selected NO third-party SSH
+    # library, so nothing is pinned here for it. The runtime dependency (ssh,
+    # ssh-keygen, ssh-keyscan binaries and the frozen probe option surface) is
+    # asserted by backend/tests/test_execution_dependencies.py instead.
     # Argon2id credential hashing (auth ADR 3e79449 §3.1, contracts.md C08
     # rule 1). Deferred to this card by the packaging owner: 01-python
     # evidence README, "argon2/session deps (02-auth)". Bounded <26 so the
