@@ -211,6 +211,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the committed capability-grant configuration
+         * @description Return the current configuration: policy deny list plus grants.
+         *
+         *     Safe method: layer 1 only. The response is the committed truth —
+         *     the revision the next edit must name as ``expected_revision``.
+         */
+        get: operations["read_grants_api_v1_grants_get"];
+        /**
+         * Commit one versioned grant-configuration edit
+         * @description Validate and atomically commit one configuration revision.
+         *
+         *     Full boundary order (session → origin → CSRF) runs before any state
+         *     is touched. The route derives the next revision from the caller's
+         *     ``expected_revision`` (C03 rule 4), so a stale caller is rejected
+         *     with ``409 conflict`` before any filesystem effect and can never
+         *     clobber a concurrent edit.
+         */
+        put: operations["edit_grants_api_v1_grants_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -344,6 +377,70 @@ export interface components {
          * @enum {string}
          */
         ExecutionEnvironment: "linux_ssh";
+        /**
+         * GrantEntry
+         * @description One explicit grant: capability slug → server UUIDs (no wildcards).
+         */
+        GrantEntry: {
+            /** Capability Id */
+            capability_id: string;
+            /** Server Ids */
+            server_ids: string[];
+        };
+        /**
+         * GrantInput
+         * @description One grant in an edit body; scope members are opaque UUIDs (C01).
+         */
+        GrantInput: {
+            /** Capability Id */
+            capability_id: string;
+            /** Server Ids */
+            server_ids: string[];
+        };
+        /**
+         * GrantsConfigView
+         * @description The committed configuration with its C02 rule-4 version triple.
+         */
+        GrantsConfigView: {
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+            policy: components["schemas"]["PolicyState"];
+            /** Grants */
+            grants: components["schemas"]["GrantEntry"][];
+        };
+        /**
+         * GrantsEditBody
+         * @description One versioned edit: caller's revision + the new policy and grants.
+         *
+         *     Deliberately carries **no** revision field for the document itself:
+         *     the next revision is ``expected_revision + 1``, derived by the route
+         *     (C03 rule 4 — approvals bind the policy revision, so callers never
+         *     choose it).
+         */
+        GrantsEditBody: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Denied Capabilities */
+            denied_capabilities?: string[];
+            /** Grants */
+            grants?: components["schemas"]["GrantInput"][];
+        };
+        /**
+         * GrantsMutationResult
+         * @description Post-commit version triple of one successful write (C02 rule 4).
+         */
+        GrantsMutationResult: {
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -356,6 +453,16 @@ export interface components {
         PasswordBody: {
             /** Password */
             password: string;
+        };
+        /**
+         * PolicyState
+         * @description The committed policy half: one revision counter plus the deny list.
+         */
+        PolicyState: {
+            /** Revision */
+            revision: number;
+            /** Denied Capabilities */
+            denied_capabilities: string[];
         };
         /**
          * PrivilegeMode
@@ -958,6 +1065,122 @@ export interface operations {
                 };
             };
             /** @description Approval service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_grants_api_v1_grants_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GrantsConfigView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No configuration committed yet */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Grant configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    edit_grants_api_v1_grants_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GrantsEditBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GrantsMutationResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected revision or canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Configuration document failed producer validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Grant configuration service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

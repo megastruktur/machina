@@ -175,6 +175,15 @@ _APPROVAL_SURFACE = frozenset(
     }
 )
 
+#: 03-grants-api surface (C03 rules 3–5): versioned read + edit of the
+#: capability-grant configuration.
+_GRANTS_SURFACE = frozenset(
+    {
+        ("GET", "/api/v1/grants"),
+        ("PUT", "/api/v1/grants"),
+    }
+)
+
 
 def test_app_registers_exactly_the_g1_health_surface() -> None:
     """P02 surface: health + auth boundary + profile surface; nothing else.
@@ -183,7 +192,9 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     frozen profile routes; intent unchanged — every privileged operation is
     session-gated, no unauthenticated mutating privilege, no docs listeners,
     everything under the /api/v1 prefix. 03-approval-api remediation: the
-    pin expanded again by the frozen approval preview/decision routes.)
+    pin expanded again by the frozen approval preview/decision routes.
+    03-grants-api remediation: the pin expanded by the frozen
+    grant-configuration read/edit routes.)
     """
     app = create_app(env={})
     api_routes = [
@@ -204,6 +215,7 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
         | _AUTH_SURFACE
         | _PROFILE_SURFACE
         | _APPROVAL_SURFACE
+        | _GRANTS_SURFACE
     )
     mutating = {
         route.path
@@ -212,7 +224,7 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     }
     assert mutating == {
         path
-        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE | _APPROVAL_SURFACE
+        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE | _APPROVAL_SURFACE | _GRANTS_SURFACE
         if method in {"POST", "PUT"}
     }
     for route in api_routes:
@@ -264,6 +276,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         # approval preview/decision routes; the health contract is unchanged.)
         "/api/v1/approvals/{approval_id}",
         "/api/v1/approvals/{approval_id}/decision",
+        # (03-grants-api remediation: the path pin expanded by the frozen
+        # grant-configuration read/edit routes; health contract unchanged.)
+        "/api/v1/grants",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
