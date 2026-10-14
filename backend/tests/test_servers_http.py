@@ -110,8 +110,9 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS admin_sessions, admin_credential, "
-                "profile_projection_journal, profile_projection, alembic_version"
+                "DROP TABLE IF EXISTS approvals, admin_sessions, "
+                "admin_credential, profile_projection_journal, "
+                "profile_projection, alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")

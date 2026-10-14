@@ -44,7 +44,7 @@ BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
-REVISION_IDS = ("0001", "0002")
+REVISION_IDS = ("0001", "0002", "0003")
 
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-02-auth-api-only"
@@ -65,7 +65,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0002``."""
+    """Disposable fixture database migrated from zero to the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -77,8 +77,9 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS admin_sessions, admin_credential, "
-                "profile_projection_journal, profile_projection, alembic_version"
+                "DROP TABLE IF EXISTS approvals, admin_sessions, "
+                "admin_credential, profile_projection_journal, "
+                "profile_projection, alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")
