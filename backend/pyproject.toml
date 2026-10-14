@@ -17,6 +17,12 @@ dependencies = [
     # linear Alembic chain). Bounded <2 so major-version chain rewrites are a
     # deliberate reconciliation, not a silent upgrade.
     "alembic>=1.16,<2",
+    # Argon2id credential hashing (auth ADR 3e79449 §3.1, contracts.md C08
+    # rule 1). Deferred to this card by the packaging owner: 01-python
+    # evidence README, "argon2/session deps (02-auth)". Bounded <26 so the
+    # next binding-generation bump is a deliberate review, not a silent
+    # upgrade of a security primitive.
+    "argon2-cffi>=23.1,<26",
 ]
 
 [dependency-groups]
