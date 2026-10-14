@@ -130,24 +130,64 @@ async def run_lifespan(app: Any) -> list[str]:
 
 
 def _route_table(app: Any) -> set[tuple[str, str]]:
+    # FastAPI ≥0.143 (Starlette 1.7) wraps include_router output in
+    # _IncludedRouter; unwrap it so the table covers every APIRoute.
+    routes: list[Any] = []
+    for route in app.routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            routes.extend(original.routes)
+        else:
+            routes.append(route)
     return {
         (method, route.path)
-        for route in app.routes
+        for route in routes
         if isinstance(route, APIRoute)
         for method in route.methods
     }
 
 
-def test_app_registers_exactly_the_g1_health_surface() -> None:
-    app = create_app(env={})
-    assert _route_table(app) == {
-        ("GET", HEALTH_PATH),
-        ("GET", READINESS_PATH),
+#: Frozen P02 public surface: health plus the 02-auth-api boundary (C08
+#: rule 1/2). Registered by mai.api.auth.register_auth through the real app.
+_AUTH_SURFACE = frozenset(
+    {
+        ("POST", "/api/v1/auth/bootstrap"),
+        ("POST", "/api/v1/auth/login"),
+        ("POST", "/api/v1/auth/logout"),
+        ("GET", "/api/v1/auth/csrf"),
     }
-    api_routes = [route for route in app.routes if isinstance(route, APIRoute)]
-    assert len(api_routes) == 2  # no other surface is registered at P01
+)
+
+
+def test_app_registers_exactly_the_g1_health_surface() -> None:
+    """P02 surface: health + the auth boundary; nothing else is public.
+
+    (02-auth-api remediation: the P01 route-table pin expanded by the frozen
+    auth routes; intent unchanged — no unauthenticated mutating privilege,
+    no docs listeners, everything under the /api/v1 prefix.)
+    """
+    app = create_app(env={})
+    api_routes = [
+        route
+        for included in app.routes
+        for route in (
+            getattr(included, "original_router", included).routes
+            if getattr(included, "original_router", None) is not None
+            else [included]
+        )
+        if isinstance(route, APIRoute)
+    ]
+    table = {
+        (method, route.path) for route in api_routes for method in route.methods
+    }
+    assert table == {("GET", HEALTH_PATH), ("GET", READINESS_PATH)} | _AUTH_SURFACE
+    mutating = {
+        route.path
+        for route in api_routes
+        if route.methods - {"GET", "HEAD"}  # every mutating verb is auth-owned
+    }
+    assert mutating == {path for method, path in _AUTH_SURFACE if method == "POST"}
     for route in api_routes:
-        assert route.methods <= {"GET", "HEAD"}  # no mutating/privileged verb
         assert route.path.startswith(API_PREFIX)
     # No public docs/OpenAPI listeners (G1 minimal unauthenticated surface).
     paths = {route.path for route in api_routes}
@@ -181,11 +221,31 @@ def test_openapi_contract_matches_implemented_routes() -> None:
     app = create_app(env={})
     schema = app.openapi()
     assert schema["openapi"].startswith("3.")
-    assert set(schema["paths"]) == {HEALTH_PATH, READINESS_PATH}
+    # (02-auth-api remediation: the P01 path pin expanded by the frozen
+    # auth routes; the health contract itself is unchanged.)
+    assert set(schema["paths"]) == {
+        HEALTH_PATH,
+        READINESS_PATH,
+        "/api/v1/auth/bootstrap",
+        "/api/v1/auth/login",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/csrf",
+    }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
     ready = schema["paths"][READINESS_PATH]["get"]
     assert set(ready["responses"]) == {"200", "503"}
+    assert set(schema["paths"]["/api/v1/auth/bootstrap"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/auth/login"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/auth/logout"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/auth/csrf"]) == {"get"}
+    # Envelope documentation exists for the boundary's rejection codes.
+    assert {"401", "403", "429"} <= set(
+        schema["paths"]["/api/v1/auth/login"]["post"]["responses"]
+    )
+    assert {"401", "403"} <= set(
+        schema["paths"]["/api/v1/auth/logout"]["post"]["responses"]
+    )
 
 
 # --- lifespan: starts/stops the dependency engine (AC1) ----------------------

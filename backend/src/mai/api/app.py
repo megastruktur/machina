@@ -21,13 +21,15 @@ Ownership map (contracts.md C01/C08; auth ADR ``3e79449`` §8 G1; SERVICES
   ``{"error": {"code", "message", "request_id", "fields"}}``; unhandled
   exceptions collapse to a generic ``internal_error`` with no traceback.
 
-The two GET health routes are the whole route table at P01. Authentication,
-origin/CSRF enforcement, and privileged routes arrive with their owning
-cards (02-auth-api, 05-jobs-api, ...) registered under the same
-``/api/v1`` prefix; no route may bypass that prefix or the envelope.
-Public docs/OpenAPI listeners stay off (G1 minimal unauthenticated surface);
-the schema is produced in-process via ``app.openapi()`` for the central
-exporter owned by the ``openapi-client`` resource.
+The health GET routes stay unauthenticated in setup state (auth ADR §8 G1).
+The request security boundary (``mai.api.auth``: bootstrap/login/logout/csrf,
+cookie/origin/CSRF layers, §5.3 throttling) is registered by
+:func:`create_app` via :func:`mai.api.auth.register_auth`; later privileged
+routers join under the same ``/api/v1`` prefix through the same boundary —
+no route may bypass that prefix or the envelope. Public docs/OpenAPI
+listeners stay off (G1 minimal unauthenticated surface); the schema is
+produced in-process via ``app.openapi()`` for the central exporter owned by
+the ``openapi-client`` resource.
 """
 
 from __future__ import annotations
@@ -37,11 +39,27 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.datastructures import State
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.status import HTTP_200_OK, HTTP_503_SERVICE_UNAVAILABLE
+from starlette.status import (
+    HTTP_200_OK,
+    HTTP_400_BAD_REQUEST,
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
 
+from mai.api.auth import (
+    bootstrap_password_from_env,
+    effective_client_ip,
+    forwarded_host_spoofed,
+    register_auth,
+    render_error_envelope,
+    resolve_public_origins,
+    resolve_trusted_proxies,
+)
+from mai.auth.sessions import AuthError, SessionStore
 from mai.database import (
     DatabaseConfigError,
     DatabaseHealth,
@@ -54,30 +72,6 @@ from mai.database import (
 API_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_PREFIX}/health"
 READINESS_PATH = f"{API_PREFIX}/health/ready"
-
-# Stable, browser-safe messages only; exception payloads are never echoed.
-_SAFE_MESSAGES: dict[int, tuple[str, str]] = {
-    404: ("not_found", "resource not found"),
-    405: ("method_not_allowed", "method not allowed"),
-}
-
-
-def _error_response(
-    request: Request, status_code: int, code: str, message: str
-) -> JSONResponse:
-    """Render the C01 structured error envelope for one request."""
-    request_id = getattr(request.state, "request_id", "")
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "request_id": request_id,
-                "fields": {},
-            }
-        },
-    )
 
 
 async def _database_state(state: State) -> DatabaseStatus:
@@ -107,6 +101,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.database_url = url
         app.state.database_config_error = None
         app.state.engine, app.state.session_factory = create_app_engine(url)
+        app.state.sessions = SessionStore(app.state.session_factory)
+        # One-shot env bootstrap (auth ADR §3): ``MAI_ADMIN_PASSWORD_FILE``
+        # first, then ``MAI_ADMIN_PASSWORD``; ignored once a credential
+        # record exists (bootstrap-only, never a runtime override). The
+        # plaintext is dropped right after the store's hashing call and is
+        # never logged. An unusable source simply leaves setup state, where
+        # ``POST /api/v1/auth/bootstrap`` is the frozen recovery path.
+        password = bootstrap_password_from_env(app.state.env)
+        if password is not None:
+            try:
+                if not await app.state.sessions.credential_exists():
+                    await app.state.sessions.bootstrap_credential(password)
+            except AuthError:
+                pass  # a concurrent startup won the one-shot insert
+            finally:
+                del password  # not retained beyond the hashing call
     try:
         yield
     finally:
@@ -134,9 +144,35 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     )
     app.state.env = env
 
+    # Request-boundary configuration (auth ADR §6.3/§7): exact origin
+    # allowlist and trusted proxies. Unusable configuration fails closed —
+    # an empty allowlist rejects every mutation, an empty proxy list ignores
+    # forwarded metadata everywhere.
+    try:
+        app.state.public_origins = resolve_public_origins(env)
+    except ValueError:
+        app.state.public_origins = frozenset()
+    try:
+        app.state.trusted_proxies = resolve_trusted_proxies(env)
+    except ValueError:
+        app.state.trusted_proxies = ()
+    register_auth(app)
+
     @app.middleware("http")
-    async def attach_request_id(request: Request, call_next):  # noqa: ANN202
+    async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
         request.state.request_id = uuid.uuid4().hex
+        if forwarded_host_spoofed(request):
+            # Auth ADR §6.3/S4: a trusted peer's forwarded metadata must
+            # agree with Host; disagreement is an origin-spoof marker.
+            response = render_error_envelope(
+                request,
+                HTTP_400_BAD_REQUEST,
+                "request_rejected",
+                "forwarded host does not match request host",
+            )
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+        request.state.client_ip = effective_client_ip(request)
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         return response
@@ -168,23 +204,48 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
             content=body,
         )
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # C01: field paths only — the submitted values are never echoed.
+        fields = {
+            ".".join(str(part) for part in error.get("loc", ())) or "request": "invalid"
+            for error in exc.errors()[:20]
+        }
+        return render_error_envelope(
+            request,
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "validation_failed",
+            "request body failed validation",
+            fields=fields,
+        )
+
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
+        # Stable, browser-safe messages only; exception payloads are never
+        # echoed.
+        messages = {
+            404: ("not_found", "resource not found"),
+            405: ("method_not_allowed", "method not allowed"),
+        }
         if exc.status_code >= 500:
             code, message = "internal_error", "internal server error"
         else:
-            code, message = _SAFE_MESSAGES.get(
+            code, message = messages.get(
                 exc.status_code, ("request_rejected", "request rejected")
             )
-        return _error_response(request, exc.status_code, code, message)
+        return render_error_envelope(request, exc.status_code, code, message)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
         # C01: no traceback, stack frame, or secret material in any body.
-        return _error_response(request, 500, "internal_error", "internal server error")
+        return render_error_envelope(
+            request, 500, "internal_error", "internal server error"
+        )
 
     return app
