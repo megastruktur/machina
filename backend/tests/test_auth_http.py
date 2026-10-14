@@ -44,7 +44,7 @@ BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
-REVISION_IDS = ("0001", "0002")
+REVISION_IDS = ("0001", "0002", "0003")
 
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-02-auth-api-only"
@@ -65,7 +65,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0002``."""
+    """Disposable fixture database migrated from zero to the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -77,8 +77,9 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS admin_sessions, admin_credential, "
-                "profile_projection_journal, profile_projection, alembic_version"
+                "DROP TABLE IF EXISTS approvals, admin_sessions, "
+                "admin_credential, profile_projection_journal, "
+                "profile_projection, alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")
@@ -310,6 +311,14 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; intent unchanged.)
+        ("GET", "/api/v1/approvals/{approval_id}"),
+        ("POST", "/api/v1/approvals/{approval_id}/decision"),
+        # (03-grants-api remediation: the pin expanded by the frozen
+        # grant-configuration read/edit routes; intent unchanged.)
+        ("GET", "/api/v1/grants"),
+        ("PUT", "/api/v1/grants"),
     }
     mutating = {route.path for route in api_routes if route.methods - {"GET", "HEAD"}}
     assert mutating == {
@@ -318,6 +327,8 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/auth/logout",
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
+        "/api/v1/approvals/{approval_id}/decision",
+        "/api/v1/grants",
     }
     assert "/docs" not in {route.path for route in api_routes}
     assert "/openapi.json" not in {route.path for route in api_routes}
@@ -336,6 +347,13 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         # canonical-profile routes; auth assertions below are unchanged.)
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; auth assertions are unchanged.)
+        "/api/v1/approvals/{approval_id}",
+        "/api/v1/approvals/{approval_id}/decision",
+        # (03-grants-api remediation: the pin expanded by the frozen
+        # grant-configuration read/edit routes; auth assertions unchanged.)
+        "/api/v1/grants",
     }
     login = schema["paths"]["/api/v1/auth/login"]["post"]
     assert {"204", "401", "403", "422", "429"} == set(login["responses"])

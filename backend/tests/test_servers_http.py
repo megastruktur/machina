@@ -110,8 +110,9 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS admin_sessions, admin_credential, "
-                "profile_projection_journal, profile_projection, alembic_version"
+                "DROP TABLE IF EXISTS approvals, admin_sessions, "
+                "admin_credential, profile_projection_journal, "
+                "profile_projection, alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")
@@ -406,6 +407,14 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; intent unchanged.)
+        ("GET", "/api/v1/approvals/{approval_id}"),
+        ("POST", "/api/v1/approvals/{approval_id}/decision"),
+        # (03-grants-api remediation: the pin expanded by the frozen
+        # grant-configuration read/edit routes; intent unchanged.)
+        ("GET", "/api/v1/grants"),
+        ("PUT", "/api/v1/grants"),
     }
     # Every route stays under the frozen prefix; no docs listeners (G1).
     for route in api_routes:

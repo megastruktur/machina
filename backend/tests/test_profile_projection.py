@@ -66,9 +66,9 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 HOST_KEY = "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
 
 # Linear migration chain (exclusive migration-chain resource). 02-auth-store
-# appended 0002_sessions; head assertions below target the chain TIP, so this
-# constant tracks the full chain rather than pinning a frozen head.
-REVISION_IDS = ("0001", "0002")
+# appended 0002_sessions and 0003_approvals; head assertions below target the
+# chain TIP, so this constant tracks the full chain rather than pinning a head.
+REVISION_IDS = ("0001", "0002", "0003")
 
 
 def _profile_text(server_id: uuid.UUID, name: str = "build-host") -> str:
@@ -118,7 +118,8 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS profile_projection_journal, "
+                "DROP TABLE IF EXISTS approvals, "
+                "profile_projection_journal, "
                 "profile_projection, admin_sessions, admin_credential, "
                 "alembic_version"
             )

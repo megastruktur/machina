@@ -55,7 +55,7 @@ ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
-REVISION_IDS = ("0001", "0002")
+REVISION_IDS = ("0001", "0002", "0003")
 
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-02-auth-store-only"
@@ -73,7 +73,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0002``."""
+    """Disposable fixture database migrated from zero to the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -85,8 +85,9 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS admin_sessions, admin_credential, "
-                "profile_projection_journal, profile_projection, alembic_version"
+                "DROP TABLE IF EXISTS approvals, admin_sessions, "
+                "admin_credential, profile_projection_journal, "
+                "profile_projection, alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")
@@ -169,7 +170,7 @@ def test_migration_chain_is_linear_and_sessions_follow_profiles(
     migrated_url: str,
 ) -> None:
     script = ScriptDirectory.from_config(_alembic_config())
-    assert script.get_heads() == ["0002"]
+    assert script.get_heads() == [REVISION_IDS[-1]]
     revisions = {r.revision: r for r in script.walk_revisions()}
     assert list(revisions) and set(REVISION_IDS) <= set(revisions)
     assert revisions["0001"].down_revision is None
@@ -179,12 +180,12 @@ def test_migration_chain_is_linear_and_sessions_follow_profiles(
 def test_upgrade_from_zero_lands_on_head_and_is_idempotent(
     migrated_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at 0002."""
+    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at the tip."""
     monkeypatch.setenv("MAI_DATABASE_URL", migrated_url)
     command.upgrade(_alembic_config(), "head")
     with psycopg.connect(migrated_url) as conn:
         row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert row == ("0002",)
+    assert row == (REVISION_IDS[-1],)
 
 
 @pytest.mark.anyio

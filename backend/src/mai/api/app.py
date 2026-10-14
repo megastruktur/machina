@@ -50,6 +50,7 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
 )
 
+from mai.api.approvals import register_approvals
 from mai.api.auth import (
     bootstrap_password_from_env,
     effective_client_ip,
@@ -59,6 +60,7 @@ from mai.api.auth import (
     resolve_public_origins,
     resolve_trusted_proxies,
 )
+from mai.api.grants import register_grants
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.auth.sessions import AuthError, SessionStore
 from mai.database import (
@@ -69,6 +71,8 @@ from mai.database import (
     create_app_engine,
     resolve_database_url,
 )
+from mai.policy.approvals import ApprovalStore
+from mai.policy.config import GrantConfigStore
 from mai.profiles.files import ProfileFileError, ProfileFileStore
 from mai.profiles.projection import ProfileProjection
 
@@ -105,6 +109,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.database_config_error = None
         app.state.engine, app.state.session_factory = create_app_engine(url)
         app.state.sessions = SessionStore(app.state.session_factory)
+        # Approval decisions (C03 rule 4): the payload-bound one-use store
+        # over the one app engine; the HTTP surface (mai.api.approvals)
+        # fails closed with 503 when this is absent.
+        app.state.approvals = ApprovalStore(app.state.session_factory)
         # Canonical profile service (C02): the confined file store over the
         # explicitly configured data root plus the journal worker over the
         # one app engine. A store that cannot be constructed (unusable
@@ -117,6 +125,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.profiles = ProfileFileStore(resolve_profiles_root(app.state.env))
         except (OSError, ProfileFileError):
             app.state.profiles_error = "profiles_root_unusable"
+        # Capability-grant configuration (C03): the confined store over the
+        # same explicitly configured data root (module-fixed policy/
+        # namespace); the HTTP surface (mai.api.grants) fails closed with
+        # 503 when this is absent. An unusable root is recorded and
+        # reported, never a startup crash.
+        app.state.grants = None
+        app.state.grants_error = None
+        try:
+            app.state.grants = GrantConfigStore(resolve_profiles_root(app.state.env))
+        except OSError:
+            app.state.grants_error = "policy_root_unusable"
         # One-shot env bootstrap (auth ADR §3): ``MAI_ADMIN_PASSWORD_FILE``
         # first, then ``MAI_ADMIN_PASSWORD``; ignored once a credential
         # record exists (bootstrap-only, never a runtime override). The
@@ -173,8 +192,12 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
         app.state.trusted_proxies = ()
     register_auth(app)
     # Privileged routers join the same /api/v1 prefix and boundary (C01/C08):
-    # the canonical server-profile surface (C02).
+    # the canonical server-profile surface (C02), the approval decision
+    # surface (C03 rule 4) and the capability-grant configuration surface
+    # (C03 rules 3–5).
     register_servers(app)
+    register_approvals(app)
+    register_grants(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202

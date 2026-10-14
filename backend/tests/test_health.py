@@ -167,6 +167,23 @@ _PROFILE_SURFACE = frozenset(
     }
 )
 
+#: 03-approval-api surface (C03 rule 4): safe preview + one-use decision.
+_APPROVAL_SURFACE = frozenset(
+    {
+        ("GET", "/api/v1/approvals/{approval_id}"),
+        ("POST", "/api/v1/approvals/{approval_id}/decision"),
+    }
+)
+
+#: 03-grants-api surface (C03 rules 3–5): versioned read + edit of the
+#: capability-grant configuration.
+_GRANTS_SURFACE = frozenset(
+    {
+        ("GET", "/api/v1/grants"),
+        ("PUT", "/api/v1/grants"),
+    }
+)
+
 
 def test_app_registers_exactly_the_g1_health_surface() -> None:
     """P02 surface: health + auth boundary + profile surface; nothing else.
@@ -174,7 +191,10 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     (02-profile-api remediation: the P02 route-table pin expanded by the
     frozen profile routes; intent unchanged — every privileged operation is
     session-gated, no unauthenticated mutating privilege, no docs listeners,
-    everything under the /api/v1 prefix.)
+    everything under the /api/v1 prefix. 03-approval-api remediation: the
+    pin expanded again by the frozen approval preview/decision routes.
+    03-grants-api remediation: the pin expanded by the frozen
+    grant-configuration read/edit routes.)
     """
     app = create_app(env={})
     api_routes = [
@@ -194,6 +214,8 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
         {("GET", HEALTH_PATH), ("GET", READINESS_PATH)}
         | _AUTH_SURFACE
         | _PROFILE_SURFACE
+        | _APPROVAL_SURFACE
+        | _GRANTS_SURFACE
     )
     mutating = {
         route.path
@@ -202,7 +224,7 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     }
     assert mutating == {
         path
-        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE
+        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE | _APPROVAL_SURFACE | _GRANTS_SURFACE
         if method in {"POST", "PUT"}
     }
     for route in api_routes:
@@ -250,6 +272,13 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/auth/csrf",
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
+        # (03-approval-api remediation: the path pin expanded by the frozen
+        # approval preview/decision routes; the health contract is unchanged.)
+        "/api/v1/approvals/{approval_id}",
+        "/api/v1/approvals/{approval_id}/decision",
+        # (03-grants-api remediation: the path pin expanded by the frozen
+        # grant-configuration read/edit routes; health contract unchanged.)
+        "/api/v1/grants",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
