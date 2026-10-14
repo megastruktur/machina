@@ -407,6 +407,10 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; intent unchanged.)
+        ("GET", "/api/v1/approvals/{approval_id}"),
+        ("POST", "/api/v1/approvals/{approval_id}/decision"),
     }
     # Every route stays under the frozen prefix; no docs listeners (G1).
     for route in api_routes:

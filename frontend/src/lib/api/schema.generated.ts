@@ -160,6 +160,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/approvals/{approval_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Inspect one approval decision (safe preview)
+         * @description Return the persisted audit view of one decision.
+         *
+         *     Safe method: layer 1 only (session), mirroring the other safe reads.
+         *     The view is what the admin confirms on the decision call — target,
+         *     authorized capability, payload digest, policy revision, expiry and the
+         *     current one-use state.
+         */
+        get: operations["read_approval_api_v1_approvals__approval_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/approvals/{approval_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record the admin decision on a pending approval (one-use)
+         * @description Spend the one-use decision atomically; return the audit receipt.
+         *
+         *     Boundary first (ADR §5 order): session → origin → CSRF before any
+         *     state is touched, so an authentication failure can never consume a
+         *     decision. The store's conditional UPDATE is the authoritative gate —
+         *     duplicate, expired and mismatched presentations are stable-code
+         *     rejections that leave the row exactly as it was.
+         */
+        post: operations["decide_approval_api_v1_approvals__approval_id__decision_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -204,6 +255,66 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * ApprovalView
+         * @description One persisted decision: the safe preview and the audit receipt.
+         *
+         *     ``status`` is persisted-state only (``pending``/``consumed``) — the
+         *     store derives it without reading a clock, so the view is replayable
+         *     audit material. ``payload_hash`` is the binding digest, never payload
+         *     bytes.
+         */
+        ApprovalView: {
+            /**
+             * Approval Id
+             * Format: uuid
+             */
+            approval_id: string;
+            /** Capability Id */
+            capability_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Payload Hash */
+            payload_hash: string;
+            /** Policy Revision */
+            policy_revision: number;
+            /** Status */
+            status: string;
+            /** Created By */
+            created_by: string;
+            /** Created At */
+            created_at: string;
+            /** Expires At */
+            expires_at: string;
+            /** Consumed By */
+            consumed_by: string | null;
+            /** Consumed At */
+            consumed_at: string | null;
+        };
+        /**
+         * DecisionBody
+         * @description The binding the admin confirms, field-for-field (C03 rule 4).
+         *
+         *     Transport bounds mirror the store's validators; the store re-validates
+         *     authoritatively. The body carries no decision semantics of its own — a
+         *     session/CSRF failure rejects the whole request before any store call.
+         */
+        DecisionBody: {
+            /** Capability Id */
+            capability_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Payload Hash */
+            payload_hash: string;
+            /** Policy Revision */
+            policy_revision: number;
+        };
         /**
          * ErrorBody
          * @description C01 stable error fields (browser-safe; never secret material).
@@ -710,6 +821,144 @@ export interface operations {
             };
             /** @description Profile document failed producer validation */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_approval_api_v1_approvals__approval_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No approval record for this id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Approval service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    decide_approval_api_v1_approvals__approval_id__decision_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecisionBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No approval record for this id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Decision already consumed, expired, or the presented binding mismatches the approval */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Decision body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Approval service unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

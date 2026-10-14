@@ -311,6 +311,10 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; intent unchanged.)
+        ("GET", "/api/v1/approvals/{approval_id}"),
+        ("POST", "/api/v1/approvals/{approval_id}/decision"),
     }
     mutating = {route.path for route in api_routes if route.methods - {"GET", "HEAD"}}
     assert mutating == {
@@ -319,6 +323,7 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/auth/logout",
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
+        "/api/v1/approvals/{approval_id}/decision",
     }
     assert "/docs" not in {route.path for route in api_routes}
     assert "/openapi.json" not in {route.path for route in api_routes}
@@ -337,6 +342,10 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         # canonical-profile routes; auth assertions below are unchanged.)
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
+        # (03-approval-api remediation: the pin expanded by the frozen
+        # approval preview/decision routes; auth assertions are unchanged.)
+        "/api/v1/approvals/{approval_id}",
+        "/api/v1/approvals/{approval_id}/decision",
     }
     login = schema["paths"]["/api/v1/auth/login"]["post"]
     assert {"204", "401", "403", "422", "429"} == set(login["responses"])

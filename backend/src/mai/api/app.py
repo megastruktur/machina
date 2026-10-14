@@ -50,6 +50,7 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
 )
 
+from mai.api.approvals import register_approvals
 from mai.api.auth import (
     bootstrap_password_from_env,
     effective_client_ip,
@@ -69,6 +70,7 @@ from mai.database import (
     create_app_engine,
     resolve_database_url,
 )
+from mai.policy.approvals import ApprovalStore
 from mai.profiles.files import ProfileFileError, ProfileFileStore
 from mai.profiles.projection import ProfileProjection
 
@@ -105,6 +107,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.database_config_error = None
         app.state.engine, app.state.session_factory = create_app_engine(url)
         app.state.sessions = SessionStore(app.state.session_factory)
+        # Approval decisions (C03 rule 4): the payload-bound one-use store
+        # over the one app engine; the HTTP surface (mai.api.approvals)
+        # fails closed with 503 when this is absent.
+        app.state.approvals = ApprovalStore(app.state.session_factory)
         # Canonical profile service (C02): the confined file store over the
         # explicitly configured data root plus the journal worker over the
         # one app engine. A store that cannot be constructed (unusable
@@ -173,8 +179,10 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
         app.state.trusted_proxies = ()
     register_auth(app)
     # Privileged routers join the same /api/v1 prefix and boundary (C01/C08):
-    # the canonical server-profile surface (C02).
+    # the canonical server-profile surface (C02) and the approval decision
+    # surface (C03 rule 4).
     register_servers(app)
+    register_approvals(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
