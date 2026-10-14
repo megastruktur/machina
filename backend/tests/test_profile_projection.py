@@ -65,7 +65,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # Same frozen fixture shape as the schema/file-store sibling cards.
 HOST_KEY = "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
 
-REVISION_IDS = ("0001",)
+# Linear migration chain (exclusive migration-chain resource). 02-auth-store
+# appended 0002_sessions; head assertions below target the chain TIP, so this
+# constant tracks the full chain rather than pinning a frozen head.
+REVISION_IDS = ("0001", "0002")
 
 
 def _profile_text(server_id: uuid.UUID, name: str = "build-host") -> str:
@@ -116,7 +119,8 @@ def migrated_url() -> str:
         with psycopg.connect(url) as conn:
             conn.execute(
                 "DROP TABLE IF EXISTS profile_projection_journal, "
-                "profile_projection, alembic_version"
+                "profile_projection, admin_sessions, admin_credential, "
+                "alembic_version"
             )
             conn.commit()
         command.upgrade(_alembic_config(), "head")
@@ -162,10 +166,12 @@ async def _raw_scalar(sessions, sql: str, **params: object) -> object:
 
 def test_migration_chain_is_linear_with_single_head(migrated_url: str) -> None:
     script = ScriptDirectory.from_config(_alembic_config())
-    assert script.get_heads() == list(REVISION_IDS)
-    revisions = list(script.walk_revisions())
-    assert [r.revision for r in revisions] == list(REVISION_IDS)
-    assert revisions[0].down_revision is None
+    assert script.get_heads() == [REVISION_IDS[-1]]
+    revisions = {r.revision: r for r in script.walk_revisions()}
+    assert sorted(revisions) == sorted(REVISION_IDS)
+    assert revisions[REVISION_IDS[0]].down_revision is None
+    for previous, following in zip(REVISION_IDS, REVISION_IDS[1:]):
+        assert revisions[following].down_revision == previous
 
 
 def test_migration_reupgrade_is_a_noop_and_records_the_revision(
@@ -175,7 +181,7 @@ def test_migration_reupgrade_is_a_noop_and_records_the_revision(
     command.upgrade(_alembic_config(), "head")  # second run on the same DB
     with psycopg.connect(migrated_url) as conn:
         row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert row == ("0001",)
+    assert row == (REVISION_IDS[-1],)
 
 
 @pytest.mark.anyio
