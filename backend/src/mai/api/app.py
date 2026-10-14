@@ -59,6 +59,7 @@ from mai.api.auth import (
     resolve_public_origins,
     resolve_trusted_proxies,
 )
+from mai.api.servers import register_servers, resolve_profiles_root
 from mai.auth.sessions import AuthError, SessionStore
 from mai.database import (
     DatabaseConfigError,
@@ -68,6 +69,8 @@ from mai.database import (
     create_app_engine,
     resolve_database_url,
 )
+from mai.profiles.files import ProfileFileError, ProfileFileStore
+from mai.profiles.projection import ProfileProjection
 
 API_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_PREFIX}/health"
@@ -102,6 +105,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.database_config_error = None
         app.state.engine, app.state.session_factory = create_app_engine(url)
         app.state.sessions = SessionStore(app.state.session_factory)
+        # Canonical profile service (C02): the confined file store over the
+        # explicitly configured data root plus the journal worker over the
+        # one app engine. A store that cannot be constructed (unusable
+        # root) fails closed: routes answer 503 unavailable and touch no
+        # state; the value-free marker is all readiness needs.
+        app.state.profiles = None
+        app.state.profiles_error = None
+        app.state.projection = ProfileProjection(app.state.session_factory)
+        try:
+            app.state.profiles = ProfileFileStore(resolve_profiles_root(app.state.env))
+        except (OSError, ProfileFileError):
+            app.state.profiles_error = "profiles_root_unusable"
         # One-shot env bootstrap (auth ADR §3): ``MAI_ADMIN_PASSWORD_FILE``
         # first, then ``MAI_ADMIN_PASSWORD``; ignored once a credential
         # record exists (bootstrap-only, never a runtime override). The
@@ -157,6 +172,9 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     except ValueError:
         app.state.trusted_proxies = ()
     register_auth(app)
+    # Privileged routers join the same /api/v1 prefix and boundary (C01/C08):
+    # the canonical server-profile surface (C02).
+    register_servers(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202

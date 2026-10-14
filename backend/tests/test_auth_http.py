@@ -305,12 +305,19 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/auth/bootstrap"),
         ("POST", "/api/v1/auth/login"),
         ("POST", "/api/v1/auth/logout"),
+        # (02-profile-api remediation: the P02 route pin expanded by the
+        # frozen canonical-profile routes; intent unchanged.)
+        ("POST", "/api/v1/servers"),
+        ("GET", "/api/v1/servers/{server_id}"),
+        ("PUT", "/api/v1/servers/{server_id}"),
     }
     mutating = {route.path for route in api_routes if route.methods - {"GET", "HEAD"}}
     assert mutating == {
         "/api/v1/auth/bootstrap",
         "/api/v1/auth/login",
         "/api/v1/auth/logout",
+        "/api/v1/servers",
+        "/api/v1/servers/{server_id}",
     }
     assert "/docs" not in {route.path for route in api_routes}
     assert "/openapi.json" not in {route.path for route in api_routes}
@@ -325,6 +332,10 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/auth/login",
         "/api/v1/auth/logout",
         "/api/v1/auth/csrf",
+        # (02-profile-api remediation: the path pin expanded by the frozen
+        # canonical-profile routes; auth assertions below are unchanged.)
+        "/api/v1/servers",
+        "/api/v1/servers/{server_id}",
     }
     login = schema["paths"]["/api/v1/auth/login"]["post"]
     assert {"204", "401", "403", "422", "429"} == set(login["responses"])

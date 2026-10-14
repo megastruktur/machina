@@ -148,7 +148,7 @@ def _route_table(app: Any) -> set[tuple[str, str]]:
 
 
 #: Frozen P02 public surface: health plus the 02-auth-api boundary (C08
-#: rule 1/2). Registered by mai.api.auth.register_auth through the real app.
+#: rule 1/2) and the 02-profile-api canonical profile surface (C02).
 _AUTH_SURFACE = frozenset(
     {
         ("POST", "/api/v1/auth/bootstrap"),
@@ -158,13 +158,23 @@ _AUTH_SURFACE = frozenset(
     }
 )
 
+#: 02-profile-api surface (C01/C02): create/read/edit canonical profiles.
+_PROFILE_SURFACE = frozenset(
+    {
+        ("POST", "/api/v1/servers"),
+        ("GET", "/api/v1/servers/{server_id}"),
+        ("PUT", "/api/v1/servers/{server_id}"),
+    }
+)
+
 
 def test_app_registers_exactly_the_g1_health_surface() -> None:
-    """P02 surface: health + the auth boundary; nothing else is public.
+    """P02 surface: health + auth boundary + profile surface; nothing else.
 
-    (02-auth-api remediation: the P01 route-table pin expanded by the frozen
-    auth routes; intent unchanged — no unauthenticated mutating privilege,
-    no docs listeners, everything under the /api/v1 prefix.)
+    (02-profile-api remediation: the P02 route-table pin expanded by the
+    frozen profile routes; intent unchanged — every privileged operation is
+    session-gated, no unauthenticated mutating privilege, no docs listeners,
+    everything under the /api/v1 prefix.)
     """
     app = create_app(env={})
     api_routes = [
@@ -180,13 +190,21 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     table = {
         (method, route.path) for route in api_routes for method in route.methods
     }
-    assert table == {("GET", HEALTH_PATH), ("GET", READINESS_PATH)} | _AUTH_SURFACE
+    assert table == (
+        {("GET", HEALTH_PATH), ("GET", READINESS_PATH)}
+        | _AUTH_SURFACE
+        | _PROFILE_SURFACE
+    )
     mutating = {
         route.path
         for route in api_routes
-        if route.methods - {"GET", "HEAD"}  # every mutating verb is auth-owned
+        if route.methods - {"GET", "HEAD"}  # every mutating verb is boundary-owned
     }
-    assert mutating == {path for method, path in _AUTH_SURFACE if method == "POST"}
+    assert mutating == {
+        path
+        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE
+        if method in {"POST", "PUT"}
+    }
     for route in api_routes:
         assert route.path.startswith(API_PREFIX)
     # No public docs/OpenAPI listeners (G1 minimal unauthenticated surface).
@@ -221,8 +239,8 @@ def test_openapi_contract_matches_implemented_routes() -> None:
     app = create_app(env={})
     schema = app.openapi()
     assert schema["openapi"].startswith("3.")
-    # (02-auth-api remediation: the P01 path pin expanded by the frozen
-    # auth routes; the health contract itself is unchanged.)
+    # (02-profile-api remediation: the P02 path pin expanded by the frozen
+    # profile routes; the health contract itself is unchanged.)
     assert set(schema["paths"]) == {
         HEALTH_PATH,
         READINESS_PATH,
@@ -230,6 +248,8 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/auth/login",
         "/api/v1/auth/logout",
         "/api/v1/auth/csrf",
+        "/api/v1/servers",
+        "/api/v1/servers/{server_id}",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
@@ -245,6 +265,13 @@ def test_openapi_contract_matches_implemented_routes() -> None:
     )
     assert {"401", "403"} <= set(
         schema["paths"]["/api/v1/auth/logout"]["post"]["responses"]
+    )
+    # 02-profile-api surface: generated models, not handwritten types.
+    assert set(schema["paths"]["/api/v1/servers"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/servers/{server_id}"]) == {"get", "put"}
+    assert "requestBody" in schema["paths"]["/api/v1/servers"]["post"]
+    assert {"ProfileCreate", "ProfileEdit", "ProfileResponse"} <= set(
+        schema["components"]["schemas"]
     )
 
 
