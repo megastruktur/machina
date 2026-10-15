@@ -184,6 +184,14 @@ _GRANTS_SURFACE = frozenset(
     }
 )
 
+#: 04-password-api surface (C03 rule 4 + C04 rule 2): the submit-only
+#: password challenge transport — deliberately no read endpoint.
+_CHALLENGE_SURFACE = frozenset(
+    {
+        ("POST", "/api/v1/password-challenges"),
+    }
+)
+
 
 def test_app_registers_exactly_the_g1_health_surface() -> None:
     """P02 surface: health + auth boundary + profile surface; nothing else.
@@ -194,7 +202,8 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     everything under the /api/v1 prefix. 03-approval-api remediation: the
     pin expanded again by the frozen approval preview/decision routes.
     03-grants-api remediation: the pin expanded by the frozen
-    grant-configuration read/edit routes.)
+    grant-configuration read/edit routes. 04-password-api remediation:
+    the pin expanded by the frozen submit-only challenge route.)
     """
     app = create_app(env={})
     api_routes = [
@@ -216,6 +225,7 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
         | _PROFILE_SURFACE
         | _APPROVAL_SURFACE
         | _GRANTS_SURFACE
+        | _CHALLENGE_SURFACE
     )
     mutating = {
         route.path
@@ -224,7 +234,11 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     }
     assert mutating == {
         path
-        for method, path in _AUTH_SURFACE | _PROFILE_SURFACE | _APPROVAL_SURFACE | _GRANTS_SURFACE
+        for method, path in _AUTH_SURFACE
+        | _PROFILE_SURFACE
+        | _APPROVAL_SURFACE
+        | _GRANTS_SURFACE
+        | _CHALLENGE_SURFACE
         if method in {"POST", "PUT"}
     }
     for route in api_routes:
@@ -279,6 +293,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         # (03-grants-api remediation: the path pin expanded by the frozen
         # grant-configuration read/edit routes; health contract unchanged.)
         "/api/v1/grants",
+        # (04-password-api remediation: the path pin expanded by the frozen
+        # submit-only challenge route; health contract unchanged.)
+        "/api/v1/password-challenges",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
@@ -328,8 +345,9 @@ async def test_lifespan_starts_and_disposes_engine(
     assert app.state.database_config_error is None
     assert app.state.engine is not None
     assert app.state.session_factory is not None
-    # The lifespan disposed exactly the engine it started (dependency stop).
-    assert dispose_calls == [app.state.engine]
+    # The lifespan disposed exactly the engines it started (dependency
+    # stop): the app engine and the 04-password-api off-loop lane engine.
+    assert dispose_calls == [app.state.engine, app.state.password_lane_engine]
 
 
 @pytest.mark.anyio
