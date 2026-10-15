@@ -29,6 +29,20 @@ dependencies = [
     # next binding-generation bump is a deliberate review, not a silent
     # upgrade of a security primitive.
     "argon2-cffi>=23.1,<26",
+    # Agent runtime (IDEA.md §2/§8: PydanticAI over configurable
+    # OpenAI-compatible endpoints; contracts.md C06). The slim distribution
+    # with ONLY the `openai` extra is the minimal provider adapter set: the
+    # configured gateway is OpenAI-compatible (AGT-PROVIDER scenario,
+    # runtime-scenarios.md). No other provider extra (anthropic, google,
+    # groq, …) and no scheduler extra (the durable engine stays the frozen
+    # dbos==3.2.0 direct pin, contracts.md C05 — pydantic-ai's dbos/temporal/
+    # prefect extras are alternate-engine vectors) may enter silently;
+    # backend/tests/test_agent_dependencies.py holds both negative controls
+    # across manifest, lock and installed environment. Bounded <3 so the
+    # framework's next major API break is a deliberate reconciliation with
+    # its downstream consumers (06-agent-run/06-tool-bridge), not a silent
+    # upgrade; within 2.x the lock file fixes the exact resolved version.
+    "pydantic-ai-slim[openai]>=2.56,<3",
 ]
 
 [dependency-groups]
