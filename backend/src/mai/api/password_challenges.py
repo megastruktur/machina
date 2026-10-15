@@ -171,7 +171,14 @@ class ChallengeOperationBody(BaseModel):
 
 
 class ChallengeIdentityBody(BaseModel):
-    """The enrolled transport identity, echoed from the target profile."""
+    """The enrolled transport identity, echoed from the target profile.
+
+    Unknown fields are rejected, never ignored (same discipline as the
+    request root): this echo carries identity fields ONLY — transport
+    paths resolve server-side (:func:`_transport_paths`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
