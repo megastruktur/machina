@@ -9,10 +9,19 @@
 #   KB-V1 / C07 rule 7: the image is pgvector-enabled (pgvector/pgvector,
 #   ≥ 0.8.0; pg_trgm ships in the image's contrib).
 # - SERVICES `mai-worker` row: same backend image/package as `mai-api`; no
-#   public listener. The worker is an explicit, HONEST placeholder: its command
-#   is spelled out and exits nonzero until 05-engine-adapter implements it
-#   (C05). It is held out of the default start set via the `worker` profile, so
-#   `docker compose up` never fakes a healthy daemon.
+#   public listener. Card 05-worker-compose wires the REAL durable-engine
+#   entrypoint from 05-engine-adapter (`python -m mai.jobs.worker`, C05):
+#   this is the ONLY full engine in the topology — launch recovery, the one
+#   Machina queue and the DBOS schedule loops live here. `mai-api` stays a
+#   bare control-plane client (never launches), so API replicas can never
+#   become a second scheduler. It remains profile-gated (explicit stack-owner
+#   opt-in, `--profile worker`), is restarted by Docker if it dies
+#   (`unless-stopped`), stops cleanly on SIGTERM (the entrypoint drains the
+#   engine), and its healthcheck reports actual worker readiness: the real
+#   entrypoint is the container's main process AND the engine-owned `dbos`
+#   schema exists — that schema is created only by a full engine launch
+#   (EngineClient ordering contract in `mai.jobs.engine`), never by the API
+#   client and never by Alembic.
 # - C02 rule 1: the data root is configured explicitly (`MAI_DATA_ROOT`); the
 #   canonical file store (02-file-store) reads this parameter. C03 rule 6 /
 #   auth ADR §3: credentials come from the Compose `.env` only — this file
@@ -70,22 +79,49 @@ services:
 
   mai-worker:
     # Same backend image/package (SERVICES row). Not built separately: reuses
-    # the mai-api image. Held disabled: only `docker compose --profile worker …`
-    # may start it, and until the durable-engine adapter card (05) implements
-    # the worker entrypoint this command exits nonzero with that fact — it is
-    # never a fake healthy daemon.
+    # the mai-api image. Real C05 entrypoint (05-engine-adapter): launch
+    # recovery + the one Machina queue + DBOS schedules in the ONLY full
+    # engine process of the topology. Still profile-gated: only
+    # `docker compose --profile worker …` starts it.
     image: mai-backend
     profiles:
       - worker
-    command: ["python", "-c", "import sys; sys.exit('mai-worker is not implemented yet: the durable engine adapter (contracts.md C05, card 05-engine-adapter) owns this entrypoint')"]
+    command: ["python", "-m", "mai.jobs.worker"]
     environment:
       MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
       MAI_DATA_ROOT: /var/lib/mai
+      # Registration modules imported before engine launch (mai.jobs.worker
+      # contract): the real run executor (capability.steps) and the schedule
+      # fire workflow. A module that fails to import stops the worker with
+      # exit 2 — a daemon that cannot execute its jobs must never run.
+      MAI_WORKER_HANDLERS: "mai.jobs.steps,mai.jobs.schedules"
     volumes:
       - mai-data:/var/lib/mai
     depends_on:
       postgres:
         condition: service_healthy
+    # Independently restartable (SERVICES end-to-end route): the worker
+    # depends on Postgres only — never on mai-api, and mai-api never depends
+    # on the worker. A dead worker is restarted by Docker; a manual stop is
+    # honored (unless-stopped).
+    restart: unless-stopped
+    # SIGTERM drains the engine cleanly (entrypoint contract: exit 0).
+    stop_grace_period: 30s
+    healthcheck:
+      # Actual worker readiness, not a fake daemon (acceptance 2): the real
+      # entrypoint must be the container's main process AND the engine-owned
+      # `dbos` schema must exist — a full engine launch is its only creator,
+      # so a green probe means this worker's launch (incl. recovery setup)
+      # completed. No public listener exists to probe instead.
+      test:
+        - CMD-SHELL
+        - >-
+          grep -aq mai.jobs.worker /proc/1/cmdline
+          && python -c 'import os,sys,psycopg; c=psycopg.connect(os.environ["MAI_DATABASE_URL"],connect_timeout=3); r=c.execute("select 1 from information_schema.tables where table_schema=%s and table_name=%s",("dbos","workflow_status")).fetchone(); sys.exit(0 if r else 1)'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     networks:
       - mai
 

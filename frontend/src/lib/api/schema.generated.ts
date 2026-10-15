@@ -272,6 +272,219 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/jobs/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List runs for one explicit server scope (bounded page)
+         * @description One bounded page of one server's runs (C01 rules 5 and 7).
+         *
+         *     Safe method: session layer only. The server scope is EXPLICIT and
+         *     required — default shared retrieval is never unfiltered multi-server
+         *     access (C01 rule 7). States are replayed from the persisted
+         *     transition events of exactly this page's runs.
+         */
+        get: operations["list_runs_api_v1_jobs_runs_get"];
+        put?: never;
+        /**
+         * Submit a run (idempotent durable intent, C05 rule 5)
+         * @description Persist one run intent and durably enqueue it (HTTP never executes).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The target profile's revisions are bound from the canonical store; the
+         *     intent is validated by the ONE run-intent producer; the facade row,
+         *     the intent-digest event and the submit edge commit atomically; the
+         *     engine enqueue follows the commit so a crash leaves a re-armable gap,
+         *     not a half intent.
+         */
+        post: operations["submit_run_api_v1_jobs_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one run: binding, replayed state and durable steps
+         * @description One run's durable record; state is replayed, never engine-called.
+         */
+        get: operations["read_run_api_v1_jobs_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/runs/{run_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a run (records the request; reports only known outcomes)
+         * @description Record the cancel request and report only a KNOWN engine outcome.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Composes the reviewed safe-cancel facade: the request is recorded
+         *     ONCE (idempotent re-entry), the engine cancellation is explicit, and
+         *     the tiny HTTP observation budget expires into an honest ``202`` with
+         *     ``outcome=null`` — never a claimed ``cancelled`` (guard rule 3).
+         */
+        post: operations["cancel_run_api_v1_jobs_runs__run_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/runs/{run_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to a run's persisted events (SSE, replay cursor)
+         * @description SSE subscription over the persisted event stream (C05 rule 4).
+         *
+         *     The replay cursor is the standard SSE ``Last-Event-ID`` header; absent
+         *     means "from the run's beginning". Frames are strictly cursor-exclusive
+         *     and ordered by ``seq``, so a reconnect with the last seen ``id``
+         *     deduplicates by construction (EVT-REPLAY). Authorization completes
+         *     BEFORE the response starts: an unauthenticated call is an ordinary 401
+         *     envelope, never stream bytes (AUTH-S5). The stream is read-only: a
+         *     disconnected browser cancels nothing (C08 rule 7).
+         */
+        get: operations["stream_events_api_v1_jobs_runs__run_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/schedules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List schedules (bounded page, optional explicit server scope)
+         * @description One bounded page of persisted schedules (C01 rule 5).
+         *
+         *     Safe method: session layer only. The server scope is optional but
+         *     EXPLICIT when present (C01 rule 7) — an unfiltered page is the
+         *     single-admin control-plane view, the scoped one never leaks another
+         *     server's schedules into a scoped consumer.
+         */
+        get: operations["list_schedules_api_v1_schedules_get"];
+        put?: never;
+        /**
+         * Create a schedule (durable configuration, engine trigger derived)
+         * @description Persist one schedule record and derive its engine trigger.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The target is bound to an EXISTING canonical server (C01 rule 7);
+         *     the facade validates cron against the frozen field contract AND the
+         *     engine's own grammar, applies the explicit timezone (default UTC),
+         *     pins the frozen misfire policy and creates row + trigger inside one
+         *     transaction — engine rejection rolls the row back.
+         */
+        post: operations["create_schedule_api_v1_schedules_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/schedules/{schedule_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one persisted schedule record
+         * @description One schedule's durable record; truth is the facade row, never the engine.
+         */
+        get: operations["read_schedule_api_v1_schedules__schedule_id__get"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a schedule (row + fires cascade, then the engine trigger)
+         * @description Remove the schedule; a deleted schedule can never fire again.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The facade deletes the domain row first (fires cascade; a fire
+         *     dispatching in the window finds no row and skips value-free), then
+         *     removes the engine trigger.
+         */
+        delete: operations["delete_schedule_api_v1_schedules__schedule_id__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Update a schedule: pause/resume ONLY (the definition is frozen)
+         * @description Pause/resume the schedule (facade ``set_enabled``).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The engine trigger toggles first (fail fast, nothing written on
+         *     rejection); the domain ``enabled`` flag stays the dispatch-time
+         *     authority, so a paused schedule never dispatches even if its trigger
+         *     fires once more before the engine notices (acceptance 2/feature
+         *     scenario: pause across due time skips the missed fire — no ledger
+         *     row, no run).
+         */
+        patch: operations["update_schedule_api_v1_schedules__schedule_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/schedules/{schedule_id}/fires": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the schedule's dispatched fires (dedup ledger, bounded page)
+         * @description One bounded page of the facade-owned fire ledger (C05 rule 8).
+         *
+         *     Safe method: session layer only. One row per ACTUALLY dispatched
+         *     ``(schedule_id, planned_fire_time)`` pair — the storage level of the
+         *     exactly-once guarantee — oldest first. ``run_id`` is the recorded
+         *     link (``null`` until the run-row owner fills it); ``planned_run_id``
+         *     is the deterministic identity the fire's run intent carries.
+         */
+        get: operations["list_fires_api_v1_schedules__schedule_id__fires_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -356,6 +569,41 @@ export interface components {
             consumed_at: string | null;
         };
         /**
+         * CancelBody
+         * @description Cancel body: explicit tree cancellation (engine guard rule 4).
+         */
+        CancelBody: {
+            /**
+             * Cancel Children
+             * @default false
+             */
+            cancel_children: boolean;
+        };
+        /**
+         * CancelView
+         * @description Cancel outcome: a KNOWN engine outcome, or an honest pending.
+         *
+         *     ``outcome`` is the engine's terminal state value — ``null`` means the
+         *     budget expired WITHOUT a known outcome (guard rule 3: never claim
+         *     ``cancelled`` from a timeout); the request stays recorded.
+         */
+        CancelView: {
+            /** Run Id */
+            run_id: string;
+            /** State */
+            state: string | null;
+            /** Outcome */
+            outcome: string | null;
+            /** Requested At */
+            requested_at: string | null;
+            /** Outcome At */
+            outcome_at: string | null;
+            /** Requested Now */
+            requested_now: boolean;
+            /** Unresolved Seqs */
+            unresolved_seqs: number[];
+        };
+        /**
          * ChallengeBody
          * @description One challenge presentation: binding + operation + identity + secret.
          *
@@ -400,6 +648,10 @@ export interface components {
         /**
          * ChallengeIdentityBody
          * @description The enrolled transport identity, echoed from the target profile.
+         *
+         *     Unknown fields are rejected, never ignored (same discipline as the
+         *     request root): this echo carries identity fields ONLY — transport
+         *     paths resolve server-side (:func:`_transport_paths`).
          */
         ChallengeIdentityBody: {
             /** Host */
@@ -540,6 +792,44 @@ export interface components {
          */
         ExecutionEnvironment: "linux_ssh";
         /**
+         * FirePage
+         * @description One bounded fire-ledger page for one explicitly named schedule.
+         */
+        FirePage: {
+            /** Schedule Id */
+            schedule_id: string;
+            /** Fires */
+            fires: components["schemas"]["FireView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * FireView
+         * @description One dispatched fire from the dedup ledger (C05 rule 8).
+         *
+         *     ``run_id`` is the ledger's recorded link — ``null`` while the fire's
+         *     run has no ``job_runs`` row yet (the deterministic identity below IS
+         *     the run intent's identity). ``planned_run_id`` is the facade's
+         *     restart-stable planned-fire identity; identical across replays and
+         *     duplicate pollers, so a consumer can never count one fire twice.
+         */
+        FireView: {
+            /** Schedule Id */
+            schedule_id: string;
+            /** Planned Fire Time */
+            planned_fire_time: string;
+            /** Fired At */
+            fired_at: string;
+            /** Run Id */
+            run_id: string | null;
+            /** Planned Run Id */
+            planned_run_id: string;
+        };
+        /**
          * GrantEntry
          * @description One explicit grant: capability slug → server UUIDs (no wildcards).
          */
@@ -616,6 +906,16 @@ export interface components {
             /** Password */
             password: string;
         };
+        /**
+         * PolicyMode
+         * @description Prompting modes within grants (C03 rule 5).
+         *
+         *     ``ask``: non-read effects prompt for an approval decision.
+         *     ``delegated``: effects run without prompting — *within* grants; the
+         *     mode never widens any check (see module docstring).
+         * @enum {string}
+         */
+        PolicyMode: "ask" | "delegated";
         /**
          * PolicyState
          * @description The committed policy half: one revision counter plus the deny list.
@@ -719,6 +1019,214 @@ export interface components {
             stale: boolean;
         };
         /**
+         * RunCreated
+         * @description Submit outcome: the run view plus the dedup verdict (C05 rule 5).
+         */
+        RunCreated: {
+            run: components["schemas"]["RunView"];
+            /** Deduplicated */
+            deduplicated: boolean;
+        };
+        /**
+         * RunDetail
+         * @description One run plus its durable step intent rows.
+         */
+        RunDetail: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Parent Run Id */
+            parent_run_id: string | null;
+            /** Depth */
+            depth: number;
+            /** Profile Revision */
+            profile_revision: number;
+            /** Prompt Revision */
+            prompt_revision: number;
+            /** Model Profile */
+            model_profile: string;
+            /** Requested Grants */
+            requested_grants: string[];
+            /** State */
+            state: string | null;
+            /** Cancel Requested At */
+            cancel_requested_at: string | null;
+            /** Submitted At */
+            submitted_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Steps */
+            steps: components["schemas"]["StepView"][];
+        };
+        /**
+         * RunPage
+         * @description One bounded, explicitly server-scoped list page (C01 rule 5/7).
+         */
+        RunPage: {
+            /** Runs */
+            runs: components["schemas"]["RunView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * RunSpecBody
+         * @description The run intent template applied per fire (references only, C05 r3).
+         *
+         *     Exactly the facade's ``run_spec`` shape: a registered handler name
+         *     and its payload object. Secret VALUES are the submission boundary's
+         *     problem (C03 rule 6) and never belong here; the payload is persisted
+         *     canonically by the facade.
+         */
+        RunSpecBody: {
+            /** Handler Name */
+            handler_name: string;
+            /** Payload */
+            payload: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * RunSpecView
+         * @description The persisted run intent template (facade-typed, references only).
+         */
+        RunSpecView: {
+            /** Handler Name */
+            handler_name: string;
+            /** Payload */
+            payload: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * RunSubmitBody
+         * @description Submit body (strict: unknown fields are rejected, value-free 422).
+         *
+         *     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
+         *     rule 5 — the deterministic workflow ID). ``mode`` selects the frozen
+         *     prompting mode (C03 rule 5); it never widens any check. Waits stay at
+         *     the frozen producer defaults (bounded knobs are engine-side).
+         */
+        RunSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Model Profile */
+            model_profile: string;
+            /** @default ask */
+            mode: components["schemas"]["PolicyMode"];
+            /** Credential References */
+            credential_references?: string[];
+            /** Steps */
+            steps: components["schemas"]["StepBody"][];
+        };
+        /**
+         * RunView
+         * @description One run: stable identity binding plus replayed facade state.
+         */
+        RunView: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Parent Run Id */
+            parent_run_id: string | null;
+            /** Depth */
+            depth: number;
+            /** Profile Revision */
+            profile_revision: number;
+            /** Prompt Revision */
+            prompt_revision: number;
+            /** Model Profile */
+            model_profile: string;
+            /** Requested Grants */
+            requested_grants: string[];
+            /** State */
+            state: string | null;
+            /** Cancel Requested At */
+            cancel_requested_at: string | null;
+            /** Submitted At */
+            submitted_at: string;
+            /** Updated At */
+            updated_at: string;
+        };
+        /**
+         * ScheduleCreateBody
+         * @description Create body (strict: unknown fields are rejected, value-free 422).
+         *
+         *     ``cron_timezone`` absent applies the frozen UTC default EXPLICITLY
+         *     inside the facade (engine rule 7 — the default never lives in the
+         *     wire layer). ``misfire_policy`` is deliberately not a field: the
+         *     single frozen value ``skip_missed`` is pinned by the facade/storage.
+         */
+        ScheduleCreateBody: {
+            /** Server Id */
+            server_id: string;
+            /** Cron */
+            cron: string;
+            run_spec: components["schemas"]["RunSpecBody"];
+            /** Cron Timezone */
+            cron_timezone?: string | null;
+        };
+        /**
+         * SchedulePage
+         * @description One bounded, optionally server-scoped list page (C01 rule 5/7).
+         */
+        SchedulePage: {
+            /** Schedules */
+            schedules: components["schemas"]["ScheduleView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ScheduleUpdateBody
+         * @description Update body: pause/resume ONLY (the definition is frozen).
+         *
+         *     Exactly ``{"enabled": bool}``. Attempts to change cron/timezone/
+         *     run_spec are rejected by the strict schema — a frozen definition has
+         *     no in-place mutation (delete + re-create is the available path), so
+         *     a conflicting update can never half-apply.
+         */
+        ScheduleUpdateBody: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /**
+         * ScheduleView
+         * @description One persisted schedule record (the facade-typed ``job_schedules`` row).
+         *
+         *     ``misfire_policy`` is always the frozen ``skip_missed`` value — the
+         *     facade fails closed on any drift, so the wire can state it plainly.
+         */
+        ScheduleView: {
+            /** Schedule Id */
+            schedule_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Cron */
+            cron: string;
+            /** Cron Timezone */
+            cron_timezone: string;
+            /** Misfire Policy */
+            misfire_policy: string;
+            /** Enabled */
+            enabled: boolean;
+            run_spec: components["schemas"]["RunSpecView"];
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+        };
+        /**
          * SshIdentityBody
          * @description SSH target identity (C04 rule 1); ``credential_ref`` is a reference.
          */
@@ -733,6 +1241,41 @@ export interface components {
             host_key: string;
             /** Credential Ref */
             credential_ref: string;
+        };
+        /**
+         * StepBody
+         * @description One ordered capability step of a run intent (C05 rule 3).
+         *
+         *     ``payload`` is the capability operation document (digest-bound into
+         *     approvals at effect time); ``resource`` optionally names the mutation
+         *     lock identity for the step (C05 rule 6). Validation truth is the
+         *     run-intent producer; this model only bounds transport.
+         */
+        StepBody: {
+            /** Capability Id */
+            capability_id: string;
+            /** Payload */
+            payload: {
+                [key: string]: unknown;
+            };
+            /** Resource */
+            resource?: string | null;
+        };
+        /**
+         * StepView
+         * @description One durable step row (intent + safe receipt; C04 rule 4).
+         */
+        StepView: {
+            /** Seq */
+            seq: number;
+            /** Capability Id */
+            capability_id: string;
+            /** State */
+            state: string;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            } | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -1436,6 +1979,661 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_runs_api_v1_jobs_runs_get: {
+        parameters: {
+            query: {
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    submit_run_api_v1_jobs_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id already used by a different submit intent */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain or canonical profile service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_run_api_v1_jobs_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetail"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persisted run state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_run_api_v1_jobs_runs__run_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description Request recorded; engine outcome not observed within the budget — outcome stays null, re-entry resumes the wait */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The engine has no workflow under this run id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    stream_events_api_v1_jobs_runs__run_id__events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session (answered before any stream byte) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description An Origin header that is not allowlisted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Last-Event-ID cursor is not a non-negative integer */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_schedules_api_v1_schedules_get: {
+        parameters: {
+            query?: {
+                server_id?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchedulePage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_schedule_api_v1_schedules_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Schedules facade or canonical profile service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_schedule_api_v1_schedules__schedule_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No schedule stored for this schedule id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_schedule_api_v1_schedules__schedule_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No schedule stored for this schedule id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Schedules facade or engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    update_schedule_api_v1_schedules__schedule_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleUpdateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No schedule stored for this schedule id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation (definition keys are rejected — delete + re-create is the definition path) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Schedules facade or engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_fires_api_v1_schedules__schedule_id__fires_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FirePage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No schedule stored for this schedule id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

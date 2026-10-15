@@ -18,7 +18,7 @@ Live lane (opt-in, ``MAI_COMPOSE_LIVE=1``): builds the core images, starts the
 stack under the disposable fixture project ``mai-fxt-01-compose`` (D3
 namespace), and exercises the real entrypoints: liveness/readiness in-network,
 mai-web HTML, non-root uids, published-port absence on live containers, the
-worker force-start negative control, Postgres data persistence across a
+worker real-entrypoint force-start (healthy), Postgres data persistence across a
 restart, and an API restart. Teardown removes every project resource and
 asserts nothing was left behind.
 
@@ -173,9 +173,10 @@ def test_worker_is_explicit_disabled_by_default_and_honest(
     worker = rendered["services"]["mai-worker"]
     # Profile-gated: only `docker compose --profile worker …` may start it.
     assert worker.get("profiles") == ["worker"]
-    # Explicit command, same backend image/package, and no fake server.
+    # (05-worker-compose) Real C05 entrypoint — the durable engine worker —
+    # same backend image/package, no HTTP server in the worker role.
     command = " ".join(worker["command"])
-    assert "not implemented" in command
+    assert command == "python -m mai.jobs.worker"
     assert "uvicorn" not in command
     assert worker["image"] == rendered["services"]["mai-api"]["image"]
     assert worker["depends_on"]["postgres"]["condition"] == "service_healthy"
@@ -398,15 +399,16 @@ def test_app_containers_run_as_non_root(stack: Stack) -> None:
 
 
 @pytest.mark.skipif(not _live_enabled(), reason="opt-in live lane: MAI_COMPOSE_LIVE=1")
-def test_worker_force_start_fails_loudly_never_fake_healthy(stack: Stack) -> None:
-    # `up --wait` must fail: an explicitly-not-implemented placeholder that
-    # exited nonzero is exactly the honest outcome (never a healthy daemon).
-    up = stack.run("--profile", "worker", "up", "-d", "--wait", "mai-worker", "--wait-timeout", "60")
-    assert up.returncode != 0, up.stdout
-    row = stack.wait_status("mai-worker", "exited", deadline_s=90)
-    assert row["ExitCode"] != 0
+def test_worker_force_start_runs_the_real_entrypoint(stack: Stack) -> None:
+    # (05-worker-compose) The worker is no longer a placeholder: force-start
+    # with the profile must reach a HEALTHY real daemon (real readiness
+    # healthcheck), then be removed cleanly.
+    up = stack.run("--profile", "worker", "up", "-d", "--wait", "mai-worker", "--wait-timeout", "120")
+    assert up.returncode == 0, up.stdout + up.stderr
+    row = stack.wait_status("mai-worker", "running", deadline_s=90)
+    assert row["ExitCode"] in (None, 0)
     logs = stack.run("logs", "mai-worker", profile="worker")
-    assert "not implemented" in logs.stdout + logs.stderr
+    assert "mai worker: ready" in logs.stdout + logs.stderr
     removed = stack.run("--profile", "worker", "rm", "-sf", "mai-worker")
     assert removed.returncode == 0, removed.stderr
 

@@ -62,11 +62,16 @@ from mai.api.auth import (
     resolve_trusted_proxies,
 )
 from mai.api.grants import register_grants
+from mai.api.jobs import register_jobs
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
 )
+from mai.jobs.lifecycle import RunLifecycle
+from mai.jobs.recovery import RecoveryService
+from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
+from mai.api.schedules import register_schedules
 from mai.auth.sessions import AuthError, SessionStore
 from mai.credentials.env import EnvFileError, EnvResolver
 from mai.database import (
@@ -150,7 +155,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.projection = ProfileProjection(app.state.session_factory)
         try:
             app.state.profiles = ProfileFileStore(resolve_profiles_root(app.state.env))
-        except (OSError, ProfileFileError):
+        except OSError, ProfileFileError:
             app.state.profiles_error = "profiles_root_unusable"
         # Capability-grant configuration (C03): the confined store over the
         # same explicitly configured data root (module-fixed policy/
@@ -163,6 +168,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.grants = GrantConfigStore(resolve_profiles_root(app.state.env))
         except OSError:
             app.state.grants_error = "policy_root_unusable"
+        # Jobs domain surfaces (C05/C08): the facade lifecycle replay
+        # producer plus the safe-cancel facade over the ONE engine client.
+        # The durable engine itself is launched by the worker (never here):
+        # the EngineClient inside RecoveryService opens lazily on first
+        # use, so an API process that never submits never touches the
+        # engine-owned ``dbos`` schema. Both fail closed with 503 when
+        # absent (mai.api.jobs).
+        app.state.job_lifecycle = RunLifecycle(app.state.session_factory)
+        app.state.job_recovery = RecoveryService(url, app.state.session_factory)
+        # Schedules surface (C05 rule 8): the control-plane facade over
+        # the ONE engine URL — a bare DBOSClient, never a launched engine
+        # (launching here would steal pending workflows via launch
+        # recovery). Fails closed with 503 when absent (mai.api.schedules).
+        app.state.schedules = ScheduleManager(url, app.state.session_factory)
         # One-shot env bootstrap (auth ADR §3): ``MAI_ADMIN_PASSWORD_FILE``
         # first, then ``MAI_ADMIN_PASSWORD``; ignored once a credential
         # record exists (bootstrap-only, never a runtime override). The
@@ -181,6 +200,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # The schedules facade owns a DBOSClient (its own system-DB pool)
+        # and the cancel facade owns an EngineClient: release both before
+        # the app engine goes away.
+        schedules = getattr(app.state, "schedules", None)
+        if schedules is not None:
+            schedules.close()
+        recovery = getattr(app.state, "job_recovery", None)
+        if recovery is not None:
+            recovery.close()
         engine = getattr(app.state, "engine", None)
         if engine is not None:
             await engine.dispose()
@@ -223,14 +251,20 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     register_auth(app)
     # Privileged routers join the same /api/v1 prefix and boundary (C01/C08):
     # the canonical server-profile surface (C02), the approval decision
-    # surface (C03 rule 4) and the capability-grant configuration surface
-    # (C03 rules 3–5).
+    # surface (C03 rule 4), the capability-grant configuration surface
+    # (C03 rules 3–5) and the jobs submit/status/cancel/event surface
+    # (C05/C08 — HTTP persists intent only; effects run in the worker).
     register_servers(app)
     register_approvals(app)
     # The password challenge surface (C03 rule 4 + C04 rule 2): the
     # ephemeral submit-only secret transport — no read endpoint exists.
     register_password_challenges(app)
     register_grants(app)
+    register_jobs(app)
+    # The scheduled-job configuration surface (C05 rule 8): durable
+    # schedule records over the reviewed facade — HTTP persists
+    # configuration only, firing stays engine/worker-owned.
+    register_schedules(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
