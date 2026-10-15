@@ -1,0 +1,37 @@
+# 04 — OpenAPI contract + mechanical type regeneration (acceptance 3)
+
+## Central exporter (the one documented command; mai/api/client.ts header)
+$ export_path=/tmp/mai-fxt-04-password-api-fix/openapi.json && \
+  mkdir -p "$(dirname "$export_path")" && \
+  (cd backend && uv run python -c "import json,sys; from mai.api.app import \
+create_app; json.dump(create_app().openapi(), open(sys.argv[1],'w'), indent=2)" \
+"$export_path") && \
+  (cd frontend && pnpm dlx openapi-typescript@7.13.0 "$export_path" \
+-o src/lib/api/schema.generated.ts)
+✨ openapi-typescript 7.13.0
+🚀 /tmp/mai-fxt-04-password-api-fix/openapi.json → src/lib/api/schema.generated.ts [37.8ms]
+Done in 307ms using pnpm v12.6.0
+
+## No-drift check: second exporter run leaves the tree unchanged
+(git status on frontend/src/lib/api/schema.generated.ts identical before/after)
+
+## Exported ChallengeBody contract (probed from the exported openapi.json)
+$ python3 -c "import json; body = json.load(open('.../openapi.json'))['components']['schemas']['ChallengeBody']; ..."
+additionalProperties: False
+properties: ['account', 'approval_id', 'capability_id', 'identity', 'operation',
+             'payload_hash', 'policy_revision', 'secret', 'server_id']
+required: ['account', 'approval_id', 'capability_id', 'identity', 'operation',
+           'payload_hash', 'policy_revision', 'secret', 'server_id']
+→ exactly 9 properties, NO key_path / NO known_hosts_path, unknown fields
+  refused at the contract level.
+
+## Generated type diff (frontend/src/lib/api/schema.generated.ts, 7+/4-)
+- key_path: string;            (removed)
+- known_hosts_path: string;    (removed)
++ ChallengeBody docstring carried over from the model (mechanical, no
+  hand-edited type lines; openapi-typescript renders additionalProperties:
+  false structurally — TS interfaces are closed — hence 0 grep hits there).
+
+## Frontend over the regenerated types
+$ cd frontend && pnpm run check
+COMPLETED 203 FILES 0 ERRORS 0 WARNINGS 0 FILES_WITH_PROBLEMS

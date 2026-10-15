@@ -1,0 +1,13 @@
+# 05 — fixture/resource cleanup proof (2026-10-15)
+
+$ docker stop mai-fxt-p04-fix-pg
+mai-fxt-p04-fix-pg
+$ docker ps -a --format '{{.Names}}' | grep mai-fxt-p04-fix; echo "grep rc=$?"
+grep rc=1 (1 = no fixture containers left)
+(--rm removed the stopped container; no other programme containers touched)
+
+Test-side state: disposable Postgres data lived only inside the container
+(dropped with it); the suite itself truncates approvals/admin tables and
+re-migrates from zero per session. /tmp/mai-fxt-04-password-api-fix/ holds
+only the exported public OpenAPI schema and the fix diff copy — no secrets
+(fixture credential values are synthetic constants defined in the test file).

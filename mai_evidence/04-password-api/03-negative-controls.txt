@@ -1,0 +1,54 @@
+# 03 — negative controls for the path-injection fix (red/green)
+
+Five new controls in tests/test_password_challenge_http.py (all through the
+real ASGI app + real approval store; ssh transport is the Popen stand-in spy
+which records every spawn):
+
+1. test_client_supplied_transport_paths_are_rejected
+   Body carries `key_path: "/etc/shadow"` and a PLANTED
+   `attacker-known-hosts` file (`<host> ssh-ed25519 AAAAattacker-controlled`).
+   ⇒ 422 validation_failed, ZERO transport spawns, decision stays `pending`,
+   and the honest path-free presentation afterwards spends it (200) with the
+   SERVER-resolved key in the argv. The client paths were neither honored nor
+   silently dropped: the request is refused whole (`extra="forbid"`).
+2. test_unenrolled_known_hosts_refuses_before_consume
+   Canonical store absent ⇒ 422 invalid_configuration, nothing spent; after
+   touching the file at the CANONICAL path (the only escape) the same
+   presentation succeeds. A client-named substitute file is unrepresentable.
+3. test_unresolvable_credential_ref_refuses_before_consume
+   A second enrolled target whose profile names `MAI_SSH_KEY_ABSENT`
+   (not in the configured .env source) ⇒ 422 invalid_configuration, nothing
+   spent (C03 rule 6: resolution only from the configured source).
+4. test_stale_identity_key_refuses_before_consume
+   Key file deleted after enrollment (reference resolves but path is not an
+   existing regular file) ⇒ 422 invalid_configuration, nothing spent (this
+   control forced the SshConnectError mapping — see 02-tests).
+5. test_unconfigured_credential_source_fails_closed
+   App built WITHOUT MAI_ENV_FILE ⇒ 503 unavailable before any state change
+   (no ambient secret fallback).
+6. (contract pin, in test_challenge_is_submit_only_no_secret_read_route)
+   In-process OpenAPI: ChallengeBody has no key_path/known_hosts_path
+   properties and `additionalProperties: false`.
+
+## RED run (guard reverted): only `model_config = ConfigDict(extra="forbid")`
+removed from ChallengeBody — the exact guard the finding is about:
+
+$ ... uv run pytest tests/test_password_challenge_http.py -q
+ +  where None = <built-in method get of dict object at 0x7f21d445b580>('additionalProperties')
+ +    where <built-in method get of dict object at 0x7f21d445b580> = {'properties': {'approval_id': ... 'title': 'ChallengeBody', ...}.get
+FAILED tests/test_password_challenge_http.py::test_client_supplied_transport_paths_are_rejected[asyncio] - assert 500 == 422
+ +  where 500 = HttpResponse(status=500, ... {"code":"internal_error", ...})
+2 failed, 19 passed in 4.95s
+
+Reading: with the guard removed, the planted client paths are silently
+accepted (first-round behavior) and the request proceeds past every gate to
+the transport seam — the spy raises on the unexpected spawn, hence 500 instead
+of 422 — and the additionalProperties contract pin fails with it. The other
+19 tests (including all four store-side refusals) stay green: the guard is
+the ONLY thing standing between a client-supplied path and the ssh boundary,
+which is precisely the review finding.
+
+## GREEN run (guard restored, final code):
+$ ... uv run pytest tests/test_password_challenge_http.py -q
+.....................                                                    [100%]
+21 passed in 4.82s

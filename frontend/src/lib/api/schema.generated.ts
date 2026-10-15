@@ -211,6 +211,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/password-challenges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit the sudo secret for one approved password challenge
+         * @description Spend the one-use decision and transport the secret to ``sudo -S``.
+         *
+         *     Boundary first (ADR §5 order): session → origin → CSRF, then the
+         *     enrolled-identity binding, before any state is touched. The lane
+         *     itself is fail-closed at every seam (structural → account → payload
+         *     hash → known-hosts → ONE-USE consume → transport) and wipes the
+         *     secret buffer whatever the outcome; this surface wipes it again
+         *     around the whole call so even a pre-consume channel rejection leaves
+         *     nothing behind. Exactly ONE authentication attempt is ever made.
+         */
+        post: operations["submit_challenge_api_v1_password_challenges_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/grants": {
         parameters: {
             query?: never;
@@ -326,6 +354,140 @@ export interface components {
             consumed_by: string | null;
             /** Consumed At */
             consumed_at: string | null;
+        };
+        /**
+         * ChallengeBody
+         * @description One challenge presentation: binding + operation + identity + secret.
+         *
+         *     ``server_id`` appears in the binding and the operation and must agree
+         *     (checked here, value-free 422); the store re-checks the binding
+         *     against the persisted approval under its row lock. ``account`` is the
+         *     target account whose sudo credential this challenge authorizes; the
+         *     channel refuses a mismatch with the transport identity's login
+         *     account (``sudo -S`` authenticates the invoking account only).
+         *
+         *     The body deliberately carries NO transport paths: both are resolved
+         *     server-side only (:func:`_transport_paths`). Unknown fields — a
+         *     client-supplied ``key_path``/``known_hosts_path`` included — are
+         *     REJECTED, never ignored: a presentation is the pinned challenge
+         *     context field-for-field, and a silently dropped field would let a
+         *     stale or hostile client believe its transport naming was honored.
+         */
+        ChallengeBody: {
+            /**
+             * Approval Id
+             * Format: uuid
+             */
+            approval_id: string;
+            /** Capability Id */
+            capability_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Payload Hash */
+            payload_hash: string;
+            /** Policy Revision */
+            policy_revision: number;
+            /** Account */
+            account: string;
+            operation: components["schemas"]["ChallengeOperationBody"];
+            identity: components["schemas"]["ChallengeIdentityBody"];
+            /** Secret */
+            secret: string;
+        };
+        /**
+         * ChallengeIdentityBody
+         * @description The enrolled transport identity, echoed from the target profile.
+         */
+        ChallengeIdentityBody: {
+            /** Host */
+            host: string;
+            /** Port */
+            port: number;
+            /** User */
+            user: string;
+            /** Host Key */
+            host_key: string;
+            /** Credential Ref */
+            credential_ref: string;
+        };
+        /**
+         * ChallengeOperationBody
+         * @description The bound command request, field-for-field (C04 rule 3 shape).
+         *
+         *     The channel recomputes the transported payload from these fields and
+         *     refuses any presentation whose hash differs from the approved
+         *     binding (``payload_mismatch``) BEFORE the decision is consumed.
+         */
+        ChallengeOperationBody: {
+            /**
+             * Op Id
+             * Format: uuid
+             */
+            op_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Display */
+            display: string;
+            /** Timeout */
+            timeout: number;
+            /** Output Budget */
+            output_budget: number;
+            /** Argv */
+            argv: string[];
+            /** Shell */
+            shell?: string | null;
+            /** Working Directory */
+            working_directory?: string | null;
+        };
+        /**
+         * ChallengeOutcomeView
+         * @description The frozen ``CommandOutcome`` shape (C04 rule 4) — nothing else.
+         *
+         *     ``stdout``/``stderr`` are the bounded payload streams (at most
+         *     ``output_budget`` bytes each); no secret material is ever placed in
+         *     them by the lane and no submission field is echoed here.
+         */
+        ChallengeOutcomeView: {
+            /**
+             * Op Id
+             * Format: uuid
+             */
+            op_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Display */
+            display: string;
+            /** Status */
+            status: string;
+            /** Exit Code */
+            exit_code: number | null;
+            /** Stdout */
+            stdout: string;
+            /** Stdout Bytes */
+            stdout_bytes: number;
+            /** Stdout Truncated */
+            stdout_truncated: boolean;
+            /** Stderr */
+            stderr: string;
+            /** Stderr Bytes */
+            stderr_bytes: number;
+            /** Stderr Truncated */
+            stderr_truncated: boolean;
+            /** Timed Out */
+            timed_out: boolean;
+            /** Cwd Change Failed */
+            cwd_change_failed: boolean;
+            /** Duration Seconds */
+            duration_seconds: number;
         };
         /**
          * DecisionBody
@@ -1065,6 +1227,93 @@ export interface operations {
                 };
             };
             /** @description Approval service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    submit_challenge_api_v1_password_challenges_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChallengeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeOutcomeView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed, CSRF token rejected, or the target refused the presented secret (decision spent) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No approval record or no enrolled profile for this target */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Decision already consumed, expired, or a binding/target/identity mismatch */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Challenge presentation failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description SSH transport failed; the decision is spent */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Password challenge service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

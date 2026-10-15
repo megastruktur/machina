@@ -34,6 +34,7 @@ the ``openapi-client`` resource.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -61,8 +62,13 @@ from mai.api.auth import (
     resolve_trusted_proxies,
 )
 from mai.api.grants import register_grants
+from mai.api.password_challenges import (
+    lane_approval_store,
+    register_password_challenges,
+)
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.auth.sessions import AuthError, SessionStore
+from mai.credentials.env import EnvFileError, EnvResolver
 from mai.database import (
     DatabaseConfigError,
     DatabaseHealth,
@@ -99,6 +105,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     readiness (``not_configured``/``invalid_config``); it does not prevent
     the app from serving liveness and truthful readiness.
     """
+    # Server-side credential resolution for the passworded transport lane
+    # (C03 rule 6): the configured ``.env`` source (``MAI_ENV_FILE``) is
+    # loaded ONCE here — the challenge surface (mai.api.password_challenges)
+    # resolves transport paths itself, and the wire never names one. An
+    # absent or unusable source fails closed: the surface answers 503
+    # unavailable and touches no state.
+    app.state.credentials = None
+    source = (app.state.env or os.environ).get("MAI_ENV_FILE")
+    if source:
+        try:
+            app.state.credentials = EnvResolver(source)
+        except EnvFileError:
+            app.state.credentials = None
     try:
         url = resolve_database_url(app.state.env)
     except DatabaseConfigError as exc:
@@ -113,6 +132,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # over the one app engine; the HTTP surface (mai.api.approvals)
         # fails closed with 503 when this is absent.
         app.state.approvals = ApprovalStore(app.state.session_factory)
+        # Passworded transport lane (mai.api.password_challenges): the
+        # bounded blocking ssh lane must run OFF the request event loop
+        # (the password channel's composition duty), so its approval gate
+        # gets a dedicated no-pool store — a NullPool connection lives on
+        # exactly one event loop, and nothing pools across loops.
+        app.state.password_approvals, app.state.password_lane_engine = (
+            lane_approval_store(url)
+        )
         # Canonical profile service (C02): the confined file store over the
         # explicitly configured data root plus the journal worker over the
         # one app engine. A store that cannot be constructed (unusable
@@ -157,6 +184,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = getattr(app.state, "engine", None)
         if engine is not None:
             await engine.dispose()
+        lane_engine = getattr(app.state, "password_lane_engine", None)
+        if lane_engine is not None:
+            await lane_engine.dispose()
 
 
 def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
@@ -197,6 +227,9 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # (C03 rules 3–5).
     register_servers(app)
     register_approvals(app)
+    # The password challenge surface (C03 rule 4 + C04 rule 2): the
+    # ephemeral submit-only secret transport — no read endpoint exists.
+    register_password_challenges(app)
     register_grants(app)
 
     @app.middleware("http")
