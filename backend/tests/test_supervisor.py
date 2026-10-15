@@ -224,13 +224,16 @@ class _FakeSsh:
         self.script.extend(results)
 
 
-_NOW = time.time()  # fixed reference for heartbeat freshness math
-
-
 def _events_fresh() -> str:
+    # Epoch is computed at call time: a module-import reference drifts past
+    # HEARTBEAT_STALE_SECONDS (5.0) once docker-backed tests in other files
+    # push this module's collection-to-execution gap past the TTL, flipping
+    # the "fresh heartbeat" fixture stale and the expected classification
+    # to outcome_unknown.
+    now = int(time.time())
     return (
         "2026-10-14T00:00:00Z seq=2 state=running\n"
-        f"2026-10-14T00:00:01Z hb payload_pid=834 hb_epoch={int(_NOW)}\n"
+        f"2026-10-14T00:00:01Z hb payload_pid=834 hb_epoch={now}\n"
     )
 
 
@@ -1261,6 +1264,23 @@ def _docker_available() -> bool:
     return shutil.which("docker") is not None
 
 
+def _prune_fixture_namespace(path: Path) -> None:
+    """Remove empty ``mai-fxt-*`` namespace ancestors of a removed scratch
+    dir (never anything above the namespace, never a non-empty dir).
+
+    04-verify acceptance requires zero ``/tmp/mai-fxt-04-*`` residue dirs
+    after a suite run; per-test scratch removal alone leaves the empty
+    namespace parents behind.
+    """
+    current = path.parent
+    while current != current.parent and current.name.startswith("mai-fxt-"):
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
 def _ensure_fixture_image() -> None:
     """Build the disposable Arch+openssh+sudo fixture image once."""
     global _image_ensured
@@ -1279,6 +1299,8 @@ def _ensure_fixture_image() -> None:
     )
     build = _docker("build", "-q", "-t", FIXTURE_IMAGE_TAG, str(context), timeout=1200)
     assert build.returncode == 0, f"fixture image build failed: {build.stderr[-800:]}"
+    shutil.rmtree(context, ignore_errors=True)  # tagged image is the cache (D4)
+    _prune_fixture_namespace(context)
     _image_ensured = True
 
 
@@ -1563,6 +1585,7 @@ class _ArchSshdFixture:
             if name.startswith("mai-fxt-04-supervisor")
         ]
         shutil.rmtree(self.scratch, ignore_errors=True)
+        _prune_fixture_namespace(self.scratch)
         self.cleanup_proof = (
             f"container {self.container} after rm: '{listing.stdout.strip() or '<none>'}'; "
             f"stray supervisor fixtures: {strays or 'none'}; "

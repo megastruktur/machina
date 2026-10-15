@@ -30,6 +30,7 @@ payloads are hashes only.
 
 from __future__ import annotations
 
+import atexit
 import os
 import secrets
 import shutil
@@ -384,6 +385,13 @@ def known_hosts(tmp_path: Path) -> Path:
 
 
 _KNOWN_HOSTS = Path("/tmp/mai-fxt-04-password-channel-unit-known-hosts")
+
+# C10 rule 2 namespace hygiene: the shared unit known-hosts scratch is
+# recreated per call (see ``_run``) and removed for good when the test
+# session ends, so a suite run leaves no /tmp/mai-fxt-04-* unit residue
+# (04-verify acceptance). Same-test direct reuses of the path keep their
+# isfile precondition satisfied.
+atexit.register(_KNOWN_HOSTS.unlink, True)
 
 
 @pytest.mark.anyio
@@ -1003,6 +1011,12 @@ class ArchPasswordFixture:
         )
         shutil.rmtree(self.scratch, ignore_errors=True)
         shutil.rmtree(FIXTURE_SCRATCH, ignore_errors=True)
+        # 04-verify hygiene: drop the empty namespace grandparent
+        # (/tmp/mai-fxt-04-password-channel) once tests/ is gone.
+        try:
+            FIXTURE_SCRATCH.parent.rmdir()
+        except OSError:
+            pass
         self.cleanup_proof = (
             f"container {FIXTURE_CONTAINER} after rm: "
             f"'{listing.stdout.strip() or '<none>'}'; "

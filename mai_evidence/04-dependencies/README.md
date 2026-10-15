@@ -36,6 +36,20 @@ client driven via subprocess** — no third-party SSH library, nothing to pin.
    options) is proven to exist on the installed client, not invented
    (02-tests §ssh -G).
 
+## File index
+
+| File | Content |
+|---|---|
+| `01-commands.txt` | Fix-round commands and results (`uv lock` removals, `--check`, `ssh -V`) |
+| `02-tests-and-runtime-checks.txt` | Focused suite receipt: `test_execution_dependencies.py` + `test_import.py`, 8 passed |
+| `03-lock-diff.txt` | `uv.lock` diff: asyncssh + cryptography dropped, 36 packages retained |
+
+Preserved first-round history (matrix copy in `plans/mai-v1/mai_evidence/`
+only; not part of the committed fix-round set): `01-toolchain-and-tree.txt`,
+`02-resolve-lock.txt`, `03-install-offline.txt`, `04-tests-entrypoint.txt`,
+`05-cleanup-proof.txt`, `06-commit-receipt.txt` — the asyncssh round kept
+for the failure record per test policy.
+
 ## Commands (verbatim outputs in the numbered files)
 - `cd backend && uv lock` → "Removed asyncssh v2.24.1 / Removed cryptography v50.0.2"
 - `cd backend && uv lock --check` → rc=0
