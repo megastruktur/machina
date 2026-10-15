@@ -69,7 +69,9 @@ from mai.api.password_challenges import (
 )
 from mai.jobs.lifecycle import RunLifecycle
 from mai.jobs.recovery import RecoveryService
+from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
+from mai.api.schedules import register_schedules
 from mai.auth.sessions import AuthError, SessionStore
 from mai.credentials.env import EnvFileError, EnvResolver
 from mai.database import (
@@ -175,6 +177,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # absent (mai.api.jobs).
         app.state.job_lifecycle = RunLifecycle(app.state.session_factory)
         app.state.job_recovery = RecoveryService(url, app.state.session_factory)
+        # Schedules surface (C05 rule 8): the control-plane facade over
+        # the ONE engine URL — a bare DBOSClient, never a launched engine
+        # (launching here would steal pending workflows via launch
+        # recovery). Fails closed with 503 when absent (mai.api.schedules).
+        app.state.schedules = ScheduleManager(url, app.state.session_factory)
         # One-shot env bootstrap (auth ADR §3): ``MAI_ADMIN_PASSWORD_FILE``
         # first, then ``MAI_ADMIN_PASSWORD``; ignored once a credential
         # record exists (bootstrap-only, never a runtime override). The
@@ -193,8 +200,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # The cancel facade owns an EngineClient (its own lazy system-DB
-        # pool); release it before the app engine goes away.
+        # The schedules facade owns a DBOSClient (its own system-DB pool)
+        # and the cancel facade owns an EngineClient: release both before
+        # the app engine goes away.
+        schedules = getattr(app.state, "schedules", None)
+        if schedules is not None:
+            schedules.close()
         recovery = getattr(app.state, "job_recovery", None)
         if recovery is not None:
             recovery.close()
@@ -250,6 +261,10 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     register_password_challenges(app)
     register_grants(app)
     register_jobs(app)
+    # The scheduled-job configuration surface (C05 rule 8): durable
+    # schedule records over the reviewed facade — HTTP persists
+    # configuration only, firing stays engine/worker-owned.
+    register_schedules(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
