@@ -1,0 +1,1399 @@
+import { expect, test, type Page, type Route } from '@playwright/test';
+import { build, type Plugin } from 'vite';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
+
+/**
+ * mai-06-web-chat — real-browser proofs for the conversation panel
+ * (frontend/src/lib/panels/ChatPanel.svelte) and its feature-owned registry
+ * entry (frontend/src/lib/workspace/entries/06-web-chat.ts).
+ *
+ * Focused per the test policy: the panel is exercised in real Chromium,
+ * mounted through the reviewed window host (`PanelHost`) and registry with a
+ * fixture in-page API implementing the panel's typed `ChatApi` shape (the
+ * same interface `createMaiApiClient()` gains at desktop composition,
+ * mirroring the reviewed `mai.api.chat` routes 1:1). The REAL backend
+ * boundary — C01 envelope codes, session/origin/CSRF, idempotent submit
+ * persistence, attachment integrity, budget ledger persistence — is owned by
+ * the `06-chat-api`/`06-delegation-budgets` producer suites; the assembled
+ * desktop journey (real Chat panel + fixture SSH + live model round) is
+ * owned by `06-verify` at the phase gate.
+ *
+ * Harness (self-contained, following the models/delegation convention):
+ *  1. test.beforeAll runs an IN-MEMORY Vite production build (write: false)
+ *     of a virtual app importing the REAL panel, the REAL feature entry, the
+ *     REAL registry + PanelHost, the REAL DelegationTree and the REAL client
+ *     primitive. Five hosts mount: MAIN (server Alpha) + SECOND (server
+ *     Beta — a DIFFERENT pinned scope) with the same services bag, BARE with
+ *     no services (fail-closed), GLOBAL (a server-only entry must be refused)
+ *     and one benign sibling panel (coexistence).
+ *  2. Each test serves the built JS/CSS/HTML through Playwright route
+ *     interception. The bag's `streamConversationEvents` is the REAL
+ *     `subscribeEvents` over the reviewed chat producer URL, answered by
+ *     route handlers — the concrete URL, `Last-Event-ID` cursor carry, frame
+ *     parsing and reconnect loop are exercised on the wire, not stubbed. The
+ *     fixture API mirrors the reviewed producer semantics: value-free rows
+ *     and events, the explicit tree-cancel body, one-use approval decisions
+ *     bound field-for-field.
+ *
+ * Both the panel AND the composed DelegationTree subscribe the root run's
+ * stream (each with its own watermark), so stream sessions are queued in
+ * PAIRS: one per live subscriber. Every subscriber deduplicates by its own
+ * `seq` watermark — that is exactly the property the reconnect test proves.
+ */
+
+const FIXTURE_URL = '/mai-chat-fixture/';
+const FRONTEND_ROOT = new URL('../', import.meta.url).pathname;
+
+const APP_ID = 'virtual:mai-chat-app.svelte';
+const ENTRY_ID = 'virtual:mai-chat-entry.js';
+
+const PANEL = `${FRONTEND_ROOT}src/lib/panels/ChatPanel.svelte`;
+const ENTRY = `${FRONTEND_ROOT}src/lib/workspace/entries/06-web-chat.ts`;
+const PANELHOST = `${FRONTEND_ROOT}src/lib/workspace/PanelHost.svelte`;
+const REGISTRY = `${FRONTEND_ROOT}src/lib/workspace/registry.ts`;
+const HOST = `${FRONTEND_ROOT}tests/fixtures/component-host.svelte`;
+const TOKENS = `${FRONTEND_ROOT}src/lib/ui/tokens.css`;
+const CLIENT = `${FRONTEND_ROOT}src/lib/api/client.ts`;
+
+/** Frozen identity fixtures (opaque UUIDs per contracts.md C01 rule 1). */
+const SERVER_A = '8c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
+const SERVER_B = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+const ROOT = 'aa111111-1111-4222-8333-444455556666';
+const CHILD_A = 'bb222222-1111-4222-8333-444455556666';
+const CHILD_B = 'cc333333-1111-4222-8333-444455556666';
+const HISTORY_RUN = 'ee555555-1111-4222-8333-444455556666';
+const APPROVAL_ID = 'f1000000-1111-4222-8333-444455556666';
+const OP_ID = 'ef000000-0000-4000-8000-000000000009';
+const ATTACHMENT_SHA = 'cd'.repeat(32);
+const PAYLOAD_SHA = 'ab'.repeat(32);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Secret-SHAPED fixture canary (synthetic, NOT a secret): stands for the
+ * conversation/context/tool bodies the value-free wire never carries. It is
+ * planted in the fixture store as an UNKNOWN row field and must NEVER appear
+ * in the DOM (C05 rule 4).
+ */
+const FIXTURE_CANARY = 'MAI-FIXTURE-CANARY-context-body-NEVER-DISPLAY';
+/**
+ * Hostile-shaped strings the fixture stream delivers as recorded VALUE-FREE
+ * text (a stable reason and a classified failure reason). The panel must
+ * render them as inert text — no element injection, no script execution.
+ */
+const HOSTILE_TOOL_TEXT = '<img src=x onerror="window.__maiPwned=1">MAI-FIXTURE-HOSTILE-TOOL-TEXT';
+const HOSTILE_FAILURE = '<script>window.__maiPwned=2</script>fixture_denial';
+
+type Scenario = 'compose' | 'replay' | 'history' | 'approval' | 'approval-absent';
+
+type Fail = { status: number; code: string; message: string };
+
+interface RecordedCall {
+	op: string;
+	runId?: string;
+	serverId?: string;
+	cursor?: string | null;
+	payload?: unknown;
+}
+
+interface ChatWindowApi {
+	calls: RecordedCall[];
+	streams: Array<{ runId: string; cursor: string | null }>;
+	submissions: Array<{ payload: Record<string, unknown>; childIds: string[] }>;
+	setConversationState(runId: string, state: string): void;
+	armCancel(outcome: string | null): void;
+	failNextRead(failure: Fail | null): void;
+	armDecideFailure(failure: Fail | null): void;
+	toggleMain(on: boolean): void;
+	toggleSecond(on: boolean): void;
+	registry: {
+		kinds: string[];
+		checkScope(kind: string, scope: unknown): { ok: true } | { ok: false; code: string };
+		defaultGeometry(kind: string): unknown;
+		minGeometry(kind: string): unknown;
+	};
+}
+
+declare global {
+	interface Window {
+		__maiChatApi?: ChatWindowApi;
+		/** Set by a test init script: the boot scenario (chat-spec-owned name). */
+		__maiChatScenario?: Scenario;
+		/** Set ONLY by hostile-content execution (its presence is the failure). */
+		__maiPwned?: number;
+	}
+}
+
+type BuiltBundle = {
+	output: Array<
+		| { type: 'chunk'; fileName: string; isEntry: boolean; code: string }
+		| { type: 'asset'; fileName: string; source: string | Uint8Array }
+	>;
+};
+
+let harnessJs = '';
+let harnessCss = '';
+
+/** Recorded fixture calls of one op (serialized VALUES only — fixture
+ * methods never cross the evaluate boundary). */
+async function callsOf(page: Page, op: string): Promise<RecordedCall[]> {
+	return page.evaluate((operation) => {
+		const api = window.__maiChatApi;
+		return api ? api.calls.filter((call) => call.op === operation) : [];
+	}, op);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture app (virtual module; compiled in RUNES mode like the reviewed
+// harnesses, so it uses `$state` only)
+// ---------------------------------------------------------------------------
+
+const APP_SOURCE = `
+<script>
+	import PanelHost from '${PANELHOST}';
+	import ComponentHost from '${HOST}';
+	import { createPanelRegistry } from '${REGISTRY}';
+	import { createRawSnippet } from 'svelte';
+	import { ApiError, subscribeEvents } from '${CLIENT}';
+	import { chatEntry, chatServices } from '${ENTRY}';
+
+	const SERVER_A = '${SERVER_A}';
+	const SERVER_B = '${SERVER_B}';
+	const ROOT = '${ROOT}';
+	const CHILD_A = '${CHILD_A}';
+	const CHILD_B = '${CHILD_B}';
+	const HISTORY_RUN = '${HISTORY_RUN}';
+	const APPROVAL_ID = '${APPROVAL_ID}';
+	const OP_ID = '${OP_ID}';
+	const ATTACHMENT_SHA = '${ATTACHMENT_SHA}';
+	const PAYLOAD_SHA = '${PAYLOAD_SHA}';
+	const CANARY = '${FIXTURE_CANARY}';
+	const UUID_RE = ${String(UUID_RE)};
+
+	const scenario = window.__maiChatScenario ?? 'compose';
+	const calls = [];
+	const streams = [];
+	const submissions = [];
+	let childCounter = 0;
+
+	function clone(value) {
+		return structuredClone(JSON.parse(JSON.stringify(value)));
+	}
+
+	function childId() {
+		childCounter += 1;
+		return 'd0000000-0000-4000-8000-' + String(childCounter).padStart(12, '0');
+	}
+
+	function consumeReadFailure() {
+		if (failNextRead) {
+			const failure = failNextRead;
+			failNextRead = null;
+			throw new ApiError(failure.status, failure.code, failure.message);
+		}
+	}
+
+	function runRow(runId, serverId, state, overrides) {
+		return Object.assign(
+			{
+				run_id: runId,
+				server_id: serverId,
+				parent_run_id: null,
+				depth: 0,
+				profile_revision: 3,
+				prompt_revision: 1,
+				model_profile: 'fixture-fast',
+				requested_grants: ['fixture.read'],
+				state,
+				cancel_requested_at: null,
+				submitted_at: '2026-10-16T09:00:00Z',
+				updated_at: '2026-10-16T09:01:00Z'
+			},
+			overrides ?? {}
+		);
+	}
+
+	function childRow(runId, parentRunId, state, serverId) {
+		return runRow(runId, serverId ?? SERVER_A, state, {
+			parent_run_id: parentRunId,
+			depth: 1,
+			model_profile: 'fixture-fast'
+		});
+	}
+
+	const conversations = {};
+	const runDetails = {};
+	const approvals = {};
+
+	const attachment = { server_id: SERVER_A, op_id: OP_ID, sha256: ATTACHMENT_SHA, bytes: 1234 };
+
+	if (scenario === 'replay') {
+		// The canary rides as an UNKNOWN row field: the schema has no message
+		// body, the panel never enumerates fields — the DOM must stay clean.
+		conversations[ROOT] = Object.assign(
+			runRow(ROOT, SERVER_A, 'running', {
+				requested_grants: ['fixture.read', 'fixture.exec'],
+				children: [childRow(CHILD_A, ROOT, 'succeeded'), childRow(CHILD_B, ROOT, 'failed')],
+				attachments: [attachment]
+			}),
+			{ message: CANARY }
+		);
+	} else if (scenario === 'history') {
+		conversations[HISTORY_RUN] = runRow(HISTORY_RUN, SERVER_A, 'running', {
+			children: [childRow(CHILD_A, HISTORY_RUN, 'succeeded')],
+			attachments: [attachment]
+		});
+	} else if (scenario === 'approval' || scenario === 'approval-absent') {
+		conversations[ROOT] = runRow(ROOT, SERVER_A, 'waiting_approval', {
+			requested_grants: ['fixture.read', 'fixture.exec']
+		});
+		runDetails[ROOT] = {
+			run_id: ROOT,
+			server_id: SERVER_A,
+			parent_run_id: null,
+			depth: 0,
+			profile_revision: 3,
+			prompt_revision: 1,
+			model_profile: 'fixture-fast',
+			requested_grants: ['fixture.read', 'fixture.exec'],
+			state: 'waiting_approval',
+			cancel_requested_at: null,
+			submitted_at: '2026-10-16T09:00:00Z',
+			updated_at: '2026-10-16T09:02:00Z',
+			steps: [
+				{
+					seq: 1,
+					capability_id: 'fixture.exec',
+					state: 'failed',
+					receipt:
+						scenario === 'approval'
+							? {
+									v: 1,
+									op_id: OP_ID,
+									capability_id: 'fixture.exec',
+									payload_hash: PAYLOAD_SHA,
+									policy_revision: 7,
+									approval_id: APPROVAL_ID
+								}
+							: {
+									v: 1,
+									op_id: OP_ID,
+									capability_id: 'fixture.exec',
+									payload_hash: PAYLOAD_SHA,
+									policy_revision: 7,
+									approval_id: null
+								}
+				}
+			]
+		};
+		if (scenario === 'approval') {
+			approvals[APPROVAL_ID] = {
+				approval_id: APPROVAL_ID,
+				capability_id: 'fixture.exec',
+				server_id: SERVER_A,
+				payload_hash: PAYLOAD_SHA,
+				policy_revision: 7,
+				status: 'pending',
+				created_by: 'fixture-admin',
+				created_at: '2026-10-16T09:01:30Z',
+				expires_at: '2026-10-16T10:01:30Z',
+				consumed_by: null,
+				consumed_at: null
+			};
+		}
+	}
+
+	let failNextRead = null;
+	let decideFailure = null;
+	let cancelOutcome = null;
+
+	const api = {
+		async submitMessage(payload) {
+			const wire = JSON.parse(JSON.stringify(payload));
+			calls.push({ op: 'submitMessage', payload: wire });
+			consumeReadFailure();
+			// Producer strictness mirrors (mai.api.chat submit_message).
+			if (!UUID_RE.test(String(payload.run_id))) {
+				throw new ApiError(422, 'validation_failed', 'run_id must be a canonical UUID string');
+			}
+			if (payload.server_id !== SERVER_A && payload.server_id !== SERVER_B) {
+				throw new ApiError(404, 'not_found', 'no canonical profile for the target server');
+			}
+			if (typeof payload.message !== 'string' || payload.message.length === 0) {
+				throw new ApiError(422, 'validation_failed', 'message failed validation', '', { message: 'min_length' });
+			}
+			if (Array.isArray(payload.children) && payload.children.length > 8) {
+				throw new ApiError(422, 'validation_failed', 'children failed validation', '', { children: 'max_items' });
+			}
+			const runId = String(payload.run_id);
+			const serverId = String(payload.server_id);
+			const childIds = (payload.children ?? []).map(() => childId());
+			const rows = childIds.map((id) => childRow(id, runId, 'queued', serverId));
+			const attachments = (payload.attachments ?? []).map((one) => ({
+				server_id: serverId,
+				op_id: String(one.op_id),
+				sha256: ATTACHMENT_SHA,
+				bytes: 1234
+			}));
+			const conversation = runRow(runId, serverId, 'running', {
+				requested_grants: payload.capabilities ?? [],
+				children: rows,
+				attachments
+			});
+			conversations[runId] = conversation;
+			submissions.push({ payload: wire, childIds });
+			return { conversation: clone(conversation), deduplicated: false };
+		},
+		async listConversations(serverId, page) {
+			calls.push({ op: 'listConversations', serverId, payload: page ?? {} });
+			consumeReadFailure();
+			const rows = Object.values(conversations)
+				.filter((row) => row.server_id === serverId)
+				.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at));
+			return {
+				conversations: clone(rows),
+				limit: page?.limit ?? 20,
+				offset: page?.offset ?? 0,
+				total: rows.length
+			};
+		},
+		async readConversation(runId) {
+			calls.push({ op: 'readConversation', runId });
+			consumeReadFailure();
+			const row = conversations[runId];
+			if (!row) throw new ApiError(404, 'not_found', 'no run stored for this run id');
+			return clone(row);
+		},
+		async cancelConversation(runId, payload) {
+			calls.push({ op: 'cancelConversation', runId, payload: JSON.parse(JSON.stringify(payload)) });
+			if (!conversations[runId]) throw new ApiError(404, 'not_found', 'no run stored for this run id');
+			// Producer strictness: the explicit tree-cancel body is REQUIRED.
+			if (payload.cancel_children !== true) {
+				throw new ApiError(422, 'validation_failed', 'cancel_children must be true');
+			}
+			if (conversations[runId].cancel_requested_at === null) {
+				conversations[runId].cancel_requested_at = '2026-10-16T09:05:00Z';
+			}
+			const outcome = cancelOutcome;
+			cancelOutcome = null;
+			return {
+				run_id: runId,
+				state: conversations[runId].state,
+				outcome,
+				requested_at: '2026-10-16T09:05:00Z',
+				outcome_at: null,
+				requested_now: true,
+				unresolved_seqs: []
+			};
+		},
+		async streamConversationEvents(runId, options) {
+			calls.push({ op: 'streamConversationEvents', runId, cursor: options.cursor ?? null });
+			streams.push({ runId, cursor: options.cursor ?? null });
+			return subscribeEvents(
+				'/api/v1/chat/runs/' + encodeURIComponent(runId) + '/events',
+				options
+			);
+		},
+		async readRun(runId) {
+			calls.push({ op: 'readRun', runId });
+			consumeReadFailure();
+			const detail = runDetails[runId];
+			if (detail) return clone(detail);
+			const row = conversations[runId];
+			if (!row) throw new ApiError(404, 'not_found', 'no run stored for this run id');
+			return Object.assign(clone(row), { steps: [] });
+		},
+		async readApproval(approvalId) {
+			calls.push({ op: 'readApproval', runId: approvalId });
+			consumeReadFailure();
+			const row = approvals[approvalId];
+			if (!row) throw new ApiError(404, 'not_found', 'no approval record for this id');
+			return clone(row);
+		},
+		async decideApproval(approvalId, payload) {
+			const wire = JSON.parse(JSON.stringify(payload));
+			calls.push({ op: 'decideApproval', runId: approvalId, payload: wire });
+			if (decideFailure) {
+				const failure = decideFailure;
+				decideFailure = null;
+				throw new ApiError(failure.status, failure.code, failure.message);
+			}
+			const row = approvals[approvalId];
+			if (!row) throw new ApiError(404, 'not_found', 'no approval record for this id');
+			if (row.status !== 'pending') {
+				throw new ApiError(409, 'already_consumed', 'decision already consumed');
+			}
+			// The binding is confirmed field-for-field (C03 rule 4).
+			if (
+				payload.capability_id !== row.capability_id ||
+				payload.server_id !== row.server_id ||
+				payload.payload_hash !== row.payload_hash ||
+				payload.policy_revision !== row.policy_revision
+			) {
+				throw new ApiError(409, 'payload_mismatch', 'presented binding mismatches the approval');
+			}
+			row.status = 'consumed';
+			row.consumed_by = 'fixture-admin';
+			row.consumed_at = '2026-10-16T09:06:00Z';
+			return clone(row);
+		}
+	};
+
+	const services = chatServices(api);
+
+	const sibling = createRawSnippet(() => {
+		return {
+			render: () =>
+				'<div class="mai-sibling" data-testid="sibling-panel">' +
+				'<p>Sibling fixture panel — benign, no domain data.</p>' +
+				'<button type="button" data-testid="sibling-interactions">Sibling interactions: 0</button>' +
+				'</div>',
+			setup: (root) => {
+				const button = root.querySelector('button');
+				let count = 0;
+				const onClick = () => {
+					count += 1;
+					button.textContent = 'Sibling interactions: ' + count;
+				};
+				button.addEventListener('click', onClick);
+				return () => button.removeEventListener('click', onClick);
+			}
+		};
+	});
+
+	const registryResult = createPanelRegistry([
+		chatEntry(),
+		{
+			panel_kind: 'fixture-notes',
+			title: 'Notes',
+			scope_types: ['server'],
+			component: () => Promise.resolve(sibling)
+		}
+	]);
+	if (!registryResult.ok) throw new Error('fixture registry rejected: ' + registryResult.issue.code);
+	const registry = registryResult.value;
+
+	let showMain = $state(true);
+	let showSecond = $state(true);
+
+	const WINDOWS = {
+		main: '6a6b7c8d-9e0f-4a1b-8c3d-4e5f6a7b8c9d',
+		second: '7b7c8d9e-0f1a-4b2c-9d4e-5f6a7b8c9d0e',
+		bare: '8c8d9e0f-1a2b-4c3d-8e5f-6a7b8c9d0e1f',
+		global: '9d9e0f1a-2b3c-4d4e-9f6a-7b8c9d0e1f2a',
+		sibling: 'a0af1b2c-3d4e-4e5f-8a7b-8c9d0e1f2a3b'
+	};
+
+	function descriptor(windowId, scope, z) {
+		return {
+			schema_version: 1,
+			window_id: windowId,
+			panel_kind: 'chat',
+			scope,
+			geometry: { x: 8, y: 8, width: 780, height: 620 },
+			presentation: 'normal',
+			z,
+			title_override: null
+		};
+	}
+
+	const descriptorSibling = {
+		schema_version: 1,
+		window_id: WINDOWS.sibling,
+		panel_kind: 'fixture-notes',
+		scope: { kind: 'server', server_id: '${SERVER_A}' },
+		geometry: { x: 16, y: 16, width: 320, height: 240 },
+		presentation: 'normal',
+		z: 5,
+		title_override: null
+	};
+
+	window.__maiChatApi = {
+		calls,
+		streams,
+		submissions,
+		setConversationState(runId, state) {
+			if (!conversations[runId]) throw new Error('no such fixture conversation');
+			conversations[runId].state = state;
+			conversations[runId].updated_at = '2026-10-16T09:07:00Z';
+		},
+		armCancel(outcome) {
+			cancelOutcome = outcome;
+		},
+		failNextRead(failure) {
+			failNextRead = failure;
+		},
+		armDecideFailure(failure) {
+			decideFailure = failure;
+		},
+		toggleMain(on) {
+			showMain = on;
+		},
+		toggleSecond(on) {
+			showSecond = on;
+		},
+		registry: {
+			kinds: Array.from(registry.knownPanelKinds()).sort(),
+			checkScope(kind, scope) {
+				const result = registry.checkScope(kind, scope);
+				return result.ok ? { ok: true } : { ok: false, code: result.issue.code };
+			},
+			defaultGeometry(kind) {
+				return registry.defaultGeometry(kind);
+			},
+			minGeometry(kind) {
+				return registry.minGeometry(kind);
+			}
+		}
+	};
+</script>
+
+<section data-testid="host-main" aria-label="Host main">
+	<ComponentHost label="Host main">
+		{#if showMain}
+			<PanelHost
+				{registry}
+				descriptor={descriptor(WINDOWS.main, { kind: 'server', server_id: '${SERVER_A}' }, 1)}
+				services={services}
+			/>
+		{/if}
+	</ComponentHost>
+</section>
+<section data-testid="host-second" aria-label="Host second">
+	<ComponentHost label="Host second">
+		{#if showSecond}
+			<PanelHost
+				{registry}
+				descriptor={descriptor(WINDOWS.second, { kind: 'server', server_id: '${SERVER_B}' }, 2)}
+				services={services}
+			/>
+		{/if}
+	</ComponentHost>
+</section>
+<section data-testid="host-bare" aria-label="Host bare">
+	<ComponentHost label="Host bare">
+		<PanelHost
+			{registry}
+			descriptor={descriptor(WINDOWS.bare, { kind: 'server', server_id: '${SERVER_A}' }, 3)}
+		/>
+	</ComponentHost>
+</section>
+<section data-testid="host-global" aria-label="Host global">
+	<ComponentHost label="Host global">
+		<PanelHost
+			{registry}
+			descriptor={descriptor(WINDOWS.global, { kind: 'global' }, 4)}
+			services={services}
+		/>
+	</ComponentHost>
+</section>
+<section data-testid="host-sibling" aria-label="Host sibling">
+	<ComponentHost label="Host sibling">
+		<PanelHost {registry} descriptor={descriptorSibling} />
+	</ComponentHost>
+</section>
+`;
+
+const ENTRY_SOURCE = `
+import { mount } from 'svelte';
+import App from '${APP_ID}';
+import '${TOKENS}';
+mount(App, { target: document.getElementById('app') });
+`;
+
+// ---------------------------------------------------------------------------
+// Event-stream wire control (real fetch, answered by route handlers)
+// ---------------------------------------------------------------------------
+
+interface StreamFrame {
+	seq: number;
+	type: string;
+	data?: Record<string, unknown>;
+}
+
+interface StreamSession {
+	/** Frames to deliver before the stream closes; empty for a bare close. */
+	frames?: StreamFrame[];
+	/** Reject the connection (API restart / network failure) instead of closing. */
+	abort?: boolean;
+	/**
+	 * Deliver EVERY queued frame regardless of the recorded cursor. The
+	 * reviewed producer is cursor-exclusive; a connection that re-delivers
+	 * anyway (proxy replay, buggy cursor) must still be deduplicated by the
+	 * consumer watermark — the reconnect test drives exactly that.
+	 */
+	replayAll?: boolean;
+}
+
+let streamSessions: StreamSession[] = [];
+let streamRequests: Array<{ runId: string; cursor: string | null; path: string }> = [];
+/** Requests held open because no session was queued yet (the loop pauses). */
+let heldStreamRoutes: Array<{ route: Route; runId: string; cursor: string | null }> = [];
+
+function frame(seq: number, type: string, data: Record<string, unknown>): StreamFrame {
+	return { seq, type, data };
+}
+
+function sseBody(runId: string, frames: StreamFrame[], cursor: string | null): string {
+	// Producer replay semantics: only frames strictly after the cursor travel
+	// on a resumed subscription (C08 rule 7). The consumer watermark is the
+	// second line of defense and is proven separately.
+	const after = frames.filter((one) => cursor === null || one.seq > Number(cursor));
+	return after
+		.map(
+			(one) =>
+				`id: ${one.seq}\n` +
+				`data: ${JSON.stringify({
+					seq: one.seq,
+					run_id: runId,
+					ts: '2026-10-16T10:00:00Z',
+					type: one.type,
+					v: 1,
+					data: one.data ?? {}
+				})}\n\n`
+		)
+		.join('');
+}
+
+function fulfillStream(
+	route: Route,
+	session: StreamSession,
+	runId: string,
+	cursor: string | null
+): Promise<void> {
+	return route.fulfill({
+		status: 200,
+		contentType: 'text/event-stream',
+		headers: { 'cache-control': 'no-store' },
+		body: sseBody(runId, session.frames ?? [], session.replayAll ? null : cursor)
+	});
+}
+
+/**
+ * One SSE request: recorded (run id, cursor, path), then either answered
+ * from the queued session or held open — a held request blocks the view's
+ * await, which keeps the reconnect loop deterministic between sessions.
+ */
+async function handleEventStream(route: Route): Promise<void> {
+	const url = new URL(route.request().url());
+	const match = url.pathname.match(/^\/api\/v1\/chat\/runs\/([^/]+)\/events$/);
+	if (!match) {
+		await route.abort();
+		return;
+	}
+	const cursor = route.request().headers()['last-event-id'] ?? null;
+	streamRequests.push({ runId: match[1], cursor, path: url.pathname });
+	const session = streamSessions.shift();
+	if (session) {
+		if (session.abort) await route.abort();
+		else await fulfillStream(route, session, match[1], cursor);
+		return;
+	}
+	heldStreamRoutes.push({ route, runId: match[1], cursor });
+}
+
+/**
+ * Queue TWO copies of the session: both live subscribers of the root stream
+ * (the panel fold and the composed tree fold) each consume one. Each keeps
+ * its own watermark, so identical frames are applied exactly once per view.
+ */
+function queueStreamPair(session: StreamSession): void {
+	queueStreamSession(session);
+	queueStreamSession(session);
+}
+
+/** Queue a session and release the oldest held request with it. */
+function queueStreamSession(session: StreamSession): void {
+	streamSessions.push(session);
+	const held = heldStreamRoutes.shift();
+	if (!held) return;
+	const next = streamSessions.shift();
+	if (!next) {
+		heldStreamRoutes.unshift(held);
+		return;
+	}
+	void (next.abort
+		? held.route.abort()
+		: fulfillStream(held.route, next, held.runId, held.cursor)
+	).catch(() => {
+		// The page may have moved on between queueing and releasing; the
+		// assertion on the recorded requests is the source of truth.
+	});
+}
+
+/** Recorded stream requests, awaited between steps (no fixed sleeps). */
+async function waitForStreamRequests(count: number): Promise<void> {
+	await expect
+		.poll(() => streamRequests.length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(count);
+}
+
+// ---------------------------------------------------------------------------
+
+/** Serves the virtual modules and the built lazy chunks; nothing hits disk. */
+function harnessPlugin(sources: Record<string, string>): Plugin {
+	return {
+		name: 'mai-chat-harness',
+		resolveId(id) {
+			// .svelte virtual modules must NOT get the conventional `\0` prefix:
+			// vite-plugin-svelte excludes `\0` ids from Svelte compilation
+			// (panel-host harness convention). The JS entry keeps the `\0`.
+			if (id === APP_ID) return id;
+			if (id === ENTRY_ID) return `\\0${id}`;
+			return undefined;
+		},
+		load(id) {
+			if (id === APP_ID) return sources[APP_ID];
+			if (id === `\\0${ENTRY_ID}`) return sources[ENTRY_ID];
+			return undefined;
+		}
+	};
+}
+
+/** Built lazy chunks (the entry's real dynamic panel import), served by name. */
+let chunks: Array<{ fileName: string; code: string }> = [];
+
+test.beforeAll(async () => {
+	const sources: Record<string, string> = {
+		[APP_ID]: APP_SOURCE,
+		[ENTRY_ID]: ENTRY_SOURCE
+	};
+	const result = await build({
+		configFile: false,
+		root: FRONTEND_ROOT,
+		logLevel: 'error',
+		plugins: [svelte(), harnessPlugin(sources)],
+		build: {
+			write: false,
+			emptyOutDir: true,
+			cssCodeSplit: false,
+			outDir: 'node_modules/.mai-chat-fixture',
+			rollupOptions: {
+				input: ENTRY_ID,
+				output: {
+					entryFileNames: 'demo.js',
+					chunkFileNames: 'chat-[hash].js',
+					assetFileNames: 'demo[extname]'
+				}
+			}
+		}
+	});
+
+	// `build()` is one-shot (no watcher configured); structural boundary type.
+	const built = result as BuiltBundle | BuiltBundle[];
+	const outputs = Array.isArray(built) ? built : [built];
+	chunks = [];
+	harnessJs = '';
+	harnessCss = '';
+	for (const { output } of outputs) {
+		for (const item of output) {
+			if (item.type === 'chunk') {
+				if (item.isEntry) harnessJs += item.code;
+				else chunks.push({ fileName: item.fileName, code: item.code });
+			} else if (item.fileName.endsWith('.css')) {
+				harnessCss += String(item.source);
+			}
+		}
+	}
+	if (!harnessJs || !harnessCss) {
+		throw new Error('harness bundle incomplete: missing JS entry chunk or CSS asset');
+	}
+	if (chunks.length === 0) {
+		throw new Error('harness bundle incomplete: the panel must build as a lazy chunk');
+	}
+});
+
+test.beforeEach(async ({ page }) => {
+	streamSessions = [];
+	streamRequests = [];
+	heldStreamRoutes = [];
+
+	const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MAI chat fixture</title>
+<link rel="stylesheet" href="${FIXTURE_URL}demo.css">
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="${FIXTURE_URL}demo.js"></script>
+</body>
+</html>`;
+
+	// Serve the virtual app; every non-fixture request aborts so the panel can
+	// never silently depend on some other origin.
+	await page.route('**/*', (route) => {
+		const { pathname } = new URL(route.request().url());
+		if (!pathname.startsWith(FIXTURE_URL)) return route.abort();
+		const rest = pathname.slice(FIXTURE_URL.length);
+		if (rest === '' || rest.endsWith('/')) {
+			return route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
+		}
+		if (rest === 'demo.js') {
+			return route.fulfill({ contentType: 'text/javascript; charset=utf-8', body: harnessJs });
+		}
+		if (rest === 'demo.css') {
+			return route.fulfill({ contentType: 'text/css; charset=utf-8', body: harnessCss });
+		}
+		const chunk = chunks.find((candidate) => candidate.fileName === rest);
+		if (chunk) {
+			return route.fulfill({ contentType: 'text/javascript; charset=utf-8', body: chunk.code });
+		}
+		return route.abort();
+	});
+	await page.route('**/api/v1/chat/runs/*/events', (route) => handleEventStream(route));
+	// Surface runtime failures in the receipt: an uncaught page error is a
+	// harness/component defect, never a silent pass.
+	page.on('pageerror', (error) => {
+		throw new Error(`fixture page error: ${error.message}`);
+	});
+});
+
+async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
+	await page.addInitScript((value) => {
+		window.__maiChatScenario = value;
+	}, scenario);
+	await page.goto(FIXTURE_URL);
+	await expect(page.getByTestId('host-main').getByTestId('chat-root')).toBeVisible();
+	await expect(page.getByTestId('host-second').getByTestId('chat-root')).toBeVisible();
+	return page;
+}
+
+/** Fill the MAIN compose form and submit; waits for the recorded call. */
+async function submitFromHost(page: Page, host: string, message: string): Promise<void> {
+	const scope = page.getByTestId(host);
+	await scope.getByTestId('compose-message').fill(message);
+	await scope.getByTestId('compose-profile').fill('fixture-fast');
+	await scope.getByTestId('chat-submit').click();
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(1);
+}
+
+test('submit pins the window scope; the recorded conversation renders transcript facts and the composed tree', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	const second = page.getByTestId('host-second');
+
+	// Boot: the two usable hosts read their OWN pinned scopes; nothing else.
+	await expect
+		.poll(async () => (await callsOf(page, 'listConversations')).map((call) => call.serverId).sort(), {
+			timeout: 15000
+		})
+		.toEqual([SERVER_A, SERVER_B]);
+	expect(await callsOf(page, 'submitMessage')).toHaveLength(0);
+	await expect(main.getByTestId('history-empty')).toBeVisible();
+
+	// Compose in MAIN: message, explicit profile, capability request (with a
+	// duplicate to prove dedup), TWO child tasks, one attachment reference.
+	await main.getByTestId('compose-message').fill('Review the fixture deployment end to end.');
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await main.getByTestId('compose-capabilities').fill('fixture.read, fixture.exec, fixture.read');
+	await main.getByTestId('compose-child-task').fill('child aspect-alpha review');
+	await main.getByTestId('child-add').click();
+	await main.getByTestId('compose-child-task').nth(1).fill('child aspect-beta review');
+	await main.getByTestId('compose-attachments').fill(OP_ID);
+	await main.getByTestId('chat-submit').click();
+
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(1);
+	const submissions = await callsOf(page, 'submitMessage');
+	const body = submissions[0].payload as Record<string, unknown>;
+	expect(body.server_id).toBe(SERVER_A);
+	expect(UUID_RE.test(String(body.run_id))).toBe(true);
+	expect(body.message).toBe('Review the fixture deployment end to end.');
+	expect(body.profile).toBe('fixture-fast');
+	expect(body.role).toBe('administrator');
+	expect(body.mode).toBe('ask');
+	expect(body.capabilities).toEqual(['fixture.read', 'fixture.exec']);
+	expect(body.children).toEqual([
+		{ task: 'child aspect-alpha review' },
+		{ task: 'child aspect-beta review' }
+	]);
+	expect(body.attachments).toEqual([{ server_id: SERVER_A, op_id: OP_ID }]);
+
+	// The recorded conversation renders: pinned target, opener message,
+	// recorded attachment handles (identity + integrity only).
+	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
+	await expect(main.getByTestId('conversation-target')).toContainText(SERVER_A.slice(0, 8));
+	await expect(main.getByTestId('conversation-message')).toHaveText(
+		'Review the fixture deployment end to end.'
+	);
+	const attachmentRow = main.getByTestId('attachment-row');
+	await expect(attachmentRow).toHaveCount(1);
+	await expect(attachmentRow.getByTestId('attachment-op')).toHaveText(OP_ID.slice(0, 8));
+	await expect(attachmentRow.getByTestId('attachment-sha')).toHaveText(
+		`sha256 ${ATTACHMENT_SHA.slice(0, 12)}`
+	);
+	await expect(attachmentRow.getByTestId('attachment-bytes')).toHaveText('1234 bytes');
+
+	// Stream the recorded facts (both live subscribers consume the pair).
+	const submission = await page.evaluate(() => {
+		const list = window.__maiChatApi!.submissions;
+		return list[list.length - 1];
+	});
+	await queueStreamPair({
+		frames: [
+			frame(1, 'chat.submitted', {
+				submission_sha256: PAYLOAD_SHA,
+				handler: 'agent.delegate',
+				children: 2,
+				attachments: [{ server_id: SERVER_A, op_id: OP_ID, sha256: ATTACHMENT_SHA, bytes: 1234 }]
+			}),
+			frame(2, 'agent.started', {
+				connection: 'fixture-gateway',
+				profile: 'fixture-fast',
+				model: 'fixture-model-mini',
+				role: 'administrator',
+				rounds_budget: 8
+			}),
+			frame(3, 'agent.context_assembled', {
+				prompt_revision: 1,
+				prompt_sha256: PAYLOAD_SHA,
+				profile_revision: 3,
+				profile_sha256: PAYLOAD_SHA,
+				connection_revision: 2,
+				profile_model_revision: 1,
+				truncated: false,
+				budget: { context_limit_tokens: 8192, used_chars: 900 },
+				evidence_items: 1
+			}),
+			frame(4, 'agent.delegation_planned', {
+				children: submission.childIds,
+				depth: 1
+			}),
+			frame(5, 'agent.model_round', {
+				round: 1,
+				status: 'tool_calls',
+				tool_calls: [{ seq: 1, capability_id: 'fixture.exec', payload_hash: PAYLOAD_SHA }]
+			})
+		]
+	});
+	const transcript = main.getByTestId('transcript-list');
+	// The planned event (seq 4) carries no transcript entry of its own — it
+	// links this window's child-task labels to the value-free child ids.
+	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(4);
+	await expect(transcript.getByTestId('transcript-label')).toContainText([
+		'Model bound',
+		'Round 1 — tool calls requested'
+	]);
+	await expect(transcript.getByTestId('transcript-value')).toContainText([
+		'fixture-model-mini',
+		PAYLOAD_SHA.slice(0, 12)
+	]);
+	// The requested capability renders as the row KEY of the round entry.
+	await expect(transcript.getByText('fixture.exec')).toBeVisible();
+
+	// The composed (not re-implemented) tree shows both children with the
+	// labels this window authored, linked through the planned event order.
+	const tree = main.getByTestId('conversation-children');
+	await expect(tree).toBeVisible();
+	await expect(tree.getByText('child aspect-alpha review')).toBeVisible();
+	await expect(tree.getByText('child aspect-beta review')).toBeVisible();
+
+	// The SECOND window pins ITS OWN scope: its submit carries SERVER_B and a
+	// different idempotency key — no hidden global current-server target.
+	await second.getByTestId('compose-message').fill('Second window task');
+	await second.getByTestId('compose-profile').fill('fixture-fast');
+	await second.getByTestId('chat-submit').click();
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(2);
+	const allSubmissions = await callsOf(page, 'submitMessage');
+	const secondBody = allSubmissions[1].payload as Record<string, unknown>;
+	expect(secondBody.server_id).toBe(SERVER_B);
+	expect(secondBody.run_id).not.toBe(body.run_id);
+});
+
+test('hostile stream content renders inert; the context body never reaches the DOM', async ({
+	page
+}) => {
+	await openFixture(page, 'replay');
+	const main = page.getByTestId('host-main');
+
+	// Open the recorded conversation from history (no authored labels here).
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('conversation-id')).toBeVisible();
+
+	// Round 1: benign value-free facts.
+	await queueStreamPair({
+		frames: [
+			frame(1, 'chat.submitted', { submission_sha256: PAYLOAD_SHA, handler: 'agent.run', children: 0, attachments: [] }),
+			frame(2, 'agent.started', {
+				connection: 'fixture-gateway',
+				profile: 'fixture-fast',
+				model: 'fixture-model-mini',
+				role: 'administrator',
+				rounds_budget: 8
+			})
+		]
+	});
+	const transcript = main.getByTestId('transcript-list');
+	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(2);
+
+	// Wait for the reconnects to be parked (the run still reads `running`,
+	// so both loops stay alive), THEN record the terminal state and deliver
+	// the hostile round: the durable refresh flips the badge afterwards.
+	await waitForStreamRequests(4);
+	await page.evaluate(() => window.__maiChatApi!.setConversationState('aa111111-1111-4222-8333-444455556666', 'failed'));
+	await queueStreamPair({
+		frames: [
+			frame(3, 'step.completed', {
+				capability_id: 'fixture.exec',
+				reason: HOSTILE_TOOL_TEXT,
+				op_id: OP_ID
+			}),
+			frame(4, 'agent.failed', { reason: HOSTILE_FAILURE })
+		]
+	});
+	await expect(transcript.getByTestId('transcript-value')).toContainText([
+		'MAI-FIXTURE-HOSTILE-TOOL-TEXT',
+		'fixture_denial'
+	]);
+
+	// The hostile content is TEXT, never markup: no injected elements, no
+	// executed handlers (sanitization negative control, brief acceptance 2).
+	await expect(transcript.locator('img')).toHaveCount(0);
+	await expect(transcript.locator('script')).toHaveCount(0);
+	expect(await page.evaluate(() => window.__maiPwned)).toBeUndefined();
+
+	// The wire-invisible context body never appears anywhere in the DOM.
+	const bodyText = await page.evaluate(() => document.body.textContent ?? '');
+	expect(bodyText.includes('MAI-FIXTURE-CANARY-context-body-NEVER-DISPLAY')).toBe(false);
+});
+
+test('reconnect resumes from Last-Event-ID; the watermark deduplicates replayed frames', async ({
+	page
+}) => {
+	await openFixture(page, 'replay');
+	const main = page.getByTestId('host-main');
+	await main.getByTestId('history-open').first().click();
+
+	// Round 1 (fresh subscriptions, cursor absent).
+	await queueStreamPair({
+		frames: [
+			frame(1, 'chat.submitted', { submission_sha256: PAYLOAD_SHA, handler: 'agent.run', children: 0, attachments: [] }),
+			frame(2, 'agent.started', {
+				connection: 'fixture-gateway',
+				profile: 'fixture-fast',
+				model: 'fixture-model-mini',
+				role: 'administrator',
+				rounds_budget: 8
+			}),
+			frame(3, 'agent.context_assembled', { prompt_revision: 1, truncated: false, evidence_items: 0 }),
+			frame(4, 'agent.model_round', {
+				round: 1,
+				status: 'tool_calls',
+				tool_calls: [{ seq: 1, capability_id: 'fixture.read', payload_hash: PAYLOAD_SHA }]
+			})
+		]
+	});
+	const transcript = main.getByTestId('transcript-list');
+	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(4);
+
+	// Both subscribers saw the bounded close and resumed with the cursor:
+	// the bag records the replay cursor per call, the route handler records
+	// the actual Last-Event-ID header that traveled on the wire.
+	await waitForStreamRequests(4);
+	await expect
+		.poll(
+			async () =>
+				(await callsOf(page, 'streamConversationEvents')).filter((call) => call.cursor === '4')
+					.length,
+			{ timeout: 15000 }
+		)
+		.toBeGreaterThanOrEqual(1);
+	const headerCarry = streamRequests.filter((one) => one.cursor === '4');
+	expect(headerCarry.length).toBeGreaterThanOrEqual(1);
+
+	// Round 2: a connection that re-delivers the ALREADY-SEEN seq 4 next to
+	// the new seq 5. The cursor-exclusivity the producer froze is what keeps
+	// honest replays bounded; the consumer watermark is the second line of
+	// defense — the duplicate must be dropped, the new frame applied once.
+	await queueStreamPair({
+		replayAll: true,
+		frames: [
+			frame(4, 'agent.model_round', {
+				round: 1,
+				status: 'tool_calls',
+				tool_calls: [{ seq: 1, capability_id: 'fixture.read', payload_hash: PAYLOAD_SHA }]
+			}),
+			frame(5, 'agent.model_round', { round: 1, status: 'final', output_chars: 42 })
+		]
+	});
+	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(5);
+	await expect(transcript.getByTestId('transcript-label')).toContainText([
+		'Round 1 — final answer recorded'
+	]);
+	const seqs = await transcript.getByTestId('transcript-entry').evaluateAll((entries) =>
+		entries.map((entry) => entry.getAttribute('data-seq'))
+	);
+	expect(new Set(seqs).size).toBe(seqs.length);
+	expect(seqs).toContain('5');
+});
+
+test('approval path: the receipt binding renders field-for-field and the one-use decision consumes', async ({
+	page
+}) => {
+	await openFixture(page, 'approval');
+	const main = page.getByTestId('host-main');
+
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('conversation-state')).toHaveText('Waiting for approval decision');
+
+	const section = main.getByTestId('approval-section');
+	await expect(section).toBeVisible();
+	await expect(section.getByTestId('approval-absent')).toHaveCount(0);
+	await expect(section.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
+	await expect(section.getByTestId('approval-capability')).toHaveText('fixture.exec');
+	await expect(section.getByTestId('approval-server')).toHaveText(SERVER_A.slice(0, 8));
+	await expect(section.getByTestId('approval-hash')).toHaveText(PAYLOAD_SHA);
+	await expect(section.getByTestId('approval-revision')).toHaveText('7');
+
+	await section.getByTestId('approval-decide').click();
+	await expect(section.getByTestId('approval-spent')).toContainText('Decision consumed');
+	await expect(section.getByTestId('approval-decide')).toHaveCount(0);
+	const decisions = await callsOf(page, 'decideApproval');
+	expect(decisions).toHaveLength(1);
+	expect(decisions[0].payload).toEqual({
+		capability_id: 'fixture.exec',
+		server_id: SERVER_A,
+		payload_hash: PAYLOAD_SHA,
+		policy_revision: 7
+	});
+});
+
+test('a refused one-use decision renders honestly and never invents a consume', async ({ page }) => {
+	await openFixture(page, 'approval');
+	const main = page.getByTestId('host-main');
+	await page.evaluate(() =>
+		window.__maiChatApi!.armDecideFailure({
+			status: 409,
+			code: 'already_consumed',
+			message: 'decision already consumed'
+		})
+	);
+
+	await main.getByTestId('history-open').first().click();
+	const section = main.getByTestId('approval-section');
+	await expect(section.getByTestId('approval-decide')).toBeVisible();
+
+	await section.getByTestId('approval-decide').click();
+	await expect(section.getByTestId('approval-error')).toContainText('already consumed');
+	await expect(section.getByTestId('approval-spent')).toHaveCount(0);
+	expect((await callsOf(page, 'decideApproval')).length).toBe(1);
+
+	// The control recovers (busy state cleared); the admin may honestly retry,
+	// and the refusal repeats while the recorded approval stays unconsumed.
+	await page.evaluate(() =>
+		window.__maiChatApi!.armDecideFailure({
+			status: 409,
+			code: 'already_consumed',
+			message: 'decision already consumed'
+		})
+	);
+	await section.getByTestId('approval-decide').click();
+	await expect(section.getByTestId('approval-error')).toContainText('already consumed');
+	expect((await callsOf(page, 'decideApproval')).length).toBe(2);
+	// The recorded approval was never consumed by a refused attempt.
+	const stored = await page.evaluate(() => {
+		const calls = window.__maiChatApi!.calls;
+		return calls.filter((call) => call.op === 'readApproval').length >= 1;
+	});
+	expect(stored).toBe(true);
+});
+
+test('no bound decision record renders an honest absent state with the recorded denial', async ({
+	page
+}) => {
+	await openFixture(page, 'approval-absent');
+	const main = page.getByTestId('host-main');
+
+	await main.getByTestId('history-open').first().click();
+	const section = main.getByTestId('approval-section');
+	await expect(section).toBeVisible();
+	await expect(section.getByTestId('approval-absent')).toBeVisible();
+	await expect(section.getByTestId('approval-decide')).toHaveCount(0);
+
+	// The recorded denial of the un-approved action shows as a value-free
+	// tool outcome (the producer's stable reason), not as a fake success.
+	await queueStreamPair({
+		frames: [
+			frame(1, 'step.completed', {
+				capability_id: 'fixture.exec',
+				reason: 'approval_required_but_absent',
+				op_id: OP_ID
+			})
+		]
+	});
+	const transcript = main.getByTestId('transcript-list');
+	await expect(transcript.getByTestId('transcript-value')).toContainText([
+		'approval_required_but_absent'
+	]);
+	await expect(section.getByTestId('approval-absent')).toBeVisible();
+});
+
+test('mount reads only; unmount submits nothing; sibling drives no traffic', async ({ page }) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// Boot: reads only.
+	expect((await callsOf(page, 'submitMessage')).length).toBe(0);
+	expect((await callsOf(page, 'cancelConversation')).length).toBe(0);
+	expect((await callsOf(page, 'decideApproval')).length).toBe(0);
+
+	// One deliberate submit, then close the window content: the teardown must
+	// record no further mutation and release the subscriptions.
+	await submitFromHost(page, 'host-main', 'Watch me close without side effects.');
+	const mutationsAfterSubmit = await page.evaluate(() =>
+		window.__maiChatApi!.calls.filter((call) =>
+			['submitMessage', 'cancelConversation', 'decideApproval'].includes(call.op)
+		).length
+	);
+	await page.evaluate(() => window.__maiChatApi!.toggleMain(false));
+	await expect(main.getByTestId('chat-root')).toHaveCount(0);
+	await page.evaluate(() => window.__maiChatApi!.toggleMain(true));
+	await expect(main.getByTestId('chat-root')).toBeVisible();
+	expect(
+		await page.evaluate(
+			() =>
+				window.__maiChatApi!.calls.filter((call) =>
+					['submitMessage', 'cancelConversation', 'decideApproval'].includes(call.op)
+				).length
+		)
+	).toBe(mutationsAfterSubmit);
+
+	// Reopen remounted the panel, which re-reads its scope — but still never
+	// submits, cancels or decides on its own.
+	await expect
+		.poll(async () => (await callsOf(page, 'listConversations')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(3);
+
+	// The benign sibling panel drives zero conversation traffic.
+	const callsBefore = await page.evaluate(() => window.__maiChatApi!.calls.length);
+	const siblingButton = page.getByTestId('host-sibling').getByTestId('sibling-interactions');
+	await siblingButton.click();
+	await expect(siblingButton).toHaveText('Sibling interactions: 1');
+	expect(await page.evaluate(() => window.__maiChatApi!.calls.length)).toBe(callsBefore);
+});
+
+test('fail-closed without services; wrong scope refused; the feature entry validates in the registry', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+
+	// BARE host: no services bag ⇒ visible config error, zero requests.
+	const bare = page.getByTestId('host-bare');
+	await expect(bare.getByTestId('panel-config-error')).toBeVisible();
+
+	// GLOBAL host: a server-only entry is refused at the kind gate — the
+	// panel body never mounts (C11 scope validation).
+	const globalHost = page.getByTestId('host-global');
+	await expect(globalHost.getByTestId('panel-unavailable')).toHaveAttribute(
+		'data-reason',
+		'scope_kind_not_allowed'
+	);
+	await expect(globalHost.getByTestId('chat-root')).toHaveCount(0);
+
+	// Only the two usable hosts ever called; each with its own pinned scope.
+	await expect
+		.poll(async () => (await callsOf(page, 'listConversations')).map((call) => call.serverId).sort(), {
+			timeout: 15000
+		})
+		.toEqual([SERVER_A, SERVER_B]);
+
+	// The real registry knows the entry: server scopes are allowed, a pinned
+	// CONVERSATION object is allowed (the panel composes conversations), a
+	// foreign object pin is refused at the kind gate, and so is the global
+	// scope; geometry is pinned by the entry.
+	const probe = await page.evaluate((pin) => {
+		const api = window.__maiChatApi!;
+		return {
+			kinds: api.registry.kinds,
+			serverScope: api.registry.checkScope('chat', { kind: 'server', server_id: pin.server }),
+			conversationPin: api.registry.checkScope('chat', {
+				kind: 'server',
+				server_id: pin.server,
+				object: { kind: 'conversation', id: pin.run }
+			}),
+			foreignPin: api.registry.checkScope('chat', {
+				kind: 'server',
+				server_id: pin.server,
+				object: { kind: 'run', id: pin.run }
+			}),
+			globalScope: api.registry.checkScope('chat', { kind: 'global' }),
+			defaultGeometry: api.registry.defaultGeometry('chat'),
+			minGeometry: api.registry.minGeometry('chat')
+		};
+	}, { server: SERVER_A, run: ROOT });
+	expect(probe.kinds).toContain('chat');
+	expect(probe.serverScope).toEqual({ ok: true });
+	expect(probe.conversationPin).toEqual({ ok: true });
+	expect(probe.foreignPin).toEqual({ ok: false, code: 'scope_object_kind_not_allowed' });
+	expect(probe.globalScope).toEqual({ ok: false, code: 'scope_kind_not_allowed' });
+	expect(probe.defaultGeometry).toEqual({ x: 48, y: 72, width: 780, height: 620 });
+	expect(probe.minGeometry).toEqual({ x: 0, y: 0, width: 480, height: 360 });
+});
+
+test('compose validation stays local; a finished conversation replays without invented labels', async ({
+	page
+}) => {
+	await openFixture(page, 'history');
+	const main = page.getByTestId('host-main');
+
+	// Empty compose: the local pre-flight blocks the request entirely.
+	await main.getByTestId('chat-submit').click();
+	await expect(main.getByText('A message is required.')).toBeVisible();
+	expect((await callsOf(page, 'submitMessage')).length).toBe(0);
+
+	// A malformed attachment reference is a local error too (no request).
+	await main.getByTestId('compose-message').fill('Hostile attachments are refused locally.');
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await main.getByTestId('compose-attachments').fill('not-a-uuid');
+	await main.getByTestId('chat-submit').click();
+	await expect(
+		main.getByText('Attachment references must be canonical op ids (UUIDs).')
+	).toBeVisible();
+	expect((await callsOf(page, 'submitMessage')).length).toBe(0);
+
+	// Open the recorded conversation: the wire carries no task bodies, so the
+	// message reads as the honest unknown and the child renders as an id.
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('conversation-id')).toBeVisible();
+	await expect(main.getByTestId('conversation-message')).toHaveText(
+		'Authored outside this window — the wire carries no task bodies.'
+	);
+
+	await page.evaluate((runId) =>
+		window.__maiChatApi!.setConversationState(runId, 'succeeded'), HISTORY_RUN);
+	await queueStreamPair({
+		frames: [
+			frame(1, 'chat.submitted', { submission_sha256: PAYLOAD_SHA, handler: 'agent.run', children: 0, attachments: [{}] }),
+			frame(2, 'agent.started', {
+				connection: 'fixture-gateway',
+				profile: 'fixture-fast',
+				model: 'fixture-model-mini',
+				role: 'administrator',
+				rounds_budget: 8
+			}),
+			frame(3, 'agent.model_round', { round: 2, status: 'final', output_chars: 42 }),
+			frame(4, 'agent.completed', { rounds: 2, tool_calls: 1, output_chars: 42 })
+		]
+	});
+	const transcript = main.getByTestId('transcript-list');
+	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(4);
+	await expect(transcript.getByTestId('transcript-value')).toContainText([
+		'held in the durable run history — the wire carries no reply text',
+		'42'
+	]);
+	await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+
+	// The tree shows the child identity; no invented task label exists.
+	const tree = main.getByTestId('conversation-children');
+	await expect(tree.getByText(CHILD_A.slice(0, 8))).toBeVisible();
+	await expect(tree.getByText('aspect-alpha review')).toHaveCount(0);
+});
