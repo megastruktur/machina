@@ -1,0 +1,85 @@
+# mai-07-retrieval — negative controls (2026-10-16)
+
+Real safety/behavior boundaries only. Each control names the boundary,
+the exact probe and the observed result.
+
+## 1. Cross-server leakage (KB-FILTER, storage boundary)
+
+- Probe: index the SAME document identity
+  (`9d8c7b6a-5e4f-4a3b-2c1d-0e9f8a7b6c5d`, revision 1) for two fixture
+  servers with conflicting content ("alfasecret-a …" vs "bravosecret-b
+  …") plus a shared doc; query each server scope through the actual
+  capability and CLI.
+- Result: server-A results contain only the server-A sha256
+  (`c0dcaaad…`), server-B only `eee352fa…`; citation tuples disjoint;
+  CLI transcript in `01-commands.txt`.
+
+## 2. Shared namespace requires explicit scope
+
+- Probe: server-scope queries for the shared doc's distinctive term
+  (`sharedgamma`, `limit=20`).
+- Result: the shared doc never appears (`server_id IS NULL` cannot
+  satisfy the server predicate); `--shared` returns exactly the shared
+  doc with `"server_id": null`.
+
+## 3. Payload cannot name a target (C03 rule 2)
+
+- Probe: bridge tool call with `{"query": "…", "scope": "server",
+  "server_id": "<server-B uuid>"}` from a server-A context.
+- Result: `status="denied"`, `error.code="payload_schema_mismatch"`,
+  `effect="not_attempted"`, executor invocation list empty. The
+  descriptor pins `additionalProperties: false` and no target field.
+
+## 4. Grant scope + policy deny (real dispatcher/policy)
+
+- Probe A: grants map `docs.retrieve` → {server A}; dispatch from a
+  server-B context. Result: `allowed=False`, `effect="not_attempted"`,
+  executor never invoked.
+- Probe B: policy `denied_capabilities={"docs.retrieve"}`. Result:
+  denied before the effect; executor never invoked.
+
+## 5. Unavailable index ≠ zero results
+
+- Probe A (zero): query an empty server scope. Result:
+  `status="ok"`, `code=null`, `excerpts=[]`, `error_type=null`; the
+  embedder really received the query text (seam accounting).
+- Probe B (unavailable): same query against a real database WITHOUT the
+  schema. Result: `status="unavailable"`, `code="index_unavailable"`,
+  `error_type="ProgrammingError"` (type name only; no SQL text in the
+  document — asserted).
+- Probe C (embedding seam): failing embedder → `embedding_unavailable`;
+  unstructured `RuntimeError` → classified, message text asserted absent
+  from the JSON; wrong-length response → `dimension_mismatch` (never
+  compared against the index, ADR §4.2 rule 3).
+
+## 6. Out-of-contract payloads (17 cases)
+
+All rejected with `invalid_payload` before any storage work: empty /
+whitespace-only / >2048-char / NUL-containing query; scope near-misses
+("shared ", "SHARED", "other-server"); unknown namespace; limit
+0 / 21 / `True` / `"5"`; excerpt budget 199 / 4001; smuggled `server_id`,
+`app_id`; unknown keys; non-mapping payload.
+
+## 7. Stale data after update/delete
+
+- Probe: update a source (rev 1 → 2) and delete another; reconcile;
+  query.
+- Result: only the new revision/hash is citable; exactly one live
+  revision row; the deleted doc returns empty ok. (Delete propagation is
+  `07-chunk-index`'s contract; this card proves retrieval visibility.)
+
+## 8. Structured rejections (CLI exit contract)
+
+- `--base-url "not a url"` → exit 1,
+  `{"code": "invalid_connection", "detail": "model config rejected
+  (base_url: invalid_field)"}`.
+- Schema-less database → exit 0 with `status="unavailable"` (the JSON
+  status distinguishes; nonzero exits are reserved for usage/IO).
+
+## Out of scope (preserved finding)
+
+`tests/test_dispatch.py` has 5 pre-existing fixture errors on the base
+tree `1ab545c` with this slice absent (verified by moving both new files
+out and re-running: identical `13 passed, 5 errors`). The suite does not
+import knowledge modules; recorded for the coordinator, not fixed here
+(allowlist).
