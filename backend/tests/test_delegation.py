@@ -56,6 +56,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents import delegate
 from mai.agents import run as agent_run
+from mai.agents.budgets import (
+    BUDGET_CHARGED_EVENT_TYPE,
+    BUDGET_PAYLOAD_VERSION,
+    BUDGET_RELEASED_EVENT_TYPE,
+    BUDGET_RESERVED_EVENT_TYPE,
+    BudgetError,
+    BudgetErrorCode,
+    BudgetLedger,
+)
 from mai.agents.context import MAX_ROLE_CHARS
 from mai.agents.model_store import ModelConfigStore
 from mai.agents.models import SCHEMA_VERSION as MODEL_SCHEMA_VERSION
@@ -201,6 +210,19 @@ def _canonical(document: object) -> str:
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+#: The canonical fixture budget: a tree of at most depth 4, 4 children
+#: per delegation, 3 concurrent active slots, 20 aggregate steps, 5k
+#: tokens (the budgets suite's own document shape).
+BUDGET_DOC: dict[str, object] = {
+    "v": BUDGET_PAYLOAD_VERSION,
+    "max_depth": 4,
+    "max_children": 4,
+    "max_active": 3,
+    "max_steps": 20,
+    "max_total_tokens": 5_000,
+}
+
+
 def _planned_intent(
     run_id: str | None = None,
     *,
@@ -209,6 +231,7 @@ def _planned_intent(
     depth: int = 0,
     child_ids: tuple[str, ...] | None = None,
     server_id: str = SERVER_ID,
+    root_budget: dict[str, object] | None = None,
 ) -> tuple[delegate.DelegationIntent, delegate.ParentRunRow, tuple[str, ...]]:
     run_id = run_id or str(uuid.uuid4())
     intent = delegate.parse_delegation_intent(
@@ -221,7 +244,7 @@ def _planned_intent(
         profile_revision=3,
         prompt_revision=7,
         model_profile="fixture-fast",
-        root_budget=None,
+        root_budget=root_budget,
     )
     ids = child_ids or tuple(str(uuid.uuid4()) for _ in intent.children)
     return intent, row, ids
@@ -493,6 +516,58 @@ class TestPlanChildren:
         assert plan.children[2].grants == ()
 
 
+class TestBudgetNarrowedPlanning:
+    """The budget document NARROWS the planner's gates (C05 rule 7)."""
+
+    def test_budget_narrows_depth_fail_closed(self) -> None:
+        budget = dict(BUDGET_DOC, max_depth=2)
+        intent, row, ids = _planned_intent(depth=2, root_budget=budget)
+        with pytest.raises(BudgetError) as error:
+            delegate.plan_children(intent, row, ids)
+        assert error.value.code is BudgetErrorCode.DEPTH_EXHAUSTED
+
+    def test_budget_narrows_fanout_fail_closed(self) -> None:
+        budget = dict(BUDGET_DOC, max_children=2)
+        intent, row, ids = _planned_intent(
+            children=[
+                _child_spec("Investigate aspect-alpha."),
+                _child_spec("Investigate aspect-beta."),
+                _child_spec("Investigate aspect-gamma."),
+            ],
+            root_budget=budget,
+        )
+        with pytest.raises(BudgetError) as error:
+            delegate.plan_children(intent, row, ids)
+        assert error.value.code is BudgetErrorCode.FANOUT_EXHAUSTED
+
+    def test_budget_at_the_module_bounds_plans(self) -> None:
+        """A budget that merely restates the module bounds never rejects."""
+        budget = dict(
+            BUDGET_DOC,
+            max_depth=delegate.MAX_DELEGATION_DEPTH,
+            max_children=delegate.MAX_CHILDREN_PER_RUN,
+        )
+        intent, row, ids = _planned_intent(
+            children=[_child_spec("Investigate aspect-alpha.")],
+            root_budget=budget,
+        )
+        plan = delegate.plan_children(intent, row, ids)
+        assert plan.child_run_ids == ids
+
+    def test_unbudgeted_row_keeps_the_module_bounds_alone(self) -> None:
+        intent, row, ids = _planned_intent(depth=delegate.MAX_DELEGATION_DEPTH - 1)
+        plan = delegate.plan_children(intent, row, ids)
+        assert plan.child_run_ids == ids
+
+    def test_corrupt_stored_budget_rejects(self) -> None:
+        intent, row, ids = _planned_intent(
+            root_budget=dict(BUDGET_DOC, v=99),
+        )
+        with pytest.raises(delegate.DelegationError) as error:
+            delegate.plan_children(intent, row, ids)
+        assert error.value.code is delegate.DelegationErrorCode.INVALID_RUN_STATE
+
+
 # ---------------------------------------------------------------------------
 # composition wiring (no database dialed)
 # ---------------------------------------------------------------------------
@@ -572,22 +647,27 @@ class TestCompositionWiring:
         client = EngineClient("postgresql://unused:unused@127.0.0.1:1/unused")
         sessions = _unused_sessions()
         with pytest.raises(delegate.DelegationError) as error:
-            delegate.DelegationExecutor(sessions=object(), executor=executor, client=client)  # type: ignore[arg-type]
+            delegate.DelegationExecutor(sessions=object(), executor=executor, client=client, ledger=BudgetLedger(sessions))  # type: ignore[arg-type]
         assert error.value.code is delegate.DelegationErrorCode.INVALID_WIRING
         with pytest.raises(delegate.DelegationError) as error:
-            delegate.DelegationExecutor(sessions=sessions, executor=object(), client=client)  # type: ignore[arg-type]
+            delegate.DelegationExecutor(sessions=sessions, executor=object(), client=client, ledger=BudgetLedger(sessions))  # type: ignore[arg-type]
         assert error.value.code is delegate.DelegationErrorCode.INVALID_WIRING
         with pytest.raises(delegate.DelegationError) as error:
-            delegate.DelegationExecutor(sessions=sessions, executor=executor, client=object())  # type: ignore[arg-type]
+            delegate.DelegationExecutor(sessions=sessions, executor=executor, client=object(), ledger=BudgetLedger(sessions))  # type: ignore[arg-type]
+        assert error.value.code is delegate.DelegationErrorCode.INVALID_WIRING
+        with pytest.raises(delegate.DelegationError) as error:
+            delegate.DelegationExecutor(sessions=sessions, executor=executor, client=client, ledger=object())  # type: ignore[arg-type]
         assert error.value.code is delegate.DelegationErrorCode.INVALID_WIRING
 
     def test_valid_wiring_composes_and_config_seam_round_trips(
         self, tmp_path: Path
     ) -> None:
+        sessions = _unused_sessions()
         executor = delegate.DelegationExecutor(
-            sessions=_unused_sessions(),
+            sessions=sessions,
             executor=_wired_executor(tmp_path),
             client=EngineClient("postgresql://unused:unused@127.0.0.1:1/unused"),
+            ledger=BudgetLedger(sessions),
         )
         assert isinstance(executor.executor, agent_run.AgentRunExecutor)
         delegate.configure_delegation(executor)
@@ -682,7 +762,9 @@ def factory(delegate_url: str) -> async_sessionmaker[AsyncSession]:
 def insert_run(factory: async_sessionmaker[AsyncSession]):
     """Insert a root ``job_runs`` row (the submit owner's row, by SQL)."""
 
-    async def _insert(run_id: str) -> None:
+    async def _insert(
+        run_id: str, root_budget: dict[str, object] | None = None
+    ) -> None:
         async with factory() as session:
             await session.execute(
                 text(
@@ -690,13 +772,19 @@ def insert_run(factory: async_sessionmaker[AsyncSession]):
                     INSERT INTO job_runs
                         (run_id, server_id, depth, profile_revision,
                          prompt_revision, model_profile, requested_grants,
-                         submitted_at, updated_at)
+                         root_budget, submitted_at, updated_at)
                     VALUES
                         (:run_id, :server_id, 0, 3, 7, 'fixture-fast',
-                         '["fixture.read"]', now(), now())
+                         '["fixture.read"]', :root_budget, now(), now())
                     """
                 ),
-                {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID)},
+                {
+                    "run_id": uuid.UUID(run_id),
+                    "server_id": uuid.UUID(SERVER_ID),
+                    "root_budget": (
+                        json.dumps(root_budget) if root_budget is not None else None
+                    ),
+                },
             )
             await session.commit()
 
@@ -813,6 +901,7 @@ from sqlalchemy.pool import NullPool
 
 import mai.agents.delegate as delegate
 import mai.agents.run as agent_run
+from mai.agents.budgets import BudgetLedger
 from mai.agents.model_store import ModelConfigStore
 from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
 from mai.credentials.env import EnvResolver
@@ -1015,6 +1104,7 @@ def _build():
             sessions=sessions,
             executor=executor,
             client=EngineClient(url),
+            ledger=BudgetLedger(sessions),
         )
     )
 
@@ -1168,9 +1258,13 @@ async def _current_state(factory: async_sessionmaker, run_id: str) -> str | None
 
 
 async def _enqueue_delegation(
-    client: EngineClient, insert_run: Callable[[str], object], run_id: str, document: dict
+    client: EngineClient,
+    insert_run: Callable[..., object],
+    run_id: str,
+    document: dict,
+    root_budget: dict[str, object] | None = None,
 ) -> None:
-    await insert_run(run_id)
+    await insert_run(run_id, root_budget=root_budget)
     client.enqueue_run(run_id, delegate.HANDLER_NAME, _canonical(document))
 
 
@@ -1735,3 +1829,218 @@ class TestDelegatingParents:
         )
         # The linkage rows persist (the tree is recorded, not erased).
         assert len(_read_child_rows(delegate_url, parent_id)) == 1
+
+
+class TestBudgetedDelegations:
+    """The root ledger, live: reserve → charge → release through the
+    REAL engine + workers (BUDGET-CAP's assembly half at the producer)."""
+
+    def test_budgeted_delegation_reserves_charges_and_releases(
+        self, delegate_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """A budgeted tree: the batch's slots are reserved BEFORE any
+        child starts, each child's durable rounds are charged to the
+        root's aggregate budget, and the batch is released when the
+        children resolve — the folded truth on the root's stream."""
+        composition()
+        _write_policy_files(scenario, grants=[{READ_CAP: True}])
+        _script = [
+            {"tool_call": {"name": "fixture_read", "args": {"marker": "m1"}}},
+            {"text": "child investigation done"},
+        ]
+        (scenario / "model-script.json").write_text(json.dumps(_script), encoding="utf-8")
+        parent_id = str(uuid.uuid4())
+        document = _delegation_document(
+            parent_id,
+            [
+                _child_spec("Investigate aspect-alpha on the fixture host."),
+                _child_spec("Investigate aspect-beta on the fixture host."),
+            ],
+            children_poll_seconds=0.5,
+        )
+        client = EngineClient(delegate_url)
+        worker = None
+        try:
+            worker = _spawn_worker(delegate_url, scenario / "handlers", scenario, "w1")
+            _run(
+                _enqueue_delegation(
+                    client,
+                    insert_run,
+                    parent_id,
+                    document,
+                    root_budget=dict(BUDGET_DOC),
+                )
+            )
+            _wait_until(
+                lambda: (_engine_state(client, parent_id) or "") == "succeeded",
+                RUN_TIMEOUT,
+                "the budgeted parent success",
+            )
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        rows = _read_child_rows(delegate_url, parent_id)
+        assert len(rows) == 2
+        for row in rows:
+            # The verbatim budget propagation (C05 rule 3) now bites: the
+            # child rows carry the SAME document the ledger enforces.
+            assert row["root_budget"] == BUDGET_DOC
+        child_ids = sorted(str(row["run_id"]) for row in rows)
+        events = _read_events(delegate_url, parent_id)
+        types = [event.type for event in events]
+
+        reserved = next(
+            event for event in events if event.type == BUDGET_RESERVED_EVENT_TYPE
+        )
+        assert reserved.data["owner"] == parent_id
+        assert sorted(reserved.data["children"]) == child_ids
+        # The reservation precedes the children's start: it commits in the
+        # dedicated checkpoint between planning and the engine child edges.
+        assert types.index(BUDGET_RESERVED_EVENT_TYPE) < types.index(
+            "agent.delegation_wait"
+        )
+
+        charged = [event for event in events if event.type == BUDGET_CHARGED_EVENT_TYPE]
+        assert sorted(str(event.data["run"]) for event in charged) == child_ids
+        # Each child ran exactly two checkpointed model rounds; tokens
+        # stay unclaimed (the model surface's recorded boundary).
+        assert all(event.data["steps"] == 2 for event in charged)
+        assert all(event.data["tokens"] == 0 for event in charged)
+
+        released = next(
+            event for event in events if event.type == BUDGET_RELEASED_EVENT_TYPE
+        )
+        assert released.data["owner"] == parent_id
+        assert sorted(released.data["children"]) == child_ids
+        # The close-out precedes the completion event (settle → finish).
+        assert types.index(BUDGET_RELEASED_EVENT_TYPE) < types.index(
+            delegate.DELEGATION_COMPLETED_EVENT_TYPE
+        )
+
+        # The fold is the truth: 4 aggregate durable steps, no slots held.
+        snapshot = _run(BudgetLedger(factory).asnapshot(parent_id))
+        assert snapshot.consumed_steps == 4
+        assert snapshot.outstanding == ()
+        assert snapshot.active_reserved == 0
+        assert snapshot.remaining_steps == BUDGET_DOC["max_steps"] - 4
+
+    def test_budget_fanout_rejection_fails_parent_before_children(
+        self, delegate_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """A delegation that can never fit the budget's fan-out is
+        rejected whole: classified budget failure, no child rows, no
+        reservation — the aggregate gate bites before any start."""
+        composition()
+        _write_policy_files(scenario, grants=[{READ_CAP: True}])
+        parent_id = str(uuid.uuid4())
+        document = _delegation_document(
+            parent_id,
+            [
+                _child_spec("Investigate aspect-alpha."),
+                _child_spec("Investigate aspect-beta."),
+            ],
+            children_poll_seconds=0.5,
+        )
+        client = EngineClient(delegate_url)
+        worker = None
+        try:
+            worker = _spawn_worker(delegate_url, scenario / "handlers", scenario, "w1")
+            _run(
+                _enqueue_delegation(
+                    client,
+                    insert_run,
+                    parent_id,
+                    document,
+                    root_budget=dict(BUDGET_DOC, max_children=1),
+                )
+            )
+            _wait_until(
+                lambda: (_engine_state(client, parent_id) or "") == "failed",
+                RUN_TIMEOUT,
+                "the classified budget failure",
+            )
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        assert _failure_reasons(delegate_url, parent_id) == ["budget_fanout_exhausted"]
+        # Nothing was ever started: no child rows, no reservation.
+        assert _read_child_rows(delegate_url, parent_id) == []
+        types = [event.type for event in _read_events(delegate_url, parent_id)]
+        assert BUDGET_RESERVED_EVENT_TYPE not in types
+
+    def test_budgeted_deadline_releases_the_batch(
+        self, delegate_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """The deadline path's ledger half: the stopped tree's unused
+        slots are refunded (no charges — the batch never settled)."""
+        composition()
+        _write_policy_files(scenario, grants=[{READ_CAP: True}])
+        _script = [
+            {
+                "gate": "gate-model-round-0",
+                "tool_call": {
+                    "name": "fixture_read",
+                    "args": {"marker": "m1"},
+                    "id": "c1",
+                },
+            },
+            {"text": "unreached"},
+        ]
+        (scenario / "model-script.json").write_text(json.dumps(_script), encoding="utf-8")
+        parent_id = str(uuid.uuid4())
+        document = _delegation_document(
+            parent_id,
+            [_child_spec("Investigate aspect-alpha.")],
+            children_wait_seconds=1.0,
+            children_poll_seconds=0.5,
+        )
+        client = EngineClient(delegate_url)
+        worker = None
+        try:
+            worker = _spawn_worker(delegate_url, scenario / "handlers", scenario, "w1")
+            _run(
+                _enqueue_delegation(
+                    client,
+                    insert_run,
+                    parent_id,
+                    document,
+                    root_budget=dict(BUDGET_DOC),
+                )
+            )
+            _wait_until(
+                lambda: (_engine_state(client, parent_id) or "") == "failed",
+                RUN_TIMEOUT,
+                "the honest deadline failure",
+            )
+            rows = _read_child_rows(delegate_url, parent_id)
+            child_id = str(rows[0]["run_id"])
+            _wait_until(
+                lambda: (_engine_state(client, child_id) or "") == "cancelled",
+                RUN_TIMEOUT,
+                "the belted child cancellation",
+            )
+        finally:
+            _open_gate(scenario, "gate-model-round-0")
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        assert _failure_reasons(delegate_url, parent_id) == [
+            delegate.CHILDREN_WAIT_DEADLINE_REASON
+        ]
+        events = _read_events(delegate_url, parent_id)
+        released = [
+            event for event in events if event.type == BUDGET_RELEASED_EVENT_TYPE
+        ]
+        assert len(released) == 1
+        assert released[0].data["owner"] == parent_id
+        # The deadline path never settles: no charge, and the fold holds
+        # no outstanding slots after the refund.
+        assert BUDGET_CHARGED_EVENT_TYPE not in [event.type for event in events]
+        snapshot = _run(BudgetLedger(factory).asnapshot(parent_id))
+        assert snapshot.outstanding == ()
+        assert snapshot.consumed_steps == 0

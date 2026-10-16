@@ -102,6 +102,15 @@ from starlette.status import (
 
 from mai.agents import delegate as agent_delegate
 from mai.agents import run as agent_run
+from mai.agents.budgets import (
+    BUDGET_PAYLOAD_VERSION,
+    MAX_ACTIVE_RUNS,
+    MAX_TOTAL_STEPS,
+    MAX_TOTAL_TOKENS,
+    BudgetError,
+    check_fanout,
+    parse_root_budget,
+)
 from mai.agents.context import MAX_EVIDENCE_ITEMS, MAX_ROLE_CHARS
 from mai.api.auth import (
     BoundaryError,
@@ -231,6 +240,29 @@ class ChildBody(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
 
 
+class RootBudgetBody(BaseModel):
+    """The frozen aggregate delegation-budget document (C05 rule 7).
+
+    The strict ``job_runs.root_budget`` vocabulary (the ONE producer is
+    :func:`mai.agents.budgets.parse_root_budget`; these bounds mirror
+    it for a value-free 422): every cap NARROWS a module bound —
+    ``max_depth``/``max_children`` the delegation module's nesting and
+    fan-out bounds, ``max_active``/``max_steps``/``max_total_tokens``
+    the ledger's tree-aggregate bounds. Omitted (the default ``None``)
+    is the explicit unbudgeted root: the module bounds alone apply and
+    no ``agent.budget_*`` events are written (backward compatible).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    v: int = Field(default=BUDGET_PAYLOAD_VERSION)
+    max_depth: int = Field(ge=1, le=agent_delegate.MAX_DELEGATION_DEPTH)
+    max_children: int = Field(ge=1, le=agent_delegate.MAX_CHILDREN_PER_RUN)
+    max_active: int = Field(ge=1, le=MAX_ACTIVE_RUNS)
+    max_steps: int = Field(ge=1, le=MAX_TOTAL_STEPS)
+    max_total_tokens: int = Field(ge=1, le=MAX_TOTAL_TOKENS)
+
+
 class ChatSubmitBody(BaseModel):
     """Submit body (strict: unknown fields are rejected, value-free 422).
 
@@ -240,6 +272,9 @@ class ChatSubmitBody(BaseModel):
     stored pairing when omitted). ``capabilities`` is the conversation's
     explicit parent grant request — omitted means NO capability, never a
     default grant; delegation children are clamped to its intersection.
+    ``root_budget`` is the optional aggregate delegation budget (C05
+    rule 7): frozen on the run row, narrowed against the delegation
+    gates, and enforced by the root ledger across the whole tree.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -257,6 +292,7 @@ class ChatSubmitBody(BaseModel):
     children: list[ChildBody] = Field(
         default_factory=list, max_length=agent_delegate.MAX_CHILDREN_PER_RUN
     )
+    root_budget: RootBudgetBody | None = None
     attachments: list[AttachmentBody] = Field(
         default_factory=list, max_length=MAX_ATTACHMENTS
     )
@@ -480,6 +516,9 @@ def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
             }
             for child in body.children
         ],
+        "root_budget": (
+            body.root_budget.model_dump() if body.root_budget is not None else None
+        ),
         "attachments": [
             {"server_id": item.server_id, "op_id": item.op_id}
             for item in body.attachments
@@ -766,6 +805,21 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         return _validation_error(request, exc.field, exc.detail)
 
     capabilities = _dedup_preserving_order(payload.capabilities)
+    root_budget: dict[str, object] | None = None
+    if payload.root_budget is not None:
+        budget_document = payload.root_budget.model_dump()
+        try:
+            budget = parse_root_budget(budget_document)
+        except BudgetError as exc:
+            return _validation_error(request, "root_budget", exc.detail)
+        if payload.children:
+            # The whole-batch gate, early: a delegation that could never
+            # fit the budget's fan-out is a 422, not a failed run.
+            try:
+                check_fanout(len(payload.children), budget)
+            except BudgetError as exc:
+                return _validation_error(request, "root_budget", exc.detail)
+        root_budget = budget_document
     try:
         context = ExecutionContext(
             principal=hash_token(token),
@@ -840,6 +894,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                 requested_grants=sorted(capabilities),
                 digest=engine_digest,
                 now=now,
+                root_budget=root_budget,
             )
             if created:
                 await _record_chat_submission(

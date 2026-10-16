@@ -1106,6 +1106,9 @@ export interface components {
          *     stored pairing when omitted). ``capabilities`` is the conversation's
          *     explicit parent grant request — omitted means NO capability, never a
          *     default grant; delegation children are clamped to its intersection.
+         *     ``root_budget`` is the optional aggregate delegation budget (C05
+         *     rule 7): frozen on the run row, narrowed against the delegation
+         *     gates, and enforced by the root ledger across the whole tree.
          */
         ChatSubmitBody: {
             /** Run Id */
@@ -1133,6 +1136,7 @@ export interface components {
             capabilities?: string[];
             /** Children */
             children?: components["schemas"]["ChildBody"][];
+            root_budget?: components["schemas"]["RootBudgetBody"] | null;
             /** Attachments */
             attachments?: components["schemas"]["AttachmentBody"][];
         };
@@ -1744,6 +1748,36 @@ export interface components {
             revision: number | null;
             /** Stale */
             stale: boolean;
+        };
+        /**
+         * RootBudgetBody
+         * @description The frozen aggregate delegation-budget document (C05 rule 7).
+         *
+         *     The strict ``job_runs.root_budget`` vocabulary (the ONE producer is
+         *     :func:`mai.agents.budgets.parse_root_budget`; these bounds mirror
+         *     it for a value-free 422): every cap NARROWS a module bound —
+         *     ``max_depth``/``max_children`` the delegation module's nesting and
+         *     fan-out bounds, ``max_active``/``max_steps``/``max_total_tokens``
+         *     the ledger's tree-aggregate bounds. Omitted (the default ``None``)
+         *     is the explicit unbudgeted root: the module bounds alone apply and
+         *     no ``agent.budget_*`` events are written (backward compatible).
+         */
+        RootBudgetBody: {
+            /**
+             * V
+             * @default 1
+             */
+            v: number;
+            /** Max Depth */
+            max_depth: number;
+            /** Max Children */
+            max_children: number;
+            /** Max Active */
+            max_active: number;
+            /** Max Steps */
+            max_steps: number;
+            /** Max Total Tokens */
+            max_total_tokens: number;
         };
         /**
          * RunCreated

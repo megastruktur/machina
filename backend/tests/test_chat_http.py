@@ -54,6 +54,12 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI
 
 import mai.api.chat as chat_surface
+from mai.agents.budgets import (
+    BUDGET_CHARGED_EVENT_TYPE,
+    BUDGET_PAYLOAD_VERSION,
+    BUDGET_RELEASED_EVENT_TYPE,
+    BUDGET_RESERVED_EVENT_TYPE,
+)
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.capabilities.logs import write_evidence_artifact
@@ -401,6 +407,7 @@ from sqlalchemy.pool import NullPool
 
 import mai.agents.run as agent_run
 import mai.agents.delegate as agent_delegate
+from mai.agents.budgets import BudgetLedger
 from mai.agents.model_store import ModelConfigStore
 from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
 from mai.credentials.env import EnvResolver
@@ -557,6 +564,7 @@ def _build():
             sessions=sessions,
             executor=executor,
             client=EngineClient(url),
+            ledger=BudgetLedger(sessions),
         )
     )
 
@@ -1005,6 +1013,40 @@ class TestSubmitBodyShape:
         with pytest.raises(ValidationError):
             chat_surface.ChildBody(task="x", server_id=str(SERVER_B))
 
+    def test_root_budget_bounds_mirror_the_producer_vocabulary(self) -> None:
+        from pydantic import ValidationError
+
+        base = {
+            "max_depth": 2,
+            "max_children": 2,
+            "max_active": 3,
+            "max_steps": 50,
+            "max_total_tokens": 5_000,
+        }
+        # Every cap is REQUIRED (no silent ultra-tight defaults); ``v``
+        # is stamped with the frozen version and the doc round-trips.
+        budget = chat_surface.RootBudgetBody(**base)
+        assert budget.v == BUDGET_PAYLOAD_VERSION
+        assert budget.model_dump() == {"v": BUDGET_PAYLOAD_VERSION, **base}
+        with pytest.raises(ValidationError):
+            chat_surface.RootBudgetBody(max_depth=2, max_children=2)
+        with pytest.raises(ValidationError):
+            chat_surface.RootBudgetBody(**{**base, "max_depth": 0})
+        with pytest.raises(ValidationError):
+            chat_surface.RootBudgetBody(
+                **{**base, "max_depth": chat_surface.agent_delegate.MAX_DELEGATION_DEPTH + 1}
+            )
+        with pytest.raises(ValidationError):
+            chat_surface.RootBudgetBody(**base, unknown=1)
+        # The omitted budget is the explicit unbudgeted root.
+        submit = chat_surface.ChatSubmitBody(
+            run_id=str(uuid.uuid4()),
+            server_id=str(uuid.uuid4()),
+            message="hello",
+            profile="fast",
+        )
+        assert submit.root_budget is None
+
 
 # ---------------------------------------------------------------------------
 # live HTTP boundary (fixture DB required)
@@ -1112,6 +1154,133 @@ async def test_duplicate_submit_attaches_and_conflicting_submit_rejects(
         attachments=[{"server_id": str(server_a), "op_id": str(op_id)}],
     )
     assert different_attachments.status == 409
+
+
+async def test_submit_root_budget_persists_and_participates_in_dedup(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C05 rule 7 at the submit seam: the budget document freezes on the
+    run row exactly as submitted, the omitted budget stays the explicit
+    unbudgeted root (backward compatible), and the budget participates
+    in the whole-submission dedup digest."""
+    budget = {
+        "max_depth": 2,
+        "max_children": 2,
+        "max_active": 3,
+        "max_steps": 50,
+        "max_total_tokens": 5_000,
+    }
+    run_id = uuid.uuid4()
+    created = await submit_chat(
+        chat_app, jar, run_id, server_a, root_budget=budget
+    )
+    assert created.status == 201, created.body
+
+    unbudgeted_id = uuid.uuid4()
+    plain = await submit_chat(chat_app, jar, unbudgeted_id, server_a)
+    assert plain.status == 201, plain.body
+
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT run_id, root_budget FROM job_runs "
+            "WHERE run_id = ANY(%s) ORDER BY run_id",
+            ([run_id, unbudgeted_id],),
+        ).fetchall()
+    by_run = {row["run_id"]: row["root_budget"] for row in rows}
+    # The stored document is the submitted one, v stamped by the wire type.
+    assert by_run[run_id] == {"v": BUDGET_PAYLOAD_VERSION, **budget}
+    assert by_run[unbudgeted_id] is None
+
+    # The SAME budget for the same key attaches (deduplicated).
+    duplicate = await submit_chat(chat_app, jar, run_id, server_a, root_budget=budget)
+    assert duplicate.status == 200
+    assert duplicate.json()["deduplicated"] is True
+    # A different budget for the same key is a DIFFERENT submission (409).
+    conflicting = await submit_chat(
+        chat_app, jar, run_id, server_a, root_budget={**budget, "max_steps": 51}
+    )
+    assert conflicting.status == 409
+    assert _error(conflicting)["code"] == "conflict"
+
+
+async def test_submit_rejects_budgets_that_fail_the_producer_or_fanout(
+    chat_app, jar, server_a
+) -> None:
+    """Fail closed at the seam: a document the ONE producer rejects and a
+    delegation that could never fit the budget's fan-out are 422s —
+    never a durable intent, never a failed run."""
+    run_id = uuid.uuid4()
+    foreign_version = await submit_chat(
+        chat_app,
+        jar,
+        run_id,
+        server_a,
+        root_budget={
+            "v": 99,
+            "max_depth": 2,
+            "max_children": 2,
+            "max_active": 3,
+            "max_steps": 50,
+            "max_total_tokens": 5_000,
+        },
+    )
+    assert foreign_version.status == 422
+    assert _error(foreign_version)["code"] == "validation_failed"
+    assert "root_budget" in foreign_version.body.decode()
+
+    out_of_range = await submit_chat(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        root_budget={
+            "max_depth": 99,
+            "max_children": 2,
+            "max_active": 3,
+            "max_steps": 50,
+            "max_total_tokens": 5_000,
+        },
+    )
+    assert out_of_range.status == 422
+
+    over_fanout = await submit_chat(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        root_budget={
+            "max_depth": 4,
+            "max_children": 1,
+            "max_active": 3,
+            "max_steps": 50,
+            "max_total_tokens": 5_000,
+        },
+        children=[
+            {"task": "child aspect-alpha review", "capabilities": [READ_CAP]},
+            {"task": "child aspect-beta review", "capabilities": [READ_CAP]},
+        ],
+    )
+    assert over_fanout.status == 422
+    assert "root_budget" in over_fanout.body.decode()
+    # A budget WITHIN the fan-out accepts the same delegation.
+    within = await submit_chat(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        root_budget={
+            "max_depth": 4,
+            "max_children": 2,
+            "max_active": 3,
+            "max_steps": 50,
+            "max_total_tokens": 5_000,
+        },
+        children=[
+            {"task": "child aspect-alpha review", "capabilities": [READ_CAP]},
+            {"task": "child aspect-beta review", "capabilities": [READ_CAP]},
+        ],
+    )
+    assert within.status == 201, within.body
 
 
 async def test_forbidden_path_references_never_resolve(
@@ -1555,6 +1724,87 @@ async def test_live_delegation_tree_parent_and_child_events(
     page = listing.json()
     assert page["total"] == 1
     assert page["conversations"][0]["run_id"] == str(run_id)
+
+
+async def test_live_budgeted_delegation_enforces_the_root_budget(
+    chat_app, jar, server_a, bootstrapped_url, scenario
+) -> None:
+    """The submit-to-ledger journey: a root budget submitted through the
+    REAL chat surface freezes on the run row and the REAL workers'
+    delegation reserves the batch, charges each child's durable rounds
+    and releases it on the root's stream (C05 rule 7 live)."""
+    _compose_worker_roots(scenario, server_a)
+    _write_model_script(
+        scenario,
+        [
+            {"tool_call": {"name": "fixture_read", "args": {"marker": "m1"}}},
+            {"text": "done"},
+        ],
+    )
+    budget = {
+        "max_depth": 4,
+        "max_children": 4,
+        "max_active": 3,
+        "max_steps": 50,
+        "max_total_tokens": 5_000,
+    }
+    run_id = uuid.uuid4()
+    created = await submit_chat(
+        chat_app,
+        jar,
+        run_id,
+        server_a,
+        message="coordinate the budgeted fixture review",
+        capabilities=[READ_CAP],
+        children=[
+            {"task": "child aspect-alpha review", "capabilities": [READ_CAP]},
+            {"task": "child aspect-beta review", "capabilities": [READ_CAP]},
+        ],
+        root_budget=budget,
+    )
+    assert created.status == 201, created.body
+
+    worker = _spawn_worker(bootstrapped_url, scenario / "handlers", scenario, "w1")
+    try:
+        _wait_until(
+            lambda: _current_state_sync(bootstrapped_url, run_id) == "succeeded",
+            120,
+            "the budgeted delegation tree to succeed",
+        )
+    finally:
+        _stop(worker)
+
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT root_budget FROM job_runs WHERE run_id = %s", (run_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["root_budget"] == {"v": BUDGET_PAYLOAD_VERSION, **budget}
+        child_rows = conn.execute(
+            "SELECT run_id, root_budget FROM job_runs WHERE parent_run_id = %s "
+            "ORDER BY run_id",
+            (run_id,),
+        ).fetchall()
+    assert len(child_rows) == 2
+    for child_row in child_rows:
+        assert child_row["root_budget"] == {"v": BUDGET_PAYLOAD_VERSION, **budget}
+    child_ids = sorted(str(child_row["run_id"]) for child_row in child_rows)
+
+    events = await read_events_direct(bootstrapped_url, run_id)
+    types = [event.type for event in events]
+    reserved = next(
+        event for event in events if event.type == BUDGET_RESERVED_EVENT_TYPE
+    )
+    assert reserved.data["owner"] == str(run_id)
+    assert sorted(reserved.data["children"]) == child_ids
+    charged = [event for event in events if event.type == BUDGET_CHARGED_EVENT_TYPE]
+    assert sorted(str(event.data["run"]) for event in charged) == child_ids
+    assert all(event.data["steps"] == 2 for event in charged)
+    released = next(
+        event for event in events if event.type == BUDGET_RELEASED_EVENT_TYPE
+    )
+    assert released.data["owner"] == str(run_id)
+    assert types.index(BUDGET_RELEASED_EVENT_TYPE) < types.index("agent.delegation_completed")
 
 
 async def test_cancel_records_request_and_stops_the_conversation(

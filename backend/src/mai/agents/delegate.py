@@ -53,9 +53,12 @@ Deliberate boundaries (recorded limitations, card evidence): the parent
 handler delegates and wakes — it does not continue its own conversation
 after the wake (the model-requested mid-conversation delegation tool is
 assembled by the chat/delegation surface on this primitive, C06 rule 5);
-the aggregate budget vocabulary stays the declared module bounds until
-``06-delegation-budgets`` freezes the ledger (``root_budget`` is
-propagated verbatim, references only); children carry no mutation-lock
+the aggregate budget vocabulary is :mod:`mai.agents.budgets` — this
+handler applies the budget-narrowed plan gates and drives the root
+ledger's reserve/charge/release at its plan/start/settle points (the
+per-model token attribution stays the agent-run surface's recorded
+boundary; the delegation charges producer-reported durable rounds);
+children carry no mutation-lock
 leases (the declared-steps surface owns lock-fenced effects, sibling to
 the agent-run card's recorded boundary). Child terminal states are facts
 of the child's own event stream; the parent records them value-free.
@@ -69,7 +72,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from dbos import DBOS, SetWorkflowID
 from dbos import error as dbos_error
@@ -89,6 +92,11 @@ from mai.jobs import engine as _engine
 from mai.jobs.engine import EngineClient
 from mai.jobs.steps import StepsError
 from mai.policy.evaluate import ExecutionContext, ParentScope, PolicyError
+
+if TYPE_CHECKING:
+    # Type-only: the budgets module imports this module's bounds, so the
+    # runtime name is resolved lazily (see ``_budget_vocabulary``).
+    from mai.agents.budgets import BudgetLedger
 
 __all__ = [
     "CHILDREN_WAIT_DEADLINE_REASON",
@@ -248,6 +256,19 @@ class ParentRunRow:
 
 def _reject_payload(detail: str) -> DelegationError:
     return DelegationError(DelegationErrorCode.INVALID_PAYLOAD, detail)
+
+
+def _budget_vocabulary():
+    """The aggregate budget vocabulary, imported at call time.
+
+    :mod:`mai.agents.budgets` imports THIS module's delegation bounds
+    (a budget may only narrow them), so a module-level import would
+    cycle; both modules are fully loaded by the time any delegation
+    plans or runs.
+    """
+    from mai.agents import budgets
+
+    return budgets
 
 
 def _bounded_wait(
@@ -471,7 +492,9 @@ def plan_children(
     intersected grants, and a payload that re-validates through the ONE
     agent-run producer before returning. The parent row's ``depth`` is
     the nesting budget: a parent at :data:`MAX_DELEGATION_DEPTH` may not
-    delegate further.
+    delegate further, and a ``root_budget`` on the parent row narrows
+    both the depth and the fan-out bound (C05 rule 7) before anything
+    persists.
     """
     if len(child_ids) != len(intent.children):
         raise _reject_payload("child identity count does not match the request")
@@ -486,6 +509,22 @@ def plan_children(
             f"parent depth {parent_row.depth} exhausted the delegation "
             f"nesting budget ({MAX_DELEGATION_DEPTH})",
         )
+    budgets = _budget_vocabulary()
+    budget = None
+    if parent_row.root_budget is not None:
+        try:
+            budget = budgets.parse_root_budget(dict(parent_row.root_budget))
+        except budgets.BudgetError as error:
+            raise DelegationError(
+                DelegationErrorCode.INVALID_RUN_STATE,
+                f"the stored root budget does not parse: {error.detail}",
+            ) from None
+    if budget is not None:
+        # Budget-narrowed gates (C05 rule 7): the document can only
+        # NARROW the module bounds, so these run after them and reject
+        # whole (nothing persists, no identity is ever generated again).
+        budgets.check_nesting(parent_row.depth, budget)
+        budgets.check_fanout(len(intent.children), budget)
     children: list[ChildPlan] = []
     for spec, child_run_id in zip(intent.children, child_ids, strict=True):
         validate_run_id_or_reject(child_run_id)
@@ -584,6 +623,7 @@ class DelegationExecutor:
         sessions: async_sessionmaker[AsyncSession],
         executor: _run.AgentRunExecutor,
         client: EngineClient,
+        ledger: BudgetLedger,
     ) -> None:
         if not isinstance(sessions, async_sessionmaker):
             raise DelegationError(
@@ -600,9 +640,15 @@ class DelegationExecutor:
                 DelegationErrorCode.INVALID_WIRING,
                 "client must be the EngineClient engine adapter",
             )
+        if not isinstance(ledger, _budget_vocabulary().BudgetLedger):
+            raise DelegationError(
+                DelegationErrorCode.INVALID_WIRING,
+                "ledger must be the BudgetLedger root-budget ledger",
+            )
         self._sessions = sessions
         self._executor = executor
         self._client = client
+        self._ledger = ledger
 
     def cancel_children_quietly(self, child_ids: Sequence[str]) -> None:
         """Best-effort explicit tree stop of the children (guard rule 4).
@@ -707,6 +753,168 @@ class DelegationExecutor:
 
     async def _aemit(self, run_id: str, event_type: str, data: Mapping[str, object]) -> int:
         return await self._executor.steps.aemit_run_event(run_id, event_type, data)
+
+    # -- the root-budget ledger (C05 rule 7; 06-delegation-budgets) --------
+
+    async def _aroot_run_id(self, run_id: str) -> str:
+        """Walk ``parent_run_id`` up to the tree root (the ledger's run).
+
+        The budget is a root concept: every row carries the verbatim
+        document, but the ledger's events live on the ROOT run's stream.
+        Depth is module-bounded, so the walk is bounded; a missing row or
+        a chain longer than the depth bound is an integrity rejection,
+        never a guessed root.
+        """
+        current = run_id
+        for _ in range(MAX_DELEGATION_DEPTH + 1):
+            async with self._sessions() as session:
+                row = (
+                    await session.execute(
+                        text("SELECT parent_run_id FROM job_runs WHERE run_id = :r"),
+                        {"r": uuid.UUID(current)},
+                    )
+                ).mappings().first()
+            if row is None:
+                raise DelegationError(
+                    DelegationErrorCode.RUN_NOT_FOUND,
+                    "no job_runs row while resolving the budget root",
+                )
+            parent = row["parent_run_id"]
+            if parent is None:
+                return current
+            current = str(parent)
+        raise DelegationError(
+            DelegationErrorCode.INVALID_RUN_STATE,
+            "the parent_run_id chain exceeds the delegation depth bound",
+        )
+
+    async def _areserve_children(
+        self, run_id: str, child_ids: Sequence[str]
+    ) -> Mapping[str, object]:
+        """Reserve the delegation's active slots on the root ledger.
+
+        ``None``-shaped no-op (``{"unbudgeted": True}``) for an
+        unbudgeted tree — the module bounds stay the only enforcement
+        there and no transaction touches the root row. A budgeted
+        rejection propagates the ledger's structured
+        :class:`~mai.agents.budgets.BudgetError` (fail closed, whole:
+        no child workflow was ever started). The ledger's own
+        same-batch replay is the recovery-window idempotency.
+        """
+        parent_row = await self._aparent_row(run_id)
+        if parent_row.root_budget is None:
+            return {"unbudgeted": True}
+        root_id = await self._aroot_run_id(run_id)
+        state = await self._ledger.areserve(root_id, run_id, child_ids)
+        if state.is_unbudgeted:
+            return {"unbudgeted": True}
+        return {"active_reserved": state.active_reserved}
+
+    async def _acharge_children(
+        self, run_id: str, child_ids: Sequence[str]
+    ) -> Mapping[str, object]:
+        """Charge each child's durable spend to the root budget.
+
+        The producer-reported aggregate: one durable step per
+        checkpointed model round on the child's own stream (token
+        attribution stays the agent-run surface's recorded boundary, so
+        tokens are not claimed here). Exactly-once under recovery: a
+        child already charged on the root stream (the crash-inside-step
+        window) is skipped — the read-before-insert discipline of the
+        reviewed ``_emit_once``. Zero-round children (never reached the
+        model) charge nothing, and a zero charge is never written.
+        """
+        parent_row = await self._aparent_row(run_id)
+        if parent_row.root_budget is None:
+            return {"unbudgeted": True}
+        root_id = await self._aroot_run_id(run_id)
+        charged = await self._abudget_charged_runs(root_id)
+        lifecycle = self._executor.steps.lifecycle
+        count = 0
+        for child_id in child_ids:
+            if child_id in charged:
+                continue
+            rounds = sum(
+                1
+                for event in await lifecycle.event_stream(child_id)
+                if event.type == _run.AGENT_ROUND_EVENT_TYPE
+            )
+            if rounds <= 0:
+                continue
+            await self._ledger.aconsume(root_id, child_id, steps=rounds)
+            count += 1
+        return {"charged_runs": count}
+
+    async def _abudget_charged_runs(self, root_id: str) -> set[str]:
+        """The run identities already charged on the root's stream."""
+        charged = _budget_vocabulary().BUDGET_CHARGED_EVENT_TYPE
+        async with self._sessions() as session:
+            rows = await session.execute(
+                text("SELECT data FROM job_events WHERE run_id = :r AND type = :t"),
+                {"r": uuid.UUID(root_id), "t": charged},
+            )
+            runs: set[str] = set()
+            for row in rows.mappings():
+                document = row["data"]
+                if isinstance(document, str):
+                    document = json.loads(document)
+                if not isinstance(document, Mapping):
+                    continue
+                run = document.get("run")
+                if isinstance(run, str):
+                    runs.add(run)
+            return runs
+
+    async def _arelease_children(
+        self, run_id: str, child_ids: Sequence[str]
+    ) -> Mapping[str, object]:
+        """Release the delegation's reserved slots (the cascade half).
+
+        The frozen policy's ledger half: a delegating run that is
+        cancelled, deadline-expired or failed refunds its unused
+        reservations so the tree's remaining active budget stays
+        truthful. Exactly-once under recovery: a released marker for
+        THIS owner on the root stream short-circuits (the
+        crash-inside-step window); a ledger rejection naming an
+        already-freed batch is verified against the fold (none of these
+        children outstanding any more, e.g. a failure path that runs
+        before the reservation ever committed) before it is re-raised.
+        """
+        parent_row = await self._aparent_row(run_id)
+        if parent_row.root_budget is None:
+            return {"unbudgeted": True}
+        budgets = _budget_vocabulary()
+        root_id = await self._aroot_run_id(run_id)
+        if await self._abudget_released(root_id, run_id):
+            return {"already_released": True}
+        try:
+            await self._ledger.arelease(root_id, run_id, child_ids)
+        except budgets.BudgetError as error:
+            if error.code is not budgets.BudgetErrorCode.LEDGER_STATE:
+                raise
+            state = await self._ledger.asnapshot(root_id)
+            if set(state.outstanding) & set(child_ids):
+                raise
+            return {"already_released": True}
+        return {"released": len(child_ids)}
+
+    async def _abudget_released(self, root_id: str, owner_run_id: str) -> bool:
+        """Whether THIS owner's batch is already released on the root."""
+        released = _budget_vocabulary().BUDGET_RELEASED_EVENT_TYPE
+        async with self._sessions() as session:
+            rows = await session.execute(
+                text("SELECT data FROM job_events WHERE run_id = :r AND type = :t"),
+                {"r": uuid.UUID(root_id), "t": released},
+            )
+            for row in rows.mappings():
+                document = row["data"]
+                if isinstance(document, str):
+                    document = json.loads(document)
+                if not isinstance(document, Mapping):
+                    continue
+                if document.get("owner") == owner_run_id:
+                    return True
+            return False
 
     async def _await_deadline(
         self, run_id: str, wait_seconds: float, child_ids: tuple[str, ...]
@@ -905,6 +1113,60 @@ def _delegation_children_planned(payload_json: str, ids_json: str) -> str:
     )
 
 
+@DBOS.step(name="agents.delegate_budget_reserved")
+def _delegation_budget_reserved(payload_json: str, ids_json: str) -> str:
+    """Reserve the delegation's active slots on the root ledger (C05 r7).
+
+    One checkpoint BEFORE any child starts: a budgeted delegation that
+    cannot fit the root's remaining active budget is rejected whole
+    (the ledger's structured ``BudgetError`` — nothing was ever
+    started), and the ledger's own same-batch replay is the recovery
+    idempotency. Unbudgeted trees skip the ledger entirely.
+    """
+    intent = parse_delegation_intent(payload_json)
+    executor = _resolve_delegation()
+    child_ids = tuple(str(item) for item in json.loads(ids_json))
+    result = executor.run(executor._areserve_children(intent.run.run_id, child_ids))
+    return canonical_json(dict(result))
+
+
+@DBOS.step(name="agents.delegate_budget_settled")
+def _delegation_budget_settled(payload_json: str, plan_json: str) -> str:
+    """Charge each child's durable spend, then release the batch.
+
+    The success path's ledger close-out (one checkpoint): per-child
+    consumption is charged to the root's aggregate budget and the
+    delegation's reserved slots are released — charged consumption is
+    never refunded, released slots free the tree's active budget for
+    the next delegation. Both halves are exactly-once under recovery
+    (charged-run / released-owner markers on the root stream).
+    """
+    intent = parse_delegation_intent(payload_json)
+    executor = _resolve_delegation()
+    plan = json.loads(plan_json)
+    child_ids = tuple(str(item) for item in plan["child_ids"])
+    charged = executor.run(executor._acharge_children(intent.run.run_id, child_ids))
+    released = executor.run(executor._arelease_children(intent.run.run_id, child_ids))
+    return canonical_json({"charged": dict(charged), "released": dict(released)})
+
+
+@DBOS.step(name="agents.delegate_budget_released")
+def _delegation_budget_released(payload_json: str, ids_json: str) -> str:
+    """Release the delegation's slots (deadline-expiry path's refund).
+
+    The tree is being stopped honestly: the batch's outstanding
+    reservations are refunded so the root's remaining active budget
+    stays truthful for the tree's remaining branches. Charged
+    consumption is never refunded; the release is exactly-once under
+    recovery (the released-owner marker).
+    """
+    intent = parse_delegation_intent(payload_json)
+    executor = _resolve_delegation()
+    child_ids = tuple(str(item) for item in json.loads(ids_json))
+    result = executor.run(executor._arelease_children(intent.run.run_id, child_ids))
+    return canonical_json(dict(result))
+
+
 @DBOS.step(name="agents.delegate_wait_entered")
 def _delegation_wait_entered(payload_json: str, plan_json: str) -> str:
     """Park ``waiting_children`` once; persist + return the deadline."""
@@ -978,6 +1240,27 @@ def _delegation_run_failed(payload_json: str, reason: str) -> str:
         )
     )
     return str(result)
+
+
+def _budget_release_quietly(intent: DelegationIntent, child_ids: Sequence[str]) -> None:
+    """Best-effort plain (non-checkpointed) reservation refund.
+
+    The cancellation/failure path's ledger half (mirror of
+    ``_record_quietly``): DBOS raises its cancellation exception AT
+    checkpoint boundaries, so the release must be plain calls. The
+    executor's release is exactly-once by observation (released-owner
+    markers), so a replay or a racing double release is a no-op, not a
+    corruption; failures leave the fold untouched (the stream never
+    lies).
+    """
+    try:
+        executor = _resolve_delegation()
+    except DelegationError:
+        return
+    try:
+        executor.run(executor._arelease_children(intent.run.run_id, tuple(child_ids)))
+    except Exception:
+        pass
 
 
 def _record_quietly(intent: DelegationIntent, action: str) -> None:
@@ -1108,16 +1391,28 @@ def run_delegating_parent(payload_json: str) -> dict[str, object]:
     ERROR — both sides agree); cancellation stops the tree (best-effort
     belt) and re-raises the engine's own exception after the facade
     translation; integrity rejections from the reviewed machinery
-    propagate as-is. Success returns the safe delegation summary.
+    propagate as-is. A budgeted tree (``root_budget`` on the parent row)
+    additionally reserves its active slots BEFORE any child starts,
+    charges each child's durable spend and releases the batch when the
+    children resolve, and refunds unused slots on every non-success
+    exit (:mod:`mai.agents.budgets`, C05 rule 7). Success returns the
+    safe delegation summary.
     """
     intent = parse_delegation_intent(payload_json)
     ids_json: str | None = None
+    child_ids: tuple[str, ...] = ()
     try:
         _delegation_parent_started(payload_json)
         ids_json = _delegation_child_ids(payload_json)
+        child_ids = tuple(str(item) for item in json.loads(ids_json))
         plan_json = _delegation_children_planned(payload_json, ids_json)
+        # The aggregate gate (C05 rule 7): the batch reserves its active
+        # slots on the root ledger BEFORE any child starts, so a
+        # delegation that cannot fit the remaining budget is rejected
+        # whole (classified ``budget_*`` failure, nothing started) and
+        # racing sibling delegations serialize on the root row.
+        _delegation_budget_reserved(payload_json, ids_json)
         plan: dict[str, object] = json.loads(plan_json)
-        child_ids = tuple(str(item) for item in plan["child_ids"])
         # Children start as checkpointed engine children of THIS workflow
         # (deterministic run IDs, reject policy); the facade rows already
         # committed, so a recovered child always finds its row.
@@ -1134,12 +1429,17 @@ def run_delegating_parent(payload_json: str) -> dict[str, object]:
         try:
             resolutions = _await_children(intent, child_ids, deadline)
         except AgentStageError as stage:
-            # Deadline expiry: stop the tree honestly, then fail.
+            # Deadline expiry: stop the tree honestly, refund the batch's
+            # unused slots, then fail.
             _cancel_children_quietly(child_ids)
+            _delegation_budget_released(payload_json, ids_json)
             _delegation_wait_resumed(payload_json)
             _delegation_run_failed(payload_json, stage.reason)
             raise DelegationParentFailed(stage.reason) from None
         _delegation_children_resolved(payload_json, canonical_json(resolutions))
+        # The ledger close-out: per-child durable spend charged, the
+        # batch's slots released (both exactly-once under recovery).
+        _delegation_budget_settled(payload_json, plan_json)
         counts: dict[str, int] = {"succeeded": 0, "failed": 0, "cancelled": 0}
         for resolution in resolutions:
             state = str(resolution["state"])
@@ -1153,28 +1453,41 @@ def run_delegating_parent(payload_json: str) -> dict[str, object]:
         _delegation_run_finished(payload_json, canonical_json(summary))
         return {"run_id": intent.run.run_id, "state": "succeeded", **summary}
     except AgentRunError:
+        _budget_release_quietly(intent, child_ids)
         _record_quietly(intent, "fail")
         raise
     except StepsError:
+        _budget_release_quietly(intent, child_ids)
         _record_quietly(intent, "fail")
         raise
     except (
         dbos_error.DBOSWorkflowCancelledError,
         dbos_error.DBOSAwaitedWorkflowCancelledError,
     ):
-        _cancel_children_quietly(
-            tuple(str(item) for item in json.loads(ids_json)) if ids_json else ()
-        )
+        _cancel_children_quietly(child_ids)
+        # Plain (non-checkpointed): the cancellation exception is in
+        # flight — a checkpoint here would re-raise it (guard rule 4).
+        _budget_release_quietly(intent, child_ids)
         _record_quietly(intent, "cancel")
         raise
     except DelegationError:
+        _budget_release_quietly(intent, child_ids)
         _record_quietly(intent, "fail")
         raise
+    except _budget_vocabulary().BudgetError as error:
+        # A classified budget rejection (a narrowed plan gate or the
+        # ledger's whole-batch refusal): fail the parent honestly with
+        # the value-free budget reason — the engine ERROR and the
+        # facade agree, like the deadline path.
+        reason = f"budget_{error.code.value}"
+        _delegation_run_failed(payload_json, reason)
+        raise DelegationParentFailed(reason) from None
     except Exception:
         # An unexpected failure (a defect, not a classified stage): the
         # engine lands ERROR either way — record the honest facade
         # translation so both sides agree, then let the original
         # exception surface as-is (never swallowed, never classified).
+        _budget_release_quietly(intent, child_ids)
         _record_quietly(intent, "fail")
         raise
 

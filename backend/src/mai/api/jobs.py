@@ -501,6 +501,7 @@ async def _record_submit_intent(
     requested_grants: list[str],
     digest: str,
     now: datetime,
+    root_budget: dict[str, object] | None = None,
 ) -> bool:
     """Insert the ``job_runs`` row + its two intent events, atomically.
 
@@ -511,7 +512,9 @@ async def _record_submit_intent(
     can never exist without its identity binding and vice versa. Seq
     allocation follows the documented whole-stream discipline (row-locked
     run, ``MAX(seq)+1``; the storage ``UNIQUE (run_id, seq)`` is the
-    backstop — lifecycle acceptance 1).
+    backstop — lifecycle acceptance 1). ``root_budget`` is the validated
+    aggregate delegation-budget document frozen at submit (``None`` = the
+    explicit unbudgeted root).
     """
     inserted = (
         await session.execute(
@@ -520,11 +523,11 @@ async def _record_submit_intent(
                 INSERT INTO job_runs
                     (run_id, server_id, depth, profile_revision,
                      prompt_revision, model_profile, requested_grants,
-                     submitted_at, updated_at)
+                     root_budget, submitted_at, updated_at)
                 VALUES
                     (:run_id, :server_id, 0, :profile_revision,
                      :prompt_revision, :model_profile, :requested_grants,
-                     :now, :now)
+                     :root_budget, :now, :now)
                 ON CONFLICT (run_id) DO NOTHING
                 RETURNING run_id
                 """
@@ -536,6 +539,9 @@ async def _record_submit_intent(
                 "prompt_revision": prompt_revision,
                 "model_profile": model_profile,
                 "requested_grants": json.dumps(requested_grants),
+                "root_budget": (
+                    json.dumps(root_budget) if root_budget is not None else None
+                ),
                 "now": now,
             },
         )
