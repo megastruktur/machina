@@ -1,0 +1,65 @@
+# mai-07-chunk-index — cleanup proof (2026-10-16, pre-commit)
+
+## Disposable resources owned by this card
+
+| Resource | Created as | Purpose |
+|---|---|---|
+| Docker container `mai-fxt-07-chunk-index` | `docker run … pgvector/pgvector:pg16 -p 127.0.0.1:55433:5432` | disposable Postgres fixture (`MAI_TEST_DATABASE_URL`) |
+| Doc-store fixture root `/tmp/mai-fxt-07-chunk-index-cli` | doc-store CLI writes during the transcript | CLI transcript data root |
+| `/tmp/mai-fxt-07-doc.md` | transcript source document | CLI transcript import |
+| `/tmp/mai-fxt-07-chunk-index-embed-stub.py` | throwaway stub embeddings endpoint | CLI transcript embedding endpoint |
+| Stub server OS process | `uv run python …-embed-stub.py &` | served the transcript; killed before the pending-negative step |
+
+## Pre-cleanup inventory
+
+```
+$ pgrep -f mai-fxt-07-chunk-index-embed-stub || echo "stub server: not running"
+stub server: not running        (killed during the pending-negative CLI step)
+$ ls -la /tmp/mai-fxt-07-chunk-index-cli
+drwx------ shared               (fixture root present, 0700)
+$ docker ps --format '{{.Names}}' | grep mai-fxt-07-chunk-index
+mai-fxt-07-chunk-index          (container running)
+```
+
+## Removal
+
+```
+$ rm -rf /tmp/mai-fxt-07-chunk-index-cli /tmp/mai-fxt-07-doc.md /tmp/mai-fxt-07-chunk-index-embed-stub.py
+tmp fixture root + doc + stub removed
+$ docker stop mai-fxt-07-chunk-index && docker rm mai-fxt-07-chunk-index
+mai-fxt-07-chunk-index
+mai-fxt-07-chunk-index
+```
+
+## Post-cleanup absence proof
+
+```
+$ docker ps -a --format '{{.Names}}' | grep mai-fxt-07-chunk-index || echo "container: absent"
+container: absent
+$ ls /tmp/mai-fxt-07-chunk-index-cli
+ls: cannot access '/tmp/mai-fxt-07-chunk-index-cli': No such file or directory
+$ pgrep -f mai-fxt-07-chunk-index-embed-stub || echo "stub process: absent"
+stub process: absent
+```
+
+Host ports: 55433 (fixture) and 55871 (stub) were the only listeners opened;
+both processes/containers are gone, so the ports are released. No other
+containers, volumes (the fixture used the image's anonymous volume, removed
+with `docker rm`), databases, or host files were created. No production
+effects; no secrets anywhere (the stub endpoint used no auth and the only
+credential-shaped string was the offline `EMBEDDING_TOKEN=fxt-value` in a
+pytest `tmp_path` fixture, pytest-managed and destroyed).
+
+## In-repo scaffold check (pre-commit)
+
+```
+$ git status --short
+?? ../BRIEF.md                        (dispatch record, not committed — card convention)
+?? src/mai/knowledge/index.py         (allowlisted slice)
+?? tests/test_index.py                (allowlisted slice)
+```
+
+Nothing else untracked; no tracked file modified; `uv.lock` untouched
+(no dependency added). `.venv/` and `.pytest_cache/` are gitignored build
+artifacts. The two `??` slice files are committed as this card's allowlisted
+diff (see 06-post-commit-receipt.txt).

@@ -1,0 +1,48 @@
+# mai-07-retrieval — cleanup proof (2026-10-16)
+
+Every disposable fixture owned by this card was destroyed after the
+transcripts were recorded.
+
+## Embedding fixture server (loopback, disposable)
+
+```
+$ pkill -f mai-fxt-07-retrieval-embed-server && sleep 0.5
+$ pgrep -f mai-fxt-07-retrieval-embed-server || echo "embed server gone"
+embed server gone
+$ rm -rf /tmp/mai-fxt-07-retrieval /tmp/mai-fxt-07-retrieval-embed-server.py /tmp/mai-fxt-embed.log
+```
+
+## Schema-less probe database
+
+```
+$ docker exec mai-fxt-07-retrieval psql -U mai -d postgres \
+    -c 'DROP DATABASE IF EXISTS mai_noindex_07retrieval'
+DROP DATABASE
+```
+
+## Fixture container
+
+```
+$ docker rm -f mai-fxt-07-retrieval
+mai-fxt-07-retrieval
+$ docker ps -a --format '{{.Names}}' | grep mai-fxt || echo "no mai-fxt containers remain"
+no mai-fxt containers remain
+```
+
+## /tmp residue check
+
+```
+$ ls /tmp | grep mai-fxt-07 || echo "no 07-retrieval leftovers"
+(no output rows for this card; remaining /tmp/mai-fxt-* directories and
+logs belong to earlier phases' cards and were left untouched)
+```
+
+## Workspace hygiene
+
+- `git status` after the run: only the two allowlisted new files
+  (`backend/src/mai/knowledge/retrieve.py`,
+  `backend/tests/test_retrieval.py`), the workspace evidence copy
+  (`mai_evidence/07-retrieval/`), and the untracked coordinator-owned
+  `BRIEF.md`. No tracked file modified; `uv.lock` untouched.
+- No process left running on fixture port 55434 or 55137 (container and
+  server removed; ports freed with them).

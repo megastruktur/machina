@@ -1,0 +1,240 @@
+diff --git a/backend/src/mai/knowledge/documents.py b/backend/src/mai/knowledge/documents.py
+index 1994539..ceb06c3 100644
+--- a/backend/src/mai/knowledge/documents.py
++++ b/backend/src/mai/knowledge/documents.py
+@@ -59,15 +59,18 @@ handling, C03 rule 6):
+ - **Secret boundary (C03 rule 6 discipline, integrated ``03-credentials``
+   review)** — host-wide secret *content* scanning is prohibited, so this
+   store never inspects content for secrets. The enforcement points are
+-  structural: (a) the explicit outside import (the only operation that ever
+-  reads a caller-supplied path outside the data root — "outside docs import
+-  explicit") refuses a fixed deny-list of credential-material file names
++  structural: (a) the two outside-read seams — the explicit import and the
++  CLI ``write`` FILE argument, the only operations that ever read a
++  caller-supplied path outside the data root ("outside docs import
++  explicit" names the import seam; the write seam enforces the identical
++  guard via the shared ``_read_outside_source``) — refuse a fixed
++  deny-list of credential-material file names
+   (``.env`` family, PEM/PKCS#12/private-key names) with
+-  ``secret_file_forbidden``, and refuses symlinked or non-regular sources
++  ``secret_file_forbidden``, and refuse symlinked or non-regular sources
+   (``symlink_forbidden`` / ``not_a_file``) — the same fail-closed posture as
+   the ``.env`` resolver; (b) every canonical-tree path is confined as above.
+-  A rejected import performs no write: no canonical file, no metadata, no
+-  intent, so nothing indexable is ever materialized.
++  A rejected import or write performs no write: no canonical file, no
++  metadata, no intent, so nothing indexable is ever materialized.
+ 
+ Error discipline: every rejection is a :class:`DocumentStoreError` carrying
+ a stable ``code`` (C01 envelope vocabulary style) and a value-free detail —
+@@ -318,6 +321,50 @@ def _checked_document(data: bytes) -> str:
+         ) from None
+ 
+ 
++def _read_outside_source(source: Path) -> bytes:
++    """Guarded read of one caller-supplied path outside the data root.
++
++    The single enforcement point shared by every outside-read seam (the
++    explicit import and the CLI ``write`` FILE door): credential-material
++    names refused (``secret_file_forbidden``), symlinked or non-regular
++    sources refused (``symlink_forbidden`` / ``not_a_file``), unreadable
++    sources refused (``not_readable``). Never follows a swap-able alias;
++    content itself is never scanned for secrets (C03 rule 6).
++    """
++    name = source.name
++    if _is_secret_name(name):
++        raise DocumentStoreError(
++            DocumentStoreErrorCode.SECRET_FILE_FORBIDDEN,
++            f"refusing to read credential-material file name {name!r} "
++            "into the canonical document store",
++        )
++    try:
++        info = source.lstat()
++    except FileNotFoundError:
++        raise DocumentStoreError(
++            DocumentStoreErrorCode.NOT_A_FILE,
++            f"outside source {source} does not exist",
++        ) from None
++    if stat.S_ISLNK(info.st_mode):
++        raise DocumentStoreError(
++            DocumentStoreErrorCode.SYMLINK_FORBIDDEN,
++            f"outside source {source} is a symbolic link; refuse rather "
++            "than follow a swap-able alias",
++        )
++    if not stat.S_ISREG(info.st_mode):
++        raise DocumentStoreError(
++            DocumentStoreErrorCode.NOT_A_FILE,
++            f"outside source {source} is not a regular file",
++        )
++    try:
++        return source.read_bytes()
++    except PermissionError:
++        raise DocumentStoreError(
++            DocumentStoreErrorCode.NOT_READABLE,
++            f"outside source {source} is not readable",
++        ) from None
++
++
+ class DocumentStore:
+     """Confined, revision-checked, atomic canonical document storage.
+ 
+@@ -524,48 +571,18 @@ class DocumentStore:
+     ) -> StoredDocument:
+         """Explicitly import one outside Markdown file into the canonical store.
+ 
+-        This is the *only* operation that reads a caller-supplied path
+-        outside the data root ("outside docs import explicit"): read-only,
+-        regular-file only, symlink refused, credential-material names
+-        refused (``secret_file_forbidden``), size/UTF-8 bounded. A rejected
+-        import materializes nothing — no canonical file, no metadata, no
+-        intent — so nothing indexable ever exists for it.
++        One of the two outside-read seams (with the CLI ``write`` FILE
++        door); both go through the same guarded read
++        (:func:`_read_outside_source`): read-only, regular-file only,
++        symlink refused, credential-material names refused
++        (``secret_file_forbidden``), size/UTF-8 bounded. A rejected import
++        materializes nothing — no canonical file, no metadata, no intent —
++        so nothing indexable ever exists for it.
+         """
+         if doc_id is None:
+             doc_id = uuid.uuid4()
+         source = Path(source_path)
+-        name = source.name
+-        if _is_secret_name(name):
+-            raise DocumentStoreError(
+-                DocumentStoreErrorCode.SECRET_FILE_FORBIDDEN,
+-                f"refusing to import credential-material file name {name!r} "
+-                "into the canonical document store",
+-            )
+-        try:
+-            info = source.lstat()
+-        except FileNotFoundError:
+-            raise DocumentStoreError(
+-                DocumentStoreErrorCode.NOT_A_FILE,
+-                f"import source {source} does not exist",
+-            ) from None
+-        if stat.S_ISLNK(info.st_mode):
+-            raise DocumentStoreError(
+-                DocumentStoreErrorCode.SYMLINK_FORBIDDEN,
+-                f"import source {source} is a symbolic link; refuse rather "
+-                "than follow a swap-able alias",
+-            )
+-        if not stat.S_ISREG(info.st_mode):
+-            raise DocumentStoreError(
+-                DocumentStoreErrorCode.NOT_A_FILE,
+-                f"import source {source} is not a regular file",
+-            )
+-        try:
+-            data = source.read_bytes()
+-        except PermissionError:
+-            raise DocumentStoreError(
+-                DocumentStoreErrorCode.NOT_READABLE,
+-                f"import source {source} is not readable",
+-            ) from None
++        data = _read_outside_source(source)
+         text = _checked_document(data)
+         return self.write(
+             doc_id,
+@@ -1190,7 +1207,13 @@ def _build_parser() -> argparse.ArgumentParser:
+     write = sub.add_parser("write", help="atomically write one document")
+     add_common(write)
+     write.add_argument("doc_id", metavar="DOC_ID")
+-    write.add_argument("file", metavar="FILE", help="UTF-8 Markdown source file")
++    write.add_argument(
++        "file",
++        metavar="FILE",
++        help="UTF-8 Markdown source file outside the data root; the "
++        "secret-name deny-list and symlink refusal apply exactly as for "
++        "import",
++    )
+     write.add_argument("--expect-revision", type=int, required=True)
+     write.add_argument(
+         "--source-kind",
+@@ -1232,8 +1255,8 @@ def _build_parser() -> argparse.ArgumentParser:
+ def main(argv: Sequence[str] | None = None) -> int:
+     """CLI entrypoint: exit 0 success / 1 structured rejection / 2 usage or IO."""
+     args = _build_parser().parse_args(argv)
+-    store = DocumentStore(args.root)
+     try:
++        store = DocumentStore(args.root)
+         server_id, app_id, namespace = _parse_scope(args)
+         if args.command == "read":
+             stored = store.read(
+@@ -1244,7 +1267,10 @@ def main(argv: Sequence[str] | None = None) -> int:
+             )
+             print(json.dumps(_meta_view(stored), sort_keys=True))
+         elif args.command == "write":
+-            text = Path(args.file).read_text(encoding="utf-8")
++            # Same guarded outside read as import_document: the FILE
++            # argument is a caller-supplied path outside the data root, so
++            # the secret-name deny-list and symlink refusal apply here too.
++            text = _checked_document(_read_outside_source(Path(args.file)))
+             stored = store.write(
+                 uuid.UUID(args.doc_id),
+                 text,
+diff --git a/backend/tests/test_documents.py b/backend/tests/test_documents.py
+index 99fdde6..ab02865 100644
+--- a/backend/tests/test_documents.py
++++ b/backend/tests/test_documents.py
+@@ -17,7 +17,6 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
+-import os
+ import stat
+ import subprocess
+ import sys
+@@ -737,6 +736,53 @@ def test_cli_rejects_secret_import_with_clean_stderr(tmp_path: Path) -> None:
+     assert not (root / "servers").exists()  # nothing materialized at all
+ 
+ 
++def test_cli_write_refuses_secret_name_without_materializing(tmp_path: Path) -> None:
++    root = tmp_path / "data"
++    env_file = tmp_path / ".env"
++    env_file.write_text("CLI_WRITE_SENTINEL=xyz\n", encoding="utf-8")
++    result = _run_cli(
++        root, "write", "--server", str(SERVER), str(DOC), str(env_file),
++        "--expect-revision", "0",
++    )
++    assert result.returncode == 1
++    error = json.loads(result.stderr.strip())
++    assert error["error"] == "secret_file_forbidden"
++    assert "CLI_WRITE_SENTINEL" not in result.stderr
++    assert "xyz" not in result.stderr
++    # The CLI write FILE door is an outside read: a refused source must
++    # materialize nothing (no canonical file, no metadata, no intent).
++    assert not (root / "servers").exists()
++
++
++def test_cli_write_refuses_symlink_source_without_following(tmp_path: Path) -> None:
++    root = tmp_path / "data"
++    real = tmp_path / "real.md"
++    real.write_text("LINK_SENTINEL_CONTENT\n", encoding="utf-8")
++    link = tmp_path / "link.md"
++    link.symlink_to(real)
++    result = _run_cli(
++        root, "write", "--server", str(SERVER), str(DOC), str(link),
++        "--expect-revision", "0",
++    )
++    assert result.returncode == 1
++    error = json.loads(result.stderr.strip())
++    assert error["error"] == "symlink_forbidden"
++    assert "LINK_SENTINEL_CONTENT" not in result.stderr
++    assert not (root / "servers").exists()
++
++
++def test_cli_root_creation_io_error_is_exit_two_not_traceback(tmp_path: Path) -> None:
++    blocker = tmp_path / "blocker"
++    blocker.write_text("not a directory", encoding="utf-8")
++    root = blocker / "data"  # mkdir through a regular file: OSError
++    result = _run_cli(root, "intents", "--server", str(SERVER))
++    assert result.returncode == 2
++    error = json.loads(result.stderr.strip())
++    assert error["error"] == "usage_or_io"
++    assert "Traceback" not in result.stderr
++    assert not (root / "servers").exists()
++
++
+ def test_cli_shared_scope_and_import(tmp_path: Path) -> None:
+     root = tmp_path / "data"
+     source = tmp_path / "shared-note.md"

@@ -77,11 +77,16 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain (exclusive migration-chain resource). Head
 # assertions target the chain TIP; the tuple tracks the full chain.
-REVISION_IDS = ("0001", "0002", "0003", "0004")
+# Chain-tip reconciliation (card 07-vector-schema, exclusive migration-chain
+# owner): revision 0005 appends the knowledge document/vector schema; the
+# tip constants are advanced here so this file's head assertions stay true.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005")
 
-# The exact public application schema after 0004 — nothing else, in
+# The exact public application schema after 0005 — nothing else, in
 # particular no engine-shadowing run-state table (C05 rule 1).
 # ``alembic_version`` is the chain's own bookkeeping table (since 0001).
+# The two knowledge tables belong to 07-vector-schema (0005); they are part
+# of the exact app set this file pins at the tip.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -95,6 +100,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_events",
         "job_schedules",
         "job_schedule_fires",
+        "knowledge_documents",
+        "knowledge_doc_chunks",
     }
 )
 
@@ -139,8 +146,12 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
+        # Full app set at the chain tip — the 07-vector-schema tables are
+        # listed here (chain-tip reconciliation) so the zero-to-head fixture
+        # stays order-independent after revision 0005.
         conn.execute(
-            "DROP TABLE IF EXISTS job_schedule_fires, job_schedules, "
+            "DROP TABLE IF EXISTS knowledge_doc_chunks, knowledge_documents, "
+            "job_schedule_fires, job_schedules, "
             "job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
             "admin_credential, alembic_version"
@@ -751,7 +762,7 @@ def test_downgrade_upgrades_cleanly(
         with psycopg.connect(down_url) as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_version"
-            ).fetchone() == ("0004",)
+            ).fetchone() == (REVISION_IDS[-1],)
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)

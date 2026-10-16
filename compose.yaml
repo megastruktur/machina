@@ -25,8 +25,15 @@
 # - C02 rule 1: the data root is configured explicitly (`MAI_DATA_ROOT`); the
 #   canonical file store (02-file-store) reads this parameter. C03 rule 6 /
 #   auth ADR §3: credentials come from the Compose `.env` only — this file
-#   references `MAI_POSTGRES_PASSWORD` as a REQUIRED variable and fails closed
-#   (render/up error) when it is unset; no default secret exists anywhere.
+#   references `MAI_POSTGRES_PASSWORD` and `SEARXNG_SECRET` as REQUIRED
+#   variables and fails closed (render/up error) when unset; no default secret
+#   exists anywhere.
+# - C07 rule 7 / knowledge-packaging ADR §3: `searxng` + `valkey` are the
+#   bundled metasearch pair (official upstream two-service shape). Both are
+#   profile-gated like `mai-worker` (`--profile search`): starting them is a
+#   stack-owner opt-in because engine queries leave the host toward public
+#   upstream search engines (egress is deliberate, never a default-up side
+#   effect). They stay internal-only on the `mai` network.
 #
 # Build contexts are the repository root; the single root `.dockerignore`
 # re-includes only the real image inputs.
@@ -141,9 +148,92 @@ services:
     networks:
       - mai
 
+  # C07 rule 7 / knowledge-packaging ADR §3: bundled metasearch. Same opt-in
+  # shape as mai-worker: `--profile search` starts the pair; the default start
+  # set stays egress-free. Pinned at the docs-verified upstream snapshot
+  # (2026.10.11+ad46ebd7d). Internal only — no published host port.
+  searxng:
+    image: docker.io/searxng/searxng:2026.10.11-ad46ebd7d
+    profiles:
+      - search
+    entrypoint:
+      # Fail closed at startup, not at render: compose interpolates every
+      # service's environment globally, so a render-time `:?` here would break
+      # plain `docker compose config` for consumers that never start the
+      # search profile. Instead the (empty-by-default) variable is injected
+      # and this guard refuses to launch without it.
+      - "/bin/sh"
+      - "-c"
+      - >-
+        if [ -z "$SEARXNG_SECRET" ]; then
+          echo "!!! SEARXNG_SECRET must be set in the Compose .env" >&2;
+          exit 1;
+        fi;
+        exec /usr/local/searxng/entrypoint.sh
+    environment:
+      # server.secret_key is injected ONLY via this native upstream env
+      # override (settings_defaults.py: SEARXNG_SECRET); the committed
+      # settings.yml carries no secret_key key at all and no default secret
+      # exists here — an unset variable renders empty and the entrypoint
+      # guard above stops the container.
+      SEARXNG_SECRET: "${SEARXNG_SECRET:-}"
+    configs:
+      # Committed configuration, mounted read-only; the repo file is the
+      # single source of truth (restart persistence = the file itself).
+      - source: searxng-settings
+        target: /etc/searxng/settings.yml
+    volumes:
+      # Favicon/static cache only (ADR §3.3: SearXNG keeps no database);
+      # disposable state, nothing to back up.
+      - searxng-cache:/var/cache/searxng
+    depends_on:
+      # The valkey pair is provisioned per ADR §3 (limiter state, used when
+      # the instance is switched to limiter/public mode; settings.yml keeps
+      # limiter off because upstream's hard-coded 4 json-requests/hour/IP
+      # window is incompatible with MAI's API consumer). Startup ordering on
+      # valkey health keeps the auxiliary service a first-class dependency.
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      # Readiness, not just liveness: the app must answer /healthz AND the
+      # provisioned valkey must accept a ping (settings.yml valkey.url).
+      # Either failure flips the service to unhealthy, so auxiliary-service
+      # failure is observable through the compose health state.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- http://127.0.0.1:8080/healthz >/dev/null
+          && /usr/local/searxng/.venv/bin/python -c "import pathlib,valkey,yaml; u=yaml.safe_load(pathlib.Path('/etc/searxng/settings.yml').read_text())['valkey']['url']; valkey.Valkey.from_url(u, socket_timeout=3).ping()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - mai
+
+  # Required auxiliary service (ADR §3.3): limiter/bot-detection state for
+  # searxng. In-memory only — losing it is harmless (rate-limit windows reset).
+  valkey:
+    image: docker.io/valkey/valkey:9-alpine
+    profiles:
+      - search
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - mai
+
 networks:
   mai:
+
+configs:
+  searxng-settings:
+    file: deploy/searxng/settings.yml
 
 volumes:
   postgres-data:
   mai-data:
+  searxng-cache:

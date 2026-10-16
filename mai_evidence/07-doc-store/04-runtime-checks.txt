@@ -1,0 +1,34 @@
+# 04 — real entrypoint runtime checks (2026-10-16)
+
+Actual `uv run python -m mai.knowledge.documents` invocations (fresh
+process each), throwaway fixture dir /tmp/mai-fxt-07-doc-store-fix.
+Transcript verbatim (paths untruncated); rc echoed after each command.
+
+$ uv run python -m mai.knowledge.documents write /tmp/mai-fxt-07-doc-store-fix/data --server 11111111-1111-1111-1111-111111111111 44444444-4444-4444-4444-444444444444 /tmp/mai-fxt-07-doc-store-fix/.env --expect-revision 0
+{"error": "secret_file_forbidden", "detail": "refusing to read credential-material file name '.env' into the canonical document store"}
+env rc=1
+
+$ uv run python -m mai.knowledge.documents write /tmp/mai-fxt-07-doc-store-fix/data --server 11111111-1111-1111-1111-111111111111 44444444-4444-4444-4444-444444444444 /tmp/mai-fxt-07-doc-store-fix/link.md --expect-revision 0
+{"error": "symlink_forbidden", "detail": "outside source /tmp/mai-fxt-07-doc-store-fix/link.md is a symbolic link; refuse rather than follow a swap-able alias"}
+link rc=1
+
+$ uv run python -m mai.knowledge.documents write /tmp/mai-fxt-07-doc-store-fix/data --server 11111111-1111-1111-1111-111111111111 44444444-4444-4444-4444-444444444444 /tmp/mai-fxt-07-doc-store-fix/good.md --expect-revision 0
+{"app_id": null, "doc_id": "44444444-4444-4444-4444-444444444444", "namespace": "docs", "origin": "operator", "origin_revision": null, "revision": 1, "server_id": "11111111-1111-1111-1111-111111111111", "sha256": "124a3e28ceda9df3ff774276b34b7b2bee2e69bb0f8180d4aee0e695f5c6493a", "source_kind": "authored", "verification": "unverified"}
+good rc=0
+
+$ uv run python -m mai.knowledge.documents read /tmp/mai-fxt-07-doc-store-fix/data --server 11111111-1111-1111-1111-111111111111 44444444-4444-4444-4444-444444444444
+{"app_id": null, "doc_id": "44444444-4444-4444-4444-444444444444", "namespace": "docs", "origin": "operator", "origin_revision": null, "revision": 1, "server_id": "11111111-1111-1111-1111-111111111111", "sha256": "124a3e28ceda9df3ff774276b34b7b2bee2e69bb0f8180d4aee0e695f5c6493a", "source_kind": "authored", "verification": "unverified"}
+read rc=0
+
+# root-creation IO error (root below an existing regular file):
+$ uv run python -m mai.knowledge.documents intents /tmp/mai-fxt-07-doc-store-fix/blocker/data --server 11111111-1111-1111-1111-111111111111
+{"error": "usage_or_io", "detail": "[Errno 20] Not a directory: '/tmp/mai-fxt-07-doc-store-fix/blocker/data'"}
+io rc=2
+
+$ uv run ruff check src/mai/knowledge/documents.py tests/test_documents.py
+All checks passed!
+
+Reading: the CLI write FILE door applies the same secret-name deny-list and
+symlink refusal as import (rc 1, structured, value-free detail); a normal
+file still writes at revision 1 with metadata-only output; root-creation
+IO errors return the documented exit 2 with no traceback.

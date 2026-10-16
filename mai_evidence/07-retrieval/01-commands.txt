@@ -1,0 +1,181 @@
+# mai-07-retrieval — exact commands and outcomes (2026-10-16)
+
+All commands ran from `backend/` in the feature-shared worktree
+`mai-07-retrieval` (base HEAD `1ab545c`, the reviewed `07-chunk-index`
+integration). uv: `/home/megastruktur/.local/bin/uv` (0.11.26),
+CPython 3.14.6, pytest 9.1.1, anyio pytest plugin.
+`uv.lock` untouched: no dependency added or changed.
+
+## Slice
+
+- `backend/src/mai/knowledge/retrieve.py` (new, 956 lines) — hybrid
+  (pgvector + FTS) scope retriever (`ScopeRetriever`), `docs.retrieve`
+  capability descriptor + trusted executor (`DocumentRetrievalCapability`),
+  CLI entrypoint `python -m mai.knowledge.retrieve query`.
+- `backend/tests/test_retrieval.py` (new, 1160 lines) — 46 focused tests.
+
+## Disposable fixture lifecycle (pgvector/pgvector:pg16, own port, own name)
+
+```
+$ docker run -d --name mai-fxt-07-retrieval -e POSTGRES_USER=mai \
+    -e POSTGRES_PASSWORD=fxtretr -e POSTGRES_DB=mai_test \
+    -p 127.0.0.1:55434:5432 pgvector/pgvector:pg16
+0b9ca5b06239b511f3269a827d2f013f994f9095a74182713ee15cc78ea82128
+$ docker exec mai-fxt-07-retrieval psql -U mai -d mai_test -tAc "SELECT version();"
+PostgreSQL 16.14 (Debian 16.14-1.pgdg12+1) ... x86_64-pc-linux-gnu, 64-bit
+$ docker exec mai-fxt-07-retrieval psql -U mai -d mai_test -tAc \
+    "SELECT name, default_version FROM pg_available_extensions WHERE name IN ('vector','pg_trgm');"
+pg_trgm|1.6
+vector|0.8.5
+```
+
+Embedding fixture: disposable loopback OpenAI-compatible server on
+127.0.0.1:55137 (hashed unit vectors, 1536 dims, deterministic).
+Started with `uv run python /tmp/mai-fxt-07-retrieval-embed-server.py`;
+probe: `curl -X POST .../v1/embeddings -d '{"model":"text-embedding-3-small","input":["probe"]}'` → HTTP 200.
+Destroyed after the transcript (see 04-cleanup-proof.txt).
+
+## Focused test runs
+
+```
+$ MAI_TEST_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_test \
+    uv run pytest tests/test_retrieval.py -q
+..............................................                           [100%]
+46 passed in 3.78s
+```
+
+First-run failures (preserved, no retry-until-green; root causes fixed in
+the slice/tests, not in the evidence):
+
+1. `RuntimeError: asyncio.run() cannot be called from a running event
+   loop` — the sync `_run` helper was used inside async tests; the
+   write+index helper became `async` and every async call site awaits.
+2. `ValueError: badly formed hexadecimal UUID string` — fixture UUID
+   `DOC_B_ONLY` had a 10-char final group; fixed to a canonical 36-char
+   form.
+3. `psycopg.errors.AmbiguousParameter: could not determine data type of
+   parameter $3` on `($3 IS NULL OR d.namespace = $3)` with a NULL bind —
+   the storage scope predicate now casts: `(CAST(:namespace AS text) IS
+   NULL OR d.namespace = CAST(:namespace AS text))`.
+4. Hybrid-ranking test asserted strict order between the dual-signal doc
+   and the pure-FTS doc; with equidistant unit-basis filler vectors a
+   (1,2)-vs-(2,1) RRF tie is possible by construction, so the test now
+   pins channel attribution (rank-null patterns) and the strict
+   inequalities that are mathematically robust, with a comment why.
+5. `KeyError: 'error_code'` against the real bridge ToolResult — the
+   frozen JSON nests the code under `error.code`; assertion corrected.
+
+Sibling suites (same fixture DB, sequential invocations):
+
+```
+$ MAI_TEST_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_test \
+    uv run pytest tests/test_index.py tests/test_documents.py \
+    tests/test_knowledge_schema.py tests/test_knowledge_dependencies.py -q
+........................................................................ [ 48%]
+........................................................................ [ 97%]
+....                                                                     [100%]
+148 passed in 5.52s
+```
+
+```
+$ MAI_TEST_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_test \
+    uv run pytest tests/test_agent_tools.py tests/test_registry.py tests/test_dispatch.py -q
+147 passed, 5 errors in 1.68s
+```
+
+The 5 `test_dispatch.py` errors are PRE-EXISTING on the base tree: with
+both new slice files moved out, `uv run pytest tests/test_dispatch.py -q`
+still reports `13 passed, 5 errors` (pytest fixture-finalizer
+`AssertionError` / `SystemExit: 2` inside that suite's own fixtures; the
+suite does not import knowledge modules). Out of scope for this card;
+recorded for the coordinator.
+
+## Production entrypoint transcript (real CLIs, real fixture DB)
+
+Seeding (doc-store CLI; same document identity, conflicting content, two
+servers + shared):
+
+```
+$ uv run python -m mai.knowledge.documents write $ROOT --server $S5D --namespace docs \
+    9d8c7b6a-5e4f-4a3b-2c1d-0e9f8a7b6c5d /tmp/.../conflict-a.md --expect-revision 0 --origin smoke-a
+{"doc_id": "9d8c7b6a-...", "origin": "smoke-a", "revision": 1,
+ "server_id": "5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60",
+ "sha256": "c0dcaaad20581cf6344fcb0ace62113e10e32190f6af0ec0bb6770aa91041e9e", ...}
+$ uv run python -m mai.knowledge.documents write $ROOT --server $S8B ... --origin smoke-b
+{... "server_id": "8f1c2e3d-4a5b-4c6d-9e7f-0a1b2c3d4e5f",
+ "sha256": "eee352fad5eba62664597b2eaef686a992e4a0839074fd69d6daa612fe505446", ...}
+$ uv run python -m mai.knowledge.documents write $ROOT --shared --namespace docs \
+    3c4d5e6f-7a8b-4c9d-0e1f-2a3b4c5d6e7f /tmp/.../shared.md --expect-revision 0 --origin smoke-shared
+{... "server_id": null, "sha256": "3f86a554afd58...", ...}
+```
+
+Reconcile (chunk-index CLI), each scope pending=0:
+
+```
+$ MAI_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_test \
+    uv run python -m mai.knowledge.index reconcile $ROOT --server $S5D --base-url http://127.0.0.1:55137
+{"chunks": 1, "doc_id": "9d8c7b6a-...", "op": "upsert", "revision": 1, "status": "indexed"}
+{"intents": 1, "kind": "summary", "pending": 0}
+( --server $S8B and --shared identical shape, all indexed )
+```
+
+KB-FILTER through the actual retrieval CLI:
+
+```
+$ MAI_DATABASE_URL=... uv run python -m mai.knowledge.retrieve query --server $S5D \
+    --query "alfasecret-a restart order" --base-url http://127.0.0.1:55137
+{"code": null, "error_type": null, "excerpts": [{"citation":
+ "docs:9d8c7b6a-5e4f-4a3b-2c1d-0e9f8a7b6c5d#r1:0", "doc_id": "9d8c7b6a-...",
+ "document_key": "bc44323d-553a-4786-8a8a-cb023cfb2fb6", "excerpt": "# Conflict
+ procedure\n\nThe alfasecret-a restart order applies to server A only: drain,
+ restart, verify.", "fts_rank": 1, "namespace": "docs",
+ "observed_at": "2026-10-16T13:02:33.327502+00:00", "ord": 0, "origin": "smoke-a",
+ "origin_revision": null, "revision": 1, "score": 0.032787,
+ "sha256": "c0dcaaad20581cf6344fcb0ace62113e10e32190f6af0ec0bb6770aa91041e9e",
+ "source_kind": "authored", "truncated": false, "vector_rank": 1,
+ "verification": "unverified"}], "scope": "server",
+ "server_id": "5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60", "status": "ok"}
+
+$ ... retrieve query --server $S8B --query "restart order verify" ...
+{"excerpts": [{"citation": "docs:9d8c7b6a-5e4f-4a3b-2c1d-0e9f8a7b6c5d#r1:0",
+ "doc_id": "9d8c7b6a-...", "revision": 1, "sha256": "eee352fad5eb",
+ "truncated": false}], "scope": "server", "status": "ok"}
+  → same document identity resolves to the SERVER-B revision hash (eee3…),
+    never the server-A hash (c0dc…): no cross-server leakage.
+
+$ ... retrieve query --shared --query "sharedgamma" ...
+{"doc_ids": ["3c4d5e6f-7a8b-4c9d-0e1f-2a3b4c5d6e7f"], "scope": "shared",
+ "server_id": null, "status": "ok"}
+  → shared namespace answers only to the explicit --shared scope.
+```
+
+Unavailable index vs zero results + structured rejection:
+
+```
+$ docker exec mai-fxt-07-retrieval psql -U mai -d postgres \
+    -c 'DROP DATABASE IF EXISTS mai_noindex_07retrieval' -c 'CREATE DATABASE mai_noindex_07retrieval'
+$ MAI_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_noindex_07retrieval \
+    uv run python -m mai.knowledge.retrieve query --server $S5D --query "alfasecret-a" \
+    --base-url http://127.0.0.1:55137; echo "exit=$?"
+{"code": "index_unavailable", "error_type": "ProgrammingError", "excerpts": [],
+ "scope": "server", "server_id": "5d5349b2-...", "status": "unavailable"}
+exit=0
+  → unavailable is a distinct JSON status with a value-free error type,
+    never an empty-success.
+
+$ MAI_DATABASE_URL=...mai_test uv run python -m mai.knowledge.retrieve query --shared \
+    --query "x" --base-url "not a url"; echo "exit=$?"
+{"code": "invalid_connection", "detail": "model config rejected (base_url: invalid_field)", "kind": "error"}
+exit=1
+```
+
+## Limitations
+
+- Query-embedding and index-embedding round trips run against the pinned
+  `openai` SDK surface with deterministic local fixtures (offline
+  discipline per test policy); a live gateway round trip is the feature
+  gate's (`07-verify`) assembled-journey concern, same as 07-chunk-index.
+- The vector channel is k-NN by design: a non-matching query over a
+  non-empty scope returns that scope's closest chunks (rank conveys
+  weakness via score/ranks); zero results is the empty-scope state. No
+  arbitrary relevance threshold was invented.

@@ -1,0 +1,45 @@
+# mai-07-vector-schema — exact commands and outcomes (2026-10-16)
+
+## Disposable fixture lifecycle (pgvector/pgvector:pg16, --rm equivalent manual removal)
+$ docker run -d --name mai-07-vschema-fixture -e POSTGRES_USER=mai -e POSTGRES_PASSWORD=<pw> -e POSTGRES_DB=mai_test -p 127.0.0.1:55432:5432 pgvector/pgvector:pg16
+652dd38dc3ccbcd7ebc3e908ec78817fd44ee1f59ecbf3386f6c50302604ca84
+$ docker exec mai-07-vschema-fixture psql -U mai -d mai_test -tAc "SELECT version();"
+PostgreSQL 16.14 (Debian 16.14-1.pgdg12+1)
+$ docker exec mai-07-vschema-fixture psql -U mai -d mai_test -tAc "SELECT name, default_version FROM pg_available_extensions WHERE name IN ('vector','pg_trgm');"
+ pg_trgm | 1.6 / vector | 0.8.5   (ADR floor pgvector >= 0.8.0 satisfied)
+$ docker exec mai-07-vschema-fixture psql -U postgres -c "ALTER ROLE mai CREATEDB;"
+ALTER ROLE  (auxiliary chain-experiment databases mai_fxt_07_prior / mai_fxt_07_down)
+
+## URL form probe (both driver paths through one URL)
+$ MAI_TEST_DATABASE_URL=postgresql://mai:***@127.0.0.1:55432/mai_test uv run python -c "psycopg connect + mai.database.create_app_engine round trip"
+raw psycopg ok: (1,) / async engine ok: 1   (plain postgresql:// serves both)
+
+## Migration entrypoint smoke (manual round trip before tests)
+$ MAI_DATABASE_URL=<fixture> uv run alembic upgrade head
+INFO Running upgrade 0004 -> 0005, document metadata + selected vector storage schema
+$ docker exec ... psql -c "\\d knowledge_doc_chunks"  (recorded: vector(1536), HNSW vector_cosine_ops,
+  generated tsvector stored, GIN, 4 tuple CHECKs, ON DELETE CASCADE FK)
+$ MAI_DATABASE_URL=<fixture> uv run alembic downgrade 0004
+INFO Running downgrade 0005 -> 0004;  alembic_version=0004; 0 knowledge tables; 5 job tables intact
+$ MAI_DATABASE_URL=<fixture> uv run alembic upgrade head
+INFO Running upgrade 0004 -> 0005;  alembic_version=0005
+
+## Baseline (pre-change facts, same fixture)
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_job_schema.py -q -k "chain or reupgrade or downgrade or public_schema or prior"
+5 passed, 107 deselected        (tip-0004 assertions green before 0005)
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_approvals.py tests/test_profile_projection.py -q -k "chain or upgrade_from_zero or head or linear"
+3 errors pre-existing (stale 0003 tip pins + shared-fixture drop lists; NOT caused by this card)
+
+## Focused runs (final tree) — full output in 02-focused-tests.txt
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_knowledge_schema.py -v
+37 passed
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_job_schema.py -q
+112 passed
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_documents.py tests/test_knowledge_dependencies.py -q
+68 passed
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_knowledge_schema.py tests/test_job_schema.py -q  (both orders)
+149 passed / 149 passed
+
+## Negative controls — full output in 03-negative-controls.txt
+$ ... pytest tests/test_knowledge_schema.py -v -k "<negative selection>"
+18 passed (batch 1) + 4 passed (batch 2) = 22 real rejection boundaries

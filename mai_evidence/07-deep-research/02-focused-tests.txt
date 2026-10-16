@@ -1,0 +1,130 @@
+# mai-07-deep-research — focused tests (fix round 1, 2026-10-16)
+
+Command (from `backend/`):
+
+```
+$ /home/megastruktur/.local/bin/uv run pytest tests/test_research_workflow.py -v
+... 47 PASSED ...
+============================== 47 passed in 0.91s ==============================
+```
+
+47 tests = 45 pre-existing + 2 new pinning the artifact-handle fix.
+Full `-v` listing preserved below; every dispatch still runs through the
+real registry/dispatcher/policy boundary with injected executor fakes
+(offline discipline), materials through the real context seam, and
+incident promotion through the real `07-doc-generation` DocGenerator +
+DocumentStore producers.
+
+## Fix under test
+
+Reviewer FAIL on a933359: the logs step computed the artifact handle
+list from `host.logs` outcomes and discarded it — `SourceEvidence` had
+no artifact-ref field, the logs `StepRecord.evidence_refs` was empty,
+nothing propagated into the promoted incident document, and no test
+pinned the docstring's "read-only, artifact-referenced" claim.
+
+Fix (allowlisted files only):
+
+- `backend/src/mai/research/workflow.py`
+  - `SourceEvidence` gains `artifact_refs: tuple[str, ...] = ()`
+    (opaque `artifact:<path>#<sha256>` handles; empty when the producer
+    returned no artifact).
+  - New module helper `_log_artifact_refs(document)` — the single
+    extraction of the handle from a parsed `host.logs` document.
+  - `_record_capability` gains `refs_from_document`; on success the
+    handle becomes the step record's `evidence_refs`, so the incident
+    payload built from settled steps (C07 rule 5) carries it unchanged.
+  - Logs phase attaches the same handle to the `SourceEvidence` and
+    passes `refs_from_document=_log_artifact_refs`.
+  - `report_document` serializes `artifact_refs` per source;
+    `render_report` lists them under the source heading (steps already
+    rendered their `evidence_refs`).
+- `backend/tests/test_research_workflow.py` — 2 new tests (below).
+
+## New tests
+
+- `TestRunComposition::test_log_artifact_handles_preserved_on_source_step_and_report`
+  — succeeded run with one `host.logs` query: asserts the handle
+  `artifact:evidence/litellm.journal#<sha256 ab*32>` on (1) the
+  `host_logs` `SourceEvidence.artifact_refs`, (2) the logs
+  `StepRecord.evidence_refs`, (3) `report_document(...)["sources"]`
+  JSON, and (4) the rendered Markdown (both the source bullet and the
+  `## Steps` section).
+- `TestIncidentPromotion::test_log_artifact_handle_propagates_into_promoted_incident`
+  — same logs query plus a synthesizer that raises: the run fails and
+  promotes a canonical incident through the real DocGenerator +
+  DocumentStore; asserts the settled logs step still carries the handle
+  and the stored incident document text cites it (`generate.py` renders
+  step `evidence_refs`).
+
+## Full -v result
+
+```
+$ /home/megastruktur/.local/bin/uv run pytest tests/test_research_workflow.py -v
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- backend/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: backend
+configfile: pyproject.toml
+plugins: anyio-4.15.0
+collected 47 items
+
+tests/test_research_workflow.py::TestRequestValidation::test_minimal_payload_accepted PASSED [  2%]
+tests/test_research_workflow.py::TestRequestValidation::test_full_payload_accepted PASSED [  4%]
+tests/test_research_workflow.py::TestRequestValidation::test_non_mapping_rejected PASSED [  6%]
+tests/test_research_workflow.py::TestRequestValidation::test_unknown_field_rejected[extra] PASSED [  8%]
+tests/test_research_workflow.py::TestRequestValidation::test_unknown_field_rejected[grants] PASSED [ 10%]
+tests/test_research_workflow.py::TestRequestValidation::test_unknown_field_rejected[server_id] PASSED [ 12%]
+tests/test_research_workflow.py::TestRequestValidation::test_missing_question_rejected PASSED [ 14%]
+tests/test_research_workflow.py::TestRequestValidation::test_bad_version_rejected PASSED [ 17%]
+tests/test_research_workflow.py::TestRequestValidation::test_blank_question_rejected PASSED [ 19%]
+tests/test_research_workflow.py::TestRequestValidation::test_overlong_question_rejected PASSED [ 21%]
+tests/test_research_workflow.py::TestRequestValidation::test_query_count_rejected PASSED [ 23%]
+tests/test_research_workflow.py::TestRequestValidation::test_page_read_count_rejected PASSED [ 25%]
+tests/test_research_workflow.py::TestRequestValidation::test_logs_shape_rejected PASSED [ 27%]
+tests/test_research_workflow.py::TestRequestValidation::test_logs_count_rejected PASSED [ 29%]
+tests/test_research_workflow.py::TestRequestValidation::test_child_unknown_field_rejected PASSED [ 31%]
+tests/test_research_workflow.py::TestRequestValidation::test_child_count_rejected PASSED [ 34%]
+tests/test_research_workflow.py::TestRequestValidation::test_child_blank_task_rejected PASSED [ 36%]
+tests/test_research_workflow.py::TestRequestValidation::test_child_capability_count_rejected PASSED [ 38%]
+tests/test_research_workflow.py::TestRequestValidation::test_wait_bounds_rejected PASSED [ 40%]
+tests/test_research_workflow.py::TestRequestValidation::test_poll_bounds_rejected PASSED [ 42%]
+tests/test_research_workflow.py::TestRequestValidation::test_parent_depth_rejected PASSED [ 44%]
+tests/test_research_workflow.py::TestRequestValidation::test_malformed_root_budget_rejected PASSED [ 46%]
+tests/test_research_workflow.py::TestRequestValidation::test_budget_fanout_narrows_before_any_child PASSED [ 48%]
+tests/test_research_workflow.py::TestRequestValidation::test_budget_nesting_narrows_before_any_child PASSED [ 51%]
+tests/test_research_workflow.py::TestRequestValidation::test_synthesize_type_rejected PASSED [ 53%]
+tests/test_research_workflow.py::TestWiring::test_dispatcher_required PASSED [ 55%]
+tests/test_research_workflow.py::TestWiring::test_loader_or_root_exactly_one PASSED [ 57%]
+tests/test_research_workflow.py::TestWiring::test_bad_synthesizer_rejected PASSED [ 59%]
+tests/test_research_workflow.py::TestWiring::test_bad_generator_rejected PASSED [ 61%]
+tests/test_research_workflow.py::TestWiring::test_children_without_runner_rejected[asyncio] PASSED [ 63%]
+tests/test_research_workflow.py::TestWiring::test_synthesize_without_synthesizer_rejected[asyncio] PASSED [ 65%]
+tests/test_research_workflow.py::TestWiring::test_synthesize_without_binding_rejected[asyncio] PASSED [ 68%]
+tests/test_research_workflow.py::TestRunComposition::test_full_run_records_all_evidence_kinds[asyncio] PASSED [ 70%]
+tests/test_research_workflow.py::TestRunComposition::test_log_artifact_handles_preserved_on_source_step_and_report[asyncio] PASSED [ 72%]
+tests/test_research_workflow.py::TestRunComposition::test_unavailable_capability_is_honest_not_fatal[asyncio] PASSED [ 74%]
+tests/test_research_workflow.py::TestRunComposition::test_policy_denial_is_a_denied_source_not_a_crash[asyncio] PASSED [ 76%]
+tests/test_research_workflow.py::TestRunComposition::test_web_content_never_enlarges_grants[asyncio] PASSED [ 78%]
+tests/test_research_workflow.py::TestRunComposition::test_child_work_is_bounded_and_recorded[asyncio] PASSED [ 80%]
+tests/test_research_workflow.py::TestRunComposition::test_report_rendering_is_deterministic[asyncio] PASSED [ 82%]
+tests/test_research_workflow.py::TestIncidentPromotion::test_child_runner_failure_promotes_canonical_incident[asyncio] PASSED [ 85%]
+tests/test_research_workflow.py::TestIncidentPromotion::test_log_artifact_handle_propagates_into_promoted_incident[asyncio] PASSED [ 87%]
+tests/test_research_workflow.py::TestIncidentPromotion::test_context_load_failure_promotes_incident[asyncio] PASSED [ 89%]
+tests/test_research_workflow.py::TestIncidentPromotion::test_incident_promotion_failure_is_recorded_not_raised[asyncio] PASSED [ 91%]
+tests/test_research_workflow.py::TestSynthesis::test_hypotheses_require_recorded_citations[asyncio] PASSED [ 93%]
+tests/test_research_workflow.py::TestSynthesis::test_assembly_uses_evidence_kinds_and_server_binding[asyncio] PASSED [ 95%]
+tests/test_research_workflow.py::TestSynthesis::test_synthesizer_failure_fails_run_and_promotes_incident[asyncio] PASSED [ 97%]
+tests/test_research_workflow.py::TestSynthesis::test_succeeded_run_promotes_nothing[asyncio] PASSED [100%]
+
+============================== 47 passed in 0.91s ==============================
+```
+
+## Lint note
+
+`ruff check` on the two allowlisted files reports 3 pre-existing F401
+unused imports in the test module — identical on HEAD (a933359), not
+introduced by this fix; left untouched per no-broad-fixes rule.
+`ruff format --diff` content is byte-identical to HEAD's drift (the
+committed tree predates formatter defaults); the fix adds zero new
+drift.
