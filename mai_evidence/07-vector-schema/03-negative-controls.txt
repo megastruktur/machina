@@ -1,0 +1,31 @@
+# mai-07-vector-schema — negative controls (real boundary rejections, not mocks)
+# every control below PASSES only because the schema rejects the bad write with a real
+# PostgreSQL error (integrity violation / data exception / zero rows).
+
+== batch 1: dimension/scope/vocabulary/tombstone boundaries ==
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1535] PASSED [  5%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1537] PASSED [ 11%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1] PASSED [ 16%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-3072] PASSED [ 22%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_app_scope_requires_server[asyncio] PASSED [ 27%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_server_filter_is_a_storage_boundary_join[asyncio] PASSED [ 33%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_duplicate_source_revision_is_an_integrity_violation[asyncio] PASSED [ 38%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_same_revision_on_two_servers_is_not_a_collision[asyncio] PASSED [ 44%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_two_live_revisions_of_one_source_rejected[asyncio] PASSED [ 50%]
+tests/test_knowledge_schema.py::TestTombstonesAndDeletionRelations::test_tombstone_pair_is_enforced[asyncio-tombstone-without-timestamp] PASSED [ 55%]
+tests/test_knowledge_schema.py::TestTombstonesAndDeletionRelations::test_tombstone_pair_is_enforced[asyncio-timestamp-without-tombstone] PASSED [ 61%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_namespace_vocabulary_rejects_unknown_values[asyncio] PASSED [ 66%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_provenance_vocabularies_reject_unknown_values[asyncio-source_kind] PASSED [ 72%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_provenance_vocabularies_reject_unknown_values[asyncio-verification] PASSED [ 77%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-uppercase] PASSED [ 83%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-short] PASSED [ 88%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-long] PASSED [ 94%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-non-hex] PASSED [100%]
+====================== 18 passed, 19 deselected in 0.46s =======================
+
+== batch 2: dimension contract tuple pins ==
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_provider] PASSED [ 25%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_model] PASSED [ 50%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_dimensions] PASSED [ 75%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-distance_metric] PASSED [100%]
+======================= 4 passed, 33 deselected in 0.31s =======================

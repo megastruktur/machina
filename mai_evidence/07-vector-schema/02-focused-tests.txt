@@ -1,0 +1,57 @@
+# mai-07-vector-schema — focused tests (final tree, real pgvector fixture)
+# fixture: docker pgvector/pgvector:pg16 (PostgreSQL 16.14, pgvector 0.8.5), loopback 127.0.0.1:55432
+# MAI_TEST_DATABASE_URL=postgresql://mai:***@127.0.0.1:55432/mai_test
+
+== run 1: tests/test_knowledge_schema.py -v ==
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_contract_tuple_is_the_frozen_v1_values PASSED [  2%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_vector_bearing_table_carries_the_tuple_columns PASSED [  5%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_embedding_column_is_pinned_vector_type PASSED [  8%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_vector_roundtrip_dims_and_cosine_distance[asyncio] PASSED [ 10%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1535] PASSED [ 13%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1537] PASSED [ 16%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-1] PASSED [ 18%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_wrong_length_vector_rejected_by_column_type[asyncio-3072] PASSED [ 21%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_provider] PASSED [ 24%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_model] PASSED [ 27%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-embedding_dimensions] PASSED [ 29%]
+tests/test_knowledge_schema.py::TestDimensionContract::test_dimension_tuple_pins_reject_other_models[asyncio-distance_metric] PASSED [ 32%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_shared_scope_is_null_server_and_roundtrips[asyncio] PASSED [ 35%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_app_scope_requires_server[asyncio] PASSED [ 37%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_same_doc_id_lives_in_each_scope_independently[asyncio] PASSED [ 40%]
+tests/test_knowledge_schema.py::TestServerSharedScope::test_server_filter_is_a_storage_boundary_join[asyncio] PASSED [ 43%]
+tests/test_knowledge_schema.py::TestFullTextSearch::test_generated_tsvector_matches_and_gin_indexed[asyncio] PASSED [ 45%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_duplicate_source_revision_is_an_integrity_violation[asyncio] PASSED [ 48%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_same_revision_on_two_servers_is_not_a_collision[asyncio] PASSED [ 51%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_two_live_revisions_of_one_source_rejected[asyncio] PASSED [ 54%]
+tests/test_knowledge_schema.py::TestSourceRevisionUniqueness::test_new_revision_lands_after_tombstone[asyncio] PASSED [ 56%]
+tests/test_knowledge_schema.py::TestTombstonesAndDeletionRelations::test_tombstone_pair_is_enforced[asyncio-tombstone-without-timestamp] PASSED [ 59%]
+tests/test_knowledge_schema.py::TestTombstonesAndDeletionRelations::test_tombstone_pair_is_enforced[asyncio-timestamp-without-tombstone] PASSED [ 62%]
+tests/test_knowledge_schema.py::TestTombstonesAndDeletionRelations::test_chunk_cascade_is_the_deletion_relation[asyncio] PASSED [ 64%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_namespace_vocabulary_rejects_unknown_values[asyncio] PASSED [ 67%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_provenance_vocabularies_reject_unknown_values[asyncio-source_kind] PASSED [ 70%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_provenance_vocabularies_reject_unknown_values[asyncio-verification] PASSED [ 72%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-uppercase] PASSED [ 75%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-short] PASSED [ 78%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-long] PASSED [ 81%]
+tests/test_knowledge_schema.py::TestVocabularyPins::test_sha256_must_be_canonical_hex[asyncio-non-hex] PASSED [ 83%]
+tests/test_knowledge_schema.py::test_migration_chain_is_linear_with_single_head PASSED [ 86%]
+tests/test_knowledge_schema.py::test_migration_reupgrade_is_a_noop_and_records_the_revision PASSED [ 89%]
+tests/test_knowledge_schema.py::test_upgrade_from_prior_head_preserves_prior_rows PASSED [ 91%]
+tests/test_knowledge_schema.py::test_downgrade_upgrades_cleanly PASSED   [ 94%]
+tests/test_knowledge_schema.py::test_public_schema_is_exactly_the_frozen_app_set PASSED [ 97%]
+tests/test_knowledge_schema.py::test_source_record_columns_cover_the_c07_rule1_shape PASSED [100%]
+============================== 37 passed in 1.17s ==============================
+
+== run 2: tests/test_job_schema.py -q (after chain-tip reconciliation) ==
+........................................                                 [100%]
+112 passed in 1.08s
+
+== run 3: adjacent 07 suites (doc-store + knowledge dependencies) -q ==
+....................................................................     [100%]
+68 passed in 0.96s
+
+== run 4: combined, both orders (order independence after drop-list reconciliation) ==
+.....                                                                    [100%]
+149 passed in 2.15s
+.....                                                                    [100%]
+149 passed in 2.07s
