@@ -485,6 +485,139 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a chat message as a durable agent conversation (C05 rule 5)
+         * @description Persist one chat submission and durably enqueue the conversation.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The target profile's revisions are bound from the canonical store;
+         *     attachment references are resolved by confined, integrity-checked
+         *     reads; the composed intent is validated by the ONE producers; the
+         *     facade row, the intent digest events and the submit edge commit
+         *     atomically; the engine enqueue follows the commit so a crash leaves
+         *     a re-armable gap, not a half intent.
+         */
+        post: operations["submit_message_api_v1_chat_messages_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List conversations for one explicit server scope (bounded page)
+         * @description One bounded page of one server's conversations (C01 rules 5 and 7).
+         *
+         *     Safe method: session layer only. Conversations are the ROOT runs
+         *     (depth 0); delegated children are reachable through their parent's
+         *     detail. States replay from the persisted transition events.
+         */
+        get: operations["list_conversations_api_v1_chat_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one conversation: binding, replayed state, children, references
+         * @description One conversation's durable record; state is replayed, never engine-called.
+         *
+         *     Children are identity+state views of the persisted child rows; the
+         *     recorded attachment references are identity+integrity handles. Task
+         *     text, prompts and artifact bodies never appear (C05 rule 4).
+         */
+        get: operations["read_conversation_api_v1_chat_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a conversation (records the request; reports known outcomes)
+         * @description Record the cancel request and report only a KNOWN engine outcome.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Composes the reviewed safe-cancel facade over the explicit tree
+         *     cancellation (guard rule 4): the request is recorded ONCE, the
+         *     engine cancellation covers the conversation's children unless the
+         *     caller explicitly keeps them, and the tiny HTTP observation budget
+         *     expires into an honest ``202`` — never a claimed ``cancelled``.
+         */
+        post: operations["cancel_conversation_api_v1_chat_runs__run_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to a conversation's persisted events (SSE, replay cursor)
+         * @description SSE subscription over the conversation's event stream (C05 rule 4).
+         *
+         *     The same transport the jobs surface froze: the replay cursor is the
+         *     standard SSE ``Last-Event-ID`` header; frames are strictly
+         *     cursor-exclusive and ordered by ``seq``, so a reconnect with the
+         *     last seen ``id`` deduplicates by construction. Authorization
+         *     completes BEFORE the response starts; the stream is read-only (a
+         *     disconnected browser cancels nothing, C08 rule 7). Delegation
+         *     children subscribe through this same route with their own run ids —
+         *     their identities are discovered from the parent's
+         *     ``agent.delegation_planned`` event (value-free references).
+         */
+        get: operations["stream_conversation_events_api_v1_chat_runs__run_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -567,6 +700,30 @@ export interface components {
             consumed_by: string | null;
             /** Consumed At */
             consumed_at: string | null;
+        };
+        /**
+         * AttachmentBody
+         * @description One permitted-artifact context reference (identity only).
+         */
+        AttachmentBody: {
+            /** Server Id */
+            server_id: string;
+            /** Op Id */
+            op_id: string;
+        };
+        /**
+         * AttachmentView
+         * @description One recorded attachment reference (identity + integrity handles).
+         */
+        AttachmentView: {
+            /** Server Id */
+            server_id: string;
+            /** Op Id */
+            op_id: string;
+            /** Sha256 */
+            sha256: string;
+            /** Bytes */
+            bytes: number;
         };
         /**
          * CancelBody
@@ -740,6 +897,140 @@ export interface components {
             cwd_change_failed: boolean;
             /** Duration Seconds */
             duration_seconds: number;
+        };
+        /**
+         * ChatCancelBody
+         * @description Cancel body: explicit tree cancellation (guard rule 4).
+         *
+         *     A conversation cancel defaults to cancelling its children — a
+         *     cancelled chat must never orphan delegated work. (Deliberately a
+         *     distinct wire type from the jobs surface's ``CancelBody``: the
+         *     defaults differ and the exported component names must not collide.)
+         */
+        ChatCancelBody: {
+            /**
+             * Cancel Children
+             * @default true
+             */
+            cancel_children: boolean;
+        };
+        /**
+         * ChatCreated
+         * @description Submit outcome: the conversation view plus the dedup verdict.
+         */
+        ChatCreated: {
+            conversation: components["schemas"]["ConversationView"];
+            /** Deduplicated */
+            deduplicated: boolean;
+        };
+        /**
+         * ChatPage
+         * @description One bounded, explicitly server-scoped list page (C01 rule 5/7).
+         */
+        ChatPage: {
+            /** Conversations */
+            conversations: components["schemas"]["ConversationView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ChatSubmitBody
+         * @description Submit body (strict: unknown fields are rejected, value-free 422).
+         *
+         *     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
+         *     rule 5). ``profile`` names the model profile selection explicitly
+         *     (C06 rule 1); ``connection`` stays optional (the model store's
+         *     stored pairing when omitted). ``capabilities`` is the conversation's
+         *     explicit parent grant request — omitted means NO capability, never a
+         *     default grant; delegation children are clamped to its intersection.
+         */
+        ChatSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Message */
+            message: string;
+            /** Profile */
+            profile: string;
+            /** Connection */
+            connection?: string | null;
+            /**
+             * Role
+             * @default administrator
+             */
+            role: string;
+            /** Rounds */
+            rounds?: number | null;
+            /** @default ask */
+            mode: components["schemas"]["PolicyMode"];
+            /** Credential References */
+            credential_references?: string[];
+            /** Capabilities */
+            capabilities?: string[];
+            /** Children */
+            children?: components["schemas"]["ChildBody"][];
+            /** Attachments */
+            attachments?: components["schemas"]["AttachmentBody"][];
+        };
+        /**
+         * ChildBody
+         * @description One explicitly scoped child task (the frozen ``ChildSpec`` words).
+         *
+         *     There is deliberately no server/target field: a child runs on its
+         *     parent's server (C06 rule 5). ``capabilities`` is the child's
+         *     REQUEST; the effective grants are the intersection with the parent's
+         *     requested set, applied by the reviewed ``plan_children``.
+         */
+        ChildBody: {
+            /** Task */
+            task: string;
+            /** Role */
+            role?: string | null;
+            /** Connection */
+            connection?: string | null;
+            /** Profile */
+            profile?: string | null;
+            /** Capabilities */
+            capabilities?: string[];
+        };
+        /**
+         * ConversationView
+         * @description One conversation: the run view plus its recorded references.
+         */
+        ConversationView: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Parent Run Id */
+            parent_run_id: string | null;
+            /** Depth */
+            depth: number;
+            /** Profile Revision */
+            profile_revision: number;
+            /** Prompt Revision */
+            prompt_revision: number;
+            /** Model Profile */
+            model_profile: string;
+            /** Requested Grants */
+            requested_grants: string[];
+            /** State */
+            state: string | null;
+            /** Cancel Requested At */
+            cancel_requested_at: string | null;
+            /** Submitted At */
+            submitted_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Attachments */
+            attachments?: components["schemas"]["AttachmentView"][];
+            /** Children */
+            children?: components["schemas"]["RunView"][];
         };
         /**
          * DecisionBody
@@ -2634,6 +2925,322 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_message_api_v1_chat_messages_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submission attached to the existing run (the intent-level resume: a lost enqueue re-arms) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile for the target server, or no artifact stored for an attachment reference */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different submission, or stored artifact state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Chat domain, artifact store or engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_conversations_api_v1_chat_runs_get: {
+        parameters: {
+            query: {
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_conversation_api_v1_chat_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persisted run state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_conversation_api_v1_chat_runs__run_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCancelBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description Request recorded; engine outcome not observed within the budget — outcome stays null, re-entry resumes the wait */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The engine has no workflow under this run id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    stream_conversation_events_api_v1_chat_runs__run_id__events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session (answered before any stream byte) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description An Origin header that is not allowlisted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Last-Event-ID cursor is not a non-negative integer */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

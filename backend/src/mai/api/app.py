@@ -61,6 +61,7 @@ from mai.api.auth import (
     resolve_public_origins,
     resolve_trusted_proxies,
 )
+from mai.api.chat import register_chat
 from mai.api.grants import register_grants
 from mai.api.jobs import register_jobs
 from mai.api.password_challenges import (
@@ -265,6 +266,11 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # schedule records over the reviewed facade — HTTP persists
     # configuration only, firing stays engine/worker-owned.
     register_schedules(app)
+    # The chat conversation surface (C06): durable agent-conversation
+    # submit/detail/cancel/event routes over the reviewed agent-run and
+    # delegation facade — HTTP persists intent only; model rounds, tool
+    # calls and child workflows run in the worker.
+    register_chat(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
