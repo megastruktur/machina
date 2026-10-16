@@ -51,6 +51,7 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
 )
 
+from mai.agents.model_store import ModelConfigStore
 from mai.api.approvals import register_approvals
 from mai.api.auth import (
     bootstrap_password_from_env,
@@ -64,6 +65,7 @@ from mai.api.auth import (
 from mai.api.chat import register_chat
 from mai.api.grants import register_grants
 from mai.api.jobs import register_jobs
+from mai.api.models import register_models
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
@@ -169,6 +171,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.grants = GrantConfigStore(resolve_profiles_root(app.state.env))
         except OSError:
             app.state.grants_error = "policy_root_unusable"
+        # Model configuration store (C03 rule 6/C06 rule 1): the confined
+        # atomic store over the same explicitly configured data root (the
+        # store appends its own ``models/`` namespace). Credential material
+        # is never held here — the resolver below is the only path that
+        # resolves references, at call time. An unusable root fails closed:
+        # routes answer 503 unavailable and touch no state.
+        app.state.models = None
+        app.state.models_error = None
+        try:
+            app.state.models = ModelConfigStore(resolve_profiles_root(app.state.env))
+        except OSError:
+            app.state.models_error = "models_root_unusable"
         # Jobs domain surfaces (C05/C08): the facade lifecycle replay
         # producer plus the safe-cancel facade over the ONE engine client.
         # The durable engine itself is launched by the worker (never here):
@@ -271,6 +285,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # delegation facade — HTTP persists intent only; model rounds, tool
     # calls and child workflows run in the worker.
     register_chat(app)
+    # The model configuration/selection/probe surface (C03 rule 6/C06
+    # rule 1): connection/profile/selection records over the confined
+    # atomic store — credential references only, never resolved material
+    # — plus the bounded classified probe. The durable model rounds of
+    # conversations stay worker-owned; the probe is a single bounded
+    # diagnostic round owned by this surface.
+    register_models(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
