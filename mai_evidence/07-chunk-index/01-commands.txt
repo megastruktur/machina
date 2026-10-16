@@ -1,0 +1,227 @@
+# mai-07-chunk-index — exact commands and outcomes (2026-10-16)
+
+All commands ran from `backend/` in the feature-shared worktree
+`mai-07-chunk-index` (base HEAD `6cbd391`, the reviewed `07-vector-schema`
+integration). uv: `/home/megastruktur/.local/bin/uv` (0.11.26),
+CPython 3.14.6, pytest 9.1.1, anyio pytest plugin 4.15.1.
+`uv.lock` untouched: no dependency added or changed.
+
+## Slice
+
+- `backend/src/mai/knowledge/index.py` (new) — section-aware Markdown
+  chunker (`chunk_markdown`), `GatewayEmbedder` (pinned `openai` SDK
+  embeddings surface over the validated `06-model-config` connection,
+  `03-credentials` `.env` resolution at request time), `ScopeIndexer`
+  (idempotent consumer of the `07-doc-store` reindex outbox into the
+  `07-vector-schema` projection), CLI entrypoint
+  `python -m mai.knowledge.index reconcile`.
+- `backend/tests/test_index.py` (new) — 43 focused tests.
+
+## Disposable fixture lifecycle (pgvector/pgvector:pg16, own port, own name)
+
+```
+$ docker run -d --name mai-fxt-07-chunk-index -e POSTGRES_USER=mai \
+    -e POSTGRES_PASSWORD=fxtchunk -e POSTGRES_DB=mai_test \
+    -p 127.0.0.1:55433:5432 pgvector/pgvector:pg16
+b67f7153ad7faef4f9fbbd234c80aa3113cb44b6cac94af4b720fdf1498fffa8
+$ docker exec mai-fxt-07-chunk-index psql -U mai -d mai_test -tAc "SELECT version();"
+PostgreSQL 16.14 (Debian 16.14-1.pgdg12+1) ... x86_64-pc-linux-gnu
+$ docker exec mai-fxt-07-chunk-index psql -U mai -d mai_test -tAc \
+    "SELECT name, default_version FROM pg_available_extensions WHERE name IN ('vector','pg_trgm');"
+pg_trgm|1.6 / vector|0.8.5   (ADR floor pgvector >= 0.8.0 satisfied)
+```
+
+The pytest fixture migrates zero→head through the real linear chain
+(0001→0005, `MAI_TEST_DATABASE_URL` contract, same discipline as
+`tests/test_knowledge_schema.py`).
+
+## Focused runs (final tree) — full output in 02-focused-tests.txt
+
+```
+$ MAI_TEST_DATABASE_URL=postgresql://mai:fxtchunk@127.0.0.1:55433/mai_test \
+    uv run pytest tests/test_index.py -v
+43 passed   (28 offline chunk/embedder + 14 real-DB reconcile + 1 CLI subprocess)
+
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest \
+    tests/test_documents.py tests/test_knowledge_schema.py \
+    tests/test_knowledge_dependencies.py tests/test_models.py tests/test_env_resolver.py -q
+181 passed   (sibling suites, incl. the two direct producers consumed here)
+
+$ uv run pytest tests/test_index.py -q            (no MAI_TEST_DATABASE_URL)
+28 passed, 15 skipped   (storage/CLI tests skip loudly without a fixture DB)
+```
+
+## Negative controls — full output in 03-negative-controls.txt
+
+```
+$ ... uv run pytest tests/test_index.py -v -k "credential_labelled or non_credential or
+    wrong_dimension or broken_endpoint or unresolvable or without_resolver or
+    leaves_pending or unknown_source or keeps_previous or hash_mismatch or missing_source"
+20 passed, 23 deselected   (real rejection boundaries, listed per test there)
+```
+
+## Production-CLI transcript (fresh OS process per step; stub embeddings endpoint)
+
+Stub: throwaway `/tmp/mai-fxt-07-chunk-index-embed-stub.py` (ThreadingHTTPServer,
+asserts path ends `/v1/embeddings`, returns 1536-dim constant vectors), probed
+live: `curl -X POST .../v1/embeddings -d '{"model":"text-embedding-3-small","input":["probe"]}'`
+→ 200 JSON list. Fixture doc root: `/tmp/mai-fxt-07-chunk-index-cli` (destroyed,
+see 04-cleanup-proof.txt).
+
+```
+$ uv run python -m mai.knowledge.documents write $ROOT --shared --namespace docs \
+    9d8c7b6a-5e4f-4a3b-2c1d-0e9f8a7b6c5d /tmp/mai-fxt-07-doc.md --expect-revision 0 --origin transcript
+{"revision": 1, "sha256": "15220c3c…2330e", "source_kind": "authored", ...}
+
+$ MAI_DATABASE_URL=<fixture> uv run python -m mai.knowledge.index reconcile $ROOT --shared \
+    --base-url http://127.0.0.1:55871 --timeout-seconds 5
+{"chunks": 1, "code": null, "doc_id": "9d8c…c5d", "namespace": "docs", "op": "upsert",
+ "revision": 1, "status": "indexed", "kind": "intent"}
+{"intents": 1, "kind": "summary", "pending": 0}          exit=0
+
+$ docker exec mai-fxt-07-chunk-index psql -U mai -d mai_test -c \
+    "SELECT revision, source_path, tombstone FROM knowledge_documents; \
+     SELECT ord, left(content,60), vector_dims(embedding), embedding_model FROM knowledge_doc_chunks; \
+     SELECT count(*) FROM knowledge_doc_chunks WHERE search_vector @@ plainto_tsquery('simple','restart');"
+ revision 1 | shared/docs/9d8c7b6a-…c5d.md | f
+ ord 0 | # Operator runbook … Restart the worker service … | 1536 | text-embedding-3-small
+ fts_restart: 1
+
+# --- update propagation ---
+$ uv run python -m mai.knowledge.documents write $ROOT --shared … --expect-revision 1
+$ … reconcile …
+{"revision": 2, "status": "indexed", "chunks": 1, ...}   {"intents": 1, "pending": 0}
+$ psql … plainto_tsquery('simple','restart')  → 0 ;  'recreate' → 1   (stale FTS result removed)
+
+# --- delete propagation ---
+$ uv run python -m mai.knowledge.documents delete $ROOT --shared --namespace docs $DOC --expect-revision 2
+$ … reconcile …
+{"op": "delete", "status": "deleted", "revision": 2, "chunks": 0, ...}
+$ psql: knowledge_documents 0 rows, knowledge_doc_chunks 0 rows
+
+# --- unavailable embedding (stub killed): visible pending, never empty-success ---
+$ … reconcile …        (same command against the dead port)
+{"code": "embedding_unavailable", "op": "upsert", "status": "pending", "chunks": 0, ...}
+{"intents": 1, "kind": "summary", "pending": 0→"pending": 1}     exit=0
+$ uv run python -m mai.knowledge.documents intents $ROOT --shared
+{"doc_id": "1a2b…c5d", "op": "upsert", "revision": 1, "sha256": "29605a…", "tombstone": false}   (intent still live)
+$ psql: SELECT count(*) FROM knowledge_documents WHERE doc_id='1a2b…c5d'  → 0   (nothing written)
+
+# --- CLI structured rejections (rc=1, value-free) ---
+$ … reconcile $ROOT --shared --base-url not-a-url
+{"code": "invalid_connection", "detail": "model config rejected (base_url: invalid_field)"}     exit=1
+$ … reconcile $ROOT --shared --base-url http://user:pass@127.0.0.1:55871
+{"code": "invalid_connection", "detail": "model config rejected (base_url: inline_credential_forbidden)"}  exit=1
+```
+
+## Acceptance criteria → evidence
+
+1. **Stable revision/offset chunks with embedding model identity; retries do
+   not duplicate current source chunks.**
+   - `TestChunking::test_chunk_list_is_stable_for_same_revision_text`,
+     `test_sections_become_chunks_in_document_order` (ord = document offset,
+     same revision text → same chunk identities).
+   - `TestReconcileUpsert::test_upsert_indexes_chunks_with_dimension_tuple_and_fts`
+     (real `vector_dims()=1536`, frozen tuple columns, `source_path` equals the
+     real on-disk canonical path).
+   - `test_confirmed_retry_is_unchanged_with_no_duplicate_chunks` (duplicate
+     intent delivery → `unchanged`, exactly 1 document row / 1 chunk row).
+   - `test_crash_between_commit_and_purge_reconverges` (kill between commit
+     and ack → rerun converges, no duplicates).
+   - `test_model_identity_tuple_is_the_frozen_v1_on_every_row`.
+2. **Update/delete removes stale retrieval results; unavailable embedding
+   leaves visible pending index, not empty-success.**
+   - `test_update_swaps_revision_and_removes_stale_results` (real FTS:
+     old term 0 hits, new term 1, one live row at revision 2).
+   - `TestReconcileDelete` all four tests (rows+chunks gone, ack-crash and
+     phase-1 crash windows re-converge, unknown source → `absent`).
+   - `TestReconcilePending` all four tests (`pending` outcome + code, intent
+     stays live, zero projection rows; failed re-embed keeps the previous
+     revision retrievable; missing source / hash mismatch stay pending).
+   - CLI transcript update/delete/pending steps above.
+
+## Binding design decisions
+
+- **Chunk identity** is `(document_key, ord)`: the parent row is
+  revision-specific (schema from `07-vector-schema`), `ord` is the offset in
+  the revision's chunk list; the chunker is pure and deterministic, so
+  retries re-derive identical identities. Sections: flat ATX-heading grammar
+  (every heading starts a section), preamble before the first heading is its
+  own section, heading-only sections yield no chunk (empty content is a CHECK
+  violation), oversized sections pack greedily at block boundaries with a
+  line/character hard split; `MAX_CHUNK_CHARS = 4000`, heading prefix counts
+  against the cap.
+- **Credential exclusion is structural** (C03 rule 6): fenced blocks whose
+  declared info string is in the fixed deny-set (`env`, `pem`, `key`, …) are
+  replaced by a fixed placeholder before chunking — keyed on the info string,
+  never on content; the test uses deliberately benign content inside a
+  denied fence to prove no content scanning in either direction.
+- **Embedding seam** is the pinned `openai` SDK surface over the validated
+  `06-model-config` `ModelConnection` (base URL gets `/v1` unless already
+  suffixed; `credential_ref` resolves through `03-credentials` `EnvResolver`
+  at request time; `headers`/`timeout_seconds` flow through). The pinned
+  model/dims are this module's frozen constants (`text-embedding-3-small`,
+  1536) — never connection settings — so one index can never mix models/dims
+  (ADR §4.2 rule-3 refusal is structural: wrong-length responses raise
+  `dimension_mismatch` before any write). Batches of 128 preserve order.
+- **Reconcile order is embed-first, swap-second**: an unavailable endpoint
+  leaves the previous index (stale but answering) plus the durable intent —
+  visible pending, never empty-success. The intent is purged only after the
+  projection confirms (C02 W4 ack). Deletes are two-phase (tombstone rows +
+  remove chunks, commit; purge rows + ack) and every phase is idempotent
+  against intent + row state, so a killed indexer restarted mid-batch
+  converges (`05-steps` retry discipline; the engine owns the actual wrap).
+- **Outbox sweep is per scope** (`read_intents(server_id=…, app_id=…)`);
+  cross-scope reads are unrepresentable by construction (doc-store
+  confinement). Scope isolation at the storage boundary is the KB-FILTER
+  writer-half proof (two servers + shared, per-scope corpora).
+- **CLI** consumes `MAI_DATABASE_URL` (`mai.database`) and exits
+  0 (reconcile ran — per-intent `status`/`pending` in the JSON lines) / 1
+  (structured rejection, value-free) / 2 (usage or IO). Output is value-free:
+  no chunk text, no credential material.
+
+## First-run failures preserved (no retry-until-green)
+
+1. Offline round 1: 6 failed — `.env` fixture perms (0644 → `EnvResolver`
+   correctly refused; fixed fixture to 0600); hard-split ignored the heading
+   prefix so rendered chunks exceeded the cap (chunker bug, fixed);
+   embedder tests bypassed `GatewayEmbedder.embed`'s checks by driving the
+   SDK directly (test design flaw — tests now call `embed()` through the
+   explicit `transport` seam); batch-order assertion indexed within batch.
+2. DB round 1: 14 errors — storage tests lacked the `@pytest.mark.anyio`
+   marker (repo convention from `test_knowledge_schema.py`; added as
+   module `pytestmark`).
+3. DB round 2: 6 failed — `_fts_count` used `asyncio.run` inside a running
+   loop (made async/await); `_write_doc` lacked `server_id` passthrough;
+   delete ack-crash test raised on the first purge call, not the intended
+   one (counting fix); scope-isolation test swept only the shared outbox
+   (now sweeps each scope, matching the per-scope design).
+4. DB round 3: 1 failed → 43 passed (see 02 receipt).
+5. Evidence-capture collision (not a product failure): two parallel pytest
+   processes re-migrating one fixture database hit
+   `duplicate key … alembic_version`; re-run sequentially — 43 + 20 passed.
+   The `sessions` fixture re-applies the chain per session by design; a
+   single worker per fixture DB is the discipline.
+
+## Out-of-scope findings
+
+None new. The 5 pre-existing HTTP route-surface failures noted by earlier
+cards were not re-observed here (no HTTP route suites run in this slice);
+this card's claims do not depend on them.
+
+## Limitations
+
+- The `05-steps` durable engine does not wrap this consumer yet; the
+  idempotency/crash-window properties are proven at the reconciler boundary
+  (commit/ack ordering, two-phase delete) so an engine restart converges —
+  the assembled kill-mid-batch journey with the live engine is owned by
+  `07-verify` per the registry (KB-FILTER / feature-gate scenario).
+- The embedding round trip against a real provider endpoint is pinned
+  offline (mock transport) here and owned by `00-verify` (KB-E1); the CLI
+  transcript used a local stub server serving the same response shape.
+- Chunking parameters (`MAX_CHUNK_CHARS=4000`, `EMBEDDING_BATCH_SIZE=128`,
+  the flat section grammar) are this card's frozen contract; the ADR
+  deliberately left them open.
+- `source_path` is mirrored from `mai.knowledge.documents._paths` (documents.py
+  is outside this card's allowlist); a test pins the mirror against the real
+  on-disk layout, and the projection CHECK bounds path length.
