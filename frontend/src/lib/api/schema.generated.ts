@@ -777,6 +777,211 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/docs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the scope's documents (projection view)
+         * @description List one scope's live documents from the SQL projection (C02 W2).
+         *
+         *     Safe method: layer 1 only. The projection is the designed UI read
+         *     path (the canonical file stays the authority); an unavailable
+         *     database fails closed. Pagination is bounded (C01 rule 5).
+         */
+        get: operations["list_documents_api_v1_docs_get"];
+        put?: never;
+        /**
+         * Create one canonical document (mints the document identity)
+         * @description Mint an opaque ``doc_id`` and commit the first revision.
+         *
+         *     Exactly one of ``content`` (authored) or ``source_path`` (explicit
+         *     import) is required; the store refuses credential-material names,
+         *     symlinks, directories and oversized/invalid documents before any
+         *     effect, so a rejected import materializes nothing indexable.
+         */
+        post: operations["create_document_api_v1_docs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/index": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Index status: durable outbox + projection state for one scope
+         * @description The explicit pending/failed truth of one scope's index (AC2).
+         *
+         *     Live outbox intents are ``pending`` — visible work, never "unknown".
+         *     The projection side reports each live row's indexed revision and
+         *     chunk count; when the database is unavailable the projection half
+         *     says so instead of guessing (C08 rule 6).
+         */
+        get: operations["index_status_api_v1_docs_index_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/{doc_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one canonical document (hash-verified, provenance-carrying)
+         * @description Return the stored document: content plus revision/hash + provenance.
+         *
+         *     Safe method: layer 1 only. The read is hash-verified against the
+         *     sidecar metadata; a live tombstone or hash mismatch is a surfaced
+         *     conflict (C02 W4/W2), never a silent answer. Naming another scope
+         *     finds nothing (404) — scopes never leak across the storage boundary.
+         */
+        get: operations["read_document_api_v1_docs__doc_id__get"];
+        /**
+         * Edit one canonical document (optimistic concurrency)
+         * @description Replace the content at ``expected_revision`` (stale → 409 conflict).
+         *
+         *     A stale caller is rejected BEFORE any write (C01 rule 6); a successful
+         *     edit emits the durable reindex intent after the file+metadata pair.
+         */
+        put: operations["edit_document_api_v1_docs__doc_id__put"];
+        post?: never;
+        /**
+         * Delete one canonical document (durable tombstone + reindex intent)
+         * @description Revision-checked removal; the tombstone intent is durable first.
+         *
+         *     The intent stays visible (``pending``) until the indexer acknowledges
+         *     with a purge — delete is never reported done before the projection
+         *     can converge (C02 W4).
+         */
+        delete: operations["delete_document_api_v1_docs__doc_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/retrieve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Hybrid search over one scope (cited, provenance-preserving)
+         * @description Answer one bounded hybrid query (pgvector cosine + FTS, RRF-fused).
+         *
+         *     Every excerpt carries its full citation tuple (doc id, revision,
+         *     hash, chunk offset), so truncated text stays traceable (C07 rule 4).
+         *     ``status: "unavailable"`` names the failed seam explicitly (index vs
+         *     embedding vs dimension contract) — never an empty-success from a
+         *     failed query (AC2). The server filter is SQL at the storage boundary
+         *     (C07 rule 2).
+         */
+        post: operations["retrieve_documents_api_v1_docs_retrieve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/index/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile the scope's reindex outbox (reindex now)
+         * @description Run every live intent of one scope through the reviewed indexer.
+         *
+         *     Per-intent outcomes are reported verbatim; an embedding/DB outage
+         *     leaves the intent ``pending`` with the producer's stable code —
+         *     never a fabricated ``indexed`` (the outbox converges on the next
+         *     reconcile).
+         */
+        post: operations["reconcile_index_api_v1_docs_index_reconcile_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/generate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate a canonical runbook/incident from settled run evidence
+         * @description Preview or commit one generated document (C07 rule 5 boundary).
+         *
+         *     Classification comes from run truth, never prose: settled
+         *     ``succeeded`` → runbook (``verified`` only when host-verified),
+         *     settled ``failed`` → incident record; anything unsettled is rejected
+         *     before any store touch. ``preview`` renders without writing; a commit
+         *     writes revision-checked through the canonical store and honestly
+         *     reports the reindex outcome (``null`` when no indexer is wired).
+         */
+        post: operations["generate_document_api_v1_docs_generate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run one bounded deep-research pass over the server's cited docs
+         * @description Execute one bounded research run and return the settled report.
+         *
+         *     The workflow composes, through the ONE dispatcher boundary, the
+         *     current pinned server context and scoped docs retrieval; every
+         *     excerpt becomes a cited source (C07 rule 4) and a failed run promotes
+         *     exactly one canonical incident (C07 rule 5). Channels the API
+         *     process cannot truthfully provide — web search/pages, host logs,
+         *     child runs, model synthesis — are honest pre-flight rejections, so a
+         *     settled report never contains silently missing evidence.
+         */
+        post: operations["research_documents_api_v1_docs_research_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -1217,6 +1422,82 @@ export interface components {
             policy_revision: number;
         };
         /**
+         * DocumentCreateBody
+         * @description Create body: either authored ``content`` or an explicit import path.
+         *
+         *     ``source_path`` is the 07-doc-store outside seam: read-only,
+         *     regular-file only, credential-material names refused — a rejected
+         *     import materializes nothing. ``verification`` is the C07 rule 5
+         *     outcome/hypothesis vocabulary.
+         */
+        DocumentCreateBody: {
+            /** Server Id */
+            server_id?: string | null;
+            /** App Id */
+            app_id?: string | null;
+            /**
+             * Shared
+             * @default false
+             */
+            shared: boolean;
+            /** @default docs */
+            namespace: components["schemas"]["DocumentNamespace"];
+            /** Content */
+            content?: string | null;
+            /** Source Path */
+            source_path?: string | null;
+            /** Origin Revision */
+            origin_revision?: string | null;
+            /** @default unverified */
+            verification: components["schemas"]["VerificationStatus"];
+        };
+        /**
+         * DocumentDeleteBody
+         * @description Delete body: revision-checked removal with a durable tombstone.
+         */
+        DocumentDeleteBody: {
+            /** Server Id */
+            server_id?: string | null;
+            /** App Id */
+            app_id?: string | null;
+            /**
+             * Shared
+             * @default false
+             */
+            shared: boolean;
+            /** @default docs */
+            namespace: components["schemas"]["DocumentNamespace"];
+            /** Expected Revision */
+            expected_revision: number;
+        };
+        /**
+         * DocumentEditBody
+         * @description Edit body: full-content replace with optimistic concurrency.
+         */
+        DocumentEditBody: {
+            /** Server Id */
+            server_id?: string | null;
+            /** App Id */
+            app_id?: string | null;
+            /**
+             * Shared
+             * @default false
+             */
+            shared: boolean;
+            /** @default docs */
+            namespace: components["schemas"]["DocumentNamespace"];
+            /** Content */
+            content: string;
+            /** Expected Revision */
+            expected_revision: number;
+        };
+        /**
+         * DocumentNamespace
+         * @description Canonical collection below a scope (C02 rule 2 docs/runbooks layout).
+         * @enum {string}
+         */
+        DocumentNamespace: "docs" | "runbooks";
+        /**
          * ErrorBody
          * @description C01 stable error fields (browser-safe; never secret material).
          */
@@ -1282,6 +1563,25 @@ export interface components {
             run_id: string | null;
             /** Planned Run Id */
             planned_run_id: string;
+        };
+        /**
+         * GenerateBody
+         * @description Run-evidence generation body (07-doc-generation payload).
+         *
+         *     ``evidence`` is the frozen ``v=1`` job-evidence document; field truth
+         *     is :func:`mai.knowledge.generate.parse_job_evidence`. ``preview``
+         *     validates/classifies/renders without touching the canonical store.
+         */
+        GenerateBody: {
+            /** Evidence */
+            evidence: {
+                [key: string]: unknown;
+            };
+            /**
+             * Preview
+             * @default false
+             */
+            preview: boolean;
         };
         /**
          * GrantEntry
@@ -1750,6 +2050,72 @@ export interface components {
             stale: boolean;
         };
         /**
+         * ReconcileBody
+         * @description Reindex-reconcile body: run the durable outbox of one scope.
+         */
+        ReconcileBody: {
+            /** Server Id */
+            server_id?: string | null;
+            /** App Id */
+            app_id?: string | null;
+            /**
+             * Shared
+             * @default false
+             */
+            shared: boolean;
+        };
+        /**
+         * ResearchBody
+         * @description Deep-research body: one server-scoped question over cited docs.
+         *
+         *     ``payload`` is the frozen research-request vocabulary validated by
+         *     :func:`mai.research.workflow.request_from_payload`. Channels the API
+         *     process cannot truthfully provide (web search/pages, host logs),
+         *     child runs and model synthesis are honest pre-flight rejections.
+         */
+        ResearchBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Payload */
+            payload: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * RetrievalBody
+         * @description Hybrid retrieval body (C07 rules 2–4).
+         *
+         *     The admin session may name any enrolled scope; the server filter is
+         *     a SQL predicate at the storage boundary, never post-filtering.
+         */
+        RetrievalBody: {
+            /** Server Id */
+            server_id?: string | null;
+            /** App Id */
+            app_id?: string | null;
+            /**
+             * Shared
+             * @default false
+             */
+            shared: boolean;
+            namespace?: components["schemas"]["DocumentNamespace"] | null;
+            /** Query */
+            query: string;
+            /**
+             * Limit
+             * @default 5
+             */
+            limit: number;
+            /**
+             * Max Excerpt Chars
+             * @default 1200
+             */
+            max_excerpt_chars: number;
+        };
+        /**
          * RootBudgetBody
          * @description The frozen aggregate delegation-budget document (C05 rule 7).
          *
@@ -2051,6 +2417,12 @@ export interface components {
             /** Context */
             ctx?: Record<string, never>;
         };
+        /**
+         * VerificationStatus
+         * @description C07 rule 5 boundary: outcomes are separated from hypotheses.
+         * @enum {string}
+         */
+        VerificationStatus: "unverified" | "verified" | "hypothesis";
     };
     responses: never;
     parameters: never;
@@ -4307,6 +4679,549 @@ export interface operations {
             };
             /** @description The pair fails producer validation, or tools were requested from a connection that does not declare tool_calls */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_documents_api_v1_docs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Scope or pagination parameters invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Document index unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_document_api_v1_docs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Content, import path or scope invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical document service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    index_status_api_v1_docs_index_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Scope invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_document_api_v1_docs__doc_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                doc_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical document for this id and scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_document_api_v1_docs__doc_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                doc_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentEditBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical document for this id and scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision or canonical state conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Content or revision invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_document_api_v1_docs__doc_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                doc_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentDeleteBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical document for this id and scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision or canonical state conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retrieve_documents_api_v1_docs_retrieve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetrievalBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query or scope invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Document index unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    reconcile_index_api_v1_docs_index_reconcile_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Scope invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Document index unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    generate_document_api_v1_docs_generate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical state conflict (tombstone/hash) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run evidence invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical document service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    research_documents_api_v1_docs_research_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile for this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Research payload invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Research channel or dependency unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

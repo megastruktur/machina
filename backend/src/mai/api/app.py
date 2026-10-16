@@ -52,6 +52,11 @@ from starlette.status import (
 )
 
 from mai.agents.model_store import ModelConfigStore
+from mai.agents.models import (
+    SCHEMA_VERSION as CONNECTION_SCHEMA_VERSION,
+    ModelConfigError,
+    parse_connection,
+)
 from mai.api.approvals import register_approvals
 from mai.api.auth import (
     bootstrap_password_from_env,
@@ -63,6 +68,12 @@ from mai.api.auth import (
     resolve_trusted_proxies,
 )
 from mai.api.chat import register_chat
+from mai.api.documents import (
+    EMBEDDINGS_BASE_URL_VAR,
+    EMBEDDINGS_CREDENTIAL_REF_VAR,
+    KnowledgeServices,
+    register_documents,
+)
 from mai.api.grants import register_grants
 from mai.api.jobs import register_jobs
 from mai.api.models import register_models
@@ -76,6 +87,7 @@ from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
 from mai.auth.sessions import AuthError, SessionStore
+from mai.capabilities.dispatch import CapabilityDispatcher
 from mai.credentials.env import EnvFileError, EnvResolver
 from mai.database import (
     DatabaseConfigError,
@@ -85,10 +97,20 @@ from mai.database import (
     create_app_engine,
     resolve_database_url,
 )
+from mai.knowledge.documents import DocumentStore
+from mai.knowledge.generate import DocGenerator
+from mai.knowledge.index import GatewayEmbedder, ScopeIndexer
+from mai.knowledge.retrieve import (
+    DocumentRetrievalCapability,
+    ScopeRetriever,
+    descriptor as retrieval_descriptor,
+)
+from mai.plugins.registry import CapabilityRegistry
 from mai.policy.approvals import ApprovalStore
 from mai.policy.config import GrantConfigStore
 from mai.profiles.files import ProfileFileError, ProfileFileStore
 from mai.profiles.projection import ProfileProjection
+from mai.research.workflow import ResearchWorkflow
 
 API_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_PREFIX}/health"
@@ -171,6 +193,84 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.grants = GrantConfigStore(resolve_profiles_root(app.state.env))
         except OSError:
             app.state.grants_error = "policy_root_unusable"
+        # Documents surface (C02/C07): the canonical doc store over the
+        # same explicit data root; the retrieval/reconcile engine over the
+        # one app engine plus the explicitly configured embeddings
+        # endpoint (never discovered); the deep-research composition over
+        # the docs.retrieve channel through the ONE dispatcher boundary
+        # with current grants/policy/adoption from app state. Every part
+        # fails closed: routes answer 503 and touch no state.
+        app.state.knowledge = None
+        doc_store: DocumentStore | None = None
+        try:
+            doc_store = DocumentStore(resolve_profiles_root(app.state.env))
+        except OSError:
+            doc_store = None
+        if doc_store is not None:
+            env = app.state.env or os.environ
+            retriever = None
+            indexer = None
+            workflow = None
+            base_url = env.get(EMBEDDINGS_BASE_URL_VAR)
+            if base_url and app.state.session_factory is not None:
+                try:
+                    connection = parse_connection(
+                        {
+                            "schema_version": CONNECTION_SCHEMA_VERSION,
+                            "name": "docs-api-embeddings",
+                            "base_url": base_url,
+                            "credential_ref": env.get(
+                                EMBEDDINGS_CREDENTIAL_REF_VAR
+                            )
+                            or None,
+                        }
+                    )
+                    embedder = GatewayEmbedder(connection, app.state.credentials)
+                except ModelConfigError:
+                    embedder = None
+                if embedder is not None:
+                    retriever = ScopeRetriever(app.state.session_factory, embedder)
+                    indexer = ScopeIndexer(
+                        app.state.session_factory, doc_store, embedder
+                    )
+            profiles_store = app.state.profiles
+            grants_store = app.state.grants
+            if (
+                retriever is not None
+                and app.state.approvals is not None
+                and grants_store is not None
+                and profiles_store is not None
+            ):
+                registry = CapabilityRegistry()
+                registry.register(retrieval_descriptor())
+
+                def adopted_probe(server_id: object) -> bool:
+                    try:
+                        profiles_store.read(server_id)
+                    except Exception:  # noqa: BLE001 - boolean probe only
+                        return False
+                    return True
+
+                dispatcher = CapabilityDispatcher(
+                    registry=registry,
+                    approvals=app.state.approvals,
+                    grants=lambda: grants_store.read().grants,
+                    policy=lambda: grants_store.read().policy,
+                    adopted=adopted_probe,
+                    credentials=lambda: app.state.credentials,
+                    executor=DocumentRetrievalCapability(retriever),
+                )
+                workflow = ResearchWorkflow(
+                    dispatcher,
+                    data_root=resolve_profiles_root(app.state.env),
+                    generator=DocGenerator(doc_store),
+                )
+            app.state.knowledge = KnowledgeServices(
+                store=doc_store,
+                retriever=retriever,
+                indexer=indexer,
+                workflow=workflow,
+            )
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
         # store appends its own ``models/`` namespace). Credential material
@@ -292,6 +392,12 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # conversations stay worker-owned; the probe is a single bounded
     # diagnostic round owned by this surface.
     register_models(app)
+    # The canonical documents surface (C02/C07): docs/runbook CRUD with
+    # provenance and revision checks, hybrid cited retrieval, explicit
+    # index status/reconcile, run-evidence generation and the bounded
+    # server-scoped deep-research pass — all over the reviewed knowledge
+    # producers; HTTP composes services, effects stay in the producers.
+    register_documents(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
