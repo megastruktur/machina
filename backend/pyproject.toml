@@ -43,6 +43,41 @@ dependencies = [
     # its downstream consumers (06-agent-run/06-tool-bridge), not a silent
     # upgrade; within 2.x the lock file fixes the exact resolved version.
     "pydantic-ai-slim[openai]>=2.56,<3",
+    # Document-chunk embeddings client (contracts.md C07 rule 3/7; ADR
+    # docs/architecture/knowledge-packaging.md §4): the doc index embeds via
+    # POST {base_url}/v1/embeddings on the SAME configured OpenAI-compatible
+    # connection as the chat path — the `embeddings.create` surface of this
+    # SDK, never /chat/completions. Direct declaration (was locked only as the
+    # pydantic-ai-slim[openai] extra's requirement while src/mai already
+    # imports it); the SDK is Apache-2.0-licensed; bounds mirror that extra's
+    # floor (openai>=3.26.0) with the major cap so the next SDK major is a
+    # silent upgrade. backend/tests/test_knowledge_dependencies.py verifies
+    # the exact request/response surface offline (mock transport) and holds
+    # the C07 dimension tuple (text-embedding-3-small / 1536 / cosine).
+    "openai>=3.26,<4",
+    # Vector column access layer for the frozen store (ADR §4.1/§4.2: the
+    # controller's own PostgreSQL + pgvector, vector(1536) HNSW
+    # vector_cosine_ops — a dedicated vector-database service is rejected).
+    # Provides the supported SQLAlchemy type (pgvector.sqlalchemy.Vector) for
+    # the 07-vector-schema migration and the cosine-distance expression for
+    # 07-chunk-index/07-retrieval; pgvector.psycopg adapts parameters on the
+    # locked psycopg3 application driver (src/mai/database.py). Distribution
+    # MIT; the server-side extension it addresses is PostgreSQL-licensed
+    # (delivered by the pgvector-enabled Postgres image, Compose cards — not
+    # a Python dependency). Bounded to the verified 0.5 line: inside a 0.x
+    # major the minor is the breaking axis, so the next minor bump is a
+    # deliberate review, not a silent upgrade.
+    "pgvector>=0.5,<0.6",
+    # HTTP fetch client (ADR §3.2: SearXNG returns result metadata, page
+    # fetching/extraction is MAI's own capability; C07 rule 7 search JSON).
+    # httpx2 is the BSD-3-Clause client already locked as the openai SDK's
+    # transport — one HTTP stack for the knowledge lane (07-search-capability,
+    # 07-page-reader, 07-service-http, 11-memory-adapter Hindsight HTTP).
+    # Plain async client only: no extra (cli/http2/socks/zstd/brotli stay
+    # unselected) and NO browser automation — page fetch is bounded HTTP,
+    # never an embedded/unbounded browser install (acceptance criterion 2).
+    # Bounded <3 so the client's next major is a deliberate reconciliation.
+    "httpx2>=2.13,<3",
 ]
 
 [dependency-groups]
