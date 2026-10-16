@@ -485,6 +485,298 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a chat message as a durable agent conversation (C05 rule 5)
+         * @description Persist one chat submission and durably enqueue the conversation.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The target profile's revisions are bound from the canonical store;
+         *     attachment references are resolved by confined, integrity-checked
+         *     reads; the composed intent is validated by the ONE producers; the
+         *     facade row, the intent digest events and the submit edge commit
+         *     atomically; the engine enqueue follows the commit so a crash leaves
+         *     a re-armable gap, not a half intent.
+         */
+        post: operations["submit_message_api_v1_chat_messages_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List conversations for one explicit server scope (bounded page)
+         * @description One bounded page of one server's conversations (C01 rules 5 and 7).
+         *
+         *     Safe method: session layer only. Conversations are the ROOT runs
+         *     (depth 0); delegated children are reachable through their parent's
+         *     detail. States replay from the persisted transition events.
+         */
+        get: operations["list_conversations_api_v1_chat_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one conversation: binding, replayed state, children, references
+         * @description One conversation's durable record; state is replayed, never engine-called.
+         *
+         *     Children are identity+state views of the persisted child rows; the
+         *     recorded attachment references are identity+integrity handles. Task
+         *     text, prompts and artifact bodies never appear (C05 rule 4).
+         */
+        get: operations["read_conversation_api_v1_chat_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a conversation (records the request; reports known outcomes)
+         * @description Record the cancel request and report only a KNOWN engine outcome.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Composes the reviewed safe-cancel facade over the explicit tree
+         *     cancellation (guard rule 4): the request is recorded ONCE, the
+         *     engine cancellation covers the conversation's children unless the
+         *     caller explicitly keeps them, and the tiny HTTP observation budget
+         *     expires into an honest ``202`` — never a claimed ``cancelled``.
+         */
+        post: operations["cancel_conversation_api_v1_chat_runs__run_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/runs/{run_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to a conversation's persisted events (SSE, replay cursor)
+         * @description SSE subscription over the conversation's event stream (C05 rule 4).
+         *
+         *     The same transport the jobs surface froze: the replay cursor is the
+         *     standard SSE ``Last-Event-ID`` header; frames are strictly
+         *     cursor-exclusive and ordered by ``seq``, so a reconnect with the
+         *     last seen ``id`` deduplicates by construction. Authorization
+         *     completes BEFORE the response starts; the stream is read-only (a
+         *     disconnected browser cancels nothing, C08 rule 7). Delegation
+         *     children subscribe through this same route with their own run ids —
+         *     their identities are discovered from the parent's
+         *     ``agent.delegation_planned`` event (value-free references).
+         */
+        get: operations["stream_conversation_events_api_v1_chat_runs__run_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List stored model connections (value-free references)
+         * @description Stored connection names with their version triples; no content.
+         */
+        get: operations["list_connections_api_v1_models_connections_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/connections/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one stored connection (credential reference only)
+         * @description The stored document view; ``credential_ref`` is a name, never a value.
+         */
+        get: operations["get_connection_api_v1_models_connections__name__get"];
+        /**
+         * Create or replace a connection (optimistic revision)
+         * @description Validate through the producer, then atomically store (C02 rule 5).
+         *
+         *     ``expected_revision: 0`` creates; any other value must match the
+         *     caller's last observed revision (C01 rule 6).
+         */
+        put: operations["put_connection_api_v1_models_connections__name__put"];
+        post?: never;
+        /**
+         * Delete a connection (revision-checked)
+         * @description Revision-checked removal; a selection-named record is refused.
+         */
+        delete: operations["delete_connection_api_v1_models_connections__name__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List stored model profiles (value-free references)
+         * @description Stored profile names with their version triples; no content.
+         */
+        get: operations["list_profiles_api_v1_models_profiles_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/profiles/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one stored model profile
+         * @description The stored document view (allowlisted settings only, by construction).
+         */
+        get: operations["get_profile_api_v1_models_profiles__name__get"];
+        /**
+         * Create or replace a model profile (optimistic revision)
+         * @description Validate through the producer, then atomically store (C02 rule 5).
+         */
+        put: operations["put_profile_api_v1_models_profiles__name__put"];
+        post?: never;
+        /**
+         * Delete a model profile (revision-checked)
+         * @description Revision-checked removal; a selection-named record is refused.
+         */
+        delete: operations["delete_profile_api_v1_models_profiles__name__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the stored (connection, profile) selection
+         * @description The selected pair; it names the records, it pins no revisions.
+         */
+        get: operations["get_selection_api_v1_models_selection_get"];
+        /**
+         * Select one (connection, profile) pair (validated, optimistic)
+         * @description Both records must be stored and pair-valid (C06 rule 1).
+         *
+         *     Capability gating is deliberate: e.g. ``reasoning_effort`` on a
+         *     connection that does not declare ``capabilities.reasoning`` is a
+         *     classified 422 (``unsupported_option``), never a silent drop.
+         */
+        put: operations["put_selection_api_v1_models_selection_put"];
+        post?: never;
+        /**
+         * Clear the stored selection (revision-checked)
+         * @description Revision-checked removal of the selection record.
+         */
+        delete: operations["delete_selection_api_v1_models_selection_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/models/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run one bounded classified probe round
+         * @description One bounded model round with a classified, value-free outcome.
+         *
+         *     Distinct outcomes (acceptance 1): ``reachability`` (transport/deadline),
+         *     ``auth`` (credential rejected by the endpoint), ``rejected_request``
+         *     (the endpoint refused the payload — the tool-smoke rejection class),
+         *     plus ``provider``/``unknown`` (other API failures), ``credential``
+         *     (local ``.env`` resolution failed; the endpoint saw nothing) and
+         *     ``ok``. Credential material is resolved at call time (C03 rule 6) and
+         *     never appears in any response.
+         */
+        post: operations["test_models_api_v1_models_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -567,6 +859,30 @@ export interface components {
             consumed_by: string | null;
             /** Consumed At */
             consumed_at: string | null;
+        };
+        /**
+         * AttachmentBody
+         * @description One permitted-artifact context reference (identity only).
+         */
+        AttachmentBody: {
+            /** Server Id */
+            server_id: string;
+            /** Op Id */
+            op_id: string;
+        };
+        /**
+         * AttachmentView
+         * @description One recorded attachment reference (identity + integrity handles).
+         */
+        AttachmentView: {
+            /** Server Id */
+            server_id: string;
+            /** Op Id */
+            op_id: string;
+            /** Sha256 */
+            sha256: string;
+            /** Bytes */
+            bytes: number;
         };
         /**
          * CancelBody
@@ -742,6 +1058,144 @@ export interface components {
             duration_seconds: number;
         };
         /**
+         * ChatCancelBody
+         * @description Cancel body: explicit tree cancellation (guard rule 4).
+         *
+         *     A conversation cancel defaults to cancelling its children — a
+         *     cancelled chat must never orphan delegated work. (Deliberately a
+         *     distinct wire type from the jobs surface's ``CancelBody``: the
+         *     defaults differ and the exported component names must not collide.)
+         */
+        ChatCancelBody: {
+            /**
+             * Cancel Children
+             * @default true
+             */
+            cancel_children: boolean;
+        };
+        /**
+         * ChatCreated
+         * @description Submit outcome: the conversation view plus the dedup verdict.
+         */
+        ChatCreated: {
+            conversation: components["schemas"]["ConversationView"];
+            /** Deduplicated */
+            deduplicated: boolean;
+        };
+        /**
+         * ChatPage
+         * @description One bounded, explicitly server-scoped list page (C01 rule 5/7).
+         */
+        ChatPage: {
+            /** Conversations */
+            conversations: components["schemas"]["ConversationView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ChatSubmitBody
+         * @description Submit body (strict: unknown fields are rejected, value-free 422).
+         *
+         *     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
+         *     rule 5). ``profile`` names the model profile selection explicitly
+         *     (C06 rule 1); ``connection`` stays optional (the model store's
+         *     stored pairing when omitted). ``capabilities`` is the conversation's
+         *     explicit parent grant request — omitted means NO capability, never a
+         *     default grant; delegation children are clamped to its intersection.
+         *     ``root_budget`` is the optional aggregate delegation budget (C05
+         *     rule 7): frozen on the run row, narrowed against the delegation
+         *     gates, and enforced by the root ledger across the whole tree.
+         */
+        ChatSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Message */
+            message: string;
+            /** Profile */
+            profile: string;
+            /** Connection */
+            connection?: string | null;
+            /**
+             * Role
+             * @default administrator
+             */
+            role: string;
+            /** Rounds */
+            rounds?: number | null;
+            /** @default ask */
+            mode: components["schemas"]["PolicyMode"];
+            /** Credential References */
+            credential_references?: string[];
+            /** Capabilities */
+            capabilities?: string[];
+            /** Children */
+            children?: components["schemas"]["ChildBody"][];
+            root_budget?: components["schemas"]["RootBudgetBody"] | null;
+            /** Attachments */
+            attachments?: components["schemas"]["AttachmentBody"][];
+        };
+        /**
+         * ChildBody
+         * @description One explicitly scoped child task (the frozen ``ChildSpec`` words).
+         *
+         *     There is deliberately no server/target field: a child runs on its
+         *     parent's server (C06 rule 5). ``capabilities`` is the child's
+         *     REQUEST; the effective grants are the intersection with the parent's
+         *     requested set, applied by the reviewed ``plan_children``.
+         */
+        ChildBody: {
+            /** Task */
+            task: string;
+            /** Role */
+            role?: string | null;
+            /** Connection */
+            connection?: string | null;
+            /** Profile */
+            profile?: string | null;
+            /** Capabilities */
+            capabilities?: string[];
+        };
+        /**
+         * ConversationView
+         * @description One conversation: the run view plus its recorded references.
+         */
+        ConversationView: {
+            /** Run Id */
+            run_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Parent Run Id */
+            parent_run_id: string | null;
+            /** Depth */
+            depth: number;
+            /** Profile Revision */
+            profile_revision: number;
+            /** Prompt Revision */
+            prompt_revision: number;
+            /** Model Profile */
+            model_profile: string;
+            /** Requested Grants */
+            requested_grants: string[];
+            /** State */
+            state: string | null;
+            /** Cancel Requested At */
+            cancel_requested_at: string | null;
+            /** Submitted At */
+            submitted_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Attachments */
+            attachments?: components["schemas"]["AttachmentView"][];
+            /** Children */
+            children?: components["schemas"]["RunView"][];
+        };
+        /**
          * DecisionBody
          * @description The binding the admin confirms, field-for-field (C03 rule 4).
          *
@@ -899,6 +1353,283 @@ export interface components {
             detail?: components["schemas"]["ValidationError"][];
         };
         /**
+         * ModelCapabilitiesBody
+         * @description Optional endpoint capabilities the connection declares (C06 rule 1).
+         *
+         *     Everything defaults to false: an endpoint is assumed plain chat-only
+         *     until the administrator declares more.
+         */
+        ModelCapabilitiesBody: {
+            /**
+             * Tool Calls
+             * @default false
+             */
+            tool_calls: boolean;
+            /**
+             * Reasoning
+             * @default false
+             */
+            reasoning: boolean;
+        };
+        /**
+         * ModelCapabilitiesView
+         * @description The endpoint's declared optional capabilities.
+         */
+        ModelCapabilitiesView: {
+            /** Tool Calls */
+            tool_calls: boolean;
+            /** Reasoning */
+            reasoning: boolean;
+        };
+        /**
+         * ModelConnectionBody
+         * @description Connection upsert payload (strict: unknown fields are rejected).
+         *
+         *     ``credential_ref`` is a *reference* (the ``.env`` name); there is
+         *     deliberately no credential-value field anywhere on this surface. The
+         *     record name is the path identity, never a body field.
+         */
+        ModelConnectionBody: {
+            /** Base Url */
+            base_url: string;
+            /** Credential Ref */
+            credential_ref?: string | null;
+            /** Timeout Seconds */
+            timeout_seconds?: number | null;
+            /** Headers */
+            headers?: {
+                [key: string]: string;
+            } | null;
+            capabilities?: components["schemas"]["ModelCapabilitiesBody"] | null;
+            /** Expected Revision */
+            expected_revision: number;
+        };
+        /**
+         * ModelConnectionList
+         * @description One bounded page of stored connection references.
+         */
+        ModelConnectionList: {
+            /** Connections */
+            connections: components["schemas"]["ModelRecordRef"][];
+        };
+        /**
+         * ModelConnectionView
+         * @description Stored connection document view (credential *reference* only).
+         */
+        ModelConnectionView: {
+            /** Schema Version */
+            schema_version: number;
+            /** Name */
+            name: string;
+            /** Base Url */
+            base_url: string;
+            /** Credential Ref */
+            credential_ref: string | null;
+            /** Timeout Seconds */
+            timeout_seconds: number | null;
+            /** Headers */
+            headers: components["schemas"]["ModelHeadersView"][];
+            capabilities: components["schemas"]["ModelCapabilitiesView"];
+            /** Revision */
+            revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
+         * ModelHeadersView
+         * @description One declared custom header (literal transport metadata only).
+         */
+        ModelHeadersView: {
+            /** Name */
+            name: string;
+            /** Value */
+            value: string;
+        };
+        /**
+         * ModelMutationResult
+         * @description Post-commit version triple of one successful record write.
+         */
+        ModelMutationResult: {
+            /** Name */
+            name: string;
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
+         * ModelProbeBody
+         * @description Bounded probe request.
+         *
+         *     Without explicit names the stored selection picks the pair (a missing
+         *     selection is a 404, never an ambient default). ``tools`` additionally
+         *     declares one local round-trip tool for the smoke round and requires
+         *     the connection to declare ``capabilities.tool_calls``.
+         */
+        ModelProbeBody: {
+            /** Connection */
+            connection?: string | null;
+            /** Profile */
+            profile?: string | null;
+            /**
+             * Tools
+             * @default false
+             */
+            tools: boolean;
+        };
+        /**
+         * ModelProbeOutcome
+         * @description One classified probe outcome (C06 rule 1 vocabulary, value-free).
+         *
+         *     ``ok`` — the bounded round (and the declared tool round-trip, when
+         *     requested) completed against the endpoint. ``reachability`` —
+         *     transport failure or probe deadline exceeded. ``auth`` — the endpoint
+         *     rejected the credential (401/403). ``rejected_request`` — the endpoint
+         *     refused the request payload (the unsupported-tool/payload class).
+         *     ``provider``/``unknown`` — other structured/unclassified API
+         *     failures. ``credential`` — the reference could not be resolved from
+         *     the configured ``.env`` source (the endpoint saw no request).
+         */
+        ModelProbeOutcome: {
+            /** Connection */
+            connection: string;
+            /** Profile */
+            profile: string;
+            /** Model */
+            model: string;
+            /** Connection Revision */
+            connection_revision: number;
+            /** Profile Revision */
+            profile_revision: number;
+            /** Tools */
+            tools: boolean;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "ok" | "reachability" | "auth" | "rejected_request" | "provider" | "unknown" | "credential";
+            /** Latency Ms */
+            latency_ms: number;
+            /** Detail */
+            detail?: {
+                [key: string]: string;
+            };
+        };
+        /**
+         * ModelProfileBody
+         * @description Model-profile upsert payload (strict; allowlisted settings only).
+         *
+         *     Settings outside the MAI allowlist are producer rejections
+         *     (``unknown_field``/``invalid_field`` → 422); endpoint-capability gates
+         *     are enforced at selection time (C06 rule 1).
+         */
+        ModelProfileBody: {
+            /** Connection */
+            connection: string;
+            /** Model */
+            model: string;
+            /** Temperature */
+            temperature?: number | null;
+            /** Top P */
+            top_p?: number | null;
+            /** Seed */
+            seed?: number | null;
+            /** Max Tokens */
+            max_tokens?: number | null;
+            /** Reasoning Effort */
+            reasoning_effort?: string | null;
+            /** Context Limit */
+            context_limit?: number | null;
+            /** Output Limit */
+            output_limit?: number | null;
+            /** Expected Revision */
+            expected_revision: number;
+        };
+        /**
+         * ModelProfileList
+         * @description One bounded page of stored profile references.
+         */
+        ModelProfileList: {
+            /** Profiles */
+            profiles: components["schemas"]["ModelRecordRef"][];
+        };
+        /**
+         * ModelProfileView
+         * @description Stored model-profile document view.
+         */
+        ModelProfileView: {
+            /** Schema Version */
+            schema_version: number;
+            /** Name */
+            name: string;
+            /** Connection */
+            connection: string;
+            /** Model */
+            model: string;
+            /** Temperature */
+            temperature: number | null;
+            /** Top P */
+            top_p: number | null;
+            /** Seed */
+            seed: number | null;
+            /** Max Tokens */
+            max_tokens: number | null;
+            /** Reasoning Effort */
+            reasoning_effort: string | null;
+            /** Context Limit */
+            context_limit: number | null;
+            /** Output Limit */
+            output_limit: number | null;
+            /** Revision */
+            revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
+         * ModelRecordRef
+         * @description Value-free record reference (identity + version triple, C02 rule 4).
+         */
+        ModelRecordRef: {
+            /** Name */
+            name: string;
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
+         * ModelSelectionBody
+         * @description Selection payload: one explicit (connection, profile) pair.
+         */
+        ModelSelectionBody: {
+            /** Connection */
+            connection: string;
+            /** Profile */
+            profile: string;
+            /** Expected Revision */
+            expected_revision: number;
+        };
+        /**
+         * ModelSelectionView
+         * @description The stored selection (it names the pair, it pins no revisions).
+         */
+        ModelSelectionView: {
+            /** Connection */
+            connection: string;
+            /** Profile */
+            profile: string;
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
          * PasswordBody
          * @description Login/bootstrap payload; bounds mirror the store's input guard.
          */
@@ -1017,6 +1748,36 @@ export interface components {
             revision: number | null;
             /** Stale */
             stale: boolean;
+        };
+        /**
+         * RootBudgetBody
+         * @description The frozen aggregate delegation-budget document (C05 rule 7).
+         *
+         *     The strict ``job_runs.root_budget`` vocabulary (the ONE producer is
+         *     :func:`mai.agents.budgets.parse_root_budget`; these bounds mirror
+         *     it for a value-free 422): every cap NARROWS a module bound —
+         *     ``max_depth``/``max_children`` the delegation module's nesting and
+         *     fan-out bounds, ``max_active``/``max_steps``/``max_total_tokens``
+         *     the ledger's tree-aggregate bounds. Omitted (the default ``None``)
+         *     is the explicit unbudgeted root: the module bounds alone apply and
+         *     no ``agent.budget_*`` events are written (backward compatible).
+         */
+        RootBudgetBody: {
+            /**
+             * V
+             * @default 1
+             */
+            v: number;
+            /** Max Depth */
+            max_depth: number;
+            /** Max Children */
+            max_children: number;
+            /** Max Active */
+            max_active: number;
+            /** Max Steps */
+            max_steps: number;
+            /** Max Total Tokens */
+            max_total_tokens: number;
         };
         /**
          * RunCreated
@@ -2634,6 +3395,923 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_message_api_v1_chat_messages_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submission attached to the existing run (the intent-level resume: a lost enqueue re-arms) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile for the target server, or no artifact stored for an attachment reference */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different submission, or stored artifact state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Chat domain, artifact store or engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_conversations_api_v1_chat_runs_get: {
+        parameters: {
+            query: {
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_conversation_api_v1_chat_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persisted run state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_conversation_api_v1_chat_runs__run_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCancelBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description Request recorded; engine outcome not observed within the budget — outcome stays null, re-entry resumes the wait */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The engine has no workflow under this run id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    stream_conversation_events_api_v1_chat_runs__run_id__events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session (answered before any stream byte) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description An Origin header that is not allowlisted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Last-Event-ID cursor is not a non-negative integer */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_connections_api_v1_models_connections_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionList"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    get_connection_api_v1_models_connections__name__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No connection stored under this name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stored document requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_connection_api_v1_models_connections__name__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelConnectionBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelMutationResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected_revision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Connection document failed producer validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_connection_api_v1_models_connections__name__delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No connection stored under this name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision or the selection names this record */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_profiles_api_v1_models_profiles_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileList"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    get_profile_api_v1_models_profiles__name__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No profile stored under this name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stored document requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_profile_api_v1_models_profiles__name__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelProfileBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelMutationResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected_revision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Profile document failed producer validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_profile_api_v1_models_profiles__name__delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No profile stored under this name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision or the selection names this record */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_selection_api_v1_models_selection_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSelectionView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No selection stored */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    put_selection_api_v1_models_selection_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelSelectionBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSelectionView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A named record is not stored */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected_revision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The pair fails producer validation (pairing or endpoint capability gating) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_selection_api_v1_models_selection_delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No selection stored */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected_revision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    test_models_api_v1_models_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelProbeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProbeOutcome"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The named records are not stored / no selection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The pair fails producer validation, or tools were requested from a connection that does not declare tool_calls */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
