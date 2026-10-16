@@ -52,11 +52,16 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain (exclusive migration-chain resource). Head
 # assertions target the chain TIP; the tuple tracks the full chain.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005")
+# Chain-tip reconciliation (card 08-adoption, exclusive migration-chain
+# owner): revision 0006 appends the application catalogue projection +
+# journal; the tip constants are advanced here so this file's head
+# assertions stay true.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006")
 
-# The exact public application schema after 0005 — the 0004 set plus the
-# two knowledge tables; nothing else, in particular no second vector store,
-# no engine-shadowing tables, no ``dbos`` schema before engine launch.
+# The exact public application schema after 0006 — the 0005 set plus the
+# two application catalogue tables (08-adoption); nothing else, in
+# particular no second vector store, no engine-shadowing tables, no
+# ``dbos`` schema before engine launch.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -72,6 +77,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_schedule_fires",
         "knowledge_documents",
         "knowledge_doc_chunks",
+        "application_projection",
+        "application_projection_journal",
     }
 )
 
@@ -115,8 +122,12 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
+        # Full app set at the chain tip — the 08-adoption tables are listed
+        # here (chain-tip reconciliation) so the zero-to-head fixture stays
+        # order-independent after revision 0006.
         conn.execute(
-            "DROP TABLE IF EXISTS knowledge_doc_chunks, knowledge_documents, "
+            "DROP TABLE IF EXISTS application_projection_journal, "
+            "application_projection, knowledge_doc_chunks, knowledge_documents, "
             "job_schedule_fires, job_schedules, "
             "job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
@@ -127,7 +138,7 @@ def _drop_app_tables(url: str) -> None:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0005``."""
+    """Disposable fixture database migrated from zero through ``0006``."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
