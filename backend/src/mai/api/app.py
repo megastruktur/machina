@@ -82,6 +82,7 @@ from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
 )
+from mai.api.plugins import register_plugins
 from mai.jobs.lifecycle import RunLifecycle
 from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
@@ -111,6 +112,7 @@ from mai.knowledge.retrieve import (
     ScopeRetriever,
     descriptor as retrieval_descriptor,
 )
+from mai.plugins.config import PluginConfigStore
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.approvals import ApprovalStore
 from mai.policy.config import GrantConfigStore
@@ -311,6 +313,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.models = ModelConfigStore(resolve_profiles_root(app.state.env))
         except OSError:
             app.state.models_error = "models_root_unusable"
+        # Plugin configuration store (C02/C03): the confined atomic store
+        # over the same explicitly configured data root (the store appends
+        # its own ``plugins/`` namespace) plus the skills namespace root
+        # (``shared/skills``, loader-owned format). Credential material is
+        # never held here — the wire carries reference names only (C03
+        # rule 6). Unusable roots fail closed: routes answer 503
+        # unavailable and touch no state.
+        app.state.plugins = None
+        app.state.plugins_error = None
+        try:
+            app.state.plugins = PluginConfigStore(
+                resolve_profiles_root(app.state.env)
+            )
+        except OSError:
+            app.state.plugins_error = "plugins_root_unusable"
+        app.state.skills_root = None
+        app.state.skills_error = None
+        try:
+            app.state.skills_root = resolve_profiles_root(app.state.env)
+        except OSError:
+            app.state.skills_error = "skills_root_unusable"
         # Jobs domain surfaces (C05/C08): the facade lifecycle replay
         # producer plus the safe-cancel facade over the ONE engine client.
         # The durable engine itself is launched by the worker (never here):
@@ -433,6 +456,14 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # submits through the EXISTING jobs facade — no Docker/SSH effect ever
     # runs in a route; the data-removal decision is an explicit field.
     register_applications(app)
+    # The plugin configuration/enablement surface (C03): plugin catalogs
+    # with availability separate from grants, versioned connection-config
+    # edits validated against the declared schemas (credential references
+    # only, never values), explicit server grant bindings, the bounded
+    # MCP discovery diagnostic, and read-only skill inspection — all over
+    # the reviewed plugin-store/native/mcp/skills producers. No
+    # installation endpoint exists by design (C03 rule 7).
+    register_plugins(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
