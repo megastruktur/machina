@@ -58,6 +58,7 @@ from mai.agents.models import (
     parse_connection,
 )
 from mai.api.approvals import register_approvals
+from mai.api.applications import register_applications
 from mai.api.auth import (
     bootstrap_password_from_env,
     effective_client_ip,
@@ -86,6 +87,11 @@ from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
+from mai.applications.adopt import (
+    ApplicationAdoption,
+    ApplicationManifestStore,
+)
+from mai.applications.document import ApplicationDocService
 from mai.auth.sessions import AuthError, SessionStore
 from mai.capabilities.dispatch import CapabilityDispatcher
 from mai.credentials.env import EnvFileError, EnvResolver
@@ -271,6 +277,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 indexer=indexer,
                 workflow=workflow,
             )
+        # Applications surface (C09): the confined canonical manifest store
+        # and the journaled adoption worker over the SAME explicit data
+        # root and the ONE app engine; the app-docs maintainer over the
+        # canonical doc store (present whenever it is). An unusable root
+        # fails closed: routes answer 503 unavailable and touch no state.
+        app.state.applications = None
+        app.state.app_adoption = None
+        app.state.app_docs = None
+        try:
+            app.state.applications = ApplicationManifestStore(
+                resolve_profiles_root(app.state.env)
+            )
+        except OSError:
+            app.state.applications = None
+        if app.state.session_factory is not None and (
+            app.state.applications is not None
+        ):
+            app.state.app_adoption = ApplicationAdoption(
+                app.state.session_factory
+            )
+        if doc_store is not None:
+            app.state.app_docs = ApplicationDocService(doc_store)
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
         # store appends its own ``models/`` namespace). Credential material
@@ -398,6 +426,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # server-scoped deep-research pass — all over the reviewed knowledge
     # producers; HTTP composes services, effects stay in the producers.
     register_documents(app)
+    # The applications surface (C09): discovery/adopted listings kept
+    # separate (C09 rule 1), the explicit adoption/revoke writes over the
+    # journaled canonical producers with the app-docs identity record, the
+    # pure C09 rule 3 plan preview, and the install/update/remove intent
+    # submits through the EXISTING jobs facade — no Docker/SSH effect ever
+    # runs in a route; the data-removal decision is an explicit field.
+    register_applications(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202

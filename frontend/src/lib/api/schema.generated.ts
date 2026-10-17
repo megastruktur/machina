@@ -982,6 +982,195 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{server_id}/applications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List adopted applications (bounded page, C09 rule 1)
+         * @description One bounded page of projected adoption records (C01 rule 5/7).
+         *
+         *     Safe method: session layer only. Adoption records are the managed
+         *     truth; discovery observations are a SEPARATE resource and never merge
+         *     into this page (C09 rule 1).
+         */
+        get: operations["list_adopted_api_v1_servers__server_id__applications_get"];
+        put?: never;
+        /**
+         * Adopt one application (explicit admin action, C09 rule 1)
+         * @description Commit one adoption: canonical manifest + projection + record doc.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The target must be an enrolled canonical server (C08 G2 binding); the
+         *     decision composes the reviewed producer request and the journaled
+         *     pipeline runs file + projection (local canonical effects only — the
+         *     external deployment paths are referenced, never touched, C09 rule 6).
+         *     On success the application's identity record is documented through the
+         *     reviewed app-docs producer; a documentation refusal/absence is
+         *     reported honestly on the response and converges on the next adoption
+         *     revision — the committed adoption is never rolled back for it.
+         */
+        post: operations["adopt_application_api_v1_servers__server_id__applications_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/discoveries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Observe one server's application inventory (read-only lanes)
+         * @description One live discovery snapshot through the pinned-identity SSH lanes.
+         *
+         *     Safe method: session layer only, but the lanes are real bounded
+         *     read-only commands on the TARGET (docker ps / systemctl / ss) — the
+         *     reviewed producer reports per-lane honesty and collects the safe view
+         *     only (no environment values, mounts or command lines; no file
+         *     contents). Managed tagging comes exclusively from the adopted
+         *     records' selectors (C09 rule 1: discovery grants nothing and enables
+         *     no execution). The transport runs off the event loop; the pinned host
+         *     key and identity key resolve server-side only, exactly like the
+         *     enrolled password lane.
+         */
+        get: operations["discover_applications_api_v1_servers__server_id__applications_discoveries_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an adoption (non-destructive; C09 rule 6)
+         * @description Revoke the adoption: tombstone first, then file, then projection.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     ONLY the canonical manifest pair is removed — the external deployment
+         *     paths recorded in the manifest are never touched (C09 rule 6), and no
+         *     target-side effect of any kind runs in this route (acceptance 2).
+         */
+        delete: operations["revoke_application_api_v1_servers__server_id__applications__application_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview the deterministic plan for one recipe (C09 rule 3)
+         * @description The pure C09 rule 3 preview: actual intended resources/limits.
+         *
+         *     POST carries the frozen mutating-request boundary (C08 rule 2), but
+         *     the route is PURE: it validates the recipe against the frozen schema,
+         *     rebuilds the deterministic policy-bound plan for the named target and
+         *     returns it — no store write, no projection, no target contact.
+         */
+        post: operations["plan_application_api_v1_servers__server_id__applications_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit an install intent (durable plan via the jobs facade)
+         * @description Submit the install plan as one ``app.install`` step (C09 rule 3).
+         *
+         *     The plan is rebuilt deterministically from the submitted recipe —
+         *     identical inputs yield the identical plan hash, so the executor's
+         *     approval binding (C03 rule 4) and the submit idempotency digest agree.
+         *     Policy/grants/approval are enforced by the worker's G2 gate on this
+         *     exact intent; a denial surfaces as the executor's structured refusal.
+         */
+        post: operations["install_application_api_v1_servers__server_id__applications__application_id__install_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit an update intent (revision-aware baseline assertion)
+         * @description Submit the update plan with the asserted current baseline (C09 r4).
+         */
+        post: operations["update_application_api_v1_servers__server_id__applications__application_id__update_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a removal intent (explicit keep/delete data decision)
+         * @description Submit the removal plan with the EXPLICIT data decision (C09 r5).
+         *
+         *     ``data_intent`` has no default and its only values are ``keep`` and
+         *     ``delete``; the decision travels inside the digest-bound step payload
+         *     and never triggers deletion by itself — the executor records it on
+         *     the receipt, and policy may delegate the choice, inference never.
+         */
+        post: operations["remove_application_api_v1_servers__server_id__applications__application_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -1026,6 +1215,120 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AdoptBody
+         * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
+         *
+         *     ``application_id`` is the admin-minted opaque identity (C01 rule 1:
+         *     discovery mints no ids, so the decision supplies one).
+         *     ``expected_revision`` follows C01 rule 6: ``0`` creates, otherwise it
+         *     must equal the live record's revision. At least one reference selector
+         *     is required (the producers enforce the full shape).
+         */
+        AdoptBody: {
+            /** Application Id */
+            application_id: string;
+            /** Name */
+            name: string;
+            origin: components["schemas"]["ApplicationOrigin"];
+            /** Compose Project */
+            compose_project?: string | null;
+            /** Working Dir */
+            working_dir?: string | null;
+            /** Unit Name */
+            unit_name?: string | null;
+            /** External Working Dir */
+            external_working_dir?: string | null;
+            /** External Config Files */
+            external_config_files?: string[];
+            /** External Environment Files */
+            external_environment_files?: string[];
+            /**
+             * Expected Revision
+             * @default 0
+             */
+            expected_revision: number;
+        };
+        /**
+         * AdoptionCreated
+         * @description One committed adoption/revoke-shaped result with its doc outcome.
+         */
+        AdoptionCreated: {
+            /** Intent Id */
+            intent_id: string;
+            /** Application Id */
+            application_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Outcome */
+            outcome: string;
+            /** Revision */
+            revision: number | null;
+            /** Sha256 */
+            sha256: string | null;
+            application: components["schemas"]["ApplicationView"];
+            record_doc: components["schemas"]["RecordDocView"];
+        };
+        /**
+         * ApplicationOrigin
+         * @description Which target source an observed application came from.
+         * @enum {string}
+         */
+        ApplicationOrigin: "compose" | "docker_container" | "systemd_unit";
+        /**
+         * ApplicationPage
+         * @description One bounded adoption list page for one explicit server (C01 r5/7).
+         */
+        ApplicationPage: {
+            /** Server Id */
+            server_id: string;
+            /** Applications */
+            applications: components["schemas"]["ApplicationView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ApplicationView
+         * @description One projected adoption record (the facade-typed projection row).
+         */
+        ApplicationView: {
+            /** Application Id */
+            application_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Name */
+            name: string;
+            /** Origin */
+            origin: string;
+            /** Compose Project */
+            compose_project: string | null;
+            /** Working Dir */
+            working_dir: string | null;
+            /** Unit Name */
+            unit_name: string | null;
+            /** External Working Dir */
+            external_working_dir: string | null;
+            /** External Config Files */
+            external_config_files: string[];
+            /** External Environment Files */
+            external_environment_files: string[];
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+            /** Adopted At */
+            adopted_at: string;
+            /** Reconciled At */
+            reconciled_at: string;
+            /** Stale */
+            stale: boolean;
+        };
         /**
          * ApprovalView
          * @description One persisted decision: the safe preview and the audit receipt.
@@ -1366,6 +1669,49 @@ export interface components {
             /** Capabilities */
             capabilities?: string[];
         };
+        /** ComposeDetailView */
+        ComposeDetailView: {
+            /**
+             * Kind
+             * @default compose_project
+             * @constant
+             */
+            kind: "compose_project";
+            /** Project Name */
+            project_name: string;
+            /** Working Dir */
+            working_dir: string | null;
+            /** Config Files */
+            config_files: string[];
+            /** Environment Files */
+            environment_files: string[];
+            /** Services */
+            services: string[];
+            /** Containers */
+            containers: components["schemas"]["ContainerView"][];
+        };
+        /**
+         * ContainerView
+         * @description One observed container (the discovery safe view: no env/mounts).
+         */
+        ContainerView: {
+            /** Container Id */
+            container_id: string;
+            /** Name */
+            name: string;
+            /** Image */
+            image: string;
+            /** State */
+            state: string;
+            /** Status */
+            status: string;
+            /** Ports */
+            ports: {
+                [key: string]: unknown;
+            }[];
+            /** Compose Service */
+            compose_service: string | null;
+        };
         /**
          * ConversationView
          * @description One conversation: the run view plus its recorded references.
@@ -1420,6 +1766,24 @@ export interface components {
             payload_hash: string;
             /** Policy Revision */
             policy_revision: number;
+        };
+        /**
+         * DiscoveryView
+         * @description The live observed inventory for one server (read-only snapshot).
+         */
+        DiscoveryView: {
+            /** Server Id */
+            server_id: string;
+            /** Observed At */
+            observed_at: string;
+            /** Applications */
+            applications: components["schemas"]["ObservedApplicationView"][];
+            /** Listen Ports */
+            listen_ports: {
+                [key: string]: unknown;
+            }[];
+            /** Lanes */
+            lanes: components["schemas"]["LaneView"][];
         };
         /**
          * DocumentCreateBody
@@ -1651,6 +2015,66 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** HealthProbeView */
+        HealthProbeView: {
+            /** Kind */
+            kind: string;
+            /** Port */
+            port: number;
+            /** Path */
+            path: string;
+            /** Expected Status */
+            expected_status: number;
+            /** Interval Seconds */
+            interval_seconds: number;
+            /** Timeout Seconds */
+            timeout_seconds: number;
+            /** Retries */
+            retries: number;
+            /** Start Period Seconds */
+            start_period_seconds: number;
+        };
+        /**
+         * LaneView
+         * @description One lane outcome (C08 rule 6: honest absence, never empty success).
+         */
+        LaneView: {
+            /** Lane */
+            lane: string;
+            /** State */
+            state: string;
+            /** Detail */
+            detail: string;
+            /** Truncated */
+            truncated: boolean;
+            /** Malformed Lines */
+            malformed_lines: number;
+        };
+        /**
+         * LifecycleSubmitBody
+         * @description Lifecycle submit base (strict): identity is the path; the plan is
+         *     rebuilt deterministically server-side (never accepted from the wire).
+         *
+         *     ``run_id`` is the client-generated idempotency key (C05 rule 5).
+         *     ``backup_confirmed`` records the operator's declared-backup decision
+         *     for data-affecting operations (C09 rule 4/5); it is transported in the
+         *     digest-bound step payload, never stored as route state.
+         */
+        LifecycleSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /**
+             * Backup Confirmed
+             * @default false
+             */
+            backup_confirmed: boolean;
         };
         /**
          * ModelCapabilitiesBody
@@ -1930,12 +2354,108 @@ export interface components {
             sha256: string;
         };
         /**
+         * ObservedApplicationView
+         * @description One observed application; ``managed`` ONLY with an adopted id.
+         */
+        ObservedApplicationView: {
+            /** Origin */
+            origin: string;
+            /** Managed */
+            managed: boolean;
+            /** Application Id */
+            application_id: string | null;
+            /** Detail */
+            detail: components["schemas"]["ComposeDetailView"] | components["schemas"]["StandaloneDetailView"] | components["schemas"]["SystemdUnitDetailView"];
+        };
+        /**
          * PasswordBody
          * @description Login/bootstrap payload; bounds mirror the store's input guard.
          */
         PasswordBody: {
             /** Password */
             password: string;
+        };
+        /**
+         * PlanBody
+         * @description Plan preview body (strict): identity + recipe document + target.
+         *
+         *     ``recipe`` is ONE canonical recipe document (a catalogue revision
+         *     stream must be split at its document boundaries by the consumer — the
+         *     schema rejects the whole stream). ``target_os``/``target_arch`` are
+         *     the explicit observed target environment the plan binds.
+         */
+        PlanBody: {
+            /** Application Id */
+            application_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+        };
+        /** PlanOperationView */
+        PlanOperationView: {
+            /** Op */
+            op: string;
+            /** Subject */
+            subject: string;
+        };
+        /**
+         * PlanView
+         * @description The C09 rule 3 preview: actual intended resources and limitations.
+         */
+        PlanView: {
+            /** Server Id */
+            server_id: string;
+            /** Application Id */
+            application_id: string;
+            /** Project Name */
+            project_name: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /** Image */
+            image: string;
+            /** Recipe Sha256 */
+            recipe_sha256: string;
+            /** Compose Path */
+            compose_path: string;
+            /** Compose Sha256 */
+            compose_sha256: string;
+            /** Compose Text */
+            compose_text: string;
+            /** Directories */
+            directories: string[];
+            /** Ports */
+            ports: components["schemas"]["PortBindingView"][];
+            /** Volumes */
+            volumes: components["schemas"]["PlannedVolumeView"][];
+            /** Credentials */
+            credentials: string[];
+            /** Credentials Path */
+            credentials_path: string | null;
+            health_probe: components["schemas"]["HealthProbeView"] | null;
+            /** Prerequisites */
+            prerequisites: string[];
+            /** Required Grants */
+            required_grants: string[];
+            /** Operations */
+            operations: components["schemas"]["PlanOperationView"][];
+            /** Limitations */
+            limitations: string[];
+            /** Plan Sha256 */
+            plan_sha256: string;
+        };
+        /** PlannedVolumeView */
+        PlannedVolumeView: {
+            /** Name */
+            name: string;
+            /** Container Path */
+            container_path: string;
+            /** Host Path */
+            host_path: string;
         };
         /**
          * PolicyMode
@@ -1956,6 +2476,15 @@ export interface components {
             revision: number;
             /** Denied Capabilities */
             denied_capabilities: string[];
+        };
+        /** PortBindingView */
+        PortBindingView: {
+            /** Host */
+            host: number;
+            /** Container */
+            container: number;
+            /** Protocol */
+            protocol: string;
         };
         /**
          * PrivilegeMode
@@ -2065,6 +2594,51 @@ export interface components {
             shared: boolean;
         };
         /**
+         * RecordDocView
+         * @description The honest documentation outcome of one adoption (C08 rule 6).
+         */
+        RecordDocView: {
+            /** Status */
+            status: string;
+            /** Doc Id */
+            doc_id?: string | null;
+            /** Reason */
+            reason?: string | null;
+        };
+        /**
+         * RemoveDataIntent
+         * @description The EXPLICIT keep-or-delete decision C09 rule 5 requires.
+         *
+         *     A member of this enum must be constructed deliberately: there is no
+         *     default, so an absent/inferred flag can never stand in for ``delete``.
+         *     ``DELETE`` on the tier-1 removal is a RECORDED intent only — the data
+         *     survives until the separately authorized tier-2 purge.
+         * @enum {string}
+         */
+        RemoveDataIntent: "keep" | "delete";
+        /**
+         * RemoveSubmitBody
+         * @description Remove submit: the EXPLICIT C09 rule 5 data decision.
+         *
+         *     No default: an absent intent is a 422, never an inferred delete.
+         */
+        RemoveSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /**
+             * Backup Confirmed
+             * @default false
+             */
+            backup_confirmed: boolean;
+            data_intent: components["schemas"]["RemoveDataIntent"];
+        };
+        /**
          * ResearchBody
          * @description Deep-research body: one server-scoped question over cited docs.
          *
@@ -2114,6 +2688,14 @@ export interface components {
              * @default 1200
              */
             max_excerpt_chars: number;
+        };
+        /**
+         * RevokeBody
+         * @description Revoke body: the C01 rule 6 expected revision (stale writes 409).
+         */
+        RevokeBody: {
+            /** Expected Revision */
+            expected_revision: number;
         };
         /**
          * RootBudgetBody
@@ -2369,6 +2951,16 @@ export interface components {
             /** Credential Ref */
             credential_ref: string;
         };
+        /** StandaloneDetailView */
+        StandaloneDetailView: {
+            /**
+             * Kind
+             * @default standalone_container
+             * @constant
+             */
+            kind: "standalone_container";
+            container: components["schemas"]["ContainerView"];
+        };
         /**
          * StepBody
          * @description One ordered capability step of a run intent (C05 rule 3).
@@ -2403,6 +2995,52 @@ export interface components {
             receipt: {
                 [key: string]: unknown;
             } | null;
+        };
+        /** SystemdUnitDetailView */
+        SystemdUnitDetailView: {
+            /**
+             * Kind
+             * @default systemd_unit
+             * @constant
+             */
+            kind: "systemd_unit";
+            /** Unit */
+            unit: string;
+            /** Unit File State */
+            unit_file_state: string | null;
+            /** Load State */
+            load_state: string | null;
+            /** Active State */
+            active_state: string | null;
+            /** Sub State */
+            sub_state: string | null;
+            /** Description */
+            description: string | null;
+        };
+        /**
+         * UpdateSubmitBody
+         * @description Update submit: adds the CURRENT recipe baseline assertion.
+         *
+         *     The executor VERIFIES this assertion against the deployed Compose
+         *     bytes before any effect (``state_diverged`` refuses otherwise), so the
+         *     recorded prior version is observed, never assumed (C09 rule 4).
+         */
+        UpdateSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /**
+             * Backup Confirmed
+             * @default false
+             */
+            backup_confirmed: boolean;
+            /** Current Recipe */
+            current_recipe: string;
         };
         /** ValidationError */
         ValidationError: {
@@ -5221,6 +5859,625 @@ export interface operations {
                 };
             };
             /** @description Research channel or dependency unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_adopted_api_v1_servers__server_id__applications_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplicationPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Applications service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    adopt_application_api_v1_servers__server_id__applications_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdoptBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdoptionCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision, duplicate adoption, selector overlap or cross-server identity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Applications service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    discover_applications_api_v1_servers__server_id__applications_discoveries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscoveryView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Pinned host key does not match the target (security boundary; re-enrollment is an explicit admin action) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Transport prerequisites are unusable */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Credential source or SSH transport unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    revoke_application_api_v1_servers__server_id__applications__application_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No adoption record for this application id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale revision or unreconciled journal state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Applications service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    plan_application_api_v1_servers__server_id__applications_plan_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Recipe or target environment failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Applications service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    install_application_api_v1_servers__server_id__applications__application_id__install_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LifecycleSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different intent, or the application id belongs to another server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    update_application_api_v1_servers__server_id__applications__application_id__update_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different intent, or the application id belongs to another server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation (an update whose recipe equals the asserted baseline is refused) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    remove_application_api_v1_servers__server_id__applications__application_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different intent, or the application id belongs to another server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation (an absent or unknown data_intent is a validation error — never inferred) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
