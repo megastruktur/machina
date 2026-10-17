@@ -87,5 +87,10 @@ dev = ["pytest"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+markers = [
+    "real_target: drives the real disposable sshd+docker fixture over the real transport (slow, host effects)",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mai"]
