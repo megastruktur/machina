@@ -1,0 +1,48 @@
+Negative controls for the review finding on 39fc79b ('$' interpolation
+passing recipe validation into the rendered Compose YAML):
+
+- deploy.volumes[*].container_path: "/var/lib/${SECRET}", "/var/lib/$HOME"
+  → RecipeError code=invalid_volume_path, rejected at parse time
+  (test_unsafe_container_paths_are_invalid, 2 new parametrized cases).
+- health.path: "/health/$PATH", "/health/${SECRET}"
+  → RecipeError code=invalid_health_check, rejected at parse time
+  (test_unsafe_health_paths_are_invalid, 2 new parametrized cases).
+
+All four cases failed RED at base (DID NOT RAISE — the finding reproduced)
+and pass GREEN after the fix — mutation-sensitive, not pinned to wording.
+
+$ cd backend && uv run pytest tests/test_recipes.py -v -k "unsafe"   # after fix, rc=0
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[var/lib/data] PASSED [  5%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/] PASSED [ 11%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var//lib] PASSED [ 17%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/] PASSED [ 23%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/../lib] PASSED [ 29%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/./lib] PASSED [ 35%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/${SECRET}] PASSED [ 41%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/$HOME] PASSED [ 47%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/\xe4] PASSED [ 52%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/li\tb] PASSED [ 58%]
+tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/xxx…(len>1024)] PASSED [ 64%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[healthz] PASSED [ 70%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health z] PASSED [ 76%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health\nz] PASSED [ 82%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/he\xe4lth] PASSED [ 88%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health/$PATH] PASSED [ 94%]
+tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health/${SECRET}] PASSED [100%]
+
+====================== 17 passed, 161 deselected in 0.07s ======================
+
+Completeness note: container_path and health.path were the ONLY free-form
+strings rendering into the deployment Compose document. Every other string
+in render_compose output is regex/vocabulary-bound or constant, so '$' is
+structurally impossible there without a separate validation change:
+  - service name: _NAME_RE ^[a-z][a-z0-9_-]{0,63}$
+  - image: _IMAGE_RE …@sha256:[0-9a-f]{64}$
+  - ports: ints + PROTOCOL_VOCABULARY ("tcp"/"udp")
+  - volume host paths: TARGET_APPS_ROOT + UUID hex + _VOLUME_NAME_RE name
+  - env_file pointer: frozen constant "credentials.env"
+  - project name: "mai-app-" + UUID hex
+  - healthcheck argv: frozen curl prefix + ints + port + validated path
+T-11 (test_compose_carries_no_shell_and_no_interpolation) still asserts
+'$' not in the rendered text on the benign fixture; the negative controls
+above now pin the same invariant at the parse boundary on hostile input.
