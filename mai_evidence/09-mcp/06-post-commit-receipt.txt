@@ -1,0 +1,36 @@
+# 06 — post-commit receipt (2026-10-17)
+
+Fix commit: 7c40a92 (branch megastruktur/mai-09-mcp, parent c3ecffd —
+the reviewed snapshot the FAIL refers to)
+
+$ git show --stat HEAD
+
+ commit 7c40a92
+ fix(p09): bound tools/list pagination — page count + wall-clock deadline (09-mcp R1)
+
+ backend/src/mai/plugins/mcp.py               |  62 +++++++++++++--
+ backend/tests/test_mcp.py                    | 110 +++++++++++++++++++++++++++
+ mai_evidence/09-mcp/02-focused-tests.txt     | 109 ++++++++++++++++++++++++++
+ mai_evidence/09-mcp/03-negative-controls.txt |  55 ++++++++++++++
+ mai_evidence/09-mcp/README.md                |  88 +++++++++++++++++++++
+ 5 files changed, 419 insertions(+), 5 deletions(-)
+
+$ git status --short
+?? BRIEF.md                      (coordinator-owned brief, untracked by design)
+?? mai_evidence/09-mcp/06-post-commit-receipt.txt  (this file, written after the commit)
+
+$ cd backend && uv run pytest tests/test_mcp.py -q   (on the committed tree)
+======================= 48 passed, 2 warnings in 15.76s ========================
+
+Allowlist check: only backend/src/mai/plugins/mcp.py and
+backend/tests/test_mcp.py modified in code; evidence receipts under
+mai_evidence/09-mcp/. No dependency, lock, manifest or sibling change
+(uv.lock untouched; git show above is the complete diff). No external
+module imports mai.plugins.mcp symbols (grep over src/mai), so the two new
+exported constants and the now-defined DiscoveryLimitExceeded widen the
+surface without breaking any consumer.
+
+Base-vs-fix ruff: c3ecffd has 2 F821 (annotation-only
+CapabilityDescriptor); 7c40a92 is clean (import added). Focused suite:
+46 passed at base → 48 passed at fix (the two new bounded-listing
+negative controls; no existing test modified).

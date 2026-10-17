@@ -78,6 +78,36 @@ dependencies = [
     # never an embedded/unbounded browser install (acceptance criterion 2).
     # Bounded <3 so the client's next major is a deliberate reconciliation.
     "httpx2>=2.13,<3",
+    # External MCP client transport (IDEA.md §13 "External MCP servers":
+    # MCP is an integration protocol, never an authorization boundary;
+    # contracts.md C03 rule 7 — MCP tools carry independent grants and
+    # server scope). The official modelcontextprotocol python-sdk is the
+    # selected implementation; declared DIRECTLY (same convention as openai
+    # above) instead of adopting pydantic-ai-slim's [mcp] extra, so the
+    # agent runtime's frozen extra set stays exactly {openai} and the
+    # plugin layer owns connection policy. Frozen v1 transports: stdio
+    # (locally spawned servers with an explicitly scoped subprocess env)
+    # and streamable HTTP (separately hosted servers, IDEA.md §13); the
+    # deprecated SSE transports are NOT selected. Plugin loading itself is
+    # importlib.metadata entry points of trusted installed code (C03 rule
+    # 7) — this lane adds NO runtime installer: no pip-style distribution
+    # may enter the runtime set (negative controls in
+    # backend/tests/test_plugin_dependencies.py). Bounded <2 so the SDK's
+    # next major protocol/API break is a deliberate reconciliation with its
+    # downstream consumers (09-mcp, 09-native-plugin), not a silent
+    # upgrade; within 1.x the lock file fixes the exact resolved version.
+    "mcp>=1.30,<2",
+    # Plugin configuration-schema runtime (IDEA.md §13 "Schema-generated
+    # configuration forms"; 09-plugin-store validates versioned config
+    # against the schema, 09-native-plugin validates the manifest,
+    # 09-plugin-api exposes config schemas without secret values). Direct
+    # declaration of the library src/mai already imports everywhere while
+    # it was only locked transitively (fastapi / pydantic-ai-slim
+    # requirements) — model_json_schema()/TypeAdapter are the frozen
+    # schema surface, ValidationError is the explicit compatibility
+    # failure. Bounded <3 so pydantic v3 is a deliberate reconciliation,
+    # not a silent upgrade of every config schema at once.
+    "pydantic>=2.14,<3",
 ]
 
 [dependency-groups]

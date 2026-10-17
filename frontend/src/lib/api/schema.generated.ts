@@ -1171,6 +1171,225 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List installed, configured and granted plugins
+         * @description Availability (installed/configured/enabled) and grants, separately.
+         *
+         *     Safe method: session layer only. Installed names come from
+         *     distribution metadata (no plugin code runs); configured documents and
+         *     bindings come from the canonical store. A configured plugin whose
+         *     binding names a capability nothing registers is reported through the
+         *     store's own views by the worker; this catalog never unions the two.
+         */
+        get: operations["list_plugins_api_v1_plugins_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one stored plugin connection document
+         * @description The stored document: credential reference *names*, never values.
+         */
+        get: operations["read_config_api_v1_plugins__plugin__config_get"];
+        /**
+         * Commit one versioned plugin configuration edit
+         * @description Validate against the declared schema, then atomically commit.
+         *
+         *     Full boundary order (session → origin → CSRF) runs before any state
+         *     is touched. The store re-validates authoritatively: frozen envelope
+         *     vocabulary, credential-token keys rejected outright
+         *     (``inline_credential_forbidden``) and ``config`` values checked
+         *     against the plugin's *declared* ``config_schema`` — resolved here so
+         *     stored values can never skip validation (schema-strict). A stale
+         *     caller is rejected with ``409 conflict`` before any filesystem
+         *     effect.
+         */
+        put: operations["edit_config_api_v1_plugins__plugin__config_put"];
+        post?: never;
+        /**
+         * Delete one plugin connection document (revision-checked)
+         * @description Refused while grant bindings reference the plugin (409).
+         *
+         *     Bindings are removed first, so no binding can outlive its config
+         *     through this API (a deleted plugin cannot leave active grants).
+         */
+        delete: operations["remove_config_api_v1_plugins__plugin__config_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the declared configuration schema of one plugin
+         * @description The schema-generated-forms input (IDEA §13), value-free.
+         *
+         *     MCP servers declare the frozen ``SERVER_CONFIG_SCHEMA``; native
+         *     plugins are resolved through a fresh fail-closed discovery (trusted
+         *     installed code — the same trust the worker applies at restart, here
+         *     over a throwaway registry with no executor wiring). A configured
+         *     plugin that is neither (``uninstalled``) reports ``null``.
+         */
+        get: operations["read_schema_api_v1_plugins__plugin__schema_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one plugin's server grant bindings
+         * @description The explicit grant documents of one plugin (never implied).
+         */
+        get: operations["list_bindings_api_v1_plugins__plugin__bindings_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/bindings/{server_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Commit one versioned server grant binding
+         * @description Grant explicitly; requires an existing connection config (409).
+         *
+         *     Writing a binding never creates the config and installing/connecting
+         *     never grants (C03 rule 7): the canonical store enforces both, this
+         *     route only maps the rejections.
+         */
+        put: operations["edit_binding_api_v1_plugins__plugin__bindings__server_id__put"];
+        post?: never;
+        /**
+         * Revoke one server grant binding (revision-checked)
+         * @description Revoke one explicit grant; the config document stays.
+         */
+        delete: operations["remove_binding_api_v1_plugins__plugin__bindings__server_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/discovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run one bounded MCP discovery against the configured server
+         * @description Connect once, list tools, register exactly the granted subset.
+         *
+         *     The granted set is read from the stored bindings — discovery never
+         *     grants (C03 rule 7); offered-but-ungranted tools are reported by
+         *     name. Descriptors register into a throwaway registry: this endpoint
+         *     is a bounded diagnostic, the worker's restart composition stays the
+         *     execution-path owner. All transport work is the reviewed ``09-mcp``
+         *     producer's (bounded timeouts, page/deadline bounds, value-free
+         *     failures).
+         */
+        post: operations["run_discovery_api_v1_plugins__plugin__discovery_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List portable skill packages below the data root
+         * @description Manifest-level summaries; corrupt packages surface by code.
+         *
+         *     Only name-shaped, non-symlink directories are candidates; each is
+         *     loaded authoritatively by the reviewed loader (all-or-nothing per
+         *     package). A rejection records the stable code and never hides the
+         *     remaining packages (C02 W4 discipline). Installing or modifying
+         *     packages is a filesystem-admin action — deliberately no HTTP write
+         *     route exists (AC2).
+         */
+        get: operations["list_skills_api_v1_skills_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/skills/{skill}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one skill package and its prerequisite binding report
+         * @description The bounded package (texts, digests, sizes) — inert by design.
+         *
+         *     ``missing_from_granted_pool`` is the declared-prerequisites report
+         *     against the capability pool granted by stored bindings — a pure
+         *     report (C03 rule 7); loading a skill never grants a tool.
+         */
+        get: operations["read_skill_api_v1_skills__skill__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -1391,6 +1610,25 @@ export interface components {
             sha256: string;
             /** Bytes */
             bytes: number;
+        };
+        /**
+         * BindingView
+         * @description One stored server grant binding: the explicit grant document.
+         */
+        BindingView: {
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /** Capabilities */
+            capabilities: string[];
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
         };
         /**
          * CancelBody
@@ -1689,6 +1927,38 @@ export interface components {
             services: string[];
             /** Containers */
             containers: components["schemas"]["ContainerView"][];
+        };
+        /**
+         * ConfiguredPluginView
+         * @description One configured plugin: connection state plus its grant bindings.
+         *
+         *     ``kind`` classifies the connection: ``mcp`` (a ``transport`` config —
+         *     the store's shared convention), ``native`` (an installed entry point
+         *     of the same name) or ``uninstalled`` (configured but not discoverable
+         *     — surfaced, never silently dropped; its grants stay in the store and
+         *     contribute nothing until backed by a registered descriptor).
+         */
+        ConfiguredPluginView: {
+            /** Plugin */
+            plugin: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Kind */
+            kind: string;
+            /** Credential Refs */
+            credential_refs: string[];
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+            /** Bindings */
+            bindings: components["schemas"]["BindingView"][];
         };
         /**
          * ContainerView
@@ -2077,6 +2347,40 @@ export interface components {
             backup_confirmed: boolean;
         };
         /**
+         * McpDiscoveryReportView
+         * @description The value-free result of one bounded discovery run (09-mcp).
+         */
+        McpDiscoveryReportView: {
+            /** Plugin */
+            plugin: string;
+            /** Transport */
+            transport: string;
+            /** Tool Count */
+            tool_count: number;
+            /** Registered */
+            registered: string[];
+            /** Ungranted */
+            ungranted: string[];
+            /** Stale Grants */
+            stale_grants: string[];
+            /** Rejections */
+            rejections: components["schemas"]["McpToolRejectionView"][];
+            /** Limit Exceeded */
+            limit_exceeded: boolean;
+        };
+        /**
+         * McpToolRejectionView
+         * @description One value-free per-tool discovery rejection (09-mcp vocabulary).
+         */
+        McpToolRejectionView: {
+            /** Tool */
+            tool: string;
+            /** Code */
+            code: string;
+            /** Detail */
+            detail: string;
+        };
+        /**
          * ModelCapabilitiesBody
          * @description Optional endpoint capabilities the connection declares (C06 rule 1).
          *
@@ -2458,6 +2762,91 @@ export interface components {
             host_path: string;
         };
         /**
+         * PluginBindingEditBody
+         * @description One versioned grant binding write (explicit admin action).
+         */
+        PluginBindingEditBody: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Capabilities */
+            capabilities: string[];
+        };
+        /**
+         * PluginCatalogView
+         * @description Availability and grants as deliberately separate sections (AC2).
+         */
+        PluginCatalogView: {
+            /** Installed */
+            installed: string[];
+            /** Configured */
+            configured: components["schemas"]["ConfiguredPluginView"][];
+        };
+        /**
+         * PluginConfigEditBody
+         * @description One versioned config edit: caller's revision + the new document.
+         *
+         *     Deliberately no ``schema_version``/``plugin`` fields: the route
+         *     derives them from the frozen current version and the storage identity
+         *     (a client can neither nominate a schema version nor mismatch the
+         *     embedded plugin name).
+         */
+        PluginConfigEditBody: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Enabled */
+            enabled: boolean;
+            /** Credential Refs */
+            credential_refs?: string[];
+            /** Config */
+            config?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * PluginConfigView
+         * @description The stored connection document (parsed) with its version triple.
+         */
+        PluginConfigView: {
+            /** Plugin */
+            plugin: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Credential Refs */
+            credential_refs: string[];
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
+        };
+        /**
+         * PluginSchemaView
+         * @description The declared configuration schema of one plugin (IDEA §13 input).
+         *
+         *     ``config_schema`` is ``null`` when the plugin declares none (the
+         *     write path then rejects any non-empty config — fail closed).
+         *     ``load_rejection`` is the value-free discovery-stage code when the
+         *     installed plugin failed to load; the schema of a rejected plugin is
+         *     unknown, never invented.
+         */
+        PluginSchemaView: {
+            /** Plugin */
+            plugin: string;
+            /** Kind */
+            kind: string;
+            /** Config Schema */
+            config_schema: {
+                [key: string]: unknown;
+            } | null;
+            /** Load Rejection */
+            load_rejection?: string | null;
+        };
+        /**
          * PolicyMode
          * @description Prompting modes within grants (C03 rule 5).
          *
@@ -2688,6 +3077,18 @@ export interface components {
              * @default 1200
              */
             max_excerpt_chars: number;
+        };
+        /**
+         * RevisionTriple
+         * @description The C02 rule-4 version triple of one committed document.
+         */
+        RevisionTriple: {
+            /** Revision */
+            revision: number;
+            /** Schema Revision */
+            schema_revision: number;
+            /** Sha256 */
+            sha256: string;
         };
         /**
          * RevokeBody
@@ -2934,6 +3335,90 @@ export interface components {
             created_at: string;
             /** Updated At */
             updated_at: string;
+        };
+        /**
+         * SkillCatalogView
+         * @description The skill namespace: loadable summaries plus value-free rejections.
+         */
+        SkillCatalogView: {
+            /** Skills */
+            skills: components["schemas"]["SkillSummaryView"][];
+            /** Rejections */
+            rejections: components["schemas"]["SkillRejectionView"][];
+        };
+        /**
+         * SkillDocumentView
+         * @description One bounded, digest-stamped skill document (09-skills shape).
+         */
+        SkillDocumentView: {
+            /** Name */
+            name: string;
+            /** Text */
+            text: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /**
+         * SkillPackageView
+         * @description One full package plus the prerequisite binding report (C03 rule 7).
+         *
+         *     ``granted_capability_pool`` is the union of capability ids currently
+         *     granted by any stored binding; ``missing_from_granted_pool`` is the
+         *     declared-minus-granted report. The worker composes the per-run
+         *     effective surface (grants ∧ registry); this view never guesses it.
+         */
+        SkillPackageView: {
+            /** Skill */
+            skill: string;
+            /** Title */
+            title: string | null;
+            /** Description */
+            description: string | null;
+            /** Requires Capabilities */
+            requires_capabilities: string[];
+            instructions: components["schemas"]["SkillDocumentView"];
+            /** Documents */
+            documents: components["schemas"]["SkillDocumentView"][];
+            /** Package Sha256 */
+            package_sha256: string;
+            /** Total Bytes */
+            total_bytes: number;
+            /** Granted Capability Pool */
+            granted_capability_pool: string[];
+            /** Missing From Granted Pool */
+            missing_from_granted_pool: string[];
+        };
+        /**
+         * SkillRejectionView
+         * @description One value-free per-package load rejection (surfaced, not hidden).
+         */
+        SkillRejectionView: {
+            /** Skill */
+            skill: string;
+            /** Code */
+            code: string;
+        };
+        /**
+         * SkillSummaryView
+         * @description One loadable skill package: manifest-level summary only.
+         */
+        SkillSummaryView: {
+            /** Skill */
+            skill: string;
+            /** Title */
+            title: string | null;
+            /** Description */
+            description: string | null;
+            /** Requires Capabilities */
+            requires_capabilities: string[];
+            /** References */
+            references: string[];
+            /** Package Sha256 */
+            package_sha256: string;
+            /** Total Bytes */
+            total_bytes: number;
         };
         /**
          * SshIdentityBody
@@ -6478,6 +6963,704 @@ export interface operations {
                 };
             };
             /** @description Jobs domain unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_plugins_api_v1_plugins_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginCatalogView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_config_api_v1_plugins__plugin__config_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginConfigView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No configuration stored for this plugin */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stored state requires recovery */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    edit_config_api_v1_plugins__plugin__config_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PluginConfigEditBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevisionTriple"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected revision or canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Document failed producer validation (schema/credential discipline) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    remove_config_api_v1_plugins__plugin__config_delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Nothing stored for this plugin */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Grant bindings still exist, stale revision, or canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_schema_api_v1_plugins__plugin__schema_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginSchemaView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin neither installed nor configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_bindings_api_v1_plugins__plugin__bindings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BindingView"][];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stored state requires recovery */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    edit_binding_api_v1_plugins__plugin__bindings__server_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PluginBindingEditBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevisionTriple"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No binding stored under this identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No connection config stored for the plugin, stale revision, or canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Binding failed producer validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    remove_binding_api_v1_plugins__plugin__bindings__server_id__delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                plugin: string;
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No binding stored under this identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale expected revision or canonical state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    run_discovery_api_v1_plugins__plugin__discovery_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpDiscoveryReportView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No configuration stored for this plugin */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an MCP server configuration, disabled, or configuration fails composition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Bounded discovery failure against the server */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_skills_api_v1_skills_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillCatalogView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Skills service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_skill_api_v1_skills__skill__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                skill: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillPackageView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No skill package stored under this name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stored package requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Skill name failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Skills service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
