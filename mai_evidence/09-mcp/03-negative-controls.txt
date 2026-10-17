@@ -1,0 +1,55 @@
+Negative controls for the review finding on c3ecffd (unbounded tools/list
+pagination: an untrusted server answering empty pages with a perpetual
+nextCursor hangs discovery indefinitely — AC2 bounded-failure violation):
+
+1. test_endless_cursor_listing_is_bounded (NEW, the requested negative
+   control). Fixture `_ENDLESS_CURSOR_SERVER`: real stdio MCP server
+   (mcp 1.30.0 low-level `@app.list_tools()` returning
+   `ListToolsResult(tools=[], nextCursor="endless")` for every request,
+   cursor echoed back and re-issued forever — protocol-legal wire shape).
+   → McpBridgeError code=connect_failed, detail
+   "stdio tool listing failed (tools/list exceeded the 128-page bound)",
+   discovery returns in <1s, registry stays empty (nothing registers —
+   value-free, no partial surface).
+   RED at base: the identical fixture hangs discovery forever (pytest
+   killed by `timeout` at 120s, rc=124 — see 02-focused-tests.txt).
+
+2. test_listing_deadline_is_bounded (NEW, second belt of the same guard).
+   Same fixture with `--sleep 0.2` per page (every page arrives well
+   inside the per-request read timeout — a slow-but-valid pager the read
+   timeout can never catch) and `LIST_DEADLINE_SECONDS` temporarily
+   tightened to 0.5s. → McpBridgeError code=connect_failed, detail
+   "stdio tool listing failed (tools/list exceeded the 0.5s listing
+   deadline)"; elapsed in [0.5, 30)s. The deadline is anchored to
+   `time.monotonic()` at listing start, so the bound is wall-clock-honest.
+
+Mutation sensitivity: the two bounds backstop each other. Removing the
+page-count check turns control 1 into a bounded deadline failure (test
+fails on elapsed/detail); removing the deadline leaves control 1 green but
+control 2 loses its bound; removing both re-creates the base hang that the
+red receipt documents. The fixture emulates only the surrounding MCP
+pagination contract (NOTE comment in the fixture) — the bounds under test
+live solely in mai.plugins.mcp, so the double cannot mask a deleted guard.
+
+Pre-existing negative controls re-run green in the same suite (base
+behavior unchanged): spawn failure bounded (<30s, connect_failed),
+initialize hang bounded by connect_timeout (0.5 <= elapsed < 30s,
+connect_failed), post-registration connect failure answers a structured
+ok=False connect_failed envelope (no retries, one attempt), call timeout
+records effect="unknown" (McpError, never replayed), ungranted tool never
+registered nor executable, denied tool never executes across the
+disconnect/reconnect journey.
+
+$ cd backend && uv run pytest tests/test_mcp.py -v -k "endless_cursor or listing_deadline"
+tests/test_mcp.py::TestFailureBoundedness::test_endless_cursor_listing_is_bounded PASSED [ 50%]
+tests/test_mcp.py::TestFailureBoundedness::test_listing_deadline_is_bounded PASSED [100%]
+
+======================= 2 passed, 46 deselected in 1.65s ========================
+
+Completeness note: the listing phase is now bounded on all four axes —
+per-request read timeout (call_timeout_s, base), tool count (max_tools,
+base), page count (MAX_LIST_PAGES=128, this fix) and wall clock
+(LIST_DEADLINE_SECONDS=60, this fix). There is no further unbounded axis:
+the cursor is server-controlled but each iteration is now both
+request-bounded and time-bounded, and non-listing phases (initialize,
+call) keep their existing bounds.
