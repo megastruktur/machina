@@ -112,7 +112,7 @@ REPO_ROOT = BACKEND_ROOT.parent
 CATALOGUE_DIR = REPO_ROOT / "catalogue"
 
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006")
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
 HTTP_FILE = "example-http.yaml"
 STATEFUL_FILE = "example-stateful.yaml"
@@ -1340,13 +1340,16 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS application_projection_journal, "
+                "DROP TABLE IF EXISTS notification_alerts, "
+                "observation_findings, server_observations, "
+                "application_projection_journal, "
                 "application_projection, knowledge_doc_chunks, "
                 "knowledge_documents, job_schedule_fires, job_schedules, "
                 "job_events, job_steps, job_runs, approvals, "
                 "profile_projection_journal, profile_projection, "
                 "admin_sessions, admin_credential, alembic_version"
             )
+            conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
             conn.commit()
         from alembic import command
 
