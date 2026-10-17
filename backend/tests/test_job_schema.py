@@ -77,16 +77,18 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain (exclusive migration-chain resource). Head
 # assertions target the chain TIP; the tuple tracks the full chain.
-# Chain-tip reconciliation (card 07-vector-schema, exclusive migration-chain
-# owner): revision 0005 appends the knowledge document/vector schema; the
-# tip constants are advanced here so this file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005")
+# Chain-tip reconciliation (card 08-adoption, exclusive migration-chain
+# owner): revision 0006 appends the application catalogue projection +
+# journal; the tip constants are advanced here so this file's head
+# assertions stay true.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006")
 
-# The exact public application schema after 0005 — nothing else, in
+# The exact public application schema after 0006 — nothing else, in
 # particular no engine-shadowing run-state table (C05 rule 1).
 # ``alembic_version`` is the chain's own bookkeeping table (since 0001).
-# The two knowledge tables belong to 07-vector-schema (0005); they are part
-# of the exact app set this file pins at the tip.
+# The two knowledge tables belong to 07-vector-schema (0005) and the two
+# application tables to 08-adoption (0006); they are part of the exact app
+# set this file pins at the tip.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -102,6 +104,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_schedule_fires",
         "knowledge_documents",
         "knowledge_doc_chunks",
+        "application_projection",
+        "application_projection_journal",
     }
 )
 
@@ -146,11 +150,12 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
-        # Full app set at the chain tip — the 07-vector-schema tables are
-        # listed here (chain-tip reconciliation) so the zero-to-head fixture
-        # stays order-independent after revision 0005.
+        # Full app set at the chain tip — the 07-vector-schema AND
+        # 08-adoption tables are listed here (chain-tip reconciliation) so
+        # the zero-to-head fixture stays order-independent after 0006.
         conn.execute(
-            "DROP TABLE IF EXISTS knowledge_doc_chunks, knowledge_documents, "
+            "DROP TABLE IF EXISTS application_projection_journal, "
+            "application_projection, knowledge_doc_chunks, knowledge_documents, "
             "job_schedule_fires, job_schedules, "
             "job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "

@@ -1,0 +1,49 @@
+$ cd backend && uv run pytest tests/test_recipes.py -v            # RED FIRST: tests added, fix stashed (git stash push -- src/mai/applications/recipes.py; red_rc=1)
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- .venv/bin/python
+rootdir: ...
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 178 items / 161 deselected / 17 selected
+
+FAILED tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/${SECRET}] - Failed: DID NOT RAISE RecipeError
+FAILED tests/test_recipes.py::test_unsafe_container_paths_are_invalid[/var/lib/$HOME] - Failed: DID NOT RAISE RecipeError
+FAILED tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health/$PATH] - Failed: DID NOT RAISE RecipeError
+FAILED tests/test_recipes.py::test_unsafe_health_paths_are_invalid[/health/${SECRET}] - Failed: DID NOT RAISE RecipeError
+4 failed, 13 passed, 161 deselected in 0.11s
+
+  Red proves the reviewer finding at base 39fc79b: '$' passes container_path
+  and health.path validation and would reach render_compose output, where
+  Docker Compose interpolates it at apply time. Fix restored via
+  `git stash pop` (verified: two `"$" in` guards back in recipes.py).
+
+$ cd backend && uv run pytest tests/test_recipes.py -v            # GREEN after fix (rc=0)
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- .venv/bin/python
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 178 items
+
+[... full per-test listing captured in-session; includes the four new
+     '$' parametrized cases now PASSED and the untouched golden fixtures:
+     test_minimal_compose_exact_fixture, test_compose_parse_back_matches_fixture,
+     test_compose_carries_no_shell_and_no_interpolation — all PASSED, i.e.
+     benign rendering is byte-identical to base ...]
+
+============================== 178 passed in 0.90s ==============================
+
+$ cd backend && uv run ruff check src/mai/applications/recipes.py tests/test_recipes.py
+All checks passed!
+
+mypy: not configured for this backend (no mypy dependency in backend/pyproject.toml) — not run.
+
+Throwaway parse-boundary probe (heredoc via `uv run python`; script not persisted):
+  rejected volume container_path '/var/lib/${SECRET}': code=invalid_volume_path
+  rejected volume container_path '/var/lib/$HOME':      code=invalid_volume_path
+  rejected health.path '/health/$PATH':                 code=invalid_health_check
+  rejected health.path '/health/${SECRET}':             code=invalid_health_check
+  benign renders ok, '$' in compose: False
+
+Commands run from `backend/` in worktree
+/home/megastruktur/orca/workspaces/machina/mai-08-recipe-schema
+(branch megastruktur/mai-08-recipe-schema, base 39fc79b), 2026-10-16 ~23:40–23:58Z.

@@ -1,0 +1,100 @@
+# MAI maintained-catalogue fixture: minimal STATELESS HTTP file server
+# (card 08-fixture-recipes; validated by
+# backend/tests/test_catalogue_examples.py through the canonical recipe
+# schema frozen by 08-recipe-schema, C09 rule 2).
+#
+# Revision stream — this file holds exactly two YAML documents:
+#   document 1 = revision v1 (initial install)
+#   document 2 = revision v2 (update target; differs from v1 ONLY in the
+#   pinned image digest, so update tests exercise image-aware upgrades).
+# The catalogue file is a stream, not one recipe: consumers split on YAML
+# document boundaries (see the test module) and parse each revision
+# separately with parse_recipe_text; the whole stream text is rejected by
+# that parser by design.
+#
+# Upstream: filebrowser/filebrowser is a generic single-binary HTTP file
+# server. It is curated here as a disposable test fixture only — it is not
+# a production application of this product, declares no credentials, and
+# must never receive real data.
+# Image facts (registry-verified at authoring time; provenance in
+# mai_evidence/08-fixture-recipes/):
+#   - multi-arch manifest list: linux amd64 + arm64 (plus armv7, declared
+#     unsupported here on purpose) -> supported archs x86_64/aarch64
+#   - serves HTTP on container port 80; GET /health answers 200
+#   - ships /usr/bin/curl, so the schema's frozen argv curl healthcheck
+#     (CMD curl --fail ...) actually runs inside this container
+#   - stateless usage: no declared volumes; nothing persists past removal.
+schema_version: 1
+name: example-http
+supported_environment:
+  os:
+    - linux
+  arch:
+    - aarch64
+    - x86_64
+prerequisites:
+  - docker
+required_grants:
+  - docker.compose
+deploy:
+  image: docker.io/filebrowser/filebrowser@sha256:a4da9ca8364b0a1fc5dd36f7add92582bf673c0ae0bda8dd9bd13062c41d1715
+  ports:
+    - host: 18080
+      container: 80
+      protocol: tcp
+health:
+  kind: http
+  port: 80
+  path: /health
+  expected_status: 200
+  interval_seconds: 10
+  timeout_seconds: 5
+  retries: 3
+  start_period_seconds: 10
+update:
+  migrations: none
+removal:
+  data_policy: keep
+recovery:
+  image_rollback: true
+backup:
+  required: false
+---
+# revision v2 (update target): ONLY the pinned image digest changed
+# (upstream tag v2.31.2 -> v2.32.0). Same name, so v1 -> v2 is an
+# image-aware recipe update of the SAME application, per C09 rule 4.
+schema_version: 1
+name: example-http
+supported_environment:
+  os:
+    - linux
+  arch:
+    - aarch64
+    - x86_64
+prerequisites:
+  - docker
+required_grants:
+  - docker.compose
+deploy:
+  image: docker.io/filebrowser/filebrowser@sha256:593478e3c24c5ea9f5d7478dc549965b7bc7030707291006ce8d0b6162d3454b
+  ports:
+    - host: 18080
+      container: 80
+      protocol: tcp
+health:
+  kind: http
+  port: 80
+  path: /health
+  expected_status: 200
+  interval_seconds: 10
+  timeout_seconds: 5
+  retries: 3
+  start_period_seconds: 10
+update:
+  migrations: none
+removal:
+  data_policy: keep
+recovery:
+  image_rollback: true
+backup:
+  required: false
