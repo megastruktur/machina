@@ -31,7 +31,12 @@ RUN groupadd --system --gid 10001 mai \
  && chown mai:mai /var/lib/mai
 COPY --from=build --chown=10001:10001 /app/.venv /app/.venv
 # Migration harness rides along (card 01-db chain); nothing auto-runs it.
-COPY backend/alembic.ini backend/migrations /app/
+# Two separate COPYs: a multi-source COPY flattens both sources into the
+# destination, which broke script_location = %(here)s/migrations (the
+# versions/env.py landed at /app instead of /app/migrations — found during
+# M-2 bring-up when the one-shot `alembic upgrade head` failed).
+COPY backend/alembic.ini /app/alembic.ini
+COPY backend/migrations/ /app/migrations/
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1
 WORKDIR /app
