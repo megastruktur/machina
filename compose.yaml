@@ -94,6 +94,15 @@ services:
       # First-admin bootstrap (auth ADR §3): read once at startup and
       # dropped after hashing; unset after the first successful bootstrap.
       MAI_ADMIN_PASSWORD: "${MAI_ADMIN_PASSWORD:-}"
+      # Documents index embeddings (C07): the OpenAI-compatible gateway the
+      # retriever/indexer dial at request time. Base URL is configuration
+      # (not secret); the key itself resolves through the EnvResolver file
+      # via the credential REF below (C03 rule 6 — never a raw value here).
+      MAI_EMBEDDINGS_BASE_URL: "${MAI_EMBEDDINGS_BASE_URL:-http://litellm:4000/v1}"
+      MAI_EMBEDDINGS_CREDENTIAL_REF: "MAI_GATEWAY_KEY"
+      # Memory provider (C07): the bundled Hindsight service on the stack
+      # network. No credential — the bundled service has no API auth.
+      MAI_HINDSIGHT_URL: "http://hindsight:8888"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path
@@ -137,6 +146,11 @@ services:
       # credential references (model connections, embeddings) through the
       # EnvResolver file at the in-container mount target (C03 rule 6).
       MAI_ENV_FILE: /run/secrets/mai-credentials.env
+      # Documents index embeddings + memory provider — same wiring as
+      # mai-api (the worker runs the same indexing/retrieval producers).
+      MAI_EMBEDDINGS_BASE_URL: "${MAI_EMBEDDINGS_BASE_URL:-http://litellm:4000/v1}"
+      MAI_EMBEDDINGS_CREDENTIAL_REF: "MAI_GATEWAY_KEY"
+      MAI_HINDSIGHT_URL: "http://hindsight:8888"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path.

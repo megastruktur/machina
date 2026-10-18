@@ -25,7 +25,14 @@ FROM python:3.14-slim
 # Non-root runtime user; /var/lib/mai is pre-created with this ownership so the
 # named volume `mai-data` inherits it on first use (C02 rule 1: service-owned
 # writable data root).
-RUN groupadd --system --gid 10001 mai \
+# openssh-client: the execution/discovery transports exec the real ssh(1)
+# (mai.execution.ssh ssh_arguments / commands.execute_command) — the slim
+# base ships no ssh binary, and Popen raises OSError → 503 "transport
+# unavailable" without it. Found in M-3 smoke.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 mai \
  && useradd --system --uid 10001 --gid mai --home-dir /var/lib/mai --no-create-home mai \
  && mkdir -p /var/lib/mai \
  && chown mai:mai /var/lib/mai
