@@ -15,7 +15,7 @@
 
 <main>
 	<h1>MAI</h1>
-	<p>Desktop workspace shell — labeled fixture panels only; no live data.</p>
+	<p>Desktop workspace shell — fixture panels until a live session signs in.</p>
 	<ComponentHost label="MAI workspace">
 		<DesktopShell />
 	</ComponentHost>

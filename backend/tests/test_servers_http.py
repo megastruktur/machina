@@ -391,7 +391,12 @@ def _api_routes(app: FastAPI) -> list[APIRoute]:
 
 
 def test_full_surface_registers_the_frozen_routes() -> None:
-    """P02 surface after this slice: health + auth boundary + profiles."""
+    """Full MAI v1 surface: health + auth + profiles + P03–P12 features.
+
+    The pin is the WHOLE frozen table: any new route must extend it
+    consciously (the same expansion discipline every remediation below
+    recorded), never silently.
+    """
     app = create_app(env={})
     api_routes = _api_routes(app)
     table = {
@@ -404,6 +409,9 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/auth/bootstrap"),
         ("POST", "/api/v1/auth/login"),
         ("POST", "/api/v1/auth/logout"),
+        # (02-profile-api: canonical profiles; the launcher's list route
+        # added by mai-wire-desktop.)
+        ("GET", "/api/v1/servers"),
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
@@ -418,6 +426,91 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         # (04-password-api remediation: the pin expanded by the frozen
         # submit-only challenge route; intent unchanged.)
         ("POST", "/api/v1/password-challenges"),
+        # (05-jobs-api: durable runs + schedules + the run event stream.)
+        ("GET", "/api/v1/jobs/runs"),
+        ("POST", "/api/v1/jobs/runs"),
+        ("GET", "/api/v1/jobs/runs/{run_id}"),
+        ("POST", "/api/v1/jobs/runs/{run_id}/cancel"),
+        ("GET", "/api/v1/jobs/runs/{run_id}/events"),
+        ("GET", "/api/v1/schedules"),
+        ("POST", "/api/v1/schedules"),
+        ("GET", "/api/v1/schedules/{schedule_id}"),
+        ("PATCH", "/api/v1/schedules/{schedule_id}"),
+        ("DELETE", "/api/v1/schedules/{schedule_id}"),
+        ("GET", "/api/v1/schedules/{schedule_id}/fires"),
+        # (06-chat-api: conversations + the conversation event stream.)
+        ("POST", "/api/v1/chat/messages"),
+        ("GET", "/api/v1/chat/runs"),
+        ("GET", "/api/v1/chat/runs/{run_id}"),
+        ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
+        ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        # (06-model-api: stored connections/profiles/selection + probe.)
+        ("GET", "/api/v1/models/connections"),
+        ("GET", "/api/v1/models/connections/{name}"),
+        ("PUT", "/api/v1/models/connections/{name}"),
+        ("DELETE", "/api/v1/models/connections/{name}"),
+        ("GET", "/api/v1/models/profiles"),
+        ("GET", "/api/v1/models/profiles/{name}"),
+        ("PUT", "/api/v1/models/profiles/{name}"),
+        ("DELETE", "/api/v1/models/profiles/{name}"),
+        ("GET", "/api/v1/models/selection"),
+        ("PUT", "/api/v1/models/selection"),
+        ("DELETE", "/api/v1/models/selection"),
+        ("POST", "/api/v1/models/test"),
+        # (07-docs-api: canonical documents, retrieval, index, generate,
+        # research.)
+        ("GET", "/api/v1/docs"),
+        ("POST", "/api/v1/docs"),
+        ("GET", "/api/v1/docs/{doc_id}"),
+        ("PUT", "/api/v1/docs/{doc_id}"),
+        ("DELETE", "/api/v1/docs/{doc_id}"),
+        ("POST", "/api/v1/docs/retrieve"),
+        ("GET", "/api/v1/docs/index"),
+        ("POST", "/api/v1/docs/index/reconcile"),
+        ("POST", "/api/v1/docs/generate"),
+        ("POST", "/api/v1/docs/research"),
+        # (08-app-api: observed inventory + explicit adoptions + lifecycle
+        # intent submits.)
+        ("GET", "/api/v1/servers/{server_id}/applications"),
+        ("GET", "/api/v1/servers/{server_id}/applications/discoveries"),
+        ("POST", "/api/v1/servers/{server_id}/applications"),
+        ("DELETE", "/api/v1/servers/{server_id}/applications/{application_id}"),
+        ("POST", "/api/v1/servers/{server_id}/applications/plan"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/update"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/remove"),
+        # (09-plugins-api: plugin configs/bindings/discovery + skills.)
+        ("GET", "/api/v1/plugins"),
+        ("GET", "/api/v1/plugins/{plugin}/config"),
+        ("PUT", "/api/v1/plugins/{plugin}/config"),
+        ("DELETE", "/api/v1/plugins/{plugin}/config"),
+        ("GET", "/api/v1/plugins/{plugin}/schema"),
+        ("GET", "/api/v1/plugins/{plugin}/bindings"),
+        ("PUT", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("DELETE", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("POST", "/api/v1/plugins/{plugin}/discovery"),
+        ("GET", "/api/v1/skills"),
+        ("GET", "/api/v1/skills/{skill}"),
+        # (10-monitor-api: observations/findings/notifications + policy.)
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/findings/evaluate"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
+        ("GET", "/api/v1/monitoring/notification-policy"),
+        # (11-knowledge-api: memory surface + local model install/pull.)
+        ("GET", "/api/v1/servers/{server_id}/memory/status"),
+        ("POST", "/api/v1/servers/{server_id}/memory/recall"),
+        ("POST", "/api/v1/servers/{server_id}/memory/retain"),
+        ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
+        ("GET", "/api/v1/servers/{server_id}/memory/export"),
+        ("POST", "/api/v1/servers/{server_id}/memory/delete"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
     }
     # Every route stays under the frozen prefix; no docs listeners (G1).
     for route in api_routes:
@@ -433,6 +526,8 @@ def test_openapi_declares_the_profile_contract() -> None:
     assert {servers_path, item_path} <= set(schema["paths"])
     create = schema["paths"][servers_path]["post"]
     assert {"201", "401", "409", "422", "503"} == set(create["responses"])
+    listed = schema["paths"][servers_path]["get"]
+    assert {"200", "401", "409", "422", "503"} == set(listed["responses"])
     read = schema["paths"][item_path]["get"]
     assert {"200", "401", "404", "422"} == set(read["responses"])
     edit = schema["paths"][item_path]["put"]
@@ -445,6 +540,7 @@ def test_openapi_declares_the_profile_contract() -> None:
         "ProfileEdit",
         "ProfileResponse",
         "ProfileMutationResult",
+        "ProfileListResponse",
     } <= component_names
     # No invented security scheme; the session cookie is the only principal.
     assert "securitySchemes" not in schema["components"]
@@ -666,6 +762,53 @@ async def test_invalid_uuid_path_gets_structured_validation_error(
     body = _error(read)
     assert body["code"] == "validation_failed"
     assert body["fields"]
+
+
+# ---------------------------------------------------------------------------
+# Launcher list: session-checked safe read of every stored profile
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_is_safe_but_never_anonymous(servers_app) -> None:
+    """Layer 1 only: no Origin/CSRF for the safe read, but never anonymous."""
+    anonymous = await call_app(servers_app, "GET", "/api/v1/servers")
+    assert anonymous.status == 401
+    assert _error(anonymous)["code"] == "unauthenticated"
+
+    jar = await login_session(servers_app)
+    empty = await call_app(servers_app, "GET", "/api/v1/servers", cookies=jar)
+    assert empty.status == 200
+    assert empty.json() == {"servers": []}
+
+
+@pytest.mark.anyio
+async def test_list_returns_every_profile_sorted_by_name(servers_app) -> None:
+    jar = await login_session(servers_app)
+    data_root: Path = servers_app.state.profiles.root
+    # Non-canonical directory litter is not a profile and never breaks the list.
+    (data_root / "servers" / "not-a-uuid").mkdir(parents=True)
+    zulu = await create_server(servers_app, jar, _profile_body("zulu-target"))
+    alpha = await create_server(
+        servers_app, jar, _profile_body("alpha-target", prompt_revision=2)
+    )
+    assert zulu.status == 201 and alpha.status == 201
+
+    listed = await call_app(servers_app, "GET", "/api/v1/servers", cookies=jar)
+    assert listed.status == 200
+    payload = listed.json()
+    assert [item["name"] for item in payload["servers"]] == [
+        "alpha-target",
+        "zulu-target",
+    ]
+    alpha_view = payload["servers"][0]
+    assert alpha_view["server_id"] == alpha.json()["server_id"]
+    assert alpha_view["revision"] == 1
+    assert alpha_view["projection"] == {"revision": 1, "stale": False}
+    # A list row and the single read of the same server never disagree.
+    single = await get_server(servers_app, jar, uuid.UUID(alpha_view["server_id"]))
+    assert single.status == 200
+    assert single.json() == alpha_view
 
 
 # ---------------------------------------------------------------------------

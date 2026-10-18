@@ -76,18 +76,22 @@ from mai.contracts.server import (
     ExecutionEnvironment,
     PrivilegeMode,
     ProfileValidationError,
+    ServerProfile,
     parse_server_profile_text,
 )
 from mai.profiles.files import (
+    SERVERS_DIR,
     FileStoreErrorCode,
     ProfileFileError,
     ProfileFileStore,
+    StoredProfile,
 )
 from mai.profiles.projection import (
     ApplyResult,
     ProjectionErrorCode,
     ProjectionError,
     ProfileProjection,
+    ProjectionState,
 )
 
 __all__ = [
@@ -193,6 +197,12 @@ class ProfileResponse(BaseModel):
     projection: ProjectionView
 
 
+class ProfileListResponse(BaseModel):
+    """Every stored server profile in deterministic ``(name, id)`` order."""
+
+    servers: list[ProfileResponse]
+
+
 # ---------------------------------------------------------------------------
 # Canonical document assembly (single producer re-validates on write)
 # ---------------------------------------------------------------------------
@@ -233,6 +243,34 @@ def _mutation_result(
         revision=result.revision,
         schema_revision=SCHEMA_VERSION,
         sha256=result.sha256,
+    )
+
+
+def _profile_view(
+    profile: ServerProfile, stored: StoredProfile, state: ProjectionState | None
+) -> ProfileResponse:
+    """One stored profile rendered as the wire view (single read == list row)."""
+    return ProfileResponse(
+        schema_version=profile.schema_version,
+        server_id=profile.server_id,
+        name=profile.name,
+        prompt_revision=profile.prompt_revision,
+        environment=profile.environment,
+        ssh=SshIdentityBody(
+            host=profile.ssh.host,
+            port=profile.ssh.port,
+            user=profile.ssh.user,
+            host_key=profile.ssh.host_key,
+            credential_ref=profile.ssh.credential_ref,
+        ),
+        privilege=profile.privilege,
+        capabilities=list(profile.capabilities),
+        revision=stored.revision,
+        sha256=stored.sha256,
+        projection=ProjectionView(
+            revision=None if state is None else state.revision,
+            stale=False if state is None else state.stale,
+        ),
     )
 
 
@@ -396,28 +434,71 @@ async def read_profile(request: Request, server_id: uuid.UUID) -> Response:
         return _profile_error(request, exc)
     profile = parse_server_profile_text(stored.text)
     state = await projection.read_projection(server_id)
-    return ProfileResponse(
-        schema_version=profile.schema_version,
-        server_id=profile.server_id,
-        name=profile.name,
-        prompt_revision=profile.prompt_revision,
-        environment=profile.environment,
-        ssh=SshIdentityBody(
-            host=profile.ssh.host,
-            port=profile.ssh.port,
-            user=profile.ssh.user,
-            host_key=profile.ssh.host_key,
-            credential_ref=profile.ssh.credential_ref,
-        ),
-        privilege=profile.privilege,
-        capabilities=list(profile.capabilities),
-        revision=stored.revision,
-        sha256=stored.sha256,
-        projection=ProjectionView(
-            revision=None if state is None else state.revision,
-            stale=False if state is None else state.stale,
-        ),
-    )
+    return _profile_view(profile, stored, state)
+
+
+@router.get(
+    "",
+    status_code=HTTP_200_OK,
+    response_model=ProfileListResponse,
+    summary="List every stored server profile",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Canonical profile state requires recovery",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "A stored profile failed producer validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Canonical profile service unavailable",
+        },
+    },
+)
+async def list_profiles(request: Request) -> Response:
+    """List every stored server profile in deterministic ``(name, id)`` order.
+
+    Safe method: layer 1 only (no Origin/CSRF). Each ``servers/`` directory is
+    read through the SAME canonical pipeline as the single read, so a list row
+    and the single read of one server can never disagree. A directory whose
+    name is not a canonical UUID is not a profile and is skipped; a missing
+    canonical file (half-finished delete sweep state) is absent, not an error;
+    any other store rejection or producer-validation failure is
+    recovery-needed canonical state that surfaces (C02: shown, never silently
+    repaired).
+    """
+    await _require_session(request)
+    store, projection = _canonical_service(request)
+    servers: list[ProfileResponse] = []
+    servers_root = store.root / SERVERS_DIR
+    if servers_root.is_dir():
+        for directory in sorted(path for path in servers_root.iterdir() if path.is_dir()):
+            try:
+                server_id = uuid.UUID(directory.name)
+            except ValueError:
+                continue
+            if str(server_id) != directory.name:
+                continue  # non-canonical spelling is not a profile identity
+            try:
+                stored = store.read(server_id)
+            except ProfileFileError as exc:
+                if exc.code is FileStoreErrorCode.NOT_FOUND:
+                    continue
+                return _profile_error(request, exc)
+            try:
+                profile = parse_server_profile_text(stored.text)
+            except ProfileValidationError as exc:
+                return _profile_error(request, exc)
+            state = await projection.read_projection(server_id)
+            servers.append(_profile_view(profile, stored, state))
+    servers.sort(key=lambda view: (view.name, str(view.server_id)))
+    return ProfileListResponse(servers=servers)
 
 
 @router.put(
