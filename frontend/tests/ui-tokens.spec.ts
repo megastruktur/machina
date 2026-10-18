@@ -64,7 +64,8 @@ test('tokens load exactly once through the layout and resolve on :root', async (
 		return {
 			sheets,
 			rootDecls,
-			text: getComputedStyle(document.documentElement).getPropertyValue(sentinel).trim()
+			text: getComputedStyle(document.documentElement).getPropertyValue(sentinel).trim(),
+			bg: getComputedStyle(document.documentElement).getPropertyValue('--mai-color-bg').trim()
 		};
 	});
 
@@ -73,7 +74,47 @@ test('tokens load exactly once through the layout and resolve on :root', async (
 		result.rootDecls,
 		'token :root layer is declared exactly once — loaded once, no duplicated theme rules'
 	).toBe(1);
-	expect(result.text, 'token value resolves on the document element').toBe('#101828');
+	// Default theme is Mechanicus (Forge World Mars): #ece8de text on #0b0d10.
+	expect(result.text, 'default --mai-color-text is the Mechanicus palette').toBe('#ece8de');
+	expect(result.bg, 'default --mai-color-bg is the Mechanicus palette').toBe('#0b0d10');
+});
+
+test('dynamically switching data-theme to standard re-themes color tokens live', async ({
+	page
+}) => {
+	await page.goto('/');
+
+	const mechanicus = await page.evaluate(() => {
+		const cs = getComputedStyle(document.documentElement);
+		return {
+			text: cs.getPropertyValue('--mai-color-text').trim(),
+			bg: cs.getPropertyValue('--mai-color-bg').trim()
+		};
+	});
+	expect(mechanicus.text).toBe('#ece8de');
+	expect(mechanicus.bg).toBe('#0b0d10');
+
+	// Encapsulated switch: only the data-theme attribute changes — no
+	// stylesheet reload, no class changes, no JS theming logic.
+	await page.evaluate(() => {
+		document.documentElement.dataset.theme = 'standard';
+	});
+
+	const standard = await page.evaluate(() => {
+		const cs = getComputedStyle(document.documentElement);
+		const body = getComputedStyle(document.body);
+		return {
+			text: cs.getPropertyValue('--mai-color-text').trim(),
+			bg: cs.getPropertyValue('--mai-color-bg').trim(),
+			bodyColor: body.color,
+			bodyBg: body.backgroundColor
+		};
+	});
+	expect(standard.text, 'standard overrides --mai-color-text').toBe('#101828');
+	expect(standard.bg, 'standard overrides --mai-color-bg').toBe('#f6f7f9');
+	// Body paints follow the tokens without any re-render.
+	expect(standard.bodyColor).toBe('rgb(16, 24, 40)');
+	expect(standard.bodyBg).toBe('rgb(246, 247, 249)');
 });
 
 test('frozen size constants are exposed (NT3 title-bar minimum, target minimum)', async ({
@@ -105,9 +146,19 @@ test('keyboard focus shows a visible, high-contrast ring from the :focus-visible
 		'<button data-testid="probe-focus" style="padding:8px 12px">Focus probe</button>'
 	);
 
-	// Fresh page: the probe button is the only tabbable element, so Tab must
-	// land on it — a keyboard-triggered :focus-visible match.
-	await page.keyboard.press('Tab');
+	// The route shell mounts workspace chrome with its own tabbables, so Tab
+	// until the probe button is focused — that keyboard-triggered match is
+	// what exercises the :focus-visible baseline.
+	for (let i = 0; i < 25; i++) {
+		if (
+			await page.evaluate(() =>
+				document.activeElement?.matches('[data-testid="probe-focus"]')
+			)
+		) {
+			break;
+		}
+		await page.keyboard.press('Tab');
+	}
 
 	const ring = await page.evaluate(() => {
 		const el = document.querySelector<HTMLElement>('[data-testid="probe-focus"]');
@@ -302,7 +353,18 @@ test('zoomed/tight viewport: focus ring, scroll and input remain usable', async 
 			 <input data-testid="probe-input" placeholder="type here" />
 			 <div data-testid="tall" style="height:250vh"></div>`
 		);
-		await page.keyboard.press('Tab');
+		// The route shell mounts workspace chrome with its own tabbables, so
+		// Tab until the probe button (appended after the shell) is focused.
+		for (let i = 0; i < 25; i++) {
+			if (
+				await page.evaluate(() =>
+					document.activeElement?.matches('[data-testid="probe-focus"]')
+				)
+			) {
+				break;
+			}
+			await page.keyboard.press('Tab');
+		}
 
 		const probe = await page.evaluate(() => {
 			const btn = document.querySelector<HTMLElement>('[data-testid="probe-focus"]');

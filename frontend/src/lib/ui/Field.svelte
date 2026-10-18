@@ -108,7 +108,22 @@
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		font-size: var(--mai-text-base);
-		transition: border-color var(--mai-motion-fast) ease;
+		caret-color: var(--mai-color-brass);
+		transition:
+			border-color var(--mai-motion-fast) ease,
+			background-color var(--mai-motion-fast) ease;
+	}
+
+	/* Tactile cogitator plate: brass seam on pointer hover, raised surface. */
+	.mai-field__input:hover:not(:disabled) {
+		border-color: var(--mai-color-border-strong);
+		background: var(--mai-color-surface-raised);
+	}
+
+	/* Brass border on any focus; the crisp keyboard focus ring itself comes
+	   from the global :focus-visible baseline in tokens.css. */
+	.mai-field__input:focus {
+		border-color: var(--mai-color-brass);
 	}
 
 	.mai-field__input:disabled {
@@ -116,6 +131,8 @@
 		cursor: not-allowed;
 	}
 
+	/* Error wins over hover/focus seams (attribute + class beats a
+	   pseudo-class). */
 	.mai-field__input[aria-invalid='true'] {
 		border-color: var(--mai-status-danger-text);
 	}

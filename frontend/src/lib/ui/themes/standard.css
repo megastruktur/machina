@@ -1,0 +1,71 @@
+/*
+ * Standard theme — the light "contract default" palette (pre-mechanicus
+ * tokens.css values, machine-verified WCAG AA). Encapsulated Theme Contract:
+ * this rule ONLY overrides the theme custom properties on
+ * `[data-theme="standard"]`; the default `:root` layer lives in
+ * mechanicus.css and is never duplicated here. Switching themes is purely
+ * `document.documentElement.dataset.theme = 'standard'` — no stylesheet
+ * reload, no duplicated blocks.
+ *
+ * Key set mirrors mechanicus.css exactly: every `--mai-*` color and
+ * typography variable exists in both themes so a switch fully re-themes the
+ * document. Font stacks intentionally match (the webfonts are bundled and
+ * self-hosted in both themes; only color/elevation/scheme change).
+ */
+
+[data-theme='standard'] {
+	color-scheme: light;
+
+	/* ---- Color: surfaces and text --------------------------------------- */
+	--mai-color-bg: #f6f7f9;
+	--mai-color-surface: #ffffff;
+	--mai-color-surface-raised: #ffffff;
+	--mai-color-border: #d1d5db;
+	--mai-color-border-strong: #9ca3af;
+	--mai-color-text: #101828;
+	--mai-color-text-muted: #4b5563;
+
+	/* ---- Color: primary / interactive ------------------------------------ */
+	--mai-color-primary: #1d4ed8;
+	--mai-color-primary-hover: #1e40af;
+	--mai-color-primary-active: #1e3a8a;
+	--mai-color-primary-contrast: #ffffff;
+
+	/* ---- Color: status ---------------------------------------------------- */
+	--mai-status-info-text: #175cd3;
+	--mai-status-info-bg: #eff8ff;
+	--mai-status-info-border: #b2ddff;
+	--mai-status-info-solid: #175cd3;
+	--mai-status-success-text: #067647;
+	--mai-status-success-bg: #ecfdf3;
+	--mai-status-success-border: #a6f4c5;
+	--mai-status-success-solid: #067647;
+	--mai-status-warning-text: #b54708;
+	--mai-status-warning-bg: #fffaeb;
+	--mai-status-warning-border: #fec84b;
+	--mai-status-warning-solid: #b54708;
+	--mai-status-danger-text: #b42318;
+	--mai-status-danger-bg: #fef3f2;
+	--mai-status-danger-border: #fecdca;
+	--mai-status-danger-solid: #b42318;
+	--mai-status-solid-contrast: #ffffff;
+	--mai-status-neutral-text: #4b5563;
+	--mai-status-neutral-bg: #f2f4f7;
+	--mai-status-neutral-border: #d1d5db;
+
+	/* ---- Color: focus ------------------------------------------------------ */
+	--mai-focus-ring-color: #1d4ed8;
+
+	/* ---- Color: accents ----------------------------------------------------- */
+	--mai-color-brass: #8a6a2f;
+	--mai-color-brass-dim: #a08c5a;
+	--mai-color-surface-header: #eef1f5;
+
+	/* ---- Type --------------------------------------------------------------- */
+	--mai-font-display: 'Cinzel', Georgia, serif;
+	--mai-font-sans: 'Rajdhani', system-ui, -apple-system, sans-serif;
+	--mai-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+	/* ---- Elevation ----------------------------------------------------------- */
+	--mai-shadow-window: 0 8px 24px rgb(16 24 40 / 0.14), 0 2px 6px rgb(16 24 40 / 0.08);
+}
