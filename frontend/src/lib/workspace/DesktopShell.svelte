@@ -32,6 +32,19 @@
 		type WindowDescriptor,
 		type WindowGeometry
 	} from './types.js';
+	// The reviewed MAI v1 feature entries (P02–P12): each is the feature's
+	// single registration point (ADR §7.1) — the shell only composes them.
+	import { applicationsEntry } from './entries/08-web-apps.js';
+	import { capabilityPolicyEntry } from './entries/03-web-policy.js';
+	import { chatEntry } from './entries/06-web-chat.js';
+	import { docsEntry } from './entries/07-web-docs.js';
+	import { executionEntry } from './entries/05-web-execution.js';
+	import { jobsEntry } from './entries/05-web-jobs.js';
+	import { knowledgeModelsEntry } from './entries/11-web-memory-models.js';
+	import { modelSettingsEntry } from './entries/06-web-models.js';
+	import { overviewEntry } from './entries/10-web-dashboard.js';
+	import { pluginFormsEntry } from './entries/09-web-plugin-forms.js';
+	import { serverProfileEntry } from './entries/02-web-server.js';
 
 	/**
 	 * Fixture server identities (opaque UUIDs per contracts.md C01 rule 1).
@@ -46,7 +59,7 @@
 	]);
 
 	/** Human label for a fixture server id; unknown ids read as "Server". */
-	function serverLabel(id: ServerId): string {
+	function fixtureServerLabel(id: ServerId): string {
 		return FIXTURE_SERVERS.find((server) => server.id === id)?.label ?? 'Server';
 	}
 
@@ -112,6 +125,7 @@
 	 */
 	function createDesktopRegistry(): PanelRegistry {
 		const result = createPanelRegistry([
+			// --- Interim benign fixtures (fixture policy, brief acceptance 2) ----
 			{
 				panel_kind: 'fixture-notes',
 				title: 'Notes',
@@ -137,7 +151,19 @@
 				title: 'Broken',
 				scope_types: ['global'],
 				component: () => Promise.reject(new Error('fixture-broken loader always fails'))
-			}
+			},
+			// --- The reviewed MAI v1 feature panels (P02–P12) --------------------
+			serverProfileEntry(),
+			capabilityPolicyEntry(),
+			executionEntry(),
+			jobsEntry(),
+			chatEntry(),
+			modelSettingsEntry(),
+			docsEntry(),
+			applicationsEntry(),
+			overviewEntry(),
+			pluginFormsEntry(),
+			knowledgeModelsEntry()
 		]);
 		if (!result.ok) {
 			// Constant input; failure here is a programming defect, not a
@@ -194,6 +220,42 @@
 	import PanelHost from './PanelHost.svelte';
 	import WindowSwitcher from './WindowSwitcher.svelte';
 	import Button from '$lib/ui/Button.svelte';
+	import Field from '$lib/ui/Field.svelte';
+	// Live transport + the per-panel service slices (each feature entry names
+	// its exact contract; the shell maps ONE client onto all of them).
+	// Live transport: one client per shell instance (ADR §5 — instances share
+	// nothing). The feature entries name the per-panel contracts; the slices
+	// below map this ONE client onto each panel's exact interface.
+	import { ApiError, createMaiApiClient, CSRF_COOKIE, type ProfileResponse } from '$lib/api/client.js';
+	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
+	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
+	import { CHAT_PANEL_KIND, browserChatEventStream, chatServices, type ChatApi } from './entries/06-web-chat.js';
+	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
+	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
+	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
+	import {
+		KNOWLEDGE_MODELS_PANEL_KIND,
+		knowledgeModelsServices
+	} from './entries/11-web-memory-models.js';
+	import {
+		MODEL_SETTINGS_PANEL_KIND,
+		modelSettingsServices,
+		type ModelSettingsApi
+	} from './entries/06-web-models.js';
+	import {
+		OVERVIEW_PANEL_KIND,
+		overviewServices,
+		type EvidenceAttachPayload,
+		type OverviewApi
+	} from './entries/10-web-dashboard.js';
+	import {
+		PLUGIN_FORMS_PANEL_KIND,
+		pluginFormsServices,
+		type PluginsApi,
+		type SkillsApi
+	} from './entries/09-web-plugin-forms.js';
+	import { SERVER_PROFILE_PANEL_KIND, serverProfileServices } from './entries/02-web-server.js';
+	import type { PanelServices } from './registry.js';
 
 	const registry = createDesktopRegistry();
 
@@ -276,8 +338,19 @@
 	 */
 	let selectedServerId = $state<ServerId>(FIXTURE_SERVERS[0].id);
 
-	/** Launcher buttons: enabled registry entries, in registration order. */
-	const launcherEntries = registry.entries().filter((entry) => entry.enabled);
+	/**
+	 * Launcher buttons. Two visible sets, keyed by the live-session state:
+	 * the interim fixtures when no backend session is active (the fixture
+	 * desktop — zero API requests, Playwright-stable), and the reviewed MAI
+	 * v1 feature panels once a live session answered. The registry itself
+	 * always holds BOTH sets; only the launcher gates them.
+	 */
+	const fixtureEntries = registry
+		.entries()
+		.filter((entry) => entry.enabled && entry.panel_kind.startsWith('fixture-'));
+	const liveEntries = registry
+		.entries()
+		.filter((entry) => entry.enabled && !entry.panel_kind.startsWith('fixture-'));
 
 	/** Last launcher outcome (open result or failure notice) — never data. */
 	let status = $state<string | null>(null);
@@ -287,6 +360,299 @@
 
 	/** Cascade counter for entries without a registry default geometry. */
 	let cascade = 0;
+
+	// ---------------------------------------------------------------------------
+	// Live session (mai-wire-desktop): ONE client, per-panel service slices.
+	//
+	// The fixture desktop performs zero API requests: the live attach runs
+	// only when the readable `mai_csrf` cookie (auth ADR §5, set by a real
+	// login) is already in `document.cookie` — fixture-only browsers never
+	// trigger a request. The live servers then REPLACE the fixture launcher
+	// selection, and the reviewed feature panels open with the exact service
+	// slice each entry contract declares.
+	// ---------------------------------------------------------------------------
+
+	const api = createMaiApiClient();
+
+	/** Live attach state: fixture desktop until a session cookie answers. */
+	let live = $state(false);
+	let liveServers = $state<ProfileResponse[]>([]);
+
+	/** Enrollment form visibility/busy/error (live mode only). */
+	let enrollOpen = $state(false);
+	let enrollBusy = $state(false);
+	let enrollError = $state<string | null>(null);
+	let enrollName = $state('');
+	let enrollPromptRevision = $state('1');
+	let enrollHost = $state('');
+	let enrollPort = $state('22');
+	let enrollUser = $state('');
+	let enrollHostKey = $state('');
+	let enrollCredentialRef = $state('');
+	let enrollPrivilege = $state<'none' | 'sudo' | 'root'>('sudo');
+	let enrollCapabilities = $state('');
+
+	/** Launcher options: live profiles replace the fixture pair when live. */
+	const serverOptions = $derived.by<{ id: ServerId; label: string }[]>(() =>
+		live
+			? liveServers.map((profile) => ({ id: String(profile.server_id), label: profile.name }))
+			: [...FIXTURE_SERVERS]
+	);
+
+	/** Label for a pinned server id: live profile name, else fixture label. */
+	function serverLabel(id: ServerId): string {
+		return (
+			liveServers.find((profile) => String(profile.server_id) === id)?.name ??
+			fixtureServerLabel(id)
+		);
+	}
+
+	/** The readable CSRF cookie is the honest "a session may exist" probe. */
+	function hasSessionCookie(): boolean {
+		if (typeof document === 'undefined') return false;
+		return document.cookie
+			.split(';')
+			.some((pair) => pair.trim().startsWith(`${CSRF_COOKIE}=`));
+	}
+
+	/** Load the enrolled servers; a 401 demotes the shell to fixture mode. */
+	async function connectLive(): Promise<void> {
+		try {
+			const { servers } = await api.listProfiles();
+			liveServers = servers;
+			live = true;
+			status = null;
+			if (servers.length > 0) selectedServerId = String(servers[0].server_id);
+		} catch (error) {
+			live = false;
+			liveServers = [];
+			if (error instanceof ApiError && error.code === 'unauthenticated') {
+				status = 'Live session required — sign in to open the live desktop.';
+			} else {
+				status = `Live servers unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+			}
+		}
+	}
+
+	/** Sign out: clear the session, return to the fixture desktop. */
+	async function signOut(): Promise<void> {
+		try {
+			await api.logout();
+		} catch {
+			// An already-expired session still ends in fixture mode below.
+		}
+		live = false;
+		liveServers = [];
+		selectedServerId = FIXTURE_SERVERS[0].id;
+		status = 'Signed out — fixture desktop.';
+	}
+
+	/** Enroll one server through the reviewed create route, then refresh. */
+	async function enrollServer(event: SubmitEvent): Promise<void> {
+		event.preventDefault();
+		enrollError = null;
+		const promptRevision = Number(enrollPromptRevision);
+		const port = Number(enrollPort);
+		if (!Number.isInteger(promptRevision) || promptRevision < 1) {
+			enrollError = 'Prompt revision must be an integer ≥ 1.';
+			return;
+		}
+		if (!Number.isInteger(port) || port < 1 || port > 65535) {
+			enrollError = 'SSH port must be an integer between 1 and 65535.';
+			return;
+		}
+		enrollBusy = true;
+		try {
+			await api.createProfile({
+				name: enrollName,
+				prompt_revision: promptRevision,
+				environment: 'linux_ssh',
+				ssh: {
+					host: enrollHost,
+					port,
+					user: enrollUser,
+					host_key: enrollHostKey,
+					credential_ref: enrollCredentialRef
+				},
+				privilege: enrollPrivilege,
+				capabilities: enrollCapabilities
+					.split(',')
+					.map((id) => id.trim())
+					.filter((id) => id !== '')
+			});
+			enrollName = '';
+			enrollHost = '';
+			enrollUser = '';
+			enrollHostKey = '';
+			enrollCredentialRef = '';
+			enrollCapabilities = '';
+			enrollOpen = false;
+			await connectLive();
+			status = 'Server enrolled.';
+		} catch (error) {
+			enrollError =
+				error instanceof ApiError ? `${error.code}: ${error.message}` : 'Enrollment failed.';
+		} finally {
+			enrollBusy = false;
+		}
+	}
+
+	// --- Per-panel service slices (each entry's exact contract) ---------------
+
+	const chatApi: ChatApi = {
+		submitMessage: api.submitMessage,
+		listConversations: api.listConversations,
+		readConversation: api.readConversation,
+		cancelConversation: api.cancelConversation,
+		streamConversationEvents: browserChatEventStream,
+		readRun: api.readRun,
+		readApproval: api.readApproval,
+		decideApproval: api.decideApproval
+	};
+
+	const jobsApi: JobsApi = {
+		listRuns: api.listRuns,
+		readRun: api.readRun,
+		cancelRun: api.cancelRun,
+		listSchedules: api.listSchedules,
+		createSchedule: api.createSchedule,
+		updateSchedule: api.updateSchedule,
+		deleteSchedule: api.deleteSchedule,
+		streamRunEvents: browserRunEventStream
+	};
+
+	const overviewApi: OverviewApi = {
+		listObservations: api.listObservations,
+		listFindings: api.listFindings,
+		evaluateFindings: api.evaluateFindings,
+		listNotifications: api.listNotifications,
+		ackNotification: api.ackNotification,
+		listAdoptedApplications: api.listAdoptedApplications,
+		listRuns: api.listRuns,
+		streamRunEvents: browserRunEventStream
+	};
+
+	/** Model-settings slice: the client's model methods under panel names. */
+	const modelSettingsApi: ModelSettingsApi = {
+		listConnections: api.listConnections,
+		readConnection: api.readConnection,
+		putConnection: api.putConnection,
+		deleteConnection: api.deleteConnection,
+		listProfiles: api.listModelProfiles,
+		readProfile: api.readModelProfile,
+		putProfile: api.putModelProfile,
+		deleteProfile: api.deleteModelProfile,
+		readSelection: api.readSelection,
+		putSelection: api.putSelection,
+		deleteSelection: api.deleteSelection,
+		probe: api.probeModel
+	};
+
+	const appsApi: ApplicationsApi = {
+		listAdopted: api.listAdoptedApplications,
+		discover: api.discoverApplications,
+		adopt: api.adoptApplication,
+		revoke: api.revokeApplication
+	};
+
+	const pluginsApi: PluginsApi = {
+		catalog: api.pluginCatalog,
+		readConfig: api.readPluginConfig,
+		editConfig: api.editPluginConfig,
+		removeConfig: api.removePluginConfig,
+		readSchema: api.readPluginSchema,
+		listBindings: api.listPluginBindings,
+		editBinding: api.editPluginBinding,
+		removeBinding: api.removePluginBinding,
+		runDiscovery: api.runPluginDiscovery
+	};
+
+	const skillsApi: SkillsApi = { catalog: api.skillCatalog, readSkill: api.readSkill };
+
+	/** Open one server-scoped panel explicitly pinned to one target. */
+	function openServerPanel(kind: PanelKind, serverId: ServerId): void {
+		openPanel(kind, { kind: 'server', server_id: serverId });
+	}
+
+	/** Open the documents panel pinned to one stored document object. */
+	function openDocumentObject(serverId: ServerId, docId: string): void {
+		openPanel(DOCS_PANEL_KIND, {
+			kind: 'server',
+			server_id: serverId,
+			object: { kind: 'document', id: docId }
+		});
+	}
+
+	/**
+	 * The registry's services bag is deliberately an open record (ADR §7.2:
+	 * explicit context, never globals); the frozen feature bags satisfy it at
+	 * runtime — this is the single widening point for all of them.
+	 */
+	function asBag(services: object): PanelServices {
+		return services as PanelServices;
+	}
+
+	/**
+	 * The services bag of ONE live window: every feature panel receives the
+	 * exact slice its entry contract declares. Cross-panel seams are real
+	 * openers into this shell; a seam with no windowable surface stays
+	 * `null` so the panel renders its honest fail-closed note (never a fake
+	 * navigation).
+	 */
+	function servicesFor(descriptor: WindowDescriptor): PanelServices {
+		switch (descriptor.panel_kind) {
+			case SERVER_PROFILE_PANEL_KIND:
+				return asBag(serverProfileServices(api));
+			case CAPABILITY_POLICY_PANEL_KIND:
+				return asBag(capabilityPolicyServices(api));
+			case EXECUTION_PANEL_KIND:
+				return asBag(executionServices(api));
+			case JOBS_PANEL_KIND:
+				return asBag(jobsServices(jobsApi));
+			case CHAT_PANEL_KIND:
+				return asBag(chatServices(chatApi));
+			case MODEL_SETTINGS_PANEL_KIND:
+				return asBag(modelSettingsServices(modelSettingsApi));
+			case DOCS_PANEL_KIND:
+				return asBag(docsServices(api, { submitMessage: api.submitMessage }));
+			case APPLICATIONS_PANEL_KIND: {
+				const serverId =
+					descriptor.scope.kind === 'server' ? descriptor.scope.server_id : selectedServerId;
+				return asBag(
+					applicationsServices(appsApi, null, {
+						openDocument: (docId) => openDocumentObject(serverId, docId)
+					})
+				);
+			}
+			case OVERVIEW_PANEL_KIND:
+				return asBag(
+					overviewServices(
+						overviewApi,
+						{
+							openApplications: (serverId) =>
+								openServerPanel(APPLICATIONS_PANEL_KIND, serverId),
+							openJobs: (serverId) => openServerPanel(JOBS_PANEL_KIND, serverId)
+						},
+						{
+							attach: (payload: EvidenceAttachPayload) =>
+								openServerPanel(CHAT_PANEL_KIND, payload.server_id)
+						}
+					)
+				);
+			case KNOWLEDGE_MODELS_PANEL_KIND:
+				return asBag(
+					knowledgeModelsServices(api, {
+						openApplications: (serverId) => openServerPanel(APPLICATIONS_PANEL_KIND, serverId),
+						openJobs: (serverId) => openServerPanel(JOBS_PANEL_KIND, serverId),
+						openModelSettings: () => openPanel(MODEL_SETTINGS_PANEL_KIND, { kind: 'global' })
+					})
+				);
+			case PLUGIN_FORMS_PANEL_KIND:
+				return asBag(pluginFormsServices(pluginsApi, skillsApi));
+			default:
+				return {};
+		}
+	}
 
 	/**
 	 * Open geometry: the entry default when declared, else the shell
@@ -318,12 +684,14 @@
 	 * entry's declared scope types and the CURRENT selection — one explicit
 	 * target per open, never a shared mutable target.
 	 */
-	function openPanel(kind: PanelKind): void {
+	function openPanel(kind: PanelKind, scopeOverride?: WindowScope): void {
 		const entry = registry.entry(kind);
 		if (!entry) return;
-		const scope: WindowScope = entry.scope_types.has('server')
-			? { kind: 'server', server_id: selectedServerId }
-			: { kind: 'global' };
+		const scope: WindowScope =
+			scopeOverride ??
+			(entry.scope_types.has('server')
+				? { kind: 'server', server_id: selectedServerId }
+				: { kind: 'global' });
 		const scopeCheck = registry.checkScope(kind, scope);
 		if (!scopeCheck.ok) {
 			status = `Cannot open ${entry.title}: ${scopeCheck.issue.message}`;
@@ -411,6 +779,15 @@
 
 	/** Viewport listener; detached again when the shell unmounts. */
 	$effect(() => responsive.start());
+
+	/**
+	 * Live attach (browser only): load the enrolled servers ONLY when the
+	 * readable `mai_csrf` cookie proves a logged-in browser — a fixture-only
+	 * browser (no backend, Playwright) performs zero API requests.
+	 */
+	$effect(() => {
+		if (hasSessionCookie()) void connectLive();
+	});
 </script>
 
 <div class="mai-desktop-shell">
@@ -425,18 +802,79 @@
 			bind:value={selectedServerId}
 			data-testid="server-select"
 		>
-			{#each FIXTURE_SERVERS as server (server.id)}
+			{#each serverOptions as server (server.id)}
 				<option value={server.id}>{server.label}</option>
 			{/each}
 		</select>
-		{#each launcherEntries as entry (entry.panel_kind)}
+		{#if live}
+			{#each liveEntries as entry (entry.panel_kind)}
+				<Button
+					data-testid={'open-' + entry.panel_kind}
+					onclick={() => openPanel(entry.panel_kind)}
+				>
+					Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
+				</Button>
+			{/each}
 			<Button
-				data-testid={'open-' + entry.panel_kind}
-				onclick={() => openPanel(entry.panel_kind)}
+				variant="secondary"
+				data-testid="desktop-enroll-toggle"
+				onclick={() => (enrollOpen = !enrollOpen)}
 			>
-				Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
+				{enrollOpen ? 'Close enrollment' : 'Enroll server'}
 			</Button>
-		{/each}
+			<Button variant="secondary" data-testid="desktop-sign-out" onclick={signOut}>
+				Sign out
+			</Button>
+		{:else}
+			{#each fixtureEntries as entry (entry.panel_kind)}
+				<Button
+					data-testid={'open-' + entry.panel_kind}
+					onclick={() => openPanel(entry.panel_kind)}
+				>
+					Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
+				</Button>
+			{/each}
+			<a class="mai-desktop-shell__signin" href="/login" data-testid="desktop-sign-in">
+				Connect live session / Sign in
+			</a>
+		{/if}
+		{#if live && enrollOpen}
+			<!-- Inline enrollment: one reviewed create call; the field set mirrors
+			     the frozen ProfileCreate document (C02 rule 1) exactly. -->
+			<form class="mai-desktop-shell__enroll" onsubmit={enrollServer} data-testid="enroll-server">
+				<Field label="Display name" bind:value={enrollName} required />
+				<Field
+					label="Prompt revision"
+					inputmode="numeric"
+					bind:value={enrollPromptRevision}
+					required
+				/>
+				<Field label="SSH host" bind:value={enrollHost} required />
+				<Field label="SSH port" inputmode="numeric" bind:value={enrollPort} required />
+				<Field label="SSH user" bind:value={enrollUser} required />
+				<Field label="Host key (SHA256 fingerprint)" bind:value={enrollHostKey} required />
+				<Field label="Credential reference" bind:value={enrollCredentialRef} required />
+				<Field label="Capabilities (comma-separated)" bind:value={enrollCapabilities} />
+				<label class="mai-desktop-shell__server-label" for="mai-enroll-privilege">
+					Privilege mode
+				</label>
+				<select
+					id="mai-enroll-privilege"
+					class="mai-desktop-shell__server-select"
+					bind:value={enrollPrivilege}
+				>
+					<option value="none">none</option>
+					<option value="sudo">sudo</option>
+					<option value="root">root</option>
+				</select>
+				{#if enrollError}
+					<p class="mai-desktop-shell__enroll-error" role="alert" data-testid="enroll-error">
+						{enrollError}
+					</p>
+				{/if}
+				<Button type="submit" loading={enrollBusy} data-testid="enroll-submit">Enroll</Button>
+			</form>
+		{/if}
 	</div>
 
 	<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
@@ -464,6 +902,7 @@
 				<PanelHost
 					registry={registry}
 					descriptor={win}
+					services={servicesFor(win)}
 					onpanelerror={(windowId, panelKind) =>
 						console.error(`[mai-desktop] panel failed: kind=${panelKind} window=${windowId}`)}
 				/>
@@ -521,6 +960,40 @@
 		min-height: 1.5em;
 		font-size: var(--mai-text-sm);
 		color: var(--mai-color-text-muted);
+	}
+
+	/* The live-session hand-off link shown next to the fixture launcher. */
+	.mai-desktop-shell__signin {
+		padding: var(--mai-space-1) var(--mai-space-3);
+		font-size: var(--mai-text-sm);
+		color: var(--mai-color-primary);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		text-decoration: none;
+	}
+
+	.mai-desktop-shell__signin:hover {
+		background: var(--mai-color-bg);
+	}
+
+	/* Inline server enrollment (live mode only): a compact field grid. */
+	.mai-desktop-shell__enroll {
+		flex: 1 1 100%;
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+		gap: var(--mai-space-2);
+		align-items: end;
+		padding: var(--mai-space-3);
+		background: var(--mai-color-bg);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+	}
+
+	.mai-desktop-shell__enroll-error {
+		margin: 0;
+		grid-column: 1 / -1;
+		font-size: var(--mai-text-sm);
+		color: var(--mai-status-danger-text);
 	}
 
 	/* The positioned ancestor of the window frames: geometry coordinates are

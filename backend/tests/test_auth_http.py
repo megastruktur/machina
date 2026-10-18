@@ -294,6 +294,13 @@ def _api_routes(app: FastAPI) -> list[APIRoute]:
 
 
 def test_auth_surface_registers_the_frozen_routes() -> None:
+    """The auth boundary is registered alongside the full MAI v1 surface.
+
+    The table is the WHOLE frozen route pin (mirrors
+    ``test_servers_http.test_full_surface_registers_the_frozen_routes``);
+    any new route must extend both consciously, never silently. The
+    auth-owned assertions are the mutating-path set below.
+    """
     app = create_app(env={})
     api_routes = _api_routes(app)
     table = {
@@ -306,22 +313,90 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/auth/bootstrap"),
         ("POST", "/api/v1/auth/login"),
         ("POST", "/api/v1/auth/logout"),
-        # (02-profile-api remediation: the P02 route pin expanded by the
-        # frozen canonical-profile routes; intent unchanged.)
+        ("GET", "/api/v1/servers"),
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
-        # (03-approval-api remediation: the pin expanded by the frozen
-        # approval preview/decision routes; intent unchanged.)
         ("GET", "/api/v1/approvals/{approval_id}"),
         ("POST", "/api/v1/approvals/{approval_id}/decision"),
-        # (03-grants-api remediation: the pin expanded by the frozen
-        # grant-configuration read/edit routes; intent unchanged.)
         ("GET", "/api/v1/grants"),
         ("PUT", "/api/v1/grants"),
-        # (04-password-api remediation: the pin expanded by the frozen
-        # submit-only challenge route; intent unchanged.)
         ("POST", "/api/v1/password-challenges"),
+        ("GET", "/api/v1/jobs/runs"),
+        ("POST", "/api/v1/jobs/runs"),
+        ("GET", "/api/v1/jobs/runs/{run_id}"),
+        ("POST", "/api/v1/jobs/runs/{run_id}/cancel"),
+        ("GET", "/api/v1/jobs/runs/{run_id}/events"),
+        ("GET", "/api/v1/schedules"),
+        ("POST", "/api/v1/schedules"),
+        ("GET", "/api/v1/schedules/{schedule_id}"),
+        ("PATCH", "/api/v1/schedules/{schedule_id}"),
+        ("DELETE", "/api/v1/schedules/{schedule_id}"),
+        ("GET", "/api/v1/schedules/{schedule_id}/fires"),
+        ("POST", "/api/v1/chat/messages"),
+        ("GET", "/api/v1/chat/runs"),
+        ("GET", "/api/v1/chat/runs/{run_id}"),
+        ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
+        ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        ("GET", "/api/v1/models/connections"),
+        ("GET", "/api/v1/models/connections/{name}"),
+        ("PUT", "/api/v1/models/connections/{name}"),
+        ("DELETE", "/api/v1/models/connections/{name}"),
+        ("GET", "/api/v1/models/profiles"),
+        ("GET", "/api/v1/models/profiles/{name}"),
+        ("PUT", "/api/v1/models/profiles/{name}"),
+        ("DELETE", "/api/v1/models/profiles/{name}"),
+        ("GET", "/api/v1/models/selection"),
+        ("PUT", "/api/v1/models/selection"),
+        ("DELETE", "/api/v1/models/selection"),
+        ("POST", "/api/v1/models/test"),
+        ("GET", "/api/v1/docs"),
+        ("POST", "/api/v1/docs"),
+        ("GET", "/api/v1/docs/{doc_id}"),
+        ("PUT", "/api/v1/docs/{doc_id}"),
+        ("DELETE", "/api/v1/docs/{doc_id}"),
+        ("POST", "/api/v1/docs/retrieve"),
+        ("GET", "/api/v1/docs/index"),
+        ("POST", "/api/v1/docs/index/reconcile"),
+        ("POST", "/api/v1/docs/generate"),
+        ("POST", "/api/v1/docs/research"),
+        ("GET", "/api/v1/servers/{server_id}/applications"),
+        ("GET", "/api/v1/servers/{server_id}/applications/discoveries"),
+        ("POST", "/api/v1/servers/{server_id}/applications"),
+        ("DELETE", "/api/v1/servers/{server_id}/applications/{application_id}"),
+        ("POST", "/api/v1/servers/{server_id}/applications/plan"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/update"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/remove"),
+        ("GET", "/api/v1/plugins"),
+        ("GET", "/api/v1/plugins/{plugin}/config"),
+        ("PUT", "/api/v1/plugins/{plugin}/config"),
+        ("DELETE", "/api/v1/plugins/{plugin}/config"),
+        ("GET", "/api/v1/plugins/{plugin}/schema"),
+        ("GET", "/api/v1/plugins/{plugin}/bindings"),
+        ("PUT", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("DELETE", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("POST", "/api/v1/plugins/{plugin}/discovery"),
+        ("GET", "/api/v1/skills"),
+        ("GET", "/api/v1/skills/{skill}"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/findings/evaluate"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
+        ("GET", "/api/v1/monitoring/notification-policy"),
+        ("GET", "/api/v1/servers/{server_id}/memory/status"),
+        ("POST", "/api/v1/servers/{server_id}/memory/recall"),
+        ("POST", "/api/v1/servers/{server_id}/memory/retain"),
+        ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
+        ("GET", "/api/v1/servers/{server_id}/memory/export"),
+        ("POST", "/api/v1/servers/{server_id}/memory/delete"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
     }
     mutating = {route.path for route in api_routes if route.methods - {"GET", "HEAD"}}
     assert mutating == {
@@ -333,6 +408,40 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/approvals/{approval_id}/decision",
         "/api/v1/grants",
         "/api/v1/password-challenges",
+        "/api/v1/jobs/runs",
+        "/api/v1/jobs/runs/{run_id}/cancel",
+        "/api/v1/schedules",
+        "/api/v1/schedules/{schedule_id}",
+        "/api/v1/chat/messages",
+        "/api/v1/chat/runs/{run_id}/cancel",
+        "/api/v1/models/connections/{name}",
+        "/api/v1/models/profiles/{name}",
+        "/api/v1/models/selection",
+        "/api/v1/models/test",
+        "/api/v1/docs",
+        "/api/v1/docs/{doc_id}",
+        "/api/v1/docs/retrieve",
+        "/api/v1/docs/index/reconcile",
+        "/api/v1/docs/generate",
+        "/api/v1/docs/research",
+        "/api/v1/servers/{server_id}/applications",
+        "/api/v1/servers/{server_id}/applications/{application_id}",
+        "/api/v1/servers/{server_id}/applications/plan",
+        "/api/v1/servers/{server_id}/applications/{application_id}/install",
+        "/api/v1/servers/{server_id}/applications/{application_id}/update",
+        "/api/v1/servers/{server_id}/applications/{application_id}/remove",
+        "/api/v1/plugins/{plugin}/config",
+        "/api/v1/plugins/{plugin}/bindings/{server_id}",
+        "/api/v1/plugins/{plugin}/discovery",
+        "/api/v1/monitoring/servers/{server_id}/findings/evaluate",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
+        "/api/v1/servers/{server_id}/memory/recall",
+        "/api/v1/servers/{server_id}/memory/retain",
+        "/api/v1/servers/{server_id}/memory/reflect",
+        "/api/v1/servers/{server_id}/memory/delete",
+        "/api/v1/servers/{server_id}/models/local/preview",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     assert "/docs" not in {route.path for route in api_routes}
     assert "/openapi.json" not in {route.path for route in api_routes}
@@ -340,6 +449,8 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
 
 def test_openapi_declares_the_frozen_auth_contract() -> None:
     schema = create_app(env={}).openapi()
+    # The whole frozen surface (mirrors the route pins); the auth-owned
+    # response assertions below are unchanged.
     assert set(schema["paths"]) == {
         "/api/v1/health",
         "/api/v1/health/ready",
@@ -347,20 +458,70 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/auth/login",
         "/api/v1/auth/logout",
         "/api/v1/auth/csrf",
-        # (02-profile-api remediation: the path pin expanded by the frozen
-        # canonical-profile routes; auth assertions below are unchanged.)
         "/api/v1/servers",
         "/api/v1/servers/{server_id}",
-        # (03-approval-api remediation: the pin expanded by the frozen
-        # approval preview/decision routes; auth assertions are unchanged.)
         "/api/v1/approvals/{approval_id}",
         "/api/v1/approvals/{approval_id}/decision",
-        # (03-grants-api remediation: the path pin expanded by the frozen
-        # grant-configuration read/edit routes; auth assertions unchanged.)
         "/api/v1/grants",
-        # (04-password-api remediation: the path pin expanded by the frozen
-        # submit-only challenge route; auth assertions unchanged.)
         "/api/v1/password-challenges",
+        "/api/v1/jobs/runs",
+        "/api/v1/jobs/runs/{run_id}",
+        "/api/v1/jobs/runs/{run_id}/cancel",
+        "/api/v1/jobs/runs/{run_id}/events",
+        "/api/v1/schedules",
+        "/api/v1/schedules/{schedule_id}",
+        "/api/v1/schedules/{schedule_id}/fires",
+        "/api/v1/chat/messages",
+        "/api/v1/chat/runs",
+        "/api/v1/chat/runs/{run_id}",
+        "/api/v1/chat/runs/{run_id}/cancel",
+        "/api/v1/chat/runs/{run_id}/events",
+        "/api/v1/models/connections",
+        "/api/v1/models/connections/{name}",
+        "/api/v1/models/profiles",
+        "/api/v1/models/profiles/{name}",
+        "/api/v1/models/selection",
+        "/api/v1/models/test",
+        "/api/v1/docs",
+        "/api/v1/docs/{doc_id}",
+        "/api/v1/docs/retrieve",
+        "/api/v1/docs/index",
+        "/api/v1/docs/index/reconcile",
+        "/api/v1/docs/generate",
+        "/api/v1/docs/research",
+        "/api/v1/servers/{server_id}/applications",
+        "/api/v1/servers/{server_id}/applications/discoveries",
+        "/api/v1/servers/{server_id}/applications/plan",
+        "/api/v1/servers/{server_id}/applications/{application_id}",
+        "/api/v1/servers/{server_id}/applications/{application_id}/install",
+        "/api/v1/servers/{server_id}/applications/{application_id}/update",
+        "/api/v1/servers/{server_id}/applications/{application_id}/remove",
+        "/api/v1/plugins",
+        "/api/v1/plugins/{plugin}/config",
+        "/api/v1/plugins/{plugin}/schema",
+        "/api/v1/plugins/{plugin}/bindings",
+        "/api/v1/plugins/{plugin}/bindings/{server_id}",
+        "/api/v1/plugins/{plugin}/discovery",
+        "/api/v1/skills",
+        "/api/v1/skills/{skill}",
+        "/api/v1/monitoring/servers/{server_id}/observations",
+        "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}",
+        "/api/v1/monitoring/servers/{server_id}/findings",
+        "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}",
+        "/api/v1/monitoring/servers/{server_id}/findings/evaluate",
+        "/api/v1/monitoring/servers/{server_id}/notifications",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
+        "/api/v1/monitoring/notification-policy",
+        "/api/v1/servers/{server_id}/memory/status",
+        "/api/v1/servers/{server_id}/memory/recall",
+        "/api/v1/servers/{server_id}/memory/retain",
+        "/api/v1/servers/{server_id}/memory/reflect",
+        "/api/v1/servers/{server_id}/memory/export",
+        "/api/v1/servers/{server_id}/memory/delete",
+        "/api/v1/servers/{server_id}/models/local/preview",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     login = schema["paths"]["/api/v1/auth/login"]["post"]
     assert {"204", "401", "403", "422", "429"} == set(login["responses"])
