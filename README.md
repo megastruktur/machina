@@ -1,138 +1,227 @@
-# MAI — AI Administration Control Panel
+# MAI — Self-Hosted AI Administration Control Panel
 
-MAI is a self-hosted, AI-powered administration control panel that understands
-the servers it manages, installs and maintains applications, investigates
-problems, and keeps authoritative operational documentation. It combines a
-windowed desktop-style web workspace with a trusted, delegated administrator
-that performs real operations over SSH under configured policy: approve where
-required, verify outcomes, document and remember.
+MAI is a self-hosted administration control panel for Linux servers. It combines a desktop-style windowed web workspace with an approval-gated AI administrator that inspects hosts over OpenSSH, manages Docker Compose applications, investigates incidents, tracks health and security posture, and maintains living operational documentation.
 
-Core workflow: **Observe → Understand → Plan → Execute under configured policy
-→ Verify → Document and remember.**
+Every action follows an explicit loop:
+**Observe → Understand → Plan → Execute under policy → Verify → Document and remember.**
 
-## Status (read before deploying)
+---
 
-This is the integrated v1 tree of the MAI campaign (phases P00–P12). What is
-claimed here is what the tree actually tests:
+## Key Capabilities
 
-- Durable job engine, SSH supervision, approvals/grants/policy, knowledge
-  retrieval, monitoring collection, backup/restore and uninstall are covered
-  by per-slice producer tests under `backend/tests/` and end-to-end journeys
-  in `tests/runtime/test_journeys.py`
-  (see `docs/operations/acceptance.md` for the journey → outcome map).
-- Every referenced CLI command/flag, HTTP endpoint, Compose profile, catalogue
-  recipe and script name in the documentation is verified against the real
-  tree by `tests/docs/test_docs_consistency.py`.
+- **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Plugin Forms, Overview Dashboard, and Memory & Local Models.
+- **Supervised SSH Execution & Policy Gates:** Key-only OpenSSH supervision with pinned host-key fingerprints, explicit capability grants (`none`, `narrow`, `broad`), one-use approval tokens for mutating operations, and secret-redacted command receipts.
+- **Durable Job Engine & Scheduling:** PostgreSQL-backed (`dbos`) workflows with lease fencing, crash recovery without blind re-execution of dangerous host steps, and cron/interval scheduling.
+- **Application Lifecycle Management:** Discover running services, adopt existing stacks, or install/update/remove curated digest-pinned recipes (`example-http.yaml`, `example-stateful.yaml`, `local-inference.yaml`, `odysseus.yaml`) with automatic health-gate rollback.
+- **Knowledge, Retrieval & Optional Long-Term Memory:** Markdown document store with `pgvector` + full-text hybrid search, optional SearXNG web search (`--profile search`), and optional Hindsight conversational memory (`--profile memory`).
+- **Monitoring, Security Posture & Notifications:** Read-only collectors for system resources, network listeners, processes, cron/systemd timers, SSH/firewall/privilege posture, and package/image updates, feeding a deduplicated findings & notification inbox.
+- **Plugins, MCP & Skills:** Extend capabilities via Python entry-point plugins (`mai.capabilities`), stdio or streamable-HTTP Model Context Protocol (MCP) servers, and portable skill packages (`docs/plugins/quickstart.md`).
+- **Whole-Instance Backup, Restore & Clean Uninstall:** Checksum-verified backups of PostgreSQL state and canonical files (`scripts/backup-restore.sh`), plus consent-gated host deprovisioning (`scripts/uninstall-host.sh`).
 
-Explicit limitations of this release (do not assume otherwise):
+---
 
-- **No published ports.** `compose.yaml` defines no `ports:` — `mai-api`
-  (8000) and `mai-web` (3000) listen on the Compose-internal `mai` network
-  only. Browser access requires an **operator-supplied TLS reverse proxy**
-  attached to that network (see `docs/operations/quickstart.md`). No bundled
-  proxy service ships in this release.
-- **Single admin, single controller.** One administrator session model, one
-  controller host per stack; LAN/Tailscale exposure only — public-internet
-  exposure is out of scope.
-- **Monitoring is collection, not armed alerting.** Collectors, findings and
-  the notification inbox exist and are tested; no paging/messenger delivery
-  is wired in v1.
-- **Linux only.** Controller and managed targets are Linux over OpenSSH.
-  Windows targets, fleets and messenger integrations are non-goals of v1.
+## Requirements
 
-## Supported platforms (tested set)
-
-| Role | Requirement |
+| Component | Requirement |
 |---|---|
-| Controller host | Linux x86_64; Docker Engine + Docker Compose v2; `uv` on PATH; OpenSSH client; git |
-| Backend runtime | Python ≥ 3.14 (installed into `backend/.venv` by `uv sync --frozen`; `backend/uv.lock` is authoritative) |
-| Managed target | Fresh Linux host with a running OpenSSH server; root access for the installer; `ufw` or `firewalld` used when present and active |
-| Browser | Current desktop Chrome/Firefox (desktop-first; mobile/touch parity deferred per the windowed-workspace contract) |
+| **Controller / Target Host** | Linux x86_64 with OpenSSH server, `git`, and root access (`sudo`) for initial host provisioning |
+| **Containers** | Docker Engine + Docker Compose v2 (`docker compose version`) |
+| **Python Toolchain** | `uv` on `PATH` (manages Python ≥ 3.14 and locked dependencies in `backend/uv.lock`) |
+| **Firewall (Optional)** | `ufw` or `firewalld` (when active, the installer adds a single rule scoped to `--controller-address`) |
+| **Browser Access** | Desktop Chrome or Firefox via an operator-supplied TLS reverse proxy on LAN or Tailscale |
 
-Exact component versions captured at integration are recorded in
-`mai_evidence/12-end-to-end/01-commands.txt` (engine `dbos==3.2.0`,
-Postgres fixture `pgvector/pgvector:0.8.1-pg18`, model stack
-`pydantic-ai-slim[openai]` over `openai 3.x`).
+---
 
-## Repository map
+## Quick Deployment (Single-Host Setup)
 
-| Path | Contents |
-|---|---|
-| `backend/` | Controller backend package (`mai`): API, auth, capabilities, execution, jobs, knowledge, memory, monitoring, plugins, profiles |
-| `frontend/` | SvelteKit windowed workspace (adapter-node SSR, container `mai-web`) |
-| `compose.yaml` | Core topology: `postgres`, `mai-api`, `mai-web` (default set) + profile-gated `mai-worker`, `searxng`+`valkey`, `hindsight` |
-| `catalogue/` | Application recipes (`example-http.yaml`, `example-stateful.yaml`, `local-inference.yaml`, `odysseus.yaml`) |
-| `scripts/` | Operator scripts: `install-host.sh`, `backup-restore.sh`, `uninstall-host.sh`, `runtime_check.py` |
-| `deploy/` | Service-specific deployment notes (`deploy/hindsight/README.md`) and settings |
-| `docs/architecture/` | Frozen contracts and ADRs (index below) |
-| `docs/operations/` | Operator runbooks (index below) |
-| `docs/plugins/` | Plugin contributor/operator quickstart |
-| `tests/` | Cross-cutting suites: `tests/runtime/` (compose/bootstrap/restore/uninstall/journeys), `tests/docs/` (documentation consistency) |
-| `experiments/` | P00 probes (`durable_job_probe.py`, `ssh_supervision_probe.py`) — regression gates, not operator tooling |
-| `mai_evidence/` | Campaign evidence root (outside disposable worktrees) |
+For the complete runbook and troubleshooting table, see [`docs/operations/quickstart.md`](docs/operations/quickstart.md).
 
-## Architecture & contract index
-
-The frozen cross-module contracts are `docs/architecture/contracts.md`
-(sections C01–C11). Specialized decisions and their owners:
-
-| Document | Owns |
-|---|---|
-| `docs/architecture/contracts.md` | C01 identities/API envelope · C02 canonical files/projections · C03 capabilities/credentials/policy · C04 SSH execution · C05 runs/schedules/locks · C06 agent/context/models · C07 documents/retrieval/memory · C08 UI/API/auth · C09 catalogue/adoption · C10 evidence/testing · C11 windowed UI summary; services ownership map |
-| `docs/architecture/auth-and-origin.md` | Single-admin auth, Argon2id bootstrap, session/CSRF/origin model, TLS proxy and exposure rules |
-| `docs/architecture/host-supervision.md` | SSH execution, wrapper-owned supervision, verified outcomes (`succeeded`/`failed`/`unknown`) |
-| `docs/architecture/job-engine.md` | Durable DBOS-backed engine, guard rules, recovery windows |
-| `docs/architecture/knowledge-packaging.md` | Documents/chunking/pgvector retrieval, SearXNG search, Hindsight memory — with per-dependency license verification |
-| `docs/architecture/runtime-environment.md` | Disposable fixture discipline (`mai-fxt-*` namespaces, cleanup proofs) |
-| `docs/architecture/runtime-scenarios.md` | Scenario registry: producer, gate, fixtures, evidence per scenario |
-| `docs/architecture/windowed-workspace.md` | Reusable OS-style windowed UI contract (drag/resize/focus/restore) |
-
-## Operations docs
-
-| Document | Covers |
-|---|---|
-| `docs/operations/quickstart.md` | Fresh-operator install: plan → apply → first authenticated browser session |
-| `docs/operations/recovery.md` | Backup/verify/restore (`scripts/backup-restore.sh`), consistency boundary, index rebuild |
-| `docs/operations/uninstall.md` | Key rotation and full uninstall (`scripts/uninstall-host.sh`), exit codes, retention semantics |
-| `docs/operations/acceptance.md` | End-to-end journey coverage and fault matrix (what is proven, on which fixtures) |
-
-## Operator surface (summary)
-
-CLI (`python -m mai.cli`, via `backend/.venv` or `uv run --frozen`):
-`bootstrap`, `doctor`, `status`, `backup`, `restore`, `uninstall`,
-`admin write`, `admin delete` — all require an explicit `--data-root`;
-output is value-free; exit `0` success / `1` structured rejection / `2`
-usage-IO. See `docs/operations/quickstart.md` for the worked flow.
-
-Compose profiles: the default start set is `postgres` + `mai-api` + `mai-web`;
-`--profile worker` adds the durable engine, `--profile search` the SearXNG +
-Valkey pair, `--profile memory` the Hindsight service.
-
-## Plugins
-
-Two plugin kinds and one skill format are documented in
-`docs/plugins/quickstart.md`: native Python capability plugins (entry-point
-group `mai.capabilities`), external MCP servers (stdio/streamable-HTTP
-connections with explicit per-server grant bindings), and portable skill
-packages under `<data-root>/shared/skills/`. Registration is never
-authorization; there is no in-app installer in v1.
-
-## Development
+### 1. Clone the repository & generate a controller SSH key
 
 ```bash
-cd backend && uv sync --frozen            # locked venv (uv.lock)
-.venv/bin/python -m pytest ../tests/docs/test_docs_consistency.py -v
-ruff format <changed files> && ruff check <changed files>
+git clone git@github.com:megastruktur/machina.git
+cd machina
+
+ssh-keygen -t ed25519 -f ~/.ssh/mai_controller -N "" -C mai-controller
+sudo cp ~/.ssh/mai_controller.pub /root/mai_controller.pub
 ```
 
-`scripts/runtime_check.py list|run SCENARIO` runs the registered runtime
-scenario harness (evidence envelopes under an explicit `--evidence-dir`).
-Runtime fixtures use disposable Docker namespaces (`mai-fxt-…`) and print a
-cleanup proof; a stray leftover fails the run.
+### 2. Preview the installation plan (read-only)
+
+Generate a permanent server UUID and run `scripts/install-host.sh` with `--print-plan` to inspect every account, sudoers file, firewall rule, and container profile before anything is touched:
+
+```bash
+SERVER_ID="$(uuidgen)"
+echo "Server ID: $SERVER_ID"
+
+sudo bash scripts/install-host.sh \
+  --server-id "$SERVER_ID" \
+  --data-root /var/lib/mai \
+  --public-key /root/mai_controller.pub \
+  --grant-scope narrow \
+  --controller-address 192.168.1.10/32 \
+  --stack-profiles core,worker \
+  --print-plan
+```
+
+- `--controller-address` must be your admin workstation/controller IP or subnet (`/8` or narrower; blanket rules like `0.0.0.0/0` are refused).
+- `--grant-scope` chooses sudo privileges for the `mai` service account: `none` (no sudo), `narrow` (`systemctl start/stop/restart/status docker.service`), or `broad` (`NOPASSWD: ALL`).
+- `--stack-profiles` selects which Compose profiles to start: `core` (`postgres`, `mai-api`, `mai-web`), `worker` (`mai-worker` durable job runner), `search` (`searxng` + `valkey`), `memory` (`hindsight`).
+
+### 3. Apply the installation
+
+Re-run with `--yes` (or answer the interactive prompt) to provision the `mai` SSH user, scoped sudoers/firewall rules, mode-`0600` `.env` secrets, Docker Compose services, and canonical server profile under `/var/lib/mai`:
+
+```bash
+sudo bash scripts/install-host.sh \
+  --server-id "$SERVER_ID" \
+  --data-root /var/lib/mai \
+  --public-key /root/mai_controller.pub \
+  --grant-scope narrow \
+  --controller-address 192.168.1.10/32 \
+  --stack-profiles core,worker \
+  --yes
+```
+
+### 4. Verify stack health
+
+```bash
+cd backend && uv sync --frozen
+.venv/bin/python -m mai.cli status --data-root /var/lib/mai
+.venv/bin/python -m mai.cli doctor --data-root /var/lib/mai --env-file ../.env
+docker compose --env-file ../.env ps
+```
+
+### 5. Attach your TLS reverse proxy
+
+By design, `compose.yaml` publishes **no host ports** (`mai-api:8000` and `mai-web:3000` listen only on the internal `mai` Docker network). Attach your reverse proxy (Caddy, Nginx, Traefik, or Tailscale Serve) to the `mai` network:
+
+- Forward `/api/v1/*` → `http://mai-api:8000`
+- Forward all other paths `/` → `http://mai-web:3000`
+- Configure `MAI_PUBLIC_ORIGINS` (e.g. `https://mai.lan.example`) and `MAI_TRUSTED_PROXIES` on `mai-api` (see [`docs/operations/quickstart.md`](docs/operations/quickstart.md) §6).
+
+### 6. Bootstrap the administrator password (one-shot)
+
+On first boot, MAI starts in setup state. Initialize the single administrator credential via the web UI or `POST /api/v1/auth/bootstrap`:
+
+```bash
+curl -fsS -X POST https://mai.lan.example/api/v1/auth/bootstrap \
+  -H 'Content-Type: application/json' \
+  -d '{"password": "<your-strong-admin-password>"}'
+```
+
+Once created, `POST /api/v1/auth/bootstrap` is permanently locked (`409 Conflict`) and you can sign in at your configured origin.
+
+---
+
+## Day-2 Operations & CLI Reference
+
+All operator commands run through `python -m mai.cli` (or the scripts in `scripts/`) and never print secret values to stdout/stderr:
+
+### Operator CLI (`mai.cli`)
+
+```bash
+# Inspect global or per-server canonical state
+python -m mai.cli status --data-root /var/lib/mai
+python -m mai.cli status --data-root /var/lib/mai --server-id "$SERVER_ID"
+
+# Run integrity and permission diagnostics
+python -m mai.cli doctor --data-root /var/lib/mai --env-file .env
+```
+
+Subcommands: `bootstrap`, `doctor`, `status`, `backup`, `restore`, `uninstall`, `admin write`, `admin delete`.
+
+### Managing Optional Compose Profiles
+
+```bash
+# Start background job & schedule worker
+docker compose --profile worker up -d
+
+# Start SearXNG + Valkey web search stack
+docker compose --profile search up -d
+
+# Start Hindsight conversational memory stack
+docker compose --profile memory up -d
+```
+
+### Backup, Verify & Restore ([`docs/operations/recovery.md`](docs/operations/recovery.md))
+
+```bash
+# Create a checksum-pinned backup bundle (Postgres + canonical data root, zero plaintext secrets)
+bash scripts/backup-restore.sh backup \
+  --data-root /var/lib/mai \
+  --env-file .env \
+  --output /var/backups/mai-backup.tar.gz
+
+# Verify bundle checksums and manifest integrity
+bash scripts/backup-restore.sh verify /var/backups/mai-backup.tar.gz
+
+# Restore into a fresh instance
+bash scripts/backup-restore.sh restore /var/backups/mai-backup.tar.gz \
+  --data-root /var/lib/mai
+```
+
+### Key Rotation & Uninstall ([`docs/operations/uninstall.md`](docs/operations/uninstall.md))
+
+```bash
+# Preview teardown plan
+sudo bash scripts/uninstall-host.sh \
+  --data-root /var/lib/mai \
+  --keep-data \
+  --print-plan
+
+# Deprovision MAI-owned host access/containers while preserving /var/lib/mai
+sudo bash scripts/uninstall-host.sh \
+  --data-root /var/lib/mai \
+  --keep-data \
+  --yes
+```
+
+---
+
+## Repository Structure
+
+| Path | Description |
+|---|---|
+| `backend/` | FastAPI + DBOS controller package (`mai`): API routes, auth, capability policy, SSH supervision, durable jobs, knowledge/retrieval, memory, monitoring, notifications, plugins |
+| `frontend/` | SvelteKit windowed desktop workspace (`mai-web`) and Playwright test suites (`frontend/tests/`) |
+| `compose.yaml` | Container topology: `postgres`, `mai-api`, `mai-web` + profile-gated `mai-worker`, `searxng` + `valkey`, `hindsight` |
+| `catalogue/` | Curated application & model recipes (`example-http.yaml`, `example-stateful.yaml`, `local-inference.yaml`, `odysseus.yaml`) |
+| `scripts/` | Operator tooling: `install-host.sh`, `backup-restore.sh`, `uninstall-host.sh`, `runtime_check.py` |
+| `deploy/` | Service deployment notes (`deploy/hindsight/README.md`) and SearXNG configuration (`deploy/searxng/settings.yml`) |
+| `docs/operations/` | Operator runbooks: [`quickstart.md`](docs/operations/quickstart.md), [`recovery.md`](docs/operations/recovery.md), [`uninstall.md`](docs/operations/uninstall.md), [`acceptance.md`](docs/operations/acceptance.md) |
+| `docs/plugins/` | Plugin, MCP & skill author guide: [`quickstart.md`](docs/plugins/quickstart.md) |
+| `docs/architecture/` | Architecture contracts (`docs/architecture/contracts.md` C01–C11) and subsystem ADRs |
+| `tests/` | Cross-cutting runtime (`tests/runtime/`) and documentation-consistency (`tests/docs/`) suites |
+
+---
+
+## Development & Verification
+
+```bash
+# Backend unit & integration tests
+cd backend && uv sync --frozen
+.venv/bin/python -m pytest ../tests/docs/test_docs_consistency.py -v
+
+# Frontend typecheck & Playwright component/workspace tests
+cd ../frontend
+pnpm run check
+pnpm exec playwright test
+```
+
+`tests/docs/test_docs_consistency.py` automatically verifies that every CLI subcommand/flag, script flag, Compose profile, recipe, repo path, relative link, and `/api/v1/` endpoint in `README.md`, `docs/operations/`, and `docs/plugins/` matches the live codebase.
+
+---
+
+## Scope & v1 Limitations
+
+- **No bundled TLS proxy or published ports:** `compose.yaml` binds internal networks only; expose the UI over LAN or Tailscale behind your own TLS proxy.
+- **Single administrator, Linux-only:** Designed for one administrator managing Linux hosts over OpenSSH (Windows/macOS targets and multi-tenant RBAC are out of scope for v1).
+- **In-app notifications:** Monitoring collectors and the notification inbox are active; external pager/messenger webhooks are not armed by default.
+
+---
 
 ## License
 
-MAI is MIT-licensed — see `LICENSE` (third-party services retain their own
-licenses, also summarized there). Credential material never appears in
-documentation, logs or CLI output by contract (C03 rule 6); reports must keep
-it that way.
+MIT License — see [`LICENSE`](LICENSE).
+Third-party container images (`pgvector`, `searxng`, `valkey`, `hindsight`, `ollama`) retain their respective upstream licenses.
