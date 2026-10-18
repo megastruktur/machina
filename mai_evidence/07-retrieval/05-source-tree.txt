@@ -1,0 +1,68 @@
+# mai-07-retrieval — source/tree/build (2026-10-16)
+
+## Tree
+
+- Worktree: `/home/megastruktur/orca/workspaces/machina/mai-07-retrieval`
+- Branch: `megastruktur/mai-07-retrieval`
+- Base HEAD: `1ab545c969ae7eee444c538043c6b70f9ad7f8b7`
+  ("feat(p07): integrate reviewed slice 07-chunk-index (squash)")
+- Slice (allowlist-complete, both new files, no tracked file modified):
+
+```
+backend/src/mai/knowledge/retrieve.py   956 lines  (new)
+backend/tests/test_retrieval.py        1160 lines  (new)
+```
+
+- `git status --short` at freeze:
+
+```
+?? BRIEF.md                              (coordinator-owned, untracked, not committed)
+?? backend/src/mai/knowledge/retrieve.py
+?? backend/tests/test_retrieval.py
+?? mai_evidence/07-retrieval/            (this evidence copy)
+```
+
+- `uv.lock`: untouched (`git diff --stat HEAD -- uv.lock` empty); no
+  dependency added or changed. The slice imports only already-pinned
+  packages (`sqlalchemy`, `pydantic_ai`-free; the embedder seam comes
+  from `mai.knowledge.index`; `openai`/`httpx2` are used lazily inside
+  the existing `GatewayEmbedder`, as in 07-chunk-index).
+
+## Build
+
+```
+$ uv --version
+uv 0.11.26 (x86_64-unknown-linux-gnu)
+$ uv run python --version
+Python 3.14.6
+$ uv run pytest --version
+pytest 9.1.1
+```
+
+`uv run` builds the `mai` workspace package cleanly (editable install of
+`backend/src`); the module import smoke and all suites below ran against
+that build:
+
+```
+$ uv run python -c "from mai.knowledge.retrieve import descriptor, CAPABILITY_ID; \
+    d = descriptor(); print(d.identifier, d.version, d.effect_class)"
+docs.retrieve 1.0.0 read
+```
+
+## Verification summary (exact commands in 01-commands.txt)
+
+| Suite | Result |
+|---|---|
+| `tests/test_retrieval.py` (focused) | 46 passed |
+| `tests/test_index.py` + `tests/test_documents.py` + `tests/test_knowledge_schema.py` + `tests/test_knowledge_dependencies.py` | 148 passed |
+| `tests/test_agent_tools.py` + `tests/test_registry.py` (+ `tests/test_dispatch.py`) | 147 passed (+ 5 pre-existing dispatch fixture errors, reproduced on clean base — out of scope) |
+
+## Fixture identity
+
+- DB: `pgvector/pgvector:pg16` container `mai-fxt-07-retrieval`,
+  127.0.0.1:55434, database `mai_test` (migrated 0001→0005 in-test);
+  destroyed after use (04-cleanup-proof.txt).
+- Embedding seam: deterministic hashed unit vectors (1536 dims), local
+  loopback fixture; wrong-dim and failure modes injected as fakes.
+- All fixture UUIDs are fixed TEST-NET-style strings; fixture origins
+  `test-fixture`/`smoke-*`; no secret values anywhere.

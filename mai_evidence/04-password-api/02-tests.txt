@@ -1,0 +1,50 @@
+# 02 — test/check runs (verbatim tails), disposable fixture Postgres on 127.0.0.1:35432
+
+## Environment per run
+MAI_TEST_DATABASE_URL=postgresql://postgres:fixture@127.0.0.1:35432/postgres
+(docker: `docker run -d --rm --name mai-fxt-p04-fix-pg -e POSTGRES_PASSWORD=fixture
+-p 127.0.0.1:35432:5432 postgres:16-alpine`; suite drops + re-migrates from zero
+through the real Alembic chain per session — `migrated_url` fixture)
+
+## Focused suite (fix round, green)
+$ cd backend && MAI_TEST_DATABASE_URL=... uv run pytest tests/test_password_challenge_http.py -q
+....................                                                    [100%]
+21 passed in 4.57s
+
+## Focused suite after widening the pre-consume catch (final, 5 new controls)
+$ ... uv run pytest tests/test_password_challenge_http.py -q
+.....................                                                    [100%]
+21 passed in 4.82s
+
+## App-consuming seams (all HTTP surfaces over the real app/lifespan)
+$ ... uv run pytest tests/test_password_challenge_http.py tests/test_auth_http.py \
+      tests/test_servers_http.py tests/test_grants_http.py tests/test_approval_http.py \
+      tests/test_health.py -q
+................................................                         [100%]
+120 passed in 23.39s
+
+## Producer seams of the unchanged modules the fix calls into
+$ ... uv run pytest tests/test_env_resolver.py tests/test_ssh.py tests/test_password_input.py -q
+..................................sssssssss                              [100%]
+106 passed, 9 skipped in 10.36s
+(skips = REAL Arch sshd live-transport boundary claims needing the fixture
+container; producer modules untouched by this fix)
+
+## Lint (type discipline: no mypy in this programme's backend toolchain)
+$ cd backend && uv run ruff check src/mai/api tests/test_password_challenge_http.py
+All checks passed!
+
+## Failing-state observations during the fix (kept, per evidence honesty)
+- First run after wiring MAI_ENV_FILE: 12 failed with 503 unavailable —
+  cause: fixture .env was mode 0644; EnvResolver refuses sources readable
+  beyond owner (PERMISSIONS_TOO_OPEN). Fixture now chmod 0600 (the resolver's
+  fail-closed construction is itself confirmed by this incident).
+- Second run: 11 failed with 500 internal_error — cause: `_transport_paths`
+  called `ProfileFileStore.root` as a method (`root` is a @property returning
+  Path); TypeError on every submission reaching resolution. Fixed by using
+  the property.
+- Reviewer-round fix during evidence: `resolve_identity_key` raises
+  SshConnectError(INVALID_CONFIGURATION) for a stale reference (resolved path
+  not an existing regular file); that escape was unmapped in `_transport_paths`
+  (500). Now caught alongside EnvFileError → same value-free 422, with the new
+  `test_stale_identity_key_refuses_before_consume` control.

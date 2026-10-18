@@ -1,0 +1,37 @@
+# mai-07-chunk-index — source/tree/build identity (pre-commit, 2026-10-16)
+
+## Worktree / branch
+
+path: /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index
+branch: megastruktur/mai-07-chunk-index
+base HEAD: 6cbd391 (feat(p07): integrate reviewed slice 07-vector-schema)
+
+## Diff vs base (allowlisted slice only)
+```
+?? BRIEF.md
+?? backend/src/mai/knowledge/index.py
+?? backend/tests/test_index.py
+```
+
+## Lock/manifest diff (must be empty)
+```
+(empty)
+```
+
+## Toolchain / build
+```
+uv: uv 0.11.26 (x86_64-unknown-linux-gnu)
+python: Python 3.14.6
+pytest: pytest 9.1.1
+```
+
+## Locked knowledge-lane versions the slice builds on
+```
+openai==3.31.0
+httpx2==2.13.1
+pgvector==0.5.1
+sqlalchemy==2.1.4
+alembic==1.20.0
+dbos==3.2.0
+pydantic-ai-slim==2.56.0
+```

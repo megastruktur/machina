@@ -1,0 +1,100 @@
+# mai-07-retrieval — focused tests (2026-10-16)
+
+Command:
+
+```
+$ MAI_TEST_DATABASE_URL=postgresql://mai:fxtretr@127.0.0.1:55434/mai_test \
+    uv run pytest tests/test_retrieval.py -q
+..............................................                           [100%]
+46 passed in 3.78s
+```
+
+46 tests = 29 test functions, one parametrized with 17 rejection cases.
+Storage-boundary claims run against the real disposable pgvector fixture
+(PostgreSQL 16.14, vector 0.8.5) migrated through the real Alembic chain
+`0001→0005`, indexed through the real `07-chunk-index` `ScopeIndexer`
+from a real `DocumentStore` root; embedding-seam claims use injected
+deterministic fakes (offline discipline); capability/tool claims run
+against the real registry, dispatcher, policy and bridge producers.
+
+## Acceptance mapping
+
+### AC1 — storage query enforces server filter + explicit shared scope; citations/freshness returned
+
+- `test_server_scope_returns_only_own_chunks` — server-A query returns
+  only server-A document ids; foreign terms absent.
+- `test_cross_server_result_sets_are_disjoint` — same document identity
+  indexed for two fixture servers with conflicting content: citation
+  tuples (doc_id, revision, sha256, ord) disjoint in both directions.
+- `test_shared_scope_answers_only_shared_namespace` — explicit shared
+  scope returns only the shared doc; server scope never returns it.
+- `test_shared_namespace_rows_hidden_from_server_scope` — `server_id IS
+  NULL` rows can never satisfy a server scope predicate (k-NN caveat in
+  docstring; the control is the shared doc never appearing).
+- `test_citations_resolve_to_source_revision` — citation tuple + rendered
+  `docs:<doc_id>#r<revision>:<ord>` + freshness (revision, sha256,
+  observed_at, verification) match the stored source exactly.
+- `test_citations_follow_source_update` — update + re-index: results
+  expose only the new revision/hash; exactly one live revision row.
+- `test_delete_removes_stale_results` — delete + re-index: stale chunks
+  gone, query returns empty ok.
+
+### AC2 — bounded relevant excerpts; unavailable index ≠ zero results
+
+- `test_excerpt_budget_truncates_but_citation_survives` — 200-char budget
+  cuts a ~6 KB chunk; `truncated` true and the full citation tuple intact.
+- `test_limit_bounds_excerpt_count` — limit=2 over a 3-doc corpus.
+- `test_namespace_filter_bounds_collections` — runbooks-only filter.
+- `test_zero_results_is_ok_not_unavailable` — empty scope: status ok,
+  code null, error_type null; the embedding seam really saw the query.
+- `test_unavailable_index_is_distinct_from_zero` — schema-less database:
+  status unavailable, code `index_unavailable`, value-free error type,
+  no `detail` key (no SQL text leak).
+- `test_embedding_failure_is_unavailable_not_zero` /
+  `test_unstructured_embedder_failure_is_classified` /
+  `test_dimension_mismatch_refused_not_compared` — embedding seam
+  failures are distinct unavailable codes (value-free; the unstructured
+  failure's message text is asserted absent from the JSON).
+
+## Hybrid ranking (both signals contribute)
+
+- `test_hybrid_combines_vector_and_fts_signals` — with dimension
+  overrides: dual-signal chunk holds strict vector rank 1 and an FTS
+  rank; pure-vector chunk has `fts_rank is None`; pure-FTS chunk has an
+  FTS rank; dual and pure-FTS both outscore pure-vector (RRF).
+- `test_vector_signal_alone_can_rank` — without any FTS term the vector
+  channel still surfaces its chunk at rank 1.
+
+## Registered capability / tool integration (real producers)
+
+- `test_dispatcher_executes_granted_scope_query` — real dispatcher:
+  allowed, effect executed, executor_ok, read effect consumes no
+  approval, output JSON scoped to the context server.
+- `test_dispatcher_denies_server_outside_grant_scope` — grants scoped to
+  server A deny a server-B context; executor never invoked.
+- `test_policy_deny_list_blocks_retrieval` — policy deny list denies;
+  executor never invoked.
+- `test_granted_capability_requires_allowed_listing` — the bridge
+  exposes the tool only when the context allows the capability.
+- `test_bridge_schema_gate_denies_smuggled_target_field` — a payload
+  naming another server (`server_id` field) is denied by the real bridge
+  schema gate (`payload_schema_mismatch`) before any dispatch; executor
+  never invoked, effect not_attempted.
+- `test_capability_executor_validates_direct_calls` — direct
+  CapabilityCall with an empty query raises the structured
+  `RetrieveError` (defense in depth behind the bridge gate).
+
+## Payload validation (17 parametrized rejections, offline)
+
+Empty/whitespace/overlong/NUL query; near-miss scope values ("shared ",
+"SHARED", "other-server"); out-of-vocabulary namespace; limit 0 /
+MAX_LIMIT+1 / bool / string; excerpt budget below floor / above cap;
+smuggled `server_id` and `app_id` fields; unknown keys; non-mapping
+payload. All reject with `RetrieveErrorCode.INVALID_PAYLOAD`.
+
+## First-run failures
+
+Recorded in `01-commands.txt` (async-helper misuse, malformed fixture
+UUID, NULL-parameter type ambiguity in the scope predicate, an
+over-strict hybrid assertion, a wrong ToolResult key). All were fixed by
+changing the slice/tests, not by weakening assertions.

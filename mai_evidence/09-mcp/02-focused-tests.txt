@@ -1,0 +1,109 @@
+$ cd backend && timeout 120 uv run pytest tests/test_mcp.py -k "endless_cursor or listing_deadline" -v
+                          # RED FIRST: tests added, fix absent at base c3ecffd (rc=124)
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- .venv/bin/python
+rootdir: /home/megastruktur/orca/workspaces/machina/mai-09-mcp/backend
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 48 items / 46 deselected / 2 selected
+
+tests/test_mcp.py::TestFailureBoundedness::test_endless_cursor_listing_is_bounded RED_RC=124
+
+  Red proves the reviewer finding at base c3ecffd: the endless-cursor fixture
+  (empty pages + perpetual nextCursor) hangs discovery forever — the run never
+  returns and is killed by `timeout` (exit 124 at 120s). Empty pages never
+  reach the max_tools tool-count bound, so the pre-fix `while True` cursor
+  loop has no termination. The deadline test is blocked behind the hang and
+  never starts. Fix applied afterwards (no stash needed: red captured, then
+  src edited, then green).
+
+$ cd backend && uv run pytest tests/test_mcp.py -v -k "endless_cursor or listing_deadline"
+                          # GREEN after fix (rc=0)
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- .venv/bin/python
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 48 items / 46 deselected / 2 selected
+
+tests/test_mcp.py::TestFailureBoundedness::test_endless_cursor_listing_is_bounded PASSED [ 50%]
+tests/test_mcp.py::TestFailureBoundedness::test_listing_deadline_is_bounded PASSED [100%]
+
+======================= 2 passed, 46 deselected in 1.65s ========================
+
+$ cd backend && uv run pytest tests/test_mcp.py -v       # GREEN full focused suite (rc=0)
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- .venv/bin/python
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 48 items
+
+tests/test_mcp.py::TestConfigAndWiring::test_store_round_trip_with_declared_schema PASSED [  2%]
+tests/test_mcp.py::TestConfigAndWiring::test_store_rejects_credential_shaped_config_keys PASSED [  4%]
+tests/test_mcp.py::TestConfigAndWiring::test_disabled_server_refuses_to_compose PASSED [  6%]
+tests/test_mcp.py::TestConfigAndWiring::test_unknown_config_field_rejected PASSED [  8%]
+tests/test_mcp.py::TestConfigAndWiring::test_transport_vocabulary_enforced PASSED [ 10%]
+tests/test_mcp.py::TestConfigAndWiring::test_stdio_requires_command PASSED [ 12%]
+tests/test_mcp.py::TestConfigAndWiring::test_http_requires_url PASSED    [ 14%]
+tests/test_mcp.py::TestConfigAndWiring::test_cross_transport_fields_rejected PASSED [ 16%]
+tests/test_mcp.py::TestConfigAndWiring::test_http_rejects_credential_refs PASSED [ 18%]
+tests/test_mcp.py::TestConfigAndWiring::test_url_userinfo_rejected PASSED [ 20%]
+tests/test_mcp.py::TestConfigAndWiring::test_non_http_url_rejected PASSED [ 22%]
+tests/test_mcp.py::TestConfigAndWiring::test_timeout_and_limit_bounds PASSED [ 25%]
+tests/test_mcp.py::TestConfigAndWiring::test_wiring_is_constructor_checked PASSED [ 27%]
+tests/test_mcp.py::TestConfigAndWiring::test_discovery_and_executor_state_boundary PASSED [ 29%]
+tests/test_mcp.py::TestConfigAndWiring::test_credential_references_surface_names_only PASSED [ 31%]
+tests/test_mcp.py::TestToolMapping::test_happy_mapping_shape PASSED      [ 33%]
+tests/test_mcp.py::TestToolMapping::test_malformed_mappings_rejected_value_free PASSED [ 35%]
+tests/test_mcp.py::TestToolMapping::test_non_object_schema_rejected_defensively PASSED [ 37%]
+tests/test_mcp.py::TestToolMapping::test_slug_collision_is_deterministic PASSED [ 39%]
+tests/test_mcp.py::TestStdioDiscoveryAndDispatch::test_discover_registers_granted_tool_over_real_stdio PASSED [ 41%]
+tests/test_mcp.py::TestStdioDiscoveryAndDispatch::test_granted_tool_executes_through_real_dispatcher PASSED [ 43%]
+tests/test_mcp.py::TestStdioDiscoveryAndDispatch::test_second_dispatch_reconnects_fresh PASSED [ 45%]
+tests/test_mcp.py::TestStdioDiscoveryAndDispatch::test_real_streamable_http_transport_round_trip PASSED [ 47%]
+tests/test_mcp.py::TestStdioDiscoveryAndDispatch::test_duplicate_registration_across_compositions_aborts_honestly PASSED [ 50%]
+tests/test_mcp.py::TestGrantBoundary::test_ungranted_tool_is_never_registered_nor_executable PASSED [ 52%]
+tests/test_mcp.py::TestGrantBoundary::test_bridge_exposes_only_granted_tool PASSED [ 54%]
+tests/test_mcp.py::TestGrantBoundary::test_ask_mode_prompts_for_mutate_class_tools PASSED [ 56%]
+tests/test_mcp.py::TestGrantBoundary::test_policy_deny_list_wins_over_grant PASSED [ 58%]
+tests/test_mcp.py::TestGrantBoundary::test_stale_grants_are_surfaced_not_registered PASSED [ 60%]
+tests/test_mcp.py::TestFailureBoundedness::test_spawn_failure_is_bounded_at_discovery PASSED [ 62%]
+tests/test_mcp.py::TestFailureBoundedness::test_connect_failure_after_registration_answers_structured PASSED [ 64%]
+tests/test_mcp.py::TestFailureBoundedness::test_initialize_timeout_is_bounded PASSED [ 66%]
+tests/test_mcp.py::TestFailureBoundedness::test_endless_cursor_listing_is_bounded PASSED [ 68%]
+tests/test_mcp.py::TestFailureBoundedness::test_listing_deadline_is_bounded PASSED [ 70%]
+tests/test_mcp.py::TestFailureBoundedness::test_call_timeout_records_unknown_effect PASSED [ 72%]
+tests/test_mcp.py::TestFailureBoundedness::test_reconnect_journey_denied_tool_never_executes PASSED [ 75%]
+tests/test_mcp.py::TestFailureBoundedness::test_unknown_capability_answers_structured_not_bound PASSED [ 77%]
+tests/test_mcp.py::TestCredentialEnvScoping::test_stdio_env_is_base_plus_configured_refs_only PASSED [ 79%]
+tests/test_mcp.py::TestCredentialEnvScoping::test_unresolved_context_ref_fails_closed_pre_spawn PASSED [ 81%]
+tests/test_mcp.py::TestCredentialEnvScoping::test_missing_env_reference_fails_discovery_value_free PASSED [ 83%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_malformed_tools_rejected_and_isolated_over_real_stdio PASSED [ 85%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_prompts_never_become_tools PASSED [ 87%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_tool_descriptions_never_reach_any_surface PASSED [ 89%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_tool_output_is_bounded_data PASSED [ 91%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_injection_style_output_stays_data PASSED [ 93%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_server_sampling_request_is_refused PASSED [ 95%]
+tests/test_mcp.py::TestMalformedToolsAndContent::test_unsupported_schema_keyword_fails_closed_at_call_time PASSED [ 97%]
+tests/test_mcp.py::TestStoreCompositionFragments::test_server_plugins_and_granted_ids_from_store PASSED [100%]
+
+======================= 48 passed, 2 warnings in 15.88s ========================
+
+  (2 warnings: pre-existing SDK DeprecationWarning "Use streamable_http_client
+   instead" emitted by streamablehttp_client teardown in the HTTP round-trip
+   test — present at base, unrelated to this fix.)
+
+$ cd backend && uv run ruff check src/mai/plugins/mcp.py tests/test_mcp.py
+All checks passed!
+
+  Note: ruff at base c3ecffd reports 2 pre-existing F821 (annotation-only
+  `CapabilityDescriptor` referenced in _map_tool/discover without being
+  imported; `from __future__ import annotations` made it latent, so the suite
+  was green). The fix commit adds the missing registry import — ruff clean on
+  the committed tree. No behavioral change.
+
+mypy: not configured for this backend (no mypy dependency in
+backend/pyproject.toml) — not run (same posture as 08-recipe-schema R1).
+
+Commands run from `backend/` in worktree
+/home/megastruktur/orca/workspaces/machina/mai-09-mcp
+(branch megastruktur/mai-09-mcp, base c3ecffd), 2026-10-17 ~13:05–13:25Z.

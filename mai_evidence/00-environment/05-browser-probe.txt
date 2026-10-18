@@ -1,0 +1,19 @@
+# 05 — Browser capability probe (2026-10-12)
+
+System browser binaries: chromium / chromium-browser / google-chrome(-stable) / firefox(-developer-edition)
+all resolve MISSING via `command -v` (see 01 inventory method).
+
+Browser automation capability exists at the omp harness layer instead — verified live:
+
+$ browser.open({ name: "mai-p00-probe", url: "data:text/html,<title>mai-p00-probe</title><h1 id=st>ok</h1>" })
+Opened tab "mai-p00-probe" on headless browser (hidden, shared)
+$ tab.title()      -> "mai-p00-probe"
+$ tab.text("#st")  -> "ok"
+$ tab.evaluate("navigator.userAgent")
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+$ tab.close()
+Released managed tab "mai-p00-probe"
+
+Reading: managed headless Chromium (Chromium 150 engine; the UA string is platform-spoofed) with
+full drive/evaluate/close cycle works. UI-e2e phases do NOT need a system browser install; if a
+phase needs a real headed browser it must say so explicitly and budget for it.

@@ -1,0 +1,13 @@
+# 05 — fixture/resource cleanup proof (2026-10-16)
+
+No containers, databases or long-lived services were used for this fix
+round: all runtime evidence ran against throwaway files under
+/tmp/mai-fxt-07-doc-store-fix (fixture .env / real.md / link.md / good.md /
+blocker plus a data root) and pytest tmp_path dirs.
+
+$ rm -rf /tmp/mai-fxt-07-doc-store-fix
+$ ls /tmp/mai-fxt-07-doc-store-fix
+ls: cannot access '/tmp/mai-fxt-07-doc-store-fix': No such file or directory
+
+Fixture values are synthetic sentinel constants defined in the tests; no
+real credentials anywhere. No other programme resources touched.

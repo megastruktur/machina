@@ -1,0 +1,19 @@
+# 04-dependencies evidence part 2 — focused tests + system ssh runtime checks
+## uv run pytest tests/test_execution_dependencies.py tests/test_import.py -q
+........                                                                 [100%]
+8 passed in 1.33s
+
+## ssh -V (runtime check target)
+OpenSSH_9.2p1 Debian-2+deb12u10, OpenSSL 3.0.22 25 Aug 2026
+
+## ssh -G frozen probe option surface (offline config render, no dial)
+batchmode yes
+identitiesonly yes
+stricthostkeychecking true
+userknownhostsfile /tmp/mai-pinned-known-hosts
+connecttimeout 5
+
+## which ssh ssh-keygen ssh-keyscan
+/usr/bin/ssh
+/usr/bin/ssh-keygen
+/usr/bin/ssh-keyscan

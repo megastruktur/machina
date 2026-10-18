@@ -1,0 +1,95 @@
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_index.py -v
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 43 items
+
+tests/test_index.py::TestChunking::test_sections_become_chunks_in_document_order PASSED [  2%]
+tests/test_index.py::TestChunking::test_chunk_list_is_stable_for_same_revision_text PASSED [  4%]
+tests/test_index.py::TestChunking::test_document_without_headings_is_one_chunk PASSED [  6%]
+tests/test_index.py::TestChunking::test_preamble_before_first_heading_keeps_its_own_section PASSED [  9%]
+tests/test_index.py::TestChunking::test_heading_only_section_yields_no_empty_chunk PASSED [ 11%]
+tests/test_index.py::TestChunking::test_oversized_section_splits_within_cap_at_block_boundaries PASSED [ 13%]
+tests/test_index.py::TestChunking::test_single_oversized_line_is_hard_split PASSED [ 16%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[env] PASSED [ 18%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[ENV] PASSED [ 20%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[dotenv] PASSED [ 23%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[pem] PASSED [ 25%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[p12] PASSED [ 27%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[key] PASSED [ 30%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[private-key] PASSED [ 32%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[python] PASSED [ 34%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[bash] PASSED [ 37%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[json] PASSED [ 39%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[] PASSED [ 41%]
+tests/test_index.py::TestChunking::test_unterminated_fence_is_one_block PASSED [ 44%]
+tests/test_index.py::TestGatewayEmbedder::test_posts_to_v1_embeddings_with_pinned_model PASSED [ 46%]
+tests/test_index.py::TestGatewayEmbedder::test_base_url_without_v1_suffix_gets_v1_appended PASSED [ 48%]
+tests/test_index.py::TestGatewayEmbedder::test_base_url_already_v1_is_not_doubled PASSED [ 51%]
+tests/test_index.py::TestGatewayEmbedder::test_wrong_dimension_response_is_refused PASSED [ 53%]
+tests/test_index.py::TestGatewayEmbedder::test_broken_endpoint_is_unavailable_not_silent PASSED [ 55%]
+tests/test_index.py::TestGatewayEmbedder::test_batches_large_inputs_preserving_order PASSED [ 58%]
+tests/test_index.py::TestGatewayEmbedder::test_credential_ref_resolves_at_request_time_into_header PASSED [ 60%]
+tests/test_index.py::TestGatewayEmbedder::test_unresolvable_credential_ref_is_unavailable PASSED [ 62%]
+tests/test_index.py::TestGatewayEmbedder::test_ref_without_resolver_is_unavailable PASSED [ 65%]
+tests/test_index.py::TestReconcileUpsert::test_upsert_indexes_chunks_with_dimension_tuple_and_fts[asyncio] PASSED [ 67%]
+tests/test_index.py::TestReconcileUpsert::test_confirmed_retry_is_unchanged_with_no_duplicate_chunks[asyncio] PASSED [ 69%]
+tests/test_index.py::TestReconcileUpsert::test_crash_between_commit_and_purge_reconverges[asyncio] PASSED [ 72%]
+tests/test_index.py::TestReconcileUpsert::test_update_swaps_revision_and_removes_stale_results[asyncio] PASSED [ 74%]
+tests/test_index.py::TestReconcileUpsert::test_model_identity_tuple_is_the_frozen_v1_on_every_row[asyncio] PASSED [ 76%]
+tests/test_index.py::TestReconcileUpsert::test_scope_isolation_server_app_shared_at_storage_boundary[asyncio] PASSED [ 79%]
+tests/test_index.py::TestReconcileDelete::test_delete_removes_rows_chunks_and_purges_intent[asyncio] PASSED [ 81%]
+tests/test_index.py::TestReconcileDelete::test_delete_retry_after_ack_crash_is_absent[asyncio] PASSED [ 83%]
+tests/test_index.py::TestReconcileDelete::test_delete_phase_one_crash_window_reconverges[asyncio] PASSED [ 86%]
+tests/test_index.py::TestReconcileDelete::test_delete_of_unknown_source_is_absent_and_purged[asyncio] PASSED [ 88%]
+tests/test_index.py::TestReconcilePending::test_unavailable_embedding_leaves_pending_and_no_empty_index[asyncio] PASSED [ 90%]
+tests/test_index.py::TestReconcilePending::test_failed_reembed_keeps_previous_revision_retrievable[asyncio] PASSED [ 93%]
+tests/test_index.py::TestReconcilePending::test_missing_source_leaves_pending_not_purged[asyncio] PASSED [ 95%]
+tests/test_index.py::TestReconcilePending::test_hash_mismatch_leaves_pending_not_purged[asyncio] PASSED [ 97%]
+tests/test_index.py::TestCliEntrypoint::test_reconcile_subprocess_roundtrip PASSED [100%]
+
+============================== 43 passed in 3.83s ==============================
+
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_index.py -v -k "<negative selection>"
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 43 items / 23 deselected / 20 selected
+
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[env] PASSED [  5%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[ENV] PASSED [ 10%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[dotenv] PASSED [ 15%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[pem] PASSED [ 20%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[p12] PASSED [ 25%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[key] PASSED [ 30%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[private-key] PASSED [ 35%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[python] PASSED [ 40%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[bash] PASSED [ 45%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[json] PASSED [ 50%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[] PASSED [ 55%]
+tests/test_index.py::TestGatewayEmbedder::test_wrong_dimension_response_is_refused PASSED [ 60%]
+tests/test_index.py::TestGatewayEmbedder::test_broken_endpoint_is_unavailable_not_silent PASSED [ 65%]
+tests/test_index.py::TestGatewayEmbedder::test_unresolvable_credential_ref_is_unavailable PASSED [ 70%]
+tests/test_index.py::TestGatewayEmbedder::test_ref_without_resolver_is_unavailable PASSED [ 75%]
+tests/test_index.py::TestReconcileDelete::test_delete_of_unknown_source_is_absent_and_purged[asyncio] PASSED [ 80%]
+tests/test_index.py::TestReconcilePending::test_unavailable_embedding_leaves_pending_and_no_empty_index[asyncio] PASSED [ 85%]
+tests/test_index.py::TestReconcilePending::test_failed_reembed_keeps_previous_revision_retrievable[asyncio] PASSED [ 90%]
+tests/test_index.py::TestReconcilePending::test_missing_source_leaves_pending_not_purged[asyncio] PASSED [ 95%]
+tests/test_index.py::TestReconcilePending::test_hash_mismatch_leaves_pending_not_purged[asyncio] PASSED [100%]
+
+====================== 20 passed, 23 deselected in 2.09s =======================
+
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_documents.py tests/test_knowledge_schema.py tests/test_knowledge_dependencies.py tests/test_models.py tests/test_env_resolver.py -q
+........................................................................ [ 79%]
+.....................................                                    [100%]
+181 passed in 11.33s
+
+$ uv run pytest tests/test_index.py -q   (no MAI_TEST_DATABASE_URL: offline-only skip path)
+............................sssssssssssssss                              [100%]
+28 passed, 15 skipped in 2.00s

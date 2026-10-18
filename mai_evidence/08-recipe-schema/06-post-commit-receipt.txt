@@ -1,0 +1,27 @@
+# 06 — post-commit receipt (2026-10-17)
+
+Fix commit: 6d778c9 (branch megastruktur/mai-08-recipe-schema,
+parent 39fc79b — the reviewed snapshot the FAIL refers to)
+
+$ git show --stat HEAD
+
+ commit 6d778c9
+ fix(p08): reject Compose interpolation '$' in recipe paths (08-recipe-schema R1)
+
+ backend/src/mai/applications/recipes.py            | 15 ++++-
+ backend/tests/test_recipes.py                      | 14 ++++-
+ mai_evidence/08-recipe-schema/02-focused-tests.txt | 49 +++++++++++++++++
+ mai_evidence/08-recipe-schema/03-negative-controls.txt | 48 +++++++++++++++
+ mai_evidence/08-recipe-schema/README.md            | 64 ++++++++++++++++++++++
+ 5 files changed, 186 insertions(+), 4 deletions(-)
+
+$ git status --short
+?? BRIEF.md                      (coordinator-owned brief, untracked by design)
+
+$ cd backend && uv run pytest tests/test_recipes.py -q   (on the committed tree)
+============================== 178 passed in 0.90s ===============================
+
+Allowlist check: only backend/src/mai/applications/recipes.py and
+backend/tests/test_recipes.py modified in code; evidence receipts under
+mai_evidence/08-recipe-schema/. No dependency, lock, manifest or sibling
+change (uv.lock untouched; git show above is the complete diff).

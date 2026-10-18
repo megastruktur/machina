@@ -1,0 +1,160 @@
+[project]
+name = "mai"
+version = "0.1.0"
+description = "MAI controller backend package"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    # Durable engine: exact pin frozen by docs/architecture/contracts.md C05 and
+    # docs/architecture/job-engine.md ("Tested exactly: dbos==3.2.0").
+    "dbos==3.2.0",
+    # API framework of the controller backend (traceability: "Python FastAPI /
+    # SvelteKit / Docker Compose / PostgreSQL"). ASGI server choice belongs to
+    # the api/compose cards, not the package lane.
+    "fastapi",
+    # Schema migration harness owner (card 01-db allowlists backend/alembic.ini
+    # and backend/migrations/env.py; SERVICES locks the migration chain to one
+    # linear Alembic chain). Bounded <2 so major-version chain rewrites are a
+    # deliberate reconciliation, not a silent upgrade.
+    "alembic>=1.16,<2",
+    # SSH/host-execution transport is the SYSTEM OpenSSH client driven via
+    # subprocess — the P00 ssh-spike decision (docs/architecture/host-supervision.md,
+    # probe experiments/ssh_supervision_probe.py) selected NO third-party SSH
+    # library, so nothing is pinned here for it. The runtime dependency (ssh,
+    # ssh-keygen, ssh-keyscan binaries and the frozen probe option surface) is
+    # asserted by backend/tests/test_execution_dependencies.py instead.
+    # Argon2id credential hashing (auth ADR 3e79449 §3.1, contracts.md C08
+    # rule 1). Deferred to this card by the packaging owner: 01-python
+    # evidence README, "argon2/session deps (02-auth)". Bounded <26 so the
+    # next binding-generation bump is a deliberate review, not a silent
+    # upgrade of a security primitive.
+    "argon2-cffi>=23.1,<26",
+    # Agent runtime (IDEA.md §2/§8: PydanticAI over configurable
+    # OpenAI-compatible endpoints; contracts.md C06). The slim distribution
+    # with ONLY the `openai` extra is the minimal provider adapter set: the
+    # configured gateway is OpenAI-compatible (AGT-PROVIDER scenario,
+    # runtime-scenarios.md). No other provider extra (anthropic, google,
+    # groq, …) and no scheduler extra (the durable engine stays the frozen
+    # dbos==3.2.0 direct pin, contracts.md C05 — pydantic-ai's dbos/temporal/
+    # prefect extras are alternate-engine vectors) may enter silently;
+    # backend/tests/test_agent_dependencies.py holds both negative controls
+    # across manifest, lock and installed environment. Bounded <3 so the
+    # framework's next major API break is a deliberate reconciliation with
+    # its downstream consumers (06-agent-run/06-tool-bridge), not a silent
+    # upgrade; within 2.x the lock file fixes the exact resolved version.
+    "pydantic-ai-slim[openai]>=2.56,<3",
+    # Document-chunk embeddings client (contracts.md C07 rule 3/7; ADR
+    # docs/architecture/knowledge-packaging.md §4): the doc index embeds via
+    # POST {base_url}/v1/embeddings on the SAME configured OpenAI-compatible
+    # connection as the chat path — the `embeddings.create` surface of this
+    # SDK, never /chat/completions. Direct declaration (was locked only as the
+    # pydantic-ai-slim[openai] extra's requirement while src/mai already
+    # imports it); the SDK is Apache-2.0-licensed; bounds mirror that extra's
+    # floor (openai>=3.26.0) with the major cap so the next SDK major is a
+    # silent upgrade. backend/tests/test_knowledge_dependencies.py verifies
+    # the exact request/response surface offline (mock transport) and holds
+    # the C07 dimension tuple (text-embedding-3-small / 1536 / cosine).
+    "openai>=3.26,<4",
+    # Vector column access layer for the frozen store (ADR §4.1/§4.2: the
+    # controller's own PostgreSQL + pgvector, vector(1536) HNSW
+    # vector_cosine_ops — a dedicated vector-database service is rejected).
+    # Provides the supported SQLAlchemy type (pgvector.sqlalchemy.Vector) for
+    # the 07-vector-schema migration and the cosine-distance expression for
+    # 07-chunk-index/07-retrieval; pgvector.psycopg adapts parameters on the
+    # locked psycopg3 application driver (src/mai/database.py). Distribution
+    # MIT; the server-side extension it addresses is PostgreSQL-licensed
+    # (delivered by the pgvector-enabled Postgres image, Compose cards — not
+    # a Python dependency). Bounded to the verified 0.5 line: inside a 0.x
+    # major the minor is the breaking axis, so the next minor bump is a
+    # deliberate review, not a silent upgrade.
+    "pgvector>=0.5,<0.6",
+    # HTTP fetch client (ADR §3.2: SearXNG returns result metadata, page
+    # fetching/extraction is MAI's own capability; C07 rule 7 search JSON).
+    # httpx2 is the BSD-3-Clause client already locked as the openai SDK's
+    # transport — one HTTP stack for the knowledge lane (07-search-capability,
+    # 07-page-reader, 07-service-http, 11-memory-adapter Hindsight HTTP).
+    # Plain async client only: no extra (cli/http2/socks/zstd/brotli stay
+    # unselected) and NO browser automation — page fetch is bounded HTTP,
+    # never an embedded/unbounded browser install (acceptance criterion 2).
+    # Bounded <3 so the client's next major is a deliberate reconciliation.
+    "httpx2>=2.13,<3",
+    # External MCP client transport (IDEA.md §13 "External MCP servers":
+    # MCP is an integration protocol, never an authorization boundary;
+    # contracts.md C03 rule 7 — MCP tools carry independent grants and
+    # server scope). The official modelcontextprotocol python-sdk is the
+    # selected implementation; declared DIRECTLY (same convention as openai
+    # above) instead of adopting pydantic-ai-slim's [mcp] extra, so the
+    # agent runtime's frozen extra set stays exactly {openai} and the
+    # plugin layer owns connection policy. Frozen v1 transports: stdio
+    # (locally spawned servers with an explicitly scoped subprocess env)
+    # and streamable HTTP (separately hosted servers, IDEA.md §13); the
+    # deprecated SSE transports are NOT selected. Plugin loading itself is
+    # importlib.metadata entry points of trusted installed code (C03 rule
+    # 7) — this lane adds NO runtime installer: no pip-style distribution
+    # may enter the runtime set (negative controls in
+    # backend/tests/test_plugin_dependencies.py). Bounded <2 so the SDK's
+    # next major protocol/API break is a deliberate reconciliation with its
+    # downstream consumers (09-mcp, 09-native-plugin), not a silent
+    # upgrade; within 1.x the lock file fixes the exact resolved version.
+    "mcp>=1.30,<2",
+    # Plugin configuration-schema runtime (IDEA.md §13 "Schema-generated
+    # configuration forms"; 09-plugin-store validates versioned config
+    # against the schema, 09-native-plugin validates the manifest,
+    # 09-plugin-api exposes config schemas without secret values). Direct
+    # declaration of the library src/mai already imports everywhere while
+    # it was only locked transitively (fastapi / pydantic-ai-slim
+    # requirements) — model_json_schema()/TypeAdapter are the frozen
+    # schema surface, ValidationError is the explicit compatibility
+    # failure. Bounded <3 so pydantic v3 is a deliberate reconciliation,
+    # not a silent upgrade of every config schema at once.
+    "pydantic>=2.14,<3",
+    # Operational memory (IDEA.md §11 "Use Hindsight for operational
+    # memory", contracts.md C07 rules 6/7, ADR knowledge-packaging.md §2):
+    # Hindsight is the Compose-internal SERVICE (ghcr.io/vectorize-io/
+    # hindsight, version pinned by the Compose card at integration) and the
+    # memory adapter speaks its bank-scoped HTTP API through the SAME httpx2
+    # client pinned above — 07-dependencies froze that one-HTTP-stack lane
+    # and its negative control (set B) keeps every in-process Hindsight
+    # distribution (hindsight-api/all/client/litellm — MIT upstream) OUT of
+    # the controller: pip-installing the engine would drag Postgres drivers
+    # and ONNX extras into the FastAPI set (ADR §2.1) and duplicate a
+    # process the stack already isolates. The optional memory capability
+    # therefore pins NOTHING here by decision: the service being absent or
+    # unconfigured makes the memory capability explicitly UNAVAILABLE
+    # (runtime-scenarios.md KB-H1) — never a core import failure.
+    # backend/tests/test_optional_dependencies.py re-asserts set B and
+    # extends it with unselected operational-memory frameworks.
+    # 1Password (IDEA.md §14, contracts.md C03 rule 6: .env is the mandatory
+    # first resolver, 1Password an optional LATER plugin behind a provider
+    # interface): the supported interface is the 1Password CLI (`op`,
+    # 1Password's own EULA-licensed distribution — never bundled or pinned
+    # here) driven via subprocess, the same selection rule as the system
+    # OpenSSH client above; service accounts — the plugin's auth mode —
+    # require CLI >= 2.18.0 (developer.1password.com, "Use service accounts
+    # with 1Password CLI"). The official onepassword-sdk distribution is NOT
+    # selected: its wheels stop at CPython 3.13 (Rust sdist beyond), so it
+    # cannot install into the python:3.14-slim runtime set, and the CLI it
+    # wraps is the documented interface anyway. The tool is OPTIONAL:
+    # missing `op` ⇒ the provider classifies the capability unavailable
+    # (never an import failure, never a fallback secret scan; the
+    # 11-onepassword card owns the plugin). backend/tests/
+    # test_optional_dependencies.py asserts the floor when `op` is present,
+    # records explicit unavailability when it is not, and keeps secret-store
+    # SDKs (onepassword-sdk, keyring, hvac) out of manifest, lock and
+    # installed environment.
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+markers = [
+    "real_target: drives the real disposable sshd+docker fixture over the real transport (slow, host effects)",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mai"]

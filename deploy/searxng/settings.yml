@@ -1,0 +1,60 @@
+# MAI SearXNG settings (card 07-searxng; C07 rule 7 / knowledge-packaging ADR §3).
+#
+# Written from the documented upstream schema for the pinned image
+# (searxng/searxng:2026.10.11-ad46ebd7d, docs snapshot 2026.10.11+ad46ebd7d);
+# no third-party configuration was copied. Mounted read-only at
+# /etc/searxng/settings.yml via the compose `configs:` entry.
+#
+# Egress (acceptance 2): queries to the enabled upstream engines leave this
+# host toward public search engines over the internet. SearXNG keeps no local
+# database (ADR §3.3); persistent state is exactly this file plus the
+# disposable favicon cache volume. Query sanitization (no secrets or host
+# identifiers in `q`) is a policy enforced by MAI's search capability layer,
+# not by this configuration.
+#
+# Secrets (acceptance 2): `server.secret_key` is deliberately ABSENT here.
+# Compose injects it through the native upstream `SEARXNG_SECRET` environment
+# override (a required `.env` variable; the render fails closed without it).
+# Nothing secret is committed in this file or anywhere in the repository.
+
+use_default_settings: true
+
+general:
+  instance_name: "MAI internal search"
+
+search:
+  # C07 rule 7: `search.formats` MUST include `json` — requesting a format
+  # that is not enabled returns HTTP 403 from the upstream API.
+  formats:
+    - html
+    - json
+
+server:
+  # limiter stays OFF — deliberate, and here is the measured reason.
+  #
+  # Upstream's ip_limit counts EVERY format!=html request against a
+  # hard-coded window of API_MAX=4 requests per API_WINDOW=3600s per client
+  # IP (searx/botdetection/ip_limit.py; the constants are NOT tunable via
+  # limiter.toml). MAI's sole JSON consumer is the backend — one container
+  # IP, one json query per user search — so limiter:true would cap the
+  # product at ~4 searches/hour. Bot detection (429 on bot User-Agents on
+  # every path; /search additionally requires Accept with text/html,
+  # Accept-Encoding gzip|deflate and a non-empty Accept-Language) is only
+  # installed when the limiter is on, so with limiter off internal clients
+  # see no bot filtering at all.
+  #
+  # If this instance is ever switched to public exposure, limiter MUST flip
+  # to true (that is the upstream-supported public mode) and the bundled
+  # valkey service becomes hard-required at startup — the compose
+  # healthcheck already proves valkey reachability as part of searxng
+  # readiness.
+  limiter: false
+
+valkey:
+  # The bundled valkey service (internal compose hostname; not a credential).
+  # SearXNG connects this client at startup whenever valkey.url is set; with
+  # limiter off nothing consumes it at runtime, but it is provisioned and
+  # health-wired (compose readiness pings it) so that switching the instance
+  # to limiter/public mode is a settings flip, not a topology change. Note
+  # SearXNG's own result/engine caches are local SQLite, NOT valkey.
+  url: "redis://valkey:6379/0"

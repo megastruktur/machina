@@ -1,0 +1,119 @@
+# MAI maintained-catalogue fixture: minimal STATEFUL HTTP file server
+# (card 08-fixture-recipes; validated by
+# backend/tests/test_catalogue_examples.py through the canonical recipe
+# schema frozen by 08-recipe-schema, C09 rule 2).
+#
+# Revision stream — this file holds exactly two YAML documents:
+#   document 1 = revision v1 (initial install)
+#   document 2 = revision v2 (update target; differs from v1 ONLY in the
+#   pinned image digest, so update tests exercise image-aware upgrades
+#   that must PRESERVE the persistent data below).
+#
+# Persistent sentinel and neighboring resource controls (acceptance 2):
+#   - sentinel: the single declared volume "srv-files" (container path
+#     /srv) is the server's served root. A fixture sentinel file placed
+#     there (mai-fixture-sentinel.txt) must survive the v1 -> v2 update
+#     and any keep-policy removal; the target host path is
+#     planner-allocated as /var/lib/mai/apps/<application_id>/volumes/
+#     srv-files and is never typed by this recipe.
+#   - controls: exactly one unprivileged published host port (18081 > 1024),
+#     exactly one bounded volume, no credentials, bounded health timings,
+#     backup.required=true so data-affecting operations demand a backup
+#     first, and removal.data_policy=explicit_choice so absent keep/delete
+#     intent can never delete the sentinel.
+#
+# Upstream: filebrowser/filebrowser is a generic single-binary HTTP file
+# server. It is curated here as a disposable test fixture only — it is not
+# a production application of this product, declares no credentials, and
+# must never receive real data.
+# Image facts (registry-verified at authoring time; provenance in
+# mai_evidence/08-fixture-recipes/):
+#   - multi-arch manifest list: linux amd64 + arm64 (plus armv7, declared
+#     unsupported here on purpose) -> supported archs x86_64/aarch64
+#   - serves HTTP on container port 80; GET /health answers 200
+#   - ships /usr/bin/curl, so the schema's frozen argv curl healthcheck
+#     (CMD curl --fail ...) actually runs inside this container
+#   - the image itself declares VOLUME /srv and serves root /srv
+#     (baked /.filebrowser.json: port 80, database /database.db,
+#     root /srv), matching the declared volume below.
+schema_version: 1
+name: example-stateful
+supported_environment:
+  os:
+    - linux
+  arch:
+    - aarch64
+    - x86_64
+prerequisites:
+  - docker
+required_grants:
+  - docker.compose
+deploy:
+  image: docker.io/filebrowser/filebrowser@sha256:a4da9ca8364b0a1fc5dd36f7add92582bf673c0ae0bda8dd9bd13062c41d1715
+  ports:
+    - host: 18081
+      container: 80
+      protocol: tcp
+  volumes:
+    - name: srv-files
+      container_path: /srv
+health:
+  kind: http
+  port: 80
+  path: /health
+  expected_status: 200
+  interval_seconds: 10
+  timeout_seconds: 5
+  retries: 3
+  start_period_seconds: 10
+update:
+  migrations: none
+removal:
+  data_policy: explicit_choice
+recovery:
+  image_rollback: true
+backup:
+  required: true
+---
+# revision v2 (update target): ONLY the pinned image digest changed
+# (upstream tag v2.31.2 -> v2.32.0). The sentinel volume declaration is
+# byte-identical, so the update must reinstall around the same
+# planner-allocated persistent path.
+schema_version: 1
+name: example-stateful
+supported_environment:
+  os:
+    - linux
+  arch:
+    - aarch64
+    - x86_64
+prerequisites:
+  - docker
+required_grants:
+  - docker.compose
+deploy:
+  image: docker.io/filebrowser/filebrowser@sha256:593478e3c24c5ea9f5d7478dc549965b7bc7030707291006ce8d0b6162d3454b
+  ports:
+    - host: 18081
+      container: 80
+      protocol: tcp
+  volumes:
+    - name: srv-files
+      container_path: /srv
+health:
+  kind: http
+  port: 80
+  path: /health
+  expected_status: 200
+  interval_seconds: 10
+  timeout_seconds: 5
+  retries: 3
+  start_period_seconds: 10
+update:
+  migrations: none
+removal:
+  data_policy: explicit_choice
+recovery:
+  image_rollback: true
+backup:
+  required: true

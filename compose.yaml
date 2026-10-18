@@ -1,0 +1,345 @@
+# MAI core topology (card 01-compose, P01).
+#
+# Contracts honored here (docs/architecture/contracts.md):
+# - C08 rule 3 / auth ADR §6: `mai-api` and `mai-web` are Compose-internal; the
+#   single TLS-terminating reverse proxy (a later platform card) is the only
+#   component that may publish host ports. No service below defines `ports:` —
+#   nothing here is reachable from the host by default.
+# - SERVICES `postgres` row: persistent volume, internal only by default.
+#   KB-V1 / C07 rule 7: the image is pgvector-enabled (pgvector/pgvector,
+#   ≥ 0.8.0; pg_trgm ships in the image's contrib).
+# - SERVICES `mai-worker` row: same backend image/package as `mai-api`; no
+#   public listener. Card 05-worker-compose wires the REAL durable-engine
+#   entrypoint from 05-engine-adapter (`python -m mai.jobs.worker`, C05):
+#   this is the ONLY full engine in the topology — launch recovery, the one
+#   Machina queue and the DBOS schedule loops live here. `mai-api` stays a
+#   bare control-plane client (never launches), so API replicas can never
+#   become a second scheduler. It remains profile-gated (explicit stack-owner
+#   opt-in, `--profile worker`), is restarted by Docker if it dies
+#   (`unless-stopped`), stops cleanly on SIGTERM (the entrypoint drains the
+#   engine), and its healthcheck reports actual worker readiness: the real
+#   entrypoint is the container's main process AND the engine-owned `dbos`
+#   schema exists — that schema is created only by a full engine launch
+#   (EngineClient ordering contract in `mai.jobs.engine`), never by the API
+#   client and never by Alembic.
+# - C02 rule 1: the data root is configured explicitly (`MAI_DATA_ROOT`); the
+#   canonical file store (02-file-store) reads this parameter. C03 rule 6 /
+#   auth ADR §3: credentials come from the Compose `.env` only — this file
+#   references `MAI_POSTGRES_PASSWORD` and `SEARXNG_SECRET` as REQUIRED
+#   variables and fails closed (render/up error) when unset; no default secret
+#   exists anywhere.
+# - C07 rule 7 / knowledge-packaging ADR §3: `searxng` + `valkey` are the
+#   bundled metasearch pair (official upstream two-service shape). Both are
+#   profile-gated like `mai-worker` (`--profile search`): starting them is a
+#   stack-owner opt-in because engine queries leave the host toward public
+#   upstream search engines (egress is deliberate, never a default-up side
+#   effect). They stay internal-only on the `mai` network.
+# - C07 rule 7 / knowledge-packaging ADR §2: `hindsight` is the bundled
+#   operational-memory service, profile-gated the same way (`--profile
+#   memory`): the default start set stays memory-free, and its LLM/embeddings
+#   configuration is a stack-owner decision injected from the Compose `.env`
+#   (deploy/hindsight/README.md). All Hindsight state lives in the dedicated
+#   `hindsight` database of the stack Postgres (its own pg_dump/backup
+#   namespace); the service itself keeps no volume. Internal only — API 8888,
+#   UI 9999, no published host port. Health/version transcripts: KB-H1.
+#
+# Build contexts are the repository root; the single root `.dockerignore`
+# re-includes only the real image inputs.
+name: mai
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg18
+    environment:
+      POSTGRES_USER: mai
+      POSTGRES_DB: mai
+      POSTGRES_PASSWORD: "${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}"
+    volumes:
+      # Postgres 18 images keep PGDATA under /var/lib/postgresql/<major>/docker;
+      # mounting the parent directory persists all of it (verified in evidence).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mai -d mai"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - mai
+
+  mai-api:
+    image: mai-backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
+      MAI_DATA_ROOT: /var/lib/mai
+    volumes:
+      - mai-data:/var/lib/mai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Liveness only: /api/v1/health never probes dependencies (app.py), so a
+      # transient database outage does not get the API killed. Readiness truth
+      # stays on /api/v1/health/ready.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - mai
+
+  mai-worker:
+    # Same backend image/package (SERVICES row). Not built separately: reuses
+    # the mai-api image. Real C05 entrypoint (05-engine-adapter): launch
+    # recovery + the one Machina queue + DBOS schedules in the ONLY full
+    # engine process of the topology. Still profile-gated: only
+    # `docker compose --profile worker …` starts it.
+    image: mai-backend
+    profiles:
+      - worker
+    command: ["python", "-m", "mai.jobs.worker"]
+    environment:
+      MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
+      MAI_DATA_ROOT: /var/lib/mai
+      # Registration modules imported before engine launch (mai.jobs.worker
+      # contract): the real run executor (capability.steps) and the schedule
+      # fire workflow. A module that fails to import stops the worker with
+      # exit 2 — a daemon that cannot execute its jobs must never run.
+      MAI_WORKER_HANDLERS: "mai.jobs.steps,mai.jobs.schedules"
+    volumes:
+      - mai-data:/var/lib/mai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Independently restartable (SERVICES end-to-end route): the worker
+    # depends on Postgres only — never on mai-api, and mai-api never depends
+    # on the worker. A dead worker is restarted by Docker; a manual stop is
+    # honored (unless-stopped).
+    restart: unless-stopped
+    # SIGTERM drains the engine cleanly (entrypoint contract: exit 0).
+    stop_grace_period: 30s
+    healthcheck:
+      # Actual worker readiness, not a fake daemon (acceptance 2): the real
+      # entrypoint must be the container's main process AND the engine-owned
+      # `dbos` schema must exist — a full engine launch is its only creator,
+      # so a green probe means this worker's launch (incl. recovery setup)
+      # completed. No public listener exists to probe instead.
+      test:
+        - CMD-SHELL
+        - >-
+          grep -aq mai.jobs.worker /proc/1/cmdline
+          && python -c 'import os,sys,psycopg; c=psycopg.connect(os.environ["MAI_DATABASE_URL"],connect_timeout=3); r=c.execute("select 1 from information_schema.tables where table_schema=%s and table_name=%s",("dbos","workflow_status")).fetchone(); sys.exit(0 if r else 1)'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - mai
+
+  mai-web:
+    image: mai-web
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - mai
+
+  # C07 rule 7 / knowledge-packaging ADR §3: bundled metasearch. Same opt-in
+  # shape as mai-worker: `--profile search` starts the pair; the default start
+  # set stays egress-free. Pinned at the docs-verified upstream snapshot
+  # (2026.10.11+ad46ebd7d). Internal only — no published host port.
+  searxng:
+    image: docker.io/searxng/searxng:2026.10.11-ad46ebd7d
+    profiles:
+      - search
+    entrypoint:
+      # Fail closed at startup, not at render: compose interpolates every
+      # service's environment globally, so a render-time `:?` here would break
+      # plain `docker compose config` for consumers that never start the
+      # search profile. Instead the (empty-by-default) variable is injected
+      # and this guard refuses to launch without it.
+      - "/bin/sh"
+      - "-c"
+      - >-
+        if [ -z "$SEARXNG_SECRET" ]; then
+          echo "!!! SEARXNG_SECRET must be set in the Compose .env" >&2;
+          exit 1;
+        fi;
+        exec /usr/local/searxng/entrypoint.sh
+    environment:
+      # server.secret_key is injected ONLY via this native upstream env
+      # override (settings_defaults.py: SEARXNG_SECRET); the committed
+      # settings.yml carries no secret_key key at all and no default secret
+      # exists here — an unset variable renders empty and the entrypoint
+      # guard above stops the container.
+      SEARXNG_SECRET: "${SEARXNG_SECRET:-}"
+    configs:
+      # Committed configuration, mounted read-only; the repo file is the
+      # single source of truth (restart persistence = the file itself).
+      - source: searxng-settings
+        target: /etc/searxng/settings.yml
+    volumes:
+      # Favicon/static cache only (ADR §3.3: SearXNG keeps no database);
+      # disposable state, nothing to back up.
+      - searxng-cache:/var/cache/searxng
+    depends_on:
+      # The valkey pair is provisioned per ADR §3 (limiter state, used when
+      # the instance is switched to limiter/public mode; settings.yml keeps
+      # limiter off because upstream's hard-coded 4 json-requests/hour/IP
+      # window is incompatible with MAI's API consumer). Startup ordering on
+      # valkey health keeps the auxiliary service a first-class dependency.
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      # Readiness, not just liveness: the app must answer /healthz AND the
+      # provisioned valkey must accept a ping (settings.yml valkey.url).
+      # Either failure flips the service to unhealthy, so auxiliary-service
+      # failure is observable through the compose health state.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- http://127.0.0.1:8080/healthz >/dev/null
+          && /usr/local/searxng/.venv/bin/python -c "import pathlib,valkey,yaml; u=yaml.safe_load(pathlib.Path('/etc/searxng/settings.yml').read_text())['valkey']['url']; valkey.Valkey.from_url(u, socket_timeout=3).ping()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - mai
+
+  # Required auxiliary service (ADR §3.3): limiter/bot-detection state for
+  # searxng. In-memory only — losing it is harmless (rate-limit windows reset).
+  valkey:
+    image: docker.io/valkey/valkey:9-alpine
+    profiles:
+      - search
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - mai
+
+  # C07 rule 7 / knowledge-packaging ADR §2: bundled operational memory
+  # (image selected over in-process pip distributions; 11-dependencies froze
+  # that decision). Version pin: newest upstream image tag at integration
+  # (1.0.0, image built 2026-10-13, labels.version=1.0.0; PyPI hindsight-api
+  # 1.0.0 MIT — verified live). Same opt-in shape as the search pair:
+  # `--profile memory` starts it; the default start set stays memory-free.
+  # No `ports:` — API 8888 / UI 9999 stay internal to the `mai` network
+  # (acceptance 2); the adapter speaks HTTP over the compose network.
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:1.0.0
+    profiles:
+      - memory
+    environment:
+      # Own persistent namespace (acceptance 1): the dedicated `hindsight`
+      # database of the STACK Postgres (created idempotently by
+      # hindsight-db-init below; HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP
+      # default true then creates pgvector/pg_trgm/btree_gin + its tables
+      # there — measured on 1.0.0). The embedded pg0 store is rejected by
+      # ADR §2.5; this URL is the entire persistence story and the pg_dump
+      # boundary (C07 rule 3: banks are backed up, never silently rebuilt).
+      HINDSIGHT_API_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/hindsight"
+      # Retain/recall/reflect need an extraction LLM (ADR §2.5: hard
+      # auxiliary dependency). Render stays `docker compose config`-clean for
+      # consumers that never enable this profile — the .env values interpolate
+      # empty and UPSTREAM fails closed at container start instead: without a
+      # key for the selected provider the container exits 1 with
+      # "LLM API key is required. Set HINDSIGHT_API_LLM_API_KEY …"
+      # (measured on 1.0.0). Point LLM_BASE_URL at the same
+      # OpenAI-compatible gateway the backend uses; leave empty only for
+      # real OpenAI or a provider with a built-in base URL.
+      HINDSIGHT_API_LLM_PROVIDER: "${HINDSIGHT_API_LLM_PROVIDER:-openai}"
+      HINDSIGHT_API_LLM_MODEL: "${HINDSIGHT_API_LLM_MODEL:-}"
+      HINDSIGHT_API_LLM_BASE_URL: "${HINDSIGHT_API_LLM_BASE_URL:-}"
+      HINDSIGHT_API_LLM_API_KEY: "${HINDSIGHT_API_LLM_API_KEY:-}"
+      # ADR §2.4/§4: embeddings come from the SAME OpenAI-compatible gateway
+      # as the doc index — provider `openai`, `text-embedding-3-small`,
+      # native 1536 dims (no HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS
+      # override). Upstream defaults (`local`/`onnx`) are rejected for
+      # deployment parity: they download a model into the container and
+      # break the frozen one-dimension story (C07 rule 3).
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: text-embedding-3-small
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: "${HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:-}"
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: "${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}"
+    depends_on:
+      hindsight-db-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Same restart posture as mai-worker (stateful profile service): Docker
+    # brings it back after a crash/host reboot; a manual stop is honored.
+    # State is safe across restarts by construction — it lives in the
+    # Postgres `hindsight` database, never in the container (acceptance 2).
+    restart: unless-stopped
+    # start-all.sh traps SIGTERM and drains API + control plane cleanly; its
+    # own comment asks operators for a 30s grace period.
+    stop_grace_period: 30s
+    healthcheck:
+      # /health is upstream readiness: it fails when the database is
+      # unreachable (KB-H1), so a green probe means migrations ran and the
+      # dedicated namespace is actually reachable. Liveness-only /health/live
+      # would hide a dead DB connection behind a "healthy" badge.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - mai
+
+  # One-shot namespace provisioner for hindsight (memory profile only): the
+  # stack Postgres is shared, so the dedicated database must be created
+  # idempotently — safe on every `up`, including after the default set has
+  # been running for a long time (docker-entrypoint-initdb.d scripts would
+  # only fire on a fresh volume, which is exactly the "enabled memory later"
+  # case this must survive). Reuses the already-pinned pgvector image (no new
+  # dependency); the extensions themselves are created by Hindsight's own
+  # migrations inside the new database (measured: vector, pg_trgm, btree_gin).
+  hindsight-db-init:
+    image: pgvector/pgvector:0.8.1-pg18
+    profiles:
+      - memory
+    environment:
+      # Runtime-resolved only ($$): the password never lands in the init
+      # container's command line / inspect output, only in its environment.
+      MAI_POSTGRES_PASSWORD: "${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - >-
+        psql "postgresql://mai:$$MAI_POSTGRES_PASSWORD@postgres:5432/mai" -tAc "SELECT 1 FROM pg_database WHERE datname='hindsight'" | grep -q 1
+        || psql "postgresql://mai:$$MAI_POSTGRES_PASSWORD@postgres:5432/mai" -c "CREATE DATABASE hindsight"
+    networks:
+      - mai
+
+networks:
+  mai:
+
+configs:
+  searxng-settings:
+    file: deploy/searxng/settings.yml
+
+volumes:
+  postgres-data:
+  mai-data:
+  searxng-cache:

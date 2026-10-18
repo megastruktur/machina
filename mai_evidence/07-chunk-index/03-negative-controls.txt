@@ -1,0 +1,31 @@
+$ MAI_TEST_DATABASE_URL=<fixture> uv run pytest tests/test_index.py -v -k "<negative selection>"
+============================= test session starts ==============================
+platform linux -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0 -- /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/megastruktur/orca/workspaces/machina/mai-07-chunk-index/backend
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 43 items / 23 deselected / 20 selected
+
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[env] PASSED [  5%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[ENV] PASSED [ 10%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[dotenv] PASSED [ 15%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[pem] PASSED [ 20%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[p12] PASSED [ 25%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[key] PASSED [ 30%]
+tests/test_index.py::TestChunking::test_credential_labelled_fence_is_excluded_structurally[private-key] PASSED [ 35%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[python] PASSED [ 40%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[bash] PASSED [ 45%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[json] PASSED [ 50%]
+tests/test_index.py::TestChunking::test_non_credential_fences_are_kept[] PASSED [ 55%]
+tests/test_index.py::TestGatewayEmbedder::test_wrong_dimension_response_is_refused PASSED [ 60%]
+tests/test_index.py::TestGatewayEmbedder::test_broken_endpoint_is_unavailable_not_silent PASSED [ 65%]
+tests/test_index.py::TestGatewayEmbedder::test_unresolvable_credential_ref_is_unavailable PASSED [ 70%]
+tests/test_index.py::TestGatewayEmbedder::test_ref_without_resolver_is_unavailable PASSED [ 75%]
+tests/test_index.py::TestReconcileDelete::test_delete_of_unknown_source_is_absent_and_purged[asyncio] PASSED [ 80%]
+tests/test_index.py::TestReconcilePending::test_unavailable_embedding_leaves_pending_and_no_empty_index[asyncio] PASSED [ 85%]
+tests/test_index.py::TestReconcilePending::test_failed_reembed_keeps_previous_revision_retrievable[asyncio] PASSED [ 90%]
+tests/test_index.py::TestReconcilePending::test_missing_source_leaves_pending_not_purged[asyncio] PASSED [ 95%]
+tests/test_index.py::TestReconcilePending::test_hash_mismatch_leaves_pending_not_purged[asyncio] PASSED [100%]
+
+====================== 20 passed, 23 deselected in 2.09s =======================

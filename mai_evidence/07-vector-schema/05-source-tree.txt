@@ -1,0 +1,13 @@
+# mai-07-vector-schema — source tree / diff (pre-commit)
+$ git rev-parse HEAD
+30cbcf90735dab68f473a27239cabc14d41d88b7
+
+$ git status --short
+ M backend/tests/test_job_schema.py
+?? BRIEF.md
+?? backend/migrations/versions/0005_knowledge.py
+?? backend/tests/test_knowledge_schema.py
+
+$ git diff --stat
+ backend/tests/test_job_schema.py | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
