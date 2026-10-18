@@ -1390,6 +1390,221 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitoring/notification-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the effective notification routing policy (frozen v1 default)
+         * @description Report the exact policy the evaluate route applies.
+         *
+         *     v1 wires no policy storage and no editor: the surface evaluates under
+         *     one frozen module constant (:data:`_EFFECTIVE_POLICY`), so what this
+         *     returns is verbatim what re-evaluation uses — the reported policy can
+         *     never drift from the applied one.
+         */
+        get: operations["read_notification_policy_api_v1_monitoring_notification_policy_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/observations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one server's health observations (bounded page, freshness derived)
+         * @description One bounded page of ``server_observations``, newest sample first.
+         *
+         *     Safe method: session layer only. The server scope is the storage
+         *     boundary (C01 rule 7): rows of any other server can never appear.
+         *     ``application_id`` narrows to one adopted application's samples,
+         *     ``source`` to one collector identity. ``freshness`` is derived
+         *     against the request clock — never a stored flag.
+         */
+        get: operations["list_observations_api_v1_monitoring_servers__server_id__observations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one health observation (server-scoped)
+         * @description One sample row; a row owned by another server is a value-free 404.
+         */
+        get: operations["read_observation_api_v1_monitoring_servers__server_id__observations__observation_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/findings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one server's findings (bounded page, attention-ordered)
+         * @description One bounded finding page, most severe / oldest first.
+         *
+         *     Safe method: session layer only; server scope is the storage boundary.
+         *     ``open`` filters the derivation state (``true`` = unresolved
+         *     conditions — the notification service's evaluation input; ``false`` =
+         *     resolved history; omitted = all).
+         */
+        get: operations["list_findings_api_v1_monitoring_servers__server_id__findings_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/findings/evaluate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-evaluate one server's open findings into inbox notices
+         * @description Re-run the notification evaluation for one server's open findings.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The reviewed producer (:func:`mai.notifications.service.evaluate_findings`)
+         *     owns every decision — dedup, cooldown, escalation, ack suppression —
+         *     under this surface's frozen effective policy (inbox-only v1; see the
+         *     policy endpoint). The route itself writes nothing: findings and
+         *     observations stay collector-owned.
+         */
+        post: operations["evaluate_findings_route_api_v1_monitoring_servers__server_id__findings_evaluate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one finding (server-scoped)
+         * @description One condition row; a row owned by another server is a value-free 404.
+         */
+        get: operations["read_finding_api_v1_monitoring_servers__server_id__findings__finding_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one server's notification inbox (bounded page, newest first)
+         * @description One bounded inbox page of persisted notices, newest first.
+         *
+         *     Safe method: session layer only; server scope is the storage boundary.
+         *     The inbox is the durable record: acknowledged notices stay listed
+         *     (evidence outlives the ack); ``unacknowledged=true`` is the attention
+         *     view, ``false`` the acknowledged history.
+         */
+        get: operations["list_notifications_api_v1_monitoring_servers__server_id__notifications_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one inbox notice (server-scoped)
+         * @description One notice row; a row owned by another server is a value-free 404.
+         */
+        get: operations["read_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge one inbox notice (evidence-preserving, idempotent)
+         * @description Stamp ``acknowledged_at`` on one notice; delete nothing.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any state is
+         *     touched. The conditional UPDATE matches the server scope (C01 rule 7)
+         *     and an empty ``acknowledged_at`` (idempotency: the first stamp wins,
+         *     a replay never re-stamps or shifts the timestamp). Ack is NOT a
+         *     delete: the notice, its finding and its producing observation all
+         *     survive — the inbox keeps the row and the evidence chain is intact.
+         */
+        post: operations["acknowledge_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -1434,6 +1649,13 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AckResult
+         * @description The ack receipt: the notice view after the (idempotent) stamp.
+         */
+        AckResult: {
+            alert: components["schemas"]["AlertView"];
+        };
         /**
          * AdoptBody
          * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
@@ -1487,6 +1709,63 @@ export interface components {
             sha256: string | null;
             application: components["schemas"]["ApplicationView"];
             record_doc: components["schemas"]["RecordDocView"];
+        };
+        /**
+         * AlertPage
+         * @description One bounded inbox page for one explicitly named server.
+         */
+        AlertPage: {
+            /** Server Id */
+            server_id: string;
+            /** Alerts */
+            alerts: components["schemas"]["AlertView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * AlertView
+         * @description One inbox notice (0007 ``notification_alerts`` row).
+         *
+         *     ``severity`` is derived per the frozen provenance rule (live anchor
+         *     join first, persisted summary tag second, ``info`` last — see module
+         *     docstring); ``acked`` mirrors ``acknowledged_at is not null`` so a
+         *     consumer never compares timestamps for state.
+         */
+        AlertView: {
+            /** Alert Id */
+            alert_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Origin */
+            origin: string;
+            /** Dedup Key */
+            dedup_key: string;
+            /** Severity */
+            severity: string;
+            /** Title */
+            title: string;
+            /** Summary */
+            summary: string | null;
+            /** Context Ref */
+            context_ref: string | null;
+            /** Delivery Status */
+            delivery_status: string;
+            /** Created At */
+            created_at: string;
+            /** Delivered At */
+            delivered_at: string | null;
+            /** Acknowledged At */
+            acknowledged_at: string | null;
+            /** Acked */
+            acked: boolean;
+            /** Finding Id */
+            finding_id: string | null;
+            /** Run Id */
+            run_id: string | null;
         };
         /**
          * ApplicationOrigin
@@ -2155,11 +2434,93 @@ export interface components {
             error: components["schemas"]["ErrorBody"];
         };
         /**
+         * EvaluateOutcomeView
+         * @description What one re-evaluation decided about one condition (service view).
+         */
+        EvaluateOutcomeView: {
+            /** Alert Id */
+            alert_id: string;
+            /** Dedup Key */
+            dedup_key: string;
+            /** Disposition */
+            disposition: string;
+            /** Delivery */
+            delivery: string;
+            /** Channels Attempted */
+            channels_attempted: string[];
+        };
+        /**
+         * EvaluateResult
+         * @description One bounded re-evaluation round over one server's open findings.
+         */
+        EvaluateResult: {
+            /** Server Id */
+            server_id: string;
+            /** Evaluated */
+            evaluated: number;
+            /** Outcomes */
+            outcomes: components["schemas"]["EvaluateOutcomeView"][];
+        };
+        /**
          * ExecutionEnvironment
          * @description Supported target execution environments (frozen set).
          * @enum {string}
          */
         ExecutionEnvironment: "linux_ssh";
+        /**
+         * FindingPage
+         * @description One bounded finding page for one explicitly named server.
+         */
+        FindingPage: {
+            /** Server Id */
+            server_id: string;
+            /** Findings */
+            findings: components["schemas"]["FindingView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * FindingView
+         * @description One derived condition (0007 ``observation_findings`` row).
+         *
+         *     ``open`` is derived from ``resolved_at is null``; ``context_ref`` is
+         *     the chat-usable ``finding:<uuid>`` reference the notification service
+         *     anchors notices on.
+         */
+        FindingView: {
+            /** Finding Id */
+            finding_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Application Id */
+            application_id: string | null;
+            /** Observation Id */
+            observation_id: string | null;
+            /** Kind */
+            kind: string;
+            /** Dedup Key */
+            dedup_key: string;
+            /** Severity */
+            severity: string;
+            /** Summary */
+            summary: string;
+            /** Detail */
+            detail: string | null;
+            /** Opened At */
+            opened_at: string;
+            /** Updated At */
+            updated_at: string;
+            /** Resolved At */
+            resolved_at: string | null;
+            /** Open */
+            open: boolean;
+            /** Context Ref */
+            context_ref: string;
+        };
         /**
          * FirePage
          * @description One bounded fire-ledger page for one explicitly named schedule.
@@ -2658,6 +3019,62 @@ export interface components {
             sha256: string;
         };
         /**
+         * ObservationPage
+         * @description One bounded observation page for one explicitly named server.
+         */
+        ObservationPage: {
+            /** Server Id */
+            server_id: string;
+            /** Observations */
+            observations: components["schemas"]["ObservationView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ObservationView
+         * @description One collected health sample (0007 ``server_observations`` row).
+         *
+         *     ``freshness`` is derived at request time (``fresh`` | ``stale`` |
+         *     ``unknown``) — C08 rule 6 truthful states; ``context_ref`` is the
+         *     chat-usable ``observation:<uuid>`` reference (bounded, never a
+         *     payload). ``metric``/``value``/``observed_at`` are ``null`` exactly
+         *     when the sample quality is ``unknown`` (schema CHECK).
+         */
+        ObservationView: {
+            /** Observation Id */
+            observation_id: string;
+            /** Server Id */
+            server_id: string;
+            /** Application Id */
+            application_id: string | null;
+            /** Source */
+            source: string;
+            /** Method */
+            method: string;
+            /** Quality */
+            quality: string;
+            /** Metric */
+            metric: string | null;
+            /** Value */
+            value: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Collected At */
+            collected_at: string;
+            /** Fresh Until */
+            fresh_until: string | null;
+            /** Freshness */
+            freshness: string;
+            /** Seq */
+            seq: number;
+            /** Context Ref */
+            context_ref: string;
+        };
+        /**
          * ObservedApplicationView
          * @description One observed application; ``managed`` ONLY with an adopted id.
          */
@@ -2865,6 +3282,25 @@ export interface components {
             revision: number;
             /** Denied Capabilities */
             denied_capabilities: string[];
+        };
+        /**
+         * PolicyView
+         * @description The effective notification routing policy (see module docstring).
+         *
+         *     ``cooldown_seconds`` is the re-delivery cooldown in whole seconds;
+         *     ``quiet_hours`` is always ``null`` in v1 (no outbound delivery to
+         *     defer); ``channels_by_severity`` maps the frozen severity vocabulary
+         *     to its (empty) outbound routes — inbox-only delivery.
+         */
+        PolicyView: {
+            /** Cooldown Seconds */
+            cooldown_seconds: number;
+            /** Quiet Hours */
+            quiet_hours: null;
+            /** Channels By Severity */
+            channels_by_severity: {
+                [key: string]: string[];
+            };
         };
         /** PortBindingView */
         PortBindingView: {
@@ -7661,6 +8097,507 @@ export interface operations {
                 };
             };
             /** @description Skills service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_notification_policy_api_v1_monitoring_notification_policy_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_observations_api_v1_monitoring_servers__server_id__observations_get: {
+        parameters: {
+            query?: {
+                application_id?: string | null;
+                source?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObservationPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_observation_api_v1_monitoring_servers__server_id__observations__observation_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                observation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObservationView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No observation for this id in this server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_findings_api_v1_monitoring_servers__server_id__findings_get: {
+        parameters: {
+            query?: {
+                open?: boolean | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FindingPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    evaluate_findings_route_api_v1_monitoring_servers__server_id__findings_evaluate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvaluateResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Notification evaluation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_finding_api_v1_monitoring_servers__server_id__findings__finding_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                finding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FindingView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No finding for this id in this server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_notifications_api_v1_monitoring_servers__server_id__notifications_get: {
+        parameters: {
+            query?: {
+                unacknowledged?: boolean | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No notice for this id in this server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    acknowledge_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No notice for this id in this server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Monitoring service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
