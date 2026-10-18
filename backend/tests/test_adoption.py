@@ -82,13 +82,14 @@ ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain (exclusive migration-chain resource). Chain-tip
-# reconciliation (this card owns 0006): the tip constants are advanced here;
-# later chain appenders advance them again in their own files.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006")
+# reconciliation (card 10-observation-schema owns 0007): the tip constants
+# are advanced here; later chain appenders advance them again in their own
+# files.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
-# The exact public application schema at the 0006 tip: the 0005 set (test
-# Job-schema reconciliation) plus this card's two tables — nothing else, in
-# particular no engine-shadowing run-state table (C05 rule 1).
+# The exact public application schema at the 0007 tip: the 0006 set plus
+# the three observation-domain tables — nothing else, in particular no
+# engine-shadowing run-state table (C05 rule 1).
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -106,6 +107,9 @@ EXPECTED_APP_TABLES = frozenset(
         "knowledge_doc_chunks",
         "application_projection",
         "application_projection_journal",
+        "server_observations",
+        "observation_findings",
+        "notification_alerts",
     }
 )
 
@@ -136,7 +140,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0006``."""
+    """Disposable fixture database migrated from zero through ``0007``."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -148,13 +152,16 @@ def migrated_url() -> str:
     try:
         with psycopg.connect(url) as conn:
             conn.execute(
-                "DROP TABLE IF EXISTS application_projection_journal, "
+                "DROP TABLE IF EXISTS notification_alerts, "
+                "observation_findings, server_observations, "
+                "application_projection_journal, "
                 "application_projection, knowledge_doc_chunks, "
                 "knowledge_documents, job_schedule_fires, job_schedules, "
                 "job_events, job_steps, job_runs, approvals, "
                 "profile_projection_journal, profile_projection, "
                 "admin_sessions, admin_credential, alembic_version"
             )
+            conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
             conn.commit()
         command.upgrade(_alembic_config(), "head")
     finally:

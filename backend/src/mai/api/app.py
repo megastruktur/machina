@@ -78,6 +78,7 @@ from mai.api.documents import (
 from mai.api.grants import register_grants
 from mai.api.jobs import register_jobs
 from mai.api.models import register_models
+from mai.api.monitoring import register_monitoring
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
@@ -464,6 +465,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # the reviewed plugin-store/native/mcp/skills producers. No
     # installation endpoint exists by design (C03 rule 7).
     register_plugins(app)
+    # The monitoring surface (C10 rules 3/4): bounded server-scoped
+    # observation/finding queries with derived freshness, the
+    # evidence-preserving notification ack, the findings re-evaluation
+    # through the reviewed notifications producer and the effective
+    # routing-policy view — all over the 0007 schema; no collection or
+    # delivery effect ever runs in a route.
+    register_monitoring(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
