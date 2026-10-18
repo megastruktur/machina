@@ -119,13 +119,23 @@ def test_both_images_build_from_repo_root_contexts(rendered: dict) -> None:
         assert (REPO_ROOT / rel).is_file(), rel
 
 
-def test_no_service_publishes_a_host_port(rendered: dict) -> None:
+def test_only_mai_proxy_publishes_loopback_http(rendered: dict) -> None:
+    """C08 rule 3 / auth ADR §6 (M-1 topology): mai-proxy is the single
+    TLS-terminating reverse proxy and the ONLY service allowed to publish a
+    host port — on the loopback interface, plain HTTP (TLS lives at the
+    Tailscale serve layer). Everything else stays Compose-internal."""
     published = {
         name: svc.get("ports")
         for name, svc in rendered["services"].items()
         if svc.get("ports")
     }
-    assert published == {}, f"services with host ports: {sorted(published)}"
+    assert set(published) == {"mai-proxy"}, f"services with host ports: {sorted(published)}"
+    ports = published["mai-proxy"]
+    assert len(ports) == 1, ports
+    port = ports[0]
+    assert port["host_ip"] == "127.0.0.1", port
+    assert port["published"] == "8390", port
+    assert port["target"] == 80, port
 
 
 def test_postgres_is_pinned_pgvector_with_persistent_volume(rendered: dict) -> None:
@@ -145,11 +155,19 @@ def test_state_lives_in_named_volumes_never_host_binds(rendered: dict) -> None:
     declared = set(rendered["volumes"])
     for name, svc in rendered["services"].items():
         for mount in svc.get("volumes", []):
+            # M-1 (C03 rule 6): the single sanctioned host bind is the
+            # read-only EnvResolver credential file on mai-api/mai-worker —
+            # an absolute host path that must exist with mode 600 BEFORE up.
+            if name in ("mai-api", "mai-worker") and mount.get("target") == "/run/secrets/mai-credentials.env":
+                assert mount["type"] == "bind", (name, mount)
+                assert mount["read_only"] is True, (name, mount)
+                assert str(mount["source"]).startswith("/"), (name, mount)
+                continue
             assert mount["type"] == "volume", f"{name}: host bind mount {mount}"
             assert mount["source"] in declared, f"{name}: undeclared volume {mount}"
     assert {"postgres-data", "mai-data"} <= declared
     api = rendered["services"]["mai-api"]
-    targets = {m["target"]: m["source"] for m in api["volumes"]}
+    targets = {m["target"]: m["source"] for m in api["volumes"] if m["type"] == "volume"}
     assert api["environment"]["MAI_DATA_ROOT"] == "/var/lib/mai"
     assert targets["/var/lib/mai"] == "mai-data"
 
@@ -169,7 +187,9 @@ def test_worker_is_explicit_disabled_by_default_and_honest(
 ) -> None:
     # Held disabled: the DEFAULT rendered start set does not contain it.
     assert "mai-worker" not in rendered_default["services"]
-    assert {"postgres", "mai-api", "mai-web"} == set(rendered_default["services"])
+    # M-1: the default start set = core trio + mai-proxy (the single
+    # TLS-side publisher of the topology, always on).
+    assert {"postgres", "mai-api", "mai-web", "mai-proxy"} == set(rendered_default["services"])
     worker = rendered["services"]["mai-worker"]
     # Profile-gated: only `docker compose --profile worker …` may start it.
     assert worker.get("profiles") == ["worker"]
@@ -193,15 +213,24 @@ def test_api_wires_internal_postgres_over_the_compose_network(rendered: dict) ->
     assert url.path == "/mai"
     assert url.password == FIXTURE_PASSWORD  # interpolation actually resolves
     assert api["depends_on"]["postgres"]["condition"] == "service_healthy"
-    assert set(api["networks"]) == {"mai"}
+    # M-1: mai-api joins the external infra network to reach litellm by
+    # container name (http://litellm:4000/v1); everything else stays `mai`.
+    assert set(api["networks"]) == {"mai", "net-infra"}
     assert set(rendered["services"]["postgres"]["networks"]) == {"mai"}
 
 
 def test_missing_required_password_fails_the_render() -> None:
-    """Negative control: without the .env credential the topology fails closed."""
+    """Negative control: without the .env credential the topology fails closed.
+
+    M-1 note: the repo directory now carries a real production .env, and
+    compose reads interpolation variables from it. Setting the variable to
+    an EMPTY string in the process environment (which outranks .env) keeps
+    this negative control deterministic: `${VAR:?}` fires when unset OR
+    empty, so the render must fail closed either way."""
     if not _docker_available():
         pytest.skip("docker CLI not available")
     env = {k: v for k, v in os.environ.items() if k != "MAI_POSTGRES_PASSWORD"}
+    env["MAI_POSTGRES_PASSWORD"] = ""
     proc = subprocess.run(
         _compose_args("config", "--format", "json"),
         capture_output=True,

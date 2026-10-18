@@ -173,8 +173,14 @@ def test_search_pair_is_internal_only_and_publishes_nothing(
         svc = rendered["services"][name]
         assert not svc.get("ports"), name
         assert set(svc["networks"]) == {"mai"}, name
-    # The default-set no-port guarantee from 01-compose keeps holding.
+    # The default-set guarantee from 01-compose keeps holding, now that the
+    # topology ships mai-proxy (M-1): the ONLY publisher is mai-proxy itself
+    # on the loopback interface; every other default service stays internal.
     for name, svc in rendered_default["services"].items():
+        if name == "mai-proxy":
+            ports = svc["ports"]
+            assert len(ports) == 1 and ports[0]["host_ip"] == "127.0.0.1", name
+            continue
         assert not svc.get("ports"), name
 
 
@@ -238,6 +244,9 @@ def test_missing_search_secret_renders_empty_and_refuses_to_start() -> None:
         pytest.skip("docker CLI not available")
     env = {k: v for k, v in os.environ.items() if k != "SEARXNG_SECRET"}
     env["MAI_POSTGRES_PASSWORD"] = FIXTURE_PASSWORD
+    # Empty override outranks the repo .env (present since M-1) so this
+    # negative control stays deterministic.
+    env["SEARXNG_SECRET"] = ""
     proc = subprocess.run(
         _compose_args("config", "--format", "json", profile="search"),
         capture_output=True,

@@ -284,7 +284,7 @@ for name in sorted(entries):
 }
 
 cmd_backup() {
-	local data_root='' env_file='' output='' compose_file="$REPO_ROOT/compose.yaml" project=mai
+	local data_root='' env_file='' output='' compose_file="$REPO_ROOT/compose.yaml" project=machina
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--data-root) data_root=$2; shift 2 ;;
@@ -406,7 +406,7 @@ load_dump() { # load_dump <container> <database> <dump.sql.gz>
 }
 
 cmd_restore() {
-	local archive='' data_root='' compose_file="$REPO_ROOT/compose.yaml" project=mai
+	local archive='' data_root='' compose_file="$REPO_ROOT/compose.yaml" project=machina
 	[ $# -ge 1 ] || { usage >&2; return "$ERR_USAGE"; }
 	archive=$1; shift
 	while [ $# -gt 0 ]; do

@@ -222,7 +222,11 @@ def test_memory_lane_stays_internal_and_grants_nothing(rendered: dict) -> None:
     for name in ("hindsight", "hindsight-db-init"):
         svc = rendered["services"][name]
         assert not svc.get("ports"), f"{name} publishes {svc.get('ports')}"
-        assert set(svc.get("networks", {})) == {"mai"}, name
+        # M-1: hindsight also joins the external net-infra network to reach
+        # the LiteLLM gateway (extraction LLM + embeddings) by container
+        # name; hindsight-db-init stays on `mai` only.
+        expected = {"mai", "net-infra"} if name == "hindsight" else {"mai"}
+        assert set(svc.get("networks", {})) == expected, name
         assert svc.get("privileged") in (None, False), name
         assert not svc.get("pid"), name
         assert svc.get("user") not in ("root", "0", "0:0"), name
@@ -300,6 +304,9 @@ def test_missing_postgres_password_fails_the_render() -> None:
     """Negative control: without the .env credential the topology fails closed
     even for consumers that only asked for the memory profile."""
     env = {k: v for k, v in os.environ.items() if k != "MAI_POSTGRES_PASSWORD"}
+    # Empty override outranks the repo .env (present since M-1) so this
+    # negative control stays deterministic.
+    env["MAI_POSTGRES_PASSWORD"] = ""
     proc = subprocess.run(
         _compose_args("config", "--format", "json", profile="memory"),
         capture_output=True, text=True, cwd=REPO_ROOT, env=env, timeout=120,

@@ -196,18 +196,33 @@ def test_worker_secrets_and_mounts_are_scoped(rendered: dict) -> None:
     worker = rendered["services"]["mai-worker"]
     # Exactly the one database URL (fail-closed interpolation — the rendered
     # value is resolved, the requirement is proven by the negative render
-    # below), the explicit data root, and the handler registration list.
+    # below), the explicit data root, the handler registration list, and the
+    # M-1 credential source pointer (C03 rule 6: MAI_ENV_FILE names the
+    # EnvResolver file; the credential material itself lives in that file,
+    # never in the compose environment).
     assert set(worker["environment"]) == {
         "MAI_DATABASE_URL",
         "MAI_DATA_ROOT",
         "MAI_WORKER_HANDLERS",
+        "MAI_ENV_FILE",
     }
-    # Scoped data mount only; no Docker socket, no host binds.
-    assert {m["type"] for m in worker["volumes"]} == {"volume"}
-    mounts = {m["target"]: m["source"] for m in worker["volumes"]}
+    # Scoped data volume + the single sanctioned read-only credential bind.
+    credential_bind = [
+        m for m in worker["volumes"]
+        if m.get("target") == "/run/secrets/mai-credentials.env"
+    ]
+    assert len(credential_bind) == 1, worker["volumes"]
+    assert credential_bind[0]["type"] == "bind"
+    assert credential_bind[0]["read_only"] is True
+    assert str(credential_bind[0]["source"]).startswith("/")
+    mounts = {
+        m["target"]: m["source"]
+        for m in worker["volumes"] if m["type"] == "volume"
+    }
     assert set(mounts) == {"/var/lib/mai"}
     assert mounts["/var/lib/mai"] == "mai-data"
-    assert set(worker["networks"]) == {"mai"}
+    # M-1: worker joins net-infra alongside `mai` to reach litellm.
+    assert set(worker["networks"]) == {"mai", "net-infra"}
 
 
 def test_worker_readiness_restart_and_shutdown_are_real(rendered: dict) -> None:
@@ -238,6 +253,9 @@ def test_worker_without_db_credential_fails_closed() -> None:
     if not _docker_available():
         pytest.skip("docker CLI not available")
     env = {k: v for k, v in os.environ.items() if k != "MAI_POSTGRES_PASSWORD"}
+    # Empty override outranks the repo .env (present since M-1) so this
+    # negative control stays deterministic.
+    env["MAI_POSTGRES_PASSWORD"] = ""
     proc = subprocess.run(
         _compose_args("config", "--format", "json", profile="worker"),
         capture_output=True,

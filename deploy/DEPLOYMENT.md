@@ -27,6 +27,7 @@ Tailscale serve (svc:machina, TLS)
 | Machina Postgres Password | `MAI_POSTGRES_PASSWORD` (compose .env / Komodo var) |
 | Machina LiteLLM Key | LiteLLM virtual key `machina` (unrestricted); `MAI_GATEWAY_KEY` in the EnvResolver file; hindsight LLM+embeddings keys |
 | Machina Admin Password | `MAI_ADMIN_PASSWORD` (first-admin bootstrap; remove after bootstrap) |
+| Machina SearXNG Secret | `SEARXNG_SECRET` (search profile entrypoint guard) |
 
 - Compose `.env` at the repo dir is mode 600, gitignored (Komodo writes its
   own copy in `/etc/komodo/stacks/machina/.env` from Stack env + Variables).
@@ -41,6 +42,9 @@ Tailscale serve (svc:machina, TLS)
 ## Source of truth / GitOps
 
 - Upstream: `git@github.com:megastruktur/machina.git` (branch `master`).
+- Compose carries NO top-level `name:` — the project name is `machina`
+  everywhere (Komodo `project_name`, repo dir default, backup-restore.sh
+  default), per the verified stack convention.
 - **Forgejo mirror**: `http://192.168.3.23:3300/megaserver/machina`
   (private; `komodo-ro` has read). Komodo clones ONLY from Forgejo.
 - Refresh mirror after GitHub pushes:

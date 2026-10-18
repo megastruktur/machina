@@ -45,7 +45,11 @@
 #
 # Build contexts are the repository root; the single root `.dockerignore`
 # re-includes only the real image inputs.
-name: mai
+#
+# No top-level `name:`: the Komodo convention (verified on transcripter/llm
+# stacks) keeps the compose project name equal to the stack name. Komodo sets
+# `-p machina` from its Stack config; local runs fall back to the directory
+# name (`machina`). scripts/backup-restore.sh defaults to the same.
 
 services:
   postgres:
