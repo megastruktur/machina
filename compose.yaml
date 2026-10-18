@@ -87,9 +87,10 @@ services:
       MAI_TRUSTED_PROXIES: "${MAI_TRUSTED_PROXIES:?MAI_TRUSTED_PROXIES must be set in the Compose .env}"
       # Application credential source (C03 rule 6): the EnvResolver file
       # holds credential material (MAI_GATEWAY_KEY etc.); the compose .env
-      # never carries it. Absolute host path — must exist on the host with
-      # mode 600 before `up`.
-      MAI_ENV_FILE: "${MAI_ENV_FILE:?MAI_ENV_FILE must be set in the Compose .env}"
+      # never carries it. In-container path (the read-only mount target
+      # below) — the host path from ${MAI_ENV_FILE} is only the bind
+      # source, never a valid path inside the container (M-2 bring-up).
+      MAI_ENV_FILE: /run/secrets/mai-credentials.env
       # First-admin bootstrap (auth ADR §3): read once at startup and
       # dropped after hashing; unset after the first successful bootstrap.
       MAI_ADMIN_PASSWORD: "${MAI_ADMIN_PASSWORD:-}"
@@ -134,8 +135,8 @@ services:
       MAI_WORKER_HANDLERS: "mai.jobs.steps,mai.jobs.schedules"
       # Same credential/origin contract as mai-api: the worker resolves
       # credential references (model connections, embeddings) through the
-      # EnvResolver file at MAI_ENV_FILE (C03 rule 6).
-      MAI_ENV_FILE: "${MAI_ENV_FILE:?MAI_ENV_FILE must be set in the Compose .env}"
+      # EnvResolver file at the in-container mount target (C03 rule 6).
+      MAI_ENV_FILE: /run/secrets/mai-credentials.env
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path.
