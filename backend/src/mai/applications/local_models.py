@@ -731,7 +731,9 @@ def _parse_model_list(stdout: str) -> list[dict[str, object]] | None:
 
     Accepts the OpenAI shape (``{"data": [...]}``) and the native daemon
     shape (``{"models": [...]}``); every entry must be a mapping with a
-    string id/name.
+    string id/name. A key present with JSON ``null`` (the REAL fresh
+    daemon's ``{"object":"list","data":null}`` while no weights exist) is
+    the valid empty list; a MISSING key is not parseable (fail closed).
     """
     try:
         document = json.loads(stdout)
@@ -740,9 +742,11 @@ def _parse_model_list(stdout: str) -> list[dict[str, object]] | None:
     if not isinstance(document, Mapping):
         return None
     for key in ("data", "models"):
-        entries = document.get(key)
-        if entries is None:
+        if key not in document:
             continue
+        entries = document[key]
+        if entries is None:
+            return []
         if not isinstance(entries, list):
             return None
         parsed: list[dict[str, object]] = []

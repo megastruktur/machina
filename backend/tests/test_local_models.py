@@ -1569,6 +1569,38 @@ async def test_nt_garbage_endpoint_body_rolls_back(tmp_path: Path) -> None:
     assert any("body was not a model list" in note for note in result.notes)
 
 
+def test_real_fresh_daemon_null_data_body_is_an_empty_model_list() -> None:
+    """The REAL pinned ollama daemon (v0.40.6) answers a fresh install with
+    ``{"object":"list","data":null}`` — present-but-null is the valid empty
+    list, never garbage (11-verify fix-1 regression)."""
+    assert local_models._parse_model_list('{"object":"list","data":null}') == []
+    # The native shape carries the same present-null convention.
+    assert local_models._parse_model_list('{"models":null}') == []
+    # A genuinely missing list key stays unparseable (fail closed).
+    assert local_models._parse_model_list('{"object":"list"}') is None
+
+
+@pytest.mark.anyio
+async def test_install_accepts_real_fresh_daemon_null_data_endpoint(
+    tmp_path: Path,
+) -> None:
+    """The full completion gate verifies against the REAL fresh daemon
+    answer: a 200 ``{"object":"list","data":null}`` body is a served (empty)
+    model list — the install completes instead of rolling back."""
+    recipe = _recipe()
+    target = _FakeTarget()
+    target.models_body = '{"object":"list","data":null}'
+    service, approvals = _service(target, recipe, model_root=tmp_path)
+
+    result = await service.install_service(_install_request(recipe))
+
+    assert result.status == "succeeded"
+    assert result.endpoint_verified is True
+    assert result.reason is None
+    assert target.down_calls == 0  # no rollback of a genuinely healthy install
+    assert approvals.consume_calls == 1
+
+
 @pytest.mark.anyio
 async def test_nt_port_conflict_refuses(tmp_path: Path) -> None:
     recipe = _recipe()
