@@ -1,0 +1,115 @@
+# MAI maintained-catalogue recipe: first self-hosted LOCAL INFERENCE service
+# (card 11-model-recipe; validated by backend/tests/test_inference_recipe.py
+# through the canonical recipe schema frozen by 08-recipe-schema, C09 rule 2).
+#
+# User-approved backend/hardware target (acceptance 1)
+# ----------------------------------------------------
+# Backend: ollama v0.40.6, digest-pinned below. Chosen because it is the only
+# curated candidate whose image default entrypoint actually SERVES models
+# from a mounted volume under the frozen recipe shape (schema v1 has no
+# command/entrypoint/env field):
+#   - `ollama serve` starts with zero arguments and serves the OpenAI-
+#     compatible endpoints on container port 11434 (verified on this exact
+#     digest: GET / -> 200 "Ollama is running", GET /v1/models -> 200 OpenAI
+#     list, GET /api/version -> {"version":"0.40.6"}).
+#   - Models are served from the volume mounted at /root/.ollama; weights are
+#     acquired INTO the volume by an explicit admin action AFTER install
+#     (`ollama pull` from the ollama library, or an offline import of a
+#     user-provided GGUF). Nothing about model weights is downloaded,
+#     provisioned or mutated by the deployment plan itself.
+# Rejected candidates (probed 2026-10-18, provenance in
+# mai_evidence/11-model-recipe/):
+#   - ghcr.io/ggml-org/llama.cpp:server (b11706) ships curl and answers
+#     /health and /v1/models, but its bare router loads zero models and has
+#     no schema-expressible loading path: --models-dir defaults to disabled,
+#     POST /models/apply answers "File Not Found" even for an existing file
+#     inside a mounted model directory, and models are only reachable via
+#     CLI args (no such recipe field) or LLAMA_ARG_MODELS_DIR (no such
+#     recipe field). A recipe for it would deploy a hollow endpoint that
+#     can never serve a model.
+#   - localai/localai:latest (v4.x core, 1.2 GiB) ships curl and answers
+#     /readyz and /v1/models, but /backends is EMPTY in the image: serving
+#     any model requires a runtime gallery backend download, which is a
+#     mandatory network acquisition the recipe surface cannot bound or
+#     budget. The aio-cpu variant (3.5 GiB compressed) bakes backends but
+#     was not pinned because the CPU-only target then pays for backends it
+#     cannot use while still needing the YAML+restart model format.
+# Image facts (registry-verified 2026-10-18; provenance in
+# mai_evidence/11-model-recipe/):
+#   - the pinned digest is the multi-arch OCI index for tag 0.40.6
+#     (linux amd64 + arm64). ONLY x86_64 is declared below: the approved v1
+#     hardware target is x86_64; planning for aarch64 is refused
+#     (unsupported_target_arch) until a separate approval reconciles it.
+#   - unpacked size 9.37 GiB (the image bundles CUDA/ROCm runner libraries;
+#     compressed ~3.6 GiB amd64). This is the deliberate price of the
+#     zero-argument default entrypoint and is covered by the disk budget
+#     token below.
+#   - the image contains NO curl binary, and the schema renders any declared
+#     health section as an argv `CMD curl ...` healthcheck that would fail
+#     forever inside this container. The recipe therefore declares NO health
+#     section: per the frozen schema the plan marks deployment success
+#     UNVERIFIED (honest absence, never a fake check). Endpoint truth is
+#     established by the C06 model-connection consumer and the runner task
+#     probing GET /v1/models on the published port.
+#
+# Model source/license and download budget (acceptance 1 + 2)
+# -----------------------------------------------------------
+# Model source: the ollama model library or a user-provided GGUF acquired
+# from its upstream publisher, placed into the `models` volume after
+# install. License responsibility is per-model and belongs to the explicit
+# admin acquisition action; this recipe pre-authorizes NO model, NO license
+# and NO model download (the plan operation vocabulary has no such op).
+# Download budget (explicit, user-approved):
+#   - at MAI setup: ZERO (this catalogue entry installs nothing by itself);
+#   - at install: the pinned image pull only, <= 10 GiB unpacked;
+#   - per model acquisition: weights <= 5 GiB (up to ~8B-class Q4_K_M),
+#     plus at most one backend copy already inside the pinned image.
+#   - disk budget token hw.disk.30gb = 10 GiB image + 5 GiB weights +
+#     15 GiB working/KV/headroom.
+#
+# Hardware/VRAM/RAM/disk prerequisite schema
+# ------------------------------------------
+# Prerequisite names are checkable TOKENS the executor's verify_prerequisites
+# operation must satisfy BEFORE any other plan operation (frozen op order,
+# C09 rule 3) - so unsupported hardware fails before any download or start
+# (acceptance 2). Token grammar for model-serving recipes (frozen by the
+# test module): hw.arch.<arch>, hw.cpu.<feature>, hw.ram.<N>gb,
+# hw.vram.<N>gb (reserved for a future GPU-target revision; the CPU-only v1
+# target must not declare it), hw.disk.<N>gb. Check semantics (producer-
+# defined by test_inference_recipe.py, fail-closed on unknown tokens):
+#   hw.arch.x86_64  target reports machine x86_64
+#   hw.cpu.avx2     /proc/cpuinfo flags contain avx2 (CPU inference minimum)
+#   hw.ram.16gb     MemTotal >= 16 GiB (weights + KV cache + OS headroom)
+#   hw.disk.30gb    >= 30 GiB free on the Docker data root (see budget above)
+schema_version: 1
+name: local-inference
+supported_environment:
+  os:
+    - linux
+  arch:
+    - x86_64
+prerequisites:
+  - docker
+  - hw.arch.x86_64
+  - hw.cpu.avx2
+  - hw.ram.16gb
+  - hw.disk.30gb
+required_grants:
+  - docker.compose
+deploy:
+  image: docker.io/ollama/ollama@sha256:265409e1d931028a8f7d5a32bcbafddd7bffbc6cc629d77efe9560adf692a5e7
+  ports:
+    - host: 18114
+      container: 11434
+      protocol: tcp
+  volumes:
+    - name: models
+      container_path: /root/.ollama
+update:
+  migrations: none
+removal:
+  data_policy: keep
+recovery:
+  image_rollback: true
+backup:
+  required: false
