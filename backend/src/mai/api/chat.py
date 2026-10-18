@@ -80,7 +80,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final
+from typing import Annotated, Final
 
 from dbos import error as dbos_error
 from fastapi import APIRouter, FastAPI, Query, Request, Response
@@ -141,6 +141,12 @@ from mai.api.jobs import (
     _wire_ts,
 )
 from mai.api.servers import resolve_profiles_root
+from mai.applications.service_map import (
+    INSTRUCTION_KEYS,
+    MAX_MATCHED_ENTRIES,
+    ServiceMapEntry,
+    ServiceMapStore,
+)
 from mai.auth.sessions import hash_token
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
@@ -174,9 +180,21 @@ __all__ = ["register_chat", "resolve_artifacts_root"]
 #: the administrator asked for, plus the value-free attachment handles.
 CHAT_SUBMITTED_EVENT_TYPE: Final[str] = "chat.submitted"
 
+#: The General Consult sentinel server id (``uuid.UUID(int=0)``): the
+#: conversation has NO target host (no server selected in the UI). Chat
+#: submits bound to it skip the canonical-profile binding (there is no
+#: host to bind) and pin revision 1; host-scoped attachments are
+#: rejected (General Consult names no target).
+GLOBAL_CONSULT_SERVER_ID: Final[str] = "00000000-0000-0000-0000-000000000000"
+
 #: The default conversation role (single-administrator product; C06
 #: rule 2's role line). Overridable per submit within the frozen bounds.
 DEFAULT_ROLE: Final[str] = "administrator"
+
+#: One immutable ``@service`` chip: a Service Map lookup key (matched
+#: case-insensitively against application_id/name/unit_name/
+#: compose_project). Bounded like every other transport field.
+ServiceTag = Annotated[str, Field(min_length=1, max_length=128)]
 
 #: Attachment bounds. Per-artifact and aggregate read budgets mirror the
 #: logs capability's per-stream output budget; the count cap is the
@@ -280,7 +298,7 @@ class ChatSubmitBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str
-    server_id: str
+    server_id: str = GLOBAL_CONSULT_SERVER_ID
     message: str = Field(min_length=1, max_length=agent_run.MAX_TASK_CHARS)
     profile: str = Field(min_length=1, max_length=200)
     connection: str | None = Field(default=None, max_length=200)
@@ -296,6 +314,7 @@ class ChatSubmitBody(BaseModel):
     attachments: list[AttachmentBody] = Field(
         default_factory=list, max_length=MAX_ATTACHMENTS
     )
+    service_tags: list[ServiceTag] = Field(default_factory=list, max_length=16)
 
 
 class ChatCancelBody(BaseModel):
@@ -322,10 +341,15 @@ class AttachmentView(BaseModel):
 
 
 class ConversationView(RunView):
-    """One conversation: the run view plus its recorded references."""
+    """One conversation: the run view plus its recorded references.
+
+    ``service_tags`` are the immutable ``@service`` chips recorded at
+    submission (read back from the run's ``chat.submitted`` record).
+    """
 
     attachments: list[AttachmentView] = Field(default_factory=list)
     children: list[RunView] = Field(default_factory=list)
+    service_tags: list[str] = Field(default_factory=list)
 
 
 class ChatCreated(BaseModel):
@@ -494,8 +518,13 @@ def _dedup_preserving_order(values: list[str]) -> tuple[str, ...]:
 
 
 def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
-    """The canonical whole-submission document (the dedup digest input)."""
-    return {
+    """The canonical whole-submission document (the dedup digest input).
+
+    ``service_tags`` participates in the digest ONLY when non-empty, so
+    submissions without tags produce the exact same digest they always
+    did (backward compatible; the tags are immutable per run).
+    """
+    document: dict[str, object] = {
         "run_id": body.run_id,
         "server_id": body.server_id,
         "message": body.message,
@@ -524,6 +553,32 @@ def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
             for item in body.attachments
         ],
     }
+    if body.service_tags:
+        document["service_tags"] = list(body.service_tags)
+    return document
+
+
+def _service_details_appendix(entries: list[ServiceMapEntry]) -> str:
+    """The structured Service Map context appended to the agent task.
+
+    Each matched entry contributes its identity, category, description
+    and operational runbook (install/update/uninstall/backup/verify) —
+    the agent's grounded service knowledge for the tagged conversation.
+    """
+    lines = ["", "## Service map context (@service tags)", ""]
+    for entry in entries:
+        lines.append(
+            f"### {entry.name} — category `{entry.category}`, "
+            f"origin `{entry.origin}` (id {entry.application_id})"
+        )
+        if entry.description:
+            lines.append(entry.description)
+        for key in INSTRUCTION_KEYS:
+            value = getattr(entry.instructions, key)
+            if value:
+                lines.append(f"- {key}: {value}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _agent_document(
@@ -531,15 +586,32 @@ def _agent_document(
     run_id: str,
     server_id: str,
     context: ExecutionContext,
+    service_details: list[ServiceMapEntry] | None = None,
 ) -> dict[str, object]:
-    """The frozen agent-run intent document (the ONE producer's shape)."""
+    """The frozen agent-run intent document (the ONE producer's shape).
+
+    ``service_details`` (the resolved ``@service`` tags) enriches the
+    task text with the tagged services' map metadata + runbook. The
+    appendix is bounded to the producer's task limit: entries drop from
+    the tail until the enriched task fits (the tags stay recorded on the
+    submission either way).
+    """
+    task = body.message
+    if service_details:
+        entries = list(service_details[:MAX_MATCHED_ENTRIES])
+        while entries:
+            enriched = task + _service_details_appendix(entries)
+            if len(enriched) <= agent_run.MAX_TASK_CHARS:
+                task = enriched
+                break
+            entries.pop()
     document: dict[str, object] = {
         "v": agent_run.RUN_PAYLOAD_VERSION,
         "run_id": run_id,
         "server_id": server_id,
         "context": context.to_json(),
         "role": body.role,
-        "task": body.message,
+        "task": task,
         "connection": body.connection,
         "profile": body.profile,
     }
@@ -556,6 +628,7 @@ async def _record_chat_submission(
     handler: str,
     attachments: list[ResolvedAttachment],
     child_count: int,
+    service_tags: list[str],
     now: datetime,
 ) -> None:
     """Append the ``chat.submitted`` submission record (one transaction).
@@ -564,7 +637,9 @@ async def _record_chat_submission(
     shared writer appended those first), so the submission record exists
     exactly when the durable intent does. Seq follows the documented
     whole-stream discipline (``MAX(seq)+1``; the storage
-    ``UNIQUE (run_id, seq)`` is the backstop).
+    ``UNIQUE (run_id, seq)`` is the backstop). ``service_tags`` (the
+    immutable ``@service`` chips) are recorded on the event; readers
+    tolerate an absent key (submissions predating the field).
     """
     seq = (
         await session.execute(
@@ -585,6 +660,7 @@ async def _record_chat_submission(
             }
             for item in attachments
         ],
+        "service_tags": list(service_tags),
     }
     await session.execute(
         text(
@@ -698,6 +774,7 @@ async def _conversation_view(
         )
     child_states = await _child_states(factory, children_rows)
     attachments: list[AttachmentView] = []
+    service_tags: list[str] = []
     if submission_event is not None:
         data = submission_event["data"]
         if isinstance(data, Mapping):
@@ -711,6 +788,9 @@ async def _conversation_view(
                             bytes=int(item["bytes"]),  # type: ignore[arg-type]
                         )
                     )
+            raw_tags = data.get("service_tags") or []
+            if isinstance(raw_tags, list):
+                service_tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
     return ConversationView(
         **_run_view(row, state).model_dump(),
         attachments=attachments,
@@ -718,6 +798,7 @@ async def _conversation_view(
             _run_view(child, child_states.get(str(child["run_id"])))
             for child in children_rows
         ],
+        service_tags=service_tags,
     )
 
 
@@ -787,15 +868,32 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         run_id = validate_run_id(payload.run_id)
     except EngineError:
         return _validation_error(request, "run_id", "must be a canonical UUID string")
+    raw_server_id = payload.server_id.strip()
     try:
-        server_uuid = uuid.UUID(payload.server_id)
+        server_uuid = uuid.UUID(raw_server_id or GLOBAL_CONSULT_SERVER_ID)
     except ValueError:
         return _validation_error(
             request, "server_id", "must be a canonical UUID string"
         )
     server_id = str(server_uuid)
-    stored = _canonical_profile(request, server_uuid)
-    profile = parse_server_profile_text(stored.text)
+    general_consult = server_uuid == uuid.UUID(int=0)
+    if general_consult:
+        # General Consult has no target host: no canonical-profile
+        # binding (revisions pin to 1) and no host-scoped attachments.
+        if payload.attachments:
+            return _validation_error(
+                request,
+                "attachments",
+                "general consult names no target host; host-scoped "
+                "attachments are rejected",
+            )
+        profile_revision = 1
+        prompt_revision = 1
+    else:
+        stored = _canonical_profile(request, server_uuid)
+        profile = parse_server_profile_text(stored.text)
+        profile_revision = stored.revision
+        prompt_revision = profile.prompt_revision
 
     try:
         resolved_attachments = _resolve_attachments(
@@ -826,8 +924,8 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
             server_id=server_uuid,
             run_id=uuid.UUID(run_id),
             parent_scope=None,
-            profile_revision=str(stored.revision),
-            prompt_revision=str(profile.prompt_revision),
+            profile_revision=str(profile_revision),
+            prompt_revision=str(prompt_revision),
             credential_references=tuple(payload.credential_references),
             allowed_capabilities=capabilities,
             mode=payload.mode,
@@ -835,8 +933,25 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     except PolicyError as exc:
         return _validation_error(request, "context", exc.detail)
 
+    # The @service chips: resolve tagged services against the server's
+    # Service Map (when there IS a target host) and enrich the agent
+    # task with their map metadata + runbook instructions. An
+    # unavailable map store degrades to no enrichment — the submission
+    # itself is never blocked by the catalogue.
+    service_details: list[ServiceMapEntry] = []
+    if payload.service_tags and not general_consult:
+        map_store = getattr(request.app.state, "service_map", None)
+        if isinstance(map_store, ServiceMapStore):
+            service_details = list(
+                map_store.find_entries(server_uuid, payload.service_tags)
+            )
+
     agent_document = _agent_document(
-        body=payload, run_id=run_id, server_id=server_id, context=context
+        body=payload,
+        run_id=run_id,
+        server_id=server_id,
+        context=context,
+        service_details=service_details,
     )
     if payload.children:
         handler = agent_delegate.HANDLER_NAME
@@ -888,8 +1003,8 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                 session,
                 run_id=run_id,
                 server_id=server_id,
-                profile_revision=stored.revision,
-                prompt_revision=profile.prompt_revision,
+                profile_revision=profile_revision,
+                prompt_revision=prompt_revision,
                 model_profile=payload.profile,
                 requested_grants=sorted(capabilities),
                 digest=engine_digest,
@@ -904,6 +1019,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                     handler=handler,
                     attachments=resolved_attachments,
                     child_count=len(payload.children),
+                    service_tags=list(payload.service_tags),
                     now=now,
                 )
     if not created:
@@ -964,7 +1080,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     "/runs",
     status_code=HTTP_200_OK,
     response_model=ChatPage,
-    summary="List conversations for one explicit server scope (bounded page)",
+    summary="List conversations (bounded page; one server or all servers)",
     responses={
         HTTP_401_UNAUTHORIZED: {
             "model": ErrorEnvelope,
@@ -978,42 +1094,47 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
 )
 async def list_conversations(
     request: Request,
-    server_id: uuid.UUID,
+    server_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> Response:
-    """One bounded page of one server's conversations (C01 rules 5 and 7).
+    """One bounded page of root conversations (C01 rules 5 and 7).
 
-    Safe method: session layer only. Conversations are the ROOT runs
-    (depth 0); delegated children are reachable through their parent's
-    detail. States replay from the persisted transition events.
+    Safe method: session layer only. With an explicit ``server_id`` the
+    page is exactly that server's scope (the frozen C01 rule 7
+    behaviour); with ``server_id`` omitted the page lists recent ROOT
+    conversations across ALL servers (including General Consult), so the
+    Floating Chat History Selector can restore any session's server +
+    service tags. Conversations are the ROOT runs (depth 0); delegated
+    children are reachable through their parent's detail. States replay
+    from the persisted transition events.
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)
     factory = _sessions(request)
-    scope = str(server_id)
+    scope = None if server_id is None else str(server_id)
+    where = "depth = 0" if scope is None else "server_id = :s AND depth = 0"
     async with factory() as session:
         rows = list(
             (
                 await session.execute(
                     text(
                         f"SELECT {_RUN_COLUMNS} FROM job_runs "
-                        "WHERE server_id = :s AND depth = 0 "
+                        f"WHERE {where} "
                         "ORDER BY submitted_at DESC, run_id LIMIT :l OFFSET :o"
                     ),
-                    {"s": scope, "l": limit, "o": offset},
-                )
+                        {"s": scope, "l": limit, "o": offset}
+                        if scope is not None
+                        else {"l": limit, "o": offset},
+                    )
             )
             .mappings()
             .all()
         )
         total = (
             await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM job_runs "
-                    "WHERE server_id = :s AND depth = 0"
-                ),
-                {"s": scope},
+                text(f"SELECT COUNT(*) FROM job_runs WHERE {where}"),
+                {"s": scope} if scope is not None else {},
             )
         ).scalar_one()
         run_ids = [str(row["run_id"]) for row in rows]
