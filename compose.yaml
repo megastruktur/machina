@@ -34,6 +34,14 @@
 #   stack-owner opt-in because engine queries leave the host toward public
 #   upstream search engines (egress is deliberate, never a default-up side
 #   effect). They stay internal-only on the `mai` network.
+# - C07 rule 7 / knowledge-packaging ADR §2: `hindsight` is the bundled
+#   operational-memory service, profile-gated the same way (`--profile
+#   memory`): the default start set stays memory-free, and its LLM/embeddings
+#   configuration is a stack-owner decision injected from the Compose `.env`
+#   (deploy/hindsight/README.md). All Hindsight state lives in the dedicated
+#   `hindsight` database of the stack Postgres (its own pg_dump/backup
+#   namespace); the service itself keeps no volume. Internal only — API 8888,
+#   UI 9999, no published host port. Health/version transcripts: KB-H1.
 #
 # Build contexts are the repository root; the single root `.dockerignore`
 # re-includes only the real image inputs.
@@ -223,6 +231,104 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    networks:
+      - mai
+
+  # C07 rule 7 / knowledge-packaging ADR §2: bundled operational memory
+  # (image selected over in-process pip distributions; 11-dependencies froze
+  # that decision). Version pin: newest upstream image tag at integration
+  # (1.0.0, image built 2026-10-13, labels.version=1.0.0; PyPI hindsight-api
+  # 1.0.0 MIT — verified live). Same opt-in shape as the search pair:
+  # `--profile memory` starts it; the default start set stays memory-free.
+  # No `ports:` — API 8888 / UI 9999 stay internal to the `mai` network
+  # (acceptance 2); the adapter speaks HTTP over the compose network.
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:1.0.0
+    profiles:
+      - memory
+    environment:
+      # Own persistent namespace (acceptance 1): the dedicated `hindsight`
+      # database of the STACK Postgres (created idempotently by
+      # hindsight-db-init below; HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP
+      # default true then creates pgvector/pg_trgm/btree_gin + its tables
+      # there — measured on 1.0.0). The embedded pg0 store is rejected by
+      # ADR §2.5; this URL is the entire persistence story and the pg_dump
+      # boundary (C07 rule 3: banks are backed up, never silently rebuilt).
+      HINDSIGHT_API_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/hindsight"
+      # Retain/recall/reflect need an extraction LLM (ADR §2.5: hard
+      # auxiliary dependency). Render stays `docker compose config`-clean for
+      # consumers that never enable this profile — the .env values interpolate
+      # empty and UPSTREAM fails closed at container start instead: without a
+      # key for the selected provider the container exits 1 with
+      # "LLM API key is required. Set HINDSIGHT_API_LLM_API_KEY …"
+      # (measured on 1.0.0). Point LLM_BASE_URL at the same
+      # OpenAI-compatible gateway the backend uses; leave empty only for
+      # real OpenAI or a provider with a built-in base URL.
+      HINDSIGHT_API_LLM_PROVIDER: "${HINDSIGHT_API_LLM_PROVIDER:-openai}"
+      HINDSIGHT_API_LLM_MODEL: "${HINDSIGHT_API_LLM_MODEL:-}"
+      HINDSIGHT_API_LLM_BASE_URL: "${HINDSIGHT_API_LLM_BASE_URL:-}"
+      HINDSIGHT_API_LLM_API_KEY: "${HINDSIGHT_API_LLM_API_KEY:-}"
+      # ADR §2.4/§4: embeddings come from the SAME OpenAI-compatible gateway
+      # as the doc index — provider `openai`, `text-embedding-3-small`,
+      # native 1536 dims (no HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS
+      # override). Upstream defaults (`local`/`onnx`) are rejected for
+      # deployment parity: they download a model into the container and
+      # break the frozen one-dimension story (C07 rule 3).
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: text-embedding-3-small
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: "${HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:-}"
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: "${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}"
+    depends_on:
+      hindsight-db-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Same restart posture as mai-worker (stateful profile service): Docker
+    # brings it back after a crash/host reboot; a manual stop is honored.
+    # State is safe across restarts by construction — it lives in the
+    # Postgres `hindsight` database, never in the container (acceptance 2).
+    restart: unless-stopped
+    # start-all.sh traps SIGTERM and drains API + control plane cleanly; its
+    # own comment asks operators for a 30s grace period.
+    stop_grace_period: 30s
+    healthcheck:
+      # /health is upstream readiness: it fails when the database is
+      # unreachable (KB-H1), so a green probe means migrations ran and the
+      # dedicated namespace is actually reachable. Liveness-only /health/live
+      # would hide a dead DB connection behind a "healthy" badge.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - mai
+
+  # One-shot namespace provisioner for hindsight (memory profile only): the
+  # stack Postgres is shared, so the dedicated database must be created
+  # idempotently — safe on every `up`, including after the default set has
+  # been running for a long time (docker-entrypoint-initdb.d scripts would
+  # only fire on a fresh volume, which is exactly the "enabled memory later"
+  # case this must survive). Reuses the already-pinned pgvector image (no new
+  # dependency); the extensions themselves are created by Hindsight's own
+  # migrations inside the new database (measured: vector, pg_trgm, btree_gin).
+  hindsight-db-init:
+    image: pgvector/pgvector:0.8.1-pg18
+    profiles:
+      - memory
+    environment:
+      # Runtime-resolved only ($$): the password never lands in the init
+      # container's command line / inspect output, only in its environment.
+      MAI_POSTGRES_PASSWORD: "${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - >-
+        psql "postgresql://mai:$$MAI_POSTGRES_PASSWORD@postgres:5432/mai" -tAc "SELECT 1 FROM pg_database WHERE datname='hindsight'" | grep -q 1
+        || psql "postgresql://mai:$$MAI_POSTGRES_PASSWORD@postgres:5432/mai" -c "CREATE DATABASE hindsight"
     networks:
       - mai
 
