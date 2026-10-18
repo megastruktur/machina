@@ -777,6 +777,232 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{server_id}/memory/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Hindsight availability/version probe (KB-H1 adapter side)
+         * @description One honest availability probe; no bank content is touched.
+         *
+         *     Safe method: session layer only. The enrolled-target check still
+         *     applies (the probe names an explicit server scope), but no grant is
+         *     consumed: availability discloses no memory content.
+         */
+        get: operations["memory_status_api_v1_servers__server_id__memory_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/memory/recall": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recall cited historical context from the scoped bank
+         * @description One gated query through the producer's own recall executor.
+         *
+         *     The grant check runs the frozen evaluator for ``memory.recall`` on
+         *     the session-derived context BEFORE any provider I/O; the payload is
+         *     validated by the adapter (unknown fields, secret-shaped queries and
+         *     unlisted shared banks are refused before anything leaves the
+         *     process).
+         */
+        post: operations["memory_recall_api_v1_servers__server_id__memory_recall_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/memory/retain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retain items synchronously into the scoped bank
+         * @description Synchronous write with the adapter's real receipt (KB-H2).
+         *
+         *     The authenticated POST is itself the operator decision, so the
+         *     context runs in ``delegated`` mode (C03 rule 5: prompting behavior
+         *     within grants — no additional approval is promptable inside a
+         *     request). A failed retain answers the producer's ``unavailable``
+         *     document — never a fabricated success.
+         */
+        post: operations["memory_retain_api_v1_servers__server_id__memory_retain_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/memory/reflect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Bounded generated answer grounded in the scoped bank
+         * @description One gated reflect through the producer's reflect executor.
+         */
+        post: operations["memory_reflect_api_v1_servers__server_id__memory_reflect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/memory/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export the scoped bank manifest (backup-grade read)
+         * @description Bank READ (the ``memory.recall`` grant class): the manifest IS the
+         *     data; it passes through unmodified and can be large (ADR backup rule:
+         *     banks are backed up, never silently rebuilt).
+         */
+        get: operations["memory_export_api_v1_servers__server_id__memory_export_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/memory/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delete memories or a whole bank (explicit, scoped, receipted)
+         * @description Bank WRITE (the ``memory.retain`` grant class): the explicit
+         *     ``target`` decides memories-vs-bank; a wrong ``fact_type`` is a 422,
+         *     never an inferred deletion.
+         */
+        post: operations["memory_delete_api_v1_servers__server_id__memory_delete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/models/local/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview the plan and MEASURE real hardware prerequisites
+         * @description Plan + fail-closed prerequisite verdict from REAL target facts.
+         *
+         *     POST carries the frozen mutating-request boundary, but the route is
+         *     effect-free on both ends: no store write, no deployment, no weight
+         *     download — only the bounded read-only measurement commands
+         *     (``uname``/``/proc/cpuinfo``/``/proc/meminfo``/docker
+         *     version+info/``df``; ``nvidia-smi`` only when a ``hw.vram.*`` token
+         *     is declared). Unsatisfied or unmeasurable prerequisites are reported
+         *     honestly; the executor re-verifies fresh facts behind the full gate
+         *     chain before any effect.
+         */
+        post: operations["preview_model_install_api_v1_servers__server_id__models_local_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/models/local/{application_id}/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a bounded local-model service install intent (durable)
+         * @description Persist the install intent (``model.install`` step, C09 rule 3).
+         *
+         *     No download, no compose effect and no approval consumption ever
+         *     happens in this route: the worker's executor re-builds the SAME
+         *     deterministic plan (identical plan hash), refuses unsatisfied
+         *     hardware BEFORE the one-use approval is spent, and converges the
+         *     canonical manifest only on verified success. An ungranted target
+         *     leaves the disk untouched by construction — the durable intent is
+         *     refused at the worker's G2 gate.
+         */
+        post: operations["install_model_service_api_v1_servers__server_id__models_local__application_id__install_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/models/local/{application_id}/pull": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit one bounded weight pull + endpoint registration intent
+         * @description Persist one explicit acquisition + registration intent.
+         *
+         *     The pull IS the registration path: the executor's approval is bound
+         *     to THIS payload (model + license + recipe revision + identities —
+         *     one decision approves exactly one acquisition), the bounded lane's
+         *     cut is the cancellation (``outcome_unknown`` + lease fence), and the
+         *     C02 connection record is written only after the daemon really lists
+         *     the pulled model and the bounded tool-call probe has answered —
+         *     capabilities are reported honestly, never inferred from the model
+         *     name. There is no separate ungated registration route by design.
+         */
+        post: operations["pull_model_weights_api_v1_servers__server_id__models_local__application_id__pull_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/docs": {
         parameters: {
             query?: never;
@@ -2742,6 +2968,71 @@ export interface components {
             detail: string;
         };
         /**
+         * MemoryDeleteBody
+         * @description Delete body (strict): explicit target, never an inferred flag.
+         */
+        MemoryDeleteBody: {
+            /** Scope */
+            scope: string;
+            /**
+             * Target
+             * @enum {string}
+             */
+            target: "memories" | "bank";
+            /** Fact Type */
+            fact_type?: string | null;
+        };
+        /**
+         * MemoryRecallBody
+         * @description Recall body (strict): scope + bounded query vocabulary.
+         */
+        MemoryRecallBody: {
+            /** Scope */
+            scope: string;
+            /** Query */
+            query: string;
+            /** Types */
+            types?: string[] | null;
+            /** Budget */
+            budget?: string | null;
+            /** Max Tokens */
+            max_tokens?: number | null;
+        };
+        /**
+         * MemoryReflectBody
+         * @description Reflect body (strict): scope + bounded generated answer request.
+         */
+        MemoryReflectBody: {
+            /** Scope */
+            scope: string;
+            /** Query */
+            query: string;
+            /** Max Tokens */
+            max_tokens?: number | null;
+        };
+        /**
+         * MemoryRetainBody
+         * @description Retain body (strict): scope + synchronous items (real receipt).
+         */
+        MemoryRetainBody: {
+            /** Scope */
+            scope: string;
+            /** Items */
+            items: components["schemas"]["MemoryRetainItemBody"][];
+        };
+        /**
+         * MemoryRetainItemBody
+         * @description One retain item (strict; the adapter validates bounds/content).
+         */
+        MemoryRetainItemBody: {
+            /** Content */
+            content: string;
+            /** Context */
+            context?: string | null;
+            /** Document Id */
+            document_id?: string | null;
+        };
+        /**
          * ModelCapabilitiesBody
          * @description Optional endpoint capabilities the connection declares (C06 rule 1).
          *
@@ -2833,6 +3124,96 @@ export interface components {
             name: string;
             /** Value */
             value: string;
+        };
+        /**
+         * ModelLocalPreviewBody
+         * @description Prerequisite preview body (strict): identity + recipe + target.
+         */
+        ModelLocalPreviewBody: {
+            /** Application Id */
+            application_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+        };
+        /**
+         * ModelLocalPreviewView
+         * @description The C09 rule 3 preview + REAL measured prerequisite facts.
+         *
+         *     ``hardware_unsatisfied`` is the producer's fail-closed verdict over
+         *     the measured facts (an unknown/unmeasurable fact counts as NOT
+         *     satisfied); ``verdict`` is ``satisfied`` only when every declared
+         *     prerequisite token is measured as satisfied. The preview never
+         *     installs anything; the executor re-measures fresh facts behind the
+         *     full gate chain at apply time.
+         */
+        ModelLocalPreviewView: {
+            /** Server Id */
+            server_id: string;
+            /** Application Id */
+            application_id: string;
+            plan: components["schemas"]["PlanView"];
+            /** Facts */
+            facts: {
+                [key: string]: unknown;
+            };
+            /** Unknown */
+            unknown: string[];
+            /** Measurement Notes */
+            measurement_notes: string[];
+            /** Hardware Unsatisfied */
+            hardware_unsatisfied: string[];
+            /**
+             * Verdict
+             * @enum {string}
+             */
+            verdict: "satisfied" | "unsatisfied";
+        };
+        /**
+         * ModelLocalPullBody
+         * @description Pull submit body (strict): one bounded acquisition + registration.
+         *
+         *     ``license`` is REQUIRED metadata naming the license under which the
+         *     operator acquires the weights (the recipe pre-authorizes none); it
+         *     travels value-free inside the digest-bound intent.
+         */
+        ModelLocalPullBody: {
+            /** Run Id */
+            run_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /** Model */
+            model: string;
+            /** License */
+            license: string;
+            /** Base Url */
+            base_url: string;
+        };
+        /**
+         * ModelLocalSubmitBody
+         * @description Install submit body (strict): the plan is rebuilt server-side.
+         */
+        ModelLocalSubmitBody: {
+            /** Run Id */
+            run_id: string;
+            /** Recipe */
+            recipe: string;
+            /** Target Os */
+            target_os: string;
+            /** Target Arch */
+            target_arch: string;
+            /**
+             * Backup Confirmed
+             * @default false
+             */
+            backup_confirmed: boolean;
         };
         /**
          * ModelMutationResult
@@ -6238,6 +6619,668 @@ export interface operations {
             };
             /** @description The pair fails producer validation, or tools were requested from a connection that does not declare tool_calls */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_status_api_v1_servers__server_id__memory_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_recall_api_v1_servers__server_id__memory_recall_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRecallBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin/CSRF rejected, or the memory.recall grant does not cover this server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload or scope rejected by the memory adapter */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_retain_api_v1_servers__server_id__memory_retain_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRetainBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin/CSRF rejected, or the memory.retain grant does not cover this server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload or scope rejected by the memory adapter */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_reflect_api_v1_servers__server_id__memory_reflect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryReflectBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin/CSRF rejected, or the memory.reflect grant does not cover this server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload or scope rejected by the memory adapter */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_export_api_v1_servers__server_id__memory_export_get: {
+        parameters: {
+            query: {
+                scope: string;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The memory.recall grant does not cover this server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Scope rejected by the memory adapter */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    memory_delete_api_v1_servers__server_id__memory_delete_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryDeleteBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin/CSRF rejected, or the memory.retain grant does not cover this server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No enrolled profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload or scope rejected by the memory adapter */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Memory service is not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    preview_model_install_api_v1_servers__server_id__models_local_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelLocalPreviewBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelLocalPreviewView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Pinned host key does not match the target */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Recipe, target or transport prerequisites failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Credential source or SSH transport unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    install_model_service_api_v1_servers__server_id__models_local__application_id__install_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelLocalSubmitBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different intent, or the application id belongs to another server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    pull_model_weights_api_v1_servers__server_id__models_local__application_id__pull_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelLocalPullBody"];
+            };
+        };
+        responses: {
+            /** @description Duplicate submit attached to the existing run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunCreated"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for the target server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Run id reused by a different intent, or the application id belongs to another server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Jobs domain unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -108,6 +108,40 @@ dependencies = [
     # failure. Bounded <3 so pydantic v3 is a deliberate reconciliation,
     # not a silent upgrade of every config schema at once.
     "pydantic>=2.14,<3",
+    # Operational memory (IDEA.md §11 "Use Hindsight for operational
+    # memory", contracts.md C07 rules 6/7, ADR knowledge-packaging.md §2):
+    # Hindsight is the Compose-internal SERVICE (ghcr.io/vectorize-io/
+    # hindsight, version pinned by the Compose card at integration) and the
+    # memory adapter speaks its bank-scoped HTTP API through the SAME httpx2
+    # client pinned above — 07-dependencies froze that one-HTTP-stack lane
+    # and its negative control (set B) keeps every in-process Hindsight
+    # distribution (hindsight-api/all/client/litellm — MIT upstream) OUT of
+    # the controller: pip-installing the engine would drag Postgres drivers
+    # and ONNX extras into the FastAPI set (ADR §2.1) and duplicate a
+    # process the stack already isolates. The optional memory capability
+    # therefore pins NOTHING here by decision: the service being absent or
+    # unconfigured makes the memory capability explicitly UNAVAILABLE
+    # (runtime-scenarios.md KB-H1) — never a core import failure.
+    # backend/tests/test_optional_dependencies.py re-asserts set B and
+    # extends it with unselected operational-memory frameworks.
+    # 1Password (IDEA.md §14, contracts.md C03 rule 6: .env is the mandatory
+    # first resolver, 1Password an optional LATER plugin behind a provider
+    # interface): the supported interface is the 1Password CLI (`op`,
+    # 1Password's own EULA-licensed distribution — never bundled or pinned
+    # here) driven via subprocess, the same selection rule as the system
+    # OpenSSH client above; service accounts — the plugin's auth mode —
+    # require CLI >= 2.18.0 (developer.1password.com, "Use service accounts
+    # with 1Password CLI"). The official onepassword-sdk distribution is NOT
+    # selected: its wheels stop at CPython 3.13 (Rust sdist beyond), so it
+    # cannot install into the python:3.14-slim runtime set, and the CLI it
+    # wraps is the documented interface anyway. The tool is OPTIONAL:
+    # missing `op` ⇒ the provider classifies the capability unavailable
+    # (never an import failure, never a fallback secret scan; the
+    # 11-onepassword card owns the plugin). backend/tests/
+    # test_optional_dependencies.py asserts the floor when `op` is present,
+    # records explicit unavailability when it is not, and keeps secret-store
+    # SDKs (onepassword-sdk, keyring, hvac) out of manifest, lock and
+    # installed environment.
 ]
 
 [dependency-groups]
