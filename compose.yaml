@@ -75,8 +75,25 @@ services:
     environment:
       MAI_DATABASE_URL: "postgresql://mai:${MAI_POSTGRES_PASSWORD:?MAI_POSTGRES_PASSWORD must be set in the Compose .env}@postgres:5432/mai"
       MAI_DATA_ROOT: /var/lib/mai
+      # Single public origin through the Tailscale serve terminator (C08
+      # rule 3 / auth ADR §6): forwarded headers are honored ONLY from the
+      # pinned internal proxy CIDR, so the public host the API derives must
+      # come from MAI_PUBLIC_ORIGINS matching the Tailscale HTTPS origin.
+      MAI_PUBLIC_ORIGINS: "${MAI_PUBLIC_ORIGINS:?MAI_PUBLIC_ORIGINS must be set in the Compose .env}"
+      MAI_TRUSTED_PROXIES: "${MAI_TRUSTED_PROXIES:?MAI_TRUSTED_PROXIES must be set in the Compose .env}"
+      # Application credential source (C03 rule 6): the EnvResolver file
+      # holds credential material (MAI_GATEWAY_KEY etc.); the compose .env
+      # never carries it. Absolute host path — must exist on the host with
+      # mode 600 before `up`.
+      MAI_ENV_FILE: "${MAI_ENV_FILE:?MAI_ENV_FILE must be set in the Compose .env}"
+      # First-admin bootstrap (auth ADR §3): read once at startup and
+      # dropped after hashing; unset after the first successful bootstrap.
+      MAI_ADMIN_PASSWORD: "${MAI_ADMIN_PASSWORD:-}"
     volumes:
       - mai-data:/var/lib/mai
+      # Credential source for EnvResolver: read-only, absolute host path
+      # (Komodo clone must never own live credential material).
+      - ${MAI_ENV_FILE}:/run/secrets/mai-credentials.env:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,6 +108,7 @@ services:
       start_period: 5s
     networks:
       - mai
+      - net-infra
 
   mai-worker:
     # Same backend image/package (SERVICES row). Not built separately: reuses
@@ -110,8 +128,14 @@ services:
       # fire workflow. A module that fails to import stops the worker with
       # exit 2 — a daemon that cannot execute its jobs must never run.
       MAI_WORKER_HANDLERS: "mai.jobs.steps,mai.jobs.schedules"
+      # Same credential/origin contract as mai-api: the worker resolves
+      # credential references (model connections, embeddings) through the
+      # EnvResolver file at MAI_ENV_FILE (C03 rule 6).
+      MAI_ENV_FILE: "${MAI_ENV_FILE:?MAI_ENV_FILE must be set in the Compose .env}"
     volumes:
       - mai-data:/var/lib/mai
+      # Credential source for EnvResolver: read-only, absolute host path.
+      - ${MAI_ENV_FILE}:/run/secrets/mai-credentials.env:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,6 +163,7 @@ services:
       start_period: 15s
     networks:
       - mai
+      - net-infra
 
   mai-web:
     image: mai-web
@@ -150,6 +175,35 @@ services:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - mai
+
+  # Single TLS-terminating reverse proxy of the topology (C08 rule 3 / auth
+  # ADR §6): the ONLY service allowed to publish a host port. Caddy listens
+  # on :80 inside the `mai` network and routes /api/* to mai-api and
+  # everything else to the SvelteKit SSR frontend. TLS itself terminates at
+  # the Tailscale serve layer (svc:machina → 127.0.0.1:8390), which is why
+  # Caddy speaks plain HTTP here; MAI_TRUSTED_PROXIES pins the `mai` subnet
+  # so forwarded headers from THIS hop (and only this hop) are honored.
+  mai-proxy:
+    image: docker.io/library/caddy:2.10.2-alpine
+    configs:
+      - source: mai-proxy-caddyfile
+        target: /etc/caddy/Caddyfile
+    ports:
+      - "127.0.0.1:${MAI_PROXY_HTTP_PORT:-8390}:80"
+    depends_on:
+      mai-api:
+        condition: service_healthy
+      mai-web:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/healthz"]
+      interval: 10s
       timeout: 5s
       retries: 12
       start_period: 5s
@@ -303,6 +357,10 @@ services:
       start_period: 30s
     networks:
       - mai
+      # Hindsight reaches the LiteLLM gateway over the infra network for
+      # extraction LLM + embeddings (ADR §2.4/§4: same gateway as the
+      # backend's doc index; litellm is attached to net-infra).
+      - net-infra
 
   # One-shot namespace provisioner for hindsight (memory profile only): the
   # stack Postgres is shared, so the dedicated database must be created
@@ -333,11 +391,24 @@ services:
       - mai
 
 networks:
+  # Pinned subnet (172.32.0.0/16 is free per host recon 2026-10-18; the
+  # host's other bridges occupy 172.17–172.31): MAI_TRUSTED_PROXIES pins
+  # this exact CIDR, so the subnet must never silently drift.
   mai:
+    ipam:
+      config:
+        - subnet: 172.32.0.0/16
+          gateway: 172.32.0.1
+  # External infra network: litellm (LiteLLM proxy) is attached here and
+  # reachable by container name from any stack that joins net-infra.
+  net-infra:
+    external: true
 
 configs:
   searxng-settings:
     file: deploy/searxng/settings.yml
+  mai-proxy-caddyfile:
+    file: deploy/proxy/Caddyfile
 
 volumes:
   postgres-data:

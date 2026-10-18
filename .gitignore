@@ -25,3 +25,7 @@ secrets.yml
 # Local spike tooling (00-job-spike): isolated venv, never committed.
 /.venv/
 __pycache__/
+
+# Runtime credential file for the MAI EnvResolver (backend/src/mai/credentials/env.py).
+# NEVER committed; live copy lives outside the repo at an absolute host path.
+mai-credentials.env

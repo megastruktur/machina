@@ -1,0 +1,33 @@
+# mai-proxy — single reverse proxy of the MAI topology (C08 rule 3 / auth
+# ADR §6). Plain HTTP on :80 inside the `mai` network; TLS terminates at the
+# Tailscale serve layer (svc:machina → 127.0.0.1:8390). The ONLY component
+# of this stack that publishes a host port.
+#
+# Routing contract:
+#   /api/*  → mai-api:8000, path PRESERVED (FastAPI mounts /api/v1 itself —
+#             never strip the prefix here).
+#   /*      → mai-web:3000 (SvelteKit SSR; its API client is same-origin
+#             relative, so browser /api/v1 calls land on this proxy too).
+#
+# Caddy's reverse_proxy sets X-Forwarded-For / -Host / -Proto. The API
+# honors them ONLY because the proxy's source address is inside
+# MAI_TRUSTED_PROXIES (the pinned 172.32.0.0/16 `mai` subnet); any other
+# peer's forwarded headers are ignored (auth ADR §6.3, fail-closed).
+#
+# /healthz is a proxy-local liveness answer used by the compose healthcheck;
+# it deliberately probes nothing downstream (that truth lives in the
+# mai-api / mai-web healthchecks).
+
+:80 {
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle /api/* {
+		reverse_proxy mai-api:8000
+	}
+
+	handle {
+		reverse_proxy mai-web:3000
+	}
+}
