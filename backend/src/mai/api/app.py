@@ -77,6 +77,12 @@ from mai.api.documents import (
 )
 from mai.api.grants import register_grants
 from mai.api.jobs import register_jobs
+from mai.api.knowledge_models import (
+    MEMORY_BASE_URL_VAR,
+    MEMORY_SHARED_BANKS_VAR,
+    MemoryServices,
+    register_knowledge_models,
+)
 from mai.api.models import register_models
 from mai.api.monitoring import register_monitoring
 from mai.api.password_challenges import (
@@ -89,6 +95,11 @@ from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
+from mai.memory.hindsight import (
+    HindsightProvider,
+    MemoryAdapterError,
+    parse_shared_banks,
+)
 from mai.applications.adopt import (
     ApplicationAdoption,
     ApplicationManifestStore,
@@ -335,6 +346,31 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.skills_root = resolve_profiles_root(app.state.env)
         except OSError:
             app.state.skills_error = "skills_root_unusable"
+        # Memory surface (C07 rule 6): the bank-scoped Hindsight provider
+        # over the explicitly configured compose-internal service URL —
+        # never discovered (the embeddings-endpoint precedent). An absent
+        # or unusable configuration fails closed: routes answer 503 and
+        # touch no state. Shared banks are the explicit validated
+        # allowlist; empty means the deployment exposes none.
+        app.state.memory = None
+        memory_env = app.state.env or os.environ
+        memory_url = memory_env.get(MEMORY_BASE_URL_VAR)
+        if memory_url:
+            try:
+                app.state.memory = MemoryServices(
+                    provider=HindsightProvider(memory_url),
+                    shared_banks=parse_shared_banks(
+                        [
+                            name.strip()
+                            for name in memory_env.get(
+                                MEMORY_SHARED_BANKS_VAR, ""
+                            ).split(",")
+                            if name.strip()
+                        ]
+                    ),
+                )
+            except MemoryAdapterError:
+                app.state.memory = None
         # Jobs domain surfaces (C05/C08): the facade lifecycle replay
         # producer plus the safe-cancel facade over the ONE engine client.
         # The durable engine itself is launched by the worker (never here):
@@ -444,6 +480,15 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # conversations stay worker-owned; the probe is a single bounded
     # diagnostic round owned by this surface.
     register_models(app)
+    # The knowledge/memory and local-model surfaces (C07/C09): the
+    # session-derived, grant-gated Hindsight memory operations
+    # (status/recall/retain/reflect/export/delete — bank scope derived
+    # from the context, never a client-supplied name) and the local-model
+    # planned lifecycle (measured prerequisite preview; durable
+    # install/pull intents through the jobs facade — the pull's
+    # executor-owned completion registers the verified endpoint). No
+    # memory content or target effect ever bypasses the producers.
+    register_knowledge_models(app)
     # The canonical documents surface (C02/C07): docs/runbook CRUD with
     # provenance and revision checks, hybrid cited retrieval, explicit
     # index status/reconcile, run-evidence generation and the bounded
