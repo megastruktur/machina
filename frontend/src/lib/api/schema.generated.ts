@@ -1924,7 +1924,7 @@ export interface components {
          */
         AdoptBody: {
             /** Application Id */
-            application_id: string;
+            application_id?: string | null;
             /** Name */
             name: string;
             /** Origin */

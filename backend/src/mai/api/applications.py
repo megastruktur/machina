@@ -310,7 +310,7 @@ class AdoptBody(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    application_id: str
+    application_id: str | None = None
     name: str = Field(min_length=1, max_length=MAP_NAME_CHARS)
     origin: ApplicationOrigin | Literal["manual"]
     compose_project: str | None = None
@@ -1067,7 +1067,10 @@ async def adopt_application(
     store = _store(request)
     adoption = _adoption(request)
     map_store = _map_store(request)
-    application_id = _application_id(payload.application_id)
+    if payload.application_id is None or payload.application_id.strip() == "":
+        application_id: uuid.UUID | None = uuid.uuid4()
+    else:
+        application_id = _application_id(payload.application_id)
     if application_id is None:
         return _validation_error(request, "application_id", "must be a canonical UUID string")
     # Target binding: an unknown/unenrolled server is denied before any

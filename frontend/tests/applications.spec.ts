@@ -118,6 +118,7 @@ const APP_SOURCE = `
 	const SERVER_A = '${SERVER_A}';
 	const SERVER_B = '${SERVER_B}';
 	const APP_ADOPTED = '${APP_ADOPTED}';
+	const APP_NEW = '${APP_NEW}';
 	const APP_BETA = '${APP_BETA}';
 	const INTENT_ID = '${INTENT_ID}';
 	const RECORD_DOC_ID = '${RECORD_DOC_ID}';
@@ -377,17 +378,21 @@ const APP_SOURCE = `
 				pendingAdopt = deferredAdopt;
 				deferredAdopt = null;
 			}
-			if (!UUID_RE.test(payload.application_id)) {
+			const resolvedId =
+				typeof payload.application_id === 'string' && payload.application_id.trim() !== ''
+					? payload.application_id.trim()
+					: APP_NEW;
+			if (!UUID_RE.test(resolvedId)) {
 				throw new ApiError(422, 'validation_failed', 'application_id must be a canonical UUID string');
 			}
 			// Cross-server identity: a live id under ANOTHER server is refused
 			// (adoption never relocates an identity across servers).
 			for (const [scopeId, scope] of Object.entries(adopted)) {
-				if (scopeId !== serverId && scope[payload.application_id]) {
+				if (scopeId !== serverId && scope[resolvedId]) {
 					throw new ApiError(409, 'conflict', 'cross-server identity conflict');
 				}
 			}
-			const live = (adopted[serverId] || {})[payload.application_id];
+			const live = (adopted[serverId] || {})[resolvedId];
 			if (live) {
 				// The Service Map re-adoption path: the SAME identity ships the
 				// observed revision and the producer reconciles the metadata
@@ -403,7 +408,7 @@ const APP_SOURCE = `
 				if (payload.instructions) live.instructions = deep(payload.instructions);
 				const updated = {
 					intent_id: INTENT_ID,
-					application_id: payload.application_id,
+					application_id: resolvedId,
 					server_id: serverId,
 					outcome: 'applied',
 					revision: live.revision,
@@ -421,7 +426,7 @@ const APP_SOURCE = `
 			if (payload.expected_revision !== 0) {
 				throw new ApiError(409, 'conflict', 'stale revision or canonical state conflict');
 			}
-			const rec = makeRecord(payload.application_id, serverId, payload.name, {
+			const rec = makeRecord(resolvedId, serverId, payload.name, {
 				origin: payload.origin,
 				compose_project: payload.compose_project,
 				working_dir: payload.working_dir,
@@ -435,10 +440,10 @@ const APP_SOURCE = `
 				sha256: 'c'.repeat(64)
 			});
 			adopted[serverId] = adopted[serverId] || {};
-			adopted[serverId][payload.application_id] = rec;
+			adopted[serverId][resolvedId] = rec;
 			const created = {
 				intent_id: INTENT_ID,
-				application_id: payload.application_id,
+				application_id: resolvedId,
 				server_id: serverId,
 				outcome: 'applied',
 				revision: 1,
@@ -1022,10 +1027,10 @@ test('adoption is explicit, preserves the external deployment paths, and links t
 	await hostA.getByTestId('discovery-observe').click();
 	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
 
-	// The form arrives pre-filled from the observation; the admin only mints
-	// the identity — paths stay exactly as observed (C09 rule 6).
+	// The form arrives pre-filled from the observation; `application_id` is
+	// generated on the backend at submit time (no manual UUID field in the UI).
 	await expect(hostA.getByTestId('adopt-origin')).toContainText('Compose project');
-	const appId = hostA.getByTestId('adopt-application-id');
+	await expect(hostA.getByTestId('adopt-application-id')).toHaveCount(0);
 	const name = hostA.getByTestId('adopt-name');
 	const workingDir = hostA.getByTestId('adopt-working-dir');
 	const externalDir = hostA.getByTestId('adopt-external-dir');
@@ -1037,15 +1042,16 @@ test('adoption is explicit, preserves the external deployment paths, and links t
 	await expect(envFiles).toHaveValue('/srv/blog/.env');
 	await expect(name).toHaveValue('blog');
 
-	// Local validation first: an adoption without an admin-minted id refuses.
+	// Local validation first: an empty display name refuses locally.
+	await name.fill('');
 	await hostA.getByTestId('adopt-submit').click();
-	await expect(appId).toHaveAttribute('aria-invalid', 'true');
+	await expect(name).toHaveAttribute('aria-invalid', 'true');
 	const { calls: before } = await apiState(page);
 	expect(before.filter((call) => call.op === 'adopt')).toHaveLength(0);
 
 	// Pending state while the decision is in flight (AC 1 pending, honest).
 	await apiCall(page, 'armDeferredAdopt');
-	await appId.fill(APP_NEW);
+	await name.fill('blog');
 	await hostA.getByTestId('adopt-submit').click();
 	await hostA.getByTestId('tab-discovery').click();
 	await expect(
@@ -1119,7 +1125,6 @@ test('adoption is explicit, preserves the external deployment paths, and links t
 	const adopt = lastCall(calls, 'adopt');
 	expect(adopt.args).toEqual([SERVER_A]);
 	expect(adopt.payload).toEqual({
-		application_id: APP_NEW,
 		name: 'blog',
 		origin: 'compose',
 		compose_project: 'blog',
@@ -1359,7 +1364,6 @@ test('a cross-server response cannot paint; a closed window drops its late adopt
 	// committed record still exists and a fresh window renders it.
 	await hostA.getByTestId('tab-discovery').click();
 	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
-	await hostA.getByTestId('adopt-application-id').fill(APP_NEW);
 	await apiCall(page, 'armDeferredAdopt');
 	await hostA.getByTestId('adopt-submit').click();
 	await apiCall(page, 'toggleHostA');
@@ -1465,7 +1469,6 @@ test('an adoption conflict is refused with the honest vocabulary and nothing cha
 	await hostA.getByTestId('tab-discovery').click();
 	await hostA.getByTestId('discovery-observe').click();
 	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
-	await hostA.getByTestId('adopt-application-id').fill(APP_ADOPTED);
 	await apiCall(page, 'failNextAdopt', [
 		{ status: 409, code: 'conflict', message: 'duplicate adoption or selector overlap' }
 	]);
@@ -1788,7 +1791,6 @@ test('adoption ships category, description and instructions only when explicitly
 	await hostA.getByTestId('tab-discovery').click();
 	await hostA.getByTestId('discovery-observe').click();
 	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
-	await hostA.getByTestId('adopt-application-id').fill(APP_NEW);
 
 	// Explicit metadata: category changed away from the suggestion, a
 	// description, and two runbook slots — all three ride the request.
@@ -1801,7 +1803,6 @@ test('adoption ships category, description and instructions only when explicitly
 
 	const { calls } = await apiState(page);
 	expect(lastCall(calls, 'adopt').payload).toEqual({
-		application_id: APP_NEW,
 		name: 'blog',
 		origin: 'compose',
 		compose_project: 'blog',
@@ -1854,13 +1855,11 @@ test('a minted custom category rides the next adoption via upsert_categories', a
 		.filter({ hasText: 'blog' })
 		.getByTestId('adopt-start')
 		.click();
-	await hostA.getByTestId('adopt-application-id').fill(APP_NEW);
 	await hostA.getByTestId('adopt-submit').click();
 	await expect(hostA.getByTestId('adopt-result')).toBeVisible();
 
 	const { calls } = await apiState(page);
 	expect(lastCall(calls, 'adopt').payload).toEqual({
-		application_id: APP_NEW,
 		name: 'blog',
 		origin: 'compose',
 		compose_project: 'blog',

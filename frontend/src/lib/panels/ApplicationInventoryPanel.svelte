@@ -759,8 +759,6 @@
 
 	function validateAdopt(): Record<string, string> {
 		const errors: Record<string, string> = {};
-		const id = adoptApplicationId.trim();
-		if (!UUID_RE.test(id)) errors.application_id = 'An application id (canonical UUID) is required.';
 		const name = adoptName.trim();
 		if (name === '') errors.name = 'A display name is required.';
 		else if (name.length > MAX_NAME_CHARS)
@@ -800,7 +798,6 @@
 		adoptFields = errors;
 		if (Object.keys(errors).length > 0) return;
 		const body: AdoptBody = {
-			application_id: adoptApplicationId.trim(),
 			name: adoptName.trim(),
 			origin: adoptOrigin,
 			compose_project: orNull(adoptComposeProject),
@@ -811,6 +808,9 @@
 			external_environment_files: parsePathList(adoptExternalEnvironmentFiles),
 			expected_revision: 0
 		};
+		if (adoptApplicationId.trim() !== '') {
+			body.application_id = adoptApplicationId.trim();
+		}
 		// The Service Map enrichments ride the request ONLY when explicitly
 		// set, so an untouched form keeps the reviewed create payload exact
 		// (the strict wire assertion in applications.spec.ts pins this).
@@ -1690,13 +1690,6 @@
 							Origin: {adoptOrigin === null ? '' : originLabel(adoptOrigin)} — carried verbatim from
 							the observation.
 						</p>
-						<Field
-							label="Application id (admin-minted UUID)"
-							bind:value={adoptApplicationId}
-							error={adoptFields.application_id ?? ''}
-							hint="Opaque identity you mint for this application (C01 rule 1); reusing it on another server conflicts."
-							data-testid="adopt-application-id"
-						/>
 						<Field
 							label="Name"
 							bind:value={adoptName}
