@@ -64,10 +64,12 @@
 		gap: var(--mai-space-2);
 		min-height: var(--mai-target-min);
 		padding: var(--mai-control-pad-y) var(--mai-control-pad-x);
-		border: var(--mai-border-width) solid transparent;
+		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		font-size: var(--mai-text-sm);
-		font-weight: var(--mai-weight-medium);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
 		white-space: nowrap;
 		cursor: pointer;
 		transition:
@@ -83,7 +85,7 @@
 	}
 
 	.mai-button--pill {
-		border-radius: var(--mai-radius-pill);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-button:disabled {
@@ -95,6 +97,8 @@
 	.mai-button--primary {
 		background: var(--mai-color-primary);
 		color: var(--mai-color-primary-contrast);
+		border-color: var(--mai-color-brass-dim);
+		clip-path: var(--mai-button-clip, none);
 		box-shadow: inset 0 1px 0 var(--mai-border-specular);
 	}
 

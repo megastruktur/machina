@@ -62,13 +62,22 @@
 	--mai-control-pad-x: 12px;
 	--mai-control-pad-y: 6px;
 
-	/* ---- Radii & Glass Blur ---------------------------------------------- */
-	--mai-radius-sm: 6px;
-	--mai-radius-md: 8px;
-	--mai-radius-lg: 12px;
-	--mai-radius-xl: 14px;
-	--mai-radius-2xl: 18px;
-	--mai-radius-pill: 9999px;
+	/* ---- Radii & Mechanicus Industrial Geometry -------------------------- */
+	--mai-radius-sm: 1px;
+	--mai-radius-md: 2px;
+	--mai-radius-lg: 2px;
+	--mai-radius-xl: 2px;
+	--mai-radius-2xl: 2px;
+	--mai-radius-pill: 2px;
+	--mai-chip-accent-width: 3px;
+	--mai-button-clip: polygon(
+		0 0,
+		calc(100% - 6px) 0,
+		100% 6px,
+		100% 100%,
+		6px 100%,
+		0 calc(100% - 6px)
+	);
 	--mai-border-width: 1px;
 	--mai-blur-glass: none;
 

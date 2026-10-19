@@ -78,6 +78,16 @@
 	--mai-font-sans: 'Rajdhani', system-ui, -apple-system, sans-serif;
 	--mai-font-mono: 'JetBrains Mono', ui-monospace, monospace;
 
+	/* ---- Geometry (Standard Theme) ------------------------------------------ */
+	--mai-radius-sm: 4px;
+	--mai-radius-md: 6px;
+	--mai-radius-lg: 8px;
+	--mai-radius-xl: 10px;
+	--mai-radius-2xl: 12px;
+	--mai-radius-pill: 9999px;
+	--mai-chip-accent-width: 1px;
+	--mai-button-clip: none;
+
 	/* ---- Elevation ----------------------------------------------------------- */
 	--mai-shadow-window:
 		inset 0 1px 0 rgb(255 255 255 / 0.8),

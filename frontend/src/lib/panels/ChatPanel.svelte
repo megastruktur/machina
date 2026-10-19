@@ -1886,24 +1886,25 @@
 	.mai-chat__bubble {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: var(--mai-space-2);
 		padding: var(--mai-space-3) var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-lg);
+		border-left-width: var(--mai-chip-accent-width, 3px);
+		border-radius: var(--mai-radius-md);
 		background-color: var(--mai-color-surface-raised);
-		max-width: 88%;
+		width: 100%;
 		box-shadow: var(--mai-shadow-sm);
 	}
 
 	.mai-chat__bubble--user {
-		align-self: flex-end;
-		margin-left: auto;
 		border-color: var(--mai-color-border-strong);
+		border-left-color: var(--mai-color-brass);
+		background-color: var(--mai-color-surface);
 	}
 
 	.mai-chat__bubble--assistant {
-		align-self: flex-start;
-		margin-right: auto;
+		border-left-color: var(--mai-color-primary);
+		background-color: var(--mai-color-surface-sunken);
 	}
 
 	.mai-chat__bubble-header {
@@ -1911,12 +1912,16 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--mai-space-2);
+		padding-bottom: var(--mai-space-1);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
 	.mai-chat__bubble-author {
+		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-semibold);
-		letter-spacing: 0.04em;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 		color: var(--mai-color-brass);
 	}
 

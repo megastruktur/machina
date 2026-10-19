@@ -68,14 +68,17 @@
 		gap: var(--mai-space-1);
 		min-height: 24px;
 		padding: 2px var(--mai-space-2);
-		font-family: var(--mai-font-sans);
+		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.03em;
 		line-height: var(--mai-leading-tight);
 		color: var(--mai-color-text);
-		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-pill);
+		border-left-width: var(--mai-chip-accent-width, 3px);
+		border-left-color: var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-sm);
 		white-space: nowrap;
 		transition:
 			border-color var(--mai-motion-fast) ease,
@@ -83,12 +86,14 @@
 	}
 
 	.mai-chip--brass {
-		border-color: var(--mai-color-brass);
+		border-color: var(--mai-color-border-strong);
+		border-left-color: var(--mai-color-brass);
 		color: var(--mai-color-text);
 	}
 
 	.mai-chip--primary {
 		border-color: var(--mai-color-primary);
+		border-left-color: var(--mai-color-primary-hover);
 		background: var(--mai-status-danger-bg);
 		color: var(--mai-color-text);
 	}

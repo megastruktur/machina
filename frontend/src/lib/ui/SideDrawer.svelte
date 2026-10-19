@@ -93,7 +93,7 @@
 		gap: var(--mai-space-2);
 		padding: var(--mai-space-3) var(--mai-card-pad);
 		background: var(--mai-color-surface-header);
-		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-brass-dim);
 	}
 
 	.mai-side-drawer--collapsed .mai-side-drawer__header {

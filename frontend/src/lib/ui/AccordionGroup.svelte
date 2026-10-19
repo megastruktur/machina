@@ -75,12 +75,15 @@
 		flex-direction: column;
 		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left-width: var(--mai-chip-accent-width, 3px);
+		border-left-color: var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		overflow: hidden;
 	}
 
 	.mai-accordion--open {
 		border-color: var(--mai-color-border-strong);
+		border-left-color: var(--mai-color-brass);
 	}
 
 	.mai-accordion__header {

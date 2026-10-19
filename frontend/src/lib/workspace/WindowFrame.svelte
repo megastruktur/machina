@@ -414,6 +414,32 @@
 		box-shadow: var(--mai-shadow-window-focused, var(--mai-shadow-window));
 	}
 
+	/* Brass auspex corner reticles on focused Mechanicus windows */
+	.mai-window-frame--focused::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		z-index: 4;
+		background:
+			linear-gradient(to right, var(--mai-color-brass) 10px, transparent 10px) 0 0 / 100% 2px
+				no-repeat,
+			linear-gradient(to bottom, var(--mai-color-brass) 10px, transparent 10px) 0 0 / 2px 100%
+				no-repeat,
+			linear-gradient(to left, var(--mai-color-brass) 10px, transparent 10px) 100% 0 / 100% 2px
+				no-repeat,
+			linear-gradient(to bottom, var(--mai-color-brass) 10px, transparent 10px) 100% 0 / 2px 100%
+				no-repeat,
+			linear-gradient(to right, var(--mai-color-brass) 10px, transparent 10px) 0 100% / 100% 2px
+				no-repeat,
+			linear-gradient(to top, var(--mai-color-brass) 10px, transparent 10px) 0 100% / 2px 100%
+				no-repeat,
+			linear-gradient(to left, var(--mai-color-brass) 10px, transparent 10px) 100% 100% / 100% 2px
+				no-repeat,
+			linear-gradient(to top, var(--mai-color-brass) 10px, transparent 10px) 100% 100% / 2px 100%
+				no-repeat;
+	}
+
 	.mai-window-frame__titlebar {
 		display: flex;
 		align-items: center;
@@ -430,6 +456,7 @@
 
 	.mai-window-frame--focused .mai-window-frame__titlebar {
 		border-bottom-color: var(--mai-color-brass);
+		box-shadow: inset 0 -1px 0 var(--mai-color-brass-dim);
 	}
 
 	.mai-window-frame__title {
@@ -439,6 +466,8 @@
 		min-width: 0;
 		font-size: var(--mai-text-sm);
 		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
 		line-height: var(--mai-leading-tight);
 		color: var(--mai-color-text-muted);
 	}
@@ -460,12 +489,16 @@
 	.mai-window-frame__title-context {
 		flex: none;
 		padding: 1px var(--mai-space-2);
+		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.03em;
+		text-transform: none;
 		color: var(--mai-status-neutral-text);
 		background: var(--mai-status-neutral-bg);
 		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
-		border-radius: var(--mai-radius-pill, var(--mai-radius-sm));
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-sm);
 		white-space: nowrap;
 	}
 
@@ -473,6 +506,7 @@
 		color: var(--mai-status-info-text);
 		background: var(--mai-status-info-bg);
 		border-color: var(--mai-status-info-border);
+		border-left-color: var(--mai-color-brass);
 	}
 
 	.mai-window-frame__window-controls {
@@ -489,9 +523,9 @@
 		width: var(--mai-target-min);
 		height: var(--mai-target-min);
 		padding: 0;
-		border: none;
-		border-radius: var(--mai-radius-pill, var(--mai-radius-sm));
-		background: transparent;
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
 		color: var(--mai-color-text-muted);
 		cursor: pointer;
 		/* Chrome controls stack above the edge/corner resize strips, so a
@@ -502,16 +536,19 @@
 
 	.mai-window-frame--focused .mai-window-frame__control {
 		color: var(--mai-color-text);
+		border-color: var(--mai-color-brass-dim);
 	}
 
 	.mai-window-frame__control:hover {
 		background: var(--mai-status-neutral-bg);
+		border-color: var(--mai-color-brass);
 		color: var(--mai-color-text);
 	}
 
 	.mai-window-frame__control--close:hover {
 		color: var(--mai-status-danger-text);
 		background: var(--mai-status-danger-bg);
+		border-color: var(--mai-status-danger-border);
 	}
 
 	.mai-window-frame__control svg {
