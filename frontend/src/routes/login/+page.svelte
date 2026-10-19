@@ -130,14 +130,16 @@
 	/* Tokens only (windowed-workspace ADR §2: shared primitives backed by
 	 * design tokens); this route owns no theme values. */
 	.mai-login {
-		min-height: 100vh;
+		min-height: 100dvh;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
 		gap: var(--mai-space-3);
-		padding: var(--mai-space-5);
-		background: var(--mai-color-bg);
+		padding: var(--mai-page-pad, var(--mai-space-5));
+		background-color: var(--mai-color-bg);
+		background-image: var(--mai-canvas-bg);
+		background-size: 100% 100%, 100% 100%, 24px 24px;
 		color: var(--mai-color-text);
 		font-family: var(--mai-font-sans);
 		box-sizing: border-box;
@@ -145,8 +147,10 @@
 
 	.mai-login h1 {
 		margin: 0;
+		font-family: var(--mai-font-display);
 		font-size: var(--mai-text-2xl);
-		letter-spacing: 0.02em;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
 	}
 
 	.mai-login__emblem {
@@ -161,14 +165,17 @@
 	}
 
 	.mai-login__card {
-		width: min(22rem, 100%);
+		width: min(24rem, 100%);
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding: var(--mai-space-5);
-		background: var(--mai-color-surface);
-		border: 1px solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		padding: var(--mai-panel-pad, var(--mai-space-5));
+		background: var(--mai-surface-glass, var(--mai-color-surface));
+		backdrop-filter: var(--mai-blur-glass);
+		-webkit-backdrop-filter: var(--mai-blur-glass);
+		border: 1px solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-xl, var(--mai-radius-md));
+		box-shadow: var(--mai-shadow-float);
 		box-sizing: border-box;
 	}
 

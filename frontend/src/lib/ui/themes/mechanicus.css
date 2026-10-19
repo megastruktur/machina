@@ -63,11 +63,33 @@
 	--mai-color-brass-dim: #8a6a2f;
 	--mai-color-surface-header: #1a1114;
 
+	/* ---- Odyssey spatial glass surfaces & canvas ------------------------- */
+	--mai-surface-glass: rgb(18 22 28 / 0.82);
+	--mai-surface-glass-raised: rgb(24 30 39 / 0.88);
+	--mai-surface-glass-header: rgb(14 17 22 / 0.88);
+	--mai-border-specular: rgb(255 255 255 / 0.08);
+	--mai-canvas-bg:
+		radial-gradient(circle at 50% 0%, rgb(185 28 28 / 0.12), transparent 55%),
+		radial-gradient(circle at 85% 90%, rgb(212 168 83 / 0.08), transparent 45%),
+		radial-gradient(rgb(212 168 83 / 0.14) 1px, transparent 1px);
+
 	/* ---- Type ------------------------------------------------------------ */
 	--mai-font-display: 'Cinzel', Georgia, serif;
 	--mai-font-sans: 'Rajdhani', system-ui, -apple-system, sans-serif;
 	--mai-font-mono: 'JetBrains Mono', ui-monospace, monospace;
 
 	/* ---- Elevation -------------------------------------------------------- */
-	--mai-shadow-window: 0 8px 24px rgb(0 0 0 / 0.5), 0 2px 6px rgb(0 0 0 / 0.4);
+	--mai-shadow-window:
+		inset 0 1px 0 rgb(255 255 255 / 0.07),
+		0 16px 40px -8px rgb(0 0 0 / 0.65),
+		0 4px 12px rgb(0 0 0 / 0.45);
+	--mai-shadow-window-focused:
+		inset 0 1px 0 rgb(212 168 83 / 0.22),
+		0 22px 52px -10px rgb(0 0 0 / 0.78),
+		0 0 0 1px rgb(185 28 28 / 0.35),
+		0 0 28px -6px rgb(185 28 28 / 0.28);
+	--mai-shadow-float:
+		inset 0 1px 0 rgb(255 255 255 / 0.09),
+		0 14px 36px -6px rgb(0 0 0 / 0.68),
+		0 4px 10px rgb(0 0 0 / 0.42);
 }

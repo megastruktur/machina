@@ -1747,10 +1747,10 @@
 	.mai-apps {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4, 1rem);
-		padding: var(--space-4, 1rem);
-		color: var(--color-fg, inherit);
-		font-size: var(--font-size-sm, 0.875rem);
+		gap: var(--mai-space-3, 0.75rem);
+		padding: var(--mai-panel-pad, 1rem);
+		color: var(--mai-color-text, inherit);
+		font-size: var(--mai-text-sm, 0.875rem);
 		min-width: 0;
 		min-height: 0;
 		overflow: auto;
@@ -1759,74 +1759,81 @@
 	.mai-apps__header {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-1, 0.25rem);
+		gap: var(--mai-space-2, 0.5rem);
 	}
 
 	.mai-apps__title {
 		margin: 0;
-		font-size: var(--font-size-md, 1rem);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-base, 1rem);
+		letter-spacing: 0.04em;
 	}
 
 	h4,
 	h5 {
 		margin: 0;
-		font-size: var(--font-size-sm, 0.875rem);
+		font-size: var(--mai-text-sm, 0.875rem);
 	}
 
 	.mai-apps__meta {
 		margin: 0;
-		color: var(--color-muted, inherit);
+		color: var(--mai-color-text-muted, inherit);
 		display: inline-flex;
-		gap: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3, 0.75rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__tabs {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__tab {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		background: transparent;
-		color: inherit;
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-pill, 9999px);
+		background: var(--mai-surface-glass-raised, transparent);
+		color: var(--mai-color-text-muted, inherit);
 		font: inherit;
-		padding: var(--space-1, 0.25rem) var(--space-3, 0.75rem);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		padding: var(--mai-space-1, 0.25rem) var(--mai-space-3, 0.75rem);
 		cursor: pointer;
 	}
 
 	.mai-apps__tab--active {
-		border-color: var(--border-strong, currentColor);
+		border-color: var(--mai-color-brass, currentColor);
+		color: var(--mai-color-text);
+		background: var(--mai-color-surface-raised);
 		font-weight: 600;
 	}
 
 	.mai-apps__section {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3, 0.75rem);
-		border-top: 1px solid var(--border-subtle, transparent);
-		padding-top: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3, 0.75rem);
+		border-top: 1px solid var(--mai-color-border, transparent);
+		padding-top: var(--mai-space-3, 0.75rem);
 	}
 
 	.mai-apps__section-head {
 		display: flex;
-		align-items: baseline;
-		gap: var(--space-3, 0.75rem);
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-3, 0.75rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__subsection {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 	}
 
 	.mai-apps__form {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3, 0.75rem);
 	}
 
 	.mai-apps__label {
@@ -1834,20 +1841,20 @@
 	}
 
 	.mai-apps__state {
-		padding: var(--space-2, 0.5rem);
-		border-radius: var(--radius-sm, 4px);
-		border: 1px dashed var(--border-subtle, transparent);
+		padding: var(--mai-card-pad, 0.75rem);
+		border-radius: var(--mai-radius-md, 8px);
+		border: 1px dashed var(--mai-color-border, transparent);
 	}
 
 	.mai-apps__state--error {
 		border-style: solid;
-		border-color: var(--color-danger, currentColor);
-		color: var(--color-danger, inherit);
+		border-color: var(--mai-status-danger-border, currentColor);
+		color: var(--mai-status-danger-text, inherit);
 	}
 
 	.mai-apps__catalogue {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
 	}
 
@@ -1855,67 +1862,73 @@
 		list-style: none;
 		margin: 0;
 		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+		gap: var(--mai-space-3, 0.75rem);
 	}
 
 	.mai-apps__row {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		padding: var(--space-2, 0.5rem);
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-lg, 12px);
+		padding: var(--mai-card-pad, 0.875rem);
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 	}
 
 	.mai-apps__row--pinned {
-		border-color: var(--border-strong, currentColor);
+		border-color: var(--mai-color-brass, currentColor);
 	}
 
 	.mai-apps__row-main {
 		display: flex;
-		align-items: baseline;
-		gap: var(--space-3, 0.75rem);
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__row-id {
 		font-weight: 600;
+		font-size: var(--mai-text-base);
 	}
 
 	.mai-apps__row-actions {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__badge {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		padding: 0 var(--space-2, 0.5rem);
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-pill, 9999px);
+		padding: 1px var(--mai-space-2, 0.5rem);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-apps__badge--ok {
-		border-color: var(--color-success, currentColor);
-		color: var(--color-success, inherit);
+		border-color: var(--mai-status-success-border, currentColor);
+		background: var(--mai-status-success-bg);
+		color: var(--mai-status-success-text, inherit);
 	}
 
 	.mai-apps__badge--danger {
-		border-color: var(--color-danger, currentColor);
-		color: var(--color-danger, inherit);
+		border-color: var(--mai-status-danger-border, currentColor);
+		background: var(--mai-status-danger-bg);
+		color: var(--mai-status-danger-text, inherit);
 	}
 
 	.mai-apps__badge--warn {
-		border-color: var(--color-warning, currentColor);
-		color: var(--color-warning, inherit);
+		border-color: var(--mai-status-warning-border, currentColor);
+		background: var(--mai-status-warning-bg);
+		color: var(--mai-status-warning-text, inherit);
 	}
 
 	.mai-apps__chip {
 		display: inline-block;
 		border: 1px solid var(--mai-color-brass, currentColor);
-		border-radius: var(--mai-radius-sm, 4px);
-		padding: 0 var(--space-2, 0.5rem);
+		border-radius: var(--mai-radius-pill, 9999px);
+		padding: 1px var(--mai-space-2, 0.5rem);
 		font-size: var(--mai-text-xs, 0.75rem);
 		color: var(--mai-color-brass, inherit);
 		white-space: nowrap;
@@ -1929,24 +1942,25 @@
 
 	.mai-apps__filterbar {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
 	}
 
 	.mai-apps__pill {
 		border: 1px solid var(--mai-color-border, transparent);
-		border-radius: var(--mai-radius-sm, 4px);
-		background: transparent;
-		color: inherit;
+		border-radius: var(--mai-radius-pill, 9999px);
+		background: var(--mai-surface-glass-raised, transparent);
+		color: var(--mai-color-text-muted);
 		font: inherit;
 		font-size: var(--mai-text-xs, 0.75rem);
-		padding: 0 var(--space-2, 0.5rem);
+		padding: 2px var(--mai-space-3, 0.75rem);
 		cursor: pointer;
 	}
 
 	.mai-apps__pill--active {
 		border-color: var(--mai-color-brass, currentColor);
 		color: var(--mai-color-brass, inherit);
+		background: var(--mai-color-surface-raised);
 		font-weight: 600;
 	}
 

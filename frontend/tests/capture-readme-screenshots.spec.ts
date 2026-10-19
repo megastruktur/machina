@@ -216,14 +216,20 @@ const APP_SOURCE = `
 	}
 </script>
 
-<section data-testid="host-a" aria-label="Service Map host">
+<section
+	data-testid="host-a"
+	aria-label="Service Map host"
+	style="height: 100dvh; max-height: 100dvh; overflow: hidden; padding: var(--mai-page-pad); background-color: var(--mai-color-bg); background-image: var(--mai-canvas-bg); background-size: 100% 100%, 100% 100%, 24px 24px; display: flex; flex-direction: column;"
+>
 	<ComponentHost label="Service Map host">
-		<PanelHost
-			onpanelerror={onPanelError}
-			{registry}
-			descriptor={descriptor('9d9d9d9d-9999-4222-8333-444455556666', { kind: 'server', server_id: SERVER_A }, 1)}
-			{services}
-		/>
+		<div style="max-height: calc(100dvh - 2 * var(--mai-page-pad)); overflow: auto; background: var(--mai-surface-glass); backdrop-filter: var(--mai-blur-glass); border: 1px solid var(--mai-color-primary); border-radius: var(--mai-radius-xl); box-shadow: var(--mai-shadow-window-focused);">
+			<PanelHost
+				onpanelerror={onPanelError}
+				{registry}
+				descriptor={descriptor('9d9d9d9d-9999-4222-8333-444455556666', { kind: 'server', server_id: SERVER_A }, 1)}
+				{services}
+			/>
+		</div>
 	</ComponentHost>
 </section>
 `;

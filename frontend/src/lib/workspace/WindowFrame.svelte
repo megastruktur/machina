@@ -307,19 +307,25 @@
 		   area; viewport clamping itself stays with drag/resize/restore. */
 		min-width: var(--mai-titlebar-min-w);
 		min-height: var(--mai-titlebar-min-h);
-		background: var(--mai-color-surface);
+		background: var(--mai-surface-glass, var(--mai-color-surface));
+		backdrop-filter: var(--mai-blur-glass);
+		-webkit-backdrop-filter: var(--mai-blur-glass);
 		color: var(--mai-color-text);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-lg);
+		border-radius: var(--mai-radius-xl, var(--mai-radius-lg));
 		box-shadow: var(--mai-shadow-window);
 		font-family: var(--mai-font-sans);
 		overflow: hidden;
+		transition:
+			border-color var(--mai-motion-fast) ease,
+			box-shadow var(--mai-motion-fast) ease;
 	}
 
 	/* Active focus styling: border, title voice and context badge all come
 	   from token pairs, so the state difference is visible, not color-only. */
 	.mai-window-frame--focused {
 		border-color: var(--mai-color-primary);
+		box-shadow: var(--mai-shadow-window-focused, var(--mai-shadow-window));
 	}
 
 	.mai-window-frame__titlebar {
@@ -327,12 +333,17 @@
 		align-items: center;
 		gap: var(--mai-space-2);
 		flex: none;
-		min-height: var(--mai-titlebar-min-h);
+		min-height: calc(var(--mai-titlebar-min-h) + 4px);
 		padding: var(--mai-space-1) var(--mai-space-2) var(--mai-space-1) var(--mai-space-3);
-		background: var(--mai-color-bg);
+		background: var(--mai-surface-glass-header, var(--mai-color-bg));
 		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: calc(var(--mai-radius-lg) - var(--mai-border-width))
-			calc(var(--mai-radius-lg) - var(--mai-border-width)) 0 0;
+		border-radius: calc(var(--mai-radius-xl, var(--mai-radius-lg)) - var(--mai-border-width))
+			calc(var(--mai-radius-xl, var(--mai-radius-lg)) - var(--mai-border-width)) 0 0;
+		cursor: grab;
+	}
+
+	.mai-window-frame--focused .mai-window-frame__titlebar {
+		border-bottom-color: var(--mai-color-brass);
 	}
 
 	.mai-window-frame__title {
@@ -362,13 +373,13 @@
 
 	.mai-window-frame__title-context {
 		flex: none;
-		padding: 0 var(--mai-space-2);
+		padding: 1px var(--mai-space-2);
 		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
 		color: var(--mai-status-neutral-text);
 		background: var(--mai-status-neutral-bg);
 		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-pill, var(--mai-radius-sm));
 		white-space: nowrap;
 	}
 
@@ -393,7 +404,7 @@
 		height: var(--mai-target-min);
 		padding: 0;
 		border: none;
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-pill, var(--mai-radius-sm));
 		background: transparent;
 		color: var(--mai-color-text-muted);
 		cursor: pointer;
@@ -430,7 +441,7 @@
 		flex: 1 1 auto;
 		min-height: 0;
 		overflow: auto;
-		padding: var(--mai-space-3);
+		padding: var(--mai-panel-pad, var(--mai-space-4));
 	}
 
 	/* Resize hit strips (PT3). Inside the frame box: the frame's

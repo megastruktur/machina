@@ -1,6 +1,6 @@
 /*
  * MAI shared token bridge + safe base styles (campaign mechanicus-ui,
- * mui_01-foundation).
+ * mui_01-foundation; Odyssey spatial UI & global padding tokens added in oui).
  *
  * Layer responsibilities (Encapsulated Theme Contract):
  *  - themes/mechanicus.css owns the default theme colors + typography,
@@ -12,40 +12,19 @@
  *    tokens and the safe global base styles. Routes and panels consume the
  *    custom properties; nothing redeclares theme rules.
  *
- * Authority: docs/architecture/windowed-workspace.md (ADR-0001) §2 layer
- * table ("backed by design tokens"), §6 ("Token values (contrast, focus
- * ring, target sizes) are owned by 01-ui-tokens"), §10.2 NT3 (frozen 64×32
- * title-bar minimum), and brief acceptance 1–2 (single shared
- * spacing/color/type/focus layer loaded once; readable active/focus/error
- * states; scoped global reset; reduced-motion baseline; no theme catalogue).
- *
  * Loaded exactly once via frontend/src/routes/+layout.svelte.
  * ui-tokens.spec.ts asserts the `:root` rule declaring `--mai-color-text`
  * appears exactly once across document.styleSheets — keep theme colors out
  * of this file's `:root` block (structural tokens only, see below).
- *
- * Palette note: every theme text pair meets WCAG 2.1 AA (≥ 4.5:1 normal
- * text); the focus ring meets the ≥ 3:1 non-text requirement on bg and
- * surface. Ratios are re-asserted in the browser by
- * frontend/tests/ui-tokens.spec.ts from the rendered colors.
  */
 
-/* ---- Vendor + theme layers (import order is contractual) ----------------
-   Tailwind v4 preflight/base first; Skeleton base second; then the theme
-   layers. All vendor rules live in cascade @layers, so the unlayered theme
-   rules and base styles below always win where they overlap. The Mechanicus
-   palette is the default (:root); standard.css only overrides under
-   [data-theme="standard"]. */
+/* ---- Vendor + theme layers (import order is contractual) ---------------- */
 @import 'tailwindcss';
 @import '@skeletonlabs/skeleton';
 @import './themes/mechanicus.css';
 @import './themes/standard.css';
 
-/* ---- Structural tokens (theme-independent) ------------------------------
-   Deliberately declares NO color or status values (--mai-color-*,
-   --mai-status-*): those are theme-owned (themes/*.css). This block may
-   therefore never trip the
-   exactly-one :root rule assertion for theme colors. */
+/* ---- Structural tokens (theme-independent) ------------------------------ */
 :root {
 	/* ---- Focus geometry (color is theme-owned) -------------------------- */
 	--mai-focus-ring-width: 2px;
@@ -73,17 +52,30 @@
 	--mai-space-6: 32px;
 	--mai-space-7: 40px;
 	--mai-space-8: 48px;
-	--mai-radius-sm: 4px;
-	--mai-radius-md: 6px;
-	--mai-radius-lg: 8px;
+
+	/* ---- Standardized Global Padding & Spatial Layout Tokens ------------- */
+	--mai-page-pad: 14px;
+	--mai-panel-pad: 16px;
+	--mai-card-pad: 14px;
+	--mai-hud-pad-x: 14px;
+	--mai-hud-pad-y: 8px;
+	--mai-control-pad-x: 12px;
+	--mai-control-pad-y: 6px;
+
+	/* ---- Radii & Glass Blur ---------------------------------------------- */
+	--mai-radius-sm: 6px;
+	--mai-radius-md: 8px;
+	--mai-radius-lg: 12px;
+	--mai-radius-xl: 14px;
+	--mai-radius-2xl: 18px;
+	--mai-radius-pill: 9999px;
 	--mai-border-width: 1px;
+	--mai-blur-glass: blur(18px) saturate(140%);
 
 	/* ---- Size invariants ---------------------------------------------------- */
 	/* Minimum interactive target (WCAG 2.5.8 AA). */
 	--mai-target-min: 24px;
-	/* windowed-workspace ADR §10.2 NT3 — FROZEN minimum visible title-bar area.
-	   The value is contractual; window producers consume these variables and
-	   never redeclare their own numbers. */
+	/* windowed-workspace ADR §10.2 NT3 — FROZEN minimum visible title-bar area. */
 	--mai-titlebar-min-w: 64px;
 	--mai-titlebar-min-h: 32px;
 
@@ -92,10 +84,10 @@
 	--mai-motion-base: 180ms;
 }
 
-/* ---- Safe global reset ------------------------------------------------
+/* ---- Safe global reset & shared control defaults -----------------------
    Deliberately minimal: nothing here may break scrolling, text selection or
    form input (brief acceptance 2; P01 scenario). No overflow, height or
-   user-select rules are set anywhere in this file. */
+   user-select rules are set on html/body. */
 *,
 *::before,
 *::after {
@@ -129,8 +121,9 @@ canvas {
 	max-width: 100%;
 }
 
-/* Form controls inherit the document voice instead of UA defaults, so panels
-   do not need per-component font fixes. */
+/* Form controls inherit the document voice and consistent padding/chrome
+   so even raw <select>, <input>, and <textarea> tags in feature panels
+   automatically look like part of the Odyssey design system. */
 button,
 input,
 optgroup,
@@ -139,6 +132,25 @@ textarea {
 	font: inherit;
 	letter-spacing: inherit;
 	color: inherit;
+}
+
+:where(select, textarea, input:not([type='checkbox']):not([type='radio']):not([type='range'])) {
+	padding: var(--mai-control-pad-y) var(--mai-control-pad-x);
+	background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+	border: var(--mai-border-width) solid var(--mai-color-border);
+	border-radius: var(--mai-radius-md);
+	transition:
+		border-color var(--mai-motion-fast) ease,
+		background-color var(--mai-motion-fast) ease,
+		box-shadow var(--mai-motion-fast) ease;
+}
+
+:where(select, textarea, input:not([type='checkbox']):not([type='radio']):not([type='range'])):hover:not(:disabled) {
+	border-color: var(--mai-color-border-strong);
+}
+
+:where(select, textarea, input:not([type='checkbox']):not([type='radio']):not([type='range'])):focus {
+	border-color: var(--mai-color-brass);
 }
 
 a {
@@ -150,12 +162,16 @@ a {
 	opacity: 1;
 }
 
-/* Visible keyboard focus everywhere (ADR §6: chrome controls reachable and
-   operable by keyboard with visible focus indicators). Pointer clicks are
-   unaffected: this matches only keyboard-triggered focus. */
+/* Visible keyboard focus everywhere (ADR §6). */
 :focus-visible {
 	outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
 	outline-offset: var(--mai-focus-ring-offset);
+}
+
+/* Subtle modern scrollbars inside windows and drawers. */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--mai-color-border) transparent;
 }
 
 /* ---- Reduced-motion baseline (ADR §6) ---------------------------------- */

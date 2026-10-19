@@ -68,6 +68,8 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import Chip from '../ui/Chip.svelte';
+	import Select from '../ui/Select.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -1062,9 +1064,11 @@
 	const approvalPending = $derived(
 		approvalBinding !== null && approval !== null && approval.status === 'pending'
 	);
+	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
+	let advancedOpen = $state(false);
 </script>
 
-<div class="mai-chat" data-testid="chat-root">
+<div class="mai-chat" class:mai-chat--docked={isDocked} data-testid="chat-root">
 	{#if !usable}
 		<div class="mai-chat__state mai-chat__state--error" role="alert" data-testid="panel-config-error">
 			<p>This panel was opened without its conversation service or outside a pinned server scope.</p>
@@ -1074,10 +1078,24 @@
 			<div class="mai-chat__header-row">
 				<h3 class="mai-chat__title">Conversation</h3>
 				<div class="mai-chat__header-actions">
-					<Button variant="secondary" onclick={newChat} data-testid="chat-new-session">
+					{#if isDocked}
+						<Button
+							size="sm"
+							pill
+							variant="secondary"
+							onclick={() => (advancedOpen = !advancedOpen)}
+							aria-expanded={advancedOpen}
+							data-testid="chat-advanced-toggle"
+						>
+							{advancedOpen ? 'Hide options' : 'Options'}
+						</Button>
+					{/if}
+					<Button size="sm" pill variant="secondary" onclick={newChat} data-testid="chat-new-session">
 						New Chat
 					</Button>
 					<Button
+						size="sm"
+						pill
 						variant="secondary"
 						onclick={() => (historyOpen = !historyOpen)}
 						aria-expanded={historyOpen}
@@ -1153,48 +1171,32 @@
 			     pick controls leave the DOM. -->
 			<div class="mai-chat__chips" data-testid="chat-context-chips">
 				{#if generalConsultMode}
-					<span class="mai-chat__badge" data-testid="chat-general-consult-badge">
+					<Chip variant="neutral" data-testid="chat-general-consult-badge">
 						General Consult — No Server Pinned
-					</span>
+					</Chip>
 				{:else}
-					<span
-						class="mai-chat__chip"
+					<Chip
+						variant="brass"
+						locked={chatContextLocked}
 						data-testid="chat-server-chip"
-						data-locked={chatContextLocked ? 'true' : null}
+						removeLabel="Remove pinned server"
+						removeTestId="chat-server-chip-remove"
+						onremove={!chatContextLocked ? () => (draftServerOverride = null) : undefined}
 					>
 						🖥 {serverLabelFor(effectiveServerId ?? '')}
-						{#if !chatContextLocked}
-							<button
-								type="button"
-								class="mai-chat__chip-remove"
-								data-testid="chat-server-chip-remove"
-								aria-label="Remove pinned server"
-								onclick={() => (draftServerOverride = null)}
-							>
-								×
-							</button>
-						{/if}
-					</span>
+					</Chip>
 				{/if}
 				{#each selectedServiceTags as tag (tag)}
-					<span
-						class="mai-chat__chip"
+					<Chip
+						variant="info"
+						locked={chatContextLocked}
 						data-testid="chat-service-chip"
-						data-locked={chatContextLocked ? 'true' : null}
+						removeLabel="Remove service tag"
+						removeTestId="chat-service-chip-remove"
+						onremove={!chatContextLocked ? () => removeServiceTag(tag) : undefined}
 					>
 						@{tag}
-						{#if !chatContextLocked}
-							<button
-								type="button"
-								class="mai-chat__chip-remove"
-								data-testid="chat-service-chip-remove"
-								aria-label="Remove service tag"
-								onclick={() => removeServiceTag(tag)}
-							>
-								×
-							</button>
-						{/if}
-					</span>
+					</Chip>
 				{/each}
 				{#if chatContextLocked}
 					<span class="mai-chat__lock" data-testid="chat-context-locked">
@@ -1206,12 +1208,15 @@
 			{#if !chatContextLocked}
 				<div class="mai-chat__compose-context">
 					<div class="mai-chat__context-controls">
-						<label class="mai-chat__label" for="{uid}-server">Target server</label>
-						<select
+						<Select
 							id="{uid}-server"
+							label="Target server"
+							inlineLabel
+							pill
+							compact
 							class="mai-chat__server-picker"
 							data-testid="chat-server-picker"
-							value={generalConsultMode ? GLOBAL_CONSULT_SERVER_ID : effectiveServerId}
+							value={generalConsultMode ? GLOBAL_CONSULT_SERVER_ID : (effectiveServerId ?? '')}
 							onchange={(event) => {
 								const next = (event.currentTarget as HTMLSelectElement).value;
 								draftServerOverride = next === GLOBAL_CONSULT_SERVER_ID ? null : next;
@@ -1226,9 +1231,11 @@
 							{#if !generalConsultMode && effectiveServerId !== null && !serverOptions.some((one) => one.id === effectiveServerId)}
 								<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
 							{/if}
-						</select>
+						</Select>
 						{#if !generalConsultMode}
 							<Button
+								size="sm"
+								pill
 								variant="secondary"
 								onclick={() => (servicePickerOpen = !servicePickerOpen)}
 								data-testid="chat-service-picker-toggle"
@@ -1261,75 +1268,95 @@
 			{/if}
 
 			<div class="mai-chat__form">
-				<label class="mai-chat__label" for="{uid}-message">Message</label>
-				<textarea
-					id="{uid}-message"
-					class="mai-chat__textarea"
-					bind:value={composeMessage}
-					oninput={handleComposeInput}
-					rows={3}
-					data-testid="compose-message"
-				></textarea>
+				<div class="mai-chat__composer-bar">
+					<div class="mai-chat__composer-input-wrap">
+						<label class="mai-chat__label" class:mai-chat__label--sr={isDocked} for="{uid}-message">Message</label>
+						<textarea
+							id="{uid}-message"
+							class="mai-chat__textarea"
+							placeholder="Ask M.A.I. or type @service to pin context…"
+							bind:value={composeMessage}
+							oninput={handleComposeInput}
+							rows={isDocked ? 1 : 3}
+							data-testid="compose-message"
+						></textarea>
+					</div>
+					<div class="mai-chat__composer-profile">
+						<Field
+							label="Model profile"
+							compact={isDocked}
+							placeholder="Profile (e.g. default)"
+							bind:value={composeProfile}
+							data-testid="compose-profile"
+							error={composeFields.profile ?? ''}
+							hint="Explicit selection (C06 rule 1); the stored pairing of the pinned server."
+						/>
+					</div>
+					{#if isDocked}
+						<div class="mai-chat__actions">
+							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
+								Send
+							</Button>
+						</div>
+					{/if}
+				</div>
 				{#if composeFields.message}
 					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
 				{/if}
-				<Field
-					label="Model profile"
-					bind:value={composeProfile}
-					data-testid="compose-profile"
-					error={composeFields.profile ?? ''}
-					hint="Explicit selection (C06 rule 1); the stored pairing of the pinned server."
-				/>
-				<Field
-					label="Capabilities"
-					bind:value={composeCapabilities}
-					data-testid="compose-capabilities"
-					error={composeFields.capabilities ?? ''}
-					hint="Comma-separated grant request; empty means NO capability."
-				/>
-				<fieldset class="mai-chat__children">
-					<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>
-					{#each composeChildren as _, index (index)}
-						<div class="mai-chat__child" data-testid="compose-child">
-							<Field
-								label="Child {index + 1} task"
-								bind:value={composeChildren[index]}
-								data-testid="compose-child-task"
-							/>
-							<Button
-								variant="secondary"
-								onclick={() => removeChildSlot(index)}
-								disabled={childSlots <= 1}
-								data-testid="child-remove"
-							>
-								Remove
-							</Button>
-						</div>
-					{/each}
-					<Button
-						variant="secondary"
-						onclick={addChildSlot}
-						disabled={childSlots >= MAX_CHILDREN}
-						data-testid="child-add"
-					>
-						Add child task
-					</Button>
-					{#if composeFields.children}
-						<p class="mai-chat__field-error" role="alert">{composeFields.children}</p>
-					{/if}
-				</fieldset>
-				<Field
-					label="Context attachments"
-					bind:value={composeAttachments}
-					data-testid="compose-attachments"
-					error={composeFields.attachments ?? ''}
-					hint="Op ids of stored artifacts of this server (comma-separated); references only."
-				/>
-				<div class="mai-chat__actions">
-					<Button onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
-						Send
-					</Button>
+				<div class="mai-chat__advanced" class:mai-chat__advanced--collapsed={isDocked && !advancedOpen}>
+					<Field
+						label="Capabilities"
+						bind:value={composeCapabilities}
+						data-testid="compose-capabilities"
+						error={composeFields.capabilities ?? ''}
+						hint="Comma-separated grant request; empty means NO capability."
+					/>
+					<fieldset class="mai-chat__children">
+						<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>
+						{#each composeChildren as _, index (index)}
+							<div class="mai-chat__child" data-testid="compose-child">
+								<Field
+									label="Child {index + 1} task"
+									bind:value={composeChildren[index]}
+									data-testid="compose-child-task"
+								/>
+								<Button
+									variant="secondary"
+									onclick={() => removeChildSlot(index)}
+									disabled={childSlots <= 1}
+									data-testid="child-remove"
+								>
+									Remove
+								</Button>
+							</div>
+						{/each}
+						<Button
+							variant="secondary"
+							onclick={addChildSlot}
+							disabled={childSlots >= MAX_CHILDREN}
+							data-testid="child-add"
+						>
+							Add child task
+						</Button>
+						{#if composeFields.children}
+							<p class="mai-chat__field-error" role="alert">{composeFields.children}</p>
+						{/if}
+					</fieldset>
+					<Field
+						label="Context attachments"
+						bind:value={composeAttachments}
+						data-testid="compose-attachments"
+						error={composeFields.attachments ?? ''}
+						hint="Op ids of stored artifacts of this server (comma-separated); references only."
+					/>
 				</div>
+				{#if !isDocked}
+					<div class="mai-chat__actions">
+						<Button onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
+							Send
+						</Button>
+					</div>
+				{/if}
 				{#if composeProblem !== null}
 					<div
 						class="mai-chat__state mai-chat__state--error"
@@ -1343,7 +1370,7 @@
 			</div>
 		</section>
 
-		<section class="mai-chat__section" aria-label="Conversations" data-testid="chat-history">
+		<section class="mai-chat__section mai-chat__section--history" aria-label="Conversations" data-testid="chat-history">
 			<div class="mai-chat__section-head">
 				<h4>Conversations</h4>
 				<Button variant="secondary" onclick={loadHistory} data-testid="history-refresh">
@@ -1407,7 +1434,12 @@
 			{/if}
 		</section>
 
-		<section class="mai-chat__section" aria-label="Open conversation" data-testid="chat-conversation">
+		<section
+			class="mai-chat__section mai-chat__section--conversation"
+			class:mai-chat__section--idle={display === null}
+			aria-label="Open conversation"
+			data-testid="chat-conversation"
+		>
 			{#if display === null}
 				<div class="mai-chat__state" role="status" data-testid="chat-none">
 					<p>No conversation is open. Send a message or open one from the list.</p>
@@ -1607,13 +1639,111 @@
 	.mai-chat {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4, 1rem);
-		padding: var(--space-4, 1rem);
-		color: var(--color-fg, inherit);
-		font-size: var(--font-size-sm, 0.875rem);
+		gap: var(--mai-space-3, 0.75rem);
+		padding: var(--mai-panel-pad, 1rem);
+		color: var(--mai-color-text, inherit);
+		font-size: var(--mai-text-sm, 0.875rem);
 		min-width: 0;
 		min-height: 0;
 		overflow: auto;
+	}
+
+	/* Compact Odyssey pill layout when mounted inside the Bottom Chat Dock. */
+	.mai-chat--docked {
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-1) 0 0;
+		overflow: visible;
+	}
+
+	.mai-chat--docked .mai-chat__title,
+	.mai-chat--docked > .mai-chat__header > .mai-chat__meta,
+	.mai-chat--docked .mai-chat__section-head > h4,
+	.mai-chat--docked .mai-chat__section--history,
+	.mai-chat--docked .mai-chat__section--idle {
+		display: none;
+	}
+
+	.mai-chat--docked .mai-chat__section {
+		border-top: none;
+		padding-top: 0;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat--docked .mai-chat__section--conversation {
+		max-height: 28vh;
+		overflow: auto;
+		padding: var(--mai-card-pad);
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-chat__composer-bar {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat--docked .mai-chat__composer-bar {
+		flex-direction: row;
+		align-items: center;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat__composer-input-wrap {
+		flex: 1 1 auto;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+	}
+
+	.mai-chat--docked .mai-chat__composer-profile {
+		flex: 0 0 13rem;
+	}
+
+	.mai-chat--docked .mai-chat__textarea {
+		min-height: 2.25rem;
+		height: 2.25rem;
+		padding: var(--mai-space-1) var(--mai-space-3);
+		border-radius: var(--mai-radius-pill);
+		resize: none;
+	}
+
+	.mai-chat__label--sr {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	.mai-chat__advanced {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat__advanced--collapsed {
+		display: none;
+	}
+
+	/* Floating history selector & @service autocomplete: open ABOVE the dock when docked. */
+	.mai-chat--docked .mai-chat__history-popover,
+	.mai-chat--docked .mai-chat__service-autocomplete {
+		top: auto;
+		bottom: calc(100% + var(--mai-space-2));
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		backdrop-filter: var(--mai-blur-glass);
+		-webkit-backdrop-filter: var(--mai-blur-glass);
+		border-color: var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-lg);
+		box-shadow: var(--mai-shadow-float);
 	}
 
 	.mai-chat__header {
@@ -1688,31 +1818,6 @@
 		flex-wrap: wrap;
 	}
 
-	.mai-chat__chip {
-		display: inline-flex;
-		align-items: center;
-		gap: var(--mai-space-1, 0.25rem);
-		padding: 0 var(--mai-space-2, 0.5rem);
-		border: 1px solid var(--border-strong, currentColor);
-		border-radius: 999px;
-		font-size: var(--mai-text-xs, 0.75rem);
-	}
-
-	.mai-chat__chip-remove {
-		padding: 0 var(--mai-space-1, 0.25rem);
-		font: inherit;
-		color: inherit;
-		cursor: pointer;
-		background: transparent;
-		border: none;
-		border-radius: 999px;
-	}
-
-	.mai-chat__chip-remove:hover {
-		background: var(--mai-status-danger-bg, transparent);
-		color: var(--mai-status-danger-text, inherit);
-	}
-
 	.mai-chat__lock {
 		font-size: var(--mai-text-xs, 0.75rem);
 		color: var(--color-warning, inherit);
@@ -1730,15 +1835,6 @@
 		align-items: center;
 		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
-	}
-
-	.mai-chat__server-picker {
-		padding: var(--mai-space-1, 0.25rem) var(--mai-space-2, 0.5rem);
-		font: inherit;
-		color: inherit;
-		background: var(--surface-raised, transparent);
-		border: 1px solid var(--border-strong, currentColor);
-		border-radius: var(--mai-radius-sm, 4px);
 	}
 
 	/* `@service` autocomplete: opens under the composer controls. */

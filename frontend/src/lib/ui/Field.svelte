@@ -1,28 +1,11 @@
 <script lang="ts">
 	/**
-	 * Shared labeled field primitive (card 01-ui-controls, P01).
+	 * Shared labeled field primitive (card 01-ui-controls, P01; Odyssey UI upgrade).
 	 *
 	 * Layer: shared UI primitive (windowed-workspace ADR-0001 §2). Owns nothing:
 	 * no window geometry, no drag, no server scoping, no stores, no context, no
 	 * module-level `window`/`document` access (ADR §5 rule 4). Safe to render
 	 * on the server (`$props.id()` works during SSR).
-	 *
-	 * Accessibility: a native <input> with a real <label for>; the visible
-	 * keyboard focus ring comes from the global `:focus-visible` baseline in
-	 * ui/tokens.css (ADR §6). We do not re-implement native behavior.
-	 * A non-empty `error` sets `aria-invalid` on the input and links it via
-	 * `aria-describedby` to the visible error text (`role="alert"`), so the
-	 * error is announced and never color-only (C08 rule 6). `hint` is linked
-	 * the same way.
-	 *
-	 * Secret non-disclosure (brief acceptance 2, windowed ADR §8 rule 1): the
-	 * value lives only in the input element binding. It is never rendered as
-	 * text, copied into any attribute, stored, or logged by this component.
-	 *
-	 * This is deliberately NOT a form generator: one labeled input + optional
-	 * hint/error wiring, nothing more.
-	 *
-	 * Tokens come only from ui/tokens.css; no dependency is added (ADR §4.3).
 	 */
 	import type { HTMLInputAttributes } from 'svelte/elements';
 
@@ -39,6 +22,8 @@
 		error?: string;
 		/** Optional help text shown under the input. */
 		hint?: string;
+		/** Compact density for floating HUD/dock bars (hides verbose hint until focused/error). */
+		compact?: boolean;
 		/** Input element id; auto-generated per instance when omitted. */
 		id?: string;
 	};
@@ -51,6 +36,7 @@
 		value = $bindable(''),
 		error = '',
 		hint = '',
+		compact = false,
 		id = generatedId,
 		class: className = '',
 		...rest
@@ -59,18 +45,21 @@
 	const hintId = $derived(`${id}-hint`);
 	const errorId = $derived(`${id}-error`);
 
-	// Reactive: the describedby list follows hint/error as they appear.
 	const describedBy = $derived(
 		[hint !== '' ? hintId : '', error !== '' ? errorId : ''].filter(Boolean).join(' ') || undefined
 	);
 </script>
 
-<div class="mai-field" class:mai-field--error={error !== ''}>
+<div
+	class="mai-field"
+	class:mai-field--error={error !== ''}
+	class:mai-field--compact={compact}
+>
 	<!-- svelte-ignore a11y_label_has_associated_control -->
 	<label class="mai-field__label" for={id}>{label}</label>
 	<input
 		{...rest}
-		id={id}
+		{id}
 		{type}
 		bind:value
 		class="mai-field__input {className}"
@@ -78,7 +67,7 @@
 		aria-describedby={describedBy}
 	/>
 	{#if hint !== ''}
-		<p class="mai-field__hint" id={hintId}>{hint}</p>
+		<p class="mai-field__hint" class:mai-field__hint--compact={compact} id={hintId}>{hint}</p>
 	{/if}
 	{#if error !== ''}
 		<p class="mai-field__error" id={errorId} role="alert">{error}</p>
@@ -90,20 +79,28 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
+		min-width: 0;
+	}
+
+	.mai-field--compact {
+		flex-direction: row;
+		align-items: center;
+		gap: var(--mai-space-2);
 	}
 
 	.mai-field__label {
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
-		color: var(--mai-color-text);
+		color: var(--mai-color-text-muted);
+		white-space: nowrap;
 	}
 
 	.mai-field__input {
 		width: 100%;
 		min-width: 0;
 		min-height: var(--mai-target-min);
-		padding: var(--mai-space-2) var(--mai-space-3);
-		background: var(--mai-color-surface);
+		padding: var(--mai-control-pad-y) var(--mai-control-pad-x);
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface));
 		color: var(--mai-color-text);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
@@ -114,14 +111,17 @@
 			background-color var(--mai-motion-fast) ease;
 	}
 
-	/* Tactile cogitator plate: brass seam on pointer hover, raised surface. */
+	.mai-field--compact .mai-field__input {
+		padding-top: var(--mai-space-1);
+		padding-bottom: var(--mai-space-1);
+		font-size: var(--mai-text-xs);
+	}
+
 	.mai-field__input:hover:not(:disabled) {
 		border-color: var(--mai-color-border-strong);
 		background: var(--mai-color-surface-raised);
 	}
 
-	/* Brass border on any focus; the crisp keyboard focus ring itself comes
-	   from the global :focus-visible baseline in tokens.css. */
 	.mai-field__input:focus {
 		border-color: var(--mai-color-brass);
 	}
@@ -131,19 +131,30 @@
 		cursor: not-allowed;
 	}
 
-	/* Error wins over hover/focus seams (attribute + class beats a
-	   pseudo-class). */
 	.mai-field__input[aria-invalid='true'] {
 		border-color: var(--mai-status-danger-text);
 	}
 
 	.mai-field__hint {
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		color: var(--mai-color-text-muted);
 	}
 
+	.mai-field__hint--compact {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+
 	.mai-field__error {
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		color: var(--mai-status-danger-text);
 	}
 </style>

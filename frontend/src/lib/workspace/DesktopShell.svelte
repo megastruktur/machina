@@ -222,6 +222,8 @@
 	import ChatPanel from '$lib/panels/ChatPanel.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Field from '$lib/ui/Field.svelte';
+	import Select from '$lib/ui/Select.svelte';
+	import GlassSurface from '$lib/ui/GlassSurface.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
 	// its exact contract; the shell maps ONE client onto all of them).
 	// Live transport: one client per shell instance (ADR §5 — instances share
@@ -968,54 +970,65 @@
 </script>
 
 <div class="mai-desktop-shell">
-	<div class="mai-desktop-shell__launcher">
+	<GlassSurface as="header" variant="hud" class="mai-desktop-shell__launcher">
 		<h2 class="mai-desktop-shell__launcher-title">Open panels</h2>
-		<label class="mai-desktop-shell__server-label" for="mai-desktop-server-select">
-			Target server for new windows
-		</label>
-		<select
+		<Select
 			id="mai-desktop-server-select"
-			class="mai-desktop-shell__server-select"
+			label="Target server for new windows"
+			inlineLabel
+			pill
+			compact
 			bind:value={selectedServerId}
 			data-testid="server-select"
 		>
 			{#each serverOptions as server (server.id)}
 				<option value={server.id}>{server.label}</option>
 			{/each}
-		</select>
-		{#if live}
-			{#each liveEntries as entry (entry.panel_kind)}
+		</Select>
+		<div class="mai-desktop-shell__launcher-actions">
+			{#if live}
+				{#each liveEntries as entry (entry.panel_kind)}
+					<Button
+						size="sm"
+						pill
+						variant="secondary"
+						data-testid={'open-' + entry.panel_kind}
+						onclick={() =>
+							entry.panel_kind === CHAT_PANEL_KIND ? focusChatDock() : openPanel(entry.panel_kind)}
+					>
+						<span class="mai-sr-only">{'Open '}</span><span class="mai-desktop-shell__btn-title">{entry.title}</span><span class="mai-sr-only">{' — '}</span><span class="mai-desktop-shell__btn-scope">{entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}</span>
+					</Button>
+				{/each}
 				<Button
-					data-testid={'open-' + entry.panel_kind}
-					onclick={() =>
-						entry.panel_kind === CHAT_PANEL_KIND ? focusChatDock() : openPanel(entry.panel_kind)}
+					size="sm"
+					pill
+					variant="secondary"
+					data-testid="desktop-enroll-toggle"
+					onclick={() => (enrollOpen = !enrollOpen)}
 				>
-					Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
+					{enrollOpen ? 'Close enrollment' : 'Enroll server'}
 				</Button>
-			{/each}
-			<Button
-				variant="secondary"
-				data-testid="desktop-enroll-toggle"
-				onclick={() => (enrollOpen = !enrollOpen)}
-			>
-				{enrollOpen ? 'Close enrollment' : 'Enroll server'}
-			</Button>
-			<Button variant="secondary" data-testid="desktop-sign-out" onclick={signOut}>
-				Sign out
-			</Button>
-		{:else}
-			{#each fixtureEntries as entry (entry.panel_kind)}
-				<Button
-					data-testid={'open-' + entry.panel_kind}
-					onclick={() => openPanel(entry.panel_kind)}
-				>
-					Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
+				<Button size="sm" pill variant="secondary" data-testid="desktop-sign-out" onclick={signOut}>
+					Sign out
 				</Button>
-			{/each}
-			<a class="mai-desktop-shell__signin" href="/login" data-testid="desktop-sign-in">
-				Connect live session / Sign in
-			</a>
-		{/if}
+			{:else}
+				{#each fixtureEntries as entry (entry.panel_kind)}
+					<Button
+						size="sm"
+						pill
+						variant="secondary"
+						data-testid={'open-' + entry.panel_kind}
+						onclick={() => openPanel(entry.panel_kind)}
+					>
+						<span class="mai-sr-only">{'Open '}</span><span class="mai-desktop-shell__btn-title">{entry.title}</span><span class="mai-sr-only">{' — '}</span><span class="mai-desktop-shell__btn-scope">{entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}</span>
+					</Button>
+				{/each}
+				<a class="mai-desktop-shell__signin" href="/login" data-testid="desktop-sign-in">
+					Connect live session / Sign in
+				</a>
+			{/if}
+		</div>
+		<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
 		{#if live && enrollOpen}
 			<!-- Inline enrollment: one reviewed create call; the field set mirrors
 			     the frozen ProfileCreate document (C02 rule 1) exactly. -->
@@ -1033,18 +1046,15 @@
 				<Field label="Host key (SHA256 fingerprint)" bind:value={enrollHostKey} required />
 				<Field label="Credential reference" bind:value={enrollCredentialRef} required />
 				<Field label="Capabilities (comma-separated)" bind:value={enrollCapabilities} />
-				<label class="mai-desktop-shell__server-label" for="mai-enroll-privilege">
-					Privilege mode
-				</label>
-				<select
+				<Select
 					id="mai-enroll-privilege"
-					class="mai-desktop-shell__server-select"
+					label="Privilege mode"
 					bind:value={enrollPrivilege}
 				>
 					<option value="none">none</option>
 					<option value="sudo">sudo</option>
 					<option value="root">root</option>
-				</select>
+				</Select>
 				{#if enrollError}
 					<p class="mai-desktop-shell__enroll-error" role="alert" data-testid="enroll-error">
 						{enrollError}
@@ -1053,9 +1063,7 @@
 				<Button type="submit" loading={enrollBusy} data-testid="enroll-submit">Enroll</Button>
 			</form>
 		{/if}
-	</div>
-
-	<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
+	</GlassSurface>
 
 	<div class="mai-desktop-shell__desktop" bind:this={desktopEl} data-testid="desktop">
 		<!-- Frame intents map 1:1 onto the state transitions (focus/close/move).
@@ -1101,9 +1109,11 @@
 		bind:this={dockEl}
 	>
 		<div class="mai-desktop-shell__dock-bar">
-			<span class="mai-desktop-shell__dock-title">Chat</span>
+			<span class="mai-desktop-shell__dock-title">⚙ Odyssey Noosphere Chat</span>
 			<Button
-				variant="secondary"
+				size="sm"
+				pill
+				variant="ghost"
 				onclick={() => (dockCollapsed = !dockCollapsed)}
 				aria-expanded={!dockCollapsed}
 				data-testid="bottom-chat-dock-toggle"
@@ -1126,73 +1136,106 @@
 
 <style>
 	.mai-desktop-shell {
+		position: relative;
+		flex: 1 1 0%;
+		min-height: 0;
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-3);
+		gap: var(--mai-space-2);
 	}
 
-	.mai-desktop-shell__launcher {
+	.mai-sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	:global(.mai-desktop-shell__launcher) {
+		flex: 0 0 auto;
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--mai-space-2);
-		padding: var(--mai-space-2) var(--mai-space-3);
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		z-index: 20;
 	}
 
 	.mai-desktop-shell__launcher-title {
-		font-size: var(--mai-text-sm);
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	.mai-desktop-shell__launcher-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-1);
+		flex: 1 1 auto;
+	}
+
+	.mai-desktop-shell__btn-title {
 		font-weight: var(--mai-weight-semibold);
 		color: var(--mai-color-text);
 	}
 
-	.mai-desktop-shell__server-label {
-		font-size: var(--mai-text-sm);
-		color: var(--mai-color-text-muted);
-	}
-
-	.mai-desktop-shell__server-select {
-		padding: var(--mai-space-1) var(--mai-space-2);
-		font-size: var(--mai-text-sm);
-		color: var(--mai-color-text);
+	.mai-desktop-shell__btn-scope {
+		padding: 1px var(--mai-space-2);
+		font-family: var(--mai-font-mono);
+		font-size: 0.7rem;
+		color: var(--mai-color-brass);
 		background: var(--mai-color-bg);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-pill);
 	}
 
 	.mai-desktop-shell__status {
-		min-height: 1.5em;
-		font-size: var(--mai-text-sm);
+		margin-left: auto;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 		color: var(--mai-color-text-muted);
+		white-space: nowrap;
 	}
 
 	/* The live-session hand-off link shown next to the fixture launcher. */
 	.mai-desktop-shell__signin {
 		padding: var(--mai-space-1) var(--mai-space-3);
-		font-size: var(--mai-text-sm);
-		color: var(--mai-color-primary);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		color: var(--mai-color-brass);
+		border: var(--mai-border-width) solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-pill);
 		text-decoration: none;
 	}
 
 	.mai-desktop-shell__signin:hover {
 		background: var(--mai-color-bg);
+		border-color: var(--mai-color-brass);
 	}
 
 	/* Inline server enrollment (live mode only): a compact field grid. */
 	.mai-desktop-shell__enroll {
 		flex: 1 1 100%;
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+		grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
 		gap: var(--mai-space-2);
 		align-items: end;
-		padding: var(--mai-space-3);
-		background: var(--mai-color-bg);
+		padding: var(--mai-card-pad, var(--mai-space-3));
+		background: var(--mai-surface-glass-raised, var(--mai-color-bg));
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-lg);
 	}
 
 	.mai-desktop-shell__enroll-error {
@@ -1208,29 +1251,33 @@
 	   lose its recoverable title bar (ADR §10.2 NT3). */
 	.mai-desktop-shell__desktop {
 		position: relative;
-		flex: 1 1 auto;
-		min-height: 60vh;
-		border: var(--mai-border-width) dashed var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-md);
+		flex: 1 1 0%;
+		min-height: 360px;
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-xl, var(--mai-radius-md));
+		background: var(--mai-surface-glass, transparent);
+		box-shadow: inset 0 1px 0 var(--mai-border-specular);
 	}
 
-	/* Always-Visible Bottom Chat Dock: the persistent chat region below the
-	   desktop canvas. Collapse hides the body visually only — the mounted
-	   panel and its draft survive an expand/collapse round trip. */
+	/* Odyssey-Style Floating Center-Bottom Chat Pill: floats above the bottom
+	   of the spatial canvas without pushing the document height. */
 	.mai-desktop-shell__dock {
-		flex: 0 0 auto;
-		/* Always-visible: pinned to the bottom of the VIEWPORT — the desktop
-		   canvas scrolls behind it, the composer never leaves reach. */
-		position: sticky;
-		bottom: 0;
+		position: absolute;
+		bottom: var(--mai-space-3);
+		left: 50%;
+		transform: translateX(-50%);
+		width: min(860px, calc(100% - 2 * var(--mai-space-4)));
 		z-index: 30;
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-2);
-		padding: var(--mai-space-2) var(--mai-space-3);
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		gap: var(--mai-space-1);
+		padding: var(--mai-hud-pad-y) var(--mai-hud-pad-x);
+		background: var(--mai-surface-glass, var(--mai-color-surface));
+		backdrop-filter: var(--mai-blur-glass);
+		-webkit-backdrop-filter: var(--mai-blur-glass);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
+		box-shadow: var(--mai-shadow-float);
 	}
 
 	.mai-desktop-shell__dock-bar {
@@ -1241,14 +1288,16 @@
 	}
 
 	.mai-desktop-shell__dock-title {
-		font-size: var(--mai-text-sm);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-semibold);
-		color: var(--mai-color-text);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-desktop-shell__dock-body {
-		max-height: 40vh;
-		overflow: auto;
+		overflow: visible;
 	}
 
 	.mai-desktop-shell__dock--collapsed .mai-desktop-shell__dock-body {

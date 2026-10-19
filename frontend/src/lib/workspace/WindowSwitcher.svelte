@@ -93,28 +93,35 @@
 <style>
 	.mai-window-switcher {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--mai-space-2);
 		min-height: var(--mai-target-min);
 		padding: var(--mai-space-1) var(--mai-space-2);
-		background: var(--mai-color-bg);
+		background: var(--mai-surface-glass, var(--mai-color-bg));
+		backdrop-filter: var(--mai-blur-glass);
+		-webkit-backdrop-filter: var(--mai-blur-glass);
 		border-top: var(--mai-border-width) solid var(--mai-color-border);
 		font-family: var(--mai-font-sans);
+	}
+
+	.mai-window-switcher:empty {
+		display: none;
 	}
 
 	.mai-window-switcher__entry {
 		display: inline-flex;
 		align-items: center;
 		gap: var(--mai-space-2);
-		max-width: 220px;
+		max-width: 240px;
 		min-height: var(--mai-target-min);
 		padding: 0 var(--mai-space-3);
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
 		color: var(--mai-color-text);
-		background: var(--mai-color-surface);
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface));
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-pill, var(--mai-radius-md));
 		cursor: pointer;
 	}
 
