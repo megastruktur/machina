@@ -487,11 +487,12 @@ page
 	await expect(a.getByTestId('profile-revision')).toHaveText('1');
 	await expect(a.getByTestId('prompt-edition-badge')).toHaveText('edition 1');
 
-	// Acceptance 1: profile fields + server system prompt are editable.
+	// Acceptance 1: profile fields + server system prompt + capability chips/dropdown are editable.
 	await expect(a.getByTestId('edit-name')).toHaveValue('alpha');
 	await expect(a.getByTestId('edit-ssh-host')).toHaveValue('203.0.113.10');
 	await expect(a.getByTestId('edit-ssh-port')).toHaveValue('22');
 	await expect(a.getByTestId('edit-ssh-user')).toHaveValue('deploy');
+	await expect(a.getByTestId('edit-capabilities-chip')).toHaveCount(2);
 	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# Server instructions for alpha');
 
 	// Acceptance 1: no credential material anywhere in the rendered document.
@@ -514,8 +515,10 @@ page
 	const a = page.getByTestId('host-a');
 	await expect(a.getByTestId('prompt-edition-badge')).toHaveText('edition 1');
 
-	// Edit display name + system prompt.
+	// Edit display name + capabilities (remove 'package', add 'host.shell') + system prompt.
 	await a.getByTestId('edit-name').fill('alpha-renamed');
+	await a.getByTestId('edit-capabilities-remove-package').click();
+	await a.getByTestId('edit-capabilities-select').selectOption('host.shell');
 	await a.getByTestId('prompt-text-input').fill('# Alpha runbook\nKeep containers under 1 GiB.');
 	await a.getByTestId('save-button').click();
 	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 2');
@@ -530,11 +533,13 @@ page
 		prompt_text: string;
 		expected_revision: number;
 		name: string;
+		capabilities: string[];
 	};
 	expect(payload.prompt_revision).toBe(2); // auto-bumped 1 → 2
 	expect(payload.prompt_text).toBe('# Alpha runbook\nKeep containers under 1 GiB.');
 	expect(payload.expected_revision).toBe(1);
 	expect(payload.name).toBe('alpha-renamed');
+	expect(payload.capabilities).toEqual(['host.shell', 'shell']);
 
 	// Post-commit triple shown; the silent re-read confirms the record.
 	await expect(a.getByTestId('profile-revision')).toHaveText('2');

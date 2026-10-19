@@ -41,6 +41,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
+	import CapabilityPicker from '../ui/CapabilityPicker.svelte';
 	import Field from '../ui/Field.svelte';
 	import Select from '../ui/Select.svelte';
 	import { CircleCheck, Cog, FingerprintPattern, History, ScrollText, TriangleAlert } from 'lucide-svelte';
@@ -87,7 +88,7 @@
 	let sshPortInput = $state('22');
 	let sshUserInput = $state('');
 	let privilegeInput = $state<'none' | 'sudo' | 'root'>('sudo');
-	let capabilitiesInput = $state('');
+	let capabilitiesList = $state<string[]>([]);
 	let hostKeyInput = $state('');
 	let credentialKeyInput = $state('');
 	let promptTextInput = $state('');
@@ -109,13 +110,6 @@
 		return raw.trim() !== '' ? raw : `# Server instructions for ${profile.name}\n`;
 	}
 
-	function parseCapabilities(raw: string): string[] {
-		return raw
-			.split(',')
-			.map((item) => item.trim())
-			.filter((item) => item !== '');
-	}
-
 	function parsePort(raw: string): number | null {
 		if (!/^\d+$/.test(raw.trim())) return null;
 		const value = Number(raw.trim());
@@ -123,7 +117,7 @@
 	}
 
 	const parsedPort = $derived(parsePort(sshPortInput));
-	const parsedCapabilities = $derived(parseCapabilities(capabilitiesInput));
+	const parsedCapabilities = $derived([...capabilitiesList]);
 	const promptByteLength = $derived(new TextEncoder().encode(promptTextInput).length);
 
 	const nameError = $derived(
@@ -185,7 +179,7 @@
 		sshPortInput = String(profile.ssh.port);
 		sshUserInput = profile.ssh.user;
 		privilegeInput = profile.privilege;
-		capabilitiesInput = profile.capabilities.join(', ');
+		capabilitiesList = [...profile.capabilities];
 		hostKeyInput = '';
 		credentialKeyInput = '';
 		promptTextInput = defaultPromptFor(profile);
@@ -506,12 +500,12 @@
 						</Select>
 					</div>
 
-					<Field
-						label="Capabilities (comma-separated)"
-						hint="Lowercase capability slugs (e.g. shell, package, site.deploy)."
-						bind:value={capabilitiesInput}
-						autocomplete="off"
-						data-testid="edit-capabilities"
+					<CapabilityPicker
+						label="Capabilities"
+						hint="Select built-in capabilities from the dropdown or add custom plugin slugs; click × on any chip to remove it."
+						bind:value={capabilitiesList}
+						disabled={saving}
+						testId="edit-capabilities"
 					/>
 
 					<div class="mai-server-profile__grid">

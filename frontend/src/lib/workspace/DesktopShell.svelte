@@ -220,9 +220,10 @@
 	import PanelHost from './PanelHost.svelte';
 	import WindowSwitcher from './WindowSwitcher.svelte';
 	import ChatPanel from '$lib/panels/ChatPanel.svelte';
-	import Button from '$lib/ui/Button.svelte';
-	import Field from '$lib/ui/Field.svelte';
-	import Select from '$lib/ui/Select.svelte';
+	import Button from '../ui/Button.svelte';
+	import CapabilityPicker from '../ui/CapabilityPicker.svelte';
+	import Field from '../ui/Field.svelte';
+	import Select from '../ui/Select.svelte';
 	import GlassSurface from '$lib/ui/GlassSurface.svelte';
 	import SideDrawer from '$lib/ui/SideDrawer.svelte';
 	import ServerTreeNav from './ServerTreeNav.svelte';
@@ -406,7 +407,18 @@
 	let enrollHostKey = $state('');
 	let enrollCredentialRef = $state('');
 	let enrollPrivilege = $state<'none' | 'sudo' | 'root'>('sudo');
-	let enrollCapabilities = $state('');
+	let enrollCapabilities = $state<string[]>([
+		'app.install',
+		'app.remove',
+		'app.update',
+		'docs.retrieve',
+		'host.logs',
+		'host.shell',
+		'memory.recall',
+		'memory.reflect',
+		'memory.retain',
+		'service.http'
+	]);
 
 	/** Launcher options: live profiles replace the fixture pair when live. */
 	const serverOptions = $derived.by<{ id: ServerId; label: string }[]>(() =>
@@ -491,10 +503,7 @@
 					credential_ref: enrollCredentialRef
 				},
 				privilege: enrollPrivilege,
-				capabilities: enrollCapabilities
-					.split(',')
-					.map((id) => id.trim())
-					.filter((id) => id !== '')
+				capabilities: [...enrollCapabilities]
 			});
 			enrollName = '';
 			enrollPromptText = '';
@@ -502,7 +511,6 @@
 			enrollUser = '';
 			enrollHostKey = '';
 			enrollCredentialRef = '';
-			enrollCapabilities = '';
 			enrollOpen = false;
 			await connectLive();
 			status = 'Server enrolled.';
@@ -1065,7 +1073,6 @@
 				<Field label="SSH user" bind:value={enrollUser} required />
 				<Field label="Host key (SHA256 fingerprint)" bind:value={enrollHostKey} required />
 				<Field label="Credential reference" bind:value={enrollCredentialRef} required />
-				<Field label="Capabilities (comma-separated)" bind:value={enrollCapabilities} />
 				<Select
 					id="mai-enroll-privilege"
 					label="Privilege mode"
@@ -1075,6 +1082,14 @@
 					<option value="sudo">sudo</option>
 					<option value="root">root</option>
 				</Select>
+				<div class="mai-desktop-shell__enroll-caps">
+					<CapabilityPicker
+						label="Capabilities"
+						bind:value={enrollCapabilities}
+						disabled={enrollBusy}
+						testId="enroll-capabilities"
+					/>
+				</div>
 				<label class="mai-desktop-shell__enroll-prompt">
 					<span>Server system prompt (required)</span>
 					<textarea
@@ -1250,6 +1265,7 @@
 		z-index: 15;
 	}
 
+	.mai-desktop-shell__enroll-caps,
 	.mai-desktop-shell__enroll-prompt {
 		display: flex;
 		flex-direction: column;
