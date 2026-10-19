@@ -18,12 +18,14 @@
 
 	/* ---- Color: surfaces and text --------------------------------------- */
 	--mai-color-bg: #f6f7f9;
+	--mai-color-surface-sunken: #f1f5f9;
 	--mai-color-surface: #ffffff;
 	--mai-color-surface-raised: #ffffff;
 	--mai-color-border: #d1d5db;
 	--mai-color-border-strong: #9ca3af;
 	--mai-color-text: #101828;
 	--mai-color-text-muted: #4b5563;
+	--mai-color-text-subtle: #6b7280;
 
 	/* ---- Color: primary / interactive ------------------------------------ */
 	--mai-color-primary: #1d4ed8;

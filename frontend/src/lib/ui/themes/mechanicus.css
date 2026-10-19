@@ -20,12 +20,14 @@
 
 	/* ---- Color: surfaces and text (Forge World Mars) ------------------- */
 	--mai-color-bg: #0b0d10;
+	--mai-color-surface-sunken: #0e1217;
 	--mai-color-surface: #12161c;
 	--mai-color-surface-raised: #181e27;
 	--mai-color-border: #2a3241;
 	--mai-color-border-strong: #d4a853;
 	--mai-color-text: #ece8de;
 	--mai-color-text-muted: #94a3b8;
+	--mai-color-text-subtle: #7c8b9e;
 
 	/* ---- Color: primary / interactive (crimson oath) -------------------- */
 	--mai-color-primary: #b91c1c;

@@ -64,6 +64,7 @@
 	import { Cable, Cpu, Gauge, Pin } from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import Select from '../ui/Select.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		ModelConnectionBody,
@@ -1065,17 +1066,16 @@
 						</dl>
 					{/if}
 
-					<label class="mai-model-settings__select-label">
-						<span>Connection</span>
-						<select class="mai-model-settings__select" bind:value={profEditor.connection} data-testid="profile-connection-select">
-							{#each profConnectionOptions as name (name)}
-								<option value={name}>{name}</option>
-							{/each}
-						</select>
-					</label>
-					{#if profErrors.connection !== undefined}
-						<p class="mai-model-settings__field-error" role="alert">{profErrors.connection}</p>
-					{/if}
+					<Select
+						label="Connection"
+						bind:value={profEditor.connection}
+						error={profErrors.connection ?? ''}
+						data-testid="profile-connection-select"
+					>
+						{#each profConnectionOptions as name (name)}
+							<option value={name}>{name}</option>
+						{/each}
+					</Select>
 
 					<Field
 						label="Model"
@@ -1125,18 +1125,17 @@
 						/>
 					</div>
 
-					<label class="mai-model-settings__select-label">
-						<span>Reasoning effort</span>
-						<select class="mai-model-settings__select" bind:value={profEditor.reasoningEffort} data-testid="profile-reasoning-select">
-							<option value="">(unset)</option>
-							{#each REASONING_EFFORTS as effort (effort)}
-								<option value={effort}>{effort}</option>
-							{/each}
-						</select>
-					</label>
-					{#if profErrors.reasoningEffort !== undefined}
-						<p class="mai-model-settings__field-error" role="alert">{profErrors.reasoningEffort}</p>
-					{/if}
+					<Select
+						label="Reasoning effort"
+						bind:value={profEditor.reasoningEffort}
+						error={profErrors.reasoningEffort ?? ''}
+						data-testid="profile-reasoning-select"
+					>
+						<option value="">(unset)</option>
+						{#each REASONING_EFFORTS as effort (effort)}
+							<option value={effort}>{effort}</option>
+						{/each}
+					</Select>
 
 					<div class="mai-model-settings__form-grid">
 						<Field
@@ -1256,24 +1255,26 @@
 			{/if}
 
 			<div class="mai-model-settings__editor" data-testid="selection-editor">
-				<label class="mai-model-settings__select-label">
-					<span>Connection</span>
-					<select class="mai-model-settings__select" bind:value={selectionForm.connection} data-testid="selection-connection-select">
-						<option value="">(none)</option>
-						{#each connections as ref (ref.name)}
-							<option value={ref.name}>{ref.name}</option>
-						{/each}
-					</select>
-				</label>
-				<label class="mai-model-settings__select-label">
-					<span>Profile</span>
-					<select class="mai-model-settings__select" bind:value={selectionForm.profile} data-testid="selection-profile-select">
-						<option value="">(none)</option>
-						{#each profiles as ref (ref.name)}
-							<option value={ref.name}>{ref.name}</option>
-						{/each}
-					</select>
-				</label>
+				<Select
+					label="Connection"
+					bind:value={selectionForm.connection}
+					data-testid="selection-connection-select"
+				>
+					<option value="">(none)</option>
+					{#each connections as ref (ref.name)}
+						<option value={ref.name}>{ref.name}</option>
+					{/each}
+				</Select>
+				<Select
+					label="Profile"
+					bind:value={selectionForm.profile}
+					data-testid="selection-profile-select"
+				>
+					<option value="">(none)</option>
+					{#each profiles as ref (ref.name)}
+						<option value={ref.name}>{ref.name}</option>
+					{/each}
+				</Select>
 				<div class="mai-model-settings__actions">
 					<Button
 						onclick={applySelection}
@@ -1309,24 +1310,26 @@
 				the pair and revisions are pinned when the round starts.
 			</p>
 
-			<label class="mai-model-settings__select-label">
-				<span>Connection</span>
-				<select class="mai-model-settings__select" bind:value={probeForm.connection} data-testid="probe-connection-select">
-					<option value="">(stored selection)</option>
-					{#each connections as ref (ref.name)}
-						<option value={ref.name}>{ref.name}</option>
-					{/each}
-				</select>
-			</label>
-			<label class="mai-model-settings__select-label">
-				<span>Profile</span>
-				<select class="mai-model-settings__select" bind:value={probeForm.profile} data-testid="probe-profile-select">
-					<option value="">(stored selection)</option>
-					{#each profiles as ref (ref.name)}
-						<option value={ref.name}>{ref.name}</option>
-					{/each}
-				</select>
-			</label>
+			<Select
+				label="Connection"
+				bind:value={probeForm.connection}
+				data-testid="probe-connection-select"
+			>
+				<option value="">(stored selection)</option>
+				{#each connections as ref (ref.name)}
+					<option value={ref.name}>{ref.name}</option>
+				{/each}
+			</Select>
+			<Select
+				label="Profile"
+				bind:value={probeForm.profile}
+				data-testid="probe-profile-select"
+			>
+				<option value="">(stored selection)</option>
+				{#each profiles as ref (ref.name)}
+					<option value={ref.name}>{ref.name}</option>
+				{/each}
+			</Select>
 			<label class="mai-model-settings__cap">
 				<input type="checkbox" bind:checked={probeForm.tools} data-testid="probe-tools" />
 				Include tool round-trip (connection must declare Tool calls)
@@ -1608,41 +1611,6 @@
 		align-items: center;
 		gap: var(--mai-space-2);
 		font-size: var(--mai-text-sm);
-	}
-
-	.mai-model-settings__select-label {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-1);
-		font-size: var(--mai-text-sm);
-		font-weight: var(--mai-weight-medium);
-		color: var(--mai-color-text-muted);
-	}
-
-	.mai-model-settings__select-label > span {
-		font-size: var(--mai-text-xs);
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-	}
-
-	.mai-model-settings__select {
-		font: inherit;
-		font-size: var(--mai-text-sm);
-		color: var(--mai-color-text);
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
-		padding: var(--mai-space-2) var(--mai-space-3);
-		transition: border-color var(--mai-motion-fast) ease;
-	}
-
-	.mai-model-settings__select:hover {
-		border-color: var(--mai-color-border-strong);
-	}
-
-	.mai-model-settings__select:focus-visible {
-		outline: 2px solid var(--mai-focus-ring-color);
-		outline-offset: 1px;
 	}
 
 	.mai-model-settings__field-error {

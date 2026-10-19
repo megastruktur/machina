@@ -11,6 +11,7 @@
 	 */
 	import Button from './Button.svelte';
 	import Chip from './Chip.svelte';
+	import Select from './Select.svelte';
 
 	export interface CapabilityOption {
 		id: string;
@@ -161,26 +162,23 @@
 	</div>
 
 	<div class="mai-cap-picker__controls">
-		<div class="mai-cap-picker__select-wrap">
-			<select
-				id="mai-cap-select-{uid}"
-				class="mai-cap-picker__select"
-				value={selectedOption}
-				onchange={onSelectChange}
-				{disabled}
-				aria-label="Add capability"
-				data-testid="{testId}-select"
-			>
-				<option value="">+ Add capability…</option>
-				{#if availableOptions.length > 1}
-					<option value="__all__">+ Add all built-in capabilities ({availableOptions.length})</option>
-				{/if}
-				{#each availableOptions as opt (opt.id)}
-					<option value={opt.id}>{opt.id} — {opt.description}</option>
-				{/each}
-			</select>
-			<span class="mai-cap-picker__chevron" aria-hidden="true">▾</span>
-		</div>
+		<Select
+			id="mai-cap-select-{uid}"
+			bind:value={selectedOption}
+			onchange={onSelectChange}
+			{disabled}
+			aria-label="Add capability"
+			compact
+			data-testid="{testId}-select"
+		>
+			<option value="">+ Add capability…</option>
+			{#if availableOptions.length > 1}
+				<option value="__all__">+ Add all built-in capabilities ({availableOptions.length})</option>
+			{/if}
+			{#each availableOptions as opt (opt.id)}
+				<option value={opt.id}>{opt.id} — {opt.description}</option>
+			{/each}
+		</Select>
 
 		<div class="mai-cap-picker__custom">
 			<input
@@ -261,40 +259,6 @@
 		grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
 		gap: var(--mai-space-2);
 		align-items: center;
-	}
-
-	.mai-cap-picker__select-wrap {
-		position: relative;
-		display: flex;
-		align-items: center;
-	}
-
-	.mai-cap-picker__select {
-		appearance: none;
-		width: 100%;
-		height: 2.125rem;
-		padding: 0 var(--mai-space-6) 0 var(--mai-space-3);
-		color: var(--mai-color-text);
-		background: var(--mai-color-surface-sunken);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-md);
-		font-family: var(--mai-font-mono);
-		font-size: var(--mai-text-xs);
-		cursor: pointer;
-	}
-
-	.mai-cap-picker__select:focus-visible {
-		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
-		outline-offset: var(--mai-focus-ring-offset);
-		border-color: var(--mai-color-accent);
-	}
-
-	.mai-cap-picker__chevron {
-		position: absolute;
-		right: var(--mai-space-2);
-		pointer-events: none;
-		font-size: var(--mai-text-xs);
-		color: var(--mai-color-text-muted);
 	}
 
 	.mai-cap-picker__custom {

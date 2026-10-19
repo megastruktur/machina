@@ -79,6 +79,7 @@
 <script lang="ts">
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import Select from '../ui/Select.svelte';
 	import { Cog, KeyRound, Package, Puzzle, Radar, Wrench } from 'lucide-svelte';
 	import { ApiError } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -1383,19 +1384,17 @@
 									aria-label="MCP server registration"
 									data-testid="mcp-register-form"
 								>
-									<label class="mai-plugins__field">
-										<span>Transport</span>
-										<select
-											value={String(draft['__mcp_transport'] ?? '')}
-											onchange={(event) => (draft['__mcp_transport'] = event.currentTarget.value)}
-											data-testid="mcp-transport"
-										>
-											<option value="">— choose —</option>
-											{#each MCP_TRANSPORTS as transport (transport)}
-												<option value={transport}>{transport}</option>
-											{/each}
-										</select>
-									</label>
+									<Select
+										label="Transport"
+										value={String(draft['__mcp_transport'] ?? '')}
+										onchange={(event) => (draft['__mcp_transport'] = event.currentTarget.value)}
+										data-testid="mcp-transport"
+									>
+										<option value="">— choose —</option>
+										{#each MCP_TRANSPORTS as transport (transport)}
+											<option value={transport}>{transport}</option>
+										{/each}
+									</Select>
 									{#if String(draft['__mcp_transport'] ?? '') === 'stdio'}
 										<Field
 											label="Command"
@@ -1856,9 +1855,10 @@
 	{@const label = String(property?.['title'] ?? name)}
 	{@const hint = describeProperty(property, required)}
 	{#if kind === 'select'}
-		<label class="mai-plugins__field" data-testid="field-{name}">
-			<span>{label}</span>
-			<select
+		<div class="mai-plugins__field" data-testid="field-{name}">
+			<Select
+				{label}
+				{hint}
 				onchange={(event) => (draft[name] = event.currentTarget.value)}
 				value={typeof draft[name] === 'string' ? draft[name] : ''}
 			>
@@ -1866,12 +1866,11 @@
 				{#each (property?.['enum'] as unknown[]) ?? [] as choice, index (index)}
 					<option value={String(choice)}>{String(choice)}</option>
 				{/each}
-			</select>
-			<small>{hint}</small>
+			</Select>
 			{#if fieldErrors[name]}
 				<strong class="mai-plugins__field-error" role="alert" data-testid="field-error-{name}">{fieldErrors[name]}</strong>
 			{/if}
-		</label>
+		</div>
 	{:else if kind === 'checkbox'}
 		<label class="mai-plugins__field mai-plugins__field--check" data-testid="field-{name}">
 			<input
@@ -2427,7 +2426,6 @@
 	}
 
 	.mai-plugins__field input,
-	.mai-plugins__field select,
 	.mai-plugins__field textarea {
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
@@ -2439,7 +2437,6 @@
 	}
 
 	.mai-plugins__field input:focus-visible,
-	.mai-plugins__field select:focus-visible,
 	.mai-plugins__field textarea:focus-visible {
 		border-color: var(--mai-color-primary);
 		outline: 2px solid var(--mai-focus-ring-color);

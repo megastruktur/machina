@@ -6,11 +6,11 @@
 	 * no window geometry, no drag, no server scoping, no stores, no module-level
 	 * `window`/`document` access (ADR §5 rule 4). Safe to render during SSR.
 	 *
-	 * Renders a native `<select>` wrapped in a glassmorphic pill/box shell with
-	 * an optional inline or stacked label and custom SVG chevron so every
-	 * dropdown across the HUD, Chat Dock, and feature panels shares one source
-	 * of truth for padding (`--mai-control-pad-*`), border, focus ring, and
-	 * typography.
+	 * Renders a native `<select>` wrapped in a solid themed shell with an
+	 * optional inline or stacked label, custom SVG chevron, helper hint, and
+	 * validation error message so every dropdown across the HUD, Chat Dock,
+	 * and feature panels shares one source of truth for colors, padding
+	 * (`--mai-control-pad-*`), border, focus ring, and typography.
 	 */
 	import type { Snippet } from 'svelte';
 	import type { HTMLSelectAttributes } from 'svelte/elements';
@@ -20,6 +20,10 @@
 		value?: string;
 		/** Optional visible label text wired to the select element. */
 		label?: string;
+		/** Optional helper text rendered under the select. */
+		hint?: string;
+		/** Optional validation error message rendered under the select. */
+		error?: string;
 		/** Render label inline beside the select (for HUD/toolbar bars). */
 		inlineLabel?: boolean;
 		/** Visually hide the label while keeping it accessible to screen readers. */
@@ -39,6 +43,8 @@
 	let {
 		value = $bindable(''),
 		label = '',
+		hint = '',
+		error = '',
 		inlineLabel = false,
 		hideLabel = false,
 		pill = false,
@@ -69,9 +75,11 @@
 			{...rest}
 			{id}
 			bind:value
+			aria-invalid={error !== '' ? 'true' : undefined}
 			class="mai-select-field__control {className}"
 			class:mai-select-field__control--pill={pill}
 			class:mai-select-field__control--compact={compact}
+			class:mai-select-field__control--error={error !== ''}
 		>
 			{@render children?.()}
 		</select>
@@ -79,6 +87,11 @@
 			<path d="M3 4.5L6 7.5L9 4.5" />
 		</svg>
 	</div>
+	{#if error !== ''}
+		<p class="mai-select-field__error" role="alert">{error}</p>
+	{:else if hint !== ''}
+		<p class="mai-select-field__hint">{hint}</p>
+	{/if}
 </div>
 
 <style>
@@ -120,6 +133,7 @@
 		display: inline-flex;
 		align-items: center;
 		min-width: 0;
+		width: 100%;
 	}
 
 	.mai-select-field__control {
@@ -131,7 +145,7 @@
 		font-size: var(--mai-text-sm);
 		font-weight: var(--mai-weight-medium);
 		color: var(--mai-color-text);
-		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		background-color: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		cursor: pointer;
@@ -140,7 +154,15 @@
 			background-color var(--mai-motion-fast) ease;
 	}
 
+	.mai-select-field__control :global(option),
+	.mai-select-field__control :global(optgroup) {
+		color: var(--mai-color-text);
+		background-color: var(--mai-color-surface-raised);
+		font-weight: var(--mai-weight-medium);
+	}
+
 	.mai-select-field__control--compact {
+		min-height: 2rem;
 		padding-top: var(--mai-space-1);
 		padding-bottom: var(--mai-space-1);
 		font-size: var(--mai-text-xs);
@@ -150,9 +172,13 @@
 		border-radius: var(--mai-radius-pill);
 	}
 
+	.mai-select-field__control--error {
+		border-color: var(--mai-status-danger-border);
+	}
+
 	.mai-select-field__control:hover:not(:disabled) {
 		border-color: var(--mai-color-brass);
-		background: var(--mai-color-surface-raised);
+		background-color: var(--mai-color-surface);
 	}
 
 	.mai-select-field__control:focus {
@@ -170,5 +196,17 @@
 		stroke-width: 1.6;
 		stroke-linecap: round;
 		stroke-linejoin: round;
+	}
+
+	.mai-select-field__hint {
+		margin: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-select-field__error {
+		margin: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-status-danger-text);
 	}
 </style>

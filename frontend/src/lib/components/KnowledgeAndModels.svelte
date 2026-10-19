@@ -73,6 +73,7 @@
 	} from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import Select from '../ui/Select.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		MemoryDeleteBody,
@@ -1065,14 +1066,15 @@
 					<label class="mai-km__cap"><input type="checkbox" bind:checked={recallForm.experience} data-testid="recall-type-experience" /> experience</label>
 					<label class="mai-km__cap"><input type="checkbox" bind:checked={recallForm.observation} data-testid="recall-type-observation" /> observation</label>
 				</fieldset>
-				<label class="mai-km__select-label">
-					<span>Budget</span>
-					<select class="mai-km__select" bind:value={recallForm.budget} data-testid="recall-budget-select">
-						{#each BUDGETS as budget (budget)}
-							<option value={budget}>{budget}</option>
-						{/each}
-					</select>
-				</label>
+				<Select
+					label="Budget"
+					bind:value={recallForm.budget}
+					data-testid="recall-budget-select"
+				>
+					{#each BUDGETS as budget (budget)}
+						<option value={budget}>{budget}</option>
+					{/each}
+				</Select>
 				<Field
 					label="Max tokens"
 					bind:value={recallForm.maxTokens}
@@ -1373,18 +1375,17 @@
 					</label>
 				</fieldset>
 				{#if deleteForm.target === 'memories'}
-					<label class="mai-km__select-label">
-						<span>Fact type</span>
-						<select class="mai-km__select" bind:value={deleteForm.factType} data-testid="delete-fact-type-select">
-							<option value="">(all types)</option>
-							{#each FACT_TYPES as factType (factType)}
-								<option value={factType}>{factType}</option>
-							{/each}
-						</select>
-					</label>
-					{#if deleteErrors.factType !== undefined}
-						<p class="mai-km__field-error" role="alert">{deleteErrors.factType}</p>
-					{/if}
+					<Select
+						label="Fact type"
+						bind:value={deleteForm.factType}
+						error={deleteErrors.factType ?? ''}
+						data-testid="delete-fact-type-select"
+					>
+						<option value="">(all types)</option>
+						{#each FACT_TYPES as factType (factType)}
+							<option value={factType}>{factType}</option>
+						{/each}
+					</Select>
 				{:else}
 					<Field
 						label="Confirmation"
@@ -1916,7 +1917,6 @@
 		font-size: var(--mai-text-sm);
 	}
 
-	.mai-km__select,
 	.mai-km__textarea {
 		width: 100%;
 		padding: var(--mai-space-1) var(--mai-space-2);
@@ -1924,17 +1924,7 @@
 		border-radius: var(--mai-radius-sm);
 		background: var(--mai-color-bg);
 		color: var(--mai-color-text);
-		font: var(--mai-text-sm) var(--mai-font-sans);
-	}
-
-	.mai-km__textarea {
-		font-family: var(--mai-font-mono);
-	}
-
-	.mai-km__field-error {
-		margin: 0;
-		color: var(--mai-status-danger-text);
-		font-size: var(--mai-text-sm);
+		font: var(--mai-text-sm) var(--mai-font-mono);
 	}
 
 	.mai-km__notice {

@@ -136,13 +136,21 @@ textarea {
 
 :where(select, textarea, input:not([type='checkbox']):not([type='radio']):not([type='range'])) {
 	padding: var(--mai-control-pad-y) var(--mai-control-pad-x);
-	background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+	color: var(--mai-color-text);
+	background-color: var(--mai-color-surface-raised);
 	border: var(--mai-border-width) solid var(--mai-color-border);
 	border-radius: var(--mai-radius-md);
 	transition:
 		border-color var(--mai-motion-fast) ease,
 		background-color var(--mai-motion-fast) ease,
 		box-shadow var(--mai-motion-fast) ease;
+}
+
+select,
+select option,
+select optgroup {
+	color: var(--mai-color-text);
+	background-color: var(--mai-color-surface-raised);
 }
 
 :where(select, textarea, input:not([type='checkbox']):not([type='radio']):not([type='range'])):hover:not(:disabled) {

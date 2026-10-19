@@ -53,6 +53,7 @@
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import SearchFilterInput from '../ui/SearchFilterInput.svelte';
+	import Select from '../ui/Select.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import {
 		CATEGORY_KEYWORD_HINTS,
@@ -1296,18 +1297,15 @@
 								</details>
 								{#if editTarget?.application_id === row.application_id}
 									<div class="mai-apps__editor" data-testid="service-edit-form">
-										<label class="mai-apps__select-label">
-											Category
-											<select
-												class="mai-apps__select"
-												bind:value={editCategory}
-												data-testid="service-edit-category"
-											>
-												{#each taxonomy as entry (entry.machine_id)}
-													<option value={entry.machine_id}>{entry.label}</option>
-												{/each}
-											</select>
-										</label>
+										<Select
+											label="Category"
+											bind:value={editCategory}
+											data-testid="service-edit-category"
+										>
+											{#each taxonomy as entry (entry.machine_id)}
+												<option value={entry.machine_id}>{entry.label}</option>
+											{/each}
+										</Select>
 										<Field
 											label="Description"
 											bind:value={editDescription}
@@ -1697,22 +1695,16 @@
 							hint="Display name, 1–{MAX_NAME_CHARS} printable characters."
 							data-testid="adopt-name"
 						/>
-						<label class="mai-apps__select-label">
-							Category
-							<select
-								class="mai-apps__select"
-								bind:value={adoptCategory}
-								data-testid="adopt-category-select"
-							>
-								{#each taxonomy as entry (entry.machine_id)}
-									<option value={entry.machine_id}>{entry.label}</option>
-								{/each}
-							</select>
-							<span class="mai-apps__note">
-								Pre-selected from the observation's suggestion; only an explicit change is sent
-								with the adoption.
-							</span>
-						</label>
+						<Select
+							label="Category"
+							hint="Pre-selected from the observation's suggestion; only an explicit change is sent with the adoption."
+							bind:value={adoptCategory}
+							data-testid="adopt-category-select"
+						>
+							{#each taxonomy as entry (entry.machine_id)}
+								<option value={entry.machine_id}>{entry.label}</option>
+							{/each}
+						</Select>
 						<Field
 							label="Description (optional)"
 							bind:value={adoptDescription}
@@ -2178,23 +2170,6 @@
 		border: 1px solid var(--mai-color-brass, currentColor);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: var(--space-3, 0.75rem);
-	}
-
-	.mai-apps__select-label {
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-1, 0.25rem);
-		font-weight: 600;
-		font-size: var(--mai-text-sm, 0.875rem);
-	}
-
-	.mai-apps__select {
-		font: inherit;
-		padding: var(--space-1, 0.25rem) var(--space-2, 0.5rem);
-		border: 1px solid var(--mai-color-border, currentColor);
-		border-radius: var(--mai-radius-sm, 4px);
-		background: var(--mai-color-surface-raised, transparent);
-		color: inherit;
 	}
 
 	.mai-apps__fieldset {
