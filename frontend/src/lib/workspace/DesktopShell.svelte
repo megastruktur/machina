@@ -1124,24 +1124,11 @@
 		aria-label="Chat dock"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-bar">
-			<span class="mai-desktop-shell__dock-title">⚙ Odyssey Noosphere Chat</span>
-			<Button
-				size="sm"
-				pill
-				variant="ghost"
-				tabindex={2}
-				onclick={() => (dockCollapsed = !dockCollapsed)}
-				aria-expanded={!dockCollapsed}
-				data-testid="bottom-chat-dock-toggle"
-			>
-				{dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
-			</Button>
-		</div>
 		<div class="mai-desktop-shell__dock-body">
 			<ChatPanel
 				bind:this={dockChatPanel}
 				panel={dockPanel}
+				bind:dockCollapsed
 				onhistorychange={(rows) => (drawerConversations = rows)}
 				onactivechange={(runId) => (drawerActiveRunId = runId)}
 			/>
@@ -1150,13 +1137,15 @@
 
 	<!-- PT4 taskbar: entries persist for hidden windows and disappear on
 	     close; a visible entry focuses, a hidden one restores+focuses. -->
-	<WindowSwitcher
-		entries={switcherEntries}
-		onactivate={(windowId) => {
-			dockChatPanel?.scrollComposerIntoView();
-			presentation.activate(windowId);
-		}}
-	/>
+	<div class="mai-desktop-shell__taskbar">
+		<WindowSwitcher
+			entries={switcherEntries}
+			onactivate={(windowId) => {
+				dockChatPanel?.scrollComposerIntoView();
+				presentation.activate(windowId);
+			}}
+		/>
+	</div>
 	</div>
 </div>
 
@@ -1286,38 +1275,14 @@
 		box-shadow: var(--mai-shadow-float);
 	}
 
-	.mai-desktop-shell__dock-bar {
-		position: absolute;
-		top: calc(-1 * var(--mai-space-4));
-		right: var(--mai-space-2);
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--mai-space-2);
-		width: auto;
-		padding: 2px var(--mai-space-2);
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-pill);
-		box-shadow: var(--mai-shadow-float);
-		z-index: 31;
-	}
-
-	.mai-desktop-shell__dock-title {
-		font-family: var(--mai-font-display);
-		font-size: 0.65rem;
-		font-weight: var(--mai-weight-semibold);
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--mai-color-brass);
-	}
-
 	.mai-desktop-shell__dock-body {
 		overflow: visible;
 	}
 
-	.mai-desktop-shell__dock--collapsed .mai-desktop-shell__dock-body {
-		display: none;
+	.mai-desktop-shell__taskbar {
+		position: relative;
+		z-index: 35;
+		align-self: flex-start;
 	}
 
 	/* PT4 maximize overlay — owned by this composition (the presentation

@@ -91,10 +91,12 @@
 
 	let {
 		panel,
+		dockCollapsed = $bindable(false),
 		onhistorychange,
 		onactivechange
 	}: {
 		panel: PanelContext;
+		dockCollapsed?: boolean;
 		onhistorychange?: (rows: readonly ConversationView[]) => void;
 		onactivechange?: (runId: string | null) => void;
 	} = $props();
@@ -362,7 +364,7 @@
 	// --- compose form (instance-local; the ONLY submit path of this panel) ----
 
 	let composeMessage = $state('');
-	let composeProfile = $state('');
+	let composeProfile = $state('default');
 	let composeCapabilities = $state('');
 	let composeChildren = $state<string[]>(['']);
 	let composeAttachments = $state('');
@@ -584,6 +586,7 @@
 		decisionStatus = null;
 		resetFold();
 		composeMessage = '';
+		composeProfile = 'default';
 		composeChildren = [''];
 		composeAttachments = '';
 		composeCapabilities = '';
@@ -1103,37 +1106,164 @@
 	}
 </script>
 
-<div class="mai-chat" class:mai-chat--docked={isDocked} data-testid="chat-root">
+<div
+	class="mai-chat"
+	class:mai-chat--docked={isDocked}
+	class:mai-chat--dock-collapsed={isDocked && dockCollapsed}
+>
 	{#if !usable}
 		<div class="mai-chat__state mai-chat__state--error" role="alert" data-testid="panel-config-error">
 			<p>This panel was opened without its conversation service or outside a pinned server scope.</p>
 		</div>
 	{:else}
-		<header class="mai-chat__header" class:mai-sr-only={isDocked && !historyOpen}>
+		<header class="mai-chat__header">
 			<div class="mai-chat__header-row">
-				<h3 class="mai-chat__title">Conversation</h3>
-				<div class="mai-chat__header-actions">
-					<Button
-						size="sm"
-						pill
-						variant="secondary"
-						tabindex={isDocked ? -1 : 0}
-						onclick={newChat}
-						data-testid="chat-new-session"
-					>
-						New Chat
-					</Button>
-					<Button
-						size="sm"
-						pill
-						variant="secondary"
-						tabindex={isDocked ? -1 : 0}
-						onclick={() => (historyOpen = !historyOpen)}
-						aria-expanded={historyOpen}
-						data-testid="chat-history-toggle"
-					>
-						History
-					</Button>
+				<!-- Left side of the header: Target server selector, active server/consult
+				     chip, @service chips, and the + @service selector. -->
+				<div class="mai-chat__header-context">
+					<div class="mai-chat__chips" data-testid="chat-context-chips">
+						{#if generalConsultMode}
+							<Chip variant="neutral" data-testid="chat-general-consult-badge">
+								General Consult — No Server Pinned
+							</Chip>
+						{:else}
+							<Chip
+								variant="brass"
+								locked={chatContextLocked}
+								data-testid="chat-server-chip"
+								removeLabel="Remove pinned server"
+								removeTestId="chat-server-chip-remove"
+								onremove={!chatContextLocked ? () => (draftServerOverride = null) : undefined}
+							>
+								🖥 {serverLabelFor(effectiveServerId ?? '')}
+							</Chip>
+						{/if}
+						{#each selectedServiceTags as tag (tag)}
+							<Chip
+								variant="info"
+								locked={chatContextLocked}
+								data-testid="chat-service-chip"
+								removeLabel="Remove service tag"
+								removeTestId="chat-service-chip-remove"
+								onremove={!chatContextLocked ? () => removeServiceTag(tag) : undefined}
+							>
+								@{tag}
+							</Chip>
+						{/each}
+						{#if chatContextLocked}
+							<span class="mai-chat__lock" data-testid="chat-context-locked">
+								🔒 Server &amp; @service context locked for this session
+							</span>
+						{/if}
+					</div>
+
+					{#if !chatContextLocked}
+						<div class="mai-chat__compose-context">
+							<div class="mai-chat__context-controls">
+								<Select
+									id="{uid}-server"
+									label="Target server"
+									inlineLabel
+									pill
+									compact
+									class="mai-chat__server-picker"
+									data-testid="chat-server-picker"
+									value={generalConsultMode ? GLOBAL_CONSULT_SERVER_ID : (effectiveServerId ?? '')}
+									onchange={(event) => {
+										const next = (event.currentTarget as HTMLSelectElement).value;
+										draftServerOverride = next === GLOBAL_CONSULT_SERVER_ID ? null : next;
+									}}
+								>
+									<option value={GLOBAL_CONSULT_SERVER_ID}>
+										General Consult — No Server Pinned
+									</option>
+									{#each serverOptions as server (server.id)}
+										<option value={server.id}>{server.label}</option>
+									{/each}
+									{#if !generalConsultMode && effectiveServerId !== null && !serverOptions.some((one) => one.id === effectiveServerId)}
+										<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
+									{/if}
+								</Select>
+								{#if !generalConsultMode}
+									<Button
+										size="sm"
+										pill
+										variant="secondary"
+										onclick={() => (servicePickerOpen = !servicePickerOpen)}
+										data-testid="chat-service-picker-toggle"
+									>
+										+ @service
+									</Button>
+								{/if}
+							</div>
+							{#if servicePickerOpen && !generalConsultMode}
+								<div class="mai-chat__service-autocomplete" data-testid="chat-service-autocomplete">
+									{#each serviceSuggestions as service (service.name)}
+										<button
+											type="button"
+											class="mai-chat__service-option"
+											data-testid="chat-service-option"
+											onclick={() => pickService(service.name)}
+										>
+											@{service.name}
+											{#if service.category}
+												<span class="mai-chat__badge">[{service.category}]</span>
+											{/if}
+										</button>
+									{/each}
+									{#if serviceSuggestions.length === 0}
+										<p class="mai-chat__meta">No services match that filter.</p>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					{/if}
+				</div>
+
+				<!-- Right side of the header: Noosphere title + dock collapse button (when docked)
+				     plus sr-only / standalone New Chat & History controls. -->
+				<div class="mai-chat__header-right">
+					{#if isDocked}
+						<span class="mai-chat__noosphere-title" data-testid="chat-noosphere-title">
+							⚙ Noosphere
+						</span>
+						<Button
+							size="sm"
+							pill
+							variant="ghost"
+							tabindex={2}
+							onclick={() => (dockCollapsed = !dockCollapsed)}
+							aria-expanded={!dockCollapsed}
+							data-testid="bottom-chat-dock-toggle"
+						>
+							{dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
+						</Button>
+					{:else}
+						<h3 class="mai-chat__title">Conversation</h3>
+					{/if}
+					<div class="mai-chat__header-actions" class:mai-sr-only={isDocked}>
+						<Button
+							size="sm"
+							pill
+							variant="secondary"
+							tabindex={isDocked ? -1 : 0}
+							onclick={newChat}
+							data-testid="chat-new-session"
+						>
+							New Chat
+						</Button>
+						<Button
+							size="sm"
+							pill
+							variant="secondary"
+							tabindex={isDocked ? -1 : 0}
+							onclick={() => (historyOpen = !historyOpen)}
+							aria-expanded={historyOpen}
+							data-testid="chat-history-toggle"
+						>
+							History
+						</Button>
+					</div>
 				</div>
 			</div>
 			{#if historyOpen}
@@ -1190,113 +1320,11 @@
 			</p>
 		</header>
 
+		<div class="mai-chat__body" hidden={isDocked && dockCollapsed} data-testid="chat-root">
 		<section class="mai-chat__section" aria-label="Compose" data-testid="chat-compose">
 			<div class="mai-chat__section-head">
 				<h4>New message</h4>
 			</div>
-
-			<!-- Draft chat context: the Server Chip (or the General Consult
-			     badge when no server is pinned) plus the removable `@service`
-			     chips. Once the chat starts everything here is recorded and
-			     immutable: chips render data-locked="true" and the remove /
-			     pick controls leave the DOM. -->
-			<div class="mai-chat__chips" data-testid="chat-context-chips">
-				{#if generalConsultMode}
-					<Chip variant="neutral" data-testid="chat-general-consult-badge">
-						General Consult — No Server Pinned
-					</Chip>
-				{:else}
-					<Chip
-						variant="brass"
-						locked={chatContextLocked}
-						data-testid="chat-server-chip"
-						removeLabel="Remove pinned server"
-						removeTestId="chat-server-chip-remove"
-						onremove={!chatContextLocked ? () => (draftServerOverride = null) : undefined}
-					>
-						🖥 {serverLabelFor(effectiveServerId ?? '')}
-					</Chip>
-				{/if}
-				{#each selectedServiceTags as tag (tag)}
-					<Chip
-						variant="info"
-						locked={chatContextLocked}
-						data-testid="chat-service-chip"
-						removeLabel="Remove service tag"
-						removeTestId="chat-service-chip-remove"
-						onremove={!chatContextLocked ? () => removeServiceTag(tag) : undefined}
-					>
-						@{tag}
-					</Chip>
-				{/each}
-				{#if chatContextLocked}
-					<span class="mai-chat__lock" data-testid="chat-context-locked">
-						🔒 Server &amp; @service context locked for this session
-					</span>
-				{/if}
-			</div>
-
-			{#if !chatContextLocked}
-				<div class="mai-chat__compose-context">
-					<div class="mai-chat__context-controls">
-						<Select
-							id="{uid}-server"
-							label="Target server"
-							inlineLabel
-							pill
-							compact
-							class="mai-chat__server-picker"
-							data-testid="chat-server-picker"
-							value={generalConsultMode ? GLOBAL_CONSULT_SERVER_ID : (effectiveServerId ?? '')}
-							onchange={(event) => {
-								const next = (event.currentTarget as HTMLSelectElement).value;
-								draftServerOverride = next === GLOBAL_CONSULT_SERVER_ID ? null : next;
-							}}
-						>
-							<option value={GLOBAL_CONSULT_SERVER_ID}>
-								General Consult — No Server Pinned
-							</option>
-							{#each serverOptions as server (server.id)}
-								<option value={server.id}>{server.label}</option>
-							{/each}
-							{#if !generalConsultMode && effectiveServerId !== null && !serverOptions.some((one) => one.id === effectiveServerId)}
-								<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
-							{/if}
-						</Select>
-						{#if !generalConsultMode}
-							<Button
-								size="sm"
-								pill
-								variant="secondary"
-								onclick={() => (servicePickerOpen = !servicePickerOpen)}
-								data-testid="chat-service-picker-toggle"
-							>
-								+ @service
-							</Button>
-						{/if}
-					</div>
-					{#if servicePickerOpen && !generalConsultMode}
-						<div class="mai-chat__service-autocomplete" data-testid="chat-service-autocomplete">
-							{#each serviceSuggestions as service (service.name)}
-								<button
-									type="button"
-									class="mai-chat__service-option"
-									data-testid="chat-service-option"
-									onclick={() => pickService(service.name)}
-								>
-									@{service.name}
-									{#if service.category}
-										<span class="mai-chat__badge">[{service.category}]</span>
-									{/if}
-								</button>
-							{/each}
-							{#if serviceSuggestions.length === 0}
-								<p class="mai-chat__meta">No services match that filter.</p>
-							{/if}
-						</div>
-					{/if}
-				</div>
-			{/if}
 
 			<div class="mai-chat__form">
 				<div class="mai-chat__composer-bar">
@@ -1310,17 +1338,9 @@
 							placeholder="Ask M.A.I. or type @service to pin context…"
 							bind:value={composeMessage}
 							oninput={handleComposeInput}
-							rows={isDocked ? 1 : 3}
+							rows={3}
 							data-testid="compose-message"
 						></textarea>
-					</div>
-					<div class="mai-chat__composer-profile">
-						<ModelProfileSelect
-							compact={isDocked}
-							bind:value={composeProfile}
-							error={composeFields.profile ?? ''}
-							testId="compose-profile"
-						/>
 					</div>
 					{#if isDocked}
 						<div class="mai-chat__actions">
@@ -1344,6 +1364,14 @@
 					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
 				{/if}
 				<div class="mai-chat__advanced" class:mai-chat__advanced--collapsed={isDocked && !advancedOpen}>
+					<div class="mai-chat__composer-profile">
+						<ModelProfileSelect
+							compact={isDocked}
+							bind:value={composeProfile}
+							error={composeFields.profile ?? ''}
+							testId="compose-profile"
+						/>
+					</div>
 					<Field
 						label="Capabilities"
 						bind:value={composeCapabilities}
@@ -1672,6 +1700,7 @@
 				</div>
 			{/if}
 		</section>
+		</div>
 	{/if}
 </div>
 
@@ -1688,11 +1717,25 @@
 		overflow: auto;
 	}
 
-	/* Compact Odyssey pill layout when mounted inside the Bottom Chat Dock. */
+	/* Compact layout when mounted inside the Bottom Chat Dock. */
 	.mai-chat--docked {
 		gap: var(--mai-space-2);
-		padding: var(--mai-space-1) 0 0;
+		padding: 0;
 		overflow: visible;
+	}
+
+	.mai-chat__body {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-3, 0.75rem);
+	}
+
+	.mai-chat__body[hidden] {
+		display: none;
+	}
+
+	.mai-chat--docked .mai-chat__body {
+		gap: var(--mai-space-2);
 	}
 
 	.mai-chat--docked .mai-chat__title,
@@ -1704,8 +1747,8 @@
 	}
 
 	.mai-chat--docked .mai-chat__section {
-		border-top: none;
-		padding-top: 0;
+		border-top: var(--mai-border-width) solid var(--mai-color-border);
+		padding-top: var(--mai-space-2);
 		gap: var(--mai-space-2);
 	}
 
@@ -1726,7 +1769,7 @@
 
 	.mai-chat--docked .mai-chat__composer-bar {
 		flex-direction: row;
-		align-items: center;
+		align-items: flex-end;
 		gap: var(--mai-space-2);
 	}
 
@@ -1738,16 +1781,39 @@
 		gap: var(--mai-space-1);
 	}
 
-	.mai-chat--docked .mai-chat__composer-profile {
-		flex: 0 0 13rem;
+	.mai-chat--docked .mai-chat__textarea {
+		min-height: 4.5rem;
+		height: auto;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		border-radius: var(--mai-radius-md);
+		resize: vertical;
+		line-height: 1.45;
 	}
 
-	.mai-chat--docked .mai-chat__textarea {
-		min-height: 2.25rem;
-		height: 2.25rem;
-		padding: var(--mai-space-1) var(--mai-space-3);
-		border-radius: var(--mai-radius-pill);
-		resize: none;
+	.mai-chat__header-context {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		flex-wrap: wrap;
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+
+	.mai-chat__header-right {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		flex: 0 0 auto;
+	}
+
+	.mai-chat__noosphere-title {
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+		white-space: nowrap;
 	}
 
 	.mai-chat__label--sr,
