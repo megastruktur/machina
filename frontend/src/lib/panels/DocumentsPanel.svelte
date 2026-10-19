@@ -38,6 +38,7 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import { BookOpen, FilePlus, FolderOpen, ScrollText, Search, Send } from 'lucide-svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		ChatSubmit,
@@ -120,11 +121,11 @@
 	const RESEARCH_REQUEST_VERSION = 1;
 
 	const TABS = Object.freeze([
-		{ id: 'library', label: 'Library' },
-		{ id: 'search', label: 'Search' },
-		{ id: 'index', label: 'Index' },
-		{ id: 'generate', label: 'Generate' },
-		{ id: 'research', label: 'Research' }
+		{ id: 'library', label: 'Library', icon: FolderOpen },
+		{ id: 'search', label: 'Search', icon: Search },
+		{ id: 'index', label: 'Index', icon: Send },
+		{ id: 'generate', label: 'Generate', icon: FilePlus },
+		{ id: 'research', label: 'Research', icon: BookOpen }
 	] as const);
 	type TabId = (typeof TABS)[number]['id'];
 	let tab = $state<TabId>('library');
@@ -644,7 +645,10 @@
 		</div>
 	{:else}
 		<header class="mai-docs__header">
-			<h3 class="mai-docs__title">Documents</h3>
+			<h3 class="mai-docs__title">
+				<ScrollText size={16} aria-hidden="true" />
+				Documents
+			</h3>
 			<p class="mai-docs__meta">
 				<span data-testid="docs-scope">Server {shortId(serverScope ?? '')}</span>
 				<span>Pinned scope — every request below names this target.</span>
@@ -653,6 +657,7 @@
 
 		<nav class="mai-docs__tabs" aria-label="Documents sections" data-testid="docs-tabs">
 			{#each TABS as entry (entry.id)}
+				{@const Icon = entry.icon}
 				<button
 					type="button"
 					class="mai-docs__tab"
@@ -661,6 +666,7 @@
 					onclick={() => (tab = entry.id)}
 					data-testid="tab-{entry.id}"
 				>
+					<Icon size={14} aria-hidden="true" />
 					{entry.label}
 				</button>
 			{/each}
@@ -870,7 +876,7 @@
 								No pending intents — the outbox of this scope is drained.
 							</p>
 						{:else}
-							<ul data-testid="index-pending-list">
+							<ul class="mai-docs__rows" data-testid="index-pending-list">
 								{#each indexStatus.pending as intent (intent.doc_id + ':' + intent.op)}
 									<li class="mai-docs__meta" data-testid="index-pending-row">
 										{intent.namespace}:{shortId(intent.doc_id)} · {intent.op} · r{intent.revision ??
@@ -895,7 +901,7 @@
 								Nothing is projected for this scope yet.
 							</p>
 						{:else}
-							<ul data-testid="index-projection-list">
+							<ul class="mai-docs__rows" data-testid="index-projection-list">
 								{#each indexStatus.projection as row (row.doc_id)}
 									<li class="mai-docs__meta" data-testid="index-projection-row">
 										{row.namespace}:{shortId(row.doc_id)} · r{row.revision} ·
@@ -921,7 +927,7 @@
 								No live intents existed; nothing was reindexed.
 							</p>
 						{:else}
-							<ul data-testid="reconcile-list">
+							<ul class="mai-docs__rows" data-testid="reconcile-list">
 								{#each reconcileReport.outcomes as outcome (outcome.doc_id + ':' + outcome.op)}
 									<li class="mai-docs__meta" data-testid="reconcile-row">
 										{outcome.namespace}:{shortId(outcome.doc_id)} · {outcome.op} ·
@@ -1018,7 +1024,7 @@
 									the durable intent converges on the next reconcile.
 								</p>
 							{:else}
-								<ul data-testid="generate-reindex-list">
+								<ul class="mai-docs__rows" data-testid="generate-reindex-list">
 									{#each generateView.reindex as outcome (outcome.doc_id + ':' + outcome.op)}
 										<li class="mai-docs__meta" data-testid="generate-reindex-row">
 											{outcome.namespace}:{shortId(outcome.doc_id)} · {outcome.status}
@@ -1090,7 +1096,7 @@
 						{/if}
 						<div class="mai-docs__subsection" data-testid="research-steps">
 							<h5>Steps</h5>
-							<ul data-testid="research-step-list">
+							<ul class="mai-docs__rows" data-testid="research-step-list">
 								{#each researchReport.steps as step (step.seq)}
 									<li class="mai-docs__meta" data-testid="research-step">
 										{step.seq} · {step.phase} · {step.capability_id} · {step.status} ·
@@ -1106,7 +1112,7 @@
 									No sources were recorded.
 								</p>
 							{:else}
-								<ul data-testid="research-source-list">
+								<ul class="mai-docs__rows" data-testid="research-source-list">
 									{#each researchReport.sources as source, index (index)}
 										<li
 											class="mai-docs__row"
@@ -1137,7 +1143,7 @@
 									No verifiable hypothesis was produced.
 								</p>
 							{:else}
-								<ul data-testid="research-hypothesis-list">
+								<ul class="mai-docs__rows" data-testid="research-hypothesis-list">
 									{#each researchReport.hypotheses as hypothesis, index (index)}
 										<li class="mai-docs__meta" data-testid="research-hypothesis">
 											{hypothesis.claim} — basis: {hypothesis.basis.join(', ')}
@@ -1149,7 +1155,7 @@
 						{#if researchReport.dropped_claims.length > 0}
 							<div class="mai-docs__subsection" data-testid="research-dropped">
 								<h5>Dropped (unbacked) claims</h5>
-								<ul>
+								<ul class="mai-docs__rows">
 									{#each researchReport.dropped_claims as claim, index (index)}
 										<li class="mai-docs__meta" data-testid="research-dropped-claim">{claim}</li>
 									{/each}
@@ -1337,119 +1343,188 @@
 	.mai-docs {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4, 1rem);
-		padding: var(--space-4, 1rem);
-		color: var(--color-fg, inherit);
-		font-size: var(--font-size-sm, 0.875rem);
+		gap: var(--mai-space-4);
+		padding: var(--mai-space-4);
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-sans);
+		font-size: var(--mai-text-sm);
+		line-height: var(--mai-leading-normal);
 		min-width: 0;
 		min-height: 0;
 		overflow: auto;
 	}
 
+	/* Header band: brass data-scroll title on the cogitator header surface. */
 	.mai-docs__header {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-1, 0.25rem);
+		gap: var(--mai-space-1);
+		padding: var(--mai-space-3) var(--mai-space-4);
+		background: var(--mai-color-surface-header);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-docs__title {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
 		margin: 0;
-		font-size: var(--font-size-md, 1rem);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-lg);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
 	h4,
 	h5 {
 		margin: 0;
-		font-size: var(--font-size-sm, 0.875rem);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
+	/* System annotations and telemetry (ids, revisions, digests, run steps). */
 	.mai-docs__meta {
 		margin: 0;
-		color: var(--color-muted, inherit);
+		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 		display: inline-flex;
-		gap: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3);
 		flex-wrap: wrap;
 	}
 
+	/* Tab strip: display-type tabs; the active tab carries a crimson underline. */
 	.mai-docs__tabs {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
 		flex-wrap: wrap;
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
 	.mai-docs__tab {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		border: var(--mai-border-width) solid transparent;
+		border-bottom: 2px solid transparent;
+		margin-bottom: calc(-1 * var(--mai-border-width));
+		border-radius: var(--mai-radius-sm) var(--mai-radius-sm) 0 0;
 		background: transparent;
-		color: inherit;
-		font: inherit;
-		padding: var(--space-1, 0.25rem) var(--space-3, 0.75rem);
+		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		padding: var(--mai-space-2) var(--mai-space-3);
 		cursor: pointer;
+		transition:
+			color var(--mai-motion-fast) ease,
+			background-color var(--mai-motion-fast) ease,
+			border-color var(--mai-motion-fast) ease;
+	}
+
+	.mai-docs__tab:hover {
+		color: var(--mai-color-text);
 	}
 
 	.mai-docs__tab--active {
-		border-color: var(--border-strong, currentColor);
-		font-weight: 600;
+		background: var(--mai-color-surface-header);
+		border-color: var(--mai-color-border);
+		border-bottom-color: var(--mai-color-primary);
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
 	}
 
+	/* Sections are raised cards; sub-groups are inset strips with a dim spine. */
 	.mai-docs__section {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3, 0.75rem);
-		border-top: 1px solid var(--border-subtle, transparent);
-		padding-top: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3);
+		padding: var(--mai-space-4);
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
 	}
 
 	.mai-docs__section-head {
 		display: flex;
-		align-items: baseline;
-		gap: var(--space-3, 0.75rem);
+		align-items: center;
+		gap: var(--mai-space-3);
 		flex-wrap: wrap;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
 	}
 
 	.mai-docs__subsection {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-docs__form {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3);
 	}
 
 	.mai-docs__label {
-		font-weight: 600;
+		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
 	}
 
 	.mai-docs__textarea {
 		width: 100%;
 		resize: vertical;
 		min-height: 3.5rem;
-		padding: var(--space-2, 0.5rem);
-		border: 1px solid var(--border-strong, currentColor);
-		border-radius: var(--radius-sm, 4px);
-		background: var(--surface-raised, transparent);
-		color: inherit;
-		font: inherit;
+		padding: var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
+		transition: border-color var(--mai-motion-fast) ease;
 	}
 
 	.mai-docs__field-error {
 		margin: 0;
-		color: var(--color-danger, inherit);
+		color: var(--mai-status-danger-text);
+		font-size: var(--mai-text-xs);
 	}
 
+	/* Honest states: dashed neutral for pending/empty, solid status for errors. */
 	.mai-docs__state {
-		padding: var(--space-2, 0.5rem);
-		border-radius: var(--radius-sm, 4px);
-		border: 1px dashed var(--border-subtle, transparent);
+		padding: var(--mai-space-3);
+		border-radius: var(--mai-radius-md);
+		border: var(--mai-border-width) dashed var(--mai-color-border);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-docs__state--error {
 		border-style: solid;
-		border-color: var(--color-danger, currentColor);
-		color: var(--color-danger, inherit);
+		border-color: var(--mai-status-danger-border);
+		background: var(--mai-status-danger-bg);
+		color: var(--mai-status-danger-text);
 	}
 
 	.mai-docs__rows {
@@ -1458,79 +1533,111 @@
 		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
 	}
 
 	.mai-docs__row {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		padding: var(--space-2, 0.5rem);
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-docs__row-main {
 		display: flex;
 		align-items: baseline;
-		gap: var(--space-3, 0.75rem);
+		gap: var(--mai-space-3);
 		flex-wrap: wrap;
 	}
 
+	/* Citation chip: the stable scroll address of a document or excerpt. */
 	.mai-docs__row-id {
-		font-weight: 600;
+		display: inline-flex;
+		align-items: baseline;
+		max-width: 100%;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-brass);
+		background: var(--mai-color-surface-header);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		padding: 0 var(--mai-space-2);
 	}
 
 	.mai-docs__row-actions {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
 		flex-wrap: wrap;
 	}
 
+	/* Status badges keep the frozen --mai-status-* triples. */
 	.mai-docs__badge {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		padding: 0 var(--space-2, 0.5rem);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.04em;
+		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
+		border-radius: var(--mai-radius-sm);
+		padding: 0 var(--mai-space-2);
+		background: var(--mai-status-neutral-bg);
+		color: var(--mai-status-neutral-text);
 	}
 
 	.mai-docs__badge--ok {
-		border-color: var(--color-success, currentColor);
-		color: var(--color-success, inherit);
+		border-color: var(--mai-status-success-border);
+		background: var(--mai-status-success-bg);
+		color: var(--mai-status-success-text);
 	}
 
 	.mai-docs__badge--danger {
-		border-color: var(--color-danger, currentColor);
-		color: var(--color-danger, inherit);
+		border-color: var(--mai-status-danger-border);
+		background: var(--mai-status-danger-bg);
+		color: var(--mai-status-danger-text);
 	}
 
 	.mai-docs__badge--warn {
-		border-color: var(--color-warning, currentColor);
-		color: var(--color-warning, inherit);
+		border-color: var(--mai-status-warning-border);
+		background: var(--mai-status-warning-bg);
+		color: var(--mai-status-warning-text);
 	}
 
+	/* Canonical document facts: muted labels, mono digests and revisions. */
 	.mai-docs__facts {
 		display: grid;
 		grid-template-columns: max-content 1fr;
-		gap: var(--space-1, 0.25rem) var(--space-3, 0.75rem);
+		gap: var(--mai-space-1) var(--mai-space-3);
 		margin: 0;
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-docs__facts dt {
-		color: var(--color-muted, inherit);
+		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-docs__facts dd {
 		margin: 0;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
+	/* Quoted source text: mono on an inset strip. */
 	.mai-docs__content {
 		margin: 0;
-		padding: var(--space-2, 0.5rem);
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		background: var(--surface-raised, transparent);
-		font-family: var(--font-mono, monospace);
-		font-size: var(--font-size-sm, 0.875rem);
+		padding: var(--mai-space-3);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 		max-height: 22rem;
@@ -1539,17 +1646,17 @@
 
 	.mai-docs__actions {
 		display: flex;
-		gap: var(--space-2, 0.5rem);
+		gap: var(--mai-space-2);
 		align-items: center;
 		flex-wrap: wrap;
 	}
 
 	.mai-docs__note {
 		margin: 0;
-		color: var(--color-muted, inherit);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-docs__note--error {
-		color: var(--color-danger, inherit);
+		color: var(--mai-status-danger-text);
 	}
 </style>

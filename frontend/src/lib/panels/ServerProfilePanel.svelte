@@ -42,6 +42,7 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import { CircleCheck, Cog, FingerprintPattern, History, ScrollText, TriangleAlert } from 'lucide-svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type { ProfileResponse } from '../api/client.js';
 	import type { ServerProfileApi } from '../workspace/entries/02-web-server.js';
@@ -257,10 +258,12 @@
 <div class="mai-server-profile" data-testid="server-profile-root">
 	{#if !usable}
 		<div class="mai-server-profile__state mai-server-profile__state--error" role="alert" data-testid="panel-config-error">
+			<span class="mai-server-profile__state-icon"><TriangleAlert size={16} aria-hidden="true" /></span>
 			<p>This panel was opened without its profile service or a pinned server target.</p>
 		</div>
 	{:else if view.status === 'loading'}
 		<div class="mai-server-profile__state" role="status" data-testid="profile-loading">
+			<span class="mai-server-profile__state-icon mai-server-profile__state-icon--spin"><Cog size={16} aria-hidden="true" /></span>
 			<p>Loading server profile…</p>
 		</div>
 	{:else if view.status === 'error'}
@@ -270,6 +273,7 @@
 			data-testid="profile-error"
 			data-error-code={view.code}
 		>
+			<span class="mai-server-profile__state-icon"><TriangleAlert size={16} aria-hidden="true" /></span>
 			<p>{view.message}</p>
 			<Button variant="secondary" onclick={loadProfile} data-testid="profile-retry">Retry</Button>
 		</div>
@@ -281,97 +285,114 @@
 					role="status"
 					data-testid="projection-stale"
 				>
-					Projection stale — the stored index has not reconciled yet (C02 W2)
+					<History size={12} aria-hidden="true" /> Projection stale — the stored index has not reconciled yet (C02 W2)
 				</p>
 			{/if}
 
-			<dl class="mai-server-profile__rows">
-				<div class="mai-server-profile__row">
-					<dt>Server</dt>
-					<dd><code data-testid="server-id">{serverId}</code></dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Name</dt>
-					<dd data-testid="profile-name">{view.profile.name}</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Environment</dt>
-					<dd data-testid="profile-environment">{view.profile.environment}</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>SSH target</dt>
-					<dd data-testid="ssh-target">
-						{view.profile.ssh.user}@{view.profile.ssh.host}:{view.profile.ssh.port}
-					</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Privilege</dt>
-					<dd data-testid="privilege">{view.profile.privilege}</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Capabilities</dt>
-					<dd data-testid="capabilities">
-						{view.profile.capabilities.length > 0 ? view.profile.capabilities.join(', ') : '—'}
-					</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Canonical revision</dt>
-					<dd><span data-testid="profile-revision">{view.profile.revision}</span></dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Projection revision</dt>
-					<dd data-testid="projection-revision">{view.profile.projection.revision ?? '—'}</dd>
-				</div>
-				<div class="mai-server-profile__row">
-					<dt>Content hash</dt>
-					<dd><code data-testid="sha256">{view.profile.sha256}</code></dd>
-				</div>
-			</dl>
-
-			<div class="mai-server-profile__editor">
-				<Field
-					label="Prompt edition"
-					hint="Versioned prompt edition (prompt_revision) saved with the profile; integer ≥ 1."
-					bind:value={revisionInput}
-					error={revisionError}
-					inputmode="numeric"
-					autocomplete="off"
-					data-testid="prompt-revision-input"
-				/>
-
-				{#if conflictMessage !== null}
-					<div class="mai-server-profile__notice mai-server-profile__notice--warning" role="alert" data-testid="conflict-banner">
-						<p>{conflictMessage}</p>
+			<article class="mai-server-profile__tablet">
+				<header class="mai-server-profile__tablet-header">
+					<span class="mai-server-profile__header-icon"><FingerprintPattern size={14} aria-hidden="true" /></span>
+					<h2 class="mai-server-profile__tablet-title">Enrolled Server Identity</h2>
+					<span class="mai-server-profile__rev-stamp">rev {view.profile.revision}</span>
+				</header>
+				<dl class="mai-server-profile__rows">
+					<div class="mai-server-profile__row">
+						<dt>Server</dt>
+						<dd><code data-testid="server-id">{serverId}</code></dd>
 					</div>
-				{/if}
-				{#if saveProblem !== null}
-					<div
-						class="mai-server-profile__notice mai-server-profile__notice--danger"
-						role="alert"
-						data-testid="save-error-banner"
-						data-error-code={saveProblem.code}
-					>
-						<p>{saveProblem.message}{saveProblem.hint}</p>
+					<div class="mai-server-profile__row">
+						<dt>Name</dt>
+						<dd data-testid="profile-name">{view.profile.name}</dd>
 					</div>
-				{/if}
-				{#if savedNotice !== null}
-					<p class="mai-server-profile__notice mai-server-profile__notice--success" role="status" data-testid="saved-notice">
-						{savedNotice}
-					</p>
-				{/if}
+					<div class="mai-server-profile__row">
+						<dt>Environment</dt>
+						<dd data-testid="profile-environment">{view.profile.environment}</dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>SSH target</dt>
+						<dd class="mai-server-profile__mono" data-testid="ssh-target">
+							{view.profile.ssh.user}@{view.profile.ssh.host}:{view.profile.ssh.port}
+						</dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>Privilege</dt>
+						<dd class="mai-server-profile__mono" data-testid="privilege">{view.profile.privilege}</dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>Capabilities</dt>
+						<dd data-testid="capabilities">
+							{view.profile.capabilities.length > 0 ? view.profile.capabilities.join(', ') : '—'}
+						</dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>Canonical revision</dt>
+						<dd><span class="mai-server-profile__rev-stamp" data-testid="profile-revision">{view.profile.revision}</span></dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>Projection revision</dt>
+						<dd class="mai-server-profile__mono" data-testid="projection-revision">{view.profile.projection.revision ?? '—'}</dd>
+					</div>
+					<div class="mai-server-profile__row">
+						<dt>Content hash</dt>
+						<dd><code data-testid="sha256">{view.profile.sha256}</code></dd>
+					</div>
+				</dl>
+			</article>
 
-				<div class="mai-server-profile__actions">
-					<Button onclick={saveEdition} loading={saving} disabled={saveDisabled} data-testid="save-button">
-						Save edition
-					</Button>
-					<Button variant="secondary" onclick={cancelEdit} disabled={saving || !dirty} data-testid="cancel-button">
-						Cancel
-					</Button>
-					<Button variant="secondary" onclick={reloadProfile} disabled={saving} data-testid="reload-button">
-						Reload
-					</Button>
+			<section class="mai-server-profile__editor">
+				<header class="mai-server-profile__editor-header">
+					<span class="mai-server-profile__header-icon"><ScrollText size={14} aria-hidden="true" /></span>
+					<h2 class="mai-server-profile__editor-title">Prompt Edition Catechism</h2>
+					<span class="mai-server-profile__counter">edition {view.profile.prompt_revision}</span>
+				</header>
+				<div class="mai-server-profile__editor-body">
+					<Field
+						label="Prompt edition"
+						hint="Versioned prompt edition (prompt_revision) saved with the profile; integer ≥ 1."
+						bind:value={revisionInput}
+						error={revisionError}
+						inputmode="numeric"
+						autocomplete="off"
+						data-testid="prompt-revision-input"
+					/>
+
+					{#if conflictMessage !== null}
+						<div class="mai-server-profile__notice mai-server-profile__notice--warning" role="alert" data-testid="conflict-banner">
+							<span class="mai-server-profile__notice-icon"><TriangleAlert size={14} aria-hidden="true" /></span>
+							<p>{conflictMessage}</p>
+						</div>
+					{/if}
+					{#if saveProblem !== null}
+						<div
+							class="mai-server-profile__notice mai-server-profile__notice--danger"
+							role="alert"
+							data-testid="save-error-banner"
+							data-error-code={saveProblem.code}
+						>
+							<span class="mai-server-profile__notice-icon"><TriangleAlert size={14} aria-hidden="true" /></span>
+							<p>{saveProblem.message}{saveProblem.hint}</p>
+						</div>
+					{/if}
+					{#if savedNotice !== null}
+						<p class="mai-server-profile__notice mai-server-profile__notice--success" role="status" data-testid="saved-notice">
+							<span class="mai-server-profile__notice-icon"><CircleCheck size={14} aria-hidden="true" /></span>
+							{savedNotice}
+						</p>
+					{/if}
+
+					<div class="mai-server-profile__actions">
+						<Button onclick={saveEdition} loading={saving} disabled={saveDisabled} data-testid="save-button">
+							Save edition
+						</Button>
+						<Button variant="secondary" onclick={cancelEdit} disabled={saving || !dirty} data-testid="cancel-button">
+							Cancel
+						</Button>
+						<Button variant="secondary" onclick={reloadProfile} disabled={saving} data-testid="reload-button">
+							Reload
+						</Button>
+					</div>
 				</div>
-			</div>
+			</section>
 		</section>
 	{/if}
 </div>
@@ -381,6 +402,7 @@
 		height: 100%;
 		overflow: auto;
 		color: var(--mai-color-text);
+		font-family: var(--mai-font-sans);
 		background: var(--mai-color-bg);
 	}
 
@@ -389,12 +411,38 @@
 		flex-direction: column;
 		gap: var(--mai-space-3);
 		align-items: flex-start;
+		margin: var(--mai-space-4);
 		padding: var(--mai-space-4);
 		color: var(--mai-status-neutral-text);
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
 	}
 
 	.mai-server-profile__state--error {
 		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
+		border-color: var(--mai-status-danger-border);
+		border-left: 3px solid var(--mai-status-danger-solid);
+	}
+
+	.mai-server-profile__state-icon {
+		flex-shrink: 0;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-server-profile__state--error .mai-server-profile__state-icon {
+		color: var(--mai-status-danger-solid);
+	}
+
+	.mai-server-profile__state-icon--spin {
+		animation: mai-server-profile-spin 1.8s linear infinite;
+	}
+
+	@keyframes mai-server-profile-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.mai-server-profile__state p {
@@ -409,13 +457,65 @@
 	}
 
 	.mai-server-profile__badge {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
 		margin: 0;
 		padding: var(--mai-space-1) var(--mai-space-3);
 		font-size: var(--mai-text-sm);
 		color: var(--mai-status-warning-text);
 		background: var(--mai-status-warning-bg);
 		border: var(--mai-border-width) solid var(--mai-status-warning-border);
+		border-left: 3px solid var(--mai-status-warning-solid);
 		border-radius: var(--mai-radius-sm);
+	}
+
+	.mai-server-profile__tablet {
+		overflow: hidden;
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-server-profile__tablet-header {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+	}
+
+	.mai-server-profile__header-icon {
+		flex-shrink: 0;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-server-profile__tablet-title,
+	.mai-server-profile__editor-title {
+		margin: 0;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-server-profile__rev-stamp {
+		display: inline-block;
+		padding: 0 var(--mai-space-2);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-brass);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-sm);
+	}
+
+	.mai-server-profile__tablet-header .mai-server-profile__rev-stamp {
+		margin-left: auto;
 	}
 
 	.mai-server-profile__rows {
@@ -423,17 +523,27 @@
 		flex-direction: column;
 		gap: var(--mai-space-2);
 		margin: 0;
+		padding: var(--mai-space-3);
 	}
 
 	.mai-server-profile__row {
 		display: grid;
 		grid-template-columns: minmax(9rem, max-content) 1fr;
 		gap: var(--mai-space-3);
+		padding-bottom: var(--mai-space-2);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+	}
+
+	.mai-server-profile__row:last-child {
+		padding-bottom: 0;
+		border-bottom-width: 0;
 	}
 
 	.mai-server-profile__row dt {
 		font-size: var(--mai-text-sm);
 		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
 		color: var(--mai-color-text-muted);
 	}
 
@@ -443,24 +553,57 @@
 		overflow-wrap: anywhere;
 	}
 
-	.mai-server-profile__row code {
+	.mai-server-profile__row code,
+	.mai-server-profile__mono {
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 	}
 
 	.mai-server-profile__editor {
+		overflow: hidden;
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-server-profile__editor-header {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+	}
+
+	.mai-server-profile__counter {
+		margin-left: auto;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.04em;
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-server-profile__editor-body {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding-top: var(--mai-space-3);
-		border-top: var(--mai-border-width) solid var(--mai-color-border);
+		padding: var(--mai-space-3);
 	}
 
 	.mai-server-profile__notice {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--mai-space-2);
 		margin: 0;
 		padding: var(--mai-space-2) var(--mai-space-3);
 		font-size: var(--mai-text-sm);
 		border-radius: var(--mai-radius-sm);
+	}
+
+	.mai-server-profile__notice-icon {
+		flex-shrink: 0;
+		margin-top: 2px;
 	}
 
 	.mai-server-profile__notice p {
@@ -471,18 +614,21 @@
 		color: var(--mai-status-warning-text);
 		background: var(--mai-status-warning-bg);
 		border: var(--mai-border-width) solid var(--mai-status-warning-border);
+		border-left: 3px solid var(--mai-status-warning-solid);
 	}
 
 	.mai-server-profile__notice--danger {
 		color: var(--mai-status-danger-text);
 		background: var(--mai-status-danger-bg);
 		border: var(--mai-border-width) solid var(--mai-status-danger-border);
+		border-left: 3px solid var(--mai-status-danger-solid);
 	}
 
 	.mai-server-profile__notice--success {
 		color: var(--mai-status-success-text);
 		background: var(--mai-status-success-bg);
 		border: var(--mai-border-width) solid var(--mai-status-success-border);
+		border-left: 3px solid var(--mai-status-success-solid);
 	}
 
 	.mai-server-profile__actions {

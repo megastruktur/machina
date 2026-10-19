@@ -52,6 +52,7 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { CalendarClock, ListTree, RadioTower, ScrollText, ServerCog } from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
@@ -584,335 +585,373 @@
 		</div>
 	{:else}
 		<header class="mai-jobs__header">
-			<h3 class="mai-jobs__title">Jobs &amp; schedules</h3>
+			<div class="mai-jobs__title-row">
+				<span class="mai-jobs__title-icon"><ServerCog size={16} aria-hidden="true" /></span>
+				<h3 class="mai-jobs__title">Jobs &amp; schedules</h3>
+			</div>
 			<p class="mai-jobs__meta">
-				<span data-testid="jobs-scope">Server {shortId(serverScope ?? '')}</span>
+				<span class="mai-jobs__mono" data-testid="jobs-scope">Server {shortId(serverScope ?? '')}</span>
 				<span>Pinned scope — every action below names this target.</span>
 			</p>
 		</header>
 
-		<section class="mai-jobs__section" aria-label="Runs" data-testid="runs-section">
-			<div class="mai-jobs__section-head">
-				<h4>Runs</h4>
-				<Button variant="secondary" onclick={loadRuns} data-testid="runs-refresh">Refresh</Button>
-			</div>
-			{#if runsState.status === 'loading'}
-				<div class="mai-jobs__state" role="status" data-testid="runs-loading">
-					<p>Loading runs…</p>
-				</div>
-			{:else if runsState.status === 'error'}
-				<div
-					class="mai-jobs__state mai-jobs__state--error"
-					role="alert"
-					data-testid="runs-error"
-					data-error-code={runsState.code}
-				>
-					<p>{runsState.message}</p>
-					<Button variant="secondary" onclick={loadRuns} data-testid="runs-retry">Retry</Button>
-				</div>
-			{:else if runs.length === 0}
-				<div class="mai-jobs__state" role="status" data-testid="runs-empty">
-					<p>No runs are recorded for this server.</p>
-				</div>
-			{:else}
-				<ul class="mai-jobs__rows" data-testid="runs-list">
-					{#each runs as row (row.run_id)}
-						<li class="mai-jobs__row" data-testid="run-row" data-run-id={row.run_id}>
-							<div class="mai-jobs__row-main">
-								<span class="mai-jobs__row-id" data-testid="run-row-id">{shortId(row.run_id)}</span>
-								<span
-									class="mai-jobs__badge"
-									class:mai-jobs__badge--ok={row.state === 'succeeded'}
-									class:mai-jobs__badge--danger={row.state === 'failed'}
-									class:mai-jobs__badge--neutral={row.state === 'cancelled'}
-									data-testid="run-row-state"
-								>
-									{runStateText(row.state)}
-								</span>
-								{#if row.cancel_requested_at !== null}
-									<span class="mai-jobs__row-note" data-testid="run-row-cancel-note">
+		<div class="mai-jobs__columns">
+			<div class="mai-jobs__col">
+				<section class="mai-jobs__section" aria-label="Runs" data-testid="runs-section">
+					<div class="mai-jobs__section-head">
+						<h4 class="mai-jobs__section-title">
+							<span class="mai-jobs__section-icon"><ListTree size={14} aria-hidden="true" /></span>
+							Runs
+						</h4>
+						<Button variant="secondary" onclick={loadRuns} data-testid="runs-refresh">Refresh</Button>
+					</div>
+					<div class="mai-jobs__section-body">
+						{#if runsState.status === 'loading'}
+							<div class="mai-jobs__state" role="status" data-testid="runs-loading">
+								<p>Loading runs…</p>
+							</div>
+						{:else if runsState.status === 'error'}
+							<div
+								class="mai-jobs__state mai-jobs__state--error"
+								role="alert"
+								data-testid="runs-error"
+								data-error-code={runsState.code}
+							>
+								<p>{runsState.message}</p>
+								<Button variant="secondary" onclick={loadRuns} data-testid="runs-retry">Retry</Button>
+							</div>
+						{:else if runs.length === 0}
+							<div class="mai-jobs__state" role="status" data-testid="runs-empty">
+								<p>No runs are recorded for this server.</p>
+							</div>
+						{:else}
+							<ul class="mai-jobs__rows" data-testid="runs-list">
+								{#each runs as row (row.run_id)}
+									<li class="mai-jobs__row" data-testid="run-row" data-run-id={row.run_id}>
+										<div class="mai-jobs__row-main">
+											<span class="mai-jobs__row-id" data-testid="run-row-id">{shortId(row.run_id)}</span>
+											<span
+												class="mai-jobs__badge"
+												class:mai-jobs__badge--ok={row.state === 'succeeded'}
+												class:mai-jobs__badge--danger={row.state === 'failed'}
+												class:mai-jobs__badge--neutral={row.state === 'cancelled'}
+												data-testid="run-row-state"
+											>
+												{runStateText(row.state)}
+											</span>
+											{#if row.cancel_requested_at !== null}
+												<span class="mai-jobs__row-note" data-testid="run-row-cancel-note">
+													Cancellation requested
+												</span>
+											{/if}
+										</div>
+										<div class="mai-jobs__row-actions">
+											<Button
+												variant="secondary"
+												onclick={() => selectRun(row.run_id)}
+												data-testid="run-watch"
+											>
+												{watchedRunId === row.run_id ? 'Watching' : 'Watch'}
+											</Button>
+										</div>
+									</li>
+								{/each}
+							</ul>
+							<p class="mai-jobs__meta" data-testid="runs-total">
+								Showing {runs.length} of {runsTotal} recorded runs.
+							</p>
+						{/if}
+					</div>
+				</section>
+
+				<section class="mai-jobs__section" aria-label="Watched run" data-testid="watched-section">
+					<div class="mai-jobs__section-head">
+						<h4 class="mai-jobs__section-title">
+							<span class="mai-jobs__section-icon"><RadioTower size={14} aria-hidden="true" /></span>
+							Watched run
+						</h4>
+						{#if watchedRunId !== ''}
+							<span class="mai-jobs__meta mai-jobs__mono" data-testid="watched-id">{shortId(watchedRunId)}</span>
+						{/if}
+					</div>
+					<div class="mai-jobs__section-body">
+						{#if watchedRunId === ''}
+							<div class="mai-jobs__state" role="status" data-testid="run-none">
+								<p>No run is being watched. Select one from the run list.</p>
+							</div>
+						{:else if watchedState.status === 'loading'}
+							<div class="mai-jobs__state" role="status" data-testid="watched-loading">
+								<p>Loading run…</p>
+							</div>
+						{:else if watchedState.status === 'error'}
+							<div
+								class="mai-jobs__state mai-jobs__state--error"
+								role="alert"
+								data-testid="watched-error"
+								data-error-code={watchedState.code}
+							>
+								<p>{watchedState.message}</p>
+								<Button variant="secondary" onclick={loadWatched} data-testid="watched-retry">
+									Retry
+								</Button>
+							</div>
+						{:else if watchedRun !== null}
+							<p class="mai-jobs__line">
+								<span data-testid="watched-state">{runStateText(watchedRun.state)}</span>
+								{#if watchedRun.cancel_requested_at !== null}
+									<span class="mai-jobs__row-note" data-testid="watched-cancel-note">
 										Cancellation requested
 									</span>
 								{/if}
-							</div>
-							<div class="mai-jobs__row-actions">
-								<Button
-									variant="secondary"
-									onclick={() => selectRun(row.run_id)}
-									data-testid="run-watch"
-								>
-									{watchedRunId === row.run_id ? 'Watching' : 'Watch'}
-								</Button>
-							</div>
-						</li>
-					{/each}
-				</ul>
-				<p class="mai-jobs__meta" data-testid="runs-total">
-					Showing {runs.length} of {runsTotal} recorded runs.
-				</p>
-			{/if}
-		</section>
+							</p>
+							<p class="mai-jobs__meta" data-testid="watched-binding">
+								Profile revision <span class="mai-jobs__mono">{watchedRun.profile_revision}</span> ·
+								prompt revision <span class="mai-jobs__mono">{watchedRun.prompt_revision}</span> ·
+								grants {watchedRun.requested_grants.join(', ')}
+							</p>
 
-		<section class="mai-jobs__section" aria-label="Watched run" data-testid="watched-section">
-			<div class="mai-jobs__section-head">
-				<h4>Watched run</h4>
-				{#if watchedRunId !== ''}
-					<span class="mai-jobs__meta" data-testid="watched-id">{shortId(watchedRunId)}</span>
-				{/if}
-			</div>
-			{#if watchedRunId === ''}
-				<div class="mai-jobs__state" role="status" data-testid="run-none">
-					<p>No run is being watched. Select one from the run list.</p>
-				</div>
-			{:else if watchedState.status === 'loading'}
-				<div class="mai-jobs__state" role="status" data-testid="watched-loading">
-					<p>Loading run…</p>
-				</div>
-			{:else if watchedState.status === 'error'}
-				<div
-					class="mai-jobs__state mai-jobs__state--error"
-					role="alert"
-					data-testid="watched-error"
-					data-error-code={watchedState.code}
-				>
-					<p>{watchedState.message}</p>
-					<Button variant="secondary" onclick={loadWatched} data-testid="watched-retry">
-						Retry
-					</Button>
-				</div>
-			{:else if watchedRun !== null}
-				<p class="mai-jobs__line">
-					<span data-testid="watched-state">{runStateText(watchedRun.state)}</span>
-					{#if watchedRun.cancel_requested_at !== null}
-						<span class="mai-jobs__row-note" data-testid="watched-cancel-note">
-							Cancellation requested
-						</span>
-					{/if}
-				</p>
-				<p class="mai-jobs__meta" data-testid="watched-binding">
-					Profile revision {watchedRun.profile_revision} · prompt revision
-					{watchedRun.prompt_revision} · grants {watchedRun.requested_grants.join(', ')}
-				</p>
+							<div class="mai-jobs__cancel">
+								{#if watchedTerminal}
+									<span class="mai-jobs__meta" data-testid="cancel-unavailable">
+										This run is terminal; cancellation no longer applies.
+									</span>
+								{:else}
+									<Button
+										variant="danger"
+										loading={cancelBusy}
+										onclick={cancelWatched}
+										data-testid="watched-cancel"
+									>
+										Cancel run
+									</Button>
+								{/if}
+								{#if cancelStatus !== null}
+									{#if cancelStatus.outcome === null}
+										<span class="mai-jobs__row-note" data-testid="cancel-pending" role="status">
+											Cancellation requested — not yet verified.
+										</span>
+									{:else if cancelStatus.outcome === 'cancelled'}
+										<span class="mai-jobs__badge mai-jobs__badge--neutral" data-testid="cancel-verified">
+											Cancelled (verified)
+										</span>
+									{:else}
+										<span class="mai-jobs__meta" data-testid="cancel-other">
+											Cancel observed a finished run: {cancelStatus.outcome}
+										</span>
+									{/if}
+								{/if}
+								{#if cancelError !== null}
+									<span
+										class="mai-jobs__row-note mai-jobs__row-note--error"
+										role="alert"
+										data-testid="cancel-error"
+										data-error-code={cancelError.code}
+									>
+										{cancelError.message}
+									</span>
+								{/if}
+							</div>
 
-				<div class="mai-jobs__cancel">
-					{#if watchedTerminal}
-						<span class="mai-jobs__meta" data-testid="cancel-unavailable">
-							This run is terminal; cancellation no longer applies.
-						</span>
-					{:else}
-						<Button variant="danger" loading={cancelBusy} onclick={cancelWatched} data-testid="watched-cancel">
-							Cancel run
-						</Button>
-					{/if}
-					{#if cancelStatus !== null}
-						{#if cancelStatus.outcome === null}
-							<span class="mai-jobs__row-note" data-testid="cancel-pending" role="status">
-								Cancellation requested — not yet verified.
-							</span>
-						{:else if cancelStatus.outcome === 'cancelled'}
-							<span class="mai-jobs__badge mai-jobs__badge--neutral" data-testid="cancel-verified">
-								Cancelled (verified)
-							</span>
-						{:else}
-							<span class="mai-jobs__meta" data-testid="cancel-other">
-								Cancel observed a finished run: {cancelStatus.outcome}
-							</span>
+							<p class="mai-jobs__meta" data-testid="stream-status">
+								{#if streamStatus === 'connecting'}
+									Event stream connecting…
+								{:else if streamStatus === 'live'}
+									Event stream live.
+								{:else if streamStatus === 'reconnecting'}
+									Event stream reconnecting from the last recorded event…
+								{:else if streamStatus === 'closed'}
+									Event stream closed.
+								{/if}
+							</p>
+							{#if streamProblem !== null}
+								<p class="mai-jobs__row-note mai-jobs__row-note--error" role="status" data-testid="stream-problem">
+									{streamProblem}
+								</p>
+							{/if}
+							{#if refreshProblem !== null}
+								<p class="mai-jobs__row-note mai-jobs__row-note--error" role="status" data-testid="refresh-problem">
+									{refreshProblem}
+								</p>
+							{/if}
+
+							<ul class="mai-jobs__events" data-testid="event-list">
+								{#each events as event (event.seq)}
+									<li class="mai-jobs__event" data-testid="event-row" data-event-seq={event.seq}>
+										<span class="mai-jobs__event-seq" data-testid="event-seq">#{event.seq}</span>
+										<span class="mai-jobs__event-ts">{event.ts}</span>
+										<span class="mai-jobs__event-kind" data-testid="event-type">{eventTypeText(event.type)}</span>
+									</li>
+								{/each}
+							</ul>
+
+							{#if watchedRun.steps.length === 0}
+								<p class="mai-jobs__meta" data-testid="step-none">No durable steps are recorded.</p>
+							{:else}
+								<ul class="mai-jobs__rows" data-testid="step-list">
+									{#each watchedRun.steps as step (step.seq)}
+										<li class="mai-jobs__row" data-testid="step-row">
+											<span class="mai-jobs__row-id">#{step.seq} {step.capability_id}</span>
+											<span class="mai-jobs__badge mai-jobs__badge--neutral" data-testid="step-state">
+												{stepStateText(step.state)}
+											</span>
+										</li>
+									{/each}
+								</ul>
+							{/if}
 						{/if}
-					{/if}
-					{#if cancelError !== null}
-						<span
-							class="mai-jobs__row-note mai-jobs__row-note--error"
-							role="alert"
-							data-testid="cancel-error"
-							data-error-code={cancelError.code}
-						>
-							{cancelError.message}
-						</span>
-					{/if}
-				</div>
-
-				<p class="mai-jobs__meta" data-testid="stream-status">
-					{#if streamStatus === 'connecting'}
-						Event stream connecting…
-					{:else if streamStatus === 'live'}
-						Event stream live.
-					{:else if streamStatus === 'reconnecting'}
-						Event stream reconnecting from the last recorded event…
-					{:else if streamStatus === 'closed'}
-						Event stream closed.
-					{/if}
-				</p>
-				{#if streamProblem !== null}
-					<p class="mai-jobs__row-note mai-jobs__row-note--error" role="status" data-testid="stream-problem">
-						{streamProblem}
-					</p>
-				{/if}
-				{#if refreshProblem !== null}
-					<p class="mai-jobs__row-note mai-jobs__row-note--error" role="status" data-testid="refresh-problem">
-						{refreshProblem}
-					</p>
-				{/if}
-
-				<ul class="mai-jobs__events" data-testid="event-list">
-					{#each events as event (event.seq)}
-						<li class="mai-jobs__event" data-testid="event-row" data-event-seq={event.seq}>
-							<span class="mai-jobs__event-seq" data-testid="event-seq">#{event.seq}</span>
-							<span data-testid="event-type">{eventTypeText(event.type)}</span>
-						</li>
-					{/each}
-				</ul>
-
-				{#if watchedRun.steps.length === 0}
-					<p class="mai-jobs__meta" data-testid="step-none">No durable steps are recorded.</p>
-				{:else}
-					<ul class="mai-jobs__rows" data-testid="step-list">
-						{#each watchedRun.steps as step (step.seq)}
-							<li class="mai-jobs__row" data-testid="step-row">
-								<span class="mai-jobs__row-id">#{step.seq} {step.capability_id}</span>
-								<span class="mai-jobs__badge mai-jobs__badge--neutral" data-testid="step-state">
-									{stepStateText(step.state)}
-								</span>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{/if}
-		</section>
-
-		<section class="mai-jobs__section" aria-label="Schedules" data-testid="schedules-section">
-			<div class="mai-jobs__section-head">
-				<h4>Schedules</h4>
-				<Button variant="secondary" onclick={loadSchedules} data-testid="schedules-refresh">
-					Refresh
-				</Button>
-			</div>
-			{#if schedulesState.status === 'loading'}
-				<div class="mai-jobs__state" role="status" data-testid="schedules-loading">
-					<p>Loading schedules…</p>
-				</div>
-			{:else if schedulesState.status === 'error'}
-				<div
-					class="mai-jobs__state mai-jobs__state--error"
-					role="alert"
-					data-testid="schedules-error"
-					data-error-code={schedulesState.code}
-				>
-					<p>{schedulesState.message}</p>
-					<Button variant="secondary" onclick={loadSchedules} data-testid="schedules-retry">
-						Retry
-					</Button>
-				</div>
-			{:else if schedules.length === 0}
-				<div class="mai-jobs__state" role="status" data-testid="schedules-empty">
-					<p>No schedules are recorded for this server.</p>
-				</div>
-			{:else}
-				<ul class="mai-jobs__rows" data-testid="schedules-list">
-					{#each schedules as row (row.schedule_id)}
-						<li class="mai-jobs__row" data-testid="schedule-row" data-schedule-id={row.schedule_id}>
-							<div class="mai-jobs__row-main">
-								<span class="mai-jobs__row-id" data-testid="schedule-cron">{row.cron}</span>
-								<span class="mai-jobs__meta" data-testid="schedule-timezone">{row.cron_timezone}</span>
-								<span class="mai-jobs__meta" data-testid="schedule-handler">
-									{row.run_spec.handler_name}
-								</span>
-								<span
-									class="mai-jobs__badge"
-									class:mai-jobs__badge--ok={row.enabled}
-									data-testid="schedule-enabled"
-								>
-									{row.enabled ? 'Enabled' : 'Paused'}
-								</span>
-							</div>
-							<div class="mai-jobs__row-actions">
-								<Button
-									variant="secondary"
-									loading={busyScheduleId === row.schedule_id}
-									onclick={() => toggleSchedule(row)}
-									data-testid="schedule-toggle"
-								>
-									{row.enabled ? 'Pause' : 'Resume'}
-								</Button>
-								<Button
-									variant="danger"
-									loading={busyScheduleId === row.schedule_id}
-									onclick={() => deleteScheduleRow(row)}
-									data-testid="schedule-delete"
-								>
-									Delete
-								</Button>
-							</div>
-						</li>
-					{/each}
-				</ul>
-			{/if}
-			{#if schedulesActionError !== null}
-				<p
-					class="mai-jobs__row-note mai-jobs__row-note--error"
-					role="alert"
-					data-testid="schedule-action-error"
-					data-error-code={schedulesActionError.code}
-				>
-					{schedulesActionError.message}
-				</p>
-			{/if}
-
-			<form
-				class="mai-jobs__form"
-				aria-label="Create a schedule"
-				onsubmit={(event) => {
-					event.preventDefault();
-					void createSchedule();
-				}}
-				data-testid="schedule-form"
-			>
-				<p class="mai-jobs__meta" data-testid="schedule-form-scope">
-					New schedule for server {shortId(serverScope ?? '')} (pinned scope).
-				</p>
-				<div class="mai-jobs__grid">
-					<Field
-						label="Cron expression"
-						bind:value={cronInput}
-						placeholder="30 2 * * *"
-						data-testid="schedule-cron-input"
-					/>
-					<Field
-						label="Timezone (optional — defaults to UTC)"
-						bind:value={timezoneInput}
-						placeholder="UTC"
-						data-testid="schedule-tz-input"
-					/>
-					<Field
-						label="Handler name"
-						bind:value={handlerInput}
-						placeholder="collect.logs"
-						data-testid="schedule-handler-input"
-					/>
-					<div class="mai-jobs__field">
-						<!-- svelte-ignore a11y_label_has_associated_control -->
-						<label class="mai-jobs__label" for="mai-jobs-payload">Payload (JSON object)</label>
-						<textarea
-							id="mai-jobs-payload"
-							class="mai-jobs__textarea"
-							rows="3"
-							spellcheck="false"
-							bind:value={payloadInput}
-							data-testid="schedule-payload-input"
-						></textarea>
 					</div>
-				</div>
-				{#if formError !== ''}
-					<p class="mai-jobs__row-note mai-jobs__row-note--error" role="alert" data-testid="schedule-form-error">
-						{formError}
-					</p>
-				{/if}
-				<div class="mai-jobs__form-actions">
-					<Button type="submit" loading={createBusy} data-testid="schedule-create">
-						Create schedule
-					</Button>
-				</div>
-			</form>
-		</section>
+				</section>
+			</div>
+
+			<div class="mai-jobs__col">
+
+				<section class="mai-jobs__section" aria-label="Schedules" data-testid="schedules-section">
+					<div class="mai-jobs__section-head">
+						<h4 class="mai-jobs__section-title">
+							<span class="mai-jobs__section-icon"><CalendarClock size={14} aria-hidden="true" /></span>
+							Schedules
+						</h4>
+						<Button variant="secondary" onclick={loadSchedules} data-testid="schedules-refresh">
+							Refresh
+						</Button>
+					</div>
+					<div class="mai-jobs__section-body">
+						{#if schedulesState.status === 'loading'}
+							<div class="mai-jobs__state" role="status" data-testid="schedules-loading">
+								<p>Loading schedules…</p>
+							</div>
+						{:else if schedulesState.status === 'error'}
+							<div
+								class="mai-jobs__state mai-jobs__state--error"
+								role="alert"
+								data-testid="schedules-error"
+								data-error-code={schedulesState.code}
+							>
+								<p>{schedulesState.message}</p>
+								<Button variant="secondary" onclick={loadSchedules} data-testid="schedules-retry">
+									Retry
+								</Button>
+							</div>
+						{:else if schedules.length === 0}
+							<div class="mai-jobs__state" role="status" data-testid="schedules-empty">
+								<p>No schedules are recorded for this server.</p>
+							</div>
+						{:else}
+							<ul class="mai-jobs__rows" data-testid="schedules-list">
+								{#each schedules as row (row.schedule_id)}
+									<li class="mai-jobs__row" data-testid="schedule-row" data-schedule-id={row.schedule_id}>
+										<div class="mai-jobs__row-main">
+											<span class="mai-jobs__row-id" data-testid="schedule-cron">{row.cron}</span>
+											<span class="mai-jobs__meta mai-jobs__mono" data-testid="schedule-timezone"
+												>{row.cron_timezone}</span
+											>
+											<span class="mai-jobs__meta mai-jobs__mono" data-testid="schedule-handler">
+												{row.run_spec.handler_name}
+											</span>
+											<span
+												class="mai-jobs__badge"
+												class:mai-jobs__badge--ok={row.enabled}
+												data-testid="schedule-enabled"
+											>
+												{row.enabled ? 'Enabled' : 'Paused'}
+											</span>
+										</div>
+										<div class="mai-jobs__row-actions">
+											<Button
+												variant="secondary"
+												loading={busyScheduleId === row.schedule_id}
+												onclick={() => toggleSchedule(row)}
+												data-testid="schedule-toggle"
+											>
+												{row.enabled ? 'Pause' : 'Resume'}
+											</Button>
+											<Button
+												variant="danger"
+												loading={busyScheduleId === row.schedule_id}
+												onclick={() => deleteScheduleRow(row)}
+												data-testid="schedule-delete"
+											>
+												Delete
+											</Button>
+										</div>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+						{#if schedulesActionError !== null}
+							<p
+								class="mai-jobs__row-note mai-jobs__row-note--error"
+								role="alert"
+								data-testid="schedule-action-error"
+								data-error-code={schedulesActionError.code}
+							>
+								{schedulesActionError.message}
+							</p>
+						{/if}
+
+						<form
+							class="mai-jobs__form"
+							aria-label="Create a schedule"
+							onsubmit={(event) => {
+								event.preventDefault();
+								void createSchedule();
+							}}
+							data-testid="schedule-form"
+						>
+							<p class="mai-jobs__workbench-title">
+								<span class="mai-jobs__section-icon"><ScrollText size={13} aria-hidden="true" /></span>
+								Creation workbench
+							</p>
+							<p class="mai-jobs__meta" data-testid="schedule-form-scope">
+								New schedule for server {shortId(serverScope ?? '')} (pinned scope).
+							</p>
+							<div class="mai-jobs__grid">
+								<Field
+									label="Cron expression"
+									bind:value={cronInput}
+									placeholder="30 2 * * *"
+									data-testid="schedule-cron-input"
+								/>
+								<Field
+									label="Timezone (optional — defaults to UTC)"
+									bind:value={timezoneInput}
+									placeholder="UTC"
+									data-testid="schedule-tz-input"
+								/>
+								<Field
+									label="Handler name"
+									bind:value={handlerInput}
+									placeholder="collect.logs"
+									data-testid="schedule-handler-input"
+								/>
+								<div class="mai-jobs__field">
+									<!-- svelte-ignore a11y_label_has_associated_control -->
+									<label class="mai-jobs__label" for="mai-jobs-payload">Payload (JSON object)</label>
+									<textarea
+										id="mai-jobs-payload"
+										class="mai-jobs__textarea"
+										rows="3"
+										spellcheck="false"
+										bind:value={payloadInput}
+										data-testid="schedule-payload-input"
+									></textarea>
+								</div>
+							</div>
+							{#if formError !== ''}
+								<p class="mai-jobs__row-note mai-jobs__row-note--error" role="alert" data-testid="schedule-form-error">
+									{formError}
+								</p>
+							{/if}
+							<div class="mai-jobs__form-actions">
+								<Button type="submit" loading={createBusy} data-testid="schedule-create">
+									Create schedule
+								</Button>
+							</div>
+						</form>
+					</div>
+				</section>
+			</div>
+		</div>
 	{/if}
 </div>
 
@@ -928,16 +967,38 @@
 		overflow-y: auto;
 	}
 
+	/* Cogitator masthead: display serif title on a header band with the
+	 * brass left rule; pinned scope named in mono telemetry. */
 	.mai-jobs__header {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+	}
+
+	.mai-jobs__title-row {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-jobs__title-icon {
+		display: inline-flex;
+		flex-shrink: 0;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-jobs__title {
 		margin: 0;
+		font-family: var(--mai-font-display);
 		font-size: var(--mai-text-lg);
 		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-jobs__meta {
@@ -949,13 +1010,34 @@
 		color: var(--mai-color-text-muted);
 	}
 
+	.mai-jobs__mono {
+		font-family: var(--mai-font-mono);
+	}
+
+	/* Two-column cogitator grid: runs + live stream left, schedules right;
+	 * collapses to a single column on narrow hosts. */
+	.mai-jobs__columns {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+		gap: var(--mai-space-4);
+		align-items: start;
+	}
+
+	.mai-jobs__col {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-4);
+		min-width: 0;
+	}
+
+	/* Rite card: raised plate, full-width header band, brass left rule. */
 	.mai-jobs__section {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-3);
-		padding: var(--mai-space-3);
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-lg);
+		overflow: hidden;
 	}
 
 	.mai-jobs__section-head {
@@ -963,12 +1045,36 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--mai-space-3);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
-	.mai-jobs__section-head h4 {
+	.mai-jobs__section-title {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
 		margin: 0;
-		font-size: var(--mai-text-base);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
 		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-jobs__section-icon {
+		display: inline-flex;
+		flex-shrink: 0;
+		color: var(--mai-color-brass-dim);
+	}
+
+	.mai-jobs__section-body {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-3);
+		padding: var(--mai-space-3);
 	}
 
 	.mai-jobs__state {
@@ -977,7 +1083,7 @@
 		gap: var(--mai-space-2);
 		align-items: flex-start;
 		padding: var(--mai-space-3);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-sm);
 		background: var(--mai-status-neutral-bg);
 		color: var(--mai-status-neutral-text);
 		font-size: var(--mai-text-sm);
@@ -1003,6 +1109,7 @@
 		gap: var(--mai-space-2);
 	}
 
+	/* Recorded rows read as inset strips engraved into the raised plate. */
 	.mai-jobs__row {
 		display: flex;
 		align-items: center;
@@ -1010,8 +1117,8 @@
 		gap: var(--mai-space-3);
 		padding: var(--mai-space-2) var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
-		background: var(--mai-color-surface-raised);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
 	}
 
 	.mai-jobs__row-main {
@@ -1022,6 +1129,7 @@
 		min-width: 0;
 	}
 
+	/* Run ids, cron expressions, step counters: mono telemetry. */
 	.mai-jobs__row-id {
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-sm);
@@ -1047,7 +1155,7 @@
 		align-items: center;
 		padding: 0 var(--mai-space-2);
 		min-height: calc(var(--mai-space-4) + var(--mai-space-1));
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-sm);
 		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
 		background: var(--mai-status-neutral-bg);
 		color: var(--mai-status-neutral-text);
@@ -1086,28 +1194,64 @@
 		gap: var(--mai-space-3);
 	}
 
+	/* Live SSE telemetry log: mono log strip under a brass rule; the bounded
+	 * replay scrolls inside the strip instead of stretching the card. */
 	.mai-jobs__events {
-		border-left: calc(2 * var(--mai-border-width)) solid var(--mai-color-border);
-		padding-left: var(--mai-space-3);
+		gap: var(--mai-space-1);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+		max-height: calc(var(--mai-space-8) * 7);
+		overflow-y: auto;
 	}
 
 	.mai-jobs__event {
 		display: flex;
+		align-items: baseline;
 		gap: var(--mai-space-2);
-		font-size: var(--mai-text-sm);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-jobs__event-seq {
-		font-family: var(--mai-font-mono);
+		flex-shrink: 0;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-jobs__event-ts {
+		flex-shrink: 0;
 		color: var(--mai-color-text-muted);
 	}
 
+	.mai-jobs__event-kind {
+		min-width: 0;
+		color: var(--mai-color-text);
+	}
+
+	/* Creation workbench: inset console plate beneath the matrix. */
 	.mai-jobs__form {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding-top: var(--mai-space-3);
-		border-top: var(--mai-border-width) solid var(--mai-color-border);
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+	}
+
+	.mai-jobs__workbench-title {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin: 0;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-jobs__grid {
@@ -1123,22 +1267,29 @@
 	}
 
 	.mai-jobs__label {
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
-		color: var(--mai-color-text);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-jobs__textarea {
 		width: 100%;
 		min-width: 0;
 		padding: var(--mai-space-2) var(--mai-space-3);
-		background: var(--mai-color-surface);
+		background: var(--mai-color-surface-raised);
 		color: var(--mai-color-text);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-sm);
 		font-size: var(--mai-text-base);
 		font-family: var(--mai-font-mono);
 		resize: vertical;
+	}
+
+	.mai-jobs__textarea:focus-visible {
+		outline: var(--mai-border-width) solid var(--mai-focus-ring-color);
+		outline-offset: 1px;
 	}
 
 	.mai-jobs__form-actions {

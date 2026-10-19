@@ -6,10 +6,12 @@ const config = {
 	preprocess: vitePreprocess(),
 
 	compilerOptions: {
-		// MAI-owned window/workspace code is Svelte 5 runes throughout
-		// (windowed-workspace ADR D2); the official Svelte template recommends
-		// forcing runes mode project-wide.
-		runes: true
+		// Project-wide runes force (added by mui-01-foundation) lifted in the
+		// mui-05 fix round: lucide-svelte@1.0.1 ships legacy Svelte-4 components
+		// ($$props), which fail to compile under forced runes mode. Svelte 5
+		// auto-detects runes per component, so MAI-owned runes-mode code keeps
+		// working without the force.
+		// runes: true
 	},
 
 	kit: {

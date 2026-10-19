@@ -59,6 +59,15 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import {
+		Cog,
+		KeyRound,
+		ScrollText,
+		Server,
+		ShieldCheck,
+		Terminal,
+		TriangleAlert
+	} from 'lucide-svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import { SHELL_CAPABILITY_ID } from '../workspace/entries/05-web-execution.js';
 	import type {
@@ -641,7 +650,10 @@
 		</div>
 	{:else}
 		<header class="mai-exec__header">
-			<h3 class="mai-exec__title" data-testid="target-name">{target.profile.name}</h3>
+			<div class="mai-exec__titlebar">
+				<Server size={16} aria-hidden="true" />
+				<h3 class="mai-exec__title" data-testid="target-name">{target.profile.name}</h3>
+			</div>
 			<p class="mai-exec__meta">
 				<span data-testid="target-server-id">Target {shortId(serverScope ?? '')}</span>
 				<span data-testid="target-privilege">
@@ -658,14 +670,21 @@
 		</header>
 
 		<section class="mai-exec__section" aria-label="Run a command" data-testid="run-form">
+			<div class="mai-exec__sectionhead">
+				<Cog size={14} aria-hidden="true" />
+				<h4 class="mai-exec__heading">Command uplink</h4>
+			</div>
 			<div class="mai-exec__grid">
 				<div class="mai-exec__field mai-exec__field--wide">
-					<Field
-						label="Command"
-						bind:value={commandInput}
-						data-testid="command-input"
-						placeholder="shell command to run on the target"
-					/>
+					<div class="mai-exec__cmdline">
+						<Terminal size={14} aria-hidden="true" />
+						<Field
+							label="Command"
+							bind:value={commandInput}
+							data-testid="command-input"
+							placeholder="shell command to run on the target"
+						/>
+					</div>
 				</div>
 				<Field
 					label="Timeout (seconds)"
@@ -707,7 +726,10 @@
 		</section>
 
 		<section class="mai-exec__section" aria-label="Tracked run" data-testid="run-view">
-			<h4 class="mai-exec__heading">Tracked run</h4>
+			<div class="mai-exec__sectionhead">
+				<ScrollText size={14} aria-hidden="true" />
+				<h4 class="mai-exec__heading">Tracked run</h4>
+			</div>
 			{#if run === null}
 				<p class="mai-exec__muted" data-testid="run-none">No run is being tracked.</p>
 			{:else}
@@ -715,9 +737,12 @@
 					<span class="mai-exec__badge" data-state={run.state ?? 'unknown'} data-testid="run-state">
 						{runStateText(run.state)}
 					</span>
-					<span data-testid="run-id">Run {shortId(run.run_id)}</span>
+					<span class="mai-exec__mono" data-testid="run-id">Run {shortId(run.run_id)}</span>
 					{#if run.cancel_requested_at !== null}
-						<span data-testid="run-cancel-flag">Cancellation requested {run.cancel_requested_at}</span>
+						<span class="mai-exec__mono mai-exec__cancelflag" data-testid="run-cancel-flag">
+							<TriangleAlert size={12} aria-hidden="true" />
+							Cancellation requested {run.cancel_requested_at}
+						</span>
 					{/if}
 				</p>
 				{#if pollProblem}
@@ -770,12 +795,12 @@
 					<ul class="mai-exec__steps" data-testid="step-list">
 						{#each run.steps as step (step.seq)}
 							<li class="mai-exec__step" data-testid="step-row" data-step-state={step.state}>
+								<span class="mai-exec__step-node">step {step.seq}</span>
 								<p class="mai-exec__stepline">
 									<span class="mai-exec__badge" data-testid="step-state">
 										{stepStateText(step.state)}
 									</span>
-									<span data-testid="step-capability">{step.capability_id}</span>
-									<span>step {step.seq}</span>
+									<span class="mai-exec__mono" data-testid="step-capability">{step.capability_id}</span>
 								</p>
 								{#if step.receipt !== null}
 									<dl class="mai-exec__receipt" data-testid="step-receipt">
@@ -790,7 +815,13 @@
 										{#if receiptNumber(step.receipt, 'exit_code') !== null}
 											<div>
 												<dt>Exit code</dt>
-												<dd data-testid="step-exit-code">{receiptNumber(step.receipt, 'exit_code')}</dd>
+												<dd
+													class="mai-exec__exitbadge"
+													data-exit-ok={receiptNumber(step.receipt, 'exit_code') === 0}
+													data-testid="step-exit-code"
+												>
+													{receiptNumber(step.receipt, 'exit_code')}
+												</dd>
 											</div>
 										{/if}
 										{#if receiptBoolean(step.receipt, 'output_truncated') === true}
@@ -829,11 +860,14 @@
 
 		{#if awaitingReceipt !== null}
 			<section
-				class="mai-exec__section"
+				class="mai-exec__section mai-exec__seal"
 				aria-label="Bound password challenge"
 				data-testid="challenge-section"
 			>
-				<h4 class="mai-exec__heading">Bound password challenge</h4>
+				<div class="mai-exec__sealhead">
+					<ShieldCheck size={16} aria-hidden="true" />
+					<h4 class="mai-exec__heading">Bound password challenge</h4>
+				</div>
 				<p class="mai-exec__note" data-testid="challenge-note">
 					This run waits on one bound approval ({shortId(awaitingReceipt.approvalId)}). Approving or
 					denying the operation itself belongs to the capability-policy panel; if the target account
@@ -881,7 +915,8 @@
 						</div>
 					</dl>
 					{#if challengeReady}
-						<div class="mai-exec__grid">
+						<div class="mai-exec__keyline">
+							<KeyRound size={14} aria-hidden="true" />
 							<div class="mai-exec__field mai-exec__field--wide">
 								<Field
 									label="Sudo password for {target.profile.ssh.user}"
@@ -942,16 +977,19 @@
 				aria-label="Last password challenge outcome"
 				data-testid="challenge-outcome-section"
 			>
-				<h4 class="mai-exec__heading">Last password challenge outcome</h4>
+				<div class="mai-exec__sectionhead">
+					<ShieldCheck size={14} aria-hidden="true" />
+					<h4 class="mai-exec__heading">Last password challenge outcome</h4>
+				</div>
 				<div class="mai-exec__outcome" data-status={challengeOutcome.status} data-testid="challenge-outcome">
 					<p class="mai-exec__runline">
 						<span class="mai-exec__badge" data-testid="challenge-outcome-status">
 							{outcomeStatusText(challengeOutcome.status)}
 						</span>
 						{#if challengeOutcome.exit_code !== null}
-							<span data-testid="challenge-outcome-exit">exit {challengeOutcome.exit_code}</span>
+							<span class="mai-exec__exitbadge" data-exit-ok={challengeOutcome.exit_code === 0} data-testid="challenge-outcome-exit">exit {challengeOutcome.exit_code}</span>
 						{/if}
-						<span>duration {challengeOutcome.duration_seconds}s</span>
+						<span class="mai-exec__mono">duration {challengeOutcome.duration_seconds}s</span>
 					</p>
 					{#if challengeOutcome.stdout_truncated || challengeOutcome.stderr_truncated}
 						<p class="mai-exec__muted" data-testid="challenge-outcome-truncation">
@@ -980,8 +1018,11 @@
 		gap: var(--mai-space-4);
 		padding: var(--mai-space-4);
 		color: var(--mai-color-text);
+		font-family: var(--mai-font-sans);
 		background: var(--mai-color-bg);
 	}
+
+	/* --- fail-closed states ---------------------------------------------- */
 
 	.mai-exec__state {
 		display: flex;
@@ -1000,25 +1041,47 @@
 		margin: 0;
 	}
 
+	/* --- cogitator header band ------------------------------------------- */
+
 	.mai-exec__header {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3) var(--mai-space-4);
+		background: var(--mai-color-surface-header);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+	}
+
+	.mai-exec__titlebar {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		color: var(--mai-color-brass);
 	}
 
 	.mai-exec__title {
 		margin: 0;
-		font-size: var(--mai-font-size-lg);
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xl);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-exec__meta {
 		display: flex;
 		flex-wrap: wrap;
-		gap: var(--mai-space-3);
+		gap: var(--mai-space-1) var(--mai-space-4);
 		margin: 0;
-		color: var(--mai-status-neutral-text);
-		font-size: var(--mai-font-size-sm);
+		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
+
+	/* --- section chrome --------------------------------------------------- */
 
 	.mai-exec__section {
 		display: flex;
@@ -1028,10 +1091,28 @@
 		border-top: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
+	.mai-exec__sectionhead {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+		color: var(--mai-color-brass);
+	}
+
 	.mai-exec__heading {
 		margin: 0;
-		font-size: var(--mai-font-size-md);
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-base);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
+
+	/* --- command uplink: monospace terminal line -------------------------- */
 
 	.mai-exec__grid {
 		display: grid;
@@ -1043,35 +1124,97 @@
 		grid-column: 1 / -1;
 	}
 
+	.mai-exec__grid :global(.mai-field__input),
+	.mai-exec__keyline :global(.mai-field__input) {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
+		letter-spacing: 0.02em;
+	}
+
+	.mai-exec__cmdline {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: 0 var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-md);
+		color: var(--mai-color-brass);
+	}
+
+	.mai-exec__cmdline :global(.mai-field) {
+		flex: 1;
+		min-width: 0;
+	}
+
 	.mai-exec__actions {
 		display: flex;
 		gap: var(--mai-space-3);
+	}
+
+	/* --- telemetry helpers ------------------------------------------------- */
+
+	.mai-exec__mono {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.02em;
 	}
 
 	.mai-exec__runline {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: var(--mai-space-3);
+		gap: var(--mai-space-2) var(--mai-space-3);
 		margin: 0;
 	}
 
+	.mai-exec__cancelflag {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1);
+		color: var(--mai-status-warning-text);
+	}
+
 	.mai-exec__badge {
-		padding: 0 var(--mai-space-2);
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1);
+		padding: var(--mai-space-1) var(--mai-space-2);
+		background: var(--mai-color-surface);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
-		font-size: var(--mai-font-size-sm);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.04em;
+	}
+
+	.mai-exec__badge[data-state='queued'],
+	.mai-exec__badge[data-state='running'],
+	.mai-exec__badge[data-state='waiting_approval'],
+	.mai-exec__badge[data-state='waiting_children'],
+	.mai-exec__badge[data-state='reconciling'],
+	.mai-exec__badge[data-state='cancel_requested'] {
+		color: var(--mai-status-info-text);
+		background: var(--mai-status-info-bg);
+		border-color: var(--mai-status-info-border);
 	}
 
 	.mai-exec__badge[data-state='succeeded'],
 	.mai-exec__badge[data-state='cancelled'] {
 		color: var(--mai-status-success-text);
+		background: var(--mai-status-success-bg);
+		border-color: var(--mai-status-success-border);
 	}
 
 	.mai-exec__badge[data-state='failed'],
 	.mai-exec__badge[data-state='outcome_unknown'] {
 		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
+		border-color: var(--mai-status-danger-border);
 	}
+
+	/* --- step receipts timeline -------------------------------------------- */
 
 	.mai-exec__steps {
 		display: flex;
@@ -1083,38 +1226,95 @@
 	}
 
 	.mai-exec__step {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-2);
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr);
+		gap: var(--mai-space-2) var(--mai-space-3);
+		align-items: start;
 		padding: var(--mai-space-3);
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-exec__step-node {
+		grid-column: 1;
+		grid-row: 1 / span 2;
+		padding: 2px var(--mai-space-2);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-brass-dim);
 		border-radius: var(--mai-radius-sm);
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		white-space: nowrap;
 	}
 
 	.mai-exec__stepline {
+		grid-column: 2;
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: var(--mai-space-3);
+		gap: var(--mai-space-2) var(--mai-space-3);
 		margin: 0;
 	}
 
 	.mai-exec__receipt {
+		grid-column: 2;
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 		gap: var(--mai-space-2) var(--mai-space-4);
 		margin: 0;
-		font-size: var(--mai-font-size-sm);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-exec__receipt dt {
-		color: var(--mai-status-neutral-text);
+		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-sans);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-exec__receipt dd {
 		margin: 0;
 		overflow-wrap: anywhere;
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
 	}
+
+	.mai-exec__receipt code {
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-mono);
+	}
+
+	.mai-exec__exitbadge {
+		display: inline-block;
+		padding: 0 var(--mai-space-2);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		color: var(--mai-status-neutral-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-medium);
+	}
+
+	.mai-exec__exitbadge[data-exit-ok='true'] {
+		color: var(--mai-status-success-text);
+		border-color: var(--mai-status-success-border);
+	}
+
+	.mai-exec__exitbadge[data-exit-ok='false'] {
+		color: var(--mai-status-danger-text);
+		border-color: var(--mai-status-danger-border);
+	}
+
+	/* --- alert banners ------------------------------------------------------ */
 
 	.mai-exec__banner {
 		display: flex;
@@ -1128,10 +1328,14 @@
 
 	.mai-exec__banner--error {
 		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
+		border-color: var(--mai-status-danger-border);
 	}
 
 	.mai-exec__banner--warn {
 		color: var(--mai-status-warning-text);
+		background: var(--mai-status-warning-bg);
+		border-color: var(--mai-status-warning-border);
 	}
 
 	.mai-exec__error {
@@ -1146,19 +1350,85 @@
 
 	.mai-exec__muted {
 		margin: 0;
-		color: var(--mai-status-neutral-text);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-exec__note {
 		margin: 0;
-		color: var(--mai-status-neutral-text);
-		font-size: var(--mai-font-size-sm);
+		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-sm);
 	}
+
+	/* --- sudo / password challenge seal ------------------------------------- */
+
+	.mai-exec__seal {
+		gap: var(--mai-space-3);
+		padding: var(--mai-space-4);
+		background: var(--mai-color-surface-raised);
+		border: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-lg);
+		box-shadow: 0 0 0 1px var(--mai-color-brass-dim);
+	}
+
+	.mai-exec__sealhead {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin: calc(-1 * var(--mai-space-4)) calc(-1 * var(--mai-space-4)) 0;
+		padding: var(--mai-space-2) var(--mai-space-4);
+		background: var(--mai-color-surface-header);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-lg) var(--mai-radius-lg) 0 0;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-exec__keyline {
+		display: flex;
+		align-items: flex-end;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) dashed var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-md);
+		color: var(--mai-color-brass);
+	}
+
+	.mai-exec__keyline .mai-exec__field {
+		flex: 1;
+		min-width: 0;
+	}
+
+	/* --- challenge outcome --------------------------------------------------- */
 
 	.mai-exec__outcome {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-exec__outcome[data-status='succeeded'] .mai-exec__badge,
+	.mai-exec__outcome[data-status='cancelled'] .mai-exec__badge {
+		color: var(--mai-status-success-text);
+		background: var(--mai-status-success-bg);
+		border-color: var(--mai-status-success-border);
+	}
+
+	.mai-exec__outcome[data-status='failed'] .mai-exec__badge,
+	.mai-exec__outcome[data-status='outcome_unknown'] .mai-exec__badge {
+		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
+		border-color: var(--mai-status-danger-border);
+	}
+
+	.mai-exec__outcome[data-status='running'] .mai-exec__badge,
+	.mai-exec__outcome[data-status='cancel_requested'] .mai-exec__badge {
+		color: var(--mai-status-info-text);
+		background: var(--mai-status-info-bg);
+		border-color: var(--mai-status-info-border);
 	}
 
 	.mai-exec__stream {
@@ -1169,7 +1439,9 @@
 		background: var(--mai-color-bg);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
-		font-size: var(--mai-font-size-sm);
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}

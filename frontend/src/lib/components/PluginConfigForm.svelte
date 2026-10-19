@@ -79,6 +79,7 @@
 <script lang="ts">
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import { Cog, KeyRound, Package, Puzzle, Radar, Wrench } from 'lucide-svelte';
 	import { ApiError } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
@@ -1131,7 +1132,7 @@
 
 <div class="mai-plugins" data-testid="plugins-root">
 	<header class="mai-plugins__header">
-		<h2>Plugins &amp; skills</h2>
+		<h2><span class="mai-plugins__icon"><Cog size={16} aria-hidden="true" /></span> Plugins &amp; skills</h2>
 		<p class="mai-plugins__scope">
 			{#if globalScope}
 				Controller-host catalogue. Every operation names its plugin — and, for grant
@@ -1188,6 +1189,7 @@
 					{#if catalogNotice !== null}
 						<div
 							class="mai-plugins__state"
+							class:mai-plugins__state--ok={catalogNotice.kind === 'ok'}
 							class:mai-plugins__state--error={catalogNotice.kind === 'error'}
 							role={catalogNotice.kind === 'error' ? 'alert' : 'status'}
 							data-testid="catalog-notice"
@@ -1227,7 +1229,12 @@
 						<div class="mai-plugins__rows" data-testid="configured-list">
 							{#each catalogState.view.configured as row (row.plugin)}
 								<article class="mai-plugins__row" data-testid="configured-row" data-plugin={row.plugin}>
-									<div class="mai-plugins__row-main">
+									<div class="mai-plugins__row-main mai-plugins__band">
+										{#if row.kind === 'mcp'}
+											<span class="mai-plugins__icon"><Wrench size={14} aria-hidden="true" /></span>
+										{:else}
+											<span class="mai-plugins__icon"><Puzzle size={14} aria-hidden="true" /></span>
+										{/if}
 										<span class="mai-plugins__row-name" data-testid="configured-plugin">{row.plugin}</span>
 										<span class="mai-plugins__badge" data-testid="configured-kind">{row.kind}</span>
 										<span
@@ -1397,7 +1404,7 @@
 											error={fieldErrors['__mcp_command'] ?? ''}
 											data-testid="mcp-command"
 										/>
-										<label class="mai-plugins__field">
+										<label class="mai-plugins__field mai-plugins__field--wide">
 											<span>Arguments (one per line, ≤ {MCP_MAX_ARGS})</span>
 											<textarea
 												rows="3"
@@ -1472,7 +1479,7 @@
 									{@render schemaField(name, property, declaredRequired.has(name))}
 								{/each}
 								{#if typeof draft['__extra_json'] === 'string'}
-									<label class="mai-plugins__field">
+									<label class="mai-plugins__field mai-plugins__field--wide">
 										<span>Stored keys outside the declared schema</span>
 										<textarea
 											rows="4"
@@ -1513,7 +1520,7 @@
 						rule 7). The server id is typed here — nothing is inferred.
 					</p>
 					{#if bindingNotice !== null}
-						<div class="mai-plugins__state" role="status" data-testid="binding-notice">{bindingNotice}</div>
+						<div class="mai-plugins__state mai-plugins__state--ok" role="status" data-testid="binding-notice">{bindingNotice}</div>
 					{/if}
 					{#if bindingError !== null}
 						<div class="mai-plugins__state mai-plugins__state--error" role="alert" data-testid="binding-error">
@@ -1534,7 +1541,7 @@
 							<div class="mai-plugins__rows" data-testid="bindings-list">
 								{#each bindingsState.view as binding (binding.server_id)}
 									<article class="mai-plugins__row" data-testid="binding-row">
-										<div class="mai-plugins__row-main">
+										<div class="mai-plugins__row-main mai-plugins__band">
 											<span class="mai-plugins__mono" data-testid="binding-server">{binding.server_id}</span>
 											<span class="mai-plugins__meta" data-testid="binding-revision">r{binding.revision}</span>
 										</div>
@@ -1592,7 +1599,7 @@
 								bind:value={() => bindingEditor.serverId, (v) => (bindingEditor.serverId = v)}
 								data-testid="binding-server-input"
 							/>
-							<label class="mai-plugins__field">
+							<label class="mai-plugins__field mai-plugins__field--wide">
 								<span>Granted capabilities (one per line)</span>
 								<textarea
 									rows="4"
@@ -1650,7 +1657,8 @@
 						</div>
 					{:else if discoveryState.view !== null}
 						<article class="mai-plugins__row" data-testid="discovery-report">
-							<div class="mai-plugins__row-main">
+							<div class="mai-plugins__row-main mai-plugins__band">
+								<span class="mai-plugins__icon"><Radar size={14} aria-hidden="true" /></span>
 								<span class="mai-plugins__badge" data-testid="discovery-transport">{discoveryState.view.transport}</span>
 								<span class="mai-plugins__meta" data-testid="discovery-tool-count">
 									{discoveryState.view.tool_count} tools offered
@@ -1679,7 +1687,7 @@
 							{:else}
 								<ul class="mai-plugins__chips" data-testid="discovery-ungranted">
 									{#each discoveryState.view.ungranted as capability (capability)}
-										<li class="mai-plugins__chip">{capability}</li>
+										<li class="mai-plugins__chip mai-plugins__chip--info">{capability}</li>
 									{/each}
 								</ul>
 								<p class="mai-plugins__hint">Grant explicitly under Bindings — discovery never widens access.</p>
@@ -1698,7 +1706,7 @@
 									{#each discoveryState.view.rejections as rejection (rejection.tool)}
 										<article class="mai-plugins__row" data-testid="discovery-rejection">
 											<span class="mai-plugins__mono">{rejection.tool}</span>
-											<span class="mai-plugins__badge mai-plugins__badge--warn">{rejection.code}</span>
+											<span class="mai-plugins__badge mai-plugins__badge--danger">{rejection.code}</span>
 											<p>{rejection.detail}</p>
 										</article>
 									{/each}
@@ -1729,7 +1737,7 @@
 							{#each skillsState.view.rejections as rejection (rejection.skill)}
 								<article class="mai-plugins__row" data-testid="skill-rejection-row">
 									<span class="mai-plugins__row-name">{rejection.skill}</span>
-									<span class="mai-plugins__badge mai-plugins__badge--warn">{rejection.code}</span>
+									<span class="mai-plugins__badge mai-plugins__badge--danger">{rejection.code}</span>
 								</article>
 							{/each}
 						</div>
@@ -1741,7 +1749,7 @@
 						<div class="mai-plugins__rows" data-testid="skills-list">
 							{#each skillsState.view.skills as skill (skill.skill)}
 								<article class="mai-plugins__row" data-testid="skill-row">
-									<div class="mai-plugins__row-main">
+									<div class="mai-plugins__row-main mai-plugins__band">
 										<span class="mai-plugins__row-name" data-testid="skill-name">{skill.skill}</span>
 										{#if skill.title !== null}
 											<span data-testid="skill-title">{skill.title}</span>
@@ -1772,7 +1780,8 @@
 						</div>
 					{:else if skillPackageState.view !== null}
 						<article class="mai-plugins__row" data-testid="skill-package">
-							<h4 data-testid="skill-package-title">
+							<h4 class="mai-plugins__band" data-testid="skill-package-title">
+								<span class="mai-plugins__icon"><Package size={14} aria-hidden="true" /></span>
 								{skillPackageState.view.skill}
 								{#if skillPackageState.view.title !== null}
 									— {skillPackageState.view.title}
@@ -1787,7 +1796,7 @@
 							{:else}
 								<ul class="mai-plugins__chips" data-testid="skill-package-requires">
 									{#each skillPackageState.view.requires_capabilities as capability (capability)}
-										<li class="mai-plugins__chip">{capability}</li>
+										<li class="mai-plugins__chip mai-plugins__chip--info">{capability}</li>
 									{/each}
 								</ul>
 							{/if}
@@ -1890,7 +1899,7 @@
 			{/if}
 		</label>
 	{:else if kind === 'list'}
-		<label class="mai-plugins__field" data-testid="field-{name}">
+		<label class="mai-plugins__field mai-plugins__field--wide" data-testid="field-{name}">
 			<span>{label}</span>
 			<textarea
 				rows="3"
@@ -1904,7 +1913,7 @@
 			{/if}
 		</label>
 	{:else if kind === 'json'}
-		<label class="mai-plugins__field" data-testid="field-{name}">
+		<label class="mai-plugins__field mai-plugins__field--wide" data-testid="field-{name}">
 			<span>{label} (raw JSON)</span>
 			<textarea
 				rows="4"
@@ -1939,6 +1948,7 @@
 {#snippet refsEditor()}
 	<fieldset class="mai-plugins__refs" data-testid="refs-editor">
 		<legend>
+			<span class="mai-plugins__icon"><KeyRound size={12} aria-hidden="true" /></span>
 			Credential references (C03 rule 6) — .env NAMES only, never values
 		</legend>
 		<p class="mai-plugins__hint">
@@ -2007,7 +2017,7 @@
 		{/if}
 	</div>
 	{#if formNotice !== null}
-		<div class="mai-plugins__state" role="status" data-testid="config-status">{formNotice}</div>
+		<div class="mai-plugins__state mai-plugins__state--ok" role="status" data-testid="config-status">{formNotice}</div>
 	{/if}
 	{#if formError !== null}
 		<div
@@ -2033,47 +2043,107 @@
 		padding: var(--mai-space-4);
 		height: 100%;
 		overflow: auto;
+		background: var(--mai-color-bg);
 		color: var(--mai-color-text);
 		font-family: var(--mai-font-sans);
-		font-size: 0.875rem;
+		font-size: var(--mai-text-sm);
+		line-height: var(--mai-leading-normal);
+	}
+
+	/* --- panel header: cogitator title band --- */
+
+	.mai-plugins__header {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+		padding: var(--mai-space-2) var(--mai-space-3);
 	}
 
 	.mai-plugins__header h2 {
-		margin: 0 0 var(--mai-space-1);
-		font-size: 1rem;
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin: 0;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-base);
+		font-weight: var(--mai-weight-semibold);
+		line-height: var(--mai-leading-tight);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-plugins__icon {
+		display: inline-flex;
+		flex: none;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-plugins__scope {
 		margin: 0;
 		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-xs);
 	}
+
+	/* --- tab strip: brass labels, crimson active underline --- */
 
 	.mai-plugins__tabs {
 		display: flex;
 		gap: var(--mai-space-2);
 		flex-wrap: wrap;
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
 	.mai-plugins__tab {
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		background: var(--mai-color-surface);
-		color: var(--mai-color-text);
-		border-radius: var(--mai-radius-sm);
+		appearance: none;
+		border: none;
+		border-bottom: 2px solid transparent;
+		background: transparent;
+		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 		padding: var(--mai-space-1) var(--mai-space-3);
 		cursor: pointer;
+		transition:
+			color var(--mai-motion-fast) linear,
+			border-color var(--mai-motion-fast) linear;
 	}
 
-	.mai-plugins__tab--active {
-		background: var(--mai-color-primary);
-		color: var(--mai-color-primary-contrast);
-		border-color: var(--mai-color-primary);
+	.mai-plugins__tab:hover {
+		color: var(--mai-color-brass-dim);
 	}
+
+	.mai-plugins__tab--active,
+	.mai-plugins__tab--active:hover {
+		color: var(--mai-color-brass);
+		border-bottom-color: var(--mai-color-primary);
+	}
+
+	.mai-plugins__tab:focus-visible {
+		outline: 2px solid var(--mai-focus-ring-color);
+		outline-offset: 2px;
+	}
+
+	/* --- state strips --- */
 
 	.mai-plugins__state {
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		padding: var(--mai-space-2) var(--mai-space-3);
 		background: var(--mai-color-surface);
+		font-size: var(--mai-text-sm);
+	}
+
+	.mai-plugins__state--ok {
+		border-color: var(--mai-status-success-border);
+		background: var(--mai-status-success-bg);
+		color: var(--mai-status-success-text);
 	}
 
 	.mai-plugins__state--error {
@@ -2084,8 +2154,10 @@
 
 	.mai-plugins__note {
 		border: var(--mai-border-width) solid var(--mai-status-info-border);
-		background: var(--mai-status-info-bg);
+		border-left: 3px solid var(--mai-status-info-solid);
 		border-radius: var(--mai-radius-md);
+		background: var(--mai-status-info-bg);
+		color: var(--mai-status-info-text);
 		padding: var(--mai-space-2) var(--mai-space-3);
 	}
 
@@ -2096,6 +2168,8 @@
 		flex-wrap: wrap;
 	}
 
+	/* --- raised record cards --- */
+
 	.mai-plugins__rows {
 		display: flex;
 		flex-direction: column;
@@ -2104,12 +2178,16 @@
 
 	.mai-plugins__row {
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-lg);
 		background: var(--mai-color-surface-raised);
 		padding: var(--mai-space-3);
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+	}
+
+	.mai-plugins__row p {
+		margin: 0;
 	}
 
 	.mai-plugins__row-main {
@@ -2119,8 +2197,29 @@
 		flex-wrap: wrap;
 	}
 
+	/* Card header band: a header strip with a brass edging opens each card. */
+	.mai-plugins__band {
+		margin: calc(-1 * var(--mai-space-3)) calc(-1 * var(--mai-space-3)) var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg) var(--mai-radius-lg) 0 0;
+	}
+
+	.mai-plugins__band .mai-plugins__mono,
+	.mai-plugins__band .mai-plugins__meta {
+		color: var(--mai-color-text);
+	}
+
 	.mai-plugins__row-name {
-		font-weight: 600;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+		overflow-wrap: anywhere;
 	}
 
 	.mai-plugins__row-actions {
@@ -2129,11 +2228,15 @@
 		flex-wrap: wrap;
 	}
 
+	/* --- badges and telemetry chips --- */
+
 	.mai-plugins__badge {
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
 		padding: 0 var(--mai-space-2);
 		color: var(--mai-color-text-muted);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-plugins__badge--on {
@@ -2148,17 +2251,31 @@
 		color: var(--mai-status-warning-text);
 	}
 
+	.mai-plugins__badge--danger {
+		border-color: var(--mai-status-danger-border);
+		background: var(--mai-status-danger-bg);
+		color: var(--mai-status-danger-text);
+	}
+
+	/* Revision triples, SHAs, byte counts: mono chips on inset strips. */
 	.mai-plugins__meta {
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		padding: 0 var(--mai-space-2);
 		color: var(--mai-color-text-muted);
 		font-family: var(--mai-font-mono);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
+		overflow-wrap: anywhere;
 	}
 
 	.mai-plugins__mono {
 		font-family: var(--mai-font-mono);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
 		overflow-wrap: anywhere;
 	}
+
+	/* --- capability / skill id lists --- */
 
 	.mai-plugins__chips {
 		list-style: none;
@@ -2172,26 +2289,38 @@
 	.mai-plugins__chip {
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
 		padding: 0 var(--mai-space-2);
+		color: var(--mai-color-text-muted);
 		font-family: var(--mai-font-mono);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
+		overflow-wrap: anywhere;
 	}
 
 	.mai-plugins__chip--ok {
 		border-color: var(--mai-status-success-border);
 		background: var(--mai-status-success-bg);
+		color: var(--mai-status-success-text);
+	}
+
+	.mai-plugins__chip--info {
+		border-color: var(--mai-status-info-border);
+		background: var(--mai-status-info-bg);
+		color: var(--mai-status-info-text);
 	}
 
 	.mai-plugins__chip--warn {
 		border-color: var(--mai-status-warning-border);
 		background: var(--mai-status-warning-bg);
+		color: var(--mai-status-warning-text);
 	}
 
 	.mai-plugins__confirm {
 		border: var(--mai-border-width) solid var(--mai-status-danger-border);
+		border-left: 3px solid var(--mai-status-danger-solid);
+		border-radius: var(--mai-radius-md);
 		background: var(--mai-status-danger-bg);
 		color: var(--mai-status-danger-text);
-		border-radius: var(--mai-radius-md);
 		padding: var(--mai-space-2) var(--mai-space-3);
 		display: flex;
 		flex-direction: column;
@@ -2205,25 +2334,29 @@
 
 	.mai-plugins__facts {
 		display: flex;
-		gap: var(--mai-space-5);
+		flex-wrap: wrap;
+		gap: var(--mai-space-2) var(--mai-space-5);
 		margin: 0;
 	}
 
 	.mai-plugins__facts dt {
 		color: var(--mai-color-text-muted);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-plugins__facts dd {
 		margin: 0;
 		font-family: var(--mai-font-mono);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
 		overflow-wrap: anywhere;
 	}
 
 	.mai-plugins__hint {
 		margin: 0;
 		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-plugins__empty {
@@ -2232,11 +2365,27 @@
 		font-style: italic;
 	}
 
+	/* --- schema-generated forms: fields in a clean grid --- */
+
 	.mai-plugins__form {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-3);
-		max-width: 40rem;
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+		gap: var(--mai-space-3) var(--mai-space-4);
+		align-items: start;
+		max-width: 52rem;
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+		padding: var(--mai-space-3);
+	}
+
+	.mai-plugins__form > .mai-plugins__refs,
+	.mai-plugins__form > .mai-plugins__field--check,
+	.mai-plugins__form > .mai-plugins__field--wide,
+	.mai-plugins__form > .mai-plugins__row-actions,
+	.mai-plugins__form > .mai-plugins__state,
+	.mai-plugins__form > .mai-plugins__hint {
+		grid-column: 1 / -1;
 	}
 
 	.mai-plugins__new {
@@ -2244,12 +2393,17 @@
 		flex-direction: column;
 		gap: var(--mai-space-2);
 		max-width: 24rem;
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+		padding: var(--mai-space-3);
 	}
 
 	.mai-plugins__field {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
+		min-width: 0;
 	}
 
 	.mai-plugins__field--check {
@@ -2258,12 +2412,18 @@
 		gap: var(--mai-space-2);
 	}
 
+	.mai-plugins__field > span {
+		font-weight: var(--mai-weight-medium);
+	}
+
 	.mai-plugins__field small {
 		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-plugins__field-error {
 		color: var(--mai-status-danger-text);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-plugins__field input,
@@ -2275,16 +2435,29 @@
 		color: var(--mai-color-text);
 		padding: var(--mai-space-1) var(--mai-space-2);
 		font: inherit;
+		transition: border-color var(--mai-motion-fast) linear;
+	}
+
+	.mai-plugins__field input:focus-visible,
+	.mai-plugins__field select:focus-visible,
+	.mai-plugins__field textarea:focus-visible {
+		border-color: var(--mai-color-primary);
+		outline: 2px solid var(--mai-focus-ring-color);
+		outline-offset: 1px;
 	}
 
 	.mai-plugins__field textarea {
 		font-family: var(--mai-font-mono);
-		font-size: 0.75rem;
+		font-size: var(--mai-text-xs);
 	}
+
+	/* --- credential reference editor --- */
 
 	.mai-plugins__refs {
 		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
 		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
 		padding: var(--mai-space-3);
 		display: flex;
 		flex-direction: column;
@@ -2292,8 +2465,16 @@
 	}
 
 	.mai-plugins__refs legend {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
 		padding: 0 var(--mai-space-1);
-		font-weight: 600;
+		font-weight: var(--mai-weight-semibold);
+		font-size: var(--mai-text-sm);
+	}
+
+	.mai-plugins__refs legend .mai-plugins__icon {
+		vertical-align: -0.125em;
 	}
 
 	.mai-plugins__ref-row {
@@ -2304,17 +2485,26 @@
 
 	.mai-plugins__ref-row input {
 		flex: 1;
+		min-width: 0;
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
 		background: var(--mai-color-bg);
 		color: var(--mai-color-text);
 		padding: var(--mai-space-1) var(--mai-space-2);
 		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
 	h3,
 	h4,
 	h5 {
 		margin: var(--mai-space-2) 0 0;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		line-height: var(--mai-leading-tight);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 </style>

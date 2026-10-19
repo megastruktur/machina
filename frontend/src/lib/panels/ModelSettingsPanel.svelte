@@ -61,6 +61,7 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { Cable, Cpu, Gauge, Pin } from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -814,7 +815,10 @@
 	{:else}
 		<!-- ===================== Connections ===================== -->
 		<section class="mai-model-settings__section" aria-label="Connections" data-testid="connections-section">
-			<h3 class="mai-model-settings__heading">Connections</h3>
+			<header class="mai-model-settings__section-header">
+				<span class="mai-model-settings__section-icon"><Cable size={16} aria-hidden="true" /></span>
+				<h3 class="mai-model-settings__heading">Connections</h3>
+			</header>
 			<p class="mai-model-settings__hint">
 				Provider endpoints. The credential field takes the .env variable NAME only — the key value
 				is never entered, stored or displayed here.
@@ -824,7 +828,9 @@
 				{#each connections as ref (ref.name)}
 					<li class="mai-model-settings__list-row">
 						<code data-testid="connection-ref-{ref.name}">{ref.name}</code>
-						<span class="mai-model-settings__refmeta">revision {ref.revision}</span>
+						<span class="mai-model-settings__chip">revision {ref.revision}</span>
+						<span class="mai-model-settings__chip">schema {ref.schema_revision}</span>
+						<span class="mai-model-settings__chip mai-model-settings__chip--sha">sha256 {ref.sha256}</span>
 						<Button
 							variant="secondary"
 							onclick={() => openConnection(ref.name)}
@@ -895,24 +901,26 @@
 						spellcheck="false"
 						data-testid="connection-base-url-input"
 					/>
-					<Field
-						label="Credential reference"
-						bind:value={connEditor.credentialRef}
-						error={connErrors.credentialRef ?? ''}
-						hint="The .env variable NAME holding the API key (e.g. MAI_GATEWAY_KEY). Empty = unauthenticated endpoint. The value itself is never read back."
-						autocomplete="off"
-						spellcheck="false"
-						data-testid="connection-credential-ref-input"
-					/>
-					<Field
-						label="Timeout seconds"
-						bind:value={connEditor.timeout}
-						error={connErrors.timeout ?? ''}
-						hint="Optional round timeout, 1–600."
-						inputmode="decimal"
-						autocomplete="off"
-						data-testid="connection-timeout-input"
-					/>
+					<div class="mai-model-settings__form-grid">
+						<Field
+							label="Credential reference"
+							bind:value={connEditor.credentialRef}
+							error={connErrors.credentialRef ?? ''}
+							hint="The .env variable NAME holding the API key (e.g. MAI_GATEWAY_KEY). Empty = unauthenticated endpoint. The value itself is never read back."
+							autocomplete="off"
+							spellcheck="false"
+							data-testid="connection-credential-ref-input"
+						/>
+						<Field
+							label="Timeout seconds"
+							bind:value={connEditor.timeout}
+							error={connErrors.timeout ?? ''}
+							hint="Optional round timeout, 1–600."
+							inputmode="decimal"
+							autocomplete="off"
+							data-testid="connection-timeout-input"
+						/>
+					</div>
 
 					<fieldset class="mai-model-settings__caps">
 						<legend>Declared capabilities</legend>
@@ -930,7 +938,7 @@
 						(422 unsupported_option) — declared here, enforced there.
 					</p>
 					{#if connEditor.headers.length > 0}
-						<p class="mai-model-settings__hint" data-testid="connection-headers">
+						<p class="mai-model-settings__hint mai-model-settings__telemetry" data-testid="connection-headers">
 							Declared transport headers (kept as stored):
 							{connEditor.headers.map((header) => header.name).join(', ')}
 						</p>
@@ -980,7 +988,10 @@
 
 		<!-- ===================== Model profiles ===================== -->
 		<section class="mai-model-settings__section" aria-label="Model profiles" data-testid="profiles-section">
-			<h3 class="mai-model-settings__heading">Model profiles</h3>
+			<header class="mai-model-settings__section-header">
+				<span class="mai-model-settings__section-icon"><Cpu size={16} aria-hidden="true" /></span>
+				<h3 class="mai-model-settings__heading">Model profiles</h3>
+			</header>
 			<p class="mai-model-settings__hint">
 				Allowlisted settings only (C06 rule 1); endpoint capability gates are enforced at selection
 				and probe time.
@@ -990,7 +1001,9 @@
 				{#each profiles as ref (ref.name)}
 					<li class="mai-model-settings__list-row">
 						<code data-testid="profile-ref-{ref.name}">{ref.name}</code>
-						<span class="mai-model-settings__refmeta">revision {ref.revision}</span>
+						<span class="mai-model-settings__chip">revision {ref.revision}</span>
+						<span class="mai-model-settings__chip">schema {ref.schema_revision}</span>
+						<span class="mai-model-settings__chip mai-model-settings__chip--sha">sha256 {ref.sha256}</span>
 						<Button
 							variant="secondary"
 							onclick={() => openProfile(ref.name)}
@@ -1073,42 +1086,44 @@
 						spellcheck="false"
 						data-testid="profile-model-input"
 					/>
-					<Field
-						label="Temperature"
-						bind:value={profEditor.temperature}
-						error={profErrors.temperature ?? ''}
-						hint="Optional, 0–2."
-						inputmode="decimal"
-						autocomplete="off"
-						data-testid="profile-temperature-input"
-					/>
-					<Field
-						label="Top P"
-						bind:value={profEditor.topP}
-						error={profErrors.topP ?? ''}
-						hint="Optional, 0–1."
-						inputmode="decimal"
-						autocomplete="off"
-						data-testid="profile-top-p-input"
-					/>
-					<Field
-						label="Seed"
-						bind:value={profEditor.seed}
-						error={profErrors.seed ?? ''}
-						hint="Optional integer, 0–2147483647."
-						inputmode="numeric"
-						autocomplete="off"
-						data-testid="profile-seed-input"
-					/>
-					<Field
-						label="Max tokens"
-						bind:value={profEditor.maxTokens}
-						error={profErrors.maxTokens ?? ''}
-						hint="Optional integer, 1–1000000."
-						inputmode="numeric"
-						autocomplete="off"
-						data-testid="profile-max-tokens-input"
-					/>
+					<div class="mai-model-settings__form-grid">
+						<Field
+							label="Temperature"
+							bind:value={profEditor.temperature}
+							error={profErrors.temperature ?? ''}
+							hint="Optional, 0–2."
+							inputmode="decimal"
+							autocomplete="off"
+							data-testid="profile-temperature-input"
+						/>
+						<Field
+							label="Top P"
+							bind:value={profEditor.topP}
+							error={profErrors.topP ?? ''}
+							hint="Optional, 0–1."
+							inputmode="decimal"
+							autocomplete="off"
+							data-testid="profile-top-p-input"
+						/>
+						<Field
+							label="Seed"
+							bind:value={profEditor.seed}
+							error={profErrors.seed ?? ''}
+							hint="Optional integer, 0–2147483647."
+							inputmode="numeric"
+							autocomplete="off"
+							data-testid="profile-seed-input"
+						/>
+						<Field
+							label="Max tokens"
+							bind:value={profEditor.maxTokens}
+							error={profErrors.maxTokens ?? ''}
+							hint="Optional integer, 1–1000000."
+							inputmode="numeric"
+							autocomplete="off"
+							data-testid="profile-max-tokens-input"
+						/>
+					</div>
 
 					<label class="mai-model-settings__select-label">
 						<span>Reasoning effort</span>
@@ -1123,24 +1138,26 @@
 						<p class="mai-model-settings__field-error" role="alert">{profErrors.reasoningEffort}</p>
 					{/if}
 
-					<Field
-						label="Context limit"
-						bind:value={profEditor.contextLimit}
-						error={profErrors.contextLimit ?? ''}
-						hint="Optional integer, 1–2147483647."
-						inputmode="numeric"
-						autocomplete="off"
-						data-testid="profile-context-limit-input"
-					/>
-					<Field
-						label="Output limit"
-						bind:value={profEditor.outputLimit}
-						error={profErrors.outputLimit ?? ''}
-						hint="Optional integer, 1–2147483647."
-						inputmode="numeric"
-						autocomplete="off"
-						data-testid="profile-output-limit-input"
-					/>
+					<div class="mai-model-settings__form-grid">
+						<Field
+							label="Context limit"
+							bind:value={profEditor.contextLimit}
+							error={profErrors.contextLimit ?? ''}
+							hint="Optional integer, 1–2147483647."
+							inputmode="numeric"
+							autocomplete="off"
+							data-testid="profile-context-limit-input"
+						/>
+						<Field
+							label="Output limit"
+							bind:value={profEditor.outputLimit}
+							error={profErrors.outputLimit ?? ''}
+							hint="Optional integer, 1–2147483647."
+							inputmode="numeric"
+							autocomplete="off"
+							data-testid="profile-output-limit-input"
+						/>
+					</div>
 
 					{#if profConflict !== null}
 						<div class="mai-model-settings__notice mai-model-settings__notice--warning" role="alert" data-testid="profile-conflict">
@@ -1186,7 +1203,10 @@
 
 		<!-- ===================== Selection ===================== -->
 		<section class="mai-model-settings__section" aria-label="Selection" data-testid="selection-section">
-			<h3 class="mai-model-settings__heading">Selection</h3>
+			<header class="mai-model-settings__section-header">
+				<span class="mai-model-settings__section-icon"><Pin size={16} aria-hidden="true" /></span>
+				<h3 class="mai-model-settings__heading">Selection</h3>
+			</header>
 			<p class="mai-model-settings__hint">
 				The default (connection, profile) pair. Changing it never retargets a running conversation:
 				chat submissions pin their profile at submit time, and probes pin the pair at click time.
@@ -1280,7 +1300,10 @@
 
 		<!-- ===================== Probe ===================== -->
 		<section class="mai-model-settings__section" aria-label="Connection test" data-testid="probe-section">
-			<h3 class="mai-model-settings__heading">Test connection</h3>
+			<header class="mai-model-settings__section-header">
+				<span class="mai-model-settings__section-icon"><Gauge size={16} aria-hidden="true" /></span>
+				<h3 class="mai-model-settings__heading">Test connection</h3>
+			</header>
 			<p class="mai-model-settings__hint">
 				Runs ONE bounded classified round. Leave both names empty to test the stored selection;
 				the pair and revisions are pinned when the round starts.
@@ -1384,6 +1407,7 @@
 		overflow: auto;
 		color: var(--mai-color-text);
 		background: var(--mai-color-bg);
+		font-family: var(--mai-font-sans);
 	}
 
 	.mai-model-settings__state {
@@ -1411,16 +1435,46 @@
 		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
+	.mai-model-settings__section-header {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin: calc(var(--mai-space-4) * -1) calc(var(--mai-space-4) * -1) 0;
+		padding: var(--mai-space-3) var(--mai-space-4);
+		background: var(--mai-color-surface-header);
+		border-left: 3px solid var(--mai-color-brass);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+	}
+
+	.mai-model-settings__section-icon {
+		display: inline-flex;
+		flex: none;
+		color: var(--mai-color-brass);
+	}
+
 	.mai-model-settings__heading {
 		margin: 0;
+		font-family: var(--mai-font-display);
 		font-size: var(--mai-text-base);
-		font-weight: var(--mai-weight-medium);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-model-settings__hint {
 		margin: 0;
 		font-size: var(--mai-text-sm);
 		color: var(--mai-color-text-muted);
+	}
+
+	.mai-model-settings__telemetry {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
 	}
 
 	.mai-model-settings__list {
@@ -1435,22 +1489,42 @@
 	.mai-model-settings__list-row {
 		display: flex;
 		align-items: center;
-		gap: var(--mai-space-3);
+		flex-wrap: wrap;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
 	}
 
 	.mai-model-settings__list-row code {
+		margin-right: auto;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-medium);
 	}
 
-	.mai-model-settings__refmeta {
-		flex: 1;
+	.mai-model-settings__chip {
+		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		color: var(--mai-color-text-muted);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		padding: calc(var(--mai-space-1) / 2) var(--mai-space-1);
+		white-space: nowrap;
+	}
+
+	.mai-model-settings__chip--sha {
+		max-width: 18ch;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.mai-model-settings__empty {
 		margin: 0;
+		padding-left: var(--mai-space-3);
+		border-left: 3px solid var(--mai-color-border);
 		font-size: var(--mai-text-sm);
 		color: var(--mai-color-text-muted);
 	}
@@ -1460,6 +1534,10 @@
 		flex-direction: column;
 		gap: var(--mai-space-2);
 		margin: 0;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
 	}
 
 	.mai-model-settings__row {
@@ -1469,13 +1547,16 @@
 	}
 
 	.mai-model-settings__row dt {
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 		color: var(--mai-color-text-muted);
 	}
 
 	.mai-model-settings__row dd {
 		margin: 0;
+		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-sm);
 		overflow-wrap: anywhere;
 	}
@@ -1489,9 +1570,17 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding: var(--mai-space-3);
+		padding: var(--mai-space-4);
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-lg);
+	}
+
+	.mai-model-settings__form-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+		gap: var(--mai-space-3);
 	}
 
 	.mai-model-settings__caps {
@@ -1499,14 +1588,18 @@
 		gap: var(--mai-space-4);
 		margin: 0;
 		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
 	}
 
 	.mai-model-settings__caps legend {
-		font-size: var(--mai-text-sm);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
 		font-weight: var(--mai-weight-medium);
-		color: var(--mai-color-text-muted);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass-dim);
 		padding: 0 var(--mai-space-1);
 	}
 
@@ -1526,6 +1619,12 @@
 		color: var(--mai-color-text-muted);
 	}
 
+	.mai-model-settings__select-label > span {
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+	}
+
 	.mai-model-settings__select {
 		font: inherit;
 		font-size: var(--mai-text-sm);
@@ -1534,6 +1633,16 @@
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
 		padding: var(--mai-space-2) var(--mai-space-3);
+		transition: border-color var(--mai-motion-fast) ease;
+	}
+
+	.mai-model-settings__select:hover {
+		border-color: var(--mai-color-border-strong);
+	}
+
+	.mai-model-settings__select:focus-visible {
+		outline: 2px solid var(--mai-focus-ring-color);
+		outline-offset: 1px;
 	}
 
 	.mai-model-settings__field-error {
@@ -1561,18 +1670,21 @@
 		color: var(--mai-status-success-text);
 		background: var(--mai-status-success-bg);
 		border: var(--mai-border-width) solid var(--mai-status-success-border);
+		border-left-width: 3px;
 	}
 
 	.mai-model-settings__notice--warning {
 		color: var(--mai-status-warning-text);
 		background: var(--mai-status-warning-bg);
 		border: var(--mai-border-width) solid var(--mai-status-warning-border);
+		border-left-width: 3px;
 	}
 
 	.mai-model-settings__notice--danger {
 		color: var(--mai-status-danger-text);
 		background: var(--mai-status-danger-bg);
 		border: var(--mai-border-width) solid var(--mai-status-danger-border);
+		border-left-width: 3px;
 	}
 
 	.mai-model-settings__actions {
@@ -1585,9 +1697,10 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding: var(--mai-space-3);
-		border-radius: var(--mai-radius-sm);
+		padding: var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
+		border-left-width: 3px;
+		border-radius: var(--mai-radius-lg);
 	}
 
 	.mai-model-settings__probe--success {
