@@ -70,6 +70,52 @@ export type ContainerView = components['schemas']['ContainerView'];
 export type RecordDocView = components['schemas']['RecordDocView'];
 /** Generated wire shape: one revision-checked, non-destructive revoke request. */
 export type RevokeBody = components['schemas']['RevokeBody'];
+/** Generated wire shape: one taxonomy category (built-in or operator-defined). */
+export type ServiceCategoryView = components['schemas']['ServiceCategoryView'];
+/** Generated wire shape: the runbook instructions persisted on a map entry. */
+export type ServiceInstructionsView = components['schemas']['ServiceInstructionsView'];
+
+/**
+ * The 8 default taxonomy categories (the confined-store grammar's built-ins).
+ * Client-side fallback when a producer page/snapshot omits ``categories``
+ * (old fixtures): the picker, chips and the taxonomy menu still render the
+ * full vocabulary, and unmapped records fall back to ``"system"``.
+ */
+export interface ServiceCategorySeed {
+	/** Stable machine id (the wire vocabulary value). */
+	readonly machine_id: string;
+	/** Human-readable label for chips and pickers. */
+	readonly label: string;
+	/** What belongs in this category (shown in the taxonomy menu). */
+	readonly description: string;
+}
+
+/** The 8 built-in categories, in display order (frozen shared contract). */
+export const DEFAULT_SERVICE_CATEGORIES: readonly ServiceCategorySeed[] = Object.freeze([
+	{ machine_id: 'games', label: 'Games', description: 'Game servers, launchers and play workloads.' },
+	{ machine_id: 'ai', label: 'AI & Models', description: 'LLM runtimes, model services and inference workloads.' },
+	{ machine_id: 'agent', label: 'Autonomous Agents', description: 'Agent loops, bots and automated workers.' },
+	{ machine_id: 'system', label: 'System & OS', description: 'OS services, daemons and host-level units.' },
+	{ machine_id: 'dev', label: 'Development & CI', description: 'Build, test and continuous-integration services.' },
+	{ machine_id: 'infrastructure', label: 'Infrastructure & Proxy', description: 'Proxies, databases and platform plumbing.' },
+	{ machine_id: 'media', label: 'Media & Content', description: 'Content sites, streaming and media libraries.' },
+	{ machine_id: 'observability', label: 'Observability & Backup', description: 'Monitoring, metrics, logs and backups.' }
+]);
+
+/** The deterministic client-side classification hints for one observed
+ * service name/path/image, first match wins (fallback when the producer
+ * omits ``suggested_category`` in old fixtures). */
+export const CATEGORY_KEYWORD_HINTS: ReadonlyArray<readonly [string, readonly string[]]> =
+	Object.freeze([
+		['games', ['game', 'steam', 'lutris', 'retro', 'minecraft']],
+		['ai', ['ai', 'llm', 'ollama', 'model', 'whisper', 'diffusion', 'embedding']],
+		['agent', ['agent', 'bot', 'worker']],
+		['system', ['system', 'cron', 'systemd', 'kernel', 'fail2ban', 'ssh', 'ntp']],
+		['dev', ['dev', 'git', 'ci', 'build', 'npm', 'cargo', 'jenkins']],
+		['infrastructure', ['nginx', 'proxy', 'caddy', 'traefik', 'ingress', 'postgres', 'mysql', 'redis', 'database', 'db']],
+		['media', ['media', 'blog', 'video', 'stream', 'jellyfin', 'plex', 'photo', 'wiki']],
+		['observability', ['metric', 'prometheus', 'grafana', 'monitor', 'observ', 'backup', 'loki', 'alert']]
+	]);
 
 /** Optional bounded-page query of the adopted list route (C01 rule 5). */
 export interface ApplicationsPageQuery {
