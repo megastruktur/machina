@@ -962,6 +962,21 @@ class AgentRunExecutor:
         if len(messages_json.encode("utf-8")) > MAX_HISTORY_BYTES:
             raise AgentStageError(HISTORY_BUDGET_REASON, error_type="HistoryBudget")
         output = result.output
+        thinking_parts: list[str] = []
+        try:
+            for msg in result.new_messages():
+                for part in getattr(msg, "parts", ()):
+                    if (
+                        getattr(part, "part_kind", None) == "thinking"
+                        or type(part).__name__ == "ThinkingPart"
+                    ):
+                        content = getattr(part, "content", None)
+                        if isinstance(content, str) and content.strip():
+                            thinking_parts.append(content.strip())
+        except Exception:
+            pass
+        thinking_text = "\n\n".join(thinking_parts)
+
         if isinstance(output, DeferredToolRequests):
             if output.approvals:
                 # The bridge never marks tools ``requires_approval``; a
@@ -972,40 +987,60 @@ class AgentRunExecutor:
                     error_type="UnexpectedApprovalDeferral",
                 )
             calls = self._deferred_calls(bridge, output, round_index)
+            round_payload: dict[str, object] = {
+                "status": "tool_calls",
+                "tool_calls": [
+                    {
+                        "seq": call["seq"],
+                        "capability_id": call["capability_id"],
+                        "payload_hash": call["payload_hash"],
+                    }
+                    for call in calls
+                ],
+            }
+            if thinking_text:
+                round_payload["thinking"] = thinking_text
             await self._emit_round_event(
                 intent.run_id,
                 round_index,
-                {
-                    "status": "tool_calls",
-                    "tool_calls": [
-                        {
-                            "seq": call["seq"],
-                            "capability_id": call["capability_id"],
-                            "payload_hash": call["payload_hash"],
-                        }
-                        for call in calls
-                    ],
-                },
+                round_payload,
             )
             return {
                 "status": "tool_calls",
                 "history_json": messages_json,
                 "calls": calls,
             }
+        raw_output = str(output)
+        if "<think>" in raw_output and "</think>" in raw_output:
+            import re
+
+            for match in re.finditer(r"<think>(.*?)</think>", raw_output, flags=re.DOTALL):
+                extracted = match.group(1).strip()
+                if extracted:
+                    thinking_text = (
+                        f"{thinking_text}\n\n{extracted}".strip()
+                        if thinking_text
+                        else extracted
+                    )
+            raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
+
+        final_payload: dict[str, object] = {
+            "status": "final",
+            "output_chars": len(raw_output),
+            "output": raw_output,
+        }
+        if thinking_text:
+            final_payload["thinking"] = thinking_text
         await self._emit_round_event(
             intent.run_id,
             round_index,
-            {
-                "status": "final",
-                "output_chars": len(str(output)),
-                "output": str(output),
-            },
+            final_payload,
         )
         return {
             "status": "final",
             "history_json": messages_json,
-            "output": str(output),
-            "output_chars": len(str(output)),
+            "output": raw_output,
+            "output_chars": len(raw_output),
         }
 
     def _deferred_calls(

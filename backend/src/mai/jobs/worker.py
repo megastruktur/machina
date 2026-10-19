@@ -248,9 +248,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         credentials=_resolve_env,
         executor=_composite_executor,
     )
-    model_store = ModelConfigStore(
-        models_root if models_root.is_dir() else data_root
-    )
+    model_store = ModelConfigStore(data_root)
     resolver = _resolve_env()
     agent_executor = agent_run.AgentRunExecutor(
         sessions=sessions,

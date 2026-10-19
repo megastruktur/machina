@@ -71,6 +71,7 @@
 	import Chip from '../ui/Chip.svelte';
 	import Select from '../ui/Select.svelte';
 	import ModelProfileSelect from '../ui/ModelProfileSelect.svelte';
+	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -653,9 +654,70 @@
 		rows: Array<{ k: string; v: string }>;
 	};
 
+	type VisibleToolCall = {
+		id: string;
+		capabilityId: string;
+		stepSeq: string;
+		payloadHash: string;
+		status: 'requested' | 'running' | 'succeeded' | 'failed';
+		reason: string;
+		opId: string;
+	};
+
 	let transcript = $state<TranscriptEntry[]>([]);
 	let latestAssistantReply = $state<string>('');
+	let streamedReply = $state<string>('');
+	let isStreamingReply = $state(false);
+	let thinkingSteps = $state<string[]>([]);
+	let visibleToolCalls = $state<VisibleToolCall[]>([]);
 	let conversationScrollEl = $state<HTMLElement | null>(null);
+	let streamRevealTimer: ReturnType<typeof setInterval> | null = null;
+
+	function stopStreamReveal(): void {
+		if (streamRevealTimer !== null) {
+			clearInterval(streamRevealTimer);
+			streamRevealTimer = null;
+		}
+		isStreamingReply = false;
+	}
+
+	function startStreamReveal(fullText: string): void {
+		stopStreamReveal();
+		if (fullText === '') {
+			streamedReply = '';
+			return;
+		}
+		// Stream chunks progressively for a responsive cogitator readout feel
+		const totalLen = fullText.length;
+		const stepChars = Math.max(12, Math.ceil(totalLen / 18));
+		let pos = Math.min(stepChars, totalLen);
+		streamedReply = fullText.slice(0, pos);
+		if (pos >= totalLen) {
+			scrollToConversationBottom();
+			return;
+		}
+		isStreamingReply = true;
+		streamRevealTimer = setInterval(() => {
+			pos = Math.min(pos + stepChars, totalLen);
+			streamedReply = fullText.slice(0, pos);
+			scrollToConversationBottom();
+			if (pos >= totalLen) {
+				stopStreamReveal();
+			}
+		}, 28);
+	}
+
+	function addThinkingStep(text: string): void {
+		const cleaned = text.trim();
+		if (!cleaned) return;
+		for (const line of cleaned.split('\n')) {
+			const trimmed = line.trim();
+			if (trimmed && !thinkingSteps.includes(trimmed)) {
+				thinkingSteps = [...thinkingSteps, trimmed];
+			}
+		}
+		queueMicrotask(scrollToConversationBottom);
+	}
 	/** Watermark of the applied stream events (C08 rule 7 dedup). */
 	let lastSeq = $state(0);
 	let appliedEvents = $state(0);
@@ -708,6 +770,9 @@
 				break;
 			}
 			case 'agent.started': {
+				addThinkingStep(
+					`Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`
+				);
 				pushEntry({
 					seq: event.seq,
 					kind: 'started',
@@ -724,6 +789,9 @@
 			}
 			case 'agent.context_assembled': {
 				const record = recordOf(data);
+				addThinkingStep(
+					`Assembled server context (prompt edition ${rowOf(data, 'prompt_revision')}, evidence items: ${rowOf(data, 'evidence_items')})`
+				);
 				pushEntry({
 					seq: event.seq,
 					kind: 'context',
@@ -739,8 +807,31 @@
 			case 'agent.model_round': {
 				const record = recordOf(data);
 				const round = rowOf(data, 'round');
+				if (typeof record?.thinking === 'string' && record.thinking.trim() !== '') {
+					addThinkingStep(record.thinking);
+				}
 				if (record?.status === 'tool_calls') {
 					const calls = Array.isArray(record.tool_calls) ? record.tool_calls : [];
+					for (let idx = 0; idx < calls.length; idx++) {
+						const one = recordOf(calls[idx]);
+						const capId =
+							typeof one?.capability_id === 'string' ? one.capability_id : `call_${idx}`;
+						const seqStr = String(one?.seq ?? event.seq);
+						const hashStr = shortHash(one?.payload_hash);
+						addThinkingStep(`Round ${round}: requesting tool ${capId} (step #${seqStr})`);
+						visibleToolCalls = [
+							...visibleToolCalls,
+							{
+								id: `${event.seq}-${idx}`,
+								capabilityId: capId,
+								stepSeq: seqStr,
+								payloadHash: hashStr,
+								status: 'requested',
+								reason: 'dispatched',
+								opId: '—'
+							}
+						];
+					}
 					pushEntry({
 						seq: event.seq,
 						kind: 'round',
@@ -755,8 +846,10 @@
 					});
 				} else if (record?.status === 'final') {
 					const replyOutput = typeof record.output === 'string' ? record.output.trim() : '';
+					addThinkingStep(`Round ${round}: synthesized final response (${rowOf(data, 'output_chars')} chars)`);
 					if (replyOutput !== '') {
 						latestAssistantReply = replyOutput;
+						startStreamReveal(replyOutput);
 					}
 					pushEntry({
 						seq: event.seq,
@@ -780,25 +873,80 @@
 				break;
 			}
 			case 'step.started': {
+				const capId = rowOf(data, 'capability_id');
+				addThinkingStep(`Executing tool capability ${capId}…`);
+				const nextCalls = [...visibleToolCalls];
+				const matchIdx = nextCalls.findIndex(
+					(c) => c.capabilityId === capId && c.status === 'requested'
+				);
+				if (matchIdx >= 0) {
+					nextCalls[matchIdx] = { ...nextCalls[matchIdx], status: 'running' };
+					visibleToolCalls = nextCalls;
+				} else {
+					visibleToolCalls = [
+						...visibleToolCalls,
+						{
+							id: `step-${event.seq}`,
+							capabilityId: capId,
+							stepSeq: String(event.seq),
+							payloadHash: '—',
+							status: 'running',
+							reason: 'running',
+							opId: '—'
+						}
+					];
+				}
 				pushEntry({
 					seq: event.seq,
 					kind: 'tool',
 					label: 'Tool attempt started',
-					rows: [{ k: 'capability_id', v: rowOf(data, 'capability_id') }]
+					rows: [{ k: 'capability_id', v: capId }]
 				});
 				break;
 			}
 			case 'step.completed': {
+				const capId = rowOf(data, 'capability_id');
 				const reason = rowOf(data, 'reason');
+				const opId = rowOf(data, 'op_id');
 				if (reason.startsWith('approval')) needsApproval = true;
+				const isOk = reason === 'ok' || reason === 'succeeded' || reason === 'completed';
+				addThinkingStep(`Tool ${capId} finished (${reason})`);
+				const nextCalls = [...visibleToolCalls];
+				const matchIdx = nextCalls.findIndex(
+					(c) =>
+						c.capabilityId === capId &&
+						(c.status === 'running' || c.status === 'requested')
+				);
+				if (matchIdx >= 0) {
+					nextCalls[matchIdx] = {
+						...nextCalls[matchIdx],
+						status: isOk ? 'succeeded' : 'failed',
+						reason,
+						opId: shortId(opId)
+					};
+					visibleToolCalls = nextCalls;
+				} else {
+					visibleToolCalls = [
+						...visibleToolCalls,
+						{
+							id: `outcome-${event.seq}`,
+							capabilityId: capId,
+							stepSeq: String(event.seq),
+							payloadHash: '—',
+							status: isOk ? 'succeeded' : 'failed',
+							reason,
+							opId: shortId(opId)
+						}
+					];
+				}
 				pushEntry({
 					seq: event.seq,
 					kind: 'outcome',
 					label: 'Tool outcome recorded',
 					rows: [
-						{ k: 'capability_id', v: rowOf(data, 'capability_id') },
+						{ k: 'capability_id', v: capId },
 						{ k: 'reason', v: reason },
-						{ k: 'op_id', v: rowOf(data, 'op_id') }
+						{ k: 'op_id', v: opId }
 					]
 				});
 				break;
@@ -1038,8 +1186,12 @@
 	}
 
 	function resetFold(): void {
+		stopStreamReveal();
 		transcript = [];
 		latestAssistantReply = '';
+		streamedReply = '';
+		thinkingSteps = [];
+		visibleToolCalls = [];
 		lastSeq = 0;
 		appliedEvents = 0;
 		streamProblem = null;
@@ -1107,6 +1259,7 @@
 		void loadHistory();
 		return () => {
 			disposed = true;
+			stopStreamReveal();
 			finishStream();
 			if (refreshTimer !== null) {
 				clearTimeout(refreshTimer);
@@ -1457,16 +1610,81 @@
 							</span>
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
-							{#if latestAssistantReply !== ''}
-								<div class="mai-chat__reply-text" data-testid="assistant-reply-text">
-									{latestAssistantReply}
+							{#if thinkingSteps.length > 0 || !rootTerminal}
+								<details
+									class="mai-chat__thinking-details"
+									data-testid="assistant-thinking-block"
+									open={!rootTerminal || latestAssistantReply === ''}
+								>
+									<summary class="mai-chat__thinking-summary">
+										{#if !rootTerminal}
+											<span class="mai-chat__thinking-pulse"></span>
+										{/if}
+										<span>
+											&gt; Thinking {thinkingSteps.length > 0
+												? `(${thinkingSteps.length} steps)`
+												: '(active…)'}
+										</span>
+									</summary>
+									<blockquote class="mai-chat__thinking-quote" data-testid="assistant-thinking">
+										{#if thinkingSteps.length === 0}
+											<div class="mai-chat__thinking-line">
+												<span class="mai-chat__thinking-prefix">&gt;</span>
+												<span>Initializing cogitator &amp; assembling server context…</span>
+											</div>
+										{:else}
+											{#each thinkingSteps as stepLine, idx (idx)}
+												<div class="mai-chat__thinking-line">
+													<span class="mai-chat__thinking-prefix">&gt;</span>
+													<span>{stepLine}</span>
+												</div>
+											{/each}
+										{/if}
+									</blockquote>
+								</details>
+							{/if}
+
+							{#if visibleToolCalls.length > 0}
+								<div class="mai-chat__tool-calls" data-testid="assistant-tool-calls">
+									{#each visibleToolCalls as tc (tc.id)}
+										<div class="mai-chat__tool-card" data-testid="assistant-tool-card">
+											<div class="mai-chat__tool-card-head">
+												<span class="mai-chat__tool-card-title">
+													⚙ TOOL CALL // {tc.capabilityId}
+												</span>
+												<span
+													class="mai-chat__badge"
+													class:mai-chat__badge--ok={tc.status === 'succeeded'}
+													class:mai-chat__badge--danger={tc.status === 'failed'}
+												>
+													{tc.status.toUpperCase()}
+												</span>
+											</div>
+											<div class="mai-chat__tool-card-meta">
+												<span>step #{tc.stepSeq}</span>
+												{#if tc.payloadHash !== '—'}
+													<span>· payload {tc.payloadHash}</span>
+												{/if}
+												{#if tc.reason !== ''}
+													<span>· outcome: {tc.reason}</span>
+												{/if}
+												{#if tc.opId !== '—'}
+													<span>· op {tc.opId}</span>
+												{/if}
+											</div>
+										</div>
+									{/each}
 								</div>
-							{:else if !rootTerminal}
-								<div class="mai-chat__thinking" data-testid="assistant-thinking">
-									<span class="mai-chat__thinking-pulse"></span>
-									Thinking — gathering context & running tools…
+							{/if}
+
+							{#if streamedReply !== ''}
+								<div class="mai-chat__reply-markdown">
+									<MarkdownRenderer content={streamedReply} testId="assistant-reply-text" />
+									{#if isStreamingReply}
+										<span class="mai-chat__stream-cursor" aria-hidden="true">▍</span>
+									{/if}
 								</div>
-							{:else}
+							{:else if rootTerminal}
 								<div class="mai-chat__reply-placeholder">
 									(Assistant reply is recorded in the transcript events below)
 								</div>
@@ -1932,26 +2150,119 @@
 	}
 
 	.mai-chat__bubble-body {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
 		font-size: var(--mai-text-sm);
 		line-height: 1.55;
 		color: var(--mai-color-text);
-		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
 
-	.mai-chat__thinking {
+	.mai-chat__thinking-details {
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		padding: var(--mai-space-1) var(--mai-space-2);
+	}
+
+	.mai-chat__thinking-summary {
 		display: inline-flex;
 		align-items: center;
 		gap: var(--mai-space-2);
+		cursor: pointer;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
 		color: var(--mai-color-text-muted);
-		font-style: italic;
+		user-select: none;
+	}
+
+	.mai-chat__thinking-quote {
+		margin: var(--mai-space-2) 0 0;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border-left: 2px solid var(--mai-color-brass-dim);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-muted);
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.mai-chat__thinking-line {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--mai-space-2);
+		line-height: 1.45;
+	}
+
+	.mai-chat__thinking-prefix {
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
+		user-select: none;
+		flex: 0 0 auto;
+	}
+
+	.mai-chat__tool-calls {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+	}
+
+	.mai-chat__tool-card {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+	}
+
+	.mai-chat__tool-card-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat__tool-card-title {
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+	}
+
+	.mai-chat__tool-card-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-2);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-chat__reply-markdown {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+	}
+
+	.mai-chat__stream-cursor {
+		display: inline-block;
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-mono);
+		animation: mai-chat-pulse 0.8s ease-in-out infinite;
 	}
 
 	.mai-chat__thinking-pulse {
 		display: inline-block;
 		width: 8px;
 		height: 8px;
-		border-radius: 50%;
+		border-radius: var(--mai-radius-sm);
 		background: var(--mai-color-brass);
 		animation: mai-chat-pulse 1.2s ease-in-out infinite;
 	}
