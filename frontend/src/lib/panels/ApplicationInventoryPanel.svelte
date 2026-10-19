@@ -52,6 +52,7 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import SearchFilterInput from '../ui/SearchFilterInput.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import {
 		CATEGORY_KEYWORD_HINTS,
@@ -177,6 +178,9 @@
 			if (index >= 0) merged[index] = custom;
 			else merged.push(custom);
 		}
+		merged.sort((a, b) =>
+			a.machine_id.localeCompare(b.machine_id, undefined, { numeric: true, sensitivity: 'base' })
+		);
 		return merged;
 	});
 
@@ -247,22 +251,59 @@
 		return 'system';
 	}
 
-	// --- service map filter (category pills over the adopted page) -----------
+	// --- service map filter (category pills + search over the adopted page) --
 
 	let categoryFilter = $state<string>('all');
+	let inventorySearchQuery = $state<string>('');
+	let discoverySearchQuery = $state<string>('');
 
-	/** Categories that actually hold at least one mapped record, in taxonomy order. */
+	/** Primary machine/unit sort key for an adopted inventory application. */
+	function inventorySortKey(row: ApplicationView): string {
+		return row.unit_name ?? row.compose_project ?? row.name ?? row.application_id;
+	}
+
+	/** Categories that actually hold at least one mapped record, in alphabetical taxonomy order. */
 	const presentCategories = $derived.by<string[]>(() => {
 		const present = new Set(applications.map((row) => mappedCategory(row)));
 		return taxonomy.map((entry) => entry.machine_id).filter((id) => present.has(id));
 	});
 
-	/** The adopted page after the active category pill (client-side view only). */
-	const filteredApplications = $derived.by<ApplicationView[]>(() =>
-		categoryFilter === 'all'
-			? applications
-			: applications.filter((row) => mappedCategory(row) === categoryFilter)
-	);
+	/** The adopted page after the active category pill + search filter, sorted alphabetically by unit/machine name. */
+	const filteredApplications = $derived.by<ApplicationView[]>(() => {
+		const byCategory =
+			categoryFilter === 'all'
+				? applications
+				: applications.filter((row) => mappedCategory(row) === categoryFilter);
+		const q = inventorySearchQuery.trim().toLowerCase();
+		const byQuery =
+			q === ''
+				? byCategory
+				: byCategory.filter((row) => {
+						const catId = mappedCategory(row);
+						const haystacks = [
+							row.name,
+							row.application_id,
+							row.origin,
+							originLabel(row.origin),
+							catId,
+							categoryLabel(catId),
+							row.compose_project ?? '',
+							row.working_dir ?? '',
+							row.unit_name ?? '',
+							row.external_working_dir ?? '',
+							mappedDescription(row)
+						];
+						return haystacks.some((part) => part.toLowerCase().includes(q));
+					});
+		return [...byQuery].sort((a, b) => {
+			const cmp = inventorySortKey(a).localeCompare(inventorySortKey(b), undefined, {
+				numeric: true,
+				sensitivity: 'base'
+			});
+			if (cmp !== 0) return cmp;
+			return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+		});
+	});
 
 	// --- value-free display helpers (C08 rule 6) -----------------------------
 
@@ -542,6 +583,62 @@
 			return { discovered, adopted, pending: adoptBusy ? 1 : 0 };
 		}
 	);
+
+	/** Discovery lanes sorted alphabetically by lane machine name. */
+	const sortedDiscoveryLanes = $derived.by(() => {
+		const lanes = discovery?.lanes ?? [];
+		return [...lanes].sort((a, b) =>
+			a.lane.localeCompare(b.lane, undefined, { numeric: true, sensitivity: 'base' })
+		);
+	});
+
+	/** Observed applications filtered by `discoverySearchQuery` and sorted alphabetically by unit/machine name. */
+	const filteredDiscoveryApplications = $derived.by<ObservedApplicationView[]>(() => {
+		const all = discovery?.applications ?? [];
+		const q = discoverySearchQuery.trim().toLowerCase();
+		const filtered =
+			q === ''
+				? all
+				: all.filter((observed) => {
+						const compose = composeDetail(observed);
+						const standalone = standaloneDetail(observed);
+						const systemd = systemdDetail(observed);
+						const catId = suggestedCategory(observed);
+						const statusText = observed.managed ? 'adopted' : 'discovered';
+						const haystacks = [
+							suggestedName(observed),
+							observed.origin,
+							originLabel(observed.origin),
+							catId,
+							categoryLabel(catId),
+							statusText,
+							observed.application_id ?? '',
+							compose?.project_name ?? '',
+							compose?.working_dir ?? '',
+							...(compose?.services ?? []),
+							...(compose?.containers.map((c) => c.name) ?? []),
+							standalone?.container.name ?? '',
+							standalone?.container.image ?? '',
+							standalone?.container.state ?? '',
+							systemd?.unit ?? '',
+							systemd?.load_state ?? '',
+							systemd?.active_state ?? '',
+							systemd?.sub_state ?? ''
+						];
+						return haystacks.some((part) => part.toLowerCase().includes(q));
+					});
+		return [...filtered].sort((a, b) => {
+			const cmp = suggestedName(a).localeCompare(suggestedName(b), undefined, {
+				numeric: true,
+				sensitivity: 'base'
+			});
+			if (cmp !== 0) return cmp;
+			return observedKey(a).localeCompare(observedKey(b), undefined, {
+				numeric: true,
+				sensitivity: 'base'
+			});
+		});
+	});
 
 	/** Pre-fill the adoption form FROM the observation (paths stay referenced). */
 	function startAdoption(observed: ObservedApplicationView): void {
@@ -996,9 +1093,19 @@
 							use the Discovery tab and adopt explicitly.</p>
 					</div>
 				{:else}
-					<p class="mai-apps__meta" data-testid="inventory-count">
-						Showing {applications.length} of {inventoryTotal} adopted.
-					</p>
+					<div class="mai-apps__toolbar">
+						<p class="mai-apps__meta" data-testid="inventory-count">
+							Showing {applications.length} of {inventoryTotal} adopted.
+						</p>
+						<SearchFilterInput
+							bind:value={inventorySearchQuery}
+							label="Search adopted applications"
+							placeholder="Filter inventory by unit, name, category, path, or id…"
+							resultCount={filteredApplications.length}
+							totalCount={applications.length}
+							testId="inventory-search"
+						/>
+					</div>
 					{#if presentCategories.length > 0}
 						<div
 							class="mai-apps__filterbar"
@@ -1351,7 +1458,7 @@
 					<div class="mai-apps__subsection">
 						<h5>Lanes</h5>
 						<ul class="mai-apps__rows" data-testid="discovery-lanes">
-							{#each discovery?.lanes ?? [] as lane (lane.lane)}
+							{#each sortedDiscoveryLanes as lane (lane.lane)}
 								<li class="mai-apps__row" data-testid="lane-row">
 									<div class="mai-apps__row-main">
 										<span class="mai-apps__label" data-testid="lane-name">{lane.lane}</span>
@@ -1381,15 +1488,31 @@
 						</ul>
 					</div>
 					<div class="mai-apps__subsection">
-						<h5>Observed applications</h5>
+						<div class="mai-apps__toolbar">
+							<h5>Observed applications</h5>
+							{#if (discovery?.applications.length ?? 0) > 0}
+								<SearchFilterInput
+									bind:value={discoverySearchQuery}
+									label="Search discovered applications"
+									placeholder="Filter discovery by unit, project, container, image, or category…"
+									resultCount={filteredDiscoveryApplications.length}
+									totalCount={discovery?.applications.length ?? 0}
+									testId="discovery-search"
+								/>
+							{/if}
+						</div>
 						{#if (discovery?.applications.length ?? 0) === 0}
 							<div class="mai-apps__state" role="status" data-testid="discovery-empty">
 								<p>No applications were observed in this snapshot. Unavailable lanes contributed
 									nothing — their states are reported above, never inferred.</p>
 							</div>
+						{:else if filteredDiscoveryApplications.length === 0}
+							<div class="mai-apps__state" role="status" data-testid="discovery-filtered-empty">
+								<p>No observed applications match "{discoverySearchQuery}".</p>
+							</div>
 						{:else}
 							<ul class="mai-apps__rows" data-testid="discovery-list">
-								{#each discovery?.applications ?? [] as observed (observedKey(observed))}
+								{#each filteredDiscoveryApplications as observed (observedKey(observed))}
 									<li class="mai-apps__row" data-testid="discovery-row">
 										<div class="mai-apps__row-main">
 											{#if observed.managed}
@@ -1817,6 +1940,14 @@
 	}
 
 	.mai-apps__section-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+	}
+
+	.mai-apps__toolbar {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
