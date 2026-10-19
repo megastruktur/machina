@@ -106,6 +106,10 @@ DATA_ROOT_VAR: Final = "MAI_DATA_ROOT"
 #: Contract default for the controller host (C02 rule 1); ``~`` expands in
 #: :func:`resolve_profiles_root`.
 DEFAULT_DATA_ROOT: Final = "~/.mai"
+#: Server-scoped system prompt filename inside ``servers/<server_id>/``.
+PROMPT_FILENAME: Final = "prompt.md"
+#: Maximum UTF-8 byte length of ``prompt.md`` (matches mai.agents.context).
+MAX_PROMPT_BYTES: Final = 16_384
 
 #: Mutation rejection codes that are document-validation, not state (the
 #: store owns the byte cap and alias/depth hardening; identity/revision
@@ -152,8 +156,9 @@ class ProfileCreate(BaseModel):
     """Creation payload; ``server_id`` is minted by the service (C01 rule 1)."""
 
     name: str
-    prompt_revision: int = Field(ge=1)
-    environment: ExecutionEnvironment
+    prompt_revision: int | None = Field(default=None, ge=1)
+    prompt_text: str | None = None
+    environment: ExecutionEnvironment = ExecutionEnvironment.LINUX_SSH
     ssh: SshIdentityBody
     privilege: PrivilegeMode
     capabilities: list[str]
@@ -188,6 +193,7 @@ class ProfileResponse(BaseModel):
     server_id: uuid.UUID
     name: str
     prompt_revision: int
+    prompt_text: str = ""
     environment: ExecutionEnvironment
     ssh: SshIdentityBody
     privilege: PrivilegeMode
@@ -208,13 +214,23 @@ class ProfileListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _canonical_document(server_id: uuid.UUID, payload: ProfileCreate) -> str:
+def _canonical_document(
+    server_id: uuid.UUID,
+    payload: ProfileCreate,
+    *,
+    prompt_revision: int | None = None,
+) -> str:
     """Render the canonical ``profile.yaml`` body in frozen field order."""
+    resolved_revision = (
+        prompt_revision
+        if prompt_revision is not None
+        else (payload.prompt_revision if payload.prompt_revision is not None else 1)
+    )
     document = {
         "schema_version": SCHEMA_VERSION,
         "server_id": str(server_id),
         "name": payload.name,
-        "prompt_revision": payload.prompt_revision,
+        "prompt_revision": resolved_revision,
         "environment": payload.environment.value,
         "ssh": {
             "host": payload.ssh.host,
@@ -227,6 +243,68 @@ def _canonical_document(server_id: uuid.UUID, payload: ProfileCreate) -> str:
         "capabilities": list(payload.capabilities),
     }
     return yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+
+
+def _validate_prompt_text(
+    request: Request, prompt_text: str | None
+) -> Response | None:
+    """Reject blank, NUL-containing, or oversized prompt text with 422."""
+    if prompt_text is None:
+        return None
+    if (
+        not isinstance(prompt_text, str)
+        or not prompt_text.strip()
+        or "\x00" in prompt_text
+        or len(prompt_text.encode("utf-8")) > MAX_PROMPT_BYTES
+    ):
+        return render_error_envelope(
+            request,
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "validation_failed",
+            "profile validation failed",
+            fields={"prompt_text": "invalid_field"},
+        )
+    return None
+
+
+def _read_prompt_text(
+    store: ProfileFileStore, server_id: uuid.UUID, fallback_name: str
+) -> str:
+    """Read ``servers/<server_id>/prompt.md`` or return a starter prompt."""
+    prompt_path = store.root / SERVERS_DIR / str(server_id) / PROMPT_FILENAME
+    try:
+        if prompt_path.is_file() and not prompt_path.is_symlink():
+            text = prompt_path.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+    except OSError:
+        pass
+    return f"# Server instructions for {fallback_name}\n"
+
+
+def _write_prompt_text(
+    store: ProfileFileStore, server_id: uuid.UUID, prompt_text: str
+) -> None:
+    """Atomically write ``servers/<server_id>/prompt.md`` (0600)."""
+    server_dir = store.root / SERVERS_DIR / str(server_id)
+    if not server_dir.is_dir():
+        return
+    normalized = prompt_text if prompt_text.endswith("\n") else prompt_text + "\n"
+    prompt_path = server_dir / PROMPT_FILENAME
+    tmp_path = server_dir / f".{PROMPT_FILENAME}.tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(normalized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, prompt_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _mutation_result(
@@ -247,7 +325,11 @@ def _mutation_result(
 
 
 def _profile_view(
-    profile: ServerProfile, stored: StoredProfile, state: ProjectionState | None
+    profile: ServerProfile,
+    stored: StoredProfile,
+    state: ProjectionState | None,
+    *,
+    prompt_text: str = "",
 ) -> ProfileResponse:
     """One stored profile rendered as the wire view (single read == list row)."""
     return ProfileResponse(
@@ -255,6 +337,7 @@ def _profile_view(
         server_id=profile.server_id,
         name=profile.name,
         prompt_revision=profile.prompt_revision,
+        prompt_text=prompt_text,
         environment=profile.environment,
         ssh=SshIdentityBody(
             host=profile.ssh.host,
@@ -390,14 +473,28 @@ async def create_profile(request: Request, payload: ProfileCreate) -> Response:
     _require_allowed_origin(request)  # layer 2
     _require_csrf(request)  # layer 3
     store, projection = _canonical_service(request)
+    prompt_err = _validate_prompt_text(request, payload.prompt_text)
+    if prompt_err is not None:
+        return prompt_err
     server_id = uuid.uuid4()
+    resolved_revision = (
+        payload.prompt_revision if payload.prompt_revision is not None else 1
+    )
+    resolved_prompt = (
+        payload.prompt_text
+        if payload.prompt_text is not None
+        else f"# Server instructions for {payload.name.strip()}\n"
+    )
     try:
         result = await projection.apply_upsert(
             store,
             server_id,
-            _canonical_document(server_id, payload),
+            _canonical_document(
+                server_id, payload, prompt_revision=resolved_revision
+            ),
             expected_revision=0,
         )
+        _write_prompt_text(store, server_id, resolved_prompt)
     except (ProfileValidationError, ProfileFileError, ProjectionError) as exc:
         return _profile_error(request, exc)
     return _mutation_result(server_id, result)
@@ -434,7 +531,12 @@ async def read_profile(request: Request, server_id: uuid.UUID) -> Response:
         return _profile_error(request, exc)
     profile = parse_server_profile_text(stored.text)
     state = await projection.read_projection(server_id)
-    return _profile_view(profile, stored, state)
+    return _profile_view(
+        profile,
+        stored,
+        state,
+        prompt_text=_read_prompt_text(store, server_id, profile.name),
+    )
 
 
 @router.get(
@@ -496,7 +598,14 @@ async def list_profiles(request: Request) -> Response:
             except ProfileValidationError as exc:
                 return _profile_error(request, exc)
             state = await projection.read_projection(server_id)
-            servers.append(_profile_view(profile, stored, state))
+            servers.append(
+                _profile_view(
+                    profile,
+                    stored,
+                    state,
+                    prompt_text=_read_prompt_text(store, server_id, profile.name),
+                )
+            )
     servers.sort(key=lambda view: (view.name, str(view.server_id)))
     return ProfileListResponse(servers=servers)
 
@@ -540,6 +649,9 @@ async def edit_profile(
     _require_allowed_origin(request)  # layer 2
     _require_csrf(request)  # layer 3
     store, projection = _canonical_service(request)
+    prompt_err = _validate_prompt_text(request, payload.prompt_text)
+    if prompt_err is not None:
+        return prompt_err
     try:
         current = store.read(server_id)
     except ProfileFileError as exc:
@@ -552,12 +664,25 @@ async def edit_profile(
             "the profile changed since the last observed revision",
         )
     try:
+        current_profile = parse_server_profile_text(current.text)
+    except ProfileValidationError as exc:
+        return _profile_error(request, exc)
+    resolved_revision = (
+        payload.prompt_revision
+        if payload.prompt_revision is not None
+        else (current_profile.prompt_revision + 1)
+    )
+    try:
         result = await projection.apply_upsert(
             store,
             server_id,
-            _canonical_document(server_id, payload),
+            _canonical_document(
+                server_id, payload, prompt_revision=resolved_revision
+            ),
             expected_revision=payload.expected_revision,
         )
+        if payload.prompt_text is not None:
+            _write_prompt_text(store, server_id, payload.prompt_text)
     except (ProfileValidationError, ProfileFileError, ProjectionError) as exc:
         return _profile_error(request, exc)
     return _mutation_result(server_id, result)

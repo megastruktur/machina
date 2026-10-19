@@ -398,7 +398,8 @@
 	let enrollBusy = $state(false);
 	let enrollError = $state<string | null>(null);
 	let enrollName = $state('');
-	let enrollPromptRevision = $state('1');
+	let enrollEnvironment = $state<'linux_ssh'>('linux_ssh');
+	let enrollPromptText = $state('');
 	let enrollHost = $state('');
 	let enrollPort = $state('22');
 	let enrollUser = $state('');
@@ -466,10 +467,9 @@
 	async function enrollServer(event: SubmitEvent): Promise<void> {
 		event.preventDefault();
 		enrollError = null;
-		const promptRevision = Number(enrollPromptRevision);
 		const port = Number(enrollPort);
-		if (!Number.isInteger(promptRevision) || promptRevision < 1) {
-			enrollError = 'Prompt revision must be an integer ≥ 1.';
+		if (!enrollPromptText.trim()) {
+			enrollError = 'Server system prompt is required.';
 			return;
 		}
 		if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -480,8 +480,9 @@
 		try {
 			await api.createProfile({
 				name: enrollName,
-				prompt_revision: promptRevision,
-				environment: 'linux_ssh',
+				prompt_revision: 1,
+				prompt_text: enrollPromptText,
+				environment: enrollEnvironment,
 				ssh: {
 					host: enrollHost,
 					port,
@@ -496,6 +497,7 @@
 					.filter((id) => id !== '')
 			});
 			enrollName = '';
+			enrollPromptText = '';
 			enrollHost = '';
 			enrollUser = '';
 			enrollHostKey = '';
@@ -1051,12 +1053,13 @@
 			     the frozen ProfileCreate document (C02 rule 1) exactly. -->
 			<form class="mai-desktop-shell__enroll" onsubmit={enrollServer} data-testid="enroll-server">
 				<Field label="Display name" bind:value={enrollName} required />
-				<Field
-					label="Prompt revision"
-					inputmode="numeric"
-					bind:value={enrollPromptRevision}
-					required
-				/>
+				<Select
+					id="mai-enroll-environment"
+					label="Environment"
+					bind:value={enrollEnvironment}
+				>
+					<option value="linux_ssh">linux_ssh (Linux over OpenSSH)</option>
+				</Select>
 				<Field label="SSH host" bind:value={enrollHost} required />
 				<Field label="SSH port" inputmode="numeric" bind:value={enrollPort} required />
 				<Field label="SSH user" bind:value={enrollUser} required />
@@ -1072,6 +1075,16 @@
 					<option value="sudo">sudo</option>
 					<option value="root">root</option>
 				</Select>
+				<label class="mai-desktop-shell__enroll-prompt">
+					<span>Server system prompt (required)</span>
+					<textarea
+						rows="4"
+						bind:value={enrollPromptText}
+						placeholder="# Server instructions&#10;Describe this server's role, OS, and operational rules..."
+						required
+						data-testid="enroll-prompt-text"
+					></textarea>
+				</label>
 				{#if enrollError}
 					<p class="mai-desktop-shell__enroll-error" role="alert" data-testid="enroll-error">
 						{enrollError}
@@ -1235,6 +1248,37 @@
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-lg);
 		z-index: 15;
+	}
+
+	.mai-desktop-shell__enroll-prompt {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+		grid-column: 1 / -1;
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-desktop-shell__enroll-prompt textarea {
+		width: 100%;
+		min-height: 5.5rem;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		color: var(--mai-color-text);
+		background: var(--mai-color-surface-sunken);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-md);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		line-height: 1.5;
+		resize: vertical;
+		box-sizing: border-box;
+	}
+
+	.mai-desktop-shell__enroll-prompt textarea:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: var(--mai-focus-ring-offset);
+		border-color: var(--mai-color-accent);
 	}
 
 	.mai-desktop-shell__enroll-error {

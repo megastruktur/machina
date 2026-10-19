@@ -42,12 +42,16 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import Select from '../ui/Select.svelte';
 	import { CircleCheck, Cog, FingerprintPattern, History, ScrollText, TriangleAlert } from 'lucide-svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type { ProfileResponse } from '../api/client.js';
 	import type { ServerProfileApi } from '../workspace/entries/02-web-server.js';
 
 	let { panel }: { panel: PanelContext } = $props();
+
+	const uid = $props.id();
+	const MAX_PROMPT_BYTES = 16_384;
 
 	// --- explicit inputs (fail closed when incomplete) -----------------------
 
@@ -76,8 +80,18 @@
 		| { status: 'ready'; profile: ProfileResponse };
 
 	let view = $state<LoadState>({ status: 'loading' });
-	/** Editable prompt edition input (string until parsed — numeric input). */
-	let revisionInput = $state('');
+	/** Editable profile fields + server system prompt (`prompt.md`). */
+	let nameInput = $state('');
+	let environmentInput = $state<'linux_ssh'>('linux_ssh');
+	let sshHostInput = $state('');
+	let sshPortInput = $state('22');
+	let sshUserInput = $state('');
+	let privilegeInput = $state<'none' | 'sudo' | 'root'>('sudo');
+	let capabilitiesInput = $state('');
+	let hostKeyInput = $state('');
+	let credentialKeyInput = $state('');
+	let promptTextInput = $state('');
+
 	let saving = $state(false);
 	/** Stale-edit conflict banner: displayed, never auto-overwritten. */
 	let conflictMessage = $state<string | null>(null);
@@ -90,25 +104,91 @@
 	 * continuations check it before touching state (ADR §7.2 release). */
 	let disposed = true;
 
-	const parsedRevision = $derived(parseEdition(revisionInput));
-	const revisionError = $derived(
-		view.status === 'ready' && parsedRevision === null
-			? 'Prompt edition must be an integer ≥ 1.'
+	function defaultPromptFor(profile: ProfileResponse): string {
+		const raw = typeof profile.prompt_text === 'string' ? profile.prompt_text : '';
+		return raw.trim() !== '' ? raw : `# Server instructions for ${profile.name}\n`;
+	}
+
+	function parseCapabilities(raw: string): string[] {
+		return raw
+			.split(',')
+			.map((item) => item.trim())
+			.filter((item) => item !== '');
+	}
+
+	function parsePort(raw: string): number | null {
+		if (!/^\d+$/.test(raw.trim())) return null;
+		const value = Number(raw.trim());
+		return value >= 1 && value <= 65535 ? value : null;
+	}
+
+	const parsedPort = $derived(parsePort(sshPortInput));
+	const parsedCapabilities = $derived(parseCapabilities(capabilitiesInput));
+	const promptByteLength = $derived(new TextEncoder().encode(promptTextInput).length);
+
+	const nameError = $derived(
+		view.status === 'ready' && nameInput.trim() === '' ? 'Display name is required.' : ''
+	);
+	const sshHostError = $derived(
+		view.status === 'ready' && sshHostInput.trim() === '' ? 'SSH host is required.' : ''
+	);
+	const sshPortError = $derived(
+		view.status === 'ready' && parsedPort === null
+			? 'SSH port must be an integer between 1 and 65535.'
 			: ''
 	);
-	const dirty = $derived(
-		view.status === 'ready' &&
-			parsedRevision !== null &&
-			parsedRevision !== view.profile.prompt_revision
+	const sshUserError = $derived(
+		view.status === 'ready' && sshUserInput.trim() === '' ? 'SSH user is required.' : ''
 	);
-	const saveDisabled = $derived(
-		saving || !dirty || parsedRevision === null || conflictMessage !== null
+	const promptError = $derived.by(() => {
+		if (view.status !== 'ready') return '';
+		if (promptTextInput.trim() === '') return 'Server system prompt is required.';
+		if (promptByteLength > MAX_PROMPT_BYTES) {
+			return `Server system prompt must be ≤ ${MAX_PROMPT_BYTES} UTF-8 bytes.`;
+		}
+		return '';
+	});
+
+	const hasValidationErrors = $derived(
+		nameError !== '' ||
+			sshHostError !== '' ||
+			sshPortError !== '' ||
+			sshUserError !== '' ||
+			promptError !== ''
 	);
 
-	function parseEdition(raw: string): number | null {
-		if (!/^\d+$/.test(raw)) return null;
-		const value = Number(raw);
-		return value >= 1 ? value : null;
+	const dirty = $derived.by(() => {
+		if (view.status !== 'ready') return false;
+		const p = view.profile;
+		const loadedPrompt = defaultPromptFor(p);
+		return (
+			promptTextInput !== loadedPrompt ||
+			nameInput.trim() !== p.name ||
+			environmentInput !== p.environment ||
+			sshHostInput.trim() !== p.ssh.host ||
+			parsedPort !== p.ssh.port ||
+			sshUserInput.trim() !== p.ssh.user ||
+			privilegeInput !== p.privilege ||
+			parsedCapabilities.join(',') !== p.capabilities.join(',') ||
+			hostKeyInput.trim() !== '' ||
+			credentialKeyInput.trim() !== ''
+		);
+	});
+	const saveDisabled = $derived(
+		saving || !dirty || hasValidationErrors || conflictMessage !== null
+	);
+
+	function syncInputsFromProfile(profile: ProfileResponse): void {
+		nameInput = profile.name;
+		environmentInput = profile.environment;
+		sshHostInput = profile.ssh.host;
+		sshPortInput = String(profile.ssh.port);
+		sshUserInput = profile.ssh.user;
+		privilegeInput = profile.privilege;
+		capabilitiesInput = profile.capabilities.join(', ');
+		hostKeyInput = '';
+		credentialKeyInput = '';
+		promptTextInput = defaultPromptFor(profile);
 	}
 
 	function codeOf(error: unknown): string | null {
@@ -137,7 +217,7 @@
 			const profile = await api.readProfile(serverId);
 			if (disposed) return;
 			view = { status: 'ready', profile };
-			revisionInput = String(profile.prompt_revision);
+			syncInputsFromProfile(profile);
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
@@ -161,7 +241,7 @@
 			const profile = await api.readProfile(serverId);
 			if (disposed) return;
 			view = { status: 'ready', profile };
-			revisionInput = String(profile.prompt_revision);
+			syncInputsFromProfile(profile);
 		} catch {
 			// Current view already reflects the post-commit triple (C02 rule 4).
 		}
@@ -169,35 +249,65 @@
 
 	async function saveEdition(): Promise<void> {
 		if (view.status !== 'ready' || api === null || serverId === null) return;
-		if (saving || conflictMessage !== null || parsedRevision === null) return;
+		if (saving || conflictMessage !== null || hasValidationErrors || parsedPort === null) return;
 		const profile = view.profile;
+		const nextEdition = profile.prompt_revision + 1;
+		const nextName = nameInput.trim();
+		const nextHost = sshHostInput.trim();
+		const nextUser = sshUserInput.trim();
+		const nextHostKey = hostKeyInput.trim() || profile.ssh.host_key;
+		const nextCredentialRef = credentialKeyInput.trim() || profile.ssh.credential_ref;
+		const nextCapabilities = [...parsedCapabilities];
+		const nextPrompt = promptTextInput;
+
 		saving = true;
 		saveProblem = null;
 		savedNotice = null;
 		try {
 			// The observed revision rides along (C01 rule 6); the server rejects
 			// a stale caller with a structured `conflict` BEFORE any write.
+			// `prompt_revision` is auto-incremented (`edition + 1`).
 			const result = await api.editProfile(serverId, {
-				name: profile.name,
-				prompt_revision: parsedRevision,
-				environment: profile.environment,
-				ssh: profile.ssh,
-				privilege: profile.privilege,
-				capabilities: [...profile.capabilities],
+				name: nextName,
+				prompt_revision: nextEdition,
+				prompt_text: nextPrompt,
+				environment: environmentInput,
+				ssh: {
+					host: nextHost,
+					port: parsedPort,
+					user: nextUser,
+					host_key: nextHostKey,
+					credential_ref: nextCredentialRef
+				},
+				privilege: privilegeInput,
+				capabilities: nextCapabilities,
 				expected_revision: profile.revision
 			});
 			if (disposed) return;
+			const updatedProfile: ProfileResponse = {
+				...profile,
+				name: nextName,
+				prompt_revision: nextEdition,
+				prompt_text: nextPrompt,
+				environment: environmentInput,
+				ssh: {
+					host: nextHost,
+					port: parsedPort,
+					user: nextUser,
+					host_key: nextHostKey,
+					credential_ref: nextCredentialRef
+				},
+				privilege: privilegeInput,
+				capabilities: nextCapabilities,
+				revision: result.revision,
+				sha256: result.sha256
+			};
 			view = {
 				status: 'ready',
-				profile: {
-					...profile,
-					prompt_revision: parsedRevision,
-					revision: result.revision,
-					sha256: result.sha256
-				}
+				profile: updatedProfile
 			};
-			revisionInput = String(parsedRevision);
-			savedNotice = `Saved — prompt edition ${parsedRevision}, canonical revision ${result.revision}.`;
+			syncInputsFromProfile(updatedProfile);
+			savedNotice = `Saved — prompt edition ${nextEdition}, canonical revision ${result.revision}.`;
 			void refreshProfile();
 		} catch (error) {
 			if (disposed) return;
@@ -225,7 +335,7 @@
 	/** Revert the editor to the loaded record (local edits only). */
 	function cancelEdit(): void {
 		if (view.status !== 'ready') return;
-		revisionInput = String(view.profile.prompt_revision);
+		syncInputsFromProfile(view.profile);
 		saveProblem = null;
 	}
 
@@ -342,19 +452,107 @@
 			<section class="mai-server-profile__editor">
 				<header class="mai-server-profile__editor-header">
 					<span class="mai-server-profile__header-icon"><ScrollText size={14} aria-hidden="true" /></span>
-					<h2 class="mai-server-profile__editor-title">Prompt Edition Catechism</h2>
-					<span class="mai-server-profile__counter">edition {view.profile.prompt_revision}</span>
+					<h2 class="mai-server-profile__editor-title">Profile &amp; Prompt Edition Catechism</h2>
+					<span class="mai-server-profile__counter" data-testid="prompt-edition-badge">edition {view.profile.prompt_revision}</span>
 				</header>
 				<div class="mai-server-profile__editor-body">
+					<div class="mai-server-profile__grid">
+						<Field
+							label="Display name"
+							bind:value={nameInput}
+							error={nameError}
+							autocomplete="off"
+							data-testid="edit-name"
+						/>
+						<Select
+							id="mai-sp-environment-{uid}"
+							label="Environment"
+							bind:value={environmentInput}
+							data-testid="edit-environment"
+						>
+							<option value="linux_ssh">linux_ssh (Linux over OpenSSH)</option>
+						</Select>
+						<Field
+							label="SSH host"
+							bind:value={sshHostInput}
+							error={sshHostError}
+							autocomplete="off"
+							data-testid="edit-ssh-host"
+						/>
+						<Field
+							label="SSH port"
+							bind:value={sshPortInput}
+							error={sshPortError}
+							inputmode="numeric"
+							autocomplete="off"
+							data-testid="edit-ssh-port"
+						/>
+						<Field
+							label="SSH user"
+							bind:value={sshUserInput}
+							error={sshUserError}
+							autocomplete="off"
+							data-testid="edit-ssh-user"
+						/>
+						<Select
+							id="mai-sp-privilege-{uid}"
+							label="Privilege mode"
+							bind:value={privilegeInput}
+							data-testid="edit-privilege"
+						>
+							<option value="none">none</option>
+							<option value="sudo">sudo</option>
+							<option value="root">root</option>
+						</Select>
+					</div>
+
 					<Field
-						label="Prompt edition"
-						hint="Versioned prompt edition (prompt_revision) saved with the profile; integer ≥ 1."
-						bind:value={revisionInput}
-						error={revisionError}
-						inputmode="numeric"
+						label="Capabilities (comma-separated)"
+						hint="Lowercase capability slugs (e.g. shell, package, site.deploy)."
+						bind:value={capabilitiesInput}
 						autocomplete="off"
-						data-testid="prompt-revision-input"
+						data-testid="edit-capabilities"
 					/>
+
+					<div class="mai-server-profile__grid">
+						<Field
+							label="Rotate SSH host key (SHA256:...)"
+							hint="Leave blank to keep stored fingerprint."
+							bind:value={hostKeyInput}
+							autocomplete="off"
+							data-testid="edit-host-key"
+						/>
+						<Field
+							label="Rotate credential env key"
+							hint="Leave blank to keep stored variable reference."
+							bind:value={credentialKeyInput}
+							autocomplete="off"
+							data-testid="edit-credential-key"
+						/>
+					</div>
+
+					<div class="mai-server-profile__prompt-field">
+						<div class="mai-server-profile__prompt-label-row">
+							<label class="mai-server-profile__prompt-label" for="mai-sp-prompt-{uid}">
+								Server system prompt
+							</label>
+							<span class="mai-server-profile__prompt-meta">
+								{promptByteLength} / {MAX_PROMPT_BYTES} bytes · saving auto-bumps to edition {view.profile.prompt_revision + 1}
+							</span>
+						</div>
+						<textarea
+							id="mai-sp-prompt-{uid}"
+							class="mai-server-profile__prompt-textarea"
+							rows="6"
+							bind:value={promptTextInput}
+							aria-invalid={promptError ? 'true' : undefined}
+							required
+							data-testid="prompt-text-input"
+						></textarea>
+						{#if promptError}
+							<p class="mai-server-profile__prompt-error" role="alert">{promptError}</p>
+						{/if}
+					</div>
 
 					{#if conflictMessage !== null}
 						<div class="mai-server-profile__notice mai-server-profile__notice--warning" role="alert" data-testid="conflict-banner">
@@ -382,7 +580,7 @@
 
 					<div class="mai-server-profile__actions">
 						<Button onclick={saveEdition} loading={saving} disabled={saveDisabled} data-testid="save-button">
-							Save edition
+							Save profile
 						</Button>
 						<Button variant="secondary" onclick={cancelEdit} disabled={saving || !dirty} data-testid="cancel-button">
 							Cancel
@@ -589,6 +787,65 @@
 		flex-direction: column;
 		gap: var(--mai-space-3);
 		padding: var(--mai-space-3);
+	}
+
+	.mai-server-profile__grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: var(--mai-space-3);
+	}
+
+	.mai-server-profile__prompt-field {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+	}
+
+	.mai-server-profile__prompt-label-row {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+		flex-wrap: wrap;
+	}
+
+	.mai-server-profile__prompt-label {
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-server-profile__prompt-meta {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-subtle);
+	}
+
+	.mai-server-profile__prompt-textarea {
+		width: 100%;
+		min-height: 7.5rem;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		color: var(--mai-color-text);
+		background: var(--mai-color-surface-sunken);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-md);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		line-height: 1.5;
+		resize: vertical;
+		box-sizing: border-box;
+	}
+
+	.mai-server-profile__prompt-textarea:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: var(--mai-focus-ring-offset);
+		border-color: var(--mai-color-accent);
+	}
+
+	.mai-server-profile__prompt-error {
+		margin: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-status-danger-text);
 	}
 
 	.mai-server-profile__notice {

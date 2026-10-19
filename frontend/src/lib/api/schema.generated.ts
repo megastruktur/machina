@@ -3793,8 +3793,10 @@ export interface components {
             /** Name */
             name: string;
             /** Prompt Revision */
-            prompt_revision: number;
-            environment: components["schemas"]["ExecutionEnvironment"];
+            prompt_revision?: number | null;
+            /** Prompt Text */
+            prompt_text?: string | null;
+            environment?: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
@@ -3808,8 +3810,10 @@ export interface components {
             /** Name */
             name: string;
             /** Prompt Revision */
-            prompt_revision: number;
-            environment: components["schemas"]["ExecutionEnvironment"];
+            prompt_revision?: number | null;
+            /** Prompt Text */
+            prompt_text?: string | null;
+            environment?: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
@@ -3858,6 +3862,8 @@ export interface components {
             name: string;
             /** Prompt Revision */
             prompt_revision: number;
+            /** Prompt Text */
+            prompt_text?: string;
             environment: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];

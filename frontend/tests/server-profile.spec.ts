@@ -146,6 +146,7 @@ const APP_SOURCE = `
 			server_id: serverId,
 			name: serverId === SERVER_A ? 'alpha' : 'beta',
 			prompt_revision: edition,
+			prompt_text: '# Server instructions for ' + (serverId === SERVER_A ? 'alpha' : 'beta'),
 			environment: 'linux_ssh',
 			ssh: { host: '203.0.113.10', port: 22, user: 'deploy', host_key: '${HOST_KEY}', credential_ref: '${CREDENTIAL_REF}' },
 			privilege: 'sudo',
@@ -191,6 +192,14 @@ const APP_SOURCE = `
 				throw new ApiError(409, 'conflict', '${CONFLICT_MESSAGE}');
 			}
 			stored.prompt_revision = payload.prompt_revision;
+			stored.name = payload.name;
+			stored.environment = payload.environment;
+			stored.privilege = payload.privilege;
+			stored.capabilities = [...payload.capabilities];
+			stored.ssh = { ...payload.ssh };
+			if (typeof payload.prompt_text === 'string') {
+				stored.prompt_text = payload.prompt_text;
+			}
 			stored.revision += 1;
 			stored.sha256 = 'cd'.repeat(32);
 			stored.projection = { revision: stored.revision, stale: false };
@@ -463,8 +472,8 @@ test.beforeEach(async ({ page }) => {
 	});
 });
 
-test('renders the pinned target identity and an editable prompt edition, no credential material', async ({
-	page
+test('renders the pinned target identity, editable profile fields & prompt textarea, no credential material', async ({
+page
 }) => {
 	const errors: Error[] = [];
 	page.on('pageerror', (error) => errors.push(error));
@@ -476,12 +485,14 @@ test('renders the pinned target identity and an editable prompt edition, no cred
 	await expect(a.getByTestId('ssh-target')).toHaveText('deploy@203.0.113.10:22');
 	await expect(a.getByTestId('privilege')).toHaveText('sudo');
 	await expect(a.getByTestId('profile-revision')).toHaveText('1');
+	await expect(a.getByTestId('prompt-edition-badge')).toHaveText('edition 1');
 
-	// Acceptance 1: the prompt edition is the editable field.
-	const input = a.getByLabel('Prompt edition');
-	await expect(input).toHaveValue('1');
-	await input.fill('5');
-	await expect(input).toHaveValue('5');
+	// Acceptance 1: profile fields + server system prompt are editable.
+	await expect(a.getByTestId('edit-name')).toHaveValue('alpha');
+	await expect(a.getByTestId('edit-ssh-host')).toHaveValue('203.0.113.10');
+	await expect(a.getByTestId('edit-ssh-port')).toHaveValue('22');
+	await expect(a.getByTestId('edit-ssh-user')).toHaveValue('deploy');
+	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# Server instructions for alpha');
 
 	// Acceptance 1: no credential material anywhere in the rendered document.
 	const content = await page.content();
@@ -496,17 +507,18 @@ test('renders the pinned target identity and an editable prompt edition, no cred
 	expect(errors).toEqual([]);
 });
 
-test('save posts expected_revision; the saved edition survives a remount (refresh)', async ({
-	page
+test('save posts expected_revision and auto-bumps the prompt edition; the saved edition survives a remount (refresh)', async ({
+page
 }) => {
 	await page.goto(FIXTURE_URL);
 	const a = page.getByTestId('host-a');
-	const input = a.getByLabel('Prompt edition');
-	await expect(input).toHaveValue('1');
+	await expect(a.getByTestId('prompt-edition-badge')).toHaveText('edition 1');
 
-	await input.fill('5');
+	// Edit display name + system prompt.
+	await a.getByTestId('edit-name').fill('alpha-renamed');
+	await a.getByTestId('prompt-text-input').fill('# Alpha runbook\nKeep containers under 1 GiB.');
 	await a.getByTestId('save-button').click();
-	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 5');
+	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 2');
 
 	// The write carried the observed revision for the stale-caller guard.
 	const [call] = await page.evaluate(() =>
@@ -515,35 +527,40 @@ test('save posts expected_revision; the saved edition survives a remount (refres
 	expect(call.serverId).toBe(SERVER_A);
 	const payload = call.payload as {
 		prompt_revision: number;
+		prompt_text: string;
 		expected_revision: number;
 		name: string;
 	};
-	expect(payload.prompt_revision).toBe(5);
+	expect(payload.prompt_revision).toBe(2); // auto-bumped 1 → 2
+	expect(payload.prompt_text).toBe('# Alpha runbook\nKeep containers under 1 GiB.');
 	expect(payload.expected_revision).toBe(1);
-	expect(payload.name).toBe('alpha');
+	expect(payload.name).toBe('alpha-renamed');
 
 	// Post-commit triple shown; the silent re-read confirms the record.
 	await expect(a.getByTestId('profile-revision')).toHaveText('2');
-	await expect(input).toHaveValue('5');
+	await expect(a.getByTestId('prompt-edition-badge')).toHaveText('edition 2');
+	await expect(a.getByTestId('edit-name')).toHaveValue('alpha-renamed');
+	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# Alpha runbook\nKeep containers under 1 GiB.');
 
 	// Component-level refresh: unmount (close) + remount re-reads the store.
 	await page.evaluate(() => window.__maiServerProfileApi!.toggleHost('A'));
 	await expect(a.getByTestId('server-profile-root')).toHaveCount(0);
 	await page.evaluate(() => window.__maiServerProfileApi!.toggleHost('A'));
 	const remounted = page.getByTestId('host-a');
-	await expect(remounted.getByLabel('Prompt edition')).toHaveValue('5');
+	await expect(remounted.getByTestId('prompt-edition-badge')).toHaveText('edition 2');
+	await expect(remounted.getByTestId('edit-name')).toHaveValue('alpha-renamed');
 	await expect(remounted.getByTestId('profile-revision')).toHaveText('2');
 
 	const stored = await page.evaluate(
 		(id) => window.__maiServerProfileApi!.db[id],
 		SERVER_A
 	);
-	expect(stored.prompt_revision).toBe(5);
+	expect(stored.prompt_revision).toBe(2);
 	expect(stored.revision).toBe(2);
 });
 
 test('stale second editor displays the conflict and never overwrites; reload recovers', async ({
-	page
+page
 }) => {
 	await page.goto(FIXTURE_URL);
 	const a = page.getByTestId('host-a');
@@ -551,13 +568,13 @@ test('stale second editor displays the conflict and never overwrites; reload rec
 	await expect(a.getByTestId('profile-revision')).toHaveText('1');
 	await expect(a2.getByTestId('profile-revision')).toHaveText('1');
 
-	// First editor saves edition 3 (observed revision 1 → committed 2).
-	await a2.getByLabel('Prompt edition').fill('3');
+	// First editor saves prompt change (observed revision 1 → committed 2, edition auto-bumped 1 → 2).
+	await a2.getByTestId('prompt-text-input').fill('# A2 runbook');
 	await a2.getByTestId('save-button').click();
-	await expect(a2.getByTestId('saved-notice')).toContainText('prompt edition 3');
+	await expect(a2.getByTestId('saved-notice')).toContainText('prompt edition 2');
 
-	// Second editor (still observing revision 1) saves edition 9 ⇒ 409 conflict.
-	await a.getByLabel('Prompt edition').fill('9');
+	// Second editor (still observing revision 1) saves its own prompt ⇒ 409 conflict.
+	await a.getByTestId('prompt-text-input').fill('# A runbook');
 	await a.getByTestId('save-button').click();
 	const banner = a.getByTestId('conflict-banner');
 	await expect(banner).toBeVisible();
@@ -566,9 +583,9 @@ test('stale second editor displays the conflict and never overwrites; reload rec
 	// DISPLAYED, not overwritten: the stored profile is untouched, the unsaved
 	// input is kept, Save stays blocked, and no retry fired without user action.
 	const stored = await page.evaluate((id) => window.__maiServerProfileApi!.db[id], SERVER_A);
-	expect(stored.prompt_revision).toBe(3);
+	expect(stored.prompt_revision).toBe(2);
 	expect(stored.revision).toBe(2);
-	await expect(a.getByLabel('Prompt edition')).toHaveValue('9');
+	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# A runbook');
 	await expect(a.getByTestId('save-button')).toBeDisabled();
 	await expect(a.getByTestId('profile-error')).toHaveCount(0);
 	const editCallCount = await page.evaluate(
@@ -578,13 +595,13 @@ test('stale second editor displays the conflict and never overwrites; reload rec
 
 	// The explicit reload is the only path back to editing.
 	await a.getByTestId('reload-button').click();
-	await expect(a.getByLabel('Prompt edition')).toHaveValue('3');
+	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# A2 runbook');
 	await expect(a.getByTestId('profile-revision')).toHaveText('2');
-	await a.getByLabel('Prompt edition').fill('4');
+	await a.getByTestId('prompt-text-input').fill('# A runbook final');
 	await a.getByTestId('save-button').click();
-	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 4');
+	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 3');
 	const final = await page.evaluate((id) => window.__maiServerProfileApi!.db[id], SERVER_A);
-	expect(final.prompt_revision).toBe(4);
+	expect(final.prompt_revision).toBe(3);
 	expect(final.revision).toBe(3);
 });
 
@@ -603,7 +620,7 @@ test('mount reads only; unmount (close) submits nothing; remount shows the autho
 	expect(ops.filter((op) => op === 'editProfile')).toHaveLength(0);
 
 	// Local dirty edits + close (content unmount) submit nothing.
-	await a.getByLabel('Prompt edition').fill('7');
+	await a.getByTestId('prompt-text-input').fill('# Unsaved local draft');
 	await page.evaluate(() => window.__maiServerProfileApi!.setPresentation('A', 'minimized'));
 	await expect(a.getByTestId('server-profile-root')).toHaveCount(0);
 	const opsAfterClose = await page.evaluate(() =>
@@ -616,7 +633,7 @@ test('mount reads only; unmount (close) submits nothing; remount shows the autho
 	// Reopening re-reads the authoritative record; local edits are gone.
 	await page.evaluate(() => window.__maiServerProfileApi!.setPresentation('A', 'normal'));
 	await expect(a.getByTestId('profile-revision')).toHaveText('1');
-	await expect(a.getByLabel('Prompt edition')).toHaveValue('1');
+	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# Server instructions for alpha');
 });
 
 test('two pinned servers never cross; sibling interaction drives no traffic', async ({ page }) => {
@@ -629,7 +646,7 @@ test('two pinned servers never cross; sibling interaction drives no traffic', as
 	await expect(page.getByTestId('host-sibling').getByTestId('sibling-panel')).toBeVisible();
 
 	// Saving in A targets ONLY A; B's displayed record is untouched.
-	await a.getByLabel('Prompt edition').fill('2');
+	await a.getByTestId('prompt-text-input').fill('# Alpha only');
 	await a.getByTestId('save-button').click();
 	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 2');
 	await expect(b.getByTestId('profile-revision')).toHaveText('7');
@@ -707,7 +724,7 @@ test('failure states: not-found, unauthenticated, save failure; retry recovers',
 	await expect(a.getByTestId('profile-revision')).toHaveText('1');
 
 	// Save-time non-conflict failure: banner keeps the editor open; retry saves.
-	await a.getByLabel('Prompt edition').fill('6');
+	await a.getByTestId('prompt-text-input').fill('# Retry prompt');
 	await page.evaluate(() =>
 		window.__maiServerProfileApi!.failNextEdit({
 			status: 503,
@@ -721,7 +738,7 @@ test('failure states: not-found, unauthenticated, save failure; retry recovers',
 	await expect(banner).toHaveAttribute('data-error-code', 'unavailable');
 	await expect(a.getByTestId('profile-revision')).toHaveText('1'); // nothing written
 	await a.getByTestId('save-button').click(); // fault consumed; retry succeeds
-	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 6');
+	await expect(a.getByTestId('saved-notice')).toContainText('prompt edition 2');
 });
 
 test('loading state holds until the profile arrives (C08 rule 6)', async ({ page }) => {
