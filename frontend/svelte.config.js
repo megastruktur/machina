@@ -6,12 +6,19 @@ const config = {
 	preprocess: vitePreprocess(),
 
 	compilerOptions: {
-		// Project-wide runes force (added by mui-01-foundation) lifted in the
-		// mui-05 fix round: lucide-svelte@1.0.1 ships legacy Svelte-4 components
-		// ($$props), which fail to compile under forced runes mode. Svelte 5
-		// auto-detects runes per component, so MAI-owned runes-mode code keeps
-		// working without the force.
-		// runes: true
+		// MAI-owned window/workspace code and virtual test fixtures are compiled
+		// in Svelte 5 runes mode throughout (windowed-workspace ADR D2).
+		runes: true
+	},
+
+	vitePlugin: {
+		// Third-party legacy Svelte 4 packages in node_modules (e.g. lucide-svelte@1.0.1
+		// using $$props) opt out of forced runes mode via dynamicCompileOptions.
+		dynamicCompileOptions({ filename }) {
+			if (filename.includes('node_modules')) {
+				return { runes: false };
+			}
+		}
 	},
 
 	kit: {
