@@ -172,6 +172,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     }
 
     async def _composite_executor(call: CapabilityCall) -> ExecutorResult:
+        import dataclasses
+
         cid = call.descriptor.identifier
         target = executors.get(cid)
         if target is None:
@@ -179,6 +181,18 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                 ok=False,
                 output=f"capability {cid!r} has no runtime executor",
             )
+        if call.context.server_id != uuid.UUID(int=0):
+            try:
+                prof = _load_profile(call.context.server_id)
+                ref = prof.ssh.credential_ref
+                if ref and ref not in call.credentials:
+                    secret = _resolve_env().resolve(ref)
+                    call = dataclasses.replace(
+                        call,
+                        credentials={**call.credentials, ref: secret},
+                    )
+            except Exception:
+                pass
         return await target(call)
 
     def _read_grants():

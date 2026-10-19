@@ -418,6 +418,13 @@
 			? GLOBAL_CONSULT_SERVER_ID
 			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
 		const tasks = composeChildren.map((task) => task.trim()).filter((task) => task !== '');
+		const explicitCaps = parseNameList(composeCapabilities);
+		const effectiveCaps =
+			explicitCaps.length > 0
+				? explicitCaps
+				: profilesLive && serverId !== GLOBAL_CONSULT_SERVER_ID
+					? ['host.logs', 'host.shell']
+					: [];
 		const body: ChatSubmitBody = {
 			run_id: runId,
 			server_id: serverId,
@@ -425,7 +432,7 @@
 			profile: composeProfile.trim(),
 			role: SUBMIT_ROLE,
 			mode: SUBMIT_MODE,
-			capabilities: parseNameList(composeCapabilities),
+			capabilities: effectiveCaps,
 			children: tasks.map((task) => ({ task })),
 			attachments: parseNameList(composeAttachments).map((opId) => ({
 				server_id: serverId,
@@ -909,8 +916,14 @@
 				const reason = rowOf(data, 'reason');
 				const opId = rowOf(data, 'op_id');
 				if (reason.startsWith('approval')) needsApproval = true;
-				const isOk = reason === 'ok' || reason === 'succeeded' || reason === 'completed';
-				addThinkingStep(`Tool ${capId} finished (${reason})`);
+				const isOk =
+					reason === '—' ||
+					reason === '' ||
+					reason === 'ok' ||
+					reason === 'succeeded' ||
+					reason === 'completed';
+				const displayReason = reason === '—' || reason === '' ? 'succeeded' : reason;
+				addThinkingStep(`Tool ${capId} finished (${displayReason})`);
 				const nextCalls = [...visibleToolCalls];
 				const matchIdx = nextCalls.findIndex(
 					(c) =>
@@ -921,7 +934,7 @@
 					nextCalls[matchIdx] = {
 						...nextCalls[matchIdx],
 						status: isOk ? 'succeeded' : 'failed',
-						reason,
+						reason: displayReason,
 						opId: shortId(opId)
 					};
 					visibleToolCalls = nextCalls;
@@ -934,7 +947,7 @@
 							stepSeq: String(event.seq),
 							payloadHash: '—',
 							status: isOk ? 'succeeded' : 'failed',
-							reason,
+							reason: displayReason,
 							opId: shortId(opId)
 						}
 					];
