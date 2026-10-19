@@ -105,6 +105,12 @@
 		minGeometry?: MinGeometry;
 		/** Extra chrome controls, rendered before the default window controls. */
 		controls?: Snippet;
+		/**
+		 * Automatically size the window height to match its intrinsic content
+		 * height, capped only when the content exceeds the available screen/canvas
+		 * height. Resets to manual height if the user drags a vertical resize handle.
+		 */
+		autoFitHeight?: boolean;
 		/** Panel content (the window body). */
 		children?: Snippet;
 		class?: string;
@@ -122,15 +128,83 @@
 		ongeometry,
 		minGeometry = DEFAULT_MIN_GEOMETRY,
 		controls,
+		autoFitHeight = false,
 		children,
 		class: className = ''
 	}: Props = $props();
 
 	const titleId = $props.id();
 
+	let frameElement = $state<HTMLElement | null>(null);
 	let titleHeading = $state<HTMLHeadingElement | null>(null);
 	/** Measured by the resize adapter at gesture start (NT3 viewport origin). */
 	let titlebarElement = $state<HTMLElement | null>(null);
+	let bodyElement = $state<HTMLElement | null>(null);
+	let contentElement = $state<HTMLElement | null>(null);
+
+	/** Set to true when the operator manually drags a vertical resize handle. */
+	let userResized = $state(false);
+	let fitHeightPx = $state<number | null>(null);
+	let maxHeightPx = $state<number | null>(null);
+	let contentCapped = $state(false);
+
+	const activeAutoFit = $derived(
+		autoFitHeight && !userResized && descriptor.presentation === 'normal'
+	);
+
+	function recomputeAutoHeight(): void {
+		if (!activeAutoFit || !frameElement || !bodyElement || !contentElement) return;
+		const titleH = titlebarElement?.offsetHeight ?? 40;
+		const bodyStyle = getComputedStyle(bodyElement);
+		const padY =
+			(parseFloat(bodyStyle.paddingTop) || 0) + (parseFloat(bodyStyle.paddingBottom) || 0);
+		const borderH = Math.max(2, frameElement.offsetHeight - frameElement.clientHeight);
+		const contentH = contentElement.scrollHeight;
+		// +2px buffer prevents sub-pixel rounding from triggering a 1px scrollbar.
+		const desiredHeight = Math.ceil(titleH + padY + contentH + borderH + 2);
+
+		const parent = frameElement.offsetParent as HTMLElement | null;
+		const parentRect = parent?.getBoundingClientRect();
+		const bottomMargin = 16;
+		const frameTopInViewport = (parentRect?.top ?? 0) + descriptor.geometry.y;
+		const maxByViewport = Math.floor(window.innerHeight - frameTopInViewport - bottomMargin);
+		const maxByCanvas = parentRect
+			? Math.floor(parentRect.height - descriptor.geometry.y - bottomMargin)
+			: maxByViewport;
+		const maxAvailable = Math.max(
+			minGeometry.height,
+			Math.min(maxByViewport, maxByCanvas)
+		);
+
+		contentCapped = desiredHeight > maxAvailable;
+		fitHeightPx = Math.max(minGeometry.height, Math.min(desiredHeight, maxAvailable));
+		maxHeightPx = maxAvailable;
+	}
+
+	$effect(() => {
+		if (!activeAutoFit || !contentElement || !frameElement) return;
+		// Track descriptor.geometry.y / width changes so dragging or width-resizing
+		// immediately updates the available vertical room and wrapped text height.
+		void descriptor.geometry.y;
+		void descriptor.geometry.width;
+		recomputeAutoHeight();
+
+		const ro = new ResizeObserver(() => recomputeAutoHeight());
+		ro.observe(contentElement);
+		if (bodyElement) ro.observe(bodyElement);
+
+		const mo = new MutationObserver(() => recomputeAutoHeight());
+		mo.observe(contentElement, { childList: true, subtree: true, attributes: true });
+
+		const onWinResize = () => recomputeAutoHeight();
+		window.addEventListener('resize', onWinResize);
+
+		return () => {
+			ro.disconnect();
+			mo.disconnect();
+			window.removeEventListener('resize', onWinResize);
+		};
+	});
 
 	/** A `title_override` replaces the registry display title (ADR §8). */
 	const displayTitle = $derived(descriptor.title_override ?? title);
@@ -189,8 +263,11 @@
      (ADR §6: no focus traps, no shortcut suite). -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
+	bind:this={frameElement}
 	class="mai-window-frame {className}"
 	class:mai-window-frame--focused={focused}
+	class:mai-window-frame--auto-height={activeAutoFit && fitHeightPx !== null}
+	class:mai-window-frame--capped={activeAutoFit && contentCapped}
 	role="dialog"
 	aria-modal="false"
 	aria-labelledby={titleId}
@@ -203,6 +280,8 @@
 	style:top="{descriptor.geometry.y}px"
 	style:width="{descriptor.geometry.width}px"
 	style:height="{descriptor.geometry.height}px"
+	style:--mai-window-fit-h={activeAutoFit && fitHeightPx !== null ? `${fitHeightPx}px` : undefined}
+	style:--mai-window-max-h={activeAutoFit && maxHeightPx !== null ? `${maxHeightPx}px` : undefined}
 	style:z-index={descriptor.z}
 	onpointerdown={onPointerDown}
 	onpointerup={onPointerUp}
@@ -267,8 +346,10 @@
 			</button>
 		</div>
 	</header>
-	<div class="mai-window-frame__body">
-		{@render children?.()}
+	<div class="mai-window-frame__body" bind:this={bodyElement}>
+		<div class="mai-window-frame__content" bind:this={contentElement}>
+			{@render children?.()}
+		</div>
 	</div>
 	<!-- Resize handles (PT3): one reusable pointer adapter per direction,
 	     bound to edge/corner hit strips. They exist only in `normal`
@@ -285,6 +366,11 @@
 				class="mai-window-frame__resize-handle"
 				data-resize-direction={direction}
 				aria-hidden="true"
+				onpointerdown={() => {
+					if (direction.includes('n') || direction.includes('s')) {
+						userResized = true;
+					}
+				}}
 				use:windowResize={{
 					windowId: descriptor.window_id,
 					direction,
@@ -442,6 +528,35 @@
 		min-height: 0;
 		overflow: auto;
 		padding: var(--mai-panel-pad, var(--mai-space-4));
+	}
+
+	/* Auto-fit content height mode: the frame sizes to the exact intrinsic
+	   height of its content (`--mai-window-fit-h`) up to the screen/canvas
+	   limit (`--mai-window-max-h`). While content fits within the screen limit,
+	   vertical overflow is hidden so no redundant scrollbar appears; when the
+	   content exceeds the screen limit (`--capped`), `.mai-window-frame__body`
+	   scrolls cleanly. */
+	.mai-window-frame--auto-height:not(.mai-desktop-shell__frame--maximized) {
+		height: var(--mai-window-fit-h) !important;
+		max-height: var(--mai-window-max-h) !important;
+	}
+
+	.mai-window-frame--auto-height:not(.mai-window-frame--capped) .mai-window-frame__body {
+		overflow-y: hidden;
+	}
+
+	.mai-window-frame__content {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+	}
+
+	.mai-window-frame--auto-height .mai-window-frame__content :global(.mai-panel-host),
+	.mai-window-frame--auto-height .mai-window-frame__content :global(.mai-panel-host__body),
+	.mai-window-frame--auto-height .mai-window-frame__content :global(.mai-panel-host__body > *) {
+		height: auto !important;
+		max-height: none !important;
+		overflow: visible !important;
 	}
 
 	/* Resize hit strips (PT3). Inside the frame box: the frame's

@@ -1093,6 +1093,7 @@
 				title={registry.entry(win.panel_kind)?.title ?? win.panel_kind}
 				contextLabel={contextLabelFor(win)}
 				focused={snapshot.focused_id === win.window_id}
+				autoFitHeight={true}
 				onactivate={(windowId) => presentation.focus(windowId)}
 				onminimize={(windowId) => presentation.minimize(windowId)}
 				ontogglemaximize={(windowId) => presentation.toggleMaximize(windowId)}
