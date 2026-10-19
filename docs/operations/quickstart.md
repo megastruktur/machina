@@ -60,6 +60,21 @@ ssh-keygen -t ed25519 -f ~/.ssh/mai_controller -N "" -C mai-controller
 scp ~/.ssh/mai_controller.pub root@TARGET:/root/mai_controller.pub
 ```
 
+### 2.1 Preparing a target server manually (remote user & permissions)
+
+When onboarding any additional Linux server through the UI (**Enroll server** in the left navigation drawer) — or verifying permissions on the primary host — ensure the remote SSH user (`mai`) exists on the target server with the following permissions:
+
+1. **Service account + `docker` group membership** (required so `docker ps -a` and `docker compose` over SSH can read `/var/run/docker.sock` without `permission_denied`):
+   ```bash
+   sudo useradd --create-home --shell /bin/bash --comment "mai-controller" mai
+   sudo usermod -aG docker mai
+   ```
+2. **Controller public key in `/home/mai/.ssh/authorized_keys`** (`0700` on `.ssh`, `0600` on `authorized_keys`, owned by `mai:mai`).
+3. **Sudoers rule in `/etc/sudoers.d/90-mai-mai`** (`0440`, validated with `visudo -cf`):
+   - `narrow` (`privilege: sudo`): `mai ALL=(root) NOPASSWD: /usr/bin/systemctl start docker.service, /usr/bin/systemctl stop docker.service, /usr/bin/systemctl restart docker.service, /usr/bin/systemctl status docker.service`
+   - `broad` (`privilege: root`): `mai ALL=(ALL) NOPASSWD: ALL`
+4. **Scoped SSH firewall rule**: allow TCP port `22` from the controller IP or from the `mai` Docker bridge subnet (e.g. `172.32.0.0/16` when `mai-api` connects to its own host via the bridge gateway `172.32.0.1`).
+
 ## 3. Plan first (read-only, exit 0)
 
 ```bash
@@ -215,6 +230,7 @@ needed, or via `--stack-profiles` at install time). The core set always runs.
 | `stale_revision` from `bootstrap` | The pair already exists; re-provision deliberately via `mai admin write --expect-revision` |
 | Every mutation returns `403` | `MAI_PUBLIC_ORIGINS` unset/invalid ⇒ fail-closed allowlist; fix the origin list (§6) |
 | `400 request_rejected` behind a proxy | Forwarded-Host disagrees with Host from a non-trusted peer; set `MAI_TRUSTED_PROXIES` (§6) |
+| Discovery `docker` lane shows `permission_denied` (`unix:///var/run/docker.sock`) | The remote SSH user (`mai`) on the target host is not in the `docker` group; run `sudo usermod -aG docker mai` on the target host (§2.1) |
 
 ## Supported platforms and limitations (exact)
 

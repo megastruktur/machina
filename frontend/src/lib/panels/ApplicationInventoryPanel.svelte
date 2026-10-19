@@ -592,6 +592,54 @@
 		);
 	});
 
+	/** Listening TCP ports sorted numerically by port, then alphabetically by address. */
+	const sortedListenPorts = $derived.by<{ address: string; port: number }[]>(() => {
+		const raw = discovery?.listen_ports ?? [];
+		const ports: { address: string; port: number }[] = [];
+		for (const item of raw) {
+			if (
+				typeof item === 'object' &&
+				item !== null &&
+				typeof item.address === 'string' &&
+				typeof item.port === 'number'
+			) {
+				ports.push({ address: item.address, port: item.port });
+			}
+		}
+		return ports.sort((a, b) => {
+			if (a.port !== b.port) return a.port - b.port;
+			return a.address.localeCompare(b.address, undefined, { numeric: true, sensitivity: 'base' });
+		});
+	});
+
+	/** Human-readable lane detail: replaces the producer's `<none>` placeholder
+	 *  when a lane succeeded with the actual observed count/summary. */
+	function formatLaneDetail(lane: { lane: string; state: string; detail: string }): string {
+		if (lane.detail && lane.detail !== '<none>') return lane.detail;
+		if (lane.state !== 'observed') return lane.detail || 'No additional detail reported.';
+		const apps = discovery?.applications ?? [];
+		if (lane.lane === 'docker') {
+			const composeCount = apps.filter((a) => a.origin === 'compose').length;
+			const containerCount = apps.filter((a) => a.origin === 'docker_container').length;
+			return `${composeCount} compose project(s), ${containerCount} standalone container(s) observed`;
+		}
+		if (lane.lane === 'systemd') {
+			const unitCount = apps.filter((a) => a.origin === 'systemd_unit').length;
+			return `${unitCount} systemd service unit(s) observed`;
+		}
+		if (lane.lane === 'listen_ports') {
+			const ports = sortedListenPorts;
+			if (ports.length === 0) return '0 listening TCP sockets observed';
+			const sample = ports
+				.slice(0, 8)
+				.map((p) => `${p.address}:${p.port}`)
+				.join(', ');
+			const more = ports.length > 8 ? ` (+${ports.length - 8} more)` : '';
+			return `${ports.length} listening TCP socket(s): ${sample}${more}`;
+		}
+		return 'Observed';
+	}
+
 	/** Observed applications filtered by `discoverySearchQuery` and sorted alphabetically by unit/machine name. */
 	const filteredDiscoveryApplications = $derived.by<ObservedApplicationView[]>(() => {
 		const all = discovery?.applications ?? [];
@@ -1482,11 +1530,23 @@
 											</span>
 										{/if}
 									</div>
-									<p class="mai-apps__note" data-testid="lane-detail">{lane.detail}</p>
+									<p class="mai-apps__note" data-testid="lane-detail">{formatLaneDetail(lane)}</p>
 								</li>
 							{/each}
 						</ul>
 					</div>
+					{#if sortedListenPorts.length > 0}
+						<div class="mai-apps__subsection" data-testid="discovery-ports-section">
+							<h5>Listening TCP ports ({sortedListenPorts.length})</h5>
+							<div class="mai-apps__port-chips">
+								{#each sortedListenPorts as entry (`${entry.address}:${entry.port}`)}
+									<span class="mai-apps__badge mai-apps__mono" data-testid="discovery-port-chip">
+										{entry.address}:{entry.port}
+									</span>
+								{/each}
+							</div>
+						</div>
+					{/if}
 					<div class="mai-apps__subsection">
 						<div class="mai-apps__toolbar">
 							<h5>Observed applications</h5>
@@ -1953,6 +2013,12 @@
 		justify-content: space-between;
 		gap: var(--mai-space-3, 0.75rem);
 		flex-wrap: wrap;
+	}
+
+	.mai-apps__port-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-1, 0.25rem);
 	}
 
 	.mai-apps__subsection {

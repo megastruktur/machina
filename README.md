@@ -150,6 +150,52 @@ curl -fsS -X POST https://mai.lan.example/api/v1/auth/bootstrap \
 
 Once created, `POST /api/v1/auth/bootstrap` is permanently locked (`409 Conflict`) and you can sign in at your configured origin.
 
+### 7. Preparing & Onboarding a Target Server (SSH User & Permissions)
+
+Machina inspects and manages target servers **exclusively over OpenSSH** (`mai-api` / `mai-worker` → `ssh <ssh_user>@<target_host>`). Even when onboarding the local host (`megaserver`) or an external Linux server, the remote SSH service account (default: `mai`) executes `docker ps`, `systemctl`, and `ss -tln` on the target host after SSH login.
+
+Before enrolling a server in the Machina UI (**Enroll server** in the left drawer) or via `scripts/install-host.sh`, prepare the target server as `root`:
+
+1. **Create the dedicated `mai` SSH user and grant `docker` socket group access:**
+   ```bash
+   # Create the passwordless SSH service account
+   sudo useradd --create-home --shell /bin/bash --comment "mai-controller" mai
+
+   # Add 'mai' to the 'docker' group so `docker ps` / `docker compose` work over SSH
+   # without "permission denied while trying to connect to unix:///var/run/docker.sock"
+   sudo usermod -aG docker mai
+   ```
+2. **Authorize the Machina controller's SSH public key (`~mai/.ssh/authorized_keys`):**
+   ```bash
+   sudo install -d -m 700 -o mai -g mai /home/mai/.ssh
+   sudo sh -c 'cat /path/to/mai_controller.pub >> /home/mai/.ssh/authorized_keys'
+   sudo chown mai:mai /home/mai/.ssh/authorized_keys
+   sudo chmod 600 /home/mai/.ssh/authorized_keys
+   ```
+3. **Configure `sudo` permissions (`/etc/sudoers.d/90-mai-mai`) matching your chosen privilege mode:**
+   - **Narrow privilege (`privilege: sudo`):**
+     ```bash
+     echo 'mai ALL=(root) NOPASSWD: /usr/bin/systemctl start docker.service, /usr/bin/systemctl stop docker.service, /usr/bin/systemctl restart docker.service, /usr/bin/systemctl status docker.service' \
+       | sudo EDITOR='tee' visudo -f /etc/sudoers.d/90-mai-mai
+     sudo chmod 440 /etc/sudoers.d/90-mai-mai
+     ```
+   - **Broad privilege (`privilege: root`, trusted admin only):**
+     ```bash
+     echo 'mai ALL=(ALL) NOPASSWD: ALL' | sudo EDITOR='tee' visudo -f /etc/sudoers.d/90-mai-mai
+     sudo chmod 440 /etc/sudoers.d/90-mai-mai
+     ```
+4. **Allow SSH from the Machina controller subnet (`ufw` / `firewalld`):**
+   - If Machina runs inside Docker on the same host, allow the `mai` Docker bridge subnet (e.g. `172.32.0.0/16`) to reach port `22/tcp`:
+     ```bash
+     sudo ufw allow from 172.32.0.0/16 to any port 22 proto tcp comment "machina -> host ssh"
+     ```
+   - If Machina connects from another host, allow that controller's IP/CIDR (`/32` or subnet).
+5. **Read the target server's SSH host-key fingerprint (for the Enrollment form):**
+   ```bash
+   ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   # Copy the SHA256:... token into the "Host key (SHA256 fingerprint)" field in Machina
+   ```
+
 ---
 
 ## Day-2 Operations & CLI Reference
