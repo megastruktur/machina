@@ -43,11 +43,12 @@ async function openPanel(page: Page, kind: string): Promise<void> {
 test('the route server-renders the empty desktop shell and mounts it client-side', async ({
 	page
 }) => {
-	// D4/§5: the SSR document is the shell with an EMPTY workspace — launcher
-	// markup present, zero window/panel DOM, no domain content in the route.
+	// D4/§5: the SSR document is the shell with an EMPTY workspace — the
+	// SideDrawer workspace navigation (Multi-Server accordion tree), zero
+	// window/panel DOM, no domain content in the route.
 	const ssr = await (await page.request.get('/')).text();
 	expect(ssr).toContain('data-testid="desktop"');
-	expect(ssr).toContain('Open panels');
+	expect(ssr).toContain('data-testid="server-tree-nav"');
 	expect(ssr).toContain('data-testid="bottom-chat-dock"');
 	expect(ssr).not.toContain('data-panel-kind');
 	expect(ssr).not.toContain('mai-fixture-panel');
@@ -58,9 +59,10 @@ test('the route server-renders the empty desktop shell and mounts it client-side
 
 	const select = page.getByTestId('server-select');
 	await expect(select).toBeVisible();
-	await expect(select.locator('option')).toHaveText(['Server Alpha', 'Server Beta']);
-	await expect(page.getByTestId('open-' + NOTES)).toHaveText('Open Notes — Server Alpha');
-	await expect(page.getByTestId('open-' + PREFS)).toHaveText('Open Preferences — Global');
+	await expect(select.locator('option')).toHaveText(['Active: Server Alpha', 'Active: Server Beta']);
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	await expect(page.getByTestId('open-' + NOTES)).toContainText('Open Notes — Server Alpha');
+	await expect(page.getByTestId('open-' + PREFS)).toContainText('Open Preferences — Global');
 	await expect(frame(page, NOTES)).toHaveCount(0);
 	await expect(frame(page, PREFS)).toHaveCount(0);
 });
@@ -274,8 +276,8 @@ test('changing the launcher server never retargets open windows (NT5)', async ({
 	await expect(alpha.getByTestId('fixture-interactions')).toHaveText('Fixture interactions: 1');
 
 	// The launcher selection changes; existing windows are not rewritten.
-	await page.getByTestId('server-select').selectOption({ label: 'Server Beta' });
-	await expect(page.getByTestId('open-' + NOTES)).toHaveText('Open Notes — Server Beta');
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect(page.getByTestId('open-' + NOTES)).toContainText('Open Notes — Server Beta');
 	await expect(alpha.getByRole('heading')).toHaveText('Notes — Server Alpha');
 	await expect(alpha.getByTestId('fixture-panel')).toContainText(
 		`Pinned target: server ${SERVER_ALPHA_ID}`
@@ -349,6 +351,8 @@ test('the bottom chat dock is always visible, interactive offline and performs n
 
 	// Offline compose round trip through the in-memory slice: the recorded
 	// conversation renders and the context locks — all without any request.
+	// `Options` expands the progressive-disclosure composer drawer first.
+	await dock.getByTestId('chat-advanced-toggle').click();
 	await dock.getByTestId('compose-message').fill('Dock fixture message');
 	await dock.getByTestId('compose-profile').fill('fixture-fast');
 	await dock.getByTestId('chat-submit').click();
@@ -358,7 +362,7 @@ test('the bottom chat dock is always visible, interactive offline and performs n
 	await expect(dock.getByTestId('chat-server-chip-remove')).toHaveCount(0);
 
 	// `New Chat` returns to an unlocked draft with the default chip.
-	await dock.getByTestId('chat-new-session').click();
+	await page.getByTestId('drawer-new-chat').click();
 	await expect(dock.getByTestId('chat-server-chip')).toContainText('Server Alpha');
 	await expect(dock.getByTestId('chat-server-chip-remove')).toBeVisible();
 

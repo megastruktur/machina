@@ -70,6 +70,7 @@
 	import Field from '../ui/Field.svelte';
 	import Chip from '../ui/Chip.svelte';
 	import Select from '../ui/Select.svelte';
+	import ModelProfileSelect from '../ui/ModelProfileSelect.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -88,7 +89,15 @@
 		type RunDetail
 	} from '../workspace/entries/06-web-chat.js';
 
-	let { panel }: { panel: PanelContext } = $props();
+	let {
+		panel,
+		onhistorychange,
+		onactivechange
+	}: {
+		panel: PanelContext;
+		onhistorychange?: (rows: readonly ConversationView[]) => void;
+		onactivechange?: (runId: string | null) => void;
+	} = $props();
 
 	// --- explicit inputs (fail closed when incomplete) -----------------------
 
@@ -232,6 +241,11 @@
 	// --- floating chat history selector ---------------------------------------
 
 	let historyOpen = $state(false);
+	let dockComposerEl = $state<HTMLTextAreaElement | null>(null);
+
+	export function scrollComposerIntoView(): void {
+		dockComposerEl?.scrollIntoView({ block: 'nearest' });
+	}
 
 	function selectHistoryRow(row: ConversationView): void {
 		historyOpen = false;
@@ -1066,6 +1080,27 @@
 	);
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let advancedOpen = $state(false);
+
+	$effect(() => {
+		onhistorychange?.(historyRows);
+	});
+
+	$effect(() => {
+		onactivechange?.(activeRunId || null);
+	});
+
+	export function triggerNewChat(): void {
+		newChat();
+	}
+
+	export function triggerSelectRun(runId: string): void {
+		const row = historyRows.find((one) => one.run_id === runId);
+		if (row) selectHistoryRow(row);
+	}
+
+	export function triggerRefreshHistory(): void {
+		void loadHistory();
+	}
 </script>
 
 <div class="mai-chat" class:mai-chat--docked={isDocked} data-testid="chat-root">
@@ -1074,29 +1109,25 @@
 			<p>This panel was opened without its conversation service or outside a pinned server scope.</p>
 		</div>
 	{:else}
-		<header class="mai-chat__header">
+		<header class="mai-chat__header" class:mai-sr-only={isDocked && !historyOpen}>
 			<div class="mai-chat__header-row">
 				<h3 class="mai-chat__title">Conversation</h3>
 				<div class="mai-chat__header-actions">
-					{#if isDocked}
-						<Button
-							size="sm"
-							pill
-							variant="secondary"
-							onclick={() => (advancedOpen = !advancedOpen)}
-							aria-expanded={advancedOpen}
-							data-testid="chat-advanced-toggle"
-						>
-							{advancedOpen ? 'Hide options' : 'Options'}
-						</Button>
-					{/if}
-					<Button size="sm" pill variant="secondary" onclick={newChat} data-testid="chat-new-session">
+					<Button
+						size="sm"
+						pill
+						variant="secondary"
+						tabindex={isDocked ? -1 : 0}
+						onclick={newChat}
+						data-testid="chat-new-session"
+					>
 						New Chat
 					</Button>
 					<Button
 						size="sm"
 						pill
 						variant="secondary"
+						tabindex={isDocked ? -1 : 0}
 						onclick={() => (historyOpen = !historyOpen)}
 						aria-expanded={historyOpen}
 						data-testid="chat-history-toggle"
@@ -1274,6 +1305,8 @@
 						<textarea
 							id="{uid}-message"
 							class="mai-chat__textarea"
+							tabindex={isDocked ? 1 : undefined}
+							bind:this={dockComposerEl}
 							placeholder="Ask M.A.I. or type @service to pin context…"
 							bind:value={composeMessage}
 							oninput={handleComposeInput}
@@ -1282,18 +1315,25 @@
 						></textarea>
 					</div>
 					<div class="mai-chat__composer-profile">
-						<Field
-							label="Model profile"
+						<ModelProfileSelect
 							compact={isDocked}
-							placeholder="Profile (e.g. default)"
 							bind:value={composeProfile}
-							data-testid="compose-profile"
 							error={composeFields.profile ?? ''}
-							hint="Explicit selection (C06 rule 1); the stored pairing of the pinned server."
+							testId="compose-profile"
 						/>
 					</div>
 					{#if isDocked}
 						<div class="mai-chat__actions">
+							<Button
+								size="sm"
+								pill
+								variant="secondary"
+								onclick={() => (advancedOpen = !advancedOpen)}
+								aria-expanded={advancedOpen}
+								data-testid="chat-advanced-toggle"
+							>
+								{advancedOpen ? 'Hide options' : 'Options'}
+							</Button>
 							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
 								Send
 							</Button>
@@ -1710,7 +1750,8 @@
 		resize: none;
 	}
 
-	.mai-chat__label--sr {
+	.mai-chat__label--sr,
+	.mai-sr-only {
 		position: absolute;
 		width: 1px;
 		height: 1px;

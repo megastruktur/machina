@@ -61,14 +61,15 @@
 	--mai-color-brass-dim: #a08c5a;
 	--mai-color-surface-header: #eef1f5;
 
-	/* ---- Odyssey spatial glass surfaces & canvas ------------------------- */
-	--mai-surface-glass: rgb(255 255 255 / 0.86);
-	--mai-surface-glass-raised: rgb(248 250 252 / 0.92);
-	--mai-surface-glass-header: rgb(241 245 249 / 0.9);
-	--mai-border-specular: rgb(255 255 255 / 0.7);
+	/* ---- Solid surfaces for windows/chat/drawer & line-grid canvas ------- */
+	--mai-surface-glass: #ffffff;
+	--mai-surface-glass-raised: #f2f4f7;
+	--mai-surface-glass-header: #eef1f5;
+	--mai-border-specular: rgb(255 255 255 / 0.8);
 	--mai-canvas-bg:
-		radial-gradient(circle at 50% 0%, rgb(29 78 216 / 0.06), transparent 55%),
-		radial-gradient(rgb(156 163 175 / 0.35) 1px, transparent 1px);
+		linear-gradient(to right, rgb(209 213 219 / 0.65) 1px, transparent 1px),
+		linear-gradient(to bottom, rgb(209 213 219 / 0.65) 1px, transparent 1px);
+	--mai-canvas-size: 32px 32px;
 
 	/* ---- Type --------------------------------------------------------------- */
 	--mai-font-display: 'Cinzel', Georgia, serif;

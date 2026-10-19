@@ -61,6 +61,7 @@
 		{...rest}
 		{id}
 		{type}
+		tabindex={compact ? -1 : rest.tabindex}
 		bind:value
 		class="mai-field__input {className}"
 		aria-invalid={error !== '' ? 'true' : undefined}

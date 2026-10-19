@@ -139,7 +139,7 @@
 		padding: var(--mai-page-pad, var(--mai-space-5));
 		background-color: var(--mai-color-bg);
 		background-image: var(--mai-canvas-bg);
-		background-size: 100% 100%, 100% 100%, 24px 24px;
+		background-size: var(--mai-canvas-size, 32px 32px);
 		color: var(--mai-color-text);
 		font-family: var(--mai-font-sans);
 		box-sizing: border-box;

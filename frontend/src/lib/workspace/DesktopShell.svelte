@@ -224,6 +224,9 @@
 	import Field from '$lib/ui/Field.svelte';
 	import Select from '$lib/ui/Select.svelte';
 	import GlassSurface from '$lib/ui/GlassSurface.svelte';
+	import SideDrawer from '$lib/ui/SideDrawer.svelte';
+	import ServerTreeNav from './ServerTreeNav.svelte';
+	import ChatDrawerSection from './ChatDrawerSection.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
 	// its exact contract; the shell maps ONE client onto all of them).
 	// Live transport: one client per shell instance (ADR §5 — instances share
@@ -666,6 +669,12 @@
 	/** The dock's API slice: live transport once a session answers, else memory. */
 	const dockChatApi = $derived<ChatApi>(live ? chatApi : memoryChatApi);
 
+	/** The mounted dock ChatPanel instance + its mirrored history/active state. */
+	let dockChatPanel = $state<ChatPanel | null>(null);
+	let drawerConversations = $state<readonly ConversationView[]>([]);
+	let drawerActiveRunId = $state<string | null>(null);
+	let drawerCollapsed = $state(false);
+
 	/**
 	 * The dock's explicit panel context — a server scope following the
 	 * launcher's visible selection (read at submit time, never a hidden
@@ -970,65 +979,73 @@
 </script>
 
 <div class="mai-desktop-shell">
-	<GlassSurface as="header" variant="hud" class="mai-desktop-shell__launcher">
-		<h2 class="mai-desktop-shell__launcher-title">Open panels</h2>
-		<Select
-			id="mai-desktop-server-select"
-			label="Target server for new windows"
-			inlineLabel
-			pill
-			compact
-			bind:value={selectedServerId}
-			data-testid="server-select"
-		>
-			{#each serverOptions as server (server.id)}
-				<option value={server.id}>{server.label}</option>
-			{/each}
-		</Select>
-		<div class="mai-desktop-shell__launcher-actions">
+	<SideDrawer bind:collapsed={drawerCollapsed} data-testid="side-drawer" aria-label="Workspace navigation">
+		{#snippet header()}
+			<div class="mai-desktop-shell__drawer-brand">
+				<span class="mai-desktop-shell__drawer-sigil" aria-hidden="true">⚙</span>
+				<h1 class="mai-desktop-shell__drawer-title">Machina</h1>
+				<span class="mai-desktop-shell__drawer-subtitle">M.A.I. — Machina Anima Intelligentia</span>
+			</div>
+		{/snippet}
+
+		<ChatDrawerSection
+			conversations={drawerConversations}
+			activeRunId={drawerActiveRunId}
+			onnewchat={() => {
+				focusChatDock();
+				dockChatPanel?.triggerNewChat();
+			}}
+			onselectconversation={(runId) => {
+				focusChatDock();
+				dockChatPanel?.triggerSelectRun(runId);
+			}}
+			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
+		/>
+
+		<ServerTreeNav
+			servers={serverOptions}
+			bind:selectedServerId
+			entries={live ? liveEntries : fixtureEntries}
+			{live}
+			onopenpanel={(kind, serverId) => {
+				if (serverId) {
+					openPanel(kind, { kind: 'server', server_id: serverId });
+				} else {
+					openPanel(kind);
+				}
+			}}
+			onfocuschat={(serverId) => {
+				selectedServerId = serverId;
+				focusChatDock();
+			}}
+		/>
+
+		{#if live}
+			<Button
+				size="sm"
+				variant="secondary"
+				data-testid="desktop-enroll-toggle"
+				onclick={() => (enrollOpen = !enrollOpen)}
+			>
+				{enrollOpen ? 'Close enrollment' : 'Enroll server'}
+			</Button>
+		{:else}
+			<a class="mai-desktop-shell__signin" href="/login" data-testid="desktop-sign-in">
+				Connect live session / Sign in
+			</a>
+		{/if}
+
+		{#snippet footer()}
+			<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
 			{#if live}
-				{#each liveEntries as entry (entry.panel_kind)}
-					<Button
-						size="sm"
-						pill
-						variant="secondary"
-						data-testid={'open-' + entry.panel_kind}
-						onclick={() =>
-							entry.panel_kind === CHAT_PANEL_KIND ? focusChatDock() : openPanel(entry.panel_kind)}
-					>
-						<span class="mai-sr-only">{'Open '}</span><span class="mai-desktop-shell__btn-title">{entry.title}</span><span class="mai-sr-only">{' — '}</span><span class="mai-desktop-shell__btn-scope">{entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}</span>
-					</Button>
-				{/each}
-				<Button
-					size="sm"
-					pill
-					variant="secondary"
-					data-testid="desktop-enroll-toggle"
-					onclick={() => (enrollOpen = !enrollOpen)}
-				>
-					{enrollOpen ? 'Close enrollment' : 'Enroll server'}
-				</Button>
-				<Button size="sm" pill variant="secondary" data-testid="desktop-sign-out" onclick={signOut}>
+				<Button size="sm" variant="secondary" data-testid="desktop-sign-out" onclick={signOut}>
 					Sign out
 				</Button>
-			{:else}
-				{#each fixtureEntries as entry (entry.panel_kind)}
-					<Button
-						size="sm"
-						pill
-						variant="secondary"
-						data-testid={'open-' + entry.panel_kind}
-						onclick={() => openPanel(entry.panel_kind)}
-					>
-						<span class="mai-sr-only">{'Open '}</span><span class="mai-desktop-shell__btn-title">{entry.title}</span><span class="mai-sr-only">{' — '}</span><span class="mai-desktop-shell__btn-scope">{entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}</span>
-					</Button>
-				{/each}
-				<a class="mai-desktop-shell__signin" href="/login" data-testid="desktop-sign-in">
-					Connect live session / Sign in
-				</a>
 			{/if}
-		</div>
-		<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
+		{/snippet}
+	</SideDrawer>
+
+	<div class="mai-desktop-shell__stage">
 		{#if live && enrollOpen}
 			<!-- Inline enrollment: one reviewed create call; the field set mirrors
 			     the frozen ProfileCreate document (C02 rule 1) exactly. -->
@@ -1063,9 +1080,8 @@
 				<Button type="submit" loading={enrollBusy} data-testid="enroll-submit">Enroll</Button>
 			</form>
 		{/if}
-	</GlassSurface>
 
-	<div class="mai-desktop-shell__desktop" bind:this={desktopEl} data-testid="desktop">
+		<div class="mai-desktop-shell__desktop" bind:this={desktopEl} data-testid="desktop">
 		<!-- Frame intents map 1:1 onto the state transitions (focus/close/move).
 		     The drag geometry intent ignores an unknown id deliberately: a window
 		     closed mid-gesture is gone, the state layer holds the committed base.
@@ -1114,6 +1130,7 @@
 				size="sm"
 				pill
 				variant="ghost"
+				tabindex={2}
 				onclick={() => (dockCollapsed = !dockCollapsed)}
 				aria-expanded={!dockCollapsed}
 				data-testid="bottom-chat-dock-toggle"
@@ -1122,7 +1139,12 @@
 			</Button>
 		</div>
 		<div class="mai-desktop-shell__dock-body">
-			<ChatPanel panel={dockPanel} />
+			<ChatPanel
+				bind:this={dockChatPanel}
+				panel={dockPanel}
+				onhistorychange={(rows) => (drawerConversations = rows)}
+				onactivechange={(runId) => (drawerActiveRunId = runId)}
+			/>
 		</div>
 	</section>
 
@@ -1130,8 +1152,12 @@
 	     close; a visible entry focuses, a hidden one restores+focuses. -->
 	<WindowSwitcher
 		entries={switcherEntries}
-		onactivate={(windowId) => presentation.activate(windowId)}
+		onactivate={(windowId) => {
+			dockChatPanel?.scrollComposerIntoView();
+			presentation.activate(windowId);
+		}}
 	/>
+	</div>
 </div>
 
 <style>
@@ -1140,65 +1166,48 @@
 		flex: 1 1 0%;
 		min-height: 0;
 		display: flex;
+		flex-direction: row;
+		align-items: stretch;
+	}
+
+	.mai-desktop-shell__stage {
+		position: relative;
+		flex: 1 1 0%;
+		min-width: 0;
+		min-height: 0;
+		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3) var(--mai-space-3);
 	}
 
-	.mai-sr-only {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		margin: -1px;
-		padding: 0;
-		overflow: hidden;
-		clip: rect(0 0 0 0);
-		clip-path: inset(50%);
-		white-space: nowrap;
-		border: 0;
-	}
-
-	:global(.mai-desktop-shell__launcher) {
-		flex: 0 0 auto;
+	.mai-desktop-shell__drawer-brand {
 		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: var(--mai-space-2);
-		z-index: 20;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
 	}
 
-	.mai-desktop-shell__launcher-title {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		margin: -1px;
-		padding: 0;
-		overflow: hidden;
-		clip: rect(0 0 0 0);
-		clip-path: inset(50%);
-		white-space: nowrap;
-		border: 0;
+	.mai-desktop-shell__drawer-sigil {
+		font-size: var(--mai-text-lg);
+		color: var(--mai-color-brass);
+		line-height: 1;
 	}
 
-	.mai-desktop-shell__launcher-actions {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: var(--mai-space-1);
-		flex: 1 1 auto;
-	}
-
-	.mai-desktop-shell__btn-title {
+	.mai-desktop-shell__drawer-title {
+		margin: 0;
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
 		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
 		color: var(--mai-color-text);
 	}
 
-	.mai-desktop-shell__btn-scope {
-		padding: 1px var(--mai-space-2);
+	.mai-desktop-shell__drawer-subtitle {
 		font-family: var(--mai-font-mono);
-		font-size: 0.7rem;
-		color: var(--mai-color-brass);
-		background: var(--mai-color-bg);
-		border-radius: var(--mai-radius-pill);
+		font-size: 0.68rem;
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-desktop-shell__status {
@@ -1227,15 +1236,15 @@
 
 	/* Inline server enrollment (live mode only): a compact field grid. */
 	.mai-desktop-shell__enroll {
-		flex: 1 1 100%;
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
 		gap: var(--mai-space-2);
 		align-items: end;
 		padding: var(--mai-card-pad, var(--mai-space-3));
-		background: var(--mai-surface-glass-raised, var(--mai-color-bg));
+		background: var(--mai-color-surface);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-lg);
+		z-index: 15;
 	}
 
 	.mai-desktop-shell__enroll-error {
@@ -1245,27 +1254,24 @@
 		color: var(--mai-status-danger-text);
 	}
 
-	/* The positioned ancestor of the window frames: geometry coordinates are
-	   desktop-relative; the drag adapter and the open clamp both measure this
-	   region's viewport origin (NT3). No overflow rule: a clipped window could
-	   lose its recoverable title bar (ADR §10.2 NT3). */
+	/* Transparent spatial line-grid canvas: no solid/overlay fill; only
+	   floating windows, the SideDrawer, and the Chat Dock render solid. */
 	.mai-desktop-shell__desktop {
 		position: relative;
 		flex: 1 1 0%;
 		min-height: 360px;
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-xl, var(--mai-radius-md));
-		background: var(--mai-surface-glass, transparent);
-		box-shadow: inset 0 1px 0 var(--mai-border-specular);
+		background: transparent;
+		border: none;
+		box-shadow: none;
 	}
 
 	/* Odyssey-Style Floating Center-Bottom Chat Pill: floats above the bottom
 	   of the spatial canvas without pushing the document height. */
 	.mai-desktop-shell__dock {
 		position: absolute;
-		bottom: var(--mai-space-3);
-		left: 50%;
-		transform: translateX(-50%);
+		bottom: var(--mai-space-2);
+		left: calc(100% - var(--mai-space-3) - min(860px, calc(100% - 2 * var(--mai-space-4))));
+		transform: none;
 		width: min(860px, calc(100% - 2 * var(--mai-space-4)));
 		z-index: 30;
 		display: flex;
@@ -1281,15 +1287,25 @@
 	}
 
 	.mai-desktop-shell__dock-bar {
+		position: absolute;
+		top: calc(-1 * var(--mai-space-4));
+		right: var(--mai-space-2);
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--mai-space-2);
+		width: auto;
+		padding: 2px var(--mai-space-2);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-pill);
+		box-shadow: var(--mai-shadow-float);
+		z-index: 31;
 	}
 
 	.mai-desktop-shell__dock-title {
 		font-family: var(--mai-font-display);
-		font-size: var(--mai-text-xs);
+		font-size: 0.65rem;
 		font-weight: var(--mai-weight-semibold);
 		letter-spacing: 0.06em;
 		text-transform: uppercase;

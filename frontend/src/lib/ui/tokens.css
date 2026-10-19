@@ -70,7 +70,7 @@
 	--mai-radius-2xl: 18px;
 	--mai-radius-pill: 9999px;
 	--mai-border-width: 1px;
-	--mai-blur-glass: blur(18px) saturate(140%);
+	--mai-blur-glass: none;
 
 	/* ---- Size invariants ---------------------------------------------------- */
 	/* Minimum interactive target (WCAG 2.5.8 AA). */
