@@ -36,6 +36,14 @@ import type { PanelEntryInput } from '../registry.js';
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
 export const CHAT_PANEL_KIND = 'chat';
 
+/**
+ * The wire's sentinel server id for a General Consult conversation (the
+ * ChatSubmitBody server_id default): a draft with no pinned server submits
+ * under this id, and a conversation stored under it restores as the General
+ * Consult badge instead of a Server Chip.
+ */
+export const GLOBAL_CONSULT_SERVER_ID = '00000000-0000-0000-0000-000000000000';
+
 /** Generated wire shape: one submit body (client-minted idempotency key, C05 rule 5). */
 export type ChatSubmitBody = components['schemas']['ChatSubmitBody'];
 /** Generated wire shape: one explicitly scoped child task (no target field, C06 rule 5). */
@@ -115,9 +123,31 @@ export interface ChatApi {
 	decideApproval(approvalId: string, payload: DecisionBody): Promise<ApprovalView>;
 }
 
-/** Typed services bag the conversation panel requires from its opener. */
+/** One server option offered by the draft-mode server picker. */
+export interface ChatServerOption {
+	readonly id: string;
+	readonly label: string;
+}
+
+/** One mapped/discovered service offered by the draft-mode `@service` autocomplete. */
+export interface ChatServiceOption {
+	readonly name: string;
+	readonly category?: string;
+}
+
+/**
+ * Typed services bag the conversation panel requires from its opener. The
+ * `api` slice is REQUIRED (a missing/incomplete bag fails closed); the
+ * context extras are OPTIONAL enrichments — a host without them still gets
+ * the full conversation view, with the composer chip controls degrading to
+ * the pinned scope alone.
+ */
 export interface ChatServices {
 	readonly api: ChatApi;
+	/** Available servers for the draft-mode Server Chip / picker. */
+	readonly serverOptions?: readonly ChatServerOption[];
+	/** Mapped/discovered services for the draft-mode `@service` autocomplete. */
+	readonly availableServices?: readonly ChatServiceOption[];
 }
 
 /**

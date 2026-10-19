@@ -48,11 +48,12 @@ test('the route server-renders the empty desktop shell and mounts it client-side
 	const ssr = await (await page.request.get('/')).text();
 	expect(ssr).toContain('data-testid="desktop"');
 	expect(ssr).toContain('Open panels');
+	expect(ssr).toContain('data-testid="bottom-chat-dock"');
 	expect(ssr).not.toContain('data-panel-kind');
 	expect(ssr).not.toContain('mai-fixture-panel');
 
 	await page.goto('/');
-	await expect(page.getByRole('heading', { level: 1 })).toHaveText('MAI');
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('Machina');
 	await expect(page.getByTestId('component-host')).toHaveAttribute('data-mounted', 'true');
 
 	const select = page.getByTestId('server-select');
@@ -325,5 +326,48 @@ test('the fixture desktop performs no API requests', async ({ page }) => {
 	await page.getByTestId('open-' + NOTES).click();
 
 	expect(urls.length).toBeGreaterThan(0);
+	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
+});
+
+test('the bottom chat dock is always visible, interactive offline and performs no API requests', async ({
+	page
+}) => {
+	const urls: string[] = [];
+	page.on('request', (request) => urls.push(request.url()));
+
+	await page.goto('/');
+	const dock = page.getByTestId('bottom-chat-dock');
+	await expect(dock).toBeVisible();
+	// The dock is NOT a registry window: no panel kind, no window frame.
+	expect(await dock.getAttribute('data-panel-kind')).toBeNull();
+	await expect(dock.locator('.mai-window-frame')).toHaveCount(0);
+	await expect(frame(page, 'chat')).toHaveCount(0);
+
+	// Draft context: the default Server Chip follows the launcher selection.
+	await expect(dock.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(dock.getByTestId('chat-server-chip-remove')).toBeVisible();
+
+	// Offline compose round trip through the in-memory slice: the recorded
+	// conversation renders and the context locks — all without any request.
+	await dock.getByTestId('compose-message').fill('Dock fixture message');
+	await dock.getByTestId('compose-profile').fill('fixture-fast');
+	await dock.getByTestId('chat-submit').click();
+	await expect(dock.getByTestId('conversation-state')).toHaveText('Running');
+	await expect(dock.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
+	await expect(dock.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(dock.getByTestId('chat-server-chip-remove')).toHaveCount(0);
+
+	// `New Chat` returns to an unlocked draft with the default chip.
+	await dock.getByTestId('chat-new-session').click();
+	await expect(dock.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(dock.getByTestId('chat-server-chip-remove')).toBeVisible();
+
+	// Collapse/expand keeps the dock (and its mounted panel) alive.
+	await dock.getByTestId('bottom-chat-dock-toggle').click();
+	await expect(dock).toBeVisible();
+	await expect(dock.getByTestId('chat-root')).toBeHidden();
+	await dock.getByTestId('bottom-chat-dock-toggle').click();
+	await expect(dock.getByTestId('chat-root')).toBeVisible();
+
 	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
 });

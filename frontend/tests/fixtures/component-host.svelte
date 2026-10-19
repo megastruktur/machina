@@ -13,7 +13,7 @@
 	import type { Snippet } from 'svelte';
 
 	let {
-		label = 'MAI component host',
+		label = 'Machina component host',
 		children
 	}: { label?: string; children?: Snippet } = $props();
 
@@ -33,8 +33,26 @@
 	 data-mounted="false"
 	 aria-label={label}
 >
-	<span data-testid="component-host-label">{label}</span>
+	<span data-testid="component-host-label" class="component-host__label">{label}</span>
 	{#if children}
 		{@render children()}
 	{/if}
 </section>
+
+<style>
+	/* The label is the redundant text twin of the section's aria-label: kept
+	 * in the DOM for tests and assistive tech, visually hidden so it cannot
+	 * disturb a host's layout. No theme values. */
+	.component-host__label {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+</style>

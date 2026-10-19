@@ -219,6 +219,7 @@
 	import WindowFrame from './WindowFrame.svelte';
 	import PanelHost from './PanelHost.svelte';
 	import WindowSwitcher from './WindowSwitcher.svelte';
+	import ChatPanel from '$lib/panels/ChatPanel.svelte';
 	import Button from '$lib/ui/Button.svelte';
 	import Field from '$lib/ui/Field.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
@@ -229,7 +230,16 @@
 	import { ApiError, createMaiApiClient, CSRF_COOKIE, type ProfileResponse } from '$lib/api/client.js';
 	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
-	import { CHAT_PANEL_KIND, browserChatEventStream, chatServices, type ChatApi } from './entries/06-web-chat.js';
+	import {
+		CHAT_PANEL_KIND,
+		GLOBAL_CONSULT_SERVER_ID,
+		browserChatEventStream,
+		chatServices,
+		type ChatApi,
+		type ChatServiceOption,
+		type ConversationView,
+		type RunDetail
+	} from './entries/06-web-chat.js';
 	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
 	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
 	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
@@ -521,6 +531,173 @@
 		streamRunEvents: browserRunEventStream
 	};
 
+	// ---------------------------------------------------------------------
+	// Always-Visible Bottom Chat Dock (mui-03): ChatPanel mounts persistently
+	// at the bottom of the viewport — NOT as a registry window (the dock
+	// element carries no data-panel-kind and never enters the workspace
+	// state). The fixture desktop must perform ZERO API requests, so until a
+	// live session answers, the dock receives a safe IN-MEMORY ChatApi: every
+	// method resolves from a local store, the event stream parks until its
+	// abort signal (no fetch ever leaves the page), and approval routes fail
+	// closed as absence. The dock is fully interactive offline; a live
+	// session swaps the slice for the real transport-backed one.
+	// ---------------------------------------------------------------------
+
+	/** Fixture services offered by the dock's `@service` autocomplete. */
+	const DOCK_AVAILABLE_SERVICES: readonly ChatServiceOption[] = Object.freeze([
+		{ name: 'enshrouded', category: 'games' },
+		{ name: 'nginx', category: 'web' },
+		{ name: 'postgres', category: 'databases' },
+		{ name: 'backups', category: 'maintenance' }
+	]);
+
+	/**
+	 * One offline conversation store per shell instance (ADR §5 rule 2 — no
+	 * module-level state). Submitted rows replay exactly like wire rows:
+	 * value-free view data, `running` state, no events.
+	 */
+	function createMemoryChatApi(): ChatApi {
+		const conversations = new Map<string, ConversationView>();
+		const stamp = () => new Date().toISOString();
+		const rowOf = (runId: string, serverId: string, profile: string): ConversationView => ({
+			run_id: runId,
+			server_id: serverId,
+			parent_run_id: null,
+			depth: 0,
+			profile_revision: 1,
+			prompt_revision: 1,
+			model_profile: profile,
+			requested_grants: [],
+			state: 'running',
+			cancel_requested_at: null,
+			submitted_at: stamp(),
+			updated_at: stamp()
+		});
+		return {
+			async submitMessage(payload) {
+				const base = rowOf(payload.run_id, payload.server_id, payload.profile);
+				base.requested_grants = [...(payload.capabilities ?? [])];
+				base.children = (payload.children ?? []).map((child, index) => ({
+					...rowOf(
+						`${payload.run_id}-child-${String(index + 1)}`,
+						payload.server_id,
+						child.profile ?? payload.profile
+					),
+					parent_run_id: payload.run_id,
+					depth: 1,
+					state: 'queued'
+				}));
+				base.attachments = (payload.attachments ?? []).map((one) => ({
+					...one,
+					sha256: '',
+					bytes: 0
+				}));
+				if (payload.service_tags !== undefined) base.service_tags = [...payload.service_tags];
+				conversations.set(payload.run_id, base);
+				return { conversation: structuredClone(base), deduplicated: false };
+			},
+			async listConversations(serverId, page) {
+				const rows = [...conversations.values()]
+					.filter((row) => row.server_id === serverId)
+					.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at));
+				return {
+					conversations: structuredClone(rows),
+					limit: page?.limit ?? 20,
+					offset: page?.offset ?? 0,
+					total: rows.length
+				};
+			},
+			async readConversation(runId) {
+				const row = conversations.get(runId);
+				if (row === undefined) {
+					throw new ApiError(404, 'not_found', 'no run stored for this run id');
+				}
+				return structuredClone(row);
+			},
+			async cancelConversation(runId) {
+				const row = conversations.get(runId);
+				if (row === undefined) {
+					throw new ApiError(404, 'not_found', 'no run stored for this run id');
+				}
+				if (row.cancel_requested_at === null) row.cancel_requested_at = stamp();
+				return {
+					run_id: runId,
+					state: row.state,
+					outcome: null,
+					requested_at: row.cancel_requested_at,
+					outcome_at: null,
+					requested_now: true,
+					unresolved_seqs: []
+				};
+			},
+			/** Offline: park until the panel aborts the subscription — no fetch. */
+			async streamConversationEvents(_runId, options) {
+				return new Promise<void>((_resolve, reject) => {
+					options.signal?.addEventListener(
+						'abort',
+						() => reject(new DOMException('stream aborted', 'AbortError')),
+						{ once: true }
+					);
+				});
+			},
+			async readRun(runId) {
+				const row = await this.readConversation(runId);
+				const detail: RunDetail = { ...row, steps: [] };
+				return detail;
+			},
+			async readApproval() {
+				throw new ApiError(404, 'not_found', 'no approval records in offline mode');
+			},
+			async decideApproval() {
+				throw new ApiError(404, 'not_found', 'no approval records in offline mode');
+			}
+		};
+	}
+
+	/** Offline slice: one per shell instance, replaced by the live slice. */
+	const memoryChatApi = createMemoryChatApi();
+
+	/** Dock composer visibility: compact bar vs the full transcript dock. */
+	let dockCollapsed = $state(false);
+	let dockEl: HTMLElement | null = null;
+
+	/** The dock's API slice: live transport once a session answers, else memory. */
+	const dockChatApi = $derived<ChatApi>(live ? chatApi : memoryChatApi);
+
+	/**
+	 * The dock's explicit panel context — a server scope following the
+	 * launcher's visible selection (read at submit time, never a hidden
+	 * global), the composed bag (api slice + server options + services for
+	 * the autocomplete), and an inert cleanup registry (the dock never
+	 * unmounts its panel except with the shell itself).
+	 */
+	const dockPanel = $derived<PanelContext>({
+		descriptor: {
+			window_id: 'mai-bottom-chat-dock',
+			panel_kind: CHAT_PANEL_KIND,
+			scope: { kind: 'server', server_id: selectedServerId },
+			geometry: { x: 0, y: 0, width: 0, height: 0 },
+			presentation: 'normal',
+			z: 0,
+			title_override: null
+		},
+		scope: { kind: 'server', server_id: selectedServerId },
+		services: {
+			api: dockChatApi,
+			serverOptions,
+			availableServices: DOCK_AVAILABLE_SERVICES
+		},
+		onCleanup: () => () => {}
+	});
+
+	/** `open-chat` focuses and expands the dock instead of a second window. */
+	function focusChatDock(): void {
+		dockCollapsed = false;
+		status = 'Chat dock focused.';
+		const compose = dockEl?.querySelector('textarea');
+		if (compose instanceof HTMLTextAreaElement) compose.focus();
+	}
+
 	const overviewApi: OverviewApi = {
 		listObservations: api.listObservations,
 		listFindings: api.listFindings,
@@ -810,7 +987,8 @@
 			{#each liveEntries as entry (entry.panel_kind)}
 				<Button
 					data-testid={'open-' + entry.panel_kind}
-					onclick={() => openPanel(entry.panel_kind)}
+					onclick={() =>
+						entry.panel_kind === CHAT_PANEL_KIND ? focusChatDock() : openPanel(entry.panel_kind)}
 				>
 					Open {entry.title} — {entry.scope_types.has('server') ? serverLabel(selectedServerId) : 'Global'}
 				</Button>
@@ -910,6 +1088,34 @@
 		{/each}
 	</div>
 
+	<!-- The Always-Visible Bottom Chat Dock: ChatPanel lives here
+	     persistently — never a registry window (no data-panel-kind, no
+	     workspace state). Collapsing hides the body visually so the mounted
+	     panel (and its draft) survives; the fixture desktop drives it with
+	     the in-memory slice and performs zero API requests. -->
+	<section
+		class="mai-desktop-shell__dock"
+		class:mai-desktop-shell__dock--collapsed={dockCollapsed}
+		data-testid="bottom-chat-dock"
+		aria-label="Chat dock"
+		bind:this={dockEl}
+	>
+		<div class="mai-desktop-shell__dock-bar">
+			<span class="mai-desktop-shell__dock-title">Chat</span>
+			<Button
+				variant="secondary"
+				onclick={() => (dockCollapsed = !dockCollapsed)}
+				aria-expanded={!dockCollapsed}
+				data-testid="bottom-chat-dock-toggle"
+			>
+				{dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
+			</Button>
+		</div>
+		<div class="mai-desktop-shell__dock-body">
+			<ChatPanel panel={dockPanel} />
+		</div>
+	</section>
+
 	<!-- PT4 taskbar: entries persist for hidden windows and disappear on
 	     close; a visible entry focuses, a hidden one restores+focuses. -->
 	<WindowSwitcher
@@ -1006,6 +1212,47 @@
 		min-height: 60vh;
 		border: var(--mai-border-width) dashed var(--mai-color-border-strong);
 		border-radius: var(--mai-radius-md);
+	}
+
+	/* Always-Visible Bottom Chat Dock: the persistent chat region below the
+	   desktop canvas. Collapse hides the body visually only — the mounted
+	   panel and its draft survive an expand/collapse round trip. */
+	.mai-desktop-shell__dock {
+		flex: 0 0 auto;
+		/* Always-visible: pinned to the bottom of the VIEWPORT — the desktop
+		   canvas scrolls behind it, the composer never leaves reach. */
+		position: sticky;
+		bottom: 0;
+		z-index: 30;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+	}
+
+	.mai-desktop-shell__dock-bar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-desktop-shell__dock-title {
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		color: var(--mai-color-text);
+	}
+
+	.mai-desktop-shell__dock-body {
+		max-height: 40vh;
+		overflow: auto;
+	}
+
+	.mai-desktop-shell__dock--collapsed .mai-desktop-shell__dock-body {
+		display: none;
 	}
 
 	/* PT4 maximize overlay — owned by this composition (the presentation
