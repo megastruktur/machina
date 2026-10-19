@@ -485,12 +485,35 @@ class ModelConfigStore:
         pair-valid (:func:`mai.agents.models.validate_selection`).
         """
         if connection is None or profile is None:
-            selected = self.get_selection()
-            connection = connection if connection is not None else selected.connection
-            profile = profile if profile is not None else selected.profile
+            stored_profiles = self.list_profiles()
+            if (
+                profile is not None
+                and profile in stored_profiles
+                and connection is None
+            ):
+                profile = self._validated_name(profile)
+                profile_doc = self.read_profile(profile)
+                raw_mapping = self._document_mapping(profile_doc.text)
+                parsed_profile = parse_profile(raw_mapping)  # type: ignore[arg-type]
+                connection = parsed_profile.connection
+            else:
+                selected = self.get_selection()
+                connection = (
+                    connection if connection is not None else selected.connection
+                )
+                if profile is None or (
+                    profile == "default" and "default" not in stored_profiles
+                ):
+                    profile = selected.profile
         else:
             connection = self._validated_name(connection)
             profile = self._validated_name(profile)
+            if profile == "default" and "default" not in self.list_profiles():
+                try:
+                    selected = self.get_selection()
+                    profile = selected.profile
+                except ModelStoreError:
+                    pass
         connection_doc = self.read_connection(connection)
         profile_doc = self.read_profile(profile)
         parsed_connection = parse_connection(

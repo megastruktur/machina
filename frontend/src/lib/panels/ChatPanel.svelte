@@ -129,6 +129,21 @@
 	const serverScope = $derived(panel.scope.kind === 'server' ? panel.scope.server_id : null);
 	const usable = $derived(api !== null && serverScope !== null);
 
+	/**
+	 * Whether ModelProfileSelect is allowed to fetch live profiles on mount.
+	 * Only true when the host is live: an explicit `live` bag flag, or the
+	 * api slice carrying the real HTTP transport markers (listProfiles or
+	 * browser streamConversationEvents). The offline in-memory harness never
+	 * triggers a real `/api/v1/models` fetch (fixture acceptance).
+	 */
+	const profilesLive = $derived.by(() => {
+		const bag = panel.services as (PanelServices & { live?: unknown }) | undefined;
+		if (bag?.live === true) return true;
+		const candidate = bag?.api as Partial<ChatApi> & { listProfiles?: unknown } | undefined;
+		if (typeof candidate !== 'object' || candidate === null) return false;
+		return typeof candidate.listProfiles === 'function';
+	});
+
 	// --- draft chat context (Server Chip + @service tags; locked once started)
 
 	/**
@@ -439,6 +454,7 @@
 			// value-free on the planned event, in body order — plan_children).
 			authoredLabels.clear();
 			authoredLabels.set(created.conversation.run_id, body.message);
+			saveStoredAuthored(authoredLabels);
 			pendingChildTasks = childTasks.map((child) => child.task);
 			openConversation(created.conversation);
 			composeMessage = '';
@@ -535,7 +551,35 @@
 	 * child tasks linked through the planned event's body-ordered ids. A
 	 * conversation opened from history has none — the wire carries no bodies.
 	 */
-	let authoredLabels = $state(new Map<string, string>());
+	const AUTHORED_STORAGE_KEY = 'mai.chat.authored.v1';
+
+	function loadStoredAuthored(): Map<string, string> {
+		if (typeof window === 'undefined') return new Map();
+		try {
+			const raw = window.localStorage.getItem(AUTHORED_STORAGE_KEY);
+			if (!raw) return new Map();
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const entries: Array<[string, string]> = [];
+			for (const [k, v] of Object.entries(parsed)) {
+				if (typeof v === 'string' && v.trim() !== '') entries.push([k, v]);
+			}
+			return new Map(entries);
+		} catch {
+			return new Map();
+		}
+	}
+
+	function saveStoredAuthored(map: Map<string, string>): void {
+		if (typeof window === 'undefined') return;
+		try {
+			const obj = Object.fromEntries(map);
+			window.localStorage.setItem(AUTHORED_STORAGE_KEY, JSON.stringify(obj));
+		} catch {
+			// Ignore storage quota errors.
+		}
+	}
+
+	let authoredLabels = $state(loadStoredAuthored());
 	let pendingChildTasks = $state<string[]>([]);
 	let taskLabels = $state<Record<string, string>>({});
 
@@ -610,6 +654,8 @@
 	};
 
 	let transcript = $state<TranscriptEntry[]>([]);
+	let latestAssistantReply = $state<string>('');
+	let conversationScrollEl = $state<HTMLElement | null>(null);
 	/** Watermark of the applied stream events (C08 rule 7 dedup). */
 	let lastSeq = $state(0);
 	let appliedEvents = $state(0);
@@ -623,9 +669,16 @@
 	/** Set once the mount cycle ended; async continuations check before writes. */
 	let disposed = true;
 
+	function scrollToConversationBottom(): void {
+		if (conversationScrollEl) {
+			conversationScrollEl.scrollTop = conversationScrollEl.scrollHeight;
+		}
+	}
+
 	function pushEntry(entry: TranscriptEntry): void {
 		if (transcript.length >= MAX_RENDERED_EVENTS) transcript = transcript.slice(1);
 		transcript = [...transcript, entry];
+		queueMicrotask(scrollToConversationBottom);
 	}
 
 	function rowOf(data: unknown, key: string): string {
@@ -701,6 +754,10 @@
 						})
 					});
 				} else if (record?.status === 'final') {
+					const replyOutput = typeof record.output === 'string' ? record.output.trim() : '';
+					if (replyOutput !== '') {
+						latestAssistantReply = replyOutput;
+					}
 					pushEntry({
 						seq: event.seq,
 						kind: 'reply',
@@ -712,7 +769,10 @@
 							},
 							{
 								k: 'body',
-								v: 'held in the durable run history — the wire carries no reply text'
+								v:
+									replyOutput !== ''
+										? replyOutput
+										: 'held in the durable run history — the wire carries no reply text'
 							}
 						]
 					});
@@ -979,16 +1039,28 @@
 
 	function resetFold(): void {
 		transcript = [];
+		latestAssistantReply = '';
 		lastSeq = 0;
 		appliedEvents = 0;
 		streamProblem = null;
 		refreshProblem = null;
 	}
 
+	function onComposerKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+			event.preventDefault();
+			if (!composeBusy && composeMessage.trim() !== '') {
+				void submitCompose();
+			}
+		}
+	}
+
 	async function streamLoop(id: string, controller: AbortController): Promise<void> {
 		if (api === null) return;
+		let passCount = 0;
 		while (!disposed && id === activeRunId && !controller.signal.aborted) {
-			if (rootTerminal) break;
+			if (rootTerminal && passCount > 0) break;
+			passCount += 1;
 			try {
 				await api.streamConversationEvents(id, {
 					cursor: lastSeq > 0 ? String(lastSeq) : null,
@@ -1321,187 +1393,6 @@
 		</header>
 
 		<div class="mai-chat__body" hidden={isDocked && dockCollapsed} data-testid="chat-root">
-		<section class="mai-chat__section" aria-label="Compose" data-testid="chat-compose">
-			<div class="mai-chat__section-head">
-				<h4>New message</h4>
-			</div>
-
-			<div class="mai-chat__form">
-				<div class="mai-chat__composer-bar">
-					<div class="mai-chat__composer-input-wrap">
-						<label class="mai-chat__label" class:mai-chat__label--sr={isDocked} for="{uid}-message">Message</label>
-						<textarea
-							id="{uid}-message"
-							class="mai-chat__textarea"
-							tabindex={isDocked ? 1 : undefined}
-							bind:this={dockComposerEl}
-							placeholder="Ask M.A.I. or type @service to pin context…"
-							bind:value={composeMessage}
-							oninput={handleComposeInput}
-							rows={3}
-							data-testid="compose-message"
-						></textarea>
-					</div>
-					{#if isDocked}
-						<div class="mai-chat__actions">
-							<Button
-								size="sm"
-								pill
-								variant="secondary"
-								onclick={() => (advancedOpen = !advancedOpen)}
-								aria-expanded={advancedOpen}
-								data-testid="chat-advanced-toggle"
-							>
-								{advancedOpen ? 'Hide options' : 'Options'}
-							</Button>
-							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
-								Send
-							</Button>
-						</div>
-					{/if}
-				</div>
-				{#if composeFields.message}
-					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
-				{/if}
-				<div class="mai-chat__advanced" class:mai-chat__advanced--collapsed={isDocked && !advancedOpen}>
-					<div class="mai-chat__composer-profile">
-						<ModelProfileSelect
-							compact={isDocked}
-							bind:value={composeProfile}
-							error={composeFields.profile ?? ''}
-							testId="compose-profile"
-						/>
-					</div>
-					<Field
-						label="Capabilities"
-						bind:value={composeCapabilities}
-						data-testid="compose-capabilities"
-						error={composeFields.capabilities ?? ''}
-						hint="Comma-separated grant request; empty means NO capability."
-					/>
-					<fieldset class="mai-chat__children">
-						<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>
-						{#each composeChildren as _, index (index)}
-							<div class="mai-chat__child" data-testid="compose-child">
-								<Field
-									label="Child {index + 1} task"
-									bind:value={composeChildren[index]}
-									data-testid="compose-child-task"
-								/>
-								<Button
-									variant="secondary"
-									onclick={() => removeChildSlot(index)}
-									disabled={childSlots <= 1}
-									data-testid="child-remove"
-								>
-									Remove
-								</Button>
-							</div>
-						{/each}
-						<Button
-							variant="secondary"
-							onclick={addChildSlot}
-							disabled={childSlots >= MAX_CHILDREN}
-							data-testid="child-add"
-						>
-							Add child task
-						</Button>
-						{#if composeFields.children}
-							<p class="mai-chat__field-error" role="alert">{composeFields.children}</p>
-						{/if}
-					</fieldset>
-					<Field
-						label="Context attachments"
-						bind:value={composeAttachments}
-						data-testid="compose-attachments"
-						error={composeFields.attachments ?? ''}
-						hint="Op ids of stored artifacts of this server (comma-separated); references only."
-					/>
-				</div>
-				{#if !isDocked}
-					<div class="mai-chat__actions">
-						<Button onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
-							Send
-						</Button>
-					</div>
-				{/if}
-				{#if composeProblem !== null}
-					<div
-						class="mai-chat__state mai-chat__state--error"
-						role="alert"
-						data-testid="compose-error"
-						data-error-code={composeProblem.code}
-					>
-						<p>{composeProblem.message}</p>
-					</div>
-				{/if}
-			</div>
-		</section>
-
-		<section class="mai-chat__section mai-chat__section--history" aria-label="Conversations" data-testid="chat-history">
-			<div class="mai-chat__section-head">
-				<h4>Conversations</h4>
-				<Button variant="secondary" onclick={loadHistory} data-testid="history-refresh">
-					Refresh
-				</Button>
-			</div>
-			{#if historyState.status === 'loading'}
-				<div class="mai-chat__state" role="status" data-testid="history-loading">
-					<p>Loading conversations…</p>
-				</div>
-			{:else if historyState.status === 'error'}
-				<div
-					class="mai-chat__state mai-chat__state--error"
-					role="alert"
-					data-testid="history-error"
-					data-error-code={historyProblem?.code}
-				>
-					<p>{historyProblem?.message}</p>
-					<Button variant="secondary" onclick={loadHistory} data-testid="history-retry">
-						Retry
-					</Button>
-				</div>
-			{:else if historyRows.length === 0}
-				<div class="mai-chat__state" role="status" data-testid="history-empty">
-					<p>No conversations are recorded for this server.</p>
-				</div>
-			{:else}
-				<ul class="mai-chat__rows" data-testid="history-list">
-					{#each historyRows as row (row.run_id)}
-						<li class="mai-chat__row" data-testid="history-row" data-run-id={row.run_id}>
-							<div class="mai-chat__row-main">
-								<span class="mai-chat__row-id" data-testid="history-row-id">
-									{shortId(row.run_id)}
-								</span>
-								<span
-									class="mai-chat__badge"
-									class:mai-chat__badge--ok={row.state === 'succeeded'}
-									class:mai-chat__badge--danger={row.state === 'failed'}
-									class:mai-chat__badge--neutral={row.state === 'cancelled'}
-									data-testid="history-row-state"
-								>
-									{runStateText(row.state)}
-								</span>
-								<span class="mai-chat__meta">{row.model_profile}</span>
-							</div>
-							<div class="mai-chat__row-actions">
-								<Button
-									variant="secondary"
-									onclick={() => openConversation(row)}
-									data-testid="history-open"
-								>
-									Open
-								</Button>
-							</div>
-						</li>
-					{/each}
-				</ul>
-				<p class="mai-chat__meta" data-testid="history-total">
-					Showing {historyRows.length} of {historyTotal} recorded conversations.
-				</p>
-			{/if}
-		</section>
-
 		<section
 			class="mai-chat__section mai-chat__section--conversation"
 			class:mai-chat__section--idle={display === null}
@@ -1541,7 +1432,83 @@
 					Server {shortId(display.server_id)} · profile {display.model_profile} · grants
 					{grantsText}
 				</p>
-				<p class="mai-chat__message" data-testid="conversation-message">{messageText}</p>
+
+				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
+					<div class="mai-chat__bubble mai-chat__bubble--user">
+						<div class="mai-chat__bubble-header">
+							<span class="mai-chat__bubble-author">You</span>
+							<span class="mai-chat__bubble-time">{display.submitted_at}</span>
+						</div>
+						<div class="mai-chat__bubble-body" data-testid="conversation-message">
+							{messageText}
+						</div>
+					</div>
+
+					<div class="mai-chat__bubble mai-chat__bubble--assistant">
+						<div class="mai-chat__bubble-header">
+							<span class="mai-chat__bubble-author">⚙ M.A.I. ({display.model_profile})</span>
+							<span
+								class="mai-chat__badge"
+								class:mai-chat__badge--ok={display.state === 'succeeded'}
+								class:mai-chat__badge--danger={display.state === 'failed'}
+								class:mai-chat__badge--neutral={display.state === 'cancelled'}
+							>
+								{runStateText(display.state)}
+							</span>
+						</div>
+						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
+							{#if latestAssistantReply !== ''}
+								<div class="mai-chat__reply-text" data-testid="assistant-reply-text">
+									{latestAssistantReply}
+								</div>
+							{:else if !rootTerminal}
+								<div class="mai-chat__thinking" data-testid="assistant-thinking">
+									<span class="mai-chat__thinking-pulse"></span>
+									Thinking — gathering context & running tools…
+								</div>
+							{:else}
+								<div class="mai-chat__reply-placeholder">
+									(Assistant reply is recorded in the transcript events below)
+								</div>
+							{/if}
+						</div>
+					</div>
+
+					{#if transcript.length > 0}
+						<details class="mai-chat__transcript" data-testid="conversation-transcript">
+							<summary class="mai-chat__transcript-summary">
+								Agent activity &amp; events ({transcript.length} recorded)
+							</summary>
+							<ul data-testid="transcript-list">
+								{#each transcript as entry (entry.seq)}
+									<li
+										class="mai-chat__entry"
+										data-testid="transcript-entry"
+										data-kind={entry.kind}
+										data-seq={entry.seq}
+									>
+										<span class="mai-chat__entry-seq">#{entry.seq}</span>
+										<span class="mai-chat__entry-label" data-testid="transcript-label">
+											{entry.label}
+										</span>
+										{#if entry.rows.length > 0}
+											<dl class="mai-chat__entry-rows" data-testid="transcript-rows">
+												{#each entry.rows as row, rowIndex (rowIndex + row.k)}
+													<dt>{row.k}</dt>
+													<dd data-testid="transcript-value">{row.v}</dd>
+												{/each}
+											</dl>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						</details>
+					{:else}
+						<p class="mai-chat__meta" data-testid="transcript-empty">
+							No events are recorded yet.
+						</p>
+					{/if}
+				</div>
 
 				<div class="mai-chat__attachments" data-testid="conversation-attachments">
 					<h5>Permitted context attachments</h5>
@@ -1590,39 +1557,6 @@
 						{refreshProblem.message}
 					</p>
 				{/if}
-
-				<div class="mai-chat__transcript" data-testid="conversation-transcript">
-					<h5>Recorded transcript</h5>
-					{#if transcript.length === 0}
-						<p class="mai-chat__meta" data-testid="transcript-empty">
-							No events are recorded yet.
-						</p>
-					{:else}
-						<ul data-testid="transcript-list">
-							{#each transcript as entry (entry.seq)}
-								<li
-									class="mai-chat__entry"
-									data-testid="transcript-entry"
-									data-kind={entry.kind}
-									data-seq={entry.seq}
-								>
-									<span class="mai-chat__entry-seq">#{entry.seq}</span>
-									<span class="mai-chat__entry-label" data-testid="transcript-label">
-										{entry.label}
-									</span>
-									{#if entry.rows.length > 0}
-										<dl class="mai-chat__entry-rows" data-testid="transcript-rows">
-											{#each entry.rows as row, rowIndex (rowIndex + row.k)}
-												<dt>{row.k}</dt>
-												<dd data-testid="transcript-value">{row.v}</dd>
-											{/each}
-										</dl>
-									{/if}
-								</li>
-							{/each}
-						</ul>
-					{/if}
-				</div>
 
 				{#if showApprovalSection}
 					<div class="mai-chat__approval" data-testid="approval-section">
@@ -1700,6 +1634,189 @@
 				</div>
 			{/if}
 		</section>
+
+		<section class="mai-chat__section mai-chat__section--history" aria-label="Conversations" data-testid="chat-history">
+			<div class="mai-chat__section-head">
+				<h4>Conversations</h4>
+				<Button variant="secondary" onclick={loadHistory} data-testid="history-refresh">
+					Refresh
+				</Button>
+			</div>
+			{#if historyState.status === 'loading'}
+				<div class="mai-chat__state" role="status" data-testid="history-loading">
+					<p>Loading conversations…</p>
+				</div>
+			{:else if historyState.status === 'error'}
+				<div
+					class="mai-chat__state mai-chat__state--error"
+					role="alert"
+					data-testid="history-error"
+					data-error-code={historyProblem?.code}
+				>
+					<p>{historyProblem?.message}</p>
+					<Button variant="secondary" onclick={loadHistory} data-testid="history-retry">
+						Retry
+					</Button>
+				</div>
+			{:else if historyRows.length === 0}
+				<div class="mai-chat__state" role="status" data-testid="history-empty">
+					<p>No conversations are recorded for this server.</p>
+				</div>
+			{:else}
+				<ul class="mai-chat__rows" data-testid="history-list">
+					{#each historyRows as row (row.run_id)}
+						<li class="mai-chat__row" data-testid="history-row" data-run-id={row.run_id}>
+							<div class="mai-chat__row-main">
+								<span class="mai-chat__row-id" data-testid="history-row-id">
+									{shortId(row.run_id)}
+								</span>
+								<span
+									class="mai-chat__badge"
+									class:mai-chat__badge--ok={row.state === 'succeeded'}
+									class:mai-chat__badge--danger={row.state === 'failed'}
+									class:mai-chat__badge--neutral={row.state === 'cancelled'}
+									data-testid="history-row-state"
+								>
+									{runStateText(row.state)}
+								</span>
+								<span class="mai-chat__meta">{row.model_profile}</span>
+							</div>
+							<div class="mai-chat__row-actions">
+								<Button
+									variant="secondary"
+									onclick={() => openConversation(row)}
+									data-testid="history-open"
+								>
+									Open
+								</Button>
+							</div>
+						</li>
+					{/each}
+				</ul>
+				<p class="mai-chat__meta" data-testid="history-total">
+					Showing {historyRows.length} of {historyTotal} recorded conversations.
+				</p>
+			{/if}
+		</section>
+
+		<section class="mai-chat__section" aria-label="Compose" data-testid="chat-compose">
+			<div class="mai-chat__section-head">
+				<h4>New message</h4>
+			</div>
+
+			<div class="mai-chat__form">
+				<div class="mai-chat__composer-bar">
+					<div class="mai-chat__composer-input-wrap">
+						<label class="mai-chat__label" class:mai-chat__label--sr={isDocked} for="{uid}-message">Message</label>
+						<textarea
+							id="{uid}-message"
+							class="mai-chat__textarea"
+							tabindex={isDocked ? 1 : undefined}
+							bind:this={dockComposerEl}
+							placeholder="Ask M.A.I. or type @service to pin context…"
+							bind:value={composeMessage}
+							oninput={handleComposeInput}
+							onkeydown={onComposerKeydown}
+							rows={3}
+							data-testid="compose-message"
+						></textarea>
+					</div>
+					{#if isDocked}
+						<div class="mai-chat__actions">
+							<Button
+								size="sm"
+								pill
+								variant="secondary"
+								onclick={() => (advancedOpen = !advancedOpen)}
+								aria-expanded={advancedOpen}
+								data-testid="chat-advanced-toggle"
+							>
+								{advancedOpen ? 'Hide options' : 'Options'}
+							</Button>
+							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
+								Send
+							</Button>
+						</div>
+					{/if}
+				</div>
+				{#if composeFields.message}
+					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
+				{/if}
+				<div class="mai-chat__advanced" class:mai-chat__advanced--collapsed={isDocked && !advancedOpen}>
+					<div class="mai-chat__composer-profile">
+						<ModelProfileSelect
+							compact={isDocked}
+							bind:value={composeProfile}
+							error={composeFields.profile ?? ''}
+							testId="compose-profile"
+							live={profilesLive}
+						/>
+					</div>
+					<Field
+						label="Capabilities"
+						bind:value={composeCapabilities}
+						data-testid="compose-capabilities"
+						error={composeFields.capabilities ?? ''}
+						hint="Comma-separated grant request; empty means NO capability."
+					/>
+					<fieldset class="mai-chat__children">
+						<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>
+						{#each composeChildren as _, index (index)}
+							<div class="mai-chat__child" data-testid="compose-child">
+								<Field
+									label="Child {index + 1} task"
+									bind:value={composeChildren[index]}
+									data-testid="compose-child-task"
+								/>
+								<Button
+									variant="secondary"
+									onclick={() => removeChildSlot(index)}
+									disabled={childSlots <= 1}
+									data-testid="child-remove"
+								>
+									Remove
+								</Button>
+							</div>
+						{/each}
+						<Button
+							variant="secondary"
+							onclick={addChildSlot}
+							disabled={childSlots >= MAX_CHILDREN}
+							data-testid="child-add"
+						>
+							Add child task
+						</Button>
+						{#if composeFields.children}
+							<p class="mai-chat__field-error" role="alert">{composeFields.children}</p>
+						{/if}
+					</fieldset>
+					<Field
+						label="Context attachments"
+						bind:value={composeAttachments}
+						data-testid="compose-attachments"
+						error={composeFields.attachments ?? ''}
+						hint="Op ids of stored artifacts of this server (comma-separated); references only."
+					/>
+				</div>
+				{#if !isDocked}
+					<div class="mai-chat__actions">
+						<Button onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
+							Send
+						</Button>
+					</div>
+				{/if}
+				{#if composeProblem !== null}
+					<div
+						class="mai-chat__state mai-chat__state--error"
+						role="alert"
+						data-testid="compose-error"
+						data-error-code={composeProblem.code}
+					>
+						<p>{composeProblem.message}</p>
+					</div>
+				{/if}
+			</div>
+		</section>
 		</div>
 	{/if}
 </div>
@@ -1752,11 +1869,126 @@
 		gap: var(--mai-space-2);
 	}
 
+	.mai-chat__conversation-scroll {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-3);
+		max-height: 42dvh;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		padding-right: var(--mai-space-1);
+	}
+
+	.mai-chat--docked .mai-chat__conversation-scroll {
+		max-height: 32dvh;
+	}
+
+	.mai-chat__bubble {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+		padding: var(--mai-space-3) var(--mai-space-4);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+		background-color: var(--mai-color-surface-raised);
+		max-width: 88%;
+		box-shadow: var(--mai-shadow-sm);
+	}
+
+	.mai-chat__bubble--user {
+		align-self: flex-end;
+		margin-left: auto;
+		border-color: var(--mai-color-border-strong);
+	}
+
+	.mai-chat__bubble--assistant {
+		align-self: flex-start;
+		margin-right: auto;
+	}
+
+	.mai-chat__bubble-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-chat__bubble-author {
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+		color: var(--mai-color-brass);
+	}
+
+	.mai-chat__bubble-time {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-subtle);
+	}
+
+	.mai-chat__bubble-body {
+		font-size: var(--mai-text-sm);
+		line-height: 1.55;
+		color: var(--mai-color-text);
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+
+	.mai-chat__thinking {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		color: var(--mai-color-text-muted);
+		font-style: italic;
+	}
+
+	.mai-chat__thinking-pulse {
+		display: inline-block;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--mai-color-brass);
+		animation: mai-chat-pulse 1.2s ease-in-out infinite;
+	}
+
+	@keyframes mai-chat-pulse {
+		0%,
+		100% {
+			opacity: 0.35;
+			transform: scale(0.9);
+		}
+		50% {
+			opacity: 1;
+			transform: scale(1.15);
+		}
+	}
+
+	.mai-chat__reply-placeholder {
+		font-size: var(--mai-text-sm);
+		color: var(--mai-color-text-subtle);
+		font-style: italic;
+	}
+
+	.mai-chat__transcript {
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+		background-color: var(--mai-color-surface-sunken);
+		padding: var(--mai-space-2) var(--mai-space-3);
+	}
+
+	.mai-chat__transcript-summary {
+		cursor: pointer;
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-text-muted);
+		user-select: none;
+	}
+
 	.mai-chat--docked .mai-chat__section--conversation {
-		max-height: 28vh;
-		overflow: auto;
 		padding: var(--mai-card-pad);
-		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-lg);
 	}
@@ -2146,14 +2378,6 @@
 
 	.mai-chat__note--error {
 		color: var(--color-danger, inherit);
-	}
-
-	.mai-chat__message {
-		margin: 0;
-		white-space: pre-wrap;
-		overflow-wrap: anywhere;
-		border-left: 3px solid var(--border-subtle, currentColor);
-		padding-left: var(--space-2, 0.5rem);
 	}
 
 	.mai-chat__attachments,

@@ -532,7 +532,9 @@
 		streamConversationEvents: browserChatEventStream,
 		readRun: api.readRun,
 		readApproval: api.readApproval,
-		decideApproval: api.decideApproval
+		decideApproval: api.decideApproval,
+		/** Live-transport marker read by ChatPanel.profilesLive (not on the wire). */
+		listProfiles: async () => []
 	};
 
 	const jobsApi: JobsApi = {

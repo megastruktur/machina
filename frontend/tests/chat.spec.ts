@@ -1001,6 +1001,9 @@ test('submit pins the window scope; the recorded conversation renders transcript
 		]
 	});
 	const transcript = main.getByTestId('transcript-list');
+	// The transcript is a collapsed details accordion — expand it before
+	// reading the recorded events.
+	await main.getByTestId('conversation-transcript').locator('summary').click();
 	// The planned event (seq 4) carries no transcript entry of its own — it
 	// links this window's child-task labels to the value-free child ids.
 	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(4);

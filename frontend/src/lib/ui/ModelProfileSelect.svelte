@@ -6,6 +6,7 @@
 	 * clean `<Select>` dropdown while preserving a synced visually-hidden input
 	 * for existing automated `.fill()` assertions.
 	 */
+	import { onMount } from 'svelte';
 	import Select from './Select.svelte';
 
 	const DEFAULT_PROFILES = ['default', 'fast', 'reasoning', 'fixture-fast'] as const;
@@ -21,6 +22,13 @@
 		error?: string;
 		/** Test id for automated test bindings (`compose-profile`). */
 		testId?: string;
+		/**
+		 * Fetch live profiles from `/api/v1/models` on mount.
+		 * Defaults to `false` — enable explicitly in the live Chat panel so
+		 * offline fixture harnesses (desktop-shell / chat.spec) never fire a
+		 * real network request.
+		 */
+		live?: boolean;
 	};
 
 	const uid = $props.id();
@@ -30,11 +38,55 @@
 		options = DEFAULT_PROFILES,
 		compact = false,
 		error = '',
-		testId = 'compose-profile'
+		testId = 'compose-profile',
+		live = false
 	}: Props = $props();
 
+	let liveProfiles = $state<string[]>([]);
+
+	onMount(() => {
+		if (!live) return;
+		let cancelled = false;
+		void (async () => {
+			try {
+				const res = await fetch('/api/v1/models', {
+					method: 'GET',
+					credentials: 'same-origin',
+					headers: { accept: 'application/json' }
+				});
+				if (!res.ok || cancelled) return;
+				const body = (await res.json()) as {
+					profiles?: Array<{ name?: unknown }>;
+					selection?: { profile?: unknown } | null;
+				};
+				if (cancelled) return;
+				const names: string[] = [];
+				if (
+					body.selection &&
+					typeof body.selection.profile === 'string' &&
+					body.selection.profile.trim() !== ''
+				) {
+					names.push(body.selection.profile.trim());
+				}
+				if (Array.isArray(body.profiles)) {
+					for (const item of body.profiles) {
+						if (typeof item?.name === 'string' && item.name.trim() !== '') {
+							names.push(item.name.trim());
+						}
+					}
+				}
+				liveProfiles = names;
+			} catch {
+				// Offline or fixture harness — fall back to static options silently.
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
 	const mergedOptions = $derived.by(() => {
-		const set = new Set<string>(options);
+		const set = new Set<string>([...liveProfiles, ...options]);
 		if (value && value.trim() !== '') set.add(value);
 		return [...set];
 	});

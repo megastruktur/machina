@@ -995,7 +995,11 @@ class AgentRunExecutor:
         await self._emit_round_event(
             intent.run_id,
             round_index,
-            {"status": "final", "output_chars": len(str(output))},
+            {
+                "status": "final",
+                "output_chars": len(str(output)),
+                "output": str(output),
+            },
         )
         return {
             "status": "final",

@@ -358,6 +358,39 @@ def load_server_context(
             ContextErrorCode.SERVER_ID_INVALID,
             "server_id must be a uuid.UUID instance",
         )
+    if server_id == uuid.UUID(int=0):
+        general_yaml = (
+            "schema_version: 1\n"
+            "server_id: 00000000-0000-0000-0000-000000000000\n"
+            "name: general_consult\n"
+            "prompt_revision: 1\n"
+            "environment: linux_ssh\n"
+            "ssh:\n"
+            "  host: 127.0.0.1\n"
+            "  port: 22\n"
+            "  user: mai\n"
+            "  host_key: SHA256:generalconsult00000000000000000000000000000\n"
+            "  credential_ref: MAI_GENERAL_CONSULT\n"
+            "privilege: none\n"
+            "capabilities: []\n"
+        )
+        profile = parse_server_profile_text(general_yaml)
+        prompt_text = (
+            "# General Consult Mode\n"
+            "No target server is pinned for this conversation. "
+            "Provide clear, accurate technical assistance for Linux, Docker, "
+            "self-hosted services, and Machina operations.\n"
+        )
+        return ServerContextMaterials(
+            server_id=server_id,
+            profile=profile,
+            prompt_text=prompt_text,
+            prompt_revision=1,
+            prompt_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+            profile_revision=1,
+            profile_schema_revision=1,
+            profile_sha256=hashlib.sha256(general_yaml.encode("utf-8")).hexdigest(),
+        )
     store = ProfileFileStore(root)
     stored = store.read(server_id)
     profile = parse_server_profile_text(stored.text)

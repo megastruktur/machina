@@ -121,6 +121,12 @@ export interface ChatApi {
 	readApproval(approvalId: string): Promise<ApprovalView>;
 	/** POST /api/v1/approvals/{approval_id}/decision — one-use consume. */
 	decideApproval(approvalId: string, payload: DecisionBody): Promise<ApprovalView>;
+	/**
+	 * OPTIONAL live-transport marker: present only on the real backend HTTP
+	 * slice (ChatPanel reads it to decide whether ModelProfileSelect may fetch
+	 * `/api/v1/models`). Not part of the wire contract.
+	 */
+	listProfiles?(): Promise<readonly string[]>;
 }
 
 /** One server option offered by the draft-mode server picker. */
