@@ -380,10 +380,43 @@ const APP_SOURCE = `
 			if (!UUID_RE.test(payload.application_id)) {
 				throw new ApiError(422, 'validation_failed', 'application_id must be a canonical UUID string');
 			}
-			for (const scope of Object.values(adopted)) {
-				if (scope[payload.application_id]) {
-					throw new ApiError(409, 'conflict', 'duplicate adoption or selector overlap');
+			// Cross-server identity: a live id under ANOTHER server is refused
+			// (adoption never relocates an identity across servers).
+			for (const [scopeId, scope] of Object.entries(adopted)) {
+				if (scopeId !== serverId && scope[payload.application_id]) {
+					throw new ApiError(409, 'conflict', 'cross-server identity conflict');
 				}
+			}
+			const live = (adopted[serverId] || {})[payload.application_id];
+			if (live) {
+				// The Service Map re-adoption path: the SAME identity ships the
+				// observed revision and the producer reconciles the metadata
+				// update (category/description/instructions); anything else is
+				// the honest stale/duplicate conflict.
+				if (payload.expected_revision !== live.revision) {
+					throw new ApiError(409, 'conflict', 'stale revision or canonical state conflict');
+				}
+				live.name = payload.name;
+				live.revision = live.revision + 1;
+				live.category = payload.category ?? live.category ?? 'system';
+				live.description = payload.description ?? live.description ?? '';
+				if (payload.instructions) live.instructions = deep(payload.instructions);
+				const updated = {
+					intent_id: INTENT_ID,
+					application_id: payload.application_id,
+					server_id: serverId,
+					outcome: 'applied',
+					revision: live.revision,
+					sha256: live.sha256,
+					application: deep(live),
+					record_doc: { status: 'documented', doc_id: RECORD_DOC_ID }
+				};
+				if (pendingAdopt) {
+					// The slot stays SET until releaseAdopt consumes it.
+					const released = await pendingAdopt.promise;
+					return deep(released);
+				}
+				return deep(updated);
 			}
 			if (payload.expected_revision !== 0) {
 				throw new ApiError(409, 'conflict', 'stale revision or canonical state conflict');
@@ -396,6 +429,9 @@ const APP_SOURCE = `
 				external_working_dir: payload.external_working_dir,
 				external_config_files: [...(payload.external_config_files || [])],
 				external_environment_files: [...(payload.external_environment_files || [])],
+				category: payload.category ?? 'system',
+				description: payload.description ?? '',
+				instructions: payload.instructions ? deep(payload.instructions) : undefined,
 				sha256: 'c'.repeat(64)
 			});
 			adopted[serverId] = adopted[serverId] || {};
@@ -1444,4 +1480,477 @@ test('an adoption conflict is refused with the honest vocabulary and nothing cha
 	// The inventory still holds exactly the pre-existing record.
 	await hostA.getByTestId('tab-inventory').click();
 	await expect(hostA.getByTestId('inventory-row')).toHaveCount(1);
+});
+
+// ---------------------------------------------------------------------------
+// Service Map & Category Taxonomy (campaign mechanicus-ui, mui_04)
+// ---------------------------------------------------------------------------
+
+/** One adopted page record WITH Service Map metadata (released over the list gate). */
+const METRICS_MAPPED = {
+	application_id: APP_ADOPTED,
+	server_id: SERVER_A,
+	name: 'metrics-stack',
+	origin: 'compose',
+	compose_project: 'metrics',
+	working_dir: '/srv/metrics',
+	unit_name: null,
+	external_working_dir: '/srv/metrics',
+	external_config_files: ['/srv/metrics/compose.yaml'],
+	external_environment_files: ['/srv/metrics/.env'],
+	revision: 2,
+	schema_revision: 1,
+	sha256: 'a'.repeat(64),
+	adopted_at: '2026-10-16T10:00:00Z',
+	reconciled_at: '2026-10-16T10:00:00Z',
+	stale: false,
+	category: 'observability',
+	description: 'Metrics and alerting stack.',
+	instructions: {
+		install: 'docker compose up -d',
+		update: 'docker compose pull && docker compose up -d',
+		uninstall: 'docker compose down',
+		backup: 'restic backup /srv/metrics',
+		verify: 'curl -fsS localhost:9090/-/healthy'
+	}
+};
+
+/** A second mapped record in another category (the filter-pill target). */
+const GAMES_MAPPED = {
+	application_id: APP_BETA,
+	server_id: SERVER_A,
+	name: 'game-server',
+	origin: 'compose',
+	compose_project: 'games',
+	working_dir: '/opt/games',
+	unit_name: null,
+	external_working_dir: null,
+	external_config_files: [],
+	external_environment_files: [],
+	revision: 1,
+	schema_revision: 1,
+	sha256: 'b'.repeat(64),
+	adopted_at: '2026-10-16T11:00:00Z',
+	reconciled_at: '2026-10-16T11:00:00Z',
+	stale: false,
+	category: 'games',
+	description: ''
+};
+
+/** Release a Service Map page (with metadata) over the armed list gate. */
+async function releaseMappedPage(page: Page): Promise<void> {
+	await apiCall(page, 'armDeferredList');
+	await page.getByTestId('host-a').getByTestId('inventory-refresh').click();
+	await apiCall(page, 'releaseList', [
+		{
+			server_id: SERVER_A,
+			applications: [METRICS_MAPPED, GAMES_MAPPED],
+			limit: 50,
+			offset: 0,
+			total: 2
+		}
+	]);
+}
+
+test('the service map renders category chips, filter pills, descriptions and the operational runbook', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+	await releaseMappedPage(page);
+
+	// Category chips on both mapped rows (label via the built-in taxonomy).
+	const rows = hostA.getByTestId('inventory-row');
+	await expect(rows).toHaveCount(2);
+	const metricsRow = rows.filter({ hasText: 'metrics-stack' });
+	await expect(metricsRow.getByTestId('service-category-chip')).toHaveAttribute(
+		'data-category',
+		'observability'
+	);
+	await expect(metricsRow.getByTestId('service-category-chip')).toHaveText('Observability & Backup');
+	const gamesRow = rows.filter({ hasText: 'game-server' });
+	await expect(gamesRow.getByTestId('service-category-chip')).toHaveAttribute(
+		'data-category',
+		'games'
+	);
+
+	// Category filter pills: All + the two present categories (taxonomy order).
+	const pills = hostA.getByTestId('category-filter-pill');
+	await expect(pills).toHaveCount(3);
+	await expect(pills.nth(0)).toHaveAttribute('data-category', 'all');
+	await expect(pills.nth(1)).toHaveAttribute('data-category', 'games');
+	await expect(pills.nth(2)).toHaveAttribute('data-category', 'observability');
+	await expect(pills.nth(1)).toHaveText('Games');
+
+	// Filtering is a client-side view over the adopted page: pill clicks add
+	// ZERO wire calls (the four panel mounts + the one refresh above are all).
+	const listCallsBefore = (await apiState(page)).calls.filter(
+		(call) => call.op === 'listAdopted'
+	).length;
+	await pills.nth(1).click();
+	await expect(hostA.getByTestId('inventory-row')).toHaveCount(1);
+	await expect(hostA.getByTestId('inventory-row-name')).toHaveText('game-server');
+	await pills.nth(0).click();
+	await expect(hostA.getByTestId('inventory-row')).toHaveCount(2);
+	const listCallsAfter = (await apiState(page)).calls.filter(
+		(call) => call.op === 'listAdopted'
+	).length;
+	expect(listCallsAfter).toBe(listCallsBefore);
+
+	// Installation description + the five-slot runbook on the mapped row.
+	await expect(metricsRow.getByTestId('service-description')).toHaveText(
+		'Metrics and alerting stack.'
+	);
+	await expect(gamesRow.getByTestId('service-description')).toHaveCount(0);
+	await expect(metricsRow.getByTestId('service-instructions')).toBeVisible();
+	const steps = metricsRow.getByTestId('runbook-step');
+	await expect(steps).toHaveCount(5);
+	await expect(metricsRow.locator('[data-step="install"]')).toHaveText('docker compose up -d');
+	await expect(metricsRow.locator('[data-step="verify"]')).toHaveText(
+		'curl -fsS localhost:9090/-/healthy'
+	);
+	// A record without runbook renders the honest empty state, never fakes one.
+	await expect(gamesRow.getByTestId('runbook-step')).toHaveCount(0);
+	await expect(gamesRow.getByTestId('service-instructions')).toContainText(
+		'No runbook instructions recorded'
+	);
+});
+
+test('one-click Chat @service tags the pinned server and service on the window for the dock', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+	await releaseMappedPage(page);
+
+	await page.evaluate(() => {
+		const target = window as unknown as { __chatTag?: unknown };
+		target.__chatTag = null;
+		window.addEventListener('mai:chat-focus-service', (event) => {
+			target.__chatTag = (event as CustomEvent).detail;
+		});
+	});
+
+	const metricsRow = hostA.getByTestId('inventory-row').filter({ hasText: 'metrics-stack' });
+	await metricsRow.getByTestId('service-chat-trigger').click();
+
+	const detail = await page.evaluate(() => {
+		return (window as unknown as { __chatTag?: unknown }).__chatTag;
+	});
+	expect(detail).toEqual({
+		serverId: SERVER_A,
+		serviceName: 'metrics-stack',
+		applicationId: APP_ADOPTED,
+		category: 'observability'
+	});
+});
+
+test('discovery rows render suggested category chips from the hint or the heuristic fallback', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+
+	// The fixture snapshot omits suggested_category: the deterministic
+	// client-side keyword heuristic classifies each observation.
+	await hostA.getByTestId('tab-discovery').click();
+	await hostA.getByTestId('discovery-observe').click();
+	const rows = hostA.getByTestId('discovery-row');
+	await expect(rows).toHaveCount(4);
+	await expect(
+		rows.filter({ hasText: 'metrics' }).getByTestId('discovery-category-chip')
+	).toHaveAttribute('data-category', 'observability');
+	await expect(
+		rows.filter({ hasText: 'blog' }).getByTestId('discovery-category-chip')
+	).toHaveAttribute('data-category', 'media');
+	await expect(
+		rows.filter({ hasText: 'legacy-cron' }).getByTestId('discovery-category-chip')
+	).toHaveAttribute('data-category', 'system');
+	await expect(
+		rows.filter({ hasText: 'nginx.service' }).getByTestId('discovery-category-chip')
+	).toHaveAttribute('data-category', 'infrastructure');
+	await expect(
+		rows.filter({ hasText: 'blog' }).getByTestId('discovery-category-chip')
+	).toHaveText('Media & Content');
+
+	// The producer hint wins when the snapshot carries it.
+	await apiCall(page, 'armDeferredDiscover');
+	await hostA.getByTestId('discovery-observe').click();
+	await apiCall(page, 'releaseDiscover', [
+		{
+			server_id: SERVER_A,
+			observed_at: '2026-10-17T10:00:00Z',
+			applications: [
+				{
+					origin: 'compose',
+					managed: false,
+					application_id: null,
+					suggested_category: 'ai',
+					detail: {
+						kind: 'compose_project',
+						project_name: 'ollama',
+						working_dir: '/srv/ollama',
+						config_files: [],
+						environment_files: [],
+						services: ['ollama'],
+						containers: []
+					}
+				}
+			],
+			listen_ports: [],
+			lanes: [
+				{
+					lane: 'docker',
+					state: 'observed',
+					detail: 'docker ps parsed',
+					truncated: false,
+					malformed_lines: 0
+				}
+			]
+		}
+	]);
+	const hintRow = hostA.getByTestId('discovery-row').filter({ hasText: 'ollama' });
+	await expect(hintRow.getByTestId('discovery-category-chip')).toHaveAttribute(
+		'data-category',
+		'ai'
+	);
+	await expect(hintRow.getByTestId('discovery-category-chip')).toHaveText('AI & Models');
+});
+
+test('the category taxonomy menu lists the 8 built-ins and mints custom categories into every picker', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+
+	await hostA.getByTestId('tab-categories').click();
+	const menu = hostA.getByTestId('category-taxonomy-menu');
+	await expect(menu).toBeVisible();
+	const rows = hostA.getByTestId('category-taxonomy-row');
+	await expect(rows).toHaveCount(8);
+	for (const [machineId, label] of [
+		['games', 'Games'],
+		['ai', 'AI & Models'],
+		['agent', 'Autonomous Agents'],
+		['system', 'System & OS'],
+		['dev', 'Development & CI'],
+		['infrastructure', 'Infrastructure & Proxy'],
+		['media', 'Media & Content'],
+		['observability', 'Observability & Backup']
+	] as const) {
+		const row = hostA.locator(
+			'[data-testid="category-taxonomy-row"][data-category="' + machineId + '"]'
+		);
+		await expect(row).toContainText(label);
+		await expect(row.getByTestId('category-taxonomy-id')).toHaveText(machineId);
+		await expect(row.getByTestId('category-taxonomy-description')).not.toHaveText('');
+		await expect(row).toContainText('built-in');
+	}
+
+	// Validation: a non-slug machine id refuses locally, nothing is minted.
+	await hostA.getByTestId('category-id-input').fill('Bad ID');
+	await hostA.getByTestId('category-label-input').fill('Broken');
+	await hostA.getByTestId('category-save-btn').click();
+	await expect(hostA.getByTestId('category-id-input')).toHaveAttribute('aria-invalid', 'true');
+	await expect(hostA.getByTestId('category-taxonomy-row')).toHaveCount(8);
+
+	// Mint a custom category: it joins the taxonomy immediately.
+	await hostA.getByTestId('category-id-input').fill('homelab');
+	await hostA.getByTestId('category-label-input').fill('Homelab');
+	await hostA.getByTestId('category-desc-input').fill('Personal homelab experiments.');
+	await hostA.getByTestId('category-save-btn').click();
+	const customRow = hostA.locator(
+		'[data-testid="category-taxonomy-row"][data-category="homelab"]'
+	);
+	await expect(customRow).toContainText('Homelab');
+	await expect(customRow).toContainText('homelab');
+	await expect(customRow).toContainText('Personal homelab experiments.');
+	await expect(customRow).toContainText('custom');
+	await expect(hostA.getByTestId('category-taxonomy-row')).toHaveCount(9);
+	// The form resets for the next mint.
+	await expect(hostA.getByTestId('category-id-input')).toHaveValue('');
+
+	// The minted category is already in the adoption picker.
+	await hostA.getByTestId('tab-discovery').click();
+	await hostA.getByTestId('discovery-observe').click();
+	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
+	await expect(hostA.getByTestId('adopt-category-select')).toContainText('Homelab');
+	// The suggested classification pre-selects the media category.
+	await expect(hostA.getByTestId('adopt-category-select')).toHaveValue('media');
+});
+
+test('adoption ships category, description and instructions only when explicitly set', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+
+	await hostA.getByTestId('tab-discovery').click();
+	await hostA.getByTestId('discovery-observe').click();
+	await hostA.getByTestId('discovery-row').filter({ hasText: 'blog' }).getByTestId('adopt-start').click();
+	await hostA.getByTestId('adopt-application-id').fill(APP_NEW);
+
+	// Explicit metadata: category changed away from the suggestion, a
+	// description, and two runbook slots — all three ride the request.
+	await hostA.getByTestId('adopt-category-select').selectOption('games');
+	await hostA.getByTestId('adopt-description-input').fill('Blog site.');
+	await hostA.getByTestId('adopt-instructions-install').fill('docker compose up -d');
+	await hostA.getByTestId('adopt-instructions-verify').fill('curl -fsS localhost');
+	await hostA.getByTestId('adopt-submit').click();
+	await expect(hostA.getByTestId('adopt-result')).toBeVisible();
+
+	const { calls } = await apiState(page);
+	expect(lastCall(calls, 'adopt').payload).toEqual({
+		application_id: APP_NEW,
+		name: 'blog',
+		origin: 'compose',
+		compose_project: 'blog',
+		working_dir: '/srv/blog',
+		unit_name: null,
+		external_working_dir: '/srv/blog',
+		external_config_files: ['/srv/blog/compose.yaml'],
+		external_environment_files: ['/srv/blog/.env'],
+		expected_revision: 0,
+		category: 'games',
+		description: 'Blog site.',
+		instructions: {
+			install: 'docker compose up -d',
+			update: '',
+			uninstall: '',
+			backup: '',
+			verify: 'curl -fsS localhost'
+		}
+	});
+
+	// The committed record carries the map metadata into the inventory.
+	await hostA.getByTestId('tab-inventory').click();
+	const blogRow = hostA.getByTestId('inventory-row').filter({ hasText: 'blog' });
+	await expect(blogRow.getByTestId('service-category-chip')).toHaveAttribute(
+		'data-category',
+		'games'
+	);
+	await expect(blogRow.getByTestId('service-description')).toHaveText('Blog site.');
+	await expect(blogRow.locator('[data-step="install"]')).toHaveText('docker compose up -d');
+});
+
+test('a minted custom category rides the next adoption via upsert_categories', async ({ page }) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+
+	await hostA.getByTestId('tab-categories').click();
+	await hostA.getByTestId('category-id-input').fill('homelab');
+	await hostA.getByTestId('category-label-input').fill('Homelab');
+	await hostA.getByTestId('category-desc-input').fill('Personal homelab experiments.');
+	await hostA.getByTestId('category-save-btn').click();
+	await expect(hostA.getByTestId('category-taxonomy-row')).toHaveCount(9);
+
+	// Adopt WITHOUT touching any optional field: the taxonomy upsert still
+	// rides the same reviewed mutation; the create payload otherwise stays
+	// exactly the ten frozen keys.
+	await hostA.getByTestId('tab-discovery').click();
+	await hostA.getByTestId('discovery-observe').click();
+	await hostA
+		.getByTestId('discovery-row')
+		.filter({ hasText: 'blog' })
+		.getByTestId('adopt-start')
+		.click();
+	await hostA.getByTestId('adopt-application-id').fill(APP_NEW);
+	await hostA.getByTestId('adopt-submit').click();
+	await expect(hostA.getByTestId('adopt-result')).toBeVisible();
+
+	const { calls } = await apiState(page);
+	expect(lastCall(calls, 'adopt').payload).toEqual({
+		application_id: APP_NEW,
+		name: 'blog',
+		origin: 'compose',
+		compose_project: 'blog',
+		working_dir: '/srv/blog',
+		unit_name: null,
+		external_working_dir: '/srv/blog',
+		external_config_files: ['/srv/blog/compose.yaml'],
+		external_environment_files: ['/srv/blog/.env'],
+		expected_revision: 0,
+		upsert_categories: [
+			{
+				machine_id: 'homelab',
+				label: 'Homelab',
+				description: 'Personal homelab experiments.'
+			}
+		]
+	});
+});
+
+test('map-details editing re-adopts with the observed revision and a stale revision is refused honestly', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	await expect(hostA.getByTestId('apps-root')).toBeVisible();
+	await releaseMappedPage(page);
+
+	const metricsRow = hostA.getByTestId('inventory-row').filter({ hasText: 'metrics-stack' });
+
+	// The editor arrives pre-filled with the stored map metadata.
+	await metricsRow.getByTestId('service-edit-start').click();
+	await expect(hostA.getByTestId('service-edit-form')).toBeVisible();
+	await expect(hostA.getByTestId('service-edit-category')).toHaveValue('observability');
+	await expect(hostA.getByTestId('service-edit-description')).toHaveValue(
+		'Metrics and alerting stack.'
+	);
+	await expect(hostA.getByTestId('service-edit-instructions-install')).toHaveValue(
+		'docker compose up -d'
+	);
+
+	// Change the category, the description and one runbook slot; save.
+	await hostA.getByTestId('service-edit-category').selectOption('games');
+	await hostA.getByTestId('service-edit-description').fill('Relocated to games.');
+	await hostA.getByTestId('service-edit-instructions-install').fill('make deploy');
+	await hostA.getByTestId('service-edit-save').click();
+	await expect(hostA.getByTestId('service-edit-form')).toHaveCount(0);
+
+	// The re-adoption names the same identity at the observed revision and
+	// carries the metadata; the external deployment paths are retained.
+	const { calls } = await apiState(page);
+	expect(lastCall(calls, 'adopt').payload).toEqual({
+		application_id: APP_ADOPTED,
+		name: 'metrics-stack',
+		origin: 'compose',
+		compose_project: 'metrics',
+		working_dir: '/srv/metrics',
+		unit_name: null,
+		external_working_dir: '/srv/metrics',
+		external_config_files: ['/srv/metrics/compose.yaml'],
+		external_environment_files: ['/srv/metrics/.env'],
+		expected_revision: 2,
+		category: 'games',
+		description: 'Relocated to games.',
+		instructions: {
+			install: 'make deploy',
+			update: 'docker compose pull && docker compose up -d',
+			uninstall: 'docker compose down',
+			backup: 'restic backup /srv/metrics',
+			verify: 'curl -fsS localhost:9090/-/healthy'
+		}
+	});
+
+	// The row paints the reconciled metadata without a refetch.
+	await expect(metricsRow.getByTestId('service-category-chip')).toHaveAttribute(
+		'data-category',
+		'games'
+	);
+	await expect(metricsRow.getByTestId('service-description')).toHaveText('Relocated to games.');
+	await expect(metricsRow.locator('[data-step="install"]')).toHaveText('make deploy');
+
+	// Stale: the record moved elsewhere; the editor still ships the observed
+	// revision, the producer refuses, the row stays and the error is honest.
+	await apiCall(page, 'setRevision', [APP_ADOPTED, 9]);
+	await metricsRow.getByTestId('service-edit-start').click();
+	await hostA.getByTestId('service-edit-save').click();
+	const editError = hostA.getByTestId('service-edit-error');
+	await expect(editError).toBeVisible();
+	await expect(editError).toHaveAttribute('data-error-code', 'conflict');
+	await expect(hostA.getByTestId('service-edit-form')).toBeVisible();
+	await expect(metricsRow.getByTestId('service-category-chip')).toHaveAttribute(
+		'data-category',
+		'games'
+	);
 });

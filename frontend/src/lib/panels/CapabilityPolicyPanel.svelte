@@ -56,6 +56,7 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { Ban, FingerprintPattern, Scale, ShieldCheck } from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -514,10 +515,18 @@
 		<header class="mai-policy__header">
 			{#if revisionShown !== null}
 				<p class="mai-policy__revision" data-testid="policy-revision">
-					Policy revision {revisionShown}{#if shaShown}&nbsp;· <code>sha256 {shaShown}</code>{/if}
+					Policy revision
+					<code class="mai-policy__chip mai-policy__chip--rev">{revisionShown}</code>
+					{#if shaShown}
+						<code class="mai-policy__chip">sha256 {shaShown}</code>
+					{/if}
 				</p>
 			{:else}
-				<p class="mai-policy__revision" data-testid="policy-empty" role="status">
+				<p
+					class="mai-policy__revision mai-policy__revision--empty"
+					data-testid="policy-empty"
+					role="status"
+				>
 					No capability policy has been committed yet — the controls below create revision 1.
 				</p>
 			{/if}
@@ -543,7 +552,15 @@
 
 		<!-- Control group 1: standing permission (enabled tools). -->
 		<section class="mai-policy__section" aria-label="Enabled tools (grants)" data-testid="grants-section">
-			<h3 class="mai-policy__heading">Enabled tools (grants)</h3>
+			<div class="mai-policy__section-head">
+				<ShieldCheck size={15} aria-hidden="true" />
+				<h3 class="mai-policy__heading">Enabled tools (grants)</h3>
+				{#if revisionShown !== null}
+					<code class="mai-policy__chip mai-policy__chip--rev mai-policy__section-rev">
+						rev {revisionShown}
+					</code>
+				{/if}
+			</div>
 			<p class="mai-policy__note" data-testid="mode-note">
 				Ask/delegated prompting is chosen per run by the agent host (C03 rule 5) and is not
 				stored in this policy: privileged operations always ask for a decision, read-only
@@ -558,18 +575,20 @@
 				<ul class="mai-policy__grants" data-testid="grant-list">
 					{#each grants as grant (grant.capability_id)}
 						<li class="mai-policy__grant" data-testid="grant-row">
-							<span class="mai-policy__capability" data-testid="grant-capability">
-								{grant.capability_id}
-							</span>
-							{#if deniedSet.has(grant.capability_id)}
-								<span class="mai-policy__badge" data-testid="grant-denied-badge" role="status">
-									denied by policy (takes precedence)
+							<div class="mai-policy__grant-head">
+								<span class="mai-policy__capability" data-testid="grant-capability">
+									{grant.capability_id}
 								</span>
-							{/if}
+								{#if deniedSet.has(grant.capability_id)}
+									<span class="mai-policy__badge" data-testid="grant-denied-badge" role="status">
+										denied by policy (takes precedence)
+									</span>
+								{/if}
+							</div>
 							<ul class="mai-policy__servers">
 								{#each grant.server_ids as serverId (serverId)}
 									<li class="mai-policy__server" data-testid="grant-server">
-										<code>{serverId}</code>
+										<code class="mai-policy__chip">{serverId}</code>
 										<Button
 											variant="danger"
 											disabled={editsBlocked}
@@ -613,7 +632,10 @@
 		</section>
 
 		<section class="mai-policy__section" aria-label="Disabled tools (deny list)" data-testid="deny-section">
-			<h3 class="mai-policy__heading">Disabled tools (deny list)</h3>
+			<div class="mai-policy__section-head">
+				<Ban size={15} aria-hidden="true" />
+				<h3 class="mai-policy__heading">Disabled tools (deny list)</h3>
+			</div>
 			<p class="mai-policy__note">
 				A denied capability is refused everywhere — deny takes precedence over any grant,
 				registration or mode (C03 rule 5).
@@ -665,7 +687,10 @@
 			aria-label="Pending operation decisions (ask)"
 			data-testid="approvals-section"
 		>
-			<h3 class="mai-policy__heading">Pending operation decisions (ask)</h3>
+			<div class="mai-policy__section-head">
+				<Scale size={15} aria-hidden="true" />
+				<h3 class="mai-policy__heading">Pending operation decisions (ask)</h3>
+			</div>
 			<p class="mai-policy__note">
 				An approval binds one operation's payload hash, exact server target, scope and policy
 				revision with an expiry (C03 rule 4). Approving presents that operation binding under
@@ -711,10 +736,13 @@
 				</div>
 			{:else if approval}
 				<div class="mai-policy__preview" data-testid="approval-preview">
-					<p class="mai-policy__target" data-testid="approval-target">
-						Operation: <strong>{approval.capability_id}</strong> on server
-						<code>{approval.server_id}</code>
-					</p>
+					<div class="mai-policy__preview-head">
+						<FingerprintPattern size={14} aria-hidden="true" />
+						<p class="mai-policy__target" data-testid="approval-target">
+							Operation: <strong>{approval.capability_id}</strong> on server
+							<code>{approval.server_id}</code>
+						</p>
+					</div>
 					<dl class="mai-policy__rows">
 						<div class="mai-policy__row">
 							<dt>Payload hash</dt>
@@ -722,7 +750,9 @@
 						</div>
 						<div class="mai-policy__row">
 							<dt>Bound policy revision</dt>
-							<dd data-testid="approval-policy-revision">{approval.policy_revision}</dd>
+							<dd class="mai-policy__chip" data-testid="approval-policy-revision">
+								{approval.policy_revision}
+							</dd>
 						</div>
 						<div class="mai-policy__row">
 							<dt>Status</dt>
@@ -785,19 +815,21 @@
 		gap: var(--mai-space-4);
 		height: 100%;
 		padding: var(--mai-space-4);
-		background: var(--mai-color-surface);
+		background: var(--mai-color-bg);
 		color: var(--mai-color-text);
 		font-family: var(--mai-font-sans);
-		font-size: var(--mai-font-size-sm, 0.875rem);
+		font-size: var(--mai-text-sm);
 		line-height: var(--mai-leading-normal);
 		overflow-y: auto;
 	}
 
+	/* Status plates: loading / error / fail-closed mounts. */
 	.mai-policy__state {
 		padding: var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md);
 		background: var(--mai-color-surface-raised);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-policy__state--error {
@@ -806,15 +838,55 @@
 		color: var(--mai-status-danger-text);
 	}
 
+	/* Doctrine header band: observed policy revision under a brass rule. */
 	.mai-policy__header {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+		padding: var(--mai-space-3) var(--mai-space-4);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface-header);
 	}
 
 	.mai-policy__revision {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-2);
 		margin: 0;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 		color: var(--mai-color-text-muted);
+	}
+
+	.mai-policy__revision--empty {
+		display: block;
+		font-family: var(--mai-font-sans);
+		font-size: var(--mai-text-sm);
+	}
+
+	/* Revision/digest chips: rev, sha256, server ids, binding revision. */
+	.mai-policy__chip {
+		display: inline-flex;
+		align-items: center;
+		padding: 0 var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		line-height: var(--mai-leading-tight);
+		transition:
+			border-color var(--mai-motion-fast) ease,
+			color var(--mai-motion-fast) ease;
+	}
+
+	.mai-policy__chip--rev {
+		border-color: var(--mai-color-brass-dim);
+		color: var(--mai-color-brass);
 	}
 
 	.mai-policy__notice {
@@ -823,6 +895,8 @@
 		border-radius: var(--mai-radius-sm);
 		background: var(--mai-status-success-bg);
 		color: var(--mai-status-success-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
 	.mai-policy__banner {
@@ -831,6 +905,7 @@
 		gap: var(--mai-space-2);
 		padding: var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-status-warning-border);
+		border-left: 3px solid var(--mai-status-warning-solid);
 		border-radius: var(--mai-radius-md);
 		background: var(--mai-status-warning-bg);
 		color: var(--mai-status-warning-text);
@@ -840,25 +915,54 @@
 		margin: 0;
 	}
 
+	/* Doctrine section cards. */
 	.mai-policy__section {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
 		padding: var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		border-radius: var(--mai-radius-lg);
 		background: var(--mai-color-surface-raised);
+		box-shadow: var(--mai-shadow-window);
+	}
+
+	.mai-policy__section-head {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin: calc(-1 * var(--mai-space-4)) calc(-1 * var(--mai-space-4)) 0;
+		padding: var(--mai-space-2) var(--mai-space-4) var(--mai-space-2) var(--mai-space-3);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-lg) var(--mai-radius-lg) 0 0;
+		background: var(--mai-color-surface-header);
+		color: var(--mai-color-brass);
+	}
+
+	.mai-policy__section-head :global(svg) {
+		flex: 0 0 auto;
 	}
 
 	.mai-policy__heading {
 		margin: 0;
-		font-size: 1rem;
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-base);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
 		line-height: var(--mai-leading-tight);
+		text-transform: uppercase;
+	}
+
+	.mai-policy__section-rev {
+		margin-left: auto;
 	}
 
 	.mai-policy__note {
 		margin: 0;
 		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-sm);
 	}
 
 	.mai-policy__muted {
@@ -867,14 +971,16 @@
 	}
 
 	.mai-policy__badge {
-		align-self: flex-start;
 		padding: 0 var(--mai-space-2);
 		border: var(--mai-border-width) solid var(--mai-status-warning-border);
 		border-radius: var(--mai-radius-sm);
 		background: var(--mai-status-warning-bg);
 		color: var(--mai-status-warning-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
 	}
 
+	/* Grants matrix: one raised-edge row per capability, servers beneath. */
 	.mai-policy__grants,
 	.mai-policy__servers,
 	.mai-policy__denied {
@@ -888,16 +994,29 @@
 
 	.mai-policy__grant {
 		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	.mai-policy__grant-head {
+		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--mai-space-2);
-		padding: var(--mai-space-2);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
 	}
 
 	.mai-policy__capability {
 		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
+	}
+
+	.mai-policy__servers {
+		padding-left: var(--mai-space-3);
+		border-left: 3px solid var(--mai-color-brass-dim);
 	}
 
 	.mai-policy__server {
@@ -910,9 +1029,11 @@
 		display: flex;
 		align-items: center;
 		gap: var(--mai-space-2);
-		padding: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-left: 3px solid var(--mai-status-danger-border);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
 	}
 
 	.mai-policy__form {
@@ -920,23 +1041,47 @@
 		flex-wrap: wrap;
 		align-items: end;
 		gap: var(--mai-space-3);
+		padding-top: var(--mai-space-3);
+		border-top: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
 	.mai-policy__form :global(.mai-field) {
 		flex: 1 1 14rem;
 	}
 
+	/* Approval binding card, presented under the observed revision. */
 	.mai-policy__preview {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		padding: var(--mai-space-3);
+		padding: var(--mai-space-3) var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-left: 3px solid var(--mai-color-brass);
 		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	.mai-policy__preview-head {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		color: var(--mai-color-brass);
+	}
+
+	.mai-policy__preview-head :global(svg) {
+		flex: 0 0 auto;
 	}
 
 	.mai-policy__target {
 		margin: 0;
+		color: var(--mai-color-text);
+		font-size: var(--mai-text-base);
+		font-weight: var(--mai-weight-medium);
+	}
+
+	.mai-policy__target code {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
 	}
 
 	.mai-policy__rows {
@@ -948,17 +1093,25 @@
 
 	.mai-policy__row {
 		display: flex;
-		gap: var(--mai-space-2);
+		align-items: baseline;
+		gap: var(--mai-space-3);
 	}
 
 	.mai-policy__row dt {
 		flex: 0 0 11rem;
 		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-sm);
 	}
 
 	.mai-policy__row dd {
 		margin: 0;
 		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-sm);
 		overflow-wrap: anywhere;
+	}
+
+	.mai-policy__row dd.mai-policy__chip {
+		align-self: center;
+		font-size: var(--mai-text-xs);
 	}
 </style>

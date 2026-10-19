@@ -1,6 +1,16 @@
-# MAI — Self-Hosted AI Administration Control Panel
+<div align="center">
 
-MAI is a self-hosted administration control panel for Linux servers. It combines a desktop-style windowed web workspace with an approval-gated AI administrator that inspects hosts over OpenSSH, manages Docker Compose applications, investigates incidents, tracks health and security posture, and maintains living operational documentation.
+<img src="docs/assets/machina-cog-skull.svg" alt="Machina cog-skull emblem" width="88" />
+
+# Machina — Self-Hosted AI Administration Control Panel
+
+**M.A.I. — Machina Anima Intelligentia**
+
+<img src="docs/assets/machina-hero-banner.svg" alt="Machina banner: Always-On Chat Dock, Server Service Map, Policy-Gated OpenSSH, DBOS Durable Runs" width="100%" />
+
+</div>
+
+Machina is a self-hosted administration control panel for Linux servers. It pairs a Mechanicus-styled desktop windowed web workspace with an approval-gated AI administrator that inspects hosts over OpenSSH, manages Docker Compose applications, investigates incidents, tracks health and security posture, and maintains living operational documentation.
 
 Every action follows an explicit loop:
 **Observe → Understand → Plan → Execute under policy → Verify → Document and remember.**
@@ -9,6 +19,8 @@ Every action follows an explicit loop:
 
 ## Key Capabilities
 
+- **Always-Visible Bottom Chat Dock:** The console's conversation surface is a dock pinned under the workspace — never a window to lose. Draft context is explicit: a pinned **Server Chip** (following the launcher selection) plus `@service` service chips from an autocomplete over the server's mapped services; both lock immutably the moment a conversation starts, and the **floating history selector** restores past conversations with their recorded scope (`chat.read_session`).
+- **Categorized Server Service Map:** Every adopted application renders as one map row with category chips (8 built-ins — `games`, `ai`, `agent`, `system`, `dev`, `infrastructure`, `media`, `observability` — plus operator-minted custom categories), client-side filter pills, one-click **Chat @service** tagging into the dock, and a five-slot operational runbook (install, update, uninstall, backup, verify) recorded through `app.upsert_map_entry`.
 - **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Plugin Forms, Overview Dashboard, and Memory & Local Models.
 - **Supervised SSH Execution & Policy Gates:** Key-only OpenSSH supervision with pinned host-key fingerprints, explicit capability grants (`none`, `narrow`, `broad`), one-use approval tokens for mutating operations, and secret-redacted command receipts.
 - **Durable Job Engine & Scheduling:** PostgreSQL-backed (`dbos`) workflows with lease fencing, crash recovery without blind re-execution of dangerous host steps, and cron/interval scheduling.
@@ -17,6 +29,32 @@ Every action follows an explicit loop:
 - **Monitoring, Security Posture & Notifications:** Read-only collectors for system resources, network listeners, processes, cron/systemd timers, SSH/firewall/privilege posture, and package/image updates, feeding a deduplicated findings & notification inbox.
 - **Plugins, MCP & Skills:** Extend capabilities via Python entry-point plugins (`mai.capabilities`), stdio or streamable-HTTP Model Context Protocol (MCP) servers, and portable skill packages (`docs/plugins/quickstart.md`).
 - **Whole-Instance Backup, Restore & Clean Uninstall:** Checksum-verified backups of PostgreSQL state and canonical files (`scripts/backup-restore.sh`), plus consent-gated host deprovisioning (`scripts/uninstall-host.sh`).
+
+---
+
+## The Machina Workspace
+
+### Command Deck — windows over the Always-Visible Bottom Chat Dock
+
+![Machina command deck: floating windows over the Always-Visible Bottom Chat Dock with pinned Server Chip and @service chip](docs/assets/screenshot-command-deck.png)
+
+Operational surfaces live in draggable, resizable windows; the chat dock stays pinned underneath at all times (it is part of the served shell, never a registry window). The dock follows the launcher's server selection, tags conversations with immutable context chips, and survives collapse/expand without losing its transcript.
+
+### Server Service Map — every adopted application, categorized
+
+![Machina Server Service Map: category chips, filter pills, operational runbooks and Chat @service buttons](docs/assets/screenshot-service-map.png)
+
+The Application Inventory panel doubles as the Server Service Map: adopt a discovered stack, categorize it (built-in taxonomy or mint a custom category), describe it, and record its five-slot runbook. Every row then offers one-click **Chat @service** — the conversation opens in the dock pre-scoped to that server and service.
+
+### Machina Login Sanctuary
+
+![Machina Login Sanctuary with the cog-skull emblem](docs/assets/screenshot-login-sanctuary.png)
+
+Single-administrator sign-in under the cog-skull sigil: the setup bootstrap creates the one administrator credential, after which the `/login` sanctuary is the only gate to the workspace.
+
+### Architecture Flow
+
+![Machina architecture flow: operator browser to reverse proxy, mai-web workspace, mai-api policy engine, OpenSSH targets, DBOS durable jobs, Postgres, optional search and memory profiles](docs/assets/machina-architecture-flow.svg)
 
 ---
 
@@ -192,6 +230,7 @@ sudo bash scripts/uninstall-host.sh \
 | `docs/operations/` | Operator runbooks: [`quickstart.md`](docs/operations/quickstart.md), [`recovery.md`](docs/operations/recovery.md), [`uninstall.md`](docs/operations/uninstall.md), [`acceptance.md`](docs/operations/acceptance.md) |
 | `docs/plugins/` | Plugin, MCP & skill author guide: [`quickstart.md`](docs/plugins/quickstart.md) |
 | `docs/architecture/` | Architecture contracts (`docs/architecture/contracts.md` C01–C11) and subsystem ADRs |
+| `docs/assets/` | Mechanicus SVG artwork and README screenshots (produced by `frontend/tests/capture-readme-screenshots.spec.ts`) |
 | `tests/` | Cross-cutting runtime (`tests/runtime/`) and documentation-consistency (`tests/docs/`) suites |
 
 ---

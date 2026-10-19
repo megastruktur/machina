@@ -302,17 +302,17 @@ test('buttons expose typed variants backed by design tokens and default to type=
 	const primaryBg = await page
 		.getByTestId('hosted-button')
 		.evaluate((el) => getComputedStyle(el).backgroundColor);
-	expect(primaryBg).toBe('rgb(29, 78, 216)'); // --mai-color-primary #1d4ed8
+	expect(primaryBg).toBe('rgb(185, 28, 28)'); // --mai-color-primary #b91c1c
 
 	const dangerBg = await page
 		.getByTestId('danger-button')
 		.evaluate((el) => getComputedStyle(el).backgroundColor);
-	expect(dangerBg).toBe('rgb(180, 35, 24)'); // --mai-status-danger-solid #b42318
+	expect(dangerBg).toBe('rgb(185, 28, 28)'); // --mai-status-danger-solid #b91c1c
 
 	const secondaryBorder = await page
 		.getByTestId('standalone-button')
 		.evaluate((el) => getComputedStyle(el).borderTopColor);
-	expect(secondaryBorder).toBe('rgb(209, 213, 219)'); // --mai-color-border #d1d5db
+	expect(secondaryBorder).toBe('rgb(42, 50, 65)'); // --mai-color-border #2a3241
 });
 
 test('buttons activate from the keyboard (Enter and Space) like native buttons', async ({
@@ -372,7 +372,7 @@ test('field error state is linked, announced and token-colored; clean fields sta
 
 	// The error is not color-only, but the color is also the danger token.
 	const border = await password.evaluate((el) => getComputedStyle(el).borderTopColor);
-	expect(border).toBe('rgb(180, 35, 24)'); // --mai-status-danger-text #b42318
+	expect(border).toBe('rgb(252, 165, 165)'); // --mai-status-danger-text #fca5a5
 
 	// Negative direction: a clean field has no invalid state…
 	expect(await page.getByLabel('Confirm password').getAttribute('aria-invalid')).toBeNull();

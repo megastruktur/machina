@@ -52,11 +52,32 @@
 </script>
 
 <svelte:head>
-	<title>Sign in — MAI</title>
+	<title>Sign in — Machina</title>
 </svelte:head>
 
 <main class="mai-login">
-	<h1>MAI</h1>
+	<!-- Mechanicus Cog-Skull emblem: the machine-cult sigil of M.A.I.
+	     Stroke-only, currentColor — no theme values of its own. -->
+	<svg
+		class="mai-login__emblem"
+		viewBox="0 0 64 64"
+		role="img"
+		aria-label="Machina cog-skull emblem"
+		data-testid="login-emblem"
+	>
+		<g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+			<!-- Cog: eight teeth around the skull housing. -->
+			<path d="M32 6v6M32 52v6M6 32h6M52 32h6M13.6 13.6l4.2 4.2M46.2 46.2l4.2 4.2M50.4 13.6l-4.2 4.2M17.8 46.2l-4.2 4.2" />
+			<circle cx="32" cy="32" r="17" />
+			<!-- Skull housing: cranium, twin optic sockets, nasal vent, jaw grille. -->
+			<path d="M24 21h16c0 0 6 3 6 9 0 5-3 8-5 9v5h-5v-3h-3v3h-2v-3h-3v3h-5v-5c-2-1-5-4-5-9 0-6 6-9 6-9z" stroke-width="1.5" />
+			<circle cx="27.5" cy="31" r="2.5" />
+			<circle cx="36.5" cy="31" r="2.5" />
+			<path d="M32 34v4M26 44v3M30 44v3M34 44v3M38 44v3" stroke-width="1.5" />
+		</g>
+	</svg>
+	<h1>Machina</h1>
+	<p class="mai-login__context">M.A.I. — Machina Anima Intelligentia</p>
 	<p class="mai-login__context">Administrator sign-in for the desktop workspace.</p>
 
 	{#if $session.status === 'checking'}
@@ -126,6 +147,12 @@
 		margin: 0;
 		font-size: var(--mai-text-2xl);
 		letter-spacing: 0.02em;
+	}
+
+	.mai-login__emblem {
+		width: 4rem;
+		height: 4rem;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-login__context {

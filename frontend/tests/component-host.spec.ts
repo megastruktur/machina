@@ -7,10 +7,10 @@ import { expect, test } from '@playwright/test';
 test('initial shell renders and mounts the labeled component host', async ({ page }) => {
 	await page.goto('/');
 
-	await expect(page.getByRole('heading', { level: 1 })).toHaveText('MAI');
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('Machina');
 
 	const host = page.getByTestId('component-host');
-	await expect(host).toHaveAttribute('aria-label', 'MAI workspace');
-	await expect(host.getByTestId('component-host-label')).toHaveText('MAI workspace');
+	await expect(host).toHaveAttribute('aria-label', 'Machina workspace');
+	await expect(host.getByTestId('component-host-label')).toHaveText('Machina workspace');
 	await expect(host).toHaveAttribute('data-mounted', 'true');
 });

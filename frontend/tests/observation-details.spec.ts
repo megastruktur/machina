@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { test, type Page } from '@playwright/test';
 import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
@@ -26,6 +26,14 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 const FIXTURE_URL = '/mai-observation-details-fixture/';
 const FRONTEND_ROOT = new URL('../', import.meta.url).pathname;
 const VIRTUAL_ID = 'virtual:mai-observation-details-entry';
+
+// Headroom under the shared 4173 preview: the service-map suites grew the
+// fully-parallel load, and this file mounts the heaviest fixture page
+// (ten evidence hosts at once). Render-starved 5s default expects tip over
+// under that load (observed as rotating element-not-found failures); the
+// assertions themselves are unchanged. Headline timeouts stay at the
+// Playwright default via every explicit `expect(...)` on counters below.
+const expect = test.expect.configure({ timeout: 15_000 });
 
 const DETAILS = `${FRONTEND_ROOT}src/lib/components/ObservationDetails.svelte`;
 const HOST = `${FRONTEND_ROOT}tests/fixtures/component-host.svelte`;
@@ -271,6 +279,16 @@ test.beforeAll(async () => {
 	};
 	const built = result as BuiltBundle | BuiltBundle[];
 	const outputs = Array.isArray(built) ? built : [built];
+	// Idempotent accumulation: under a fully-parallel run Playwright may
+	// execute this file's beforeAll twice in ONE worker process (the file's
+	// tests are scheduled in more than one batch). `+=` would concatenate
+	// the bundle onto itself — the doubled script re-declares every
+	// top-level minified identifier and the fixture page dies with
+	// "SyntaxError: Identifier '_r' has already been declared" before
+	// mounting anything (observed as rotating element-not-found failures).
+	// A fresh build replaces the previous one; the bundle is deterministic.
+	harnessJs = '';
+	harnessCss = '';
 	for (const { output } of outputs) {
 		for (const item of output) {
 			if (item.type === 'chunk') harnessJs += item.code;

@@ -83,6 +83,9 @@
 		cursor: not-allowed;
 	}
 
+	/* Mechanicus cogitator chrome: every accent below resolves from --mai-*
+	   tokens only (campaign hard rule: no hardcoded color literals). */
+
 	.mai-button--primary {
 		background: var(--mai-color-primary);
 		color: var(--mai-color-primary-contrast);
@@ -90,10 +93,13 @@
 
 	.mai-button--primary:hover:not(:disabled) {
 		background: var(--mai-color-primary-hover);
+		/* Subtle brass filigree on the crimson casing. */
+		box-shadow: inset 0 0 0 1px var(--mai-color-brass);
 	}
 
 	.mai-button--primary:active:not(:disabled) {
 		background: var(--mai-color-primary-active);
+		box-shadow: inset 0 0 0 1px var(--mai-color-brass-dim);
 	}
 
 	.mai-button--secondary {
@@ -103,12 +109,21 @@
 	}
 
 	.mai-button--secondary:hover:not(:disabled) {
-		border-color: var(--mai-color-border-strong);
+		border-color: var(--mai-color-brass);
+		background: var(--mai-color-surface-raised);
+	}
+
+	.mai-button--secondary:active:not(:disabled) {
+		border-color: var(--mai-color-brass-dim);
 	}
 
 	.mai-button--danger {
 		background: var(--mai-status-danger-solid);
 		color: var(--mai-status-solid-contrast);
+	}
+
+	.mai-button--danger:hover:not(:disabled) {
+		box-shadow: inset 0 0 0 1px var(--mai-status-danger-border);
 	}
 
 	.mai-button__spinner {

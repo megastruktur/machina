@@ -47,6 +47,8 @@
 	import ObservationDetails from '../components/ObservationDetails.svelte';
 	import Button from '../ui/Button.svelte';
 	import { readMaiEvent } from '../api/client.js';
+	import { DEFAULT_SERVICE_CATEGORIES } from '../workspace/entries/08-web-apps.js';
+	import type { ServiceCategoryView } from '../workspace/entries/08-web-apps.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		ApplicationPage,
@@ -441,6 +443,27 @@
 	let applicationsTotal = $state(0);
 	let applicationsState = $state<ListState>({ status: 'loading' });
 	let applicationsEpoch = 0;
+	/** The merged taxonomy riding the adopted page (omitted in old fixtures). */
+	let applicationsCategories = $state<ServiceCategoryView[]>([]);
+
+	/**
+	 * The rendered taxonomy for the Service Map summary: the producer's page
+	 * when carried, else the 8 client-side built-ins (shared contract).
+	 */
+	const serviceTaxonomy = $derived.by<ServiceCategoryView[]>(() =>
+		applicationsCategories.length > 0
+			? applicationsCategories
+			: DEFAULT_SERVICE_CATEGORIES.map((seed) => ({
+					machine_id: seed.machine_id,
+					label: seed.label,
+					description: seed.description,
+					built_in: true
+				}))
+	);
+
+	function serviceCategoryLabel(machineId: string): string {
+		return serviceTaxonomy.find((entry) => entry.machine_id === machineId)?.label ?? machineId;
+	}
 
 	type ImportedApplication = Awaited<
 		ReturnType<OverviewApi['listAdoptedApplications']>
@@ -468,6 +491,7 @@
 			}
 			applications = page.applications;
 			applicationsTotal = page.total;
+			applicationsCategories = page.categories ?? [];
 			applicationsState = { status: 'ready' };
 		} catch (error) {
 			if (disposed || epoch !== applicationsEpoch) return;
@@ -483,6 +507,34 @@
 	}
 
 	const staleApplications = $derived(applications.filter((row) => row.stale).length);
+
+	/** Mapped service counts per category chip, in taxonomy order (AC strip). */
+	const serviceMapCounts = $derived.by<Array<{ machineId: string; label: string; count: number }>>(
+		() => {
+			const counts = new Map<string, number>();
+			for (const row of applications) {
+				// The generated type declares the field; old fixtures omit it
+				// at runtime — the `in` guard reads only what is present.
+				const machineId =
+					'category' in row && typeof row.category === 'string' && row.category !== ''
+						? row.category
+						: 'system';
+				counts.set(machineId, (counts.get(machineId) ?? 0) + 1);
+			}
+			const ordered: Array<{ machineId: string; label: string; count: number }> = [];
+			for (const entry of serviceTaxonomy) {
+				const count = counts.get(entry.machine_id);
+				if (count !== undefined) {
+					ordered.push({ machineId: entry.machine_id, label: entry.label, count });
+					counts.delete(entry.machine_id);
+				}
+			}
+			for (const [machineId, count] of counts) {
+				ordered.push({ machineId, label: machineId, count });
+			}
+			return ordered;
+		}
+	);
 
 	let runs = $state<RunView[]>([]);
 	let runsTotal = $state(0);
@@ -1052,6 +1104,25 @@
 							· <span data-testid="apps-stale">{staleApplications} with observed drift</span>
 						{/if}
 					</p>
+					{#if serviceMapCounts.length > 0}
+						<div
+							class="mai-overview__servicemap"
+							role="list"
+							aria-label="Server service map summary"
+							data-testid="service-map-summary"
+						>
+							{#each serviceMapCounts as entry (entry.machineId)}
+								<span
+									class="mai-overview__servicemap-chip"
+									role="listitem"
+									data-testid="service-map-chip"
+									data-category={entry.machineId}
+								>
+									{serviceCategoryLabel(entry.machineId)} · {entry.count}
+								</span>
+							{/each}
+						</div>
+					{/if}
 					<p class="mai-overview__meta" data-testid="runs-counts">
 						<span data-testid="runs-active">{runCounts.active} active</span> ·
 						<span data-testid="runs-terminal">{runCounts.terminal} finished</span>
@@ -1258,6 +1329,23 @@
 	.mai-overview__badge--neutral {
 		color: var(--mai-color-text-muted);
 		background: var(--mai-color-bg);
+	}
+
+	.mai-overview__servicemap {
+		display: flex;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+		align-items: baseline;
+	}
+
+	.mai-overview__servicemap-chip {
+		display: inline-block;
+		border: 1px solid var(--mai-color-brass, var(--mai-color-border));
+		border-radius: var(--mai-radius-sm, 0.25rem);
+		padding: 0 var(--mai-space-2, 0.5rem);
+		font-size: var(--mai-font-size-xs, 0.75rem);
+		white-space: nowrap;
+		color: var(--mai-color-brass, var(--mai-color-text));
 	}
 
 	.mai-overview__state {

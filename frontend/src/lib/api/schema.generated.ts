@@ -109,7 +109,20 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List every stored server profile
+         * @description List every stored server profile in deterministic ``(name, id)`` order.
+         *
+         *     Safe method: layer 1 only (no Origin/CSRF). Each ``servers/`` directory is
+         *     read through the SAME canonical pipeline as the single read, so a list row
+         *     and the single read of one server can never disagree. A directory whose
+         *     name is not a canonical UUID is not a profile and is skipped; a missing
+         *     canonical file (half-finished delete sweep state) is absent, not an error;
+         *     any other store rejection or producer-validation failure is
+         *     recovery-needed canonical state that surfaces (C02: shown, never silently
+         *     repaired).
+         */
+        get: operations["list_profiles_api_v1_servers_get"];
         put?: never;
         /**
          * Create a server profile (mints the server identity)
@@ -521,12 +534,17 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List conversations for one explicit server scope (bounded page)
-         * @description One bounded page of one server's conversations (C01 rules 5 and 7).
+         * List conversations (bounded page; one server or all servers)
+         * @description One bounded page of root conversations (C01 rules 5 and 7).
          *
-         *     Safe method: session layer only. Conversations are the ROOT runs
-         *     (depth 0); delegated children are reachable through their parent's
-         *     detail. States replay from the persisted transition events.
+         *     Safe method: session layer only. With an explicit ``server_id`` the
+         *     page is exactly that server's scope (the frozen C01 rule 7
+         *     behaviour); with ``server_id`` omitted the page lists recent ROOT
+         *     conversations across ALL servers (including General Consult), so the
+         *     Floating Chat History Selector can restore any session's server +
+         *     service tags. Conversations are the ROOT runs (depth 0); delegated
+         *     children are reachable through their parent's detail. States replay
+         *     from the persisted transition events.
          */
         get: operations["list_conversations_api_v1_chat_runs_get"];
         put?: never;
@@ -1221,7 +1239,10 @@ export interface paths {
          *
          *     Safe method: session layer only. Adoption records are the managed
          *     truth; discovery observations are a SEPARATE resource and never merge
-         *     into this page (C09 rule 1).
+         *     into this page (C09 rule 1). Service Map entries with no SQL adoption
+         *     row (``origin="manual"`` chat/agent additions) appear seamlessly at
+         *     the tail of the page, and the merged category taxonomy rides the page
+         *     for the picker.
          */
         get: operations["list_adopted_api_v1_servers__server_id__applications_get"];
         put?: never;
@@ -1891,13 +1912,23 @@ export interface components {
          *     ``expected_revision`` follows C01 rule 6: ``0`` creates, otherwise it
          *     must equal the live record's revision. At least one reference selector
          *     is required (the producers enforce the full shape).
+         *
+         *     The Service Map fields are backwards-compatible enrichments:
+         *     ``category``/``description``/``instructions`` persist map metadata
+         *     for the adopted (or manual-added) service (absent/``None`` keeps the
+         *     ``"system"``/empty defaults); ``upsert_categories`` saves
+         *     operator-defined taxonomy categories in the same request. With
+         *     ``origin="manual"`` the entry is persisted directly in the Service
+         *     Map + canonical document store (outcome ``"reconciled"``) without
+         *     hitting the adoption pipeline's live-target restriction.
          */
         AdoptBody: {
             /** Application Id */
             application_id: string;
             /** Name */
             name: string;
-            origin: components["schemas"]["ApplicationOrigin"];
+            /** Origin */
+            origin: components["schemas"]["ApplicationOrigin"] | "manual";
             /** Compose Project */
             compose_project?: string | null;
             /** Working Dir */
@@ -1915,6 +1946,13 @@ export interface components {
              * @default 0
              */
             expected_revision: number;
+            /** Category */
+            category?: string | null;
+            /** Description */
+            description?: string | null;
+            instructions?: components["schemas"]["ServiceInstructionsBody"];
+            /** Upsert Categories */
+            upsert_categories?: components["schemas"]["ServiceCategoryBody"][];
         };
         /**
          * AdoptionCreated
@@ -2002,12 +2040,18 @@ export interface components {
         /**
          * ApplicationPage
          * @description One bounded adoption list page for one explicit server (C01 r5/7).
+         *
+         *     ``categories`` is the merged taxonomy (8 built-ins + customs) for
+         *     the category picker; the applications list includes manual/standalone
+         *     map entries that have no SQL adoption row (seamless chat additions).
          */
         ApplicationPage: {
             /** Server Id */
             server_id: string;
             /** Applications */
             applications: components["schemas"]["ApplicationView"][];
+            /** Categories */
+            categories?: components["schemas"]["ServiceCategoryView"][];
             /** Limit */
             limit: number;
             /** Offset */
@@ -2018,6 +2062,11 @@ export interface components {
         /**
          * ApplicationView
          * @description One projected adoption record (the facade-typed projection row).
+         *
+         *     ``category``/``description``/``instructions`` are the Service Map
+         *     metadata (default ``"system"``/empty for unmapped records; the map
+         *     entry's values for mapped ones — including chat/manual additions
+         *     that have no SQL adoption row at all).
          */
         ApplicationView: {
             /** Application Id */
@@ -2052,6 +2101,17 @@ export interface components {
             reconciled_at: string;
             /** Stale */
             stale: boolean;
+            /**
+             * Category
+             * @default system
+             */
+            category: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            instructions?: components["schemas"]["ServiceInstructionsView"];
         };
         /**
          * ApprovalView
@@ -2364,7 +2424,10 @@ export interface components {
         ChatSubmitBody: {
             /** Run Id */
             run_id: string;
-            /** Server Id */
+            /**
+             * Server Id
+             * @default 00000000-0000-0000-0000-000000000000
+             */
             server_id: string;
             /** Message */
             message: string;
@@ -2390,6 +2453,8 @@ export interface components {
             root_budget?: components["schemas"]["RootBudgetBody"] | null;
             /** Attachments */
             attachments?: components["schemas"]["AttachmentBody"][];
+            /** Service Tags */
+            service_tags?: string[];
         };
         /**
          * ChildBody
@@ -2490,6 +2555,9 @@ export interface components {
         /**
          * ConversationView
          * @description One conversation: the run view plus its recorded references.
+         *
+         *     ``service_tags`` are the immutable ``@service`` chips recorded at
+         *     submission (read back from the run's ``chat.submitted`` record).
          */
         ConversationView: {
             /** Run Id */
@@ -2520,6 +2588,8 @@ export interface components {
             attachments?: components["schemas"]["AttachmentView"][];
             /** Children */
             children?: components["schemas"]["RunView"][];
+            /** Service Tags */
+            service_tags?: string[];
         };
         /**
          * DecisionBody
@@ -2545,6 +2615,9 @@ export interface components {
         /**
          * DiscoveryView
          * @description The live observed inventory for one server (read-only snapshot).
+         *
+         *     ``categories`` is the merged service taxonomy (8 built-ins +
+         *     customs) for the adoption picker.
          */
         DiscoveryView: {
             /** Server Id */
@@ -2553,6 +2626,8 @@ export interface components {
             observed_at: string;
             /** Applications */
             applications: components["schemas"]["ObservedApplicationView"][];
+            /** Categories */
+            categories?: components["schemas"]["ServiceCategoryView"][];
             /** Listen Ports */
             listen_ports: {
                 [key: string]: unknown;
@@ -3458,6 +3533,11 @@ export interface components {
         /**
          * ObservedApplicationView
          * @description One observed application; ``managed`` ONLY with an adopted id.
+         *
+         *     ``suggested_category`` is the deterministic taxonomy hint for the
+         *     adoption decision (never an enforced label); ``category`` is the
+         *     already-mapped category when the observed application carries a
+         *     managed id with Service Map metadata (``None`` otherwise).
          */
         ObservedApplicationView: {
             /** Origin */
@@ -3466,6 +3546,13 @@ export interface components {
             managed: boolean;
             /** Application Id */
             application_id: string | null;
+            /**
+             * Suggested Category
+             * @default system
+             */
+            suggested_category: string;
+            /** Category */
+            category?: string | null;
             /** Detail */
             detail: components["schemas"]["ComposeDetailView"] | components["schemas"]["StandaloneDetailView"] | components["schemas"]["SystemdUnitDetailView"];
         };
@@ -3729,6 +3816,14 @@ export interface components {
             capabilities: string[];
             /** Expected Revision */
             expected_revision: number;
+        };
+        /**
+         * ProfileListResponse
+         * @description Every stored server profile in deterministic ``(name, id)`` order.
+         */
+        ProfileListResponse: {
+            /** Servers */
+            servers: components["schemas"]["ProfileResponse"][];
         };
         /**
          * ProfileMutationResult
@@ -4154,6 +4249,97 @@ export interface components {
             updated_at: string;
         };
         /**
+         * ServiceCategoryBody
+         * @description One custom category upsert (the confined-store grammar).
+         */
+        ServiceCategoryBody: {
+            /** Machine Id */
+            machine_id: string;
+            /** Label */
+            label: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+        };
+        /**
+         * ServiceCategoryView
+         * @description One taxonomy category (built-in or operator-defined).
+         */
+        ServiceCategoryView: {
+            /** Machine Id */
+            machine_id: string;
+            /** Label */
+            label: string;
+            /** Description */
+            description: string;
+            /** Built In */
+            built_in: boolean;
+        };
+        /**
+         * ServiceInstructionsBody
+         * @description The adoption-side runbook body (strict like every mutation body).
+         */
+        ServiceInstructionsBody: {
+            /**
+             * Install
+             * @default
+             */
+            install: string;
+            /**
+             * Update
+             * @default
+             */
+            update: string;
+            /**
+             * Uninstall
+             * @default
+             */
+            uninstall: string;
+            /**
+             * Backup
+             * @default
+             */
+            backup: string;
+            /**
+             * Verify
+             * @default
+             */
+            verify: string;
+        };
+        /**
+         * ServiceInstructionsView
+         * @description One service's operational runbook (the five frozen slots).
+         */
+        ServiceInstructionsView: {
+            /**
+             * Install
+             * @default
+             */
+            install: string;
+            /**
+             * Update
+             * @default
+             */
+            update: string;
+            /**
+             * Uninstall
+             * @default
+             */
+            uninstall: string;
+            /**
+             * Backup
+             * @default
+             */
+            backup: string;
+            /**
+             * Verify
+             * @default
+             */
+            verify: string;
+        };
+        /**
          * SkillCatalogView
          * @description The skill namespace: loadable summaries plus value-free rejections.
          */
@@ -4535,6 +4721,62 @@ export interface operations {
             };
             /** @description No valid session */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_profiles_api_v1_servers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProfileListResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical profile state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A stored profile failed producer validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Canonical profile service unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5800,8 +6042,8 @@ export interface operations {
     };
     list_conversations_api_v1_chat_runs_get: {
         parameters: {
-            query: {
-                server_id: string;
+            query?: {
+                server_id?: string | null;
                 limit?: number;
                 offset?: number;
             };

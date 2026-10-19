@@ -73,12 +73,13 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Final, Literal
 
 from fastapi import APIRouter, FastAPI, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.status import (
     HTTP_200_OK,
     HTTP_201_CREATED,
@@ -124,7 +125,22 @@ from mai.applications.discover import (
     SystemdUnitObservation,
     discover_server,
 )
-from mai.applications.document import AppDocError, ApplicationDocService
+from mai.applications.document import (
+    AppDocError,
+    ApplicationDocService,
+    record_doc_id,
+)
+from mai.applications.service_map import (
+    CATEGORY_MACHINE_ID_RE,
+    INSTRUCTION_KEYS,
+    MAX_NAME_CHARS as MAP_NAME_CHARS,
+    ServiceInstructions,
+    ServiceMapEntry,
+    ServiceMapError,
+    ServiceMapStore,
+    classify_service,
+    entry_digest,
+)
 from mai.applications.install import LOCK_RESOURCE_PREFIX
 from mai.applications.recipes import (
     DeploymentPlan,
@@ -144,6 +160,14 @@ from mai.execution.ssh import (
     SshConnectError,
     SshErrorCode,
     resolve_identity_key,
+)
+from mai.knowledge.documents import (
+    DocumentStore,
+    DocumentStoreError,
+    DocumentStoreErrorCode,
+    DocumentNamespace,
+    SourceKind,
+    VerificationStatus,
 )
 
 __all__ = ["register_applications"]
@@ -173,8 +197,58 @@ REMOVE_CAPABILITY: Final[str] = "app.remove"
 # ---------------------------------------------------------------------------
 
 
+class ServiceInstructionsView(BaseModel):
+    """One service's operational runbook (the five frozen slots)."""
+
+    install: str = ""
+    update: str = ""
+    uninstall: str = ""
+    backup: str = ""
+    verify: str = ""
+
+
+class ServiceInstructionsBody(ServiceInstructionsView):
+    """The adoption-side runbook body (strict like every mutation body)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ServiceCategoryView(BaseModel):
+    """One taxonomy category (built-in or operator-defined)."""
+
+    machine_id: str
+    label: str
+    description: str
+    built_in: bool
+
+
+class ServiceCategoryBody(BaseModel):
+    """One custom category upsert (the confined-store grammar)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    machine_id: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+
+    @field_validator("machine_id")
+    @classmethod
+    def _machine_id_slug(cls, value: str) -> str:
+        if not CATEGORY_MACHINE_ID_RE.fullmatch(value):
+            raise ValueError(
+                f"machine_id must match {CATEGORY_MACHINE_ID_RE.pattern}"
+            )
+        return value
+
+
 class ApplicationView(BaseModel):
-    """One projected adoption record (the facade-typed projection row)."""
+    """One projected adoption record (the facade-typed projection row).
+
+    ``category``/``description``/``instructions`` are the Service Map
+    metadata (default ``"system"``/empty for unmapped records; the map
+    entry's values for mapped ones — including chat/manual additions
+    that have no SQL adoption row at all).
+    """
 
     application_id: str
     server_id: str
@@ -192,13 +266,24 @@ class ApplicationView(BaseModel):
     adopted_at: str
     reconciled_at: str
     stale: bool
+    category: str = "system"
+    description: str = ""
+    instructions: ServiceInstructionsView = Field(
+        default_factory=ServiceInstructionsView
+    )
 
 
 class ApplicationPage(BaseModel):
-    """One bounded adoption list page for one explicit server (C01 r5/7)."""
+    """One bounded adoption list page for one explicit server (C01 r5/7).
+
+    ``categories`` is the merged taxonomy (8 built-ins + customs) for
+    the category picker; the applications list includes manual/standalone
+    map entries that have no SQL adoption row (seamless chat additions).
+    """
 
     server_id: str
     applications: list[ApplicationView]
+    categories: list[ServiceCategoryView] = Field(default_factory=list)
     limit: int
     offset: int
     total: int
@@ -212,13 +297,22 @@ class AdoptBody(BaseModel):
     ``expected_revision`` follows C01 rule 6: ``0`` creates, otherwise it
     must equal the live record's revision. At least one reference selector
     is required (the producers enforce the full shape).
+
+    The Service Map fields are backwards-compatible enrichments:
+    ``category``/``description``/``instructions`` persist map metadata
+    for the adopted (or manual-added) service (absent/``None`` keeps the
+    ``"system"``/empty defaults); ``upsert_categories`` saves
+    operator-defined taxonomy categories in the same request. With
+    ``origin="manual"`` the entry is persisted directly in the Service
+    Map + canonical document store (outcome ``"reconciled"``) without
+    hitting the adoption pipeline's live-target restriction.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     application_id: str
-    name: str = Field(min_length=1, max_length=200)
-    origin: ApplicationOrigin
+    name: str = Field(min_length=1, max_length=MAP_NAME_CHARS)
+    origin: ApplicationOrigin | Literal["manual"]
     compose_project: str | None = None
     working_dir: str | None = None
     unit_name: str | None = None
@@ -226,6 +320,21 @@ class AdoptBody(BaseModel):
     external_config_files: list[str] = Field(default_factory=list)
     external_environment_files: list[str] = Field(default_factory=list)
     expected_revision: int = ABSENT_REVISION
+    category: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=2000)
+    instructions: ServiceInstructionsBody = Field(
+        default_factory=ServiceInstructionsBody
+    )
+    upsert_categories: list[ServiceCategoryBody] = Field(default_factory=list)
+
+    @field_validator("category")
+    @classmethod
+    def _category_slug(cls, value: str | None) -> str | None:
+        if value is not None and not CATEGORY_MACHINE_ID_RE.fullmatch(value):
+            raise ValueError(
+                f"category must match {CATEGORY_MACHINE_ID_RE.pattern}"
+            )
+        return value
 
 
 class RecordDocView(BaseModel):
@@ -405,11 +514,19 @@ class SystemdUnitDetailView(BaseModel):
 
 
 class ObservedApplicationView(BaseModel):
-    """One observed application; ``managed`` ONLY with an adopted id."""
+    """One observed application; ``managed`` ONLY with an adopted id.
+
+    ``suggested_category`` is the deterministic taxonomy hint for the
+    adoption decision (never an enforced label); ``category`` is the
+    already-mapped category when the observed application carries a
+    managed id with Service Map metadata (``None`` otherwise).
+    """
 
     origin: str
     managed: bool
     application_id: str | None
+    suggested_category: str = "system"
+    category: str | None = None
     detail: (
         ComposeDetailView | StandaloneDetailView | SystemdUnitDetailView
     )
@@ -426,11 +543,16 @@ class LaneView(BaseModel):
 
 
 class DiscoveryView(BaseModel):
-    """The live observed inventory for one server (read-only snapshot)."""
+    """The live observed inventory for one server (read-only snapshot).
+
+    ``categories`` is the merged service taxonomy (8 built-ins +
+    customs) for the adoption picker.
+    """
 
     server_id: str
     observed_at: str
     applications: list[ObservedApplicationView]
+    categories: list[ServiceCategoryView] = Field(default_factory=list)
     listen_ports: list[dict[str, Any]]
     lanes: list[LaneView]
 
@@ -467,6 +589,18 @@ def _adoption(request: Request) -> ApplicationAdoption:
 def _docs(request: Request) -> ApplicationDocService | None:
     """The app-docs maintainer; ``None`` is honest (doc outcome pending)."""
     return getattr(request.app.state, "app_docs", None)
+
+
+def _map_store(request: Request) -> ServiceMapStore:
+    """The lifespan-composed Service Map store; without it fail closed."""
+    store = getattr(request.app.state, "service_map", None)
+    if store is None:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "service map is unavailable",
+        )
+    return store
 
 
 def _application_id(value: str) -> uuid.UUID | None:
@@ -537,8 +671,33 @@ def _recipe_error(request: Request, error: RecipeError) -> Response:
     return _validation_error(request, field, str(error))
 
 
-def _application_view(record: AdoptedApplication) -> ApplicationView:
-    """Type one projection record into the wire view (frozen ``…Z`` times)."""
+def _instructions_view(instructions: ServiceInstructions) -> ServiceInstructionsView:
+    """Type one store runbook into the wire view (pure projection)."""
+    return ServiceInstructionsView(**instructions.to_json())
+
+
+def _categories_view(store: ServiceMapStore) -> list[ServiceCategoryView]:
+    """The merged taxonomy (built-ins + customs) as the wire view."""
+    return [
+        ServiceCategoryView(
+            machine_id=category.machine_id,
+            label=category.label,
+            description=category.description,
+            built_in=category.built_in,
+        )
+        for category in store.list_categories()
+    ]
+
+
+def _application_view(
+    record: AdoptedApplication, entry: ServiceMapEntry | None = None
+) -> ApplicationView:
+    """Type one projection record into the wire view (frozen ``…Z`` times).
+
+    When the Service Map holds metadata for this application, its
+    category/description/instructions enrich the view (defaults
+    ``"system"``/empty keep unmapped records source-compatible).
+    """
     return ApplicationView(
         application_id=str(record.application_id),
         server_id=str(record.server_id),
@@ -556,6 +715,45 @@ def _application_view(record: AdoptedApplication) -> ApplicationView:
         adopted_at=_wire_ts(record.adopted_at),
         reconciled_at=_wire_ts(record.reconciled_at),
         stale=record.stale,
+        category="system" if entry is None else entry.category,
+        description="" if entry is None else entry.description,
+        instructions=(
+            ServiceInstructionsView()
+            if entry is None
+            else _instructions_view(entry.instructions)
+        ),
+    )
+
+
+def _map_entry_view(entry: ServiceMapEntry) -> ApplicationView:
+    """The wire view of one Service Map entry with no SQL adoption row.
+
+    Chat/manual additions appear seamlessly in the adopted listing: the
+    entry identity/timestamps/revision stand in for the projection
+    fields, the digest is the entry's canonical hash, and there is no
+    external deployment reference (``None``/empty — manual entries are
+    controller-local metadata only).
+    """
+    return ApplicationView(
+        application_id=entry.application_id,
+        server_id=entry.server_id,
+        name=entry.name,
+        origin=entry.origin,
+        compose_project=entry.compose_project,
+        working_dir=entry.working_dir,
+        unit_name=entry.unit_name,
+        external_working_dir=None,
+        external_config_files=[],
+        external_environment_files=[],
+        revision=entry.revision,
+        schema_revision=0,
+        sha256=entry_digest(entry),
+        adopted_at=entry.updated_at,
+        reconciled_at=entry.updated_at,
+        stale=False,
+        category=entry.category,
+        description=entry.description,
+        instructions=_instructions_view(entry.instructions),
     )
 
 
@@ -688,23 +886,45 @@ def _detail_view(observed: ObservedApplication) -> (
     )
 
 
-def _inventory_view(inventory: DiscoveryInventory) -> DiscoveryView:
+def _observed_name(view: ObservedApplicationView) -> str:
+    """The display name of one observed application (classifier input)."""
+    detail = view.detail
+    if isinstance(detail, ComposeDetailView):
+        return detail.project_name
+    if isinstance(detail, StandaloneDetailView):
+        return detail.container.name
+    return detail.unit
+
+
+def _inventory_view(
+    inventory: DiscoveryInventory,
+    *,
+    categories: list[ServiceCategoryView],
+    mapped_categories: Mapping[str, str],
+) -> DiscoveryView:
+    applications: list[ObservedApplicationView] = []
+    for observed in inventory.applications:
+        observed_id = (
+            str(observed.application_id)
+            if observed.application_id is not None
+            else None
+        )
+        view = ObservedApplicationView(
+            origin=observed.origin.value,
+            managed=observed.managed,
+            application_id=observed_id,
+            detail=_detail_view(observed),
+        )
+        view.suggested_category = classify_service(_observed_name(view))
+        view.category = (
+            None if observed_id is None else mapped_categories.get(observed_id)
+        )
+        applications.append(view)
     return DiscoveryView(
         server_id=str(inventory.server_id),
         observed_at=inventory.observed_at,
-        applications=[
-            ObservedApplicationView(
-                origin=observed.origin.value,
-                managed=observed.managed,
-                application_id=(
-                    str(observed.application_id)
-                    if observed.application_id is not None
-                    else None
-                ),
-                detail=_detail_view(observed),
-            )
-            for observed in inventory.applications
-        ],
+        applications=applications,
+        categories=categories,
         listen_ports=[asdict(p) for p in inventory.listen_ports],
         lanes=[
             LaneView(
@@ -759,16 +979,34 @@ async def list_adopted(
 
     Safe method: session layer only. Adoption records are the managed
     truth; discovery observations are a SEPARATE resource and never merge
-    into this page (C09 rule 1).
+    into this page (C09 rule 1). Service Map entries with no SQL adoption
+    row (``origin="manual"`` chat/agent additions) appear seamlessly at
+    the tail of the page, and the merged category taxonomy rides the page
+    for the picker.
     """
     await _require_session(request)
     adoption = _adoption(request)
+    map_store = _map_store(request)
     records = await adoption.list_adopted(server_id)
-    total = len(records)
-    page = records[offset : offset + limit]
+    entries = {entry.application_id: entry for entry in map_store.list_entries(server_id)}
+    views = [
+        _application_view(record, entries.get(str(record.application_id)))
+        for record in records
+    ]
+    adopted_ids = {view.application_id for view in views}
+    views.extend(
+        _map_entry_view(entry)
+        for entry in sorted(
+            (entry for aid, entry in entries.items() if aid not in adopted_ids),
+            key=lambda entry: (entry.name, entry.application_id),
+        )
+    )
+    total = len(views)
+    page = views[offset : offset + limit]
     return ApplicationPage(
         server_id=str(server_id),
-        applications=[_application_view(record) for record in page],
+        applications=page,
+        categories=_categories_view(map_store),
         limit=limit,
         offset=offset,
         total=total,
@@ -828,18 +1066,37 @@ async def adopt_application(
     _require_csrf(request)  # layer 3
     store = _store(request)
     adoption = _adoption(request)
+    map_store = _map_store(request)
     application_id = _application_id(payload.application_id)
     if application_id is None:
         return _validation_error(request, "application_id", "must be a canonical UUID string")
     # Target binding: an unknown/unenrolled server is denied before any
     # effect (C01 rule 7; same boundary as the jobs facade).
     _canonical_profile(request, server_id)
+
+    # Custom taxonomy categories ride the adoption request (saving the
+    # picker round-trip); a store rejection is the caller's field error.
+    for category_body in payload.upsert_categories:
+        try:
+            map_store.upsert_category(
+                category_body.machine_id,
+                label=category_body.label,
+                description=category_body.description,
+            )
+        except ServiceMapError as error:
+            return _validation_error(
+                request, "upsert_categories", error.detail
+            )
+
+    if payload.origin == "manual":
+        return await _adopt_manual_entry(request, map_store, server_id, application_id, payload)
+
     try:
         composed = AdoptionRequest(
             server_id=server_id,
             application_id=application_id,
             name=payload.name,
-            origin=payload.origin,
+            origin=ApplicationOrigin(payload.origin),
             compose_project=payload.compose_project,
             working_dir=payload.working_dir,
             unit_name=payload.unit_name,
@@ -854,6 +1111,21 @@ async def adopt_application(
         result = await adoption.adopt(store, composed)
     except AdoptionError as error:
         return _adoption_error(request, error)
+    # The Service Map sidecar: category/description/instructions persist
+    # for the adopted service (the map is the metadata catalogue over the
+    # C09 truth; a store rejection here surfaces, never a silent skip).
+    entry = map_store.upsert_entry(
+        server_id,
+        name=payload.name,
+        category=payload.category or "system",
+        origin=ApplicationOrigin(payload.origin).value,
+        application_id=application_id,
+        compose_project=payload.compose_project,
+        working_dir=payload.working_dir,
+        unit_name=payload.unit_name,
+        description=payload.description or "",
+        instructions=payload.instructions.model_dump(),
+    )
     record = await adoption.read(server_id, application_id)
     assert record is not None  # the pipeline just reconciled it
     return AdoptionCreated(
@@ -863,9 +1135,117 @@ async def adopt_application(
         outcome=result.outcome,
         revision=result.revision,
         sha256=result.sha256,
-        application=_application_view(record),
+        application=_application_view(record, entry),
         record_doc=await _document_adoption(request, record),
     )
+
+
+async def _adopt_manual_entry(
+    request: Request,
+    map_store: ServiceMapStore,
+    server_id: uuid.UUID,
+    application_id: uuid.UUID,
+    payload: AdoptBody,
+) -> Response:
+    """The chat/manual addition: persist directly in the Service Map.
+
+    A manual entry has no live compose/systemd/docker target, so the
+    adoption pipeline's target-reference restriction cannot apply — the
+    entry is stored in the confined map plus its canonical identity
+    record, and answers with the reconciled outcome. The identity doc
+    write is an upsert; a documentation refusal/absence is reported
+    honestly (``pending``) — the committed map entry is never rolled
+    back for it.
+    """
+    entry = map_store.upsert_entry(
+        server_id,
+        name=payload.name,
+        category=payload.category or "system",
+        origin="manual",
+        application_id=application_id,
+        compose_project=payload.compose_project,
+        working_dir=payload.working_dir,
+        unit_name=payload.unit_name,
+        description=payload.description or "",
+        instructions=payload.instructions.model_dump(),
+    )
+    return AdoptionCreated(
+        intent_id=str(uuid.uuid5(application_id, "service-map:manual-adoption")),
+        application_id=entry.application_id,
+        server_id=entry.server_id,
+        outcome="reconciled",
+        revision=entry.revision,
+        sha256=entry_digest(entry),
+        application=_map_entry_view(entry),
+        record_doc=_document_manual_entry(request, server_id, application_id, entry),
+    )
+
+
+def _render_manual_record(entry: ServiceMapEntry) -> str:
+    """The deterministic identity record for one manual map entry."""
+    lines = [
+        f"# {entry.name}",
+        "",
+        "Manual Service Map entry (chat/agent addition).",
+        "",
+        "## Service",
+        "",
+        f"- application_id: `{entry.application_id}`",
+        f"- server_id: `{entry.server_id}`",
+        f"- origin: `{entry.origin}`",
+        f"- category: `{entry.category}`",
+        f"- map_revision: {entry.revision}",
+        "",
+    ]
+    if entry.description:
+        lines += ["## Description", "", entry.description, ""]
+    runbook = entry.instructions.to_json()
+    if any(runbook.values()):
+        lines += ["## Runbook instructions", ""]
+        lines += [f"- **{key}**: {runbook[key]}" for key in INSTRUCTION_KEYS if runbook[key]]
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _document_manual_entry(
+    request: Request,
+    server_id: uuid.UUID,
+    application_id: uuid.UUID,
+    entry: ServiceMapEntry,
+) -> RecordDocView:
+    """Seed the manual entry's identity record through the canonical store."""
+    knowledge = getattr(request.app.state, "knowledge", None)
+    doc_store: DocumentStore | None = (
+        None if knowledge is None else getattr(knowledge, "store", None)
+    )
+    if doc_store is None:
+        return RecordDocView(status="pending", reason="unavailable")
+    doc_id = record_doc_id(server_id, application_id)
+    try:
+        try:
+            current = doc_store.read(
+                doc_id, server_id=server_id, app_id=application_id
+            )
+            expected_revision = current.revision
+        except DocumentStoreError as error:
+            if error.code is not DocumentStoreErrorCode.NOT_FOUND:
+                raise
+            expected_revision = 0
+        document = doc_store.write(
+            doc_id,
+            _render_manual_record(entry),
+            server_id=server_id,
+            app_id=application_id,
+            namespace=DocumentNamespace.DOCS,
+            expected_revision=expected_revision,
+            source_kind=SourceKind.GENERATED,
+            origin=f"service-map:{entry.revision}",
+            origin_revision=str(entry.revision),
+            verification=VerificationStatus.UNVERIFIED,
+        )
+    except DocumentStoreError as error:
+        return RecordDocView(status="pending", reason=error.code.value)
+    return RecordDocView(status="documented", doc_id=str(document.doc_id))
 
 
 async def _document_adoption(
@@ -995,7 +1375,16 @@ async def discover_applications(
             "unavailable",
             "discovery transport is unavailable",
         ) from error
-    return _inventory_view(inventory)
+    map_store = _map_store(request)
+    mapped_categories = {
+        entry.application_id: entry.category
+        for entry in map_store.list_entries(server_id)
+    }
+    return _inventory_view(
+        inventory,
+        categories=_categories_view(map_store),
+        mapped_categories=mapped_categories,
+    )
 
 
 @router.delete(

@@ -1124,7 +1124,7 @@
 		flex-direction: column;
 		gap: var(--mai-space-4, 16px);
 		padding: var(--mai-space-4, 16px);
-		color: var(--mai-color-text, #101828);
+		color: var(--mai-color-text);
 		font-size: var(--mai-text-sm, 0.875rem);
 		line-height: var(--mai-leading-normal, 1.5);
 		min-width: 0;
@@ -1148,17 +1148,17 @@
 		flex-wrap: wrap;
 		gap: var(--mai-space-2, 8px);
 		align-items: baseline;
-		color: var(--mai-color-text-muted, #4b5563);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-appactions__section {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3, 12px);
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-md, 6px);
 		padding: var(--mai-space-3, 12px);
-		background: var(--mai-color-surface, #ffffff);
+		background: var(--mai-color-surface);
 		min-width: 0;
 	}
 
@@ -1171,7 +1171,7 @@
 	.mai-appactions__target {
 		display: flex;
 		gap: var(--mai-space-4, 16px);
-		color: var(--mai-color-text-muted, #4b5563);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-appactions__field {
@@ -1183,7 +1183,7 @@
 
 	.mai-appactions__field-label {
 		font-weight: var(--mai-weight-medium, 500);
-		color: var(--mai-color-text-muted, #4b5563);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-appactions__textarea {
@@ -1192,15 +1192,15 @@
 		font-family: var(--mai-font-mono, monospace);
 		font-size: var(--mai-text-xs, 0.75rem);
 		padding: var(--mai-space-2, 8px);
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm, 4px);
-		background: var(--mai-color-surface-raised, #ffffff);
+		background: var(--mai-color-surface-raised);
 		color: inherit;
 	}
 
 	.mai-appactions__textarea:disabled {
-		background: var(--mai-status-neutral-bg, #f2f4f7);
-		color: var(--mai-status-neutral-text, #4b5563);
+		background: var(--mai-status-neutral-bg);
+		color: var(--mai-status-neutral-text);
 	}
 
 	.mai-appactions__actions {
@@ -1220,7 +1220,7 @@
 
 	.mai-appactions__facts dt {
 		font-weight: var(--mai-weight-medium, 500);
-		color: var(--mai-color-text-muted, #4b5563);
+		color: var(--mai-color-text-muted);
 	}
 
 	.mai-appactions__facts dd {
@@ -1235,7 +1235,7 @@
 	}
 
 	.mai-appactions__note {
-		color: var(--mai-color-text-muted, #4b5563);
+		color: var(--mai-color-text-muted);
 		font-size: var(--mai-text-xs, 0.75rem);
 	}
 
@@ -1243,12 +1243,12 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2, 8px);
-		border-top: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border-top: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		padding-top: var(--mai-space-3, 12px);
 	}
 
 	.mai-appactions__fieldset {
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: var(--mai-space-2, 8px);
 		margin: 0;
@@ -1281,7 +1281,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2, 8px);
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: var(--mai-space-2, 8px);
 	}
@@ -1294,38 +1294,38 @@
 
 	.mai-appactions__badge {
 		display: inline-block;
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: 0 var(--mai-space-2, 8px);
 		white-space: nowrap;
 	}
 
 	.mai-appactions__badge--ok {
-		border-color: var(--mai-status-success-border, #a6f4c5);
-		color: var(--mai-status-success-text, #067647);
-		background: var(--mai-status-success-bg, #ecfdf3);
+		border-color: var(--mai-status-success-border);
+		color: var(--mai-status-success-text);
+		background: var(--mai-status-success-bg);
 	}
 
 	.mai-appactions__badge--danger {
-		border-color: var(--mai-status-danger-border, #fecdca);
-		color: var(--mai-status-danger-text, #b42318);
-		background: var(--mai-status-danger-bg, #fef3f2);
+		border-color: var(--mai-status-danger-border);
+		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
 	}
 
 	.mai-appactions__badge--warn {
-		border-color: var(--mai-status-warning-border, #fec84b);
-		color: var(--mai-status-warning-text, #b54708);
-		background: var(--mai-status-warning-bg, #fffaeb);
+		border-color: var(--mai-status-warning-border);
+		color: var(--mai-status-warning-text);
+		background: var(--mai-status-warning-bg);
 	}
 
 	.mai-appactions__badge--neutral {
-		border-color: var(--mai-status-neutral-border, #d1d5db);
-		color: var(--mai-status-neutral-text, #4b5563);
-		background: var(--mai-status-neutral-bg, #f2f4f7);
+		border-color: var(--mai-status-neutral-border);
+		color: var(--mai-status-neutral-text);
+		background: var(--mai-status-neutral-bg);
 	}
 
 	.mai-appactions__state {
-		border: var(--mai-border-width, 1px) solid var(--mai-color-border, #d1d5db);
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: var(--mai-space-2, 8px);
 		display: flex;
@@ -1338,8 +1338,8 @@
 	}
 
 	.mai-appactions__state--error {
-		border-color: var(--mai-status-danger-border, #fecdca);
-		color: var(--mai-status-danger-text, #b42318);
-		background: var(--mai-status-danger-bg, #fef3f2);
+		border-color: var(--mai-status-danger-border);
+		color: var(--mai-status-danger-text);
+		background: var(--mai-status-danger-bg);
 	}
 </style>

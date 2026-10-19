@@ -105,6 +105,7 @@ from mai.applications.adopt import (
     ApplicationManifestStore,
 )
 from mai.applications.document import ApplicationDocService
+from mai.applications.service_map import ServiceMapStore
 from mai.auth.sessions import AuthError, SessionStore
 from mai.capabilities.dispatch import CapabilityDispatcher
 from mai.credentials.env import EnvFileError, EnvResolver
@@ -313,6 +314,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         if doc_store is not None:
             app.state.app_docs = ApplicationDocService(doc_store)
+        # Service Map surface (mechanicus-ui 02): the confined category
+        # taxonomy + per-service map store (category/description/runbook)
+        # over the SAME explicit data root (``<root>/service_map/``); the
+        # applications + chat surfaces fail closed with 503 when absent.
+        app.state.service_map = None
+        try:
+            app.state.service_map = ServiceMapStore(
+                os.path.join(resolve_profiles_root(app.state.env), "service_map")
+            )
+        except OSError:
+            app.state.service_map = None
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
         # store appends its own ``models/`` namespace). Credential material

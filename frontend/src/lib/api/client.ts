@@ -508,8 +508,13 @@ export interface MaiApiClient {
 
 	/** POST /api/v1/chat/messages — durable intent; idempotent on `run_id`. */
 	submitMessage(payload: ChatSubmitBody): Promise<ChatCreated>;
-	/** GET /api/v1/chat/runs?server_id=… — explicitly scoped page. */
-	listConversations(serverId: string, page?: PageQuery): Promise<ChatPage>;
+	/**
+	 * GET /api/v1/chat/runs — explicitly scoped page when `serverId` is
+	 * passed (identical to the frozen behaviour); with `serverId` omitted
+	 * or `null` the page lists recent ROOT conversations across ALL
+	 * servers + General Consult (the Floating Chat History Selector).
+	 */
+	listConversations(serverId?: string | null, page?: PageQuery): Promise<ChatPage>;
 	/** GET /api/v1/chat/runs/{run_id} — replayed conversation record. */
 	readConversation(runId: string): Promise<ConversationView>;
 	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
@@ -791,11 +796,16 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 
 		// Conversations (P06).
 		submitMessage: (payload) => requestJson<ChatCreated>('POST', '/api/v1/chat/messages', payload),
-		listConversations: (serverId, page) =>
-			requestJson<ChatPage>(
+		listConversations: (serverId, page) => {
+			const scope =
+				serverId === undefined || serverId === null
+					? ''
+					: `server_id=${encodeURIComponent(serverId)}`;
+			return requestJson<ChatPage>(
 				'GET',
-				`/api/v1/chat/runs?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
+				`/api/v1/chat/runs?${scope}${pageSuffix(page)}`
+			);
+		},
 		readConversation: (runId) =>
 			requestJson<ConversationView>('GET', `/api/v1/chat/runs/${encodeURIComponent(runId)}`),
 		cancelConversation: (runId, payload) =>

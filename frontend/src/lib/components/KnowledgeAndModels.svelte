@@ -56,6 +56,21 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import {
+		Brain,
+		Cable,
+		Cog,
+		Database,
+		Download,
+		FileDown,
+		KeyRound,
+		Lightbulb,
+		ListChecks,
+		NotebookPen,
+		Search,
+		Trash2,
+		Wrench
+	} from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -974,7 +989,10 @@
 	{:else}
 		<!-- ===================== Memory availability ===================== -->
 		<section class="mai-km__section" aria-label="Memory availability" data-testid="memory-status-section">
-			<h3 class="mai-km__heading">Hindsight memory</h3>
+			<header class="mai-km__header">
+				<Brain size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Hindsight memory</h3>
+			</header>
 			{#if statusOutcome.kind === 'ok'}
 				<p class="mai-km__notice mai-km__notice--success" role="status" data-testid="memory-status-ok">
 					Available — API version <code>{statusOutcome.document.api_version ?? 'unknown'}</code>
@@ -1015,7 +1033,10 @@
 
 		<!-- ===================== Recall ===================== -->
 		<section class="mai-km__section" aria-label="Recall" data-testid="recall-section">
-			<h3 class="mai-km__heading">Recall</h3>
+			<header class="mai-km__header">
+				<Search size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Recall</h3>
+			</header>
 			<p class="mai-km__hint">
 				One gated query through the memory.recall grant. Scope is "server" (this server's bank)
 				or "shared:&lt;name&gt;" (the configured allowlist).
@@ -1067,11 +1088,14 @@
 			</div>
 
 			{#if recallOutcome.kind === 'ok'}
-				<div data-testid="recall-result">
-					<p class="mai-km__muted" data-testid="recall-meta">
-						{recallOutcome.document.results.length} hit(s) from <code>{recallOutcome.document.bank}</code>
-						· trust {recallOutcome.document.trust} · role {recallOutcome.document.role}
-					</p>
+				<div class="mai-km__card" data-testid="recall-result">
+					<div class="mai-km__cardhead">
+						<Database size={14} aria-hidden="true" />
+						<p class="mai-km__cardhead-meta" data-testid="recall-meta">
+							{recallOutcome.document.results.length} hit(s) from <code>{recallOutcome.document.bank}</code>
+							· trust {recallOutcome.document.trust} · role {recallOutcome.document.role}
+						</p>
+					</div>
 					{#if recallOutcome.document.results_truncated}
 						<p class="mai-km__notice mai-km__notice--warning" role="status" data-testid="recall-truncated">
 							Results were truncated by the producer — the page is bounded, not complete.
@@ -1123,7 +1147,10 @@
 
 		<!-- ===================== Retain ===================== -->
 		<section class="mai-km__section" aria-label="Retain" data-testid="retain-section">
-			<h3 class="mai-km__heading">Retain</h3>
+			<header class="mai-km__header">
+				<NotebookPen size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Retain</h3>
+			</header>
 			<p class="mai-km__hint">
 				Synchronous write with the producer's real receipt — a failed retain is shown as an
 				outage, never as a success.
@@ -1140,6 +1167,9 @@
 				/>
 				{#each retainItems as item, index (index)}
 					<div class="mai-km__item" data-testid="retain-item">
+						<div class="mai-km__itemhead">
+							<span class="mai-km__ord">#{index + 1}</span>
+						</div>
 						<Field
 							label={`Content ${index + 1}`}
 							bind:value={item.content}
@@ -1204,7 +1234,10 @@
 
 		<!-- ===================== Reflect ===================== -->
 		<section class="mai-km__section" aria-label="Reflect" data-testid="reflect-section">
-			<h3 class="mai-km__heading">Reflect</h3>
+			<header class="mai-km__header">
+				<Lightbulb size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Reflect</h3>
+			</header>
 			<p class="mai-km__hint">One bounded generated answer grounded in the scoped bank.</p>
 			<div class="mai-km__form">
 				<Field
@@ -1239,7 +1272,7 @@
 			</div>
 
 			{#if reflectOutcome.kind === 'ok'}
-				<div data-testid="reflect-result">
+				<div class="mai-km__card" data-testid="reflect-result">
 					<p class="mai-km__answer" data-testid="reflect-answer">{reflectOutcome.document.text}</p>
 					{#if reflectOutcome.document.truncated}
 						<p class="mai-km__notice mai-km__notice--warning" role="status" data-testid="reflect-truncated">
@@ -1267,7 +1300,10 @@
 
 		<!-- ===================== Export ===================== -->
 		<section class="mai-km__section" aria-label="Export" data-testid="export-section">
-			<h3 class="mai-km__heading">Export</h3>
+			<header class="mai-km__header">
+				<FileDown size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Export</h3>
+			</header>
 			<p class="mai-km__hint">
 				Backup-grade bank read (the memory.recall grant class): the manifest IS the data and
 				passes through unmodified — banks are backed up, never silently rebuilt.
@@ -1288,8 +1324,8 @@
 			</div>
 
 			{#if exportOutcome.kind === 'ok'}
-				<div data-testid="export-result">
-					<p class="mai-km__muted" data-testid="export-meta">
+				<div class="mai-km__card" data-testid="export-result">
+					<p class="mai-km__telemetry" data-testid="export-meta">
 						Manifest received ({JSON.stringify(exportOutcome.document.manifest ?? null).length} bytes serialized).
 					</p>
 					<pre class="mai-km__pre" data-testid="export-manifest">{JSON.stringify(exportOutcome.document.manifest ?? null, null, 2)}</pre>
@@ -1307,7 +1343,10 @@
 
 		<!-- ===================== Delete ===================== -->
 		<section class="mai-km__section" aria-label="Delete" data-testid="delete-section">
-			<h3 class="mai-km__heading">Delete</h3>
+			<header class="mai-km__header">
+				<Trash2 size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Delete</h3>
+			</header>
 			<p class="mai-km__hint">
 				Explicit and receipted (the memory.retain grant class): the target decides
 				memories-vs-bank — nothing is ever inferred.
@@ -1382,7 +1421,10 @@
 
 		<!-- ===================== Local models ===================== -->
 		<section class="mai-km__section" aria-label="Local models" data-testid="local-models-section">
-			<h3 class="mai-km__heading">Local models</h3>
+			<header class="mai-km__header">
+				<Cog size={16} aria-hidden="true" />
+				<h3 class="mai-km__heading">Local models</h3>
+			</header>
 			<p class="mai-km__hint">
 				Prerequisite preview measures REAL target facts; the executor re-verifies fresh facts
 				behind the full gate chain before any effect. The pull IS the registration path —
@@ -1487,7 +1529,10 @@
 			{/if}
 
 			<div class="mai-km__form">
-				<h4 class="mai-km__subheading">Install service</h4>
+				<div class="mai-km__subhead">
+					<Wrench size={14} aria-hidden="true" />
+					<h4 class="mai-km__subheading">Install service</h4>
+				</div>
 				<label class="mai-km__cap">
 					<input type="checkbox" bind:checked={backupConfirmed} data-testid="model-backup-confirmed" />
 					Backup confirmed (explicit operator decision for pre-existing volume data)
@@ -1506,7 +1551,10 @@
 					</div>
 				{/if}
 
-				<h4 class="mai-km__subheading">Pull weights (the pull IS the registration)</h4>
+				<div class="mai-km__subhead">
+					<Download size={14} aria-hidden="true" />
+					<h4 class="mai-km__subheading">Pull weights (the pull IS the registration)</h4>
+				</div>
 				<Field
 					label="Model"
 					bind:value={pullForm.model}
@@ -1546,17 +1594,20 @@
 
 			{#if watchedRun !== null}
 				<div class="mai-km__watch" data-testid="model-run-watch" data-run-kind={watchedRun.kind}>
-					<p class="mai-km__muted" data-testid="model-run-id">
-						{watchedRun.kind} run <code>{watchedRun.runId}</code>
-						{#if watchedRun.deduplicated}(deduplicated: an identical intent was already running){/if}
-					</p>
+					<div class="mai-km__cardhead">
+						<ListChecks size={14} aria-hidden="true" />
+						<p class="mai-km__cardhead-meta" data-testid="model-run-id">
+							{watchedRun.kind} run <code>{watchedRun.runId}</code>
+							{#if watchedRun.deduplicated}(deduplicated: an identical intent was already running){/if}
+						</p>
+					</div>
 					{#if watchProblem !== null}
 						<div class="mai-km__notice mai-km__notice--warning" role="alert" data-testid="model-run-problem" data-error-code={watchProblem.code}>
 							<p>{watchProblem.message}</p>
 						</div>
 					{/if}
 					{#if watchedDetail !== null}
-						<p data-testid="model-run-state">{runStateText(watchedDetail.state)}</p>
+						<p class="mai-km__runstate" data-testid="model-run-state">{runStateText(watchedDetail.state)}</p>
 						{#if watchedDetail.state !== null && TERMINAL_RUN_STATES.has(watchedDetail.state)}
 							<p class="mai-km__muted" data-testid="model-run-terminal">
 								{watchedDetail.state === 'succeeded'
@@ -1566,8 +1617,10 @@
 						{/if}
 						<ul class="mai-km__list" data-testid="model-run-steps">
 							{#each watchedDetail.steps as step (step.seq)}
-								<li class="mai-km__list-row" data-testid="model-run-step">
-									<code>{step.capability_id}</code> — {stepStateText(step.state)}
+								<li class="mai-km__list-row mai-km__step" data-testid="model-run-step">
+									<span class="mai-km__step-seq">{step.seq}</span>
+									<code>{step.capability_id}</code>
+									<span class="mai-km__step-state">— {stepStateText(step.state)}</span>
 								</li>
 							{/each}
 						</ul>
@@ -1583,7 +1636,10 @@
 			{/if}
 
 			<div class="mai-km__form">
-				<h4 class="mai-km__subheading">Registered connections</h4>
+				<div class="mai-km__subhead">
+					<Cable size={14} aria-hidden="true" />
+					<h4 class="mai-km__subheading">Registered connections</h4>
+				</div>
 				<ul class="mai-km__list" data-testid="connection-list">
 					{#each connections as ref (ref.name)}
 						<li class="mai-km__list-row">
@@ -1631,7 +1687,10 @@
 			</div>
 
 			<div class="mai-km__form">
-				<h4 class="mai-km__subheading">Credential references (1Password-aware)</h4>
+				<div class="mai-km__subhead">
+					<KeyRound size={14} aria-hidden="true" />
+					<h4 class="mai-km__subheading">Credential references (1Password-aware)</h4>
+				</div>
 				<p class="mai-km__hint">
 					Credentials resolve by REFERENCE (C03 rule 6): a connection stores the .env variable
 					NAME; the optional 1Password provider reads op://&lt;vault&gt;/&lt;item&gt;/&lt;field&gt;
@@ -1678,7 +1737,8 @@
 	.mai-km__state {
 		padding: var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
 	}
 
 	.mai-km__state--error {
@@ -1688,23 +1748,89 @@
 	.mai-km__section {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-2);
-		padding: var(--mai-space-3);
+		gap: var(--mai-space-3);
+		padding: var(--mai-space-4);
 		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-lg);
+		background: var(--mai-color-surface-raised);
+	}
+
+	/* Section header band: brass mark + Cinzel title on the header surface. */
+	.mai-km__header {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		border-left: 3px solid var(--mai-color-brass);
 		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-surface);
+		background: var(--mai-color-surface-header);
+	}
+
+	.mai-km__header :global(svg),
+	.mai-km__cardhead :global(svg) {
+		flex: none;
+		color: var(--mai-color-brass);
 	}
 
 	.mai-km__heading {
 		margin: 0;
+		color: var(--mai-color-brass);
+		font-family: var(--mai-font-display);
 		font-size: var(--mai-text-base);
-		font-weight: var(--mai-weight-medium);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+	}
+
+	/* Card-level band: mono telemetry line under a brass mark. */
+	.mai-km__cardhead {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-header);
+	}
+
+	.mai-km__cardhead-meta {
+		margin: 0;
+		color: var(--mai-color-text);
+		font: var(--mai-text-xs) var(--mai-font-mono);
+	}
+
+	/* Raised result card (recall / reflect / export receipts). */
+	.mai-km__card {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		width: 100%;
+		padding: var(--mai-space-3);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	.mai-km__subhead {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		margin-top: var(--mai-space-2);
+	}
+
+	.mai-km__subhead :global(svg) {
+		flex: none;
+		color: var(--mai-color-brass-dim);
 	}
 
 	.mai-km__subheading {
-		margin: var(--mai-space-2) 0 0;
+		margin: 0;
+		color: var(--mai-color-brass-dim);
+		font-family: var(--mai-font-display);
 		font-size: var(--mai-text-sm);
-		font-weight: var(--mai-weight-medium);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-km__hint,
@@ -1728,20 +1854,51 @@
 	.mai-km__item {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: var(--mai-space-2);
 		width: 100%;
 		padding: var(--mai-space-2);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	/* Retain-record band: mono ordinal on a full-bleed header strip. */
+	.mai-km__itemhead {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-1) var(--mai-space-2);
+		margin: calc(-1 * var(--mai-space-2)) calc(-1 * var(--mai-space-2)) 0;
+		border-left: 3px solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-md) var(--mai-radius-md) 0 0;
+		background: var(--mai-color-surface-header);
+	}
+
+	.mai-km__ord {
+		color: var(--mai-color-brass-dim);
+		font: var(--mai-text-xs) var(--mai-font-mono);
+		letter-spacing: 0.06em;
 	}
 
 	.mai-km__caps {
 		display: flex;
+		flex-wrap: wrap;
 		gap: var(--mai-space-3);
 		margin: 0;
-		padding: var(--mai-space-2);
+		padding: var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	.mai-km__caps legend {
+		padding: 0 var(--mai-space-2);
+		color: var(--mai-color-brass-dim);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-km__cap {
@@ -1784,7 +1941,7 @@
 		margin: 0;
 		padding: var(--mai-space-2);
 		border: var(--mai-border-width) solid var(--mai-status-neutral-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
 		font-size: var(--mai-text-sm);
 	}
 
@@ -1825,23 +1982,38 @@
 
 	.mai-km__refmeta {
 		color: var(--mai-color-text-muted);
-		font-size: var(--mai-text-xs);
+		font: var(--mai-text-xs) var(--mai-font-mono);
 	}
 
 	.mai-km__hit {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
-		padding: var(--mai-space-2);
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
 	}
 
-	.mai-km__hit-meta,
+	/* Hit band: rank/type/score/ordinals as mono telemetry on the header surface. */
+	.mai-km__hit-meta {
+		margin: 0;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border-left: 2px solid var(--mai-color-brass-dim);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-header);
+		color: var(--mai-color-text-muted);
+		font: var(--mai-text-xs) var(--mai-font-mono);
+	}
+
 	.mai-km__hit-cite {
 		margin: 0;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-raised);
 		color: var(--mai-color-text-muted);
-		font-size: var(--mai-text-xs);
+		font: var(--mai-text-xs) var(--mai-font-mono);
 	}
 
 	.mai-km__hit-text {
@@ -1852,9 +2024,11 @@
 
 	.mai-km__answer {
 		margin: 0;
-		padding: var(--mai-space-2);
+		padding: var(--mai-space-3);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
 		white-space: pre-wrap;
 	}
 
@@ -1863,10 +2037,22 @@
 		margin: 0;
 		padding: var(--mai-space-2);
 		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
+		border-radius: var(--mai-radius-md);
 		overflow: auto;
 		background: var(--mai-color-bg);
 		font: var(--mai-text-xs) var(--mai-font-mono);
+	}
+
+	/* Mono telemetry strip (serialized manifest size, receipts). */
+	.mai-km__telemetry {
+		margin: 0;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-raised);
+		color: var(--mai-color-text-muted);
+		font: var(--mai-text-xs) var(--mai-font-mono);
+		overflow-wrap: anywhere;
 	}
 
 	.mai-km__rows {
@@ -1885,7 +2071,9 @@
 
 	.mai-km__row > dt {
 		color: var(--mai-color-text-muted);
-		font-size: var(--mai-text-sm);
+		font-size: var(--mai-text-xs);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 	}
 
 	.mai-km__row > dd {
@@ -1900,12 +2088,60 @@
 		flex-direction: column;
 		gap: var(--mai-space-2);
 		width: 100%;
-		padding: var(--mai-space-2);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong, var(--mai-color-border));
+		padding: var(--mai-space-3);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-md);
+		background: var(--mai-color-surface);
+	}
+
+	.mai-km__preview[data-verdict='satisfied'] {
+		border-color: var(--mai-status-success-border);
+	}
+
+	.mai-km__preview[data-verdict='unsatisfied'] {
+		border-color: var(--mai-status-warning-border);
+	}
+
+	.mai-km__watch[data-run-kind='pull'] {
+		border-color: var(--mai-color-brass-dim);
+	}
+
+	/* Watched-run state line and step rows. */
+	.mai-km__runstate {
+		margin: 0;
+		font-size: var(--mai-text-base);
+		font-weight: var(--mai-weight-semibold);
+	}
+
+	.mai-km__step {
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-raised);
+	}
+
+	.mai-km__step-seq {
+		flex: none;
+		min-width: 3ch;
+		padding: 0 var(--mai-space-1);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-header);
+		color: var(--mai-color-brass);
+		font: var(--mai-text-xs) var(--mai-font-mono);
+		text-align: center;
+	}
+
+	.mai-km__step-state {
+		color: var(--mai-color-text-muted);
+		font-size: var(--mai-text-sm);
 	}
 
 	code {
+		padding: 0 var(--mai-space-1);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface-raised);
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		overflow-wrap: anywhere;

@@ -486,8 +486,11 @@ test('active focus styling follows the controller focus; activation affects only
 	await expect(chat).toHaveAttribute('data-focused', 'false');
 	const focusedBorder = await prefs.evaluate((el) => getComputedStyle(el).borderTopColor);
 	const unfocusedBorder = await chat.evaluate((el) => getComputedStyle(el).borderTopColor);
-	expect(focusedBorder).toBe('rgb(29, 78, 216)'); // --mai-color-primary #1d4ed8
-	expect(unfocusedBorder).toBe('rgb(209, 213, 219)'); // --mai-color-border #d1d5db
+	// The harness imports tokens.css with the encapsulated mechanicus theme
+	// as the default palette (mui-01): primary is the red sanctum accent,
+	// the unfocused border the dark panel line.
+	expect(focusedBorder).toBe('rgb(185, 28, 28)'); // --mai-color-primary #b91c1c
+	expect(unfocusedBorder).toBe('rgb(42, 50, 65)'); // --mai-color-border #2a3241
 	const focusedTitle = await prefs.evaluate((el) =>
 		getComputedStyle(el.querySelector('.mai-window-frame__title-text')!).color
 	);

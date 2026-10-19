@@ -71,15 +71,19 @@
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
-	import type {
-		ApprovalView,
-		CancelView,
-		ChatApi,
-		ChatPage,
-		ChatSubmitBody,
-		ConversationView,
-		DecisionBody,
-		RunDetail
+	import {
+		GLOBAL_CONSULT_SERVER_ID,
+		type ApprovalView,
+		type CancelView,
+		type ChatApi,
+		type ChatPage,
+		type ChatServerOption,
+		type ChatServiceOption,
+		type ChatServices,
+		type ChatSubmitBody,
+		type ConversationView,
+		type DecisionBody,
+		type RunDetail
 	} from '../workspace/entries/06-web-chat.js';
 
 	let { panel }: { panel: PanelContext } = $props();
@@ -111,6 +115,126 @@
 	/** Conversation submission: a global mount contradicts the entry contract. */
 	const serverScope = $derived(panel.scope.kind === 'server' ? panel.scope.server_id : null);
 	const usable = $derived(api !== null && serverScope !== null);
+
+	// --- draft chat context (Server Chip + @service tags; locked once started)
+
+	/**
+	 * Optional bag extras (typed as the frozen ChatServices shape): the server
+	 * list for the draft picker and the mapped/discovered services for the
+	 * `@service` autocomplete. A host that passes only `api` still works —
+	 * every control below degrades to the pinned scope alone.
+	 */
+	const serverOptions = $derived.by<readonly ChatServerOption[]>(() => {
+		const bag = panel.services as Partial<ChatServices> | undefined;
+		const list = bag?.serverOptions;
+		if (!Array.isArray(list)) return [];
+		return list.filter(
+			(one): one is ChatServerOption =>
+				typeof one === 'object' && one !== null && typeof one.id === 'string'
+		);
+	});
+	const availableServices = $derived.by<readonly ChatServiceOption[]>(() => {
+		const bag = panel.services as Partial<ChatServices> | undefined;
+		const list = bag?.availableServices;
+		if (!Array.isArray(list)) return [];
+		return list.filter(
+			(one): one is ChatServiceOption =>
+				typeof one === 'object' && one !== null && typeof one.name === 'string'
+		);
+	});
+
+	/**
+	 * Draft target override: `undefined` follows the pinned window scope (the
+	 * default Server Chip), a server id pins that server, `null` is General
+	 * Consult mode. Once a conversation is open the displayed context is the
+	 * RECORDED one — immutable for that session.
+	 */
+	let draftServerOverride = $state<string | null | undefined>(undefined);
+	let selectedServiceTags = $state<string[]>([]);
+
+	/** Display label of one server id: the option list first, then the id. */
+	function serverLabelFor(id: string): string {
+		return serverOptions.find((one) => one.id === id)?.label ?? `Server ${shortId(id)}`;
+	}
+
+	// --- @service autocomplete (draft mode, server pinned) --------------------
+
+	let servicePickerOpen = $state(false);
+	let serviceQuery = $state('');
+
+	/**
+	 * Suggestions: the host's mapped/discovered services filtered by the typed
+	 * `@<query>`, plus one explicit custom entry so a user can pin an
+	 * arbitrary `@tag` the inventory does not list yet.
+	 */
+	const serviceSuggestions = $derived.by<ChatServiceOption[]>(() => {
+		const query = serviceQuery.trim().toLowerCase();
+		const matched = availableServices.filter(
+			(one) => query === '' || one.name.toLowerCase().includes(query)
+		);
+		const seen = new Set(matched.map((one) => one.name));
+		const custom = serviceQuery.trim();
+		if (custom !== '' && !seen.has(custom)) matched.push({ name: serviceQuery.trim() });
+		return matched;
+	});
+
+	/** Typing `@<token>` in the message input opens the autocomplete. */
+	function handleComposeInput(event: Event): void {
+		const el = event.currentTarget as HTMLTextAreaElement;
+		const upto = el.value.slice(0, el.selectionStart ?? el.value.length);
+		const match = /(?:^|[\s])@([^\s@]*)$/.exec(upto);
+		if (match !== null && !chatContextLocked && !generalConsultMode) {
+			serviceQuery = match[1];
+			servicePickerOpen = true;
+		} else if (servicePickerOpen) {
+			servicePickerOpen = false;
+			serviceQuery = '';
+		}
+	}
+
+	function pickService(name: string): void {
+		const tag = name.trim();
+		if (tag !== '' && !selectedServiceTags.includes(tag)) {
+			selectedServiceTags = [...selectedServiceTags, tag];
+		}
+		servicePickerOpen = false;
+		serviceQuery = '';
+		// The consumed `@<token>` leaves the draft text.
+		composeMessage = composeMessage.replace(/@[^\s@]*$/, '');
+	}
+
+	function removeServiceTag(tag: string): void {
+		selectedServiceTags = selectedServiceTags.filter((one) => one !== tag);
+	}
+
+	/** The docked Service Map seam pre-populates a new draft via this event. */
+	function handleFocusService(event: Event): void {
+		if (chatContextLocked) return;
+		const detail = (event as CustomEvent<unknown>).detail;
+		if (typeof detail !== 'object' || detail === null) return;
+		const record = detail as Record<string, unknown>;
+		if (typeof record.serverId === 'string' && record.serverId !== '') {
+			draftServerOverride = record.serverId;
+		}
+		const tag =
+			typeof record.serviceName === 'string'
+				? record.serviceName
+				: typeof record.serviceTag === 'string'
+					? record.serviceTag
+					: null;
+		if (tag !== null && tag.trim() !== '' && !selectedServiceTags.includes(tag)) {
+			selectedServiceTags = [...selectedServiceTags, tag];
+		}
+	}
+
+	// --- floating chat history selector ---------------------------------------
+
+	let historyOpen = $state(false);
+
+	function selectHistoryRow(row: ConversationView): void {
+		historyOpen = false;
+		openConversation(row);
+	}
 
 	/** Stable element-id namespace for this instance (labels ⇄ inputs). */
 	const uid = $props.id();
@@ -255,9 +379,12 @@
 		return errors;
 	}
 
-	function buildSubmitBody(runId: string, serverId: string): ChatSubmitBody {
+	function buildSubmitBody(runId: string): ChatSubmitBody {
+		const serverId = generalConsultMode
+			? GLOBAL_CONSULT_SERVER_ID
+			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
 		const tasks = composeChildren.map((task) => task.trim()).filter((task) => task !== '');
-		return {
+		const body: ChatSubmitBody = {
 			run_id: runId,
 			server_id: serverId,
 			message: composeMessage.trim(),
@@ -271,6 +398,11 @@
 				op_id: opId
 			}))
 		};
+		// Recorded once, immutable thereafter: `@service` chips ride the submit
+		// body ONLY when the draft actually carries them — an empty selection
+		// omits the field entirely (the producer treats omission as no tags).
+		if (selectedServiceTags.length > 0) body.service_tags = [...selectedServiceTags];
+		return body;
 	}
 
 	async function submitCompose(): Promise<void> {
@@ -278,7 +410,7 @@
 		composeFields = composeFieldErrors();
 		composeProblem = null;
 		if (Object.keys(composeFields).length > 0) return;
-		const body = buildSubmitBody(crypto.randomUUID(), serverScope);
+		const body = buildSubmitBody(crypto.randomUUID());
 		const childTasks = body.children ?? [];
 		composeBusy = true;
 		try {
@@ -358,6 +490,24 @@
 	let refreshed = $state<ConversationView | null>(null);
 	const display = $derived(refreshed ?? conversation);
 	const activeRunId = $derived(display === null ? '' : display.run_id);
+
+	/**
+	 * Immutable-once-started: the moment a conversation is open — submitted
+	 * here or restored from history — its recorded server and `@service`
+	 * context is the ONLY context; the remove/pick controls leave the DOM and
+	 * the chips render `data-locked="true"` until `New Chat` resets the draft.
+	 */
+	const chatContextLocked = $derived(display !== null);
+	const effectiveServerId = $derived(
+		chatContextLocked
+			? (display?.server_id ?? null)
+			: draftServerOverride === undefined
+				? serverScope
+				: draftServerOverride
+	);
+	const generalConsultMode = $derived(
+		effectiveServerId === null || effectiveServerId === GLOBAL_CONSULT_SERVER_ID
+	);
 	const rootTerminal = $derived(
 		display !== null && display.state !== null && TERMINAL_RUN_STATES.has(display.state)
 	);
@@ -382,8 +532,52 @@
 		approvalBusy = false;
 		decisionStatus = null;
 		resetFold();
+		// The recorded conversation RESTORES its frozen context and locks it:
+		// the General Consult sentinel restores as the consult badge, any
+		// other id restores as the Server Chip, the recorded `@service` tags
+		// become (locked) chips, and the recorded model profile refills the
+		// composer. A row without recorded tags keeps the current draft tags
+		// (the producer records them at submission; older rows predate them).
+		draftServerOverride =
+			view.server_id === GLOBAL_CONSULT_SERVER_ID ? null : view.server_id;
+		if (Array.isArray(view.service_tags)) selectedServiceTags = asStringArray(view.service_tags);
+		composeProfile = view.model_profile;
+		servicePickerOpen = false;
+		serviceQuery = '';
 		void loadConversation();
 		startStream();
+	}
+
+	/**
+	 * `+ New Chat`: drop the open conversation, release its stream and reset
+	 * the composer to a fresh UNLOCKED draft — the default Server Chip back
+	 * on the pinned scope, no `@service` tags, no profile/capability/child
+	 * residue, history untouched.
+	 */
+	function newChat(): void {
+		finishStream();
+		conversation = null;
+		refreshed = null;
+		runDetail = null;
+		taskLabels = {};
+		needsApproval = false;
+		approvalBinding = null;
+		approval = null;
+		approvalProblem = null;
+		approvalBusy = false;
+		decisionStatus = null;
+		resetFold();
+		composeMessage = '';
+		composeChildren = [''];
+		composeAttachments = '';
+		composeCapabilities = '';
+		composeFields = {};
+		composeProblem = null;
+		draftServerOverride = undefined;
+		selectedServiceTags = [];
+		servicePickerOpen = false;
+		serviceQuery = '';
+		historyOpen = false;
 	}
 
 	// --- transcript fold (value-free stream facts; hostile text stays text) ---
@@ -830,6 +1024,18 @@
 		};
 	});
 
+	/**
+	 * The Service Map seam: `window` dispatches `mai:chat-focus-service` with
+	 * `{ serverId, serviceName | serviceTag, category }` so clicking
+	 * `[Chat @service]` pre-populates a NEW draft chat. A locked (started)
+	 * session never mutates: the event is ignored until `New Chat`.
+	 */
+	$effect(() => {
+		if (typeof window === 'undefined') return;
+		window.addEventListener('mai:chat-focus-service', handleFocusService);
+		return () => window.removeEventListener('mai:chat-focus-service', handleFocusService);
+	});
+
 	onDestroy(() => {
 		disposed = true;
 		finishStream();
@@ -865,7 +1071,70 @@
 		</div>
 	{:else}
 		<header class="mai-chat__header">
-			<h3 class="mai-chat__title">Conversation</h3>
+			<div class="mai-chat__header-row">
+				<h3 class="mai-chat__title">Conversation</h3>
+				<div class="mai-chat__header-actions">
+					<Button variant="secondary" onclick={newChat} data-testid="chat-new-session">
+						New Chat
+					</Button>
+					<Button
+						variant="secondary"
+						onclick={() => (historyOpen = !historyOpen)}
+						aria-expanded={historyOpen}
+						data-testid="chat-history-toggle"
+					>
+						History
+					</Button>
+				</div>
+			</div>
+			{#if historyOpen}
+				<!-- Floating history selector: the same bounded page the inline
+				     list renders, as a header popover that restores the selected
+				     session's transcript AND its frozen server/service context. -->
+				<div class="mai-chat__history-popover" data-testid="chat-history-popover">
+					{#if historyState.status === 'loading'}
+						<p class="mai-chat__meta" role="status">Loading conversations…</p>
+					{:else if historyState.status === 'error'}
+						<p class="mai-chat__note mai-chat__note--error" role="alert">
+							{historyProblem?.message}
+						</p>
+					{:else if historyRows.length === 0}
+						<p class="mai-chat__meta">No conversations are recorded for this server.</p>
+					{:else}
+						<ul class="mai-chat__history-popover-list">
+							{#each historyRows as row (row.run_id)}
+								<li>
+									<button
+										type="button"
+										class="mai-chat__history-item"
+										data-testid="chat-history-item"
+										onclick={() => selectHistoryRow(row)}
+									>
+										<span class="mai-chat__row-id">{shortId(row.run_id)}</span>
+										{#if row.server_id === GLOBAL_CONSULT_SERVER_ID}
+											<span class="mai-chat__badge">General Consult</span>
+										{:else}
+											<span class="mai-chat__badge">{serverLabelFor(row.server_id)}</span>
+										{/if}
+										{#each row.service_tags ?? [] as tag (tag)}
+											<span class="mai-chat__badge">@{tag}</span>
+										{/each}
+										<span
+											class="mai-chat__badge"
+											class:mai-chat__badge--ok={row.state === 'succeeded'}
+											class:mai-chat__badge--danger={row.state === 'failed'}
+											class:mai-chat__badge--neutral={row.state === 'cancelled'}
+										>
+											{runStateText(row.state)}
+										</span>
+										<span class="mai-chat__meta">{row.submitted_at}</span>
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</div>
+			{/if}
 			<p class="mai-chat__meta">
 				<span data-testid="chat-scope">Server {shortId(serverScope ?? '')}</span>
 				<span>Pinned scope — every action below names this target.</span>
@@ -876,12 +1145,128 @@
 			<div class="mai-chat__section-head">
 				<h4>New message</h4>
 			</div>
+
+			<!-- Draft chat context: the Server Chip (or the General Consult
+			     badge when no server is pinned) plus the removable `@service`
+			     chips. Once the chat starts everything here is recorded and
+			     immutable: chips render data-locked="true" and the remove /
+			     pick controls leave the DOM. -->
+			<div class="mai-chat__chips" data-testid="chat-context-chips">
+				{#if generalConsultMode}
+					<span class="mai-chat__badge" data-testid="chat-general-consult-badge">
+						General Consult — No Server Pinned
+					</span>
+				{:else}
+					<span
+						class="mai-chat__chip"
+						data-testid="chat-server-chip"
+						data-locked={chatContextLocked ? 'true' : null}
+					>
+						🖥 {serverLabelFor(effectiveServerId ?? '')}
+						{#if !chatContextLocked}
+							<button
+								type="button"
+								class="mai-chat__chip-remove"
+								data-testid="chat-server-chip-remove"
+								aria-label="Remove pinned server"
+								onclick={() => (draftServerOverride = null)}
+							>
+								×
+							</button>
+						{/if}
+					</span>
+				{/if}
+				{#each selectedServiceTags as tag (tag)}
+					<span
+						class="mai-chat__chip"
+						data-testid="chat-service-chip"
+						data-locked={chatContextLocked ? 'true' : null}
+					>
+						@{tag}
+						{#if !chatContextLocked}
+							<button
+								type="button"
+								class="mai-chat__chip-remove"
+								data-testid="chat-service-chip-remove"
+								aria-label="Remove service tag"
+								onclick={() => removeServiceTag(tag)}
+							>
+								×
+							</button>
+						{/if}
+					</span>
+				{/each}
+				{#if chatContextLocked}
+					<span class="mai-chat__lock" data-testid="chat-context-locked">
+						🔒 Server &amp; @service context locked for this session
+					</span>
+				{/if}
+			</div>
+
+			{#if !chatContextLocked}
+				<div class="mai-chat__compose-context">
+					<div class="mai-chat__context-controls">
+						<label class="mai-chat__label" for="{uid}-server">Target server</label>
+						<select
+							id="{uid}-server"
+							class="mai-chat__server-picker"
+							data-testid="chat-server-picker"
+							value={generalConsultMode ? GLOBAL_CONSULT_SERVER_ID : effectiveServerId}
+							onchange={(event) => {
+								const next = (event.currentTarget as HTMLSelectElement).value;
+								draftServerOverride = next === GLOBAL_CONSULT_SERVER_ID ? null : next;
+							}}
+						>
+							<option value={GLOBAL_CONSULT_SERVER_ID}>
+								General Consult — No Server Pinned
+							</option>
+							{#each serverOptions as server (server.id)}
+								<option value={server.id}>{server.label}</option>
+							{/each}
+							{#if !generalConsultMode && effectiveServerId !== null && !serverOptions.some((one) => one.id === effectiveServerId)}
+								<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
+							{/if}
+						</select>
+						{#if !generalConsultMode}
+							<Button
+								variant="secondary"
+								onclick={() => (servicePickerOpen = !servicePickerOpen)}
+								data-testid="chat-service-picker-toggle"
+							>
+								+ @service
+							</Button>
+						{/if}
+					</div>
+					{#if servicePickerOpen && !generalConsultMode}
+						<div class="mai-chat__service-autocomplete" data-testid="chat-service-autocomplete">
+							{#each serviceSuggestions as service (service.name)}
+								<button
+									type="button"
+									class="mai-chat__service-option"
+									data-testid="chat-service-option"
+									onclick={() => pickService(service.name)}
+								>
+									@{service.name}
+									{#if service.category}
+										<span class="mai-chat__badge">[{service.category}]</span>
+									{/if}
+								</button>
+							{/each}
+							{#if serviceSuggestions.length === 0}
+								<p class="mai-chat__meta">No services match that filter.</p>
+							{/if}
+						</div>
+					{/if}
+				</div>
+			{/if}
+
 			<div class="mai-chat__form">
 				<label class="mai-chat__label" for="{uid}-message">Message</label>
 				<textarea
 					id="{uid}-message"
 					class="mai-chat__textarea"
 					bind:value={composeMessage}
+					oninput={handleComposeInput}
 					rows={3}
 					data-testid="compose-message"
 				></textarea>
@@ -1235,6 +1620,162 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-1, 0.25rem);
+		position: relative;
+	}
+
+	.mai-chat__header-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+	}
+
+	.mai-chat__header-actions {
+		display: inline-flex;
+		gap: var(--mai-space-2, 0.5rem);
+	}
+
+	/* Floating history selector: anchored to the header row, above the page. */
+	.mai-chat__history-popover {
+		position: absolute;
+		top: 100%;
+		right: 0;
+		z-index: 20;
+		width: min(24rem, 100%);
+		max-height: 18rem;
+		overflow: auto;
+		padding: var(--mai-space-2, 0.5rem);
+		background: var(--surface-raised, var(--mai-color-surface, inherit));
+		border: 1px solid var(--border-strong, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		box-shadow: var(--mai-shadow-window, none);
+	}
+
+	.mai-chat__history-popover-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1, 0.25rem);
+	}
+
+	.mai-chat__history-item {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+		width: 100%;
+		padding: var(--mai-space-2, 0.5rem);
+		font: inherit;
+		color: inherit;
+		text-align: start;
+		cursor: pointer;
+		background: transparent;
+		border: 1px solid var(--border-subtle, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+	}
+
+	.mai-chat__history-item:hover {
+		background: var(--mai-color-bg, transparent);
+	}
+
+	.mai-chat__chips {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+	}
+
+	.mai-chat__chip {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1, 0.25rem);
+		padding: 0 var(--mai-space-2, 0.5rem);
+		border: 1px solid var(--border-strong, currentColor);
+		border-radius: 999px;
+		font-size: var(--mai-text-xs, 0.75rem);
+	}
+
+	.mai-chat__chip-remove {
+		padding: 0 var(--mai-space-1, 0.25rem);
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		background: transparent;
+		border: none;
+		border-radius: 999px;
+	}
+
+	.mai-chat__chip-remove:hover {
+		background: var(--mai-status-danger-bg, transparent);
+		color: var(--mai-status-danger-text, inherit);
+	}
+
+	.mai-chat__lock {
+		font-size: var(--mai-text-xs, 0.75rem);
+		color: var(--color-warning, inherit);
+	}
+
+	.mai-chat__compose-context {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2, 0.5rem);
+	}
+
+	.mai-chat__context-controls {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+	}
+
+	.mai-chat__server-picker {
+		padding: var(--mai-space-1, 0.25rem) var(--mai-space-2, 0.5rem);
+		font: inherit;
+		color: inherit;
+		background: var(--surface-raised, transparent);
+		border: 1px solid var(--border-strong, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+	}
+
+	/* `@service` autocomplete: opens under the composer controls. */
+	.mai-chat__service-autocomplete {
+		position: absolute;
+		top: 100%;
+		left: 0;
+		z-index: 20;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1, 0.25rem);
+		width: min(20rem, 100%);
+		max-height: 14rem;
+		overflow: auto;
+		padding: var(--mai-space-2, 0.5rem);
+		background: var(--surface-raised, var(--mai-color-surface, inherit));
+		border: 1px solid var(--border-strong, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		box-shadow: var(--mai-shadow-window, none);
+	}
+
+	.mai-chat__service-option {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		padding: var(--mai-space-1, 0.25rem) var(--mai-space-2, 0.5rem);
+		font: inherit;
+		color: inherit;
+		text-align: start;
+		cursor: pointer;
+		background: transparent;
+		border: 1px solid var(--border-subtle, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+	}
+
+	.mai-chat__service-option:hover {
+		background: var(--mai-color-bg, transparent);
 	}
 
 	.mai-chat__title {

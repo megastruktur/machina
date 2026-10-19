@@ -53,7 +53,12 @@
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
+	import {
+		CATEGORY_KEYWORD_HINTS,
+		DEFAULT_SERVICE_CATEGORIES
+	} from '../workspace/entries/08-web-apps.js';
 	import type {
+		AdoptBody,
 		ApplicationOrigin,
 		ApplicationPage,
 		ApplicationView,
@@ -65,6 +70,8 @@
 		DiscoveryView,
 		ObservedApplicationView,
 		RecordDocView,
+		ServiceCategoryView,
+		ServiceInstructionsView,
 		StandaloneDetailView,
 		SystemdUnitDetailView
 	} from '../workspace/entries/08-web-apps.js';
@@ -132,10 +139,130 @@
 	const TABS = Object.freeze([
 		{ id: 'inventory', label: 'Inventory' },
 		{ id: 'discovery', label: 'Discovery' },
-		{ id: 'adopt', label: 'Adopt' }
+		{ id: 'adopt', label: 'Adopt' },
+		{ id: 'categories', label: 'Categories' }
 	] as const);
 	type TabId = (typeof TABS)[number]['id'];
 	let tab = $state<TabId>('inventory');
+
+	// --- category taxonomy (the Service Map chips vocabulary) ----------------
+
+	/** Producer taxonomy carried on the latest adopted page (may be omitted). */
+	let pageCategories = $state<ServiceCategoryView[]>([]);
+	/** Producer taxonomy carried on the latest discovery snapshot. */
+	let snapshotCategories = $state<ServiceCategoryView[]>([]);
+	/** Custom categories minted in this window; they ride the next adoption. */
+	let customCategories = $state<ServiceCategoryView[]>([]);
+
+	/**
+	 * The rendered taxonomy: the producer's merged page (8 built-ins +
+	 * customs) when the wire carries it, else the client-side built-ins
+	 * (old fixtures); session-minted customs merge on top by machine id.
+	 */
+	const taxonomy = $derived.by<ServiceCategoryView[]>(() => {
+		const base: ServiceCategoryView[] =
+			pageCategories.length > 0
+				? pageCategories
+				: snapshotCategories.length > 0
+					? snapshotCategories
+					: DEFAULT_SERVICE_CATEGORIES.map((seed) => ({
+							machine_id: seed.machine_id,
+							label: seed.label,
+							description: seed.description,
+							built_in: true
+						}));
+		const merged = [...base];
+		for (const custom of customCategories) {
+			const index = merged.findIndex((entry) => entry.machine_id === custom.machine_id);
+			if (index >= 0) merged[index] = custom;
+			else merged.push(custom);
+		}
+		return merged;
+	});
+
+	/** Human label for one machine id; unknown ids render as-is (honest). */
+	function categoryLabel(machineId: string): string {
+		return taxonomy.find((entry) => entry.machine_id === machineId)?.label ?? machineId;
+	}
+
+	/** The category recorded on one mapped record (old records → "system"). */
+	function mappedCategory(row: ApplicationView): string {
+		// The generated type declares the field; old fixtures omit it at
+		// runtime — the `in` guard reads only what is actually present.
+		if ('category' in row && typeof row.category === 'string' && row.category !== '') {
+			return row.category;
+		}
+		return 'system';
+	}
+
+	/** The stored installation description (old records → empty). */
+	function mappedDescription(row: ApplicationView): string {
+		if ('description' in row && typeof row.description === 'string') return row.description;
+		return '';
+	}
+
+	/** The runbook recorded on one mapped record (old records → none). */
+	function mappedInstructions(row: ApplicationView): ServiceInstructionsView | null {
+		if ('instructions' in row && typeof row.instructions === 'object' && row.instructions !== null) {
+			return row.instructions;
+		}
+		return null;
+	}
+
+	const RUNBOOK_STEPS = Object.freeze(['install', 'update', 'uninstall', 'backup', 'verify'] as const);
+	type RunbookStep = (typeof RUNBOOK_STEPS)[number];
+
+	/** Non-empty runbook steps of one record, in display order. */
+	function recordedSteps(instructions: ServiceInstructionsView | null): Array<[RunbookStep, string]> {
+		if (instructions === null) return [];
+		const steps: Array<[RunbookStep, string]> = [];
+		for (const step of RUNBOOK_STEPS) {
+			const text = instructions[step];
+			if (typeof text === 'string' && text.trim() !== '') steps.push([step, text]);
+		}
+		return steps;
+	}
+
+	/**
+	 * The deterministic suggested category for one observation: the
+	 * producer's hint when present, else the client-side keyword heuristic
+	 * over the suggested name and unit path (old fixtures omit the hint).
+	 */
+	function suggestedCategory(observed: ObservedApplicationView): string {
+		// The producer hint wins when the snapshot carries it; the generated
+		// type declares the field, old fixtures omit it at runtime.
+		if (
+			'suggested_category' in observed &&
+			typeof observed.suggested_category === 'string' &&
+			observed.suggested_category !== ''
+		) {
+			return observed.suggested_category;
+		}
+		const haystack = suggestedName(observed).toLowerCase();
+		for (const [machineId, keywords] of CATEGORY_KEYWORD_HINTS) {
+			for (const keyword of keywords) {
+				if (haystack.includes(keyword)) return machineId;
+			}
+		}
+		return 'system';
+	}
+
+	// --- service map filter (category pills over the adopted page) -----------
+
+	let categoryFilter = $state<string>('all');
+
+	/** Categories that actually hold at least one mapped record, in taxonomy order. */
+	const presentCategories = $derived.by<string[]>(() => {
+		const present = new Set(applications.map((row) => mappedCategory(row)));
+		return taxonomy.map((entry) => entry.machine_id).filter((id) => present.has(id));
+	});
+
+	/** The adopted page after the active category pill (client-side view only). */
+	const filteredApplications = $derived.by<ApplicationView[]>(() =>
+		categoryFilter === 'all'
+			? applications
+			: applications.filter((row) => mappedCategory(row) === categoryFilter)
+	);
 
 	// --- value-free display helpers (C08 rule 6) -----------------------------
 
@@ -246,6 +373,9 @@
 			}
 			applications = page.applications;
 			inventoryTotal = page.total;
+			// The merged taxonomy rides the page when the producer carries it;
+			// an omitted field (old fixtures) keeps the client-side built-ins.
+			pageCategories = page.categories ?? [];
 			inventoryState = 'ready';
 		} catch (error) {
 			if (disposed || epoch !== inventoryEpoch) return;
@@ -346,6 +476,7 @@
 				return;
 			}
 			discovery = view;
+			snapshotCategories = view.categories ?? [];
 			snapshotStale = false;
 			discoveryState = 'ready';
 		} catch (error) {
@@ -380,6 +511,21 @@
 	let adoptResult = $state<AdoptionCreated | null>(null);
 	/** Discovery key of the observation whose adoption is in flight (AC 1 pending). */
 	let adoptPendingKey = $state<string | null>(null);
+
+	// --- service map metadata on the adoption decision (optional fields) -----
+
+	/** Selected category machine id; '' = keep the taxonomy default ("system"). */
+	let adoptCategory = $state('');
+	/** The pre-filled (suggested) category: selecting it is NOT an explicit change. */
+	let adoptCategoryInitial = $state('');
+	let adoptDescription = $state('');
+	let adoptInstructions = $state<Record<RunbookStep, string>>({
+		install: '',
+		update: '',
+		uninstall: '',
+		backup: '',
+		verify: ''
+	});
 
 	/** Catalogue summary of the held snapshot (AC 1: the three states). */
 	const catalogue = $derived.by<{ discovered: number; adopted: number; pending: number } | null>(
@@ -418,6 +564,12 @@
 		adoptExternalWorkingDir = compose?.working_dir ?? '';
 		adoptExternalConfigFiles = (compose?.config_files ?? []).join(', ');
 		adoptExternalEnvironmentFiles = (compose?.environment_files ?? []).join(', ');
+		// Service Map metadata starts empty: the suggested category is offered
+		// as the pre-selection, but only an EXPLICIT change ships in the body.
+		adoptCategory = suggestedCategory(observed);
+		adoptCategoryInitial = adoptCategory;
+		adoptDescription = '';
+		adoptInstructions = { install: '', update: '', uninstall: '', backup: '', verify: '' };
 		adoptFields = {};
 		adoptProblem = null;
 		adoptResult = null;
@@ -477,6 +629,8 @@
 			if (value.trim().length > MAX_SELECTOR_CHARS)
 				errors[field] = `Bounded to ${MAX_SELECTOR_CHARS} characters.`;
 		}
+		if (adoptDescription.length > CATEGORY_DESC_MAX)
+			errors.description = `Bounded to ${CATEGORY_DESC_MAX} characters.`;
 		if (adoptExternalWorkingDir.trim().length > MAX_PATH_CHARS)
 			errors.external_working_dir = `Bounded to ${MAX_PATH_CHARS} characters.`;
 		for (const entry of parsePathList(adoptExternalConfigFiles)) {
@@ -500,7 +654,7 @@
 		const errors = validateAdopt();
 		adoptFields = errors;
 		if (Object.keys(errors).length > 0) return;
-		const body = {
+		const body: AdoptBody = {
 			application_id: adoptApplicationId.trim(),
 			name: adoptName.trim(),
 			origin: adoptOrigin,
@@ -512,6 +666,24 @@
 			external_environment_files: parsePathList(adoptExternalEnvironmentFiles),
 			expected_revision: 0
 		};
+		// The Service Map enrichments ride the request ONLY when explicitly
+		// set, so an untouched form keeps the reviewed create payload exact
+		// (the strict wire assertion in applications.spec.ts pins this).
+		if (adoptCategory !== '' && adoptCategory !== adoptCategoryInitial) {
+			body.category = adoptCategory;
+		}
+		if (adoptDescription.trim() !== '') body.description = adoptDescription.trim();
+		const steps = Object.fromEntries(
+			RUNBOOK_STEPS.map((step) => [step, adoptInstructions[step].trim()])
+		) as Record<RunbookStep, string>;
+		if (RUNBOOK_STEPS.some((step) => steps[step] !== '')) body.instructions = steps;
+		if (customCategories.length > 0) {
+			body.upsert_categories = customCategories.map((entry) => ({
+				machine_id: entry.machine_id,
+				label: entry.label,
+				description: entry.description
+			}));
+		}
 		adoptBusy = true;
 		adoptProblem = null;
 		try {
@@ -569,6 +741,183 @@
 	function openRecordDoc(docId: string): void {
 		if (docs === null) return;
 		docs.openDocument(docId);
+	}
+
+	// --- one-click chat tag (the bottom dock listens on the window) ----------
+
+	/**
+	 * Tags this server + `@service` in the Bottom Chat Dock: a window-level
+	 * CustomEvent, nothing else — the dock owns the focus mechanics (the
+	 * panel never reaches into another surface's state).
+	 */
+	function chatAboutService(row: ApplicationView): void {
+		if (serverScope === null) return;
+		window.dispatchEvent(
+			new CustomEvent('mai:chat-focus-service', {
+				detail: {
+					serverId: serverScope,
+					serviceName: row.name,
+					applicationId: row.application_id,
+					category: mappedCategory(row)
+				}
+			})
+		);
+	}
+
+	// --- service map editing (revision-checked re-adoption of metadata) ------
+
+	let editTarget = $state<ApplicationView | null>(null);
+	let editCategory = $state('');
+	let editDescription = $state('');
+	let editInstructions = $state<Record<RunbookStep, string>>({
+		install: '',
+		update: '',
+		uninstall: '',
+		backup: '',
+		verify: ''
+	});
+	let editBusy = $state(false);
+	let editProblem = $state<{ code: string; message: string } | null>(null);
+
+	function emptyInstructions(): Record<RunbookStep, string> {
+		return { install: '', update: '', uninstall: '', backup: '', verify: '' };
+	}
+
+	/** Open the inline editor pre-filled with the record's stored map metadata. */
+	function startEdit(row: ApplicationView): void {
+		editTarget = row;
+		editCategory = mappedCategory(row);
+		editDescription = mappedDescription(row);
+		const recorded = mappedInstructions(row);
+		editInstructions = emptyInstructions();
+		if (recorded !== null) {
+			for (const step of RUNBOOK_STEPS) {
+				const text = recorded[step];
+				if (typeof text === 'string') editInstructions[step] = text;
+			}
+		}
+		editProblem = null;
+	}
+
+	function cancelEdit(): void {
+		editTarget = null;
+		editProblem = null;
+	}
+
+	/**
+	 * Persist the edited map metadata through the ONE reviewed mutation: a
+	 * revision-checked re-adoption of the same identity (expected_revision =
+	 * the observed revision), carrying only metadata differences. A stale
+	 * revision is the producer's conflict, surfaced verbatim.
+	 */
+	async function saveEdit(): Promise<void> {
+		const target = editTarget;
+		if (api === null || serverScope === null || target === null || editBusy) return;
+		const scope = serverScope;
+		// The wire vocabulary is the generated enum plus the manual map entry;
+		// a foreign origin string cannot be re-adopted (fail closed).
+		const origin = ORIGINS.includes(target.origin) ? (target.origin as AdoptBody['origin']) : null;
+		if (origin === null) {
+			editProblem = {
+				code: 'validation_failed',
+				message: 'This record\'s origin cannot be updated through the map.'
+			};
+			return;
+		}
+		const steps = emptyInstructions();
+		for (const step of RUNBOOK_STEPS) steps[step] = editInstructions[step].trim();
+		const body: AdoptBody = {
+			application_id: target.application_id,
+			name: target.name,
+			origin,
+			compose_project: target.compose_project,
+			working_dir: target.working_dir,
+			unit_name: target.unit_name,
+			external_working_dir: target.external_working_dir,
+			external_config_files: [...target.external_config_files],
+			external_environment_files: [...target.external_environment_files],
+			expected_revision: target.revision,
+			category: editCategory,
+			description: editDescription.trim(),
+			instructions: steps
+		};
+		editBusy = true;
+		editProblem = null;
+		try {
+			const updated = await api.adopt(scope, body);
+			if (disposed || scope !== serverScope) return;
+			if (updated.server_id !== scope) {
+				editProblem = {
+					code: 'scope_mismatch',
+					message: 'The map update names a different server than this window\'s pinned scope.'
+				};
+				return;
+			}
+			applications = applications.map((row) =>
+				row.application_id === updated.application.application_id ? updated.application : row
+			);
+			editTarget = null;
+			snapshotStale = true;
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			editProblem = {
+				code,
+				message:
+					code === 'conflict'
+						? 'The record changed at another revision; refresh the inventory and reapply.'
+						: friendlyText(code, messageOf(error) ?? 'The map details could not be saved.')
+			};
+		} finally {
+			if (!disposed) editBusy = false;
+		}
+	}
+
+	// --- custom taxonomy minting (rides the next adoption) -------------------
+
+	let categoryIdInput = $state('');
+	let categoryLabelInput = $state('');
+	let categoryDescInput = $state('');
+	let categoryFields = $state<Record<string, string>>({});
+
+	const CATEGORY_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+	const CATEGORY_DESC_MAX = 2000;
+
+	function validateCategory(): Record<string, string> {
+		const errors: Record<string, string> = {};
+		const machineId = categoryIdInput.trim();
+		if (!CATEGORY_ID_RE.test(machineId))
+			errors.machine_id = 'A machine id: lowercase letters, digits, - and _ (1–64 characters).';
+		else if (taxonomy.some((entry) => entry.machine_id === machineId))
+			errors.machine_id = 'This machine id already exists in the taxonomy.';
+		if (categoryLabelInput.trim() === '') errors.label = 'A human-readable label is required.';
+		if (categoryDescInput.length > CATEGORY_DESC_MAX)
+			errors.description = `Bounded to ${CATEGORY_DESC_MAX} characters.`;
+		return errors;
+	}
+
+	/**
+	 * Mint one custom category in this window: it joins every picker and
+	 * chip immediately and persists through the next adoption's
+	 * `upsert_categories` (the one reviewed mutation that carries taxonomy).
+	 */
+	function saveCategory(): void {
+		const errors = validateCategory();
+		categoryFields = errors;
+		if (Object.keys(errors).length > 0) return;
+		customCategories = [
+			...customCategories,
+			{
+				machine_id: categoryIdInput.trim(),
+				label: categoryLabelInput.trim(),
+				description: categoryDescInput.trim(),
+				built_in: false
+			}
+		];
+		categoryIdInput = '';
+		categoryLabelInput = '';
+		categoryDescInput = '';
+		categoryFields = {};
 	}
 
 	// --- mount cycle (the $effect teardown is the release path) ---------------
@@ -650,8 +999,46 @@
 					<p class="mai-apps__meta" data-testid="inventory-count">
 						Showing {applications.length} of {inventoryTotal} adopted.
 					</p>
+					{#if presentCategories.length > 0}
+						<div
+							class="mai-apps__filterbar"
+							role="group"
+							aria-label="Filter mapped services by category"
+							data-testid="category-filter-bar"
+						>
+							<button
+								type="button"
+								class="mai-apps__pill"
+								class:mai-apps__pill--active={categoryFilter === 'all'}
+								aria-pressed={categoryFilter === 'all'}
+								onclick={() => (categoryFilter = 'all')}
+								data-testid="category-filter-pill"
+								data-category="all"
+							>
+								All
+							</button>
+							{#each presentCategories as machineId (machineId)}
+								<button
+									type="button"
+									class="mai-apps__pill"
+									class:mai-apps__pill--active={categoryFilter === machineId}
+									aria-pressed={categoryFilter === machineId}
+									onclick={() => (categoryFilter = machineId)}
+									data-testid="category-filter-pill"
+									data-category={machineId}
+								>
+									{categoryLabel(machineId)}
+								</button>
+							{/each}
+						</div>
+					{/if}
+					{#if filteredApplications.length === 0}
+						<div class="mai-apps__state" role="status" data-testid="inventory-filtered-empty">
+							<p>No mapped services in this category.</p>
+						</div>
+					{/if}
 					<ul class="mai-apps__rows" data-testid="inventory-list">
-						{#each applications as row (row.application_id)}
+						{#each filteredApplications as row (row.application_id)}
 							<li
 								class="mai-apps__row"
 								class:mai-apps__row--pinned={row.application_id === pinnedApplicationId}
@@ -666,6 +1053,13 @@
 									<span class="mai-apps__label" data-testid="inventory-row-name">{row.name}</span>
 									<span class="mai-apps__badge" data-testid="inventory-row-origin">
 										{originLabel(row.origin)}
+									</span>
+									<span
+										class="mai-apps__chip"
+										data-testid="service-category-chip"
+										data-category={mappedCategory(row)}
+									>
+										{categoryLabel(mappedCategory(row))}
 									</span>
 									{#if row.stale}
 										<span
@@ -727,7 +1121,90 @@
 									<dt>Adopted</dt>
 									<dd data-testid="inventory-row-adopted-at">{row.adopted_at}</dd>
 								</dl>
+								{#if mappedDescription(row) !== ''}
+									<p class="mai-apps__description" data-testid="service-description">
+										{mappedDescription(row)}
+									</p>
+								{/if}
+								<details class="mai-apps__runbook" data-testid="service-instructions">
+									<summary>Operational runbook</summary>
+									{#if recordedSteps(mappedInstructions(row)).length === 0}
+										<p class="mai-apps__note">No runbook instructions recorded for this service.</p>
+									{:else}
+										<dl class="mai-apps__facts">
+											{#each recordedSteps(mappedInstructions(row)) as [step, text] (step)}
+												<dt>{step}</dt>
+												<dd data-testid="runbook-step" data-step={step}>{text}</dd>
+											{/each}
+										</dl>
+									{/if}
+								</details>
+								{#if editTarget?.application_id === row.application_id}
+									<div class="mai-apps__editor" data-testid="service-edit-form">
+										<label class="mai-apps__select-label">
+											Category
+											<select
+												class="mai-apps__select"
+												bind:value={editCategory}
+												data-testid="service-edit-category"
+											>
+												{#each taxonomy as entry (entry.machine_id)}
+													<option value={entry.machine_id}>{entry.label}</option>
+												{/each}
+											</select>
+										</label>
+										<Field
+											label="Description"
+											bind:value={editDescription}
+											hint="What this service is for (bounded to 2000 characters)."
+											data-testid="service-edit-description"
+										/>
+										<fieldset class="mai-apps__fieldset">
+											<legend>Runbook instructions</legend>
+											{#each RUNBOOK_STEPS as step (step)}
+												<Field
+													label={step}
+													bind:value={editInstructions[step]}
+													hint="Optional command or note for the {step} procedure."
+													data-testid="service-edit-instructions-{step}"
+												/>
+											{/each}
+										</fieldset>
+										<div class="mai-apps__actions">
+											<Button onclick={saveEdit} loading={editBusy} data-testid="service-edit-save">
+												Save map details
+											</Button>
+											<Button variant="secondary" onclick={cancelEdit} data-testid="service-edit-cancel">
+												Cancel
+											</Button>
+										</div>
+										{#if editProblem !== null}
+											<div
+												class="mai-apps__state mai-apps__state--error"
+												role="alert"
+												data-testid="service-edit-error"
+												data-error-code={editProblem.code}
+											>
+												<p>{editProblem.message}</p>
+											</div>
+										{/if}
+									</div>
+								{/if}
 								<div class="mai-apps__row-actions">
+									<Button
+										variant="secondary"
+										onclick={() => chatAboutService(row)}
+										data-testid="service-chat-trigger"
+									>
+										Chat @{row.name}
+									</Button>
+									<Button
+										variant="secondary"
+										onclick={() => startEdit(row)}
+										data-testid="service-edit-start"
+									>
+										Map details…
+									</Button>
 									<Button
 										variant="secondary"
 										onclick={() => openInstall(row)}
@@ -931,6 +1408,14 @@
 											<span class="mai-apps__badge" data-testid="discovery-row-origin">
 												{originLabel(observed.origin)}
 											</span>
+											<span
+												class="mai-apps__chip mai-apps__chip--suggested"
+												data-testid="discovery-category-chip"
+												data-category={suggestedCategory(observed)}
+												title="Suggested category — the adoption decision may override it."
+											>
+												{categoryLabel(suggestedCategory(observed))}
+											</span>
 											{#if observed.managed && observed.application_id !== null}
 												<span
 													class="mai-apps__meta"
@@ -1036,6 +1521,40 @@
 							hint="Display name, 1–{MAX_NAME_CHARS} printable characters."
 							data-testid="adopt-name"
 						/>
+						<label class="mai-apps__select-label">
+							Category
+							<select
+								class="mai-apps__select"
+								bind:value={adoptCategory}
+								data-testid="adopt-category-select"
+							>
+								{#each taxonomy as entry (entry.machine_id)}
+									<option value={entry.machine_id}>{entry.label}</option>
+								{/each}
+							</select>
+							<span class="mai-apps__note">
+								Pre-selected from the observation's suggestion; only an explicit change is sent
+								with the adoption.
+							</span>
+						</label>
+						<Field
+							label="Description (optional)"
+							bind:value={adoptDescription}
+							error={adoptFields.description ?? ''}
+							hint="What this service is for; bounded to 2000 characters."
+							data-testid="adopt-description-input"
+						/>
+						<fieldset class="mai-apps__fieldset">
+							<legend>Runbook instructions (optional)</legend>
+							{#each RUNBOOK_STEPS as step (step)}
+								<Field
+									label={step}
+									bind:value={adoptInstructions[step]}
+									hint="Optional command or note for the {step} procedure."
+									data-testid="adopt-instructions-{step}"
+								/>
+							{/each}
+						</fieldset>
 						{#if adoptOrigin === 'compose'}
 							<Field
 								label="Compose project"
@@ -1152,6 +1671,73 @@
 						</div>
 					{/if}
 				{/if}
+			</section>
+
+		{:else if tab === 'categories'}
+			<section class="mai-apps__section" aria-label="Category taxonomy" data-testid="apps-categories">
+				<div class="mai-apps__section-head">
+					<h4>Categories</h4>
+					<span class="mai-apps__meta">
+						The Service Map taxonomy: 8 built-ins plus operator-defined categories.
+					</span>
+				</div>
+				<div class="mai-apps__taxonomy" data-testid="category-taxonomy-menu">
+					{#each taxonomy as entry (entry.machine_id)}
+						<div
+							class="mai-apps__taxonomy-row"
+							data-testid="category-taxonomy-row"
+							data-category={entry.machine_id}
+						>
+							<span class="mai-apps__chip">{entry.label}</span>
+							<code class="mai-apps__mono" data-testid="category-taxonomy-id">{entry.machine_id}</code>
+							<span class="mai-apps__taxonomy-desc" data-testid="category-taxonomy-description">
+								{entry.description}
+							</span>
+							{#if entry.built_in}
+								<span class="mai-apps__badge">built-in</span>
+							{:else}
+								<span class="mai-apps__badge mai-apps__badge--ok">custom</span>
+							{/if}
+						</div>
+					{/each}
+				</div>
+				<form
+					class="mai-apps__form"
+					data-testid="category-create-form"
+					onsubmit={(event) => {
+						event.preventDefault();
+						saveCategory();
+					}}
+				>
+					<Field
+						label="Machine id"
+						bind:value={categoryIdInput}
+						error={categoryFields.machine_id ?? ''}
+						hint="Lowercase letters, digits, - and _ (1–64 characters); the wire vocabulary value."
+						data-testid="category-id-input"
+					/>
+					<Field
+						label="Label"
+						bind:value={categoryLabelInput}
+						error={categoryFields.label ?? ''}
+						hint="Human-readable label shown on chips and pickers."
+						data-testid="category-label-input"
+					/>
+					<Field
+						label="Description"
+						bind:value={categoryDescInput}
+						error={categoryFields.description ?? ''}
+						hint="What belongs in this category."
+						data-testid="category-desc-input"
+					/>
+					<div class="mai-apps__actions">
+						<Button type="submit" data-testid="category-save-btn">Save category</Button>
+					</div>
+				</form>
+				<p class="mai-apps__note">
+					A custom category joins every picker and chip immediately and persists with the next
+					adoption or map save (the reviewed upsert rides that one mutation).
+				</p>
 			</section>
 		{/if}
 	{/if}
@@ -1323,6 +1909,131 @@
 	.mai-apps__badge--warn {
 		border-color: var(--color-warning, currentColor);
 		color: var(--color-warning, inherit);
+	}
+
+	.mai-apps__chip {
+		display: inline-block;
+		border: 1px solid var(--mai-color-brass, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: 0 var(--space-2, 0.5rem);
+		font-size: var(--mai-text-xs, 0.75rem);
+		color: var(--mai-color-brass, inherit);
+		white-space: nowrap;
+	}
+
+	.mai-apps__chip--suggested {
+		border-style: dashed;
+		color: var(--mai-color-brass-dim, inherit);
+		border-color: var(--mai-color-brass-dim, currentColor);
+	}
+
+	.mai-apps__filterbar {
+		display: flex;
+		gap: var(--space-2, 0.5rem);
+		flex-wrap: wrap;
+	}
+
+	.mai-apps__pill {
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		font-size: var(--mai-text-xs, 0.75rem);
+		padding: 0 var(--space-2, 0.5rem);
+		cursor: pointer;
+	}
+
+	.mai-apps__pill--active {
+		border-color: var(--mai-color-brass, currentColor);
+		color: var(--mai-color-brass, inherit);
+		font-weight: 600;
+	}
+
+	.mai-apps__description {
+		margin: 0;
+		color: var(--color-muted, inherit);
+	}
+
+	.mai-apps__runbook {
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: var(--space-2, 0.5rem);
+	}
+
+	.mai-apps__runbook summary {
+		cursor: pointer;
+		font-weight: 600;
+		font-size: var(--mai-text-xs, 0.75rem);
+	}
+
+	.mai-apps__editor {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3, 0.75rem);
+		border: 1px solid var(--mai-color-brass, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: var(--space-3, 0.75rem);
+	}
+
+	.mai-apps__select-label {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1, 0.25rem);
+		font-weight: 600;
+		font-size: var(--mai-text-sm, 0.875rem);
+	}
+
+	.mai-apps__select {
+		font: inherit;
+		padding: var(--space-1, 0.25rem) var(--space-2, 0.5rem);
+		border: 1px solid var(--mai-color-border, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		background: var(--mai-color-surface-raised, transparent);
+		color: inherit;
+	}
+
+	.mai-apps__fieldset {
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: var(--space-2, 0.5rem);
+		margin: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2, 0.5rem);
+	}
+
+	.mai-apps__fieldset legend {
+		padding: 0 var(--space-1, 0.25rem);
+		font-weight: 600;
+		font-size: var(--mai-text-xs, 0.75rem);
+	}
+
+	.mai-apps__taxonomy {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2, 0.5rem);
+	}
+
+	.mai-apps__taxonomy-row {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-3, 0.75rem);
+		flex-wrap: wrap;
+		border: 1px solid var(--mai-color-border, transparent);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: var(--space-2, 0.5rem);
+	}
+
+	.mai-apps__taxonomy-desc {
+		color: var(--color-muted, inherit);
+		flex: 1 1 16rem;
+		min-width: 0;
+	}
+
+	.mai-apps__mono {
+		font-family: var(--mai-font-mono, monospace);
+		font-size: var(--mai-text-xs, 0.75rem);
 	}
 
 	.mai-apps__facts {

@@ -6,10 +6,19 @@ const config = {
 	preprocess: vitePreprocess(),
 
 	compilerOptions: {
-		// MAI-owned window/workspace code is Svelte 5 runes throughout
-		// (windowed-workspace ADR D2); the official Svelte template recommends
-		// forcing runes mode project-wide.
+		// MAI-owned window/workspace code and virtual test fixtures are compiled
+		// in Svelte 5 runes mode throughout (windowed-workspace ADR D2).
 		runes: true
+	},
+
+	vitePlugin: {
+		// Third-party legacy Svelte 4 packages in node_modules (e.g. lucide-svelte@1.0.1
+		// using $$props) opt out of forced runes mode via dynamicCompileOptions.
+		dynamicCompileOptions({ filename }) {
+			if (filename.includes('node_modules')) {
+				return { runes: false };
+			}
+		}
 	},
 
 	kit: {

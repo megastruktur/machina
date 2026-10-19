@@ -58,6 +58,8 @@ const CLIENT = `${FRONTEND_ROOT}src/lib/api/client.ts`;
 /** Frozen identity fixtures (opaque UUIDs per contracts.md C01 rule 1). */
 const SERVER_A = '8c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
 const SERVER_B = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+/** The General Consult sentinel (the wire's server_id default). */
+const GLOBAL_CONSULT_SERVER_ID = '00000000-0000-0000-0000-000000000000';
 const ROOT = 'aa111111-1111-4222-8333-444455556666';
 const CHILD_A = 'bb222222-1111-4222-8333-444455556666';
 const CHILD_B = 'cc333333-1111-4222-8333-444455556666';
@@ -165,6 +167,7 @@ const APP_SOURCE = `
 	const HISTORY_RUN = '${HISTORY_RUN}';
 	const APPROVAL_ID = '${APPROVAL_ID}';
 	const OP_ID = '${OP_ID}';
+	const GLOBAL_CONSULT = '${GLOBAL_CONSULT_SERVER_ID}';
 	const ATTACHMENT_SHA = '${ATTACHMENT_SHA}';
 	const PAYLOAD_SHA = '${PAYLOAD_SHA}';
 	const CANARY = '${FIXTURE_CANARY}';
@@ -241,7 +244,10 @@ const APP_SOURCE = `
 	} else if (scenario === 'history') {
 		conversations[HISTORY_RUN] = runRow(HISTORY_RUN, SERVER_A, 'running', {
 			children: [childRow(CHILD_A, HISTORY_RUN, 'succeeded')],
-			attachments: [attachment]
+			attachments: [attachment],
+			// Recorded @service chips: the floating history selector restores
+			// them as locked chips.
+			service_tags: ['enshrouded', 'nginx']
 		});
 	} else if (scenario === 'approval' || scenario === 'approval-absent') {
 		conversations[ROOT] = runRow(ROOT, SERVER_A, 'waiting_approval', {
@@ -316,7 +322,11 @@ const APP_SOURCE = `
 			if (!UUID_RE.test(String(payload.run_id))) {
 				throw new ApiError(422, 'validation_failed', 'run_id must be a canonical UUID string');
 			}
-			if (payload.server_id !== SERVER_A && payload.server_id !== SERVER_B) {
+			if (
+				payload.server_id !== SERVER_A &&
+				payload.server_id !== SERVER_B &&
+				payload.server_id !== GLOBAL_CONSULT
+			) {
 				throw new ApiError(404, 'not_found', 'no canonical profile for the target server');
 			}
 			if (typeof payload.message !== 'string' || payload.message.length === 0) {
@@ -338,7 +348,10 @@ const APP_SOURCE = `
 			const conversation = runRow(runId, serverId, 'running', {
 				requested_grants: payload.capabilities ?? [],
 				children: rows,
-				attachments
+				attachments,
+				// The producer records the submitted @service chips on the run
+				// row; a restore reads them back (absent ⇒ older row, no tags).
+				...(Array.isArray(payload.service_tags) ? { service_tags: [...payload.service_tags] } : {})
 			});
 			conversations[runId] = conversation;
 			submissions.push({ payload: wire, childIds });
@@ -439,7 +452,21 @@ const APP_SOURCE = `
 		}
 	};
 
-	const services = chatServices(api);
+	// The bag carries the optional draft-context extras (server options for
+	// the picker, mapped services for the @service autocomplete) alongside
+	// the required api slice — the composed desktop passes the same shape.
+	const services = {
+		...chatServices(api),
+		serverOptions: [
+			{ id: SERVER_A, label: 'Server Alpha' },
+			{ id: SERVER_B, label: 'Server Beta' }
+		],
+		availableServices: [
+			{ name: 'enshrouded', category: 'games' },
+			{ name: 'nginx', category: 'web' },
+			{ name: 'postgres', category: 'databases' }
+		]
+	};
 
 	const sibling = createRawSnippet(() => {
 		return {
@@ -1396,4 +1423,211 @@ test('compose validation stays local; a finished conversation replays without in
 	const tree = main.getByTestId('conversation-children');
 	await expect(tree.getByText(CHILD_A.slice(0, 8))).toBeVisible();
 	await expect(tree.getByText('aspect-alpha review')).toHaveCount(0);
+});
+
+test('draft Server Chip: remove → General Consult, re-pick, @service chips; everything locks once the chat starts', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// Draft: the chip reflects the pinned scope and is removable.
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(main.getByTestId('chat-server-chip')).not.toHaveAttribute('data-locked', 'true');
+
+	// Removing it switches the composer to General Consult mode.
+	await main.getByTestId('chat-server-chip-remove').click();
+	await expect(main.getByTestId('chat-server-chip')).toHaveCount(0);
+	await expect(main.getByTestId('chat-general-consult-badge')).toHaveText(
+		'General Consult — No Server Pinned'
+	);
+
+	// Re-picking a server from the draft picker restores the chip.
+	await main.getByTestId('chat-server-picker').selectOption({ label: 'Server Beta' });
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Beta');
+
+	// `@service` chips: the toggle opens the autocomplete…
+	await main.getByTestId('chat-service-picker-toggle').click();
+	await expect(main.getByTestId('chat-service-autocomplete')).toBeVisible();
+	await main
+		.getByTestId('chat-service-option')
+		.filter({ hasText: '@enshrouded' })
+		.click();
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(1);
+	await expect(main.getByTestId('chat-service-chip')).toContainText('@enshrouded');
+
+	// …and typing `@<query>` in the message input opens the filtered list.
+	await main.getByTestId('compose-message').fill('check @ng');
+	await expect(main.getByTestId('chat-service-autocomplete')).toBeVisible();
+	await main
+		.getByTestId('chat-service-option')
+		.filter({ hasText: '@nginx' })
+		.click();
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(2);
+	// The consumed `@<token>` left the draft text.
+	await expect(main.getByTestId('compose-message')).toHaveValue('check ');
+
+	// A chip is removable while still in draft (drop the @nginx probe chip).
+	await main
+		.getByTestId('chat-service-chip')
+		.filter({ hasText: '@nginx' })
+		.getByTestId('chat-service-chip-remove')
+		.click();
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(1);
+
+	// Submit: server_id carries the picked server and the body records the
+	// remaining `@service` chip.
+	await main.getByTestId('compose-message').fill('Consult the pinned services.');
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await main.getByTestId('chat-submit').click();
+	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(1);
+	const submissions = await callsOf(page, 'submitMessage');
+	const body = submissions[submissions.length - 1].payload as Record<string, unknown>;
+	expect(body.server_id).toBe(SERVER_B);
+	expect(body.service_tags).toEqual(['enshrouded']);
+
+	// Immutable once started: chips lock, remove/pick controls leave the DOM.
+	await expect(main.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
+	await expect(main.getByTestId('chat-service-chip')).toHaveAttribute('data-locked', 'true');
+	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(main.getByTestId('chat-server-chip-remove')).toHaveCount(0);
+	await expect(main.getByTestId('chat-service-chip-remove')).toHaveCount(0);
+	await expect(main.getByTestId('chat-server-picker')).toHaveCount(0);
+	await expect(main.getByTestId('chat-service-picker-toggle')).toHaveCount(0);
+
+	// `New Chat` resets to a fresh unlocked draft with the default chip.
+	await main.getByTestId('chat-new-session').click();
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(main.getByTestId('chat-server-chip')).not.toHaveAttribute('data-locked', 'true');
+	await expect(main.getByTestId('chat-server-chip-remove')).toBeVisible();
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(0);
+	await expect(main.getByTestId('chat-context-locked')).toHaveCount(0);
+	await expect(main.getByTestId('chat-server-picker')).toBeVisible();
+});
+
+test('General Consult submit rides the sentinel server id and restores as the consult badge', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// Remove the Server Chip → General Consult mode.
+	await main.getByTestId('chat-server-chip-remove').click();
+	await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
+
+	await main.getByTestId('compose-message').fill('Cross-server consult question.');
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await main.getByTestId('chat-submit').click();
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(1);
+	const submissions = await callsOf(page, 'submitMessage');
+	const body = submissions[0].payload as Record<string, unknown>;
+	expect(body.server_id).toBe(GLOBAL_CONSULT_SERVER_ID);
+
+	// The recorded consult conversation shows the badge — never a Server Chip —
+	// and it is locked.
+	await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
+	await expect(main.getByTestId('chat-server-chip')).toHaveCount(0);
+	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+
+	// New Chat restores the default Server Chip.
+	await main.getByTestId('chat-new-session').click();
+	await expect(main.getByTestId('chat-general-consult-badge')).toHaveCount(0);
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+});
+
+test('the floating chat history selector restores the transcript and the locked server/service context', async ({
+	page
+}) => {
+	await openFixture(page, 'history');
+	const main = page.getByTestId('host-main');
+
+	// The header toggle opens the floating popover with the recorded session.
+	await main.getByTestId('chat-history-toggle').click();
+	const popover = main.getByTestId('chat-history-popover');
+	await expect(popover).toBeVisible();
+	const item = popover.getByTestId('chat-history-item');
+	await expect(item).toHaveCount(1);
+	await expect(item).toContainText('Server Alpha');
+	await expect(item).toContainText('@enshrouded');
+	await expect(item).toContainText('@nginx');
+	await expect(item).toContainText('Running');
+	await expect(item).toContainText('2026-10-16T09:00:00Z');
+
+	// Selecting the session loads its transcript AND restores its frozen
+	// context in the locked state.
+	await item.click();
+	await expect(main.getByTestId('chat-history-popover')).toHaveCount(0);
+	await expect(main.getByTestId('conversation-id')).toHaveText(HISTORY_RUN.slice(0, 8));
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(main.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(2);
+	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(main.getByTestId('compose-profile')).toHaveValue('fixture-fast');
+	await expect(main.getByTestId('chat-server-chip-remove')).toHaveCount(0);
+	await expect(main.getByTestId('chat-service-chip-remove')).toHaveCount(0);
+	await expect(main.getByTestId('chat-server-picker')).toHaveCount(0);
+	await expect(main.getByTestId('chat-service-picker-toggle')).toHaveCount(0);
+
+	// `New Chat` unlocks and returns to the default draft.
+	await main.getByTestId('chat-new-session').click();
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(main.getByTestId('chat-server-chip-remove')).toBeVisible();
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(0);
+});
+
+test('the mai:chat-focus-service window event pre-populates a new draft and never mutates a locked one', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// A draft draft accepts the Service Map seam event.
+	await page.evaluate(
+		([serverId, serviceName, category]) => {
+			window.dispatchEvent(
+				new CustomEvent('mai:chat-focus-service', {
+					detail: { serverId, serviceName, category }
+				})
+			);
+		},
+		[SERVER_B, 'enshrouded', 'games'] as const
+	);
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Beta');
+	await expect(main.getByTestId('chat-service-chip')).toContainText('@enshrouded');
+
+	// Start the chat; the recorded conversation locks to its scope.
+	await main.getByTestId('compose-message').fill('Seam-started conversation.');
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await main.getByTestId('chat-submit').click();
+	await expect
+		.poll(async () => (await callsOf(page, 'submitMessage')).length, { timeout: 15000 })
+		.toBeGreaterThanOrEqual(1);
+	const submissions = await callsOf(page, 'submitMessage');
+	const body = submissions[0].payload as Record<string, unknown>;
+	expect(body.server_id).toBe(SERVER_B);
+	expect(body.service_tags).toEqual(['enshrouded']);
+
+	// A locked session ignores a later focus-service event entirely.
+	await page.evaluate(
+		([serverId, serviceName]) => {
+			window.dispatchEvent(
+				new CustomEvent('mai:chat-focus-service', {
+					detail: { serverId, serviceName, category: 'web' }
+				})
+			);
+		},
+		[SERVER_A, 'nginx'] as const
+	);
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Beta');
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(1);
+
+	// New Chat unlocks again.
+	await main.getByTestId('chat-new-session').click();
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	await expect(main.getByTestId('chat-service-chip')).toHaveCount(0);
 });
