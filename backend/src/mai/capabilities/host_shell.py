@@ -143,6 +143,12 @@ SETTLE_POLL_SECONDS = 0.5
 #: tool result small for model contexts, C06 rule 3).
 MAX_EVENTS_TAIL_CHARS = 1024
 
+#: Per-stream UTF-8 byte cap in the JSON result document so that the
+#: serialized JSON (stdout + stderr + envelope) always fits comfortably
+#: inside CapabilityDispatcher's 64 KiB output budget without slicing the
+#: JSON mid-string (which would render the status unparseable).
+MAX_RESULT_STREAM_BYTES = 24 * 1024
+
 #: Payload vocabulary (frozen by this descriptor's input schema).
 _PAYLOAD_FIELDS = frozenset(
     {"command", "timeout", "output_budget", "working_directory"}
@@ -595,6 +601,22 @@ class HostShellCapability:
     ) -> dict[str, object]:
         """The safe result document: outcome AND evidence (acceptance 2)."""
         op_id = str(report.op_id)
+        stdout = report.stdout
+        stdout_truncated = report.stdout_truncated
+        raw_stdout = stdout.encode("utf-8")
+        if len(raw_stdout) > MAX_RESULT_STREAM_BYTES:
+            stdout = raw_stdout[:MAX_RESULT_STREAM_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            stdout_truncated = True
+        stderr = report.stderr
+        stderr_truncated = report.stderr_truncated
+        raw_stderr = stderr.encode("utf-8")
+        if len(raw_stderr) > MAX_RESULT_STREAM_BYTES:
+            stderr = raw_stderr[:MAX_RESULT_STREAM_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            stderr_truncated = True
         return {
             "capability": CAPABILITY_ID,
             "op_id": op_id,
@@ -604,12 +626,12 @@ class HostShellCapability:
             "scheme": report.scheme.value,
             "status": report.status.value,
             "exit_code": report.exit_code,
-            "stdout": report.stdout,
+            "stdout": stdout,
             "stdout_bytes": report.stdout_bytes,
-            "stdout_truncated": report.stdout_truncated,
-            "stderr": report.stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr": stderr,
             "stderr_bytes": report.stderr_bytes,
-            "stderr_truncated": report.stderr_truncated,
+            "stderr_truncated": stderr_truncated,
             "receipt_dir": f"{self._receipt_root}/{op_id}",
             "receipt_seq": report.state_seq,
             "receipt_ts": report.state_ts,

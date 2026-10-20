@@ -430,10 +430,33 @@
 				: profilesLive && serverId !== GLOBAL_CONSULT_SERVER_ID
 					? ['host.logs', 'host.shell', 'service.http', 'docs.retrieve']
 					: [];
+		const userPrompt = composeMessage.trim();
+		let fullMessage = userPrompt;
+		if (display !== null && profilesLive) {
+			const turnsToSummarize: Array<{ user: string; assistant: string }> = [
+				...priorTurns.map((t) => ({ user: t.userMessage, assistant: t.reply })),
+				{ user: messageText, assistant: latestAssistantReply || streamedReply }
+			];
+			const historyLines: string[] = ['## Prior conversation turns in this session', ''];
+			for (let idx = 0; idx < turnsToSummarize.length; idx++) {
+				const turn = turnsToSummarize[idx];
+				historyLines.push(`### Turn ${idx + 1} — User`);
+				historyLines.push(turn.user);
+				if (turn.assistant.trim() !== '') {
+					historyLines.push('', `### Turn ${idx + 1} — Assistant`, turn.assistant.trim());
+				}
+				historyLines.push('');
+			}
+			historyLines.push('## Follow-up request', '', userPrompt);
+			const candidate = historyLines.join('\n');
+			if (candidate.length <= 15000) {
+				fullMessage = candidate;
+			}
+		}
 		const body: ChatSubmitBody = {
 			run_id: runId,
 			server_id: serverId,
-			message: composeMessage.trim(),
+			message: fullMessage,
 			profile: composeProfile.trim(),
 			role: SUBMIT_ROLE,
 			mode: composeMode,
@@ -456,20 +479,37 @@
 		composeFields = composeFieldErrors();
 		composeProblem = null;
 		if (Object.keys(composeFields).length > 0) return;
+		const rawUserPrompt = composeMessage.trim();
 		const body = buildSubmitBody(crypto.randomUUID());
 		const childTasks = body.children ?? [];
 		composeBusy = true;
 		try {
 			const created = await api.submitMessage(body);
 			if (disposed) return;
+			const isFollowUp = display !== null;
+			if (isFollowUp && display !== null) {
+				priorTurns = [
+					...priorTurns,
+					{
+						runId: display.run_id,
+						submittedAt: display.submitted_at,
+						userMessage: messageText,
+						modelLabel: resolvedModel ?? display.model_profile,
+						thinkingSteps: [...thinkingSteps],
+						toolCalls: [...visibleToolCalls],
+						reply: latestAssistantReply || streamedReply
+					}
+				];
+			} else {
+				authoredLabels.clear();
+			}
 			// This window authored the submission: the message and the ordered
 			// child tasks are the labels the tree may render (child ids arrive
 			// value-free on the planned event, in body order — plan_children).
-			authoredLabels.clear();
-			authoredLabels.set(created.conversation.run_id, body.message);
+			authoredLabels.set(created.conversation.run_id, rawUserPrompt);
 			saveStoredAuthored(authoredLabels);
 			pendingChildTasks = childTasks.map((child) => child.task);
-			openConversation(created.conversation);
+			openConversation(created.conversation, isFollowUp);
 			composeMessage = '';
 			composeChildren = [''];
 			composeAttachments = '';
@@ -596,7 +636,10 @@
 	let pendingChildTasks = $state<string[]>([]);
 	let taskLabels = $state<Record<string, string>>({});
 
-	function openConversation(view: ConversationView): void {
+	function openConversation(view: ConversationView, keepPriorTurns = false): void {
+		if (!keepPriorTurns) {
+			priorTurns = [];
+		}
 		conversation = view;
 		refreshed = null;
 		taskLabels = Object.fromEntries(authoredLabels);
@@ -632,6 +675,7 @@
 	 */
 	function newChat(): void {
 		finishStream();
+		priorTurns = [];
 		conversation = null;
 		refreshed = null;
 		runDetail = null;
@@ -679,6 +723,17 @@
 		opId: string;
 	};
 
+	type PriorTurn = {
+		runId: string;
+		submittedAt: string;
+		userMessage: string;
+		modelLabel: string;
+		thinkingSteps: string[];
+		toolCalls: VisibleToolCall[];
+		reply: string;
+	};
+
+	let priorTurns = $state<PriorTurn[]>([]);
 	let transcript = $state<TranscriptEntry[]>([]);
 	let latestAssistantReply = $state<string>('');
 	let streamedReply = $state<string>('');
@@ -1643,6 +1698,73 @@
 				</p>
 
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
+					{#each priorTurns as turn (turn.runId)}
+						<div class="mai-chat__bubble mai-chat__bubble--user" data-testid="prior-turn-user">
+							<div class="mai-chat__bubble-header">
+								<span class="mai-chat__bubble-author">You</span>
+								<span class="mai-chat__bubble-time">{turn.submittedAt}</span>
+							</div>
+							<div class="mai-chat__bubble-body">
+								{turn.userMessage}
+							</div>
+						</div>
+
+						<div class="mai-chat__bubble mai-chat__bubble--assistant" data-testid="prior-turn-assistant">
+							<div class="mai-chat__bubble-header">
+								<span class="mai-chat__bubble-author">⚙ M.A.I. ({turn.modelLabel})</span>
+							</div>
+							<div class="mai-chat__bubble-body">
+								{#if turn.thinkingSteps.length > 0}
+									<details class="mai-chat__thinking-details">
+										<summary class="mai-chat__thinking-summary">
+											<span>&gt; Thinking ({turn.thinkingSteps.length} steps)</span>
+										</summary>
+										<blockquote class="mai-chat__thinking-quote">
+											{#each turn.thinkingSteps as stepLine, idx (idx)}
+												<div class="mai-chat__thinking-line">
+													<span class="mai-chat__thinking-prefix">&gt;</span>
+													<span>{stepLine}</span>
+												</div>
+											{/each}
+										</blockquote>
+									</details>
+								{/if}
+
+								{#if turn.toolCalls.length > 0}
+									<div class="mai-chat__tool-calls">
+										{#each turn.toolCalls as tc (tc.id)}
+											<div class="mai-chat__tool-card">
+												<div class="mai-chat__tool-card-head">
+													<span class="mai-chat__tool-card-title">
+														⚙ TOOL CALL // {tc.capabilityId}
+													</span>
+													<span
+														class="mai-chat__badge"
+														class:mai-chat__badge--ok={tc.status === 'succeeded'}
+														class:mai-chat__badge--danger={tc.status === 'failed'}
+													>
+														{tc.status.toUpperCase()}
+													</span>
+												</div>
+												<div class="mai-chat__tool-card-meta">
+													{#if tc.reason !== ''}
+														<span>· outcome: {tc.reason}</span>
+													{/if}
+												</div>
+											</div>
+										{/each}
+									</div>
+								{/if}
+
+								{#if turn.reply !== ''}
+									<div class="mai-chat__reply-markdown">
+										<MarkdownRenderer content={turn.reply} />
+									</div>
+								{/if}
+							</div>
+						</div>
+					{/each}
+
 					<div class="mai-chat__bubble mai-chat__bubble--user">
 						<div class="mai-chat__bubble-header">
 							<span class="mai-chat__bubble-author">You</span>

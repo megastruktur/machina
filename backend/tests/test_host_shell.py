@@ -789,6 +789,25 @@ class TestTransportComposition:
         assert str(harness.key_file) not in rendered
         assert "not-a-real-key" not in rendered
 
+    def test_large_stdout_is_capped_before_json_serialization(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        harness = _Harness(monkeypatch, tmp_path)
+        harness.lane.script = [
+            _report(
+                status=CommandStatus.SUCCEEDED,
+                exit_code=0,
+                stdout="A" * 65536,
+            )
+        ]
+        result = asyncio.run(harness.run())
+        assert result.ok is True
+        assert len(result.output.encode("utf-8")) < 64 * 1024
+        document = json.loads(result.output)
+        assert document["status"] == "succeeded"
+        assert document["stdout_truncated"] is True
+        assert document["stdout_bytes"] == 65536
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher integration: deny outcomes never reach this executor
