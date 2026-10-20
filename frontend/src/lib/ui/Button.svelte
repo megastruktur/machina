@@ -93,23 +93,78 @@
 		cursor: not-allowed;
 	}
 
-	/* Mechanicus / Odyssey chrome: every accent resolves from --mai-* tokens. */
-	.mai-button--primary {
-		background: var(--mai-color-primary);
-		color: var(--mai-color-primary-contrast);
-		border-color: var(--mai-color-brass-dim);
+	/* Mechanicus / Odyssey chrome: every accent resolves from --mai-* tokens.
+	   Because CSS `clip-path` slices away standard rectangular `border` and
+	   `box-shadow: inset` along the 45° top-right and bottom-left chamfers,
+	   chipped variants (.mai-button--primary and .mai-button--danger) paint a
+	   full 6-edge polygon border via ::before (border plate) and ::after
+	   (1px-inset inner fill plate) while keeping `background-color` on the
+	   button element itself for token inspection. */
+	.mai-button--primary,
+	.mai-button--danger {
+		--mai-button-inner-clip: polygon(
+			0 0,
+			calc(100% - 5.5px) 0,
+			100% 5.5px,
+			100% 100%,
+			5.5px 100%,
+			0 calc(100% - 5.5px)
+		);
+		position: relative;
+		isolation: isolate;
+		border-color: transparent;
 		clip-path: var(--mai-button-clip, none);
+	}
+
+	.mai-button--primary::before,
+	.mai-button--danger::before {
+		content: '';
+		position: absolute;
+		inset: -1px;
+		z-index: -2;
+		background: var(--mai-btn-border, var(--mai-color-brass-dim));
+		clip-path: var(--mai-button-clip, none);
+		border-radius: inherit;
+		pointer-events: none;
+		transition: background-color var(--mai-motion-fast) ease;
+	}
+
+	.mai-button--primary::after,
+	.mai-button--danger::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		z-index: -1;
+		background: var(--mai-btn-fill, var(--mai-color-primary));
 		box-shadow: inset 0 1px 0 var(--mai-border-specular);
+		clip-path: var(--mai-button-inner-clip, none);
+		border-radius: inherit;
+		pointer-events: none;
+		transition: background-color var(--mai-motion-fast) ease;
+	}
+
+	:global([data-theme='standard']) .mai-button--primary,
+	:global([data-theme='standard']) .mai-button--danger {
+		--mai-button-inner-clip: none;
+	}
+
+	.mai-button--primary {
+		--mai-btn-fill: var(--mai-color-primary);
+		--mai-btn-border: var(--mai-color-brass-dim);
+		background-color: var(--mai-color-primary);
+		color: var(--mai-color-primary-contrast);
 	}
 
 	.mai-button--primary:hover:not(:disabled) {
-		background: var(--mai-color-primary-hover);
-		box-shadow: inset 0 0 0 1px var(--mai-color-brass);
+		--mai-btn-fill: var(--mai-color-primary-hover);
+		--mai-btn-border: var(--mai-color-brass);
+		background-color: var(--mai-color-primary-hover);
 	}
 
 	.mai-button--primary:active:not(:disabled) {
-		background: var(--mai-color-primary-active);
-		box-shadow: inset 0 0 0 1px var(--mai-color-brass-dim);
+		--mai-btn-fill: var(--mai-color-primary-active);
+		--mai-btn-border: var(--mai-color-brass-dim);
+		background-color: var(--mai-color-primary-active);
 	}
 
 	.mai-button--secondary {
@@ -140,12 +195,14 @@
 	}
 
 	.mai-button--danger {
-		background: var(--mai-status-danger-solid);
+		--mai-btn-fill: var(--mai-status-danger-solid);
+		--mai-btn-border: var(--mai-color-brass-dim);
+		background-color: var(--mai-status-danger-solid);
 		color: var(--mai-status-solid-contrast);
 	}
 
 	.mai-button--danger:hover:not(:disabled) {
-		box-shadow: inset 0 0 0 1px var(--mai-status-danger-border);
+		--mai-btn-border: var(--mai-status-danger-text);
 	}
 
 	.mai-button__spinner {

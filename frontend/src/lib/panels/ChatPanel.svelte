@@ -1447,6 +1447,50 @@
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let advancedOpen = $state(false);
 	let detailsOpen = $state(false);
+	let stoppingRun = $state(false);
+	const canStopRun = $derived(
+		api !== null && display !== null && jobInProgress && !cancelRequested && !stoppingRun
+	);
+
+	function toggleOptionsDrawer(): void {
+		const next = !advancedOpen;
+		advancedOpen = next;
+		if (next) detailsOpen = false;
+	}
+
+	function handleOptionsKeydown(e: KeyboardEvent): void {
+		if (e.key === 'Escape' && advancedOpen) {
+			e.stopPropagation();
+			advancedOpen = false;
+			const btn = document.getElementById(`${uid}-options-trigger`);
+			btn?.focus();
+		}
+	}
+
+	$effect(() => {
+		if (detailsOpen) {
+			advancedOpen = false;
+		}
+	});
+
+	async function stopActiveConversation(): Promise<void> {
+		if (api === null || display === null || !jobInProgress || cancelRequested || stoppingRun) return;
+		stoppingRun = true;
+		try {
+			await api.cancelConversation(display.run_id, { cancel_children: true });
+			if (disposed) return;
+			await loadConversation();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			refreshProblem = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'The cancellation could not be recorded.')
+			};
+		} finally {
+			if (!disposed) stoppingRun = false;
+		}
+	}
 
 	$effect(() => {
 		onhistorychange?.(historyRows);
@@ -1646,7 +1690,7 @@
 					{/if}
 				</div>
 
-				<!-- Right side of the header: Noosphere title + dock collapse button (when docked)
+				<!-- Right side of the header: Noosphere title + Options toggle + dock collapse button (when docked)
 				     plus sr-only / standalone New Chat & History controls. -->
 				<div class="mai-chat__header-right">
 					{#if isDocked}
@@ -1658,6 +1702,22 @@
 								WORKING · {elapsedSeconds}s
 							</span>
 						{/if}
+					{:else}
+						<h3 class="mai-chat__title">Conversation</h3>
+					{/if}
+					<Button
+						id="{uid}-options-trigger"
+						size="sm"
+						pill
+						variant="secondary"
+						onclick={toggleOptionsDrawer}
+						aria-expanded={advancedOpen}
+						aria-controls="{uid}-options"
+						data-testid="chat-advanced-toggle"
+					>
+						{advancedOpen ? 'Hide options' : 'Options'}
+					</Button>
+					{#if isDocked}
 						<Button
 							size="sm"
 							pill
@@ -1669,8 +1729,6 @@
 						>
 							{dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
 						</Button>
-					{:else}
-						<h3 class="mai-chat__title">Conversation</h3>
 					{/if}
 					<div class="mai-chat__header-actions" class:mai-sr-only={isDocked}>
 						<Button
@@ -1947,6 +2005,18 @@
 				</div>
 
 				<DetailsDisclosure bind:open={detailsOpen} id="{uid}-details" testId="chat-details">
+					<div class="mai-chat__drawer-head">
+						<span class="mai-chat__drawer-title">⚙ Conversation Details</span>
+						<Button
+							size="sm"
+							variant="ghost"
+							onclick={() => (detailsOpen = false)}
+							aria-label="Close details"
+							data-testid="chat-details-close"
+						>
+							✕
+						</Button>
+					</div>
 					<div class="mai-chat__section-head">
 						<span class="mai-chat__meta" data-testid="conversation-id">{shortId(display.run_id)}</span>
 						<Button variant="secondary" onclick={loadConversation} data-testid="conversation-refresh">Refresh</Button>
@@ -2114,15 +2184,14 @@
 					</div>
 						<div class="mai-chat__actions">
 							<Button
-								size="sm"
 								pill
-								variant="secondary"
-								onclick={() => (advancedOpen = !advancedOpen)}
-								aria-expanded={advancedOpen}
-								aria-controls="{uid}-options"
-								data-testid="chat-advanced-toggle"
+								variant="danger"
+								disabled={!canStopRun}
+								loading={stoppingRun}
+								onclick={stopActiveConversation}
+								data-testid="chat-stop"
 							>
-								{advancedOpen ? 'Hide options' : 'Options'}
+								Stop
 							</Button>
 							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
 								Send
@@ -2135,10 +2204,31 @@
 				{#if !advancedOpen && Object.keys(composeFields).some((field) => field !== 'message')}
 					<p class="mai-chat__field-error" role="alert" data-testid="compose-options-error">
 						Review the highlighted Options before sending.
-						<Button variant="ghost" size="sm" onclick={() => (advancedOpen = true)}>Options</Button>
+						<Button variant="ghost" size="sm" onclick={toggleOptionsDrawer}>Options</Button>
 					</p>
 				{/if}
-				<div class="mai-chat__advanced" hidden={!advancedOpen} id="{uid}-options">
+				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div
+					class="mai-chat__advanced"
+					role="region"
+					aria-label="Options"
+					hidden={!advancedOpen}
+					id="{uid}-options"
+					onkeydown={handleOptionsKeydown}
+				>
+					<div class="mai-chat__drawer-head">
+						<span class="mai-chat__drawer-title">⚙ Composer Options</span>
+						<Button
+							size="sm"
+							variant="ghost"
+							onclick={() => (advancedOpen = false)}
+							aria-label="Close options"
+							data-testid="chat-options-close"
+						>
+							✕
+						</Button>
+					</div>
 					<div class="mai-chat__composer-profile">
 						<ModelProfileSelect
 							compact={isDocked}
@@ -2248,18 +2338,20 @@
 	}
 
 	.mai-chat__body {
+		position: relative;
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
 		min-width: 0;
 		min-height: 0;
+		overflow: hidden;
 		/* Bound the whole workspace, never individual message length. Auto-height
 		   windows still measure this intrinsic body and own their outer cap. */
 		height: min(40rem, calc(100dvh - 10rem));
 	}
 
 	.mai-chat--dock-collapsed { height: auto; }
-	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle) { height: auto; }
+	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle):not(:has(.mai-chat__advanced:not([hidden]))) { height: auto; }
 
 	.mai-chat__body[hidden] {
 		display: none;
@@ -2282,11 +2374,12 @@
 	}
 
 	/* Place the reviewed disclosure trigger beside status; its mounted panel
-	 * stays after the messages, so toggling never recreates the tree fold. */
+	 * slides in from the right edge of .mai-chat__body, so toggling never
+	 * steals vertical height from the conversation scroll area. */
 	.mai-chat__section--conversation:not(.mai-chat__section--idle) {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) auto;
-		grid-template-rows: auto auto minmax(0, 1fr) auto;
+		grid-template-rows: auto auto minmax(0, 1fr);
 		flex: 1 1 0;
 		min-height: 0;
 		min-width: 0;
@@ -2301,14 +2394,54 @@
 	.mai-chat__section--conversation > :global(.mai-details) { display: contents; }
 	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) { grid-area: 1 / 2; }
 	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) {
-		grid-area: 4 / 1 / auto / -1;
-		max-height: min(12rem, 26dvh);
-		overflow: auto;
+		position: absolute;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		width: min(26rem, 92%);
+		max-height: none;
+		z-index: 25;
+		overflow-x: hidden;
+		overflow-y: auto;
 		overscroll-behavior: contain;
 		box-sizing: border-box;
-		border: 0;
-		border-top: var(--mai-border-width) solid var(--mai-color-border);
-		padding: var(--mai-space-2) 0;
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+		box-shadow: var(--mai-shadow-float);
+		padding: var(--mai-space-3);
+		animation: mai-chat-slide-from-right var(--mai-motion-base, 180ms) ease-out;
+	}
+
+	.mai-chat__drawer-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+		padding-bottom: var(--mai-space-2);
+		margin-bottom: var(--mai-space-2);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+	}
+
+	.mai-chat__drawer-title {
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--mai-color-brass);
+	}
+
+	@keyframes mai-chat-slide-from-right {
+		from {
+			transform: translateX(100%);
+			opacity: 0.4;
+		}
+		to {
+			transform: translateX(0);
+			opacity: 1;
+		}
 	}
 
 	.mai-chat__conversation-scroll {
@@ -2585,9 +2718,27 @@
 	}
 
 	.mai-chat__advanced {
+		position: absolute;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		width: min(26rem, 92%);
+		max-height: none;
+		z-index: 25;
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+		overflow-x: hidden;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		box-sizing: border-box;
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-md);
+		box-shadow: var(--mai-shadow-float);
+		padding: var(--mai-space-3);
+		animation: mai-chat-slide-from-right var(--mai-motion-base, 180ms) ease-out;
 	}
 
 	.mai-chat__advanced[hidden] {
@@ -3042,7 +3193,6 @@
 	}
 
 	.mai-chat__section--compose { flex: 0 0 auto; min-width: 0; }
-	.mai-chat__advanced { max-height: min(10rem, 22dvh); overflow: auto; overscroll-behavior: contain; }
 	.mai-chat__section--idle { flex: 1 1 0; min-height: 0; overflow: auto; }
 	.mai-chat__header { flex: 0 0 auto; }
 	.mai-chat__header-right { flex-wrap: wrap; min-width: 0; }
@@ -3058,8 +3208,6 @@
 		.mai-chat__header-right { gap: var(--mai-space-1); }
 		.mai-chat__title, .mai-chat__noosphere-title { display: none; }
 		.mai-chat__body { height: calc(100dvh - 14rem); }
-		.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) { max-height: 14dvh; }
-		.mai-chat__advanced { max-height: 12dvh; }
 	}
 	.mai-chat__history-item {
 		display: flex; width: 100%; min-width: 0; align-items: center;
