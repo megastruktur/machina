@@ -1387,6 +1387,68 @@
 			<p>This panel was opened without its conversation service or outside a pinned server scope.</p>
 		</div>
 	{:else}
+		{#snippet historyList()}
+		<section class="mai-chat__section" aria-label="Conversations" data-testid="chat-history">
+			<div class="mai-chat__section-head">
+				<h4>Conversations</h4>
+				<Button variant="secondary" onclick={loadHistory} data-testid="history-refresh">
+					Refresh
+				</Button>
+			</div>
+			{#if historyState.status === 'loading'}
+				<div class="mai-chat__state" role="status" data-testid="history-loading">
+					<p>Loading conversations…</p>
+				</div>
+			{:else if historyState.status === 'error'}
+				<div
+					class="mai-chat__state mai-chat__state--error"
+					role="alert"
+					data-testid="history-error"
+					data-error-code={historyProblem?.code}
+				>
+					<p>{historyProblem?.message}</p>
+					<Button variant="secondary" onclick={loadHistory} data-testid="history-retry">
+						Retry
+					</Button>
+				</div>
+			{:else if historyRows.length === 0}
+				<div class="mai-chat__state" role="status" data-testid="history-empty">
+					<p>No conversations are recorded for this server.</p>
+				</div>
+			{:else}
+				<ul class="mai-chat__rows" data-testid="history-list">
+					{#each historyRows as row (row.run_id)}
+						<li class="mai-chat__row" data-testid="history-row" data-run-id={row.run_id}>
+							<button type="button" class="mai-chat__history-item" data-testid="chat-history-item" onclick={() => selectHistoryRow(row)}>
+							<div class="mai-chat__row-main">
+								<span class="mai-chat__row-id" data-testid="history-row-id">
+									{shortId(row.run_id)}
+								</span>
+								<span
+									class="mai-chat__badge"
+									class:mai-chat__badge--ok={row.state === 'succeeded'}
+									class:mai-chat__badge--danger={row.state === 'failed'}
+									class:mai-chat__badge--neutral={row.state === 'cancelled'}
+									data-testid="history-row-state"
+								>
+									{runStateText(row.state)}
+								</span>
+								<span class="mai-chat__meta">{row.model_profile}</span>
+								<span class="mai-chat__meta">{row.submitted_at}</span>
+								<span class="mai-chat__badge">{row.server_id === GLOBAL_CONSULT_SERVER_ID ? 'General Consult' : serverLabelFor(row.server_id)}</span>
+								{#each row.service_tags ?? [] as tag (tag)}<span class="mai-chat__badge">@{tag}</span>{/each}
+							</div>
+							<span data-testid="history-open">Open</span>
+							</button>
+						</li>
+					{/each}
+				</ul>
+				<p class="mai-chat__meta" data-testid="history-total">
+					Showing {historyRows.length} of {historyTotal} recorded conversations.
+				</p>
+			{/if}
+		</section>
+		{/snippet}
 		<header class="mai-chat__header">
 			<div class="mai-chat__header-row">
 				<!-- Left side of the header: Target server selector, active server/consult
@@ -1538,51 +1600,10 @@
 				</div>
 			</div>
 			{#if historyOpen}
-				<!-- Floating history selector: the same bounded page the inline
-				     list renders, as a header popover that restores the selected
-				     session's transcript AND its frozen server/service context. -->
+				<!-- One bounded history picker; selection restores transcript and
+				     frozen server/service context without displacing the chat. -->
 				<div class="mai-chat__history-popover" data-testid="chat-history-popover">
-					{#if historyState.status === 'loading'}
-						<p class="mai-chat__meta" role="status">Loading conversations…</p>
-					{:else if historyState.status === 'error'}
-						<p class="mai-chat__note mai-chat__note--error" role="alert">
-							{historyProblem?.message}
-						</p>
-					{:else if historyRows.length === 0}
-						<p class="mai-chat__meta">No conversations are recorded for this server.</p>
-					{:else}
-						<ul class="mai-chat__history-popover-list">
-							{#each historyRows as row (row.run_id)}
-								<li>
-									<button
-										type="button"
-										class="mai-chat__history-item"
-										data-testid="chat-history-item"
-										onclick={() => selectHistoryRow(row)}
-									>
-										<span class="mai-chat__row-id">{shortId(row.run_id)}</span>
-										{#if row.server_id === GLOBAL_CONSULT_SERVER_ID}
-											<span class="mai-chat__badge">General Consult</span>
-										{:else}
-											<span class="mai-chat__badge">{serverLabelFor(row.server_id)}</span>
-										{/if}
-										{#each row.service_tags ?? [] as tag (tag)}
-											<span class="mai-chat__badge">@{tag}</span>
-										{/each}
-										<span
-											class="mai-chat__badge"
-											class:mai-chat__badge--ok={row.state === 'succeeded'}
-											class:mai-chat__badge--danger={row.state === 'failed'}
-											class:mai-chat__badge--neutral={row.state === 'cancelled'}
-										>
-											{runStateText(row.state)}
-										</span>
-										<span class="mai-chat__meta">{row.submitted_at}</span>
-									</button>
-								</li>
-							{/each}
-						</ul>
-					{/if}
+					{@render historyList()}
 				</div>
 			{/if}
 		</header>
@@ -1683,7 +1704,6 @@
 												</span>
 											</div>
 											<div class="mai-chat__tool-card-meta">
-												<span>step #{tc.stepSeq}</span>
 												{#if tc.reason !== ''}
 													<span>· outcome: {tc.reason}</span>
 												{/if}
@@ -1702,7 +1722,7 @@
 								</div>
 							{:else if rootTerminal}
 								<div class="mai-chat__reply-placeholder">
-									(Assistant reply is recorded in the transcript events below)
+									(Assistant reply is recorded in Details → Agent activity & events)
 								</div>
 							{/if}
 						</div>
@@ -1884,79 +1904,11 @@
 			{/if}
 		</section>
 
-		<section class="mai-chat__section mai-chat__section--history" aria-label="Conversations" data-testid="chat-history">
-			<div class="mai-chat__section-head">
-				<h4>Conversations</h4>
-				<Button variant="secondary" onclick={loadHistory} data-testid="history-refresh">
-					Refresh
-				</Button>
-			</div>
-			{#if historyState.status === 'loading'}
-				<div class="mai-chat__state" role="status" data-testid="history-loading">
-					<p>Loading conversations…</p>
-				</div>
-			{:else if historyState.status === 'error'}
-				<div
-					class="mai-chat__state mai-chat__state--error"
-					role="alert"
-					data-testid="history-error"
-					data-error-code={historyProblem?.code}
-				>
-					<p>{historyProblem?.message}</p>
-					<Button variant="secondary" onclick={loadHistory} data-testid="history-retry">
-						Retry
-					</Button>
-				</div>
-			{:else if historyRows.length === 0}
-				<div class="mai-chat__state" role="status" data-testid="history-empty">
-					<p>No conversations are recorded for this server.</p>
-				</div>
-			{:else}
-				<ul class="mai-chat__rows" data-testid="history-list">
-					{#each historyRows as row (row.run_id)}
-						<li class="mai-chat__row" data-testid="history-row" data-run-id={row.run_id}>
-							<div class="mai-chat__row-main">
-								<span class="mai-chat__row-id" data-testid="history-row-id">
-									{shortId(row.run_id)}
-								</span>
-								<span
-									class="mai-chat__badge"
-									class:mai-chat__badge--ok={row.state === 'succeeded'}
-									class:mai-chat__badge--danger={row.state === 'failed'}
-									class:mai-chat__badge--neutral={row.state === 'cancelled'}
-									data-testid="history-row-state"
-								>
-									{runStateText(row.state)}
-								</span>
-								<span class="mai-chat__meta">{row.model_profile}</span>
-							</div>
-							<div class="mai-chat__row-actions">
-								<Button
-									variant="secondary"
-									onclick={() => openConversation(row)}
-									data-testid="history-open"
-								>
-									Open
-								</Button>
-							</div>
-						</li>
-					{/each}
-				</ul>
-				<p class="mai-chat__meta" data-testid="history-total">
-					Showing {historyRows.length} of {historyTotal} recorded conversations.
-				</p>
-			{/if}
-		</section>
-
-		<section class="mai-chat__section" aria-label="Compose" data-testid="chat-compose">
-			<div class="mai-chat__section-head">
-				<h4>New message</h4>
-			</div>
-
+		<section class="mai-chat__section mai-chat__section--compose" aria-label="Compose" data-testid="chat-compose">
 			<div class="mai-chat__form">
 				<div class="mai-chat__composer-bar">
 					<div class="mai-chat__composer-input-wrap">
-						<label class="mai-chat__label" class:mai-chat__label--sr={isDocked} for="{uid}-message">Message</label>
+						<label class="mai-chat__label mai-chat__label--sr" for="{uid}-message">Message</label>
 						<textarea
 							id="{uid}-message"
 							class="mai-chat__textarea"
@@ -1970,7 +1922,6 @@
 							data-testid="compose-message"
 						></textarea>
 					</div>
-					{#if isDocked}
 						<div class="mai-chat__actions">
 							<Button
 								size="sm"
@@ -1978,6 +1929,7 @@
 								variant="secondary"
 								onclick={() => (advancedOpen = !advancedOpen)}
 								aria-expanded={advancedOpen}
+								aria-controls="{uid}-options"
 								data-testid="chat-advanced-toggle"
 							>
 								{advancedOpen ? 'Hide options' : 'Options'}
@@ -1986,12 +1938,17 @@
 								Send
 							</Button>
 						</div>
-					{/if}
 				</div>
 				{#if composeFields.message}
 					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
 				{/if}
-				<div class="mai-chat__advanced" class:mai-chat__advanced--collapsed={isDocked && !advancedOpen}>
+				{#if !advancedOpen && Object.keys(composeFields).some((field) => field !== 'message')}
+					<p class="mai-chat__field-error" role="alert" data-testid="compose-options-error">
+						Review the highlighted Options before sending.
+						<Button variant="ghost" size="sm" onclick={() => (advancedOpen = true)}>Options</Button>
+					</p>
+				{/if}
+				<div class="mai-chat__advanced" hidden={!advancedOpen} id="{uid}-options">
 					<div class="mai-chat__composer-profile">
 						<ModelProfileSelect
 							compact={isDocked}
@@ -2047,13 +2004,6 @@
 						hint="Op ids of stored artifacts of this server (comma-separated); references only."
 					/>
 				</div>
-				{#if !isDocked}
-					<div class="mai-chat__actions">
-						<Button onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
-							Send
-						</Button>
-					</div>
-				{/if}
 				{#if composeProblem !== null}
 					<div
 						class="mai-chat__state mai-chat__state--error"
@@ -2075,12 +2025,14 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3, 0.75rem);
-		padding: var(--mai-panel-pad, 1rem);
+		padding: 0;
 		color: var(--mai-color-text, inherit);
 		font-size: var(--mai-text-sm, 0.875rem);
 		min-width: 0;
 		min-height: 0;
-		overflow: auto;
+		overflow: visible;
+		container-type: inline-size;
+		overflow-wrap: anywhere;
 	}
 
 	/* Compact layout when mounted inside the Bottom Chat Dock. */
@@ -2093,8 +2045,16 @@
 	.mai-chat__body {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-3, 0.75rem);
+		gap: var(--mai-space-2);
+		min-width: 0;
+		min-height: 0;
+		/* Bound the whole workspace, never individual message length. Auto-height
+		   windows still measure this intrinsic body and own their outer cap. */
+		height: min(40rem, calc(100dvh - 10rem));
 	}
+
+	.mai-chat--dock-collapsed { height: auto; }
+	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle) { height: auto; }
 
 	.mai-chat__body[hidden] {
 		display: none;
@@ -2106,7 +2066,6 @@
 
 	.mai-chat--docked .mai-chat__title,
 	.mai-chat--docked .mai-chat__section-head > h4,
-	.mai-chat--docked .mai-chat__section--history,
 	.mai-chat--docked .mai-chat__section--idle {
 		display: none;
 	}
@@ -2122,6 +2081,12 @@
 	.mai-chat__section--conversation:not(.mai-chat__section--idle) {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) auto;
+		grid-template-rows: auto auto minmax(0, 1fr) auto;
+		flex: 1 1 0;
+		min-height: 0;
+		min-width: 0;
+		border: 0;
+		padding: 0;
 	}
 
 	.mai-chat__conversation-status { grid-area: 1 / 1; }
@@ -2130,50 +2095,47 @@
 	.mai-chat__section--conversation > .mai-chat__conversation-scroll { grid-area: 3 / 1 / auto / -1; }
 	.mai-chat__section--conversation > :global(.mai-details) { display: contents; }
 	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) { grid-area: 1 / 2; }
-	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) { grid-area: 4 / 1 / auto / -1; }
+	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) {
+		grid-area: 4 / 1 / auto / -1;
+		max-height: min(12rem, 26dvh);
+		overflow: auto;
+		overscroll-behavior: contain;
+		box-sizing: border-box;
+		border: 0;
+		border-top: var(--mai-border-width) solid var(--mai-color-border);
+		padding: var(--mai-space-2) 0;
+	}
 
 	.mai-chat__conversation-scroll {
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-3);
-		max-height: 42dvh;
+		min-height: 0;
+		min-width: 0;
 		overflow-y: auto;
 		overscroll-behavior: contain;
-		padding-right: var(--mai-space-1);
-	}
-
-	.mai-chat--docked .mai-chat__conversation-scroll {
-		max-height: 32dvh;
+		padding: 0;
+		scrollbar-gutter: stable;
 	}
 
 	.mai-chat__bubble {
 		display: flex;
 		flex-direction: column;
+		flex: 0 0 auto;
 		gap: var(--mai-space-2);
-		padding: var(--mai-space-3) var(--mai-space-4);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-left-width: var(--mai-chip-accent-width, 3px);
-		border-radius: var(--mai-radius-md);
-		background-color: var(--mai-color-surface-raised);
 		width: 100%;
-		box-shadow: var(--mai-shadow-sm);
-	}
-
-	.mai-chat__bubble--user {
-		border-color: var(--mai-color-border-strong);
-		border-left-color: var(--mai-color-brass);
-		background-color: var(--mai-color-surface);
-	}
-
-	.mai-chat__bubble--assistant {
-		border-left-color: var(--mai-color-primary);
-		background-color: var(--mai-color-surface-sunken);
+		min-width: 0;
+		padding: var(--mai-space-2) 0;
+		border: 0;
+		background: transparent;
+		box-shadow: none;
 	}
 
 	.mai-chat__bubble-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		flex-wrap: wrap;
 		gap: var(--mai-space-2);
 		padding-bottom: var(--mai-space-1);
 		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
@@ -2205,10 +2167,9 @@
 	}
 
 	.mai-chat__thinking-details {
-		border: var(--mai-border-width) solid var(--mai-color-border);
+		border: 0;
 		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
-		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-surface);
+		background: transparent;
 		padding: var(--mai-space-1) var(--mai-space-2);
 	}
 
@@ -2228,7 +2189,7 @@
 	.mai-chat__thinking-quote {
 		margin: var(--mai-space-2) 0 0;
 		padding: var(--mai-space-1) var(--mai-space-2);
-		border-left: 2px solid var(--mai-color-brass-dim);
+		border: 0;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		color: var(--mai-color-text-muted);
@@ -2262,10 +2223,9 @@
 		flex-direction: column;
 		gap: 2px;
 		padding: var(--mai-space-1) var(--mai-space-2);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
-		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-surface);
+		border: 0;
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
+		background: transparent;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 	}
@@ -2347,20 +2307,8 @@
 		user-select: none;
 	}
 
-	.mai-chat--docked .mai-chat__section--conversation {
-		padding: var(--mai-card-pad);
-		background: var(--mai-color-surface-raised);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-lg);
-	}
-
 	.mai-chat__composer-bar {
 		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-2);
-	}
-
-	.mai-chat--docked .mai-chat__composer-bar {
 		flex-direction: row;
 		align-items: flex-end;
 		gap: var(--mai-space-2);
@@ -2372,15 +2320,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
-	}
-
-	.mai-chat--docked .mai-chat__textarea {
-		min-height: 4.5rem;
-		height: auto;
-		padding: var(--mai-space-2) var(--mai-space-3);
-		border-radius: var(--mai-radius-md);
-		resize: vertical;
-		line-height: 1.45;
 	}
 
 	.mai-chat__header-context {
@@ -2429,7 +2368,7 @@
 		gap: var(--mai-space-2);
 	}
 
-	.mai-chat__advanced--collapsed {
+	.mai-chat__advanced[hidden] {
 		display: none;
 	}
 
@@ -2480,35 +2419,6 @@
 		border: 1px solid var(--border-strong, currentColor);
 		border-radius: var(--mai-radius-sm, 4px);
 		box-shadow: var(--mai-shadow-window, none);
-	}
-
-	.mai-chat__history-popover-list {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-1, 0.25rem);
-	}
-
-	.mai-chat__history-item {
-		display: flex;
-		align-items: center;
-		gap: var(--mai-space-2, 0.5rem);
-		flex-wrap: wrap;
-		width: 100%;
-		padding: var(--mai-space-2, 0.5rem);
-		font: inherit;
-		color: inherit;
-		text-align: start;
-		cursor: pointer;
-		background: transparent;
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--mai-radius-sm, 4px);
-	}
-
-	.mai-chat__history-item:hover {
-		background: var(--mai-color-bg, transparent);
 	}
 
 	.mai-chat__chips {
@@ -2620,8 +2530,10 @@
 
 	.mai-chat__textarea {
 		width: 100%;
-		resize: vertical;
+		resize: none;
+		height: 4.5rem;
 		min-height: 3.5rem;
+		box-sizing: border-box;
 		padding: var(--space-2, 0.5rem);
 		border: 1px solid var(--border-strong, currentColor);
 		border-radius: var(--radius-sm, 4px);
@@ -2786,7 +2698,7 @@
 	.mai-chat__entry-rows {
 		margin: 0;
 		display: grid;
-		grid-template-columns: max-content 1fr;
+		grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
 		gap: 0 var(--space-3, 0.75rem);
 		font-family: var(--font-mono, monospace);
 		font-size: var(--font-size-xs, 0.75rem);
@@ -2799,5 +2711,37 @@
 
 	.mai-chat__entry-rows dd {
 		margin: 0;
+	}
+
+	.mai-chat__section--compose { flex: 0 0 auto; min-width: 0; }
+	.mai-chat__advanced { max-height: min(10rem, 22dvh); overflow: auto; overscroll-behavior: contain; }
+	.mai-chat__section--idle { flex: 1 1 0; min-height: 0; overflow: auto; }
+	.mai-chat__header { flex: 0 0 auto; }
+	.mai-chat__header-right { flex-wrap: wrap; min-width: 0; }
+	.mai-chat__context-controls, .mai-chat__compose-context, .mai-chat__chips { min-width: 0; max-width: 100%; }
+	.mai-chat__context-controls :global(.mai-select), .mai-chat__context-controls :global(select) { min-width: 0; max-width: 100%; }
+	.mai-chat__child, .mai-chat__children, .mai-chat__child > :global(.mai-field) { min-width: 0; }
+	.mai-chat__tool-card-head { flex-wrap: wrap; }
+	.mai-chat__inline-alerts { max-height: 18dvh; overflow: auto; }
+	.mai-chat__reply-markdown, .mai-chat__bubble-body { min-width: 0; }
+	@container (max-width: 440px) {
+		.mai-chat__composer-bar { flex-direction: column; align-items: stretch; }
+		.mai-chat__actions { justify-content: flex-end; }
+		.mai-chat__header-right { gap: var(--mai-space-1); }
+		.mai-chat__title, .mai-chat__noosphere-title { display: none; }
+		.mai-chat__body { height: calc(100dvh - 14rem); }
+		.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) { max-height: 14dvh; }
+		.mai-chat__advanced { max-height: 12dvh; }
+	}
+	.mai-chat__history-item {
+		display: flex; width: 100%; min-width: 0; align-items: center;
+		justify-content: space-between; gap: var(--mai-space-2);
+		border: 0; padding: var(--mai-space-2); color: inherit;
+		background: transparent; font: inherit; text-align: left; cursor: pointer;
+	}
+	.mai-chat__history-item:hover { background: var(--mai-color-surface-raised); }
+	.mai-chat__history-item:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: calc(-1 * var(--mai-focus-ring-width));
 	}
 </style>

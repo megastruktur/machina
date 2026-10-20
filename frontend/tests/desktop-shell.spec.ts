@@ -375,3 +375,45 @@ test('the bottom chat dock is always visible, interactive offline and performs n
 
 	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
 });
+
+for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) {
+	test(`real dock ${viewport.width}: composer stays reachable with both disclosures`, async ({page}) => {
+		await page.setViewportSize(viewport);
+		const requests: string[] = [];
+		page.on('request', r => requests.push(r.url()));
+		await page.goto('/');
+		// Existing user-controlled shell navigation, not a geometry override.
+		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
+		const dock = page.getByTestId('bottom-chat-dock');
+		await expect(dock.getByTestId('compose-profile')).toBeHidden();
+		await expect(dock.getByTestId('chat-advanced-toggle')).toHaveAttribute('aria-expanded', 'false');
+		await dock.getByTestId('chat-advanced-toggle').click();
+		await dock.getByTestId('compose-profile').fill('fixture-fast');
+		await dock.getByTestId('compose-message').fill('Long fixture token '.repeat(150));
+		await dock.getByTestId('chat-submit').click();
+		await dock.getByTestId('chat-advanced-toggle').click();
+		await expect(dock.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+		await dock.getByTestId('compose-message').fill('Preserve this dock draft');
+		for (const state of ['closed', 'details', 'both', 'restored']) {
+			if (state === 'details') await dock.getByTestId('chat-details-trigger').click();
+			if (state === 'both') await dock.getByTestId('chat-advanced-toggle').click();
+			if (state === 'restored') {
+				await dock.getByTestId('chat-advanced-toggle').click();
+				await dock.getByTestId('chat-details-trigger').click();
+			}
+			for (const id of ['compose-message', 'chat-submit', 'chat-details-trigger']) {
+				const box = await dock.getByTestId(id).boundingBox();
+				expect(box, `${state}: ${id}`).not.toBeNull();
+				expect(box!.y, `${state}: ${id} top`).toBeGreaterThanOrEqual(0);
+				expect(box!.y + box!.height, `${state}: ${id} bottom`).toBeLessThanOrEqual(viewport.height);
+				expect(box!.x + box!.width, `${state}: ${id} right`).toBeLessThanOrEqual(viewport.width);
+			}
+			expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
+			const scroll = await dock.locator('.mai-chat__conversation-scroll').evaluate(el => ({h: el.clientHeight, total: el.scrollHeight}));
+			expect(scroll.h).toBeGreaterThan(24);
+			expect(scroll.total).toBeGreaterThan(scroll.h);
+		}
+		await expect(dock.getByTestId('compose-message')).toHaveValue('Preserve this dock draft');
+		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
+	});
+}

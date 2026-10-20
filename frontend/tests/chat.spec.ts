@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
@@ -123,6 +123,7 @@ declare global {
 		__maiChatApi?: ChatWindowApi;
 		/** Set by a test init script: the boot scenario (chat-spec-owned name). */
 		__maiChatScenario?: Scenario;
+		__maiChatFramed?: boolean;
 		/** Set ONLY by hostile-content execution (its presence is the failure). */
 		__maiPwned?: number;
 	}
@@ -155,6 +156,7 @@ async function callsOf(page: Page, op: string): Promise<RecordedCall[]> {
 const APP_SOURCE = `
 <script>
 	import PanelHost from '${PANELHOST}';
+	import WindowFrame from '${FRONTEND_ROOT}src/lib/workspace/WindowFrame.svelte';
 	import ComponentHost from '${HOST}';
 	import { createPanelRegistry } from '${REGISTRY}';
 	import { createRawSnippet } from 'svelte';
@@ -591,11 +593,17 @@ const APP_SOURCE = `
 <section data-testid="host-main" aria-label="Host main">
 	<ComponentHost label="Host main">
 		{#if showMain}
-			<PanelHost
-				{registry}
-				descriptor={descriptor(WINDOWS.main, { kind: 'server', server_id: '${SERVER_A}' }, 1)}
-				services={services}
-			/>
+			{#snippet mainPanel()}
+				<PanelHost {registry} descriptor={descriptor(WINDOWS.main, { kind: 'server', server_id: '${SERVER_A}' }, 1)} services={services} />
+			{/snippet}
+			{#if window.__maiChatFramed}
+				<WindowFrame
+					descriptor={{...descriptor(WINDOWS.main, {kind:'server', server_id:'${SERVER_A}'}, 1), geometry: {x:0,y:0,width: Math.min(1100, window.innerWidth),height:window.innerHeight}}}
+					title="Conversation" contextLabel="Server Alpha" autoFitHeight
+				>{@render mainPanel()}</WindowFrame>
+			{:else}
+				{@render mainPanel()}
+			{/if}
 		{/if}
 	</ComponentHost>
 </section>
@@ -852,6 +860,7 @@ test.beforeEach(async ({ page }) => {
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MAI chat fixture</title>
 <link rel="stylesheet" href="${FIXTURE_URL}demo.css">
 </head>
@@ -901,10 +910,16 @@ async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
 	return page;
 }
 
+async function openOptions(scope: Locator): Promise<void> {
+	const toggle = scope.getByTestId('chat-advanced-toggle');
+	if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+}
+
 /** Fill the MAIN compose form and submit; waits for the recorded call. */
 async function submitFromHost(page: Page, host: string, message: string): Promise<void> {
 	const scope = page.getByTestId(host);
 	await scope.getByTestId('compose-message').fill(message);
+	await openOptions(scope);
 	await scope.getByTestId('compose-profile').fill('fixture-fast');
 	await scope.getByTestId('chat-submit').click();
 	await expect
@@ -926,11 +941,14 @@ test('submit pins the window scope; the recorded conversation renders transcript
 		})
 		.toEqual([SERVER_A, SERVER_B]);
 	expect(await callsOf(page, 'submitMessage')).toHaveLength(0);
+	await main.getByTestId('chat-history-toggle').click();
 	await expect(main.getByTestId('history-empty')).toBeVisible();
+	await main.getByTestId('chat-history-toggle').click();
 
 	// Compose in MAIN: message, explicit profile, capability request (with a
 	// duplicate to prove dedup), TWO child tasks, one attachment reference.
 	await main.getByTestId('compose-message').fill('Review the fixture deployment end to end.');
+	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('compose-capabilities').fill('fixture.read, fixture.exec, fixture.read');
 	await main.getByTestId('compose-child-task').fill('child aspect-alpha review');
@@ -1044,6 +1062,7 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	// The SECOND window pins ITS OWN scope: its submit carries SERVER_B and a
 	// different idempotency key — no hidden global current-server target.
 	await second.getByTestId('compose-message').fill('Second window task');
+	await openOptions(second);
 	await second.getByTestId('compose-profile').fill('fixture-fast');
 	await second.getByTestId('chat-submit').click();
 	await expect
@@ -1062,6 +1081,7 @@ test('hostile stream content renders inert; the context body never reaches the D
 	const main = page.getByTestId('host-main');
 
 	// Open the recorded conversation from history (no authored labels here).
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-id')).toBeVisible();
@@ -1118,6 +1138,7 @@ test('reconnect resumes from Last-Event-ID; the watermark deduplicates replayed 
 }) => {
 	await openFixture(page, 'replay');
 	const main = page.getByTestId('host-main');
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await main.getByTestId('chat-details-trigger').click();
 
@@ -1190,6 +1211,7 @@ test('approval path: the receipt binding renders field-for-field and the one-use
 	await openFixture(page, 'approval');
 	const main = page.getByTestId('host-main');
 
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await expect(main.getByTestId('conversation-state')).toHaveText('Waiting for approval decision');
 
@@ -1231,6 +1253,7 @@ test('a refused one-use decision renders honestly and never invents a consume', 
 		})
 	);
 
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	const section = main.getByTestId('approval-section');
 	await expect(main.getByTestId('approval-decide')).toBeVisible();
@@ -1260,6 +1283,7 @@ test('no bound decision record renders an honest absent state with the recorded 
 	await openFixture(page, 'approval-absent');
 	const main = page.getByTestId('host-main');
 
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	const section = main.getByTestId('approval-section');
 	await expect(section).toBeHidden();
@@ -1329,6 +1353,7 @@ test('Details defaults closed and preserves draft, transcript, scope and subscri
 	await submitFromHost(page, 'host-main', 'New prompt');
 	await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
 	await main.getByTestId('chat-details-trigger').click();
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
 	await main.getByTestId('chat-details-trigger').click();
@@ -1340,7 +1365,8 @@ for (const state of ['succeeded', 'failed', 'cancelled']) {
 	test(`terminal ${state} removes approval action but retains exact receipt in Details`, async ({ page }) => {
 		await openFixture(page, 'approval');
 		const main = page.getByTestId('host-main');
-		await main.getByTestId('history-open').first().click();
+		await main.getByTestId('chat-history-toggle').click();
+	await main.getByTestId('history-open').first().click();
 		await expect(main.getByTestId('approval-decide')).toBeVisible();
 		await main.getByTestId('chat-details-trigger').click();
 		await page.evaluate(({ runId, state }) => window.__maiChatApi!.setConversationState(runId, state), { runId: ROOT, state });
@@ -1366,7 +1392,8 @@ for (const fields of [
 		await openFixture(page, 'approval');
 		await page.evaluate((fields) => window.__maiChatApi!.setApprovalFields(fields), fields);
 		const main = page.getByTestId('host-main');
-		await main.getByTestId('history-open').first().click();
+		await main.getByTestId('chat-history-toggle').click();
+	await main.getByTestId('history-open').first().click();
 		await expect.poll(async () => (await callsOf(page, 'readApproval')).length).toBeGreaterThan(0);
 		await main.getByTestId('chat-details-trigger').click();
 		await expect(main.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
@@ -1380,6 +1407,7 @@ test('pending approval expires while open without a decision or automatic Detail
 	await page.clock.install({ time: new Date('2026-10-16T09:30:00Z') });
 	await page.evaluate(() => window.__maiChatApi!.setApprovalFields({ expires_at: '2026-10-16T09:30:02Z' }));
 	const main = page.getByTestId('host-main');
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await expect(main.getByTestId('approval-decide')).toBeVisible();
 	await page.clock.fastForward(3000);
@@ -1414,6 +1442,7 @@ test('approval load failure warns outside Details, never fabricates approval, an
 	await openFixture(page, 'approval');
 	await page.evaluate(() => window.__maiChatApi!.failApprovalRead({ status: 503, code: 'unavailable', message: 'Fixture approval unavailable' }));
 	const main = page.getByTestId('host-main');
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await expect(main.getByTestId('approval-warning')).toContainText('Fixture approval unavailable');
 	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
@@ -1429,6 +1458,7 @@ test('approval load failure warns outside Details, never fabricates approval, an
 test('stream and refresh failures remain visible with Details closed', async ({ page }) => {
 	await openFixture(page, 'replay');
 	const main = page.getByTestId('host-main');
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	queueStreamPair({ abort: true });
 	await expect(main.locator('.mai-chat__inline-alerts [data-testid="stream-problem"]')).toBeVisible();
@@ -1558,6 +1588,7 @@ test('compose validation stays local; a finished conversation replays without in
 
 	// A malformed attachment reference is a local error too (no request).
 	await main.getByTestId('compose-message').fill('Hostile attachments are refused locally.');
+	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('compose-attachments').fill('not-a-uuid');
 	await main.getByTestId('chat-submit').click();
@@ -1568,6 +1599,7 @@ test('compose validation stays local; a finished conversation replays without in
 
 	// Open the recorded conversation: the wire carries no task bodies, so the
 	// message reads as the honest unknown and the child renders as an id.
+	await main.getByTestId('chat-history-toggle').click();
 	await main.getByTestId('history-open').first().click();
 	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-id')).toBeVisible();
@@ -1658,6 +1690,7 @@ test('draft Server Chip: remove → General Consult, re-pick, @service chips; ev
 	// Submit: server_id carries the picked server and the body records the
 	// remaining `@service` chip.
 	await main.getByTestId('compose-message').fill('Consult the pinned services.');
+	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
@@ -1699,6 +1732,7 @@ test('General Consult submit rides the sentinel server id and restores as the co
 	await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
 
 	await main.getByTestId('compose-message').fill('Cross-server consult question.');
+	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect
@@ -1784,6 +1818,7 @@ test('the mai:chat-focus-service window event pre-populates a new draft and neve
 
 	// Start the chat; the recorded conversation locks to its scope.
 	await main.getByTestId('compose-message').fill('Seam-started conversation.');
+	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect
@@ -1812,4 +1847,119 @@ test('the mai:chat-focus-service window event pre-populates a new draft and neve
 	await main.getByTestId('chat-new-session').click();
 	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
 	await expect(main.getByTestId('chat-service-chip')).toHaveCount(0);
+});
+
+for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 640 }]) {
+	for (const framed of [false, true]) {
+	test(`chat layout ${viewport.width} framed=${framed}: full width, bounded scrolling and reversible controls`, async ({ page }) => {
+		await page.setViewportSize(viewport);
+		await page.addInitScript((value) => { window.__maiChatFramed = value; }, framed);
+		await openFixture(page, 'compose');
+		// Isolate a single standalone host, without overriding any ChatPanel style.
+		await page.addStyleTag({ content: 'body { margin: 0; } #app > section:not([data-testid="host-main"]) { display:none; }' });
+		const main = page.getByTestId('host-main');
+		await expect(main.getByTestId('chat-advanced-toggle')).toHaveAttribute('aria-expanded', 'false');
+		await expect(main.getByTestId('compose-profile')).toBeHidden();
+		await expect(main.getByTestId('chat-history')).toHaveCount(0);
+		const longText = 'LongWord'.repeat(100) + '\n' + 'Full width paragraph. '.repeat(150);
+		await submitFromHost(page, 'host-main', longText);
+		await main.getByTestId('chat-advanced-toggle').click();
+		await queueStreamPair({ frames: [
+			frame(1, 'agent.started', { model: 'fixture-model', profile: 'fixture-fast' }),
+			frame(2, 'agent.model_round', { round: 1, status: 'tool_calls', tool_calls: [{seq: 1, capability_id: 'fixture.read', payload_hash: PAYLOAD_SHA}] }),
+			frame(3, 'agent.model_round', { round: 2, status: 'final', output: '**Readable answer**\n\n' + longText + '\n\n```text\n' + 'code'.repeat(200) + '\n```' })
+		] });
+		await expect(main.getByTestId('assistant-reply-text').locator('strong')).toHaveText('Readable answer');
+		await expect(main.getByTestId('assistant-reply-text').locator('pre')).toContainText('code'.repeat(200));
+		await expect(main.getByTestId('assistant-tool-card')).toContainText('fixture.read');
+		await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+		const draft = main.getByTestId('compose-message');
+		await draft.fill('Unsent draft survives both disclosures');
+		await waitForStreamRequests(4);
+		await expect.poll(async () => (await callsOf(page, 'readConversation')).length).toBeGreaterThanOrEqual(3);
+		const callsBefore = await page.evaluate(() => window.__maiChatApi!.calls);
+		async function geometry() {
+			const result = await main.evaluate((host) => {
+				const get = (selector: string) => host.querySelector(selector)! as HTMLElement;
+				const rect = (selector: string) => { const r = get(selector).getBoundingClientRect(); return {x:r.x, y:r.y, right:r.right, bottom:r.bottom, width:r.width, height:r.height}; };
+				const scroll = get('.mai-chat__conversation-scroll');
+				const bubble = get('.mai-chat__bubble');
+				return {
+					conversation: rect('[data-testid="chat-conversation"]'), composer: rect('[data-testid="chat-compose"]'),
+					input: rect('[data-testid="compose-message"]'), send: rect('[data-testid="chat-submit"]'),
+					trigger: rect('[data-testid="chat-details-trigger"]'),
+					scrollHeight: scroll.scrollHeight, clientHeight: scroll.clientHeight,
+					scrollWidth: scroll.clientWidth, bubbleWidth: bubble.getBoundingClientRect().width,
+					border: getComputedStyle(bubble).borderTopWidth, shadow: getComputedStyle(bubble).boxShadow,
+					pageWidth: document.documentElement.scrollWidth, viewportWidth: innerWidth,
+					body: rect('[data-testid="chat-root"]')
+				};
+			});
+			expect(result.pageWidth).toBeLessThanOrEqual(result.viewportWidth);
+			expect(result.input.bottom).toBeLessThanOrEqual(viewport.height);
+			expect(result.send.bottom).toBeLessThanOrEqual(viewport.height);
+			expect(result.input.y).toBeGreaterThanOrEqual(0);
+			expect(result.send.right).toBeLessThanOrEqual(viewport.width);
+			expect(result.conversation.bottom).toBeLessThanOrEqual(result.composer.y);
+			expect(result.trigger.y).toBeLessThan(result.composer.y);
+			expect(result.scrollHeight).toBeGreaterThan(result.clientHeight);
+			expect(result.clientHeight).toBeGreaterThan(24);
+			expect(result.bubbleWidth).toBeGreaterThanOrEqual(result.scrollWidth - 1);
+			expect(result.border).toBe('0px'); expect(result.shadow).toBe('none');
+			expect(result.composer.bottom).toBeCloseTo(result.body.bottom, 0);
+		}
+		await geometry();
+		await main.getByTestId('chat-details-trigger').click();
+		await main.getByTestId('conversation-transcript').locator('summary').click();
+		await geometry();
+		await openOptions(main);
+		await geometry();
+		await main.getByTestId('compose-capabilities').fill('fixture.read');
+		await main.getByTestId('chat-advanced-toggle').click();
+		await main.getByTestId('conversation-refresh').focus();
+		await page.keyboard.press('Escape');
+		await expect(main.getByTestId('chat-details-trigger')).toBeFocused();
+		await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+		await expect(draft).toHaveValue('Unsent draft survives both disclosures');
+		await geometry();
+		expect(await page.evaluate(() => window.__maiChatApi!.calls)).toEqual(callsBefore);
+	});
+
+	}
+	test(`pending approval ${viewport.width} remains reachable outside Details`, async ({page}) => {
+		await page.setViewportSize(viewport);
+		await openFixture(page, 'approval');
+		await page.addStyleTag({ content: 'body { margin:0; } #app > section:not([data-testid="host-main"]) { display:none; }' });
+		const main = page.getByTestId('host-main');
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-open').click();
+		await expect(main.getByTestId('approval-decide')).toBeVisible();
+		await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+		await main.getByTestId('approval-decide').focus();
+		const bounds = await main.getByTestId('approval-decide').boundingBox();
+		expect(bounds!.y).toBeGreaterThanOrEqual(0);
+		expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height);
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('approval-hash')).toHaveText(PAYLOAD_SHA);
+		await expect(main.getByTestId('approval-server')).toHaveText(SERVER_A);
+		await openOptions(main);
+		const send = await main.getByTestId('chat-submit').boundingBox();
+		expect(send!.y + send!.height).toBeLessThanOrEqual(viewport.height);
+		expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
+	});
+}
+
+test('closed Options validation remains actionable without submitting', async ({page}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	await openOptions(main);
+	await main.getByTestId('compose-profile').fill('');
+	await main.getByTestId('chat-advanced-toggle').click();
+	await main.getByTestId('compose-message').fill('Message without a required profile');
+	await main.getByTestId('chat-submit').click();
+	await expect(main.getByTestId('compose-options-error')).toBeVisible();
+	await main.getByTestId('compose-options-error').getByRole('button', {name:'Options'}).click();
+	await expect(main.getByTestId('compose-profile')).toBeVisible();
+	await expect(main.getByTestId('compose-message')).toHaveValue('Message without a required profile');
+	expect(await callsOf(page, 'submitMessage')).toEqual([]);
 });
