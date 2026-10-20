@@ -1411,6 +1411,39 @@
 	const resolvedModel = $derived(
 		transcript.find((entry) => entry.kind === 'started')?.rows.find((row) => row.k === 'model')?.v
 	);
+	const jobInProgress = $derived(display !== null && !rootTerminal);
+	let elapsedSeconds = $state(0);
+	$effect(() => {
+		if (!jobInProgress || display === null) {
+			elapsedSeconds = 0;
+			return;
+		}
+		const submittedMs = Date.parse(display.submitted_at);
+		const origin = Number.isFinite(submittedMs) ? submittedMs : Date.now();
+		function tickElapsed(): void {
+			elapsedSeconds = Math.max(0, Math.floor((Date.now() - origin) / 1000));
+		}
+		tickElapsed();
+		const interval = setInterval(tickElapsed, 1000);
+		return () => clearInterval(interval);
+	});
+	const activeStepText = $derived.by(() => {
+		if (!jobInProgress) return '';
+		const activeTool = [...visibleToolCalls]
+			.reverse()
+			.find((c) => c.status === 'running' || c.status === 'requested');
+		if (activeTool) {
+			return activeTool.status === 'running'
+				? `Executing tool capability ${activeTool.capabilityId}…`
+				: `Dispatching tool capability ${activeTool.capabilityId}…`;
+		}
+		if (thinkingSteps.length > 0) {
+			const lastStep = thinkingSteps[thinkingSteps.length - 1] ?? '';
+			if (lastStep.includes('finished')) return 'Synthesizing next cogitator round…';
+			return lastStep;
+		}
+		return 'Initializing cogitator & assembling server context…';
+	});
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let advancedOpen = $state(false);
 	let detailsOpen = $state(false);
@@ -1618,8 +1651,13 @@
 				<div class="mai-chat__header-right">
 					{#if isDocked}
 						<span class="mai-chat__noosphere-title" data-testid="chat-noosphere-title">
-							⚙ Noosphere
+							<span class:mai-chat__cog-spin={jobInProgress} aria-hidden="true">⚙</span> Noosphere
 						</span>
+						{#if jobInProgress}
+							<span class="mai-chat__badge mai-chat__badge--active" data-testid="chat-header-working">
+								WORKING · {elapsedSeconds}s
+							</span>
+						{/if}
 						<Button
 							size="sm"
 							pill
@@ -1683,6 +1721,7 @@
 				<p class="mai-chat__line mai-chat__conversation-status">
 					<span
 						class="mai-chat__badge"
+						class:mai-chat__badge--active={jobInProgress}
 						class:mai-chat__badge--ok={display.state === 'succeeded'}
 						class:mai-chat__badge--danger={display.state === 'failed'}
 						class:mai-chat__badge--neutral={display.state === 'cancelled'}
@@ -1690,6 +1729,13 @@
 					>
 						{runStateText(display.state)}
 					</span>
+					{#if jobInProgress}
+						<span class="mai-chat__live-status" data-testid="conversation-live-progress" role="status">
+							<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
+							<span class="mai-chat__live-status-text">{activeStepText}</span>
+							<span class="mai-chat__live-status-timer">{elapsedSeconds}s</span>
+						</span>
+					{/if}
 					{#if cancelRequested && !rootTerminal}
 						<span class="mai-chat__note" data-testid="conversation-cancel-note">
 							Cancellation requested
@@ -1820,10 +1866,11 @@
 										<div class="mai-chat__tool-card" data-testid="assistant-tool-card">
 											<div class="mai-chat__tool-card-head">
 												<span class="mai-chat__tool-card-title">
-													⚙ TOOL CALL // {tc.capabilityId}
+													<span class:mai-chat__cog-spin={tc.status === 'running' || tc.status === 'requested'} aria-hidden="true">⚙</span> TOOL CALL // {tc.capabilityId}
 												</span>
 												<span
 													class="mai-chat__badge"
+													class:mai-chat__badge--active={tc.status === 'running' || tc.status === 'requested'}
 													class:mai-chat__badge--ok={tc.status === 'succeeded'}
 													class:mai-chat__badge--danger={tc.status === 'failed'}
 												>
@@ -1846,6 +1893,22 @@
 									{#if isStreamingReply}
 										<span class="mai-chat__stream-cursor" aria-hidden="true">▍</span>
 									{/if}
+								</div>
+							{:else if jobInProgress}
+								<div
+									class="mai-chat__work-indicator"
+									role="status"
+									aria-live="polite"
+									data-testid="assistant-working-indicator"
+								>
+									<div class="mai-chat__work-indicator-row">
+										<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
+										<span class="mai-chat__work-indicator-label">{activeStepText}</span>
+										<span class="mai-chat__work-indicator-elapsed">{elapsedSeconds}s</span>
+									</div>
+									<div class="mai-chat__work-bar" aria-hidden="true">
+										<div class="mai-chat__work-bar-fill"></div>
+									</div>
 								</div>
 							{:else if rootTerminal}
 								<div class="mai-chat__reply-placeholder">
@@ -2779,6 +2842,112 @@
 		border: 1px solid var(--border-subtle, currentColor);
 		border-radius: 999px;
 		padding: 0 var(--space-2, 0.5rem);
+	}
+
+	.mai-chat__badge--active {
+		color: var(--mai-color-brass);
+		border-color: var(--mai-color-brass);
+		background: color-mix(in srgb, var(--mai-color-brass) 12%, transparent);
+	}
+
+	.mai-chat__cog-spin {
+		display: inline-block;
+		color: var(--mai-color-brass);
+		animation: mai-chat-spin 2.2s linear infinite;
+	}
+
+	@keyframes mai-chat-spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	.mai-chat__live-status {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs, 0.75rem);
+		color: var(--mai-color-text-muted);
+		min-width: 0;
+	}
+
+	.mai-chat__live-status-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		max-width: 36ch;
+	}
+
+	.mai-chat__live-status-timer {
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
+		flex: 0 0 auto;
+	}
+
+	.mai-chat__work-indicator {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		border: var(--mai-border-width) solid var(--mai-color-brass-dim);
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
+		background: color-mix(in srgb, var(--mai-color-brass) 6%, var(--mai-color-surface));
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		min-width: 0;
+		max-width: 100%;
+	}
+
+	.mai-chat__work-indicator-row {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		min-width: 0;
+	}
+
+	.mai-chat__work-indicator-label {
+		flex: 1 1 auto;
+		min-width: 0;
+		color: var(--mai-color-text);
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+
+	.mai-chat__work-indicator-elapsed {
+		flex: 0 0 auto;
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
+	}
+
+	.mai-chat__work-bar {
+		position: relative;
+		width: 100%;
+		height: 2px;
+		background: var(--mai-color-border);
+		overflow: hidden;
+	}
+
+	.mai-chat__work-bar-fill {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 35%;
+		height: 100%;
+		background: var(--mai-color-brass);
+		animation: mai-chat-shimmer 1.4s ease-in-out infinite;
+	}
+
+	@keyframes mai-chat-shimmer {
+		0% {
+			transform: translateX(-100%);
+		}
+		100% {
+			transform: translateX(300%);
+		}
 	}
 
 	.mai-chat__badge--ok {
