@@ -72,6 +72,7 @@
 	import Select from '../ui/Select.svelte';
 	import ModelProfileSelect from '../ui/ModelProfileSelect.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
+	import DetailsDisclosure from '../ui/DetailsDisclosure.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -602,6 +603,7 @@
 		approvalBusy = false;
 		decisionStatus = null;
 		resetFold();
+		detailsOpen = false;
 		// The recorded conversation RESTORES its frozen context and locks it:
 		// the General Consult sentinel restores as the consult badge, any
 		// other id restores as the Server Chip, the recorded `@service` tags
@@ -637,6 +639,7 @@
 		approvalBusy = false;
 		decisionStatus = null;
 		resetFold();
+		detailsOpen = false;
 		composeMessage = '';
 		composeProfile = 'default';
 		composeChildren = [''];
@@ -1124,6 +1127,7 @@
 			}
 			const view = await api.readApproval(binding.approvalId);
 			if (disposed || id !== activeRunId) return;
+			if (binding.approvalId !== approvalBinding?.approvalId) approvalProblem = null;
 			approvalBinding = binding;
 			approval = view;
 		} catch (error) {
@@ -1145,7 +1149,7 @@
 		const binding = approvalBinding;
 		const view = approval;
 		if (api === null || binding === null || view === null || approvalBusy) return;
-		if (view.status !== 'pending' || display === null) return;
+		if (!approvalPending || display === null || Date.parse(view.expires_at) <= Date.now()) return;
 		const body: DecisionBody = {
 			capability_id: binding.capabilityId,
 			server_id: display.server_id,
@@ -1316,11 +1320,40 @@
 		display === null ? '' : display.requested_grants.length === 0 ? 'none' : display.requested_grants.join(', ')
 	);
 	const showApprovalSection = $derived(needsApproval && display !== null);
+	let approvalExpired = $state(true);
+	$effect(() => {
+		const expiry = Date.parse(approval?.expires_at ?? '');
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		function checkExpiry(): void {
+			const remaining = expiry - Date.now();
+			approvalExpired = !Number.isFinite(remaining) || remaining <= 0;
+			if (remaining > 0) timer = setTimeout(checkExpiry, Math.min(remaining, 2_147_483_647));
+		}
+		checkExpiry();
+		return () => clearTimeout(timer);
+	});
+	// The receipt and loaded decision must name exactly the same operation.
 	const approvalPending = $derived(
-		approvalBinding !== null && approval !== null && approval.status === 'pending'
+		!rootTerminal && !approvalExpired &&
+		!['already_consumed', 'expired', 'payload_mismatch', 'revision_mismatch'].includes(approvalProblem?.code ?? '') &&
+		display !== null && approvalBinding !== null && approval !== null &&
+		approval.status === 'pending' &&
+		approval.approval_id === approvalBinding.approvalId &&
+		approval.capability_id === approvalBinding.capabilityId &&
+		approval.server_id === display.server_id &&
+		approval.payload_hash === approvalBinding.payloadHash &&
+		approval.policy_revision === approvalBinding.policyRevision
+	);
+	const approvalWarning = $derived(
+		!rootTerminal && (approvalProblem !== null ||
+			(display?.state === 'waiting_approval' && !approvalPending && approval?.status !== 'consumed'))
+	);
+	const resolvedModel = $derived(
+		transcript.find((entry) => entry.kind === 'started')?.rows.find((row) => row.k === 'model')?.v
 	);
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let advancedOpen = $state(false);
+	let detailsOpen = $state(false);
 
 	$effect(() => {
 		onhistorychange?.(historyRows);
@@ -1552,10 +1585,6 @@
 					{/if}
 				</div>
 			{/if}
-			<p class="mai-chat__meta">
-				<span data-testid="chat-scope">Server {shortId(serverScope ?? '')}</span>
-				<span>Pinned scope — every action below names this target.</span>
-			</p>
 		</header>
 
 		<div class="mai-chat__body" hidden={isDocked && dockCollapsed} data-testid="chat-root">
@@ -1570,15 +1599,7 @@
 					<p>No conversation is open. Send a message or open one from the list.</p>
 				</div>
 			{:else}
-				<div class="mai-chat__section-head">
-					<h4>Conversation</h4>
-					<span class="mai-chat__meta" data-testid="conversation-id">{shortId(display.run_id)}</span>
-					<Button variant="secondary" onclick={loadConversation} data-testid="conversation-refresh">
-						Refresh
-					</Button>
-				</div>
-
-				<p class="mai-chat__line">
+				<p class="mai-chat__line mai-chat__conversation-status">
 					<span
 						class="mai-chat__badge"
 						class:mai-chat__badge--ok={display.state === 'succeeded'}
@@ -1588,15 +1609,11 @@
 					>
 						{runStateText(display.state)}
 					</span>
-					{#if cancelRequested}
+					{#if cancelRequested && !rootTerminal}
 						<span class="mai-chat__note" data-testid="conversation-cancel-note">
 							Cancellation requested
 						</span>
 					{/if}
-				</p>
-				<p class="mai-chat__meta" data-testid="conversation-target">
-					Server {shortId(display.server_id)} · profile {display.model_profile} · grants
-					{grantsText}
 				</p>
 
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
@@ -1612,15 +1629,7 @@
 
 					<div class="mai-chat__bubble mai-chat__bubble--assistant">
 						<div class="mai-chat__bubble-header">
-							<span class="mai-chat__bubble-author">⚙ M.A.I. ({display.model_profile})</span>
-							<span
-								class="mai-chat__badge"
-								class:mai-chat__badge--ok={display.state === 'succeeded'}
-								class:mai-chat__badge--danger={display.state === 'failed'}
-								class:mai-chat__badge--neutral={display.state === 'cancelled'}
-							>
-								{runStateText(display.state)}
-							</span>
+							<span class="mai-chat__bubble-author">⚙ M.A.I. ({resolvedModel ?? display.model_profile})</span>
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
 							{#if thinkingSteps.length > 0 || !rootTerminal}
@@ -1675,14 +1684,8 @@
 											</div>
 											<div class="mai-chat__tool-card-meta">
 												<span>step #{tc.stepSeq}</span>
-												{#if tc.payloadHash !== '—'}
-													<span>· payload {tc.payloadHash}</span>
-												{/if}
 												{#if tc.reason !== ''}
 													<span>· outcome: {tc.reason}</span>
-												{/if}
-												{#if tc.opId !== '—'}
-													<span>· op {tc.opId}</span>
 												{/if}
 											</div>
 										</div>
@@ -1705,6 +1708,46 @@
 						</div>
 					</div>
 
+				</div>
+
+				<div class="mai-chat__inline-alerts">
+					{#if approvalPending}
+						<Button onclick={recordDecision} loading={approvalBusy} data-testid="approval-decide">
+							Approve bounded action
+						</Button>
+					{/if}
+					{#if approvalWarning}
+						<p class="mai-chat__note mai-chat__note--error" role="alert" data-testid="approval-warning">
+							{approvalProblem?.message ?? 'Waiting for approval; no actionable bound decision is available.'}
+							<Button variant="ghost" size="sm" onclick={() => (detailsOpen = true)}>Details</Button>
+						</p>
+					{/if}
+					{#if streamProblem !== null}
+						<p class="mai-chat__note mai-chat__note--error" role="status" data-testid="stream-problem">
+							{streamProblem}
+							<Button variant="ghost" size="sm" onclick={() => (detailsOpen = true)}>Details</Button>
+						</p>
+					{/if}
+					{#if refreshProblem !== null}
+						<p class="mai-chat__note mai-chat__note--error" role="status" data-testid="refresh-problem" data-error-code={refreshProblem.code}>
+							{refreshProblem.message}
+							<Button variant="ghost" size="sm" onclick={() => (detailsOpen = true)}>Details</Button>
+						</p>
+					{/if}
+				</div>
+
+				<DetailsDisclosure bind:open={detailsOpen} id="{uid}-details" testId="chat-details">
+					<div class="mai-chat__section-head">
+						<span class="mai-chat__meta" data-testid="conversation-id">{shortId(display.run_id)}</span>
+						<Button variant="secondary" onclick={loadConversation} data-testid="conversation-refresh">Refresh</Button>
+					</div>
+					<p class="mai-chat__meta" data-testid="chat-scope">Server {shortId(serverScope ?? '')} · Pinned scope</p>
+					<p class="mai-chat__meta" data-testid="conversation-target">
+						Server {shortId(display.server_id)} · profile {display.model_profile} · grants {grantsText}
+					</p>
+					{#if cancelRequested && rootTerminal}
+						<p class="mai-chat__meta" data-testid="conversation-cancel-note">Cancellation requested</p>
+					{/if}
 					{#if transcript.length > 0}
 						<details class="mai-chat__transcript" data-testid="conversation-transcript">
 							<summary class="mai-chat__transcript-summary">
@@ -1739,7 +1782,6 @@
 							No events are recorded yet.
 						</p>
 					{/if}
-				</div>
 
 				<div class="mai-chat__attachments" data-testid="conversation-attachments">
 					<h5>Permitted context attachments</h5>
@@ -1773,22 +1815,6 @@
 						Event stream live ({appliedEvents} applied).
 					{/if}
 				</p>
-				{#if streamProblem !== null}
-					<p class="mai-chat__note mai-chat__note--error" role="status" data-testid="stream-problem">
-						{streamProblem}
-					</p>
-				{/if}
-				{#if refreshProblem !== null}
-					<p
-						class="mai-chat__note mai-chat__note--error"
-						role="status"
-						data-testid="refresh-problem"
-						data-error-code={refreshProblem.code}
-					>
-						{refreshProblem.message}
-					</p>
-				{/if}
-
 				{#if showApprovalSection}
 					<div class="mai-chat__approval" data-testid="approval-section">
 						<h5>Bounded action</h5>
@@ -1814,7 +1840,7 @@
 								<dt>capability_id</dt>
 								<dd data-testid="approval-capability">{approvalBinding.capabilityId}</dd>
 								<dt>server_id</dt>
-								<dd data-testid="approval-server">{shortId(display.server_id)}</dd>
+								<dd data-testid="approval-server">{display.server_id}</dd>
 								<dt>payload_hash</dt>
 								<dd data-testid="approval-hash">{approvalBinding.payloadHash}</dd>
 								<dt>policy_revision</dt>
@@ -1825,15 +1851,6 @@
 								<dd data-testid="approval-expires">{approval.expires_at}</dd>
 							</dl>
 							{#if approvalPending}
-								<div class="mai-chat__actions">
-									<Button
-										onclick={recordDecision}
-										loading={approvalBusy}
-										data-testid="approval-decide"
-									>
-										Approve bounded action
-									</Button>
-								</div>
 								<p class="mai-chat__meta">
 									One-use decision (C03 rule 4): recording it consumes the approval for
 									exactly this binding.
@@ -1863,6 +1880,7 @@
 					<h5>Delegated children</h5>
 					<DelegationTree conversation={display} api={api} taskLabels={taskLabels} />
 				</div>
+				</DetailsDisclosure>
 			{/if}
 		</section>
 
@@ -2087,7 +2105,6 @@
 	}
 
 	.mai-chat--docked .mai-chat__title,
-	.mai-chat--docked > .mai-chat__header > .mai-chat__meta,
 	.mai-chat--docked .mai-chat__section-head > h4,
 	.mai-chat--docked .mai-chat__section--history,
 	.mai-chat--docked .mai-chat__section--idle {
@@ -2099,6 +2116,21 @@
 		padding-top: var(--mai-space-2);
 		gap: var(--mai-space-2);
 	}
+
+	/* Place the reviewed disclosure trigger beside status; its mounted panel
+	 * stays after the messages, so toggling never recreates the tree fold. */
+	.mai-chat__section--conversation:not(.mai-chat__section--idle) {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+	}
+
+	.mai-chat__conversation-status { grid-area: 1 / 1; }
+	.mai-chat__inline-alerts { grid-area: 2 / 1 / auto / -1; }
+	.mai-chat__inline-alerts:empty { display: none; }
+	.mai-chat__section--conversation > .mai-chat__conversation-scroll { grid-area: 3 / 1 / auto / -1; }
+	.mai-chat__section--conversation > :global(.mai-details) { display: contents; }
+	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) { grid-area: 1 / 2; }
+	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) { grid-area: 4 / 1 / auto / -1; }
 
 	.mai-chat__conversation-scroll {
 		display: flex;

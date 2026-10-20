@@ -103,6 +103,8 @@ interface ChatWindowApi {
 	streams: Array<{ runId: string; cursor: string | null }>;
 	submissions: Array<{ payload: Record<string, unknown>; childIds: string[] }>;
 	setConversationState(runId: string, state: string): void;
+	setApprovalFields(fields: Record<string, unknown>): void;
+	failApprovalRead(failure: Fail | null): void;
 	armCancel(outcome: string | null): void;
 	failNextRead(failure: Fail | null): void;
 	armDecideFailure(failure: Fail | null): void;
@@ -309,6 +311,7 @@ const APP_SOURCE = `
 		}
 	}
 
+	let approvalReadFailure = null;
 	let failNextRead = null;
 	let decideFailure = null;
 	let cancelOutcome = null;
@@ -418,6 +421,10 @@ const APP_SOURCE = `
 		},
 		async readApproval(approvalId) {
 			calls.push({ op: 'readApproval', runId: approvalId });
+			if (approvalReadFailure) {
+				const { status, code, message } = approvalReadFailure;
+				throw new ApiError(status, code, message);
+			}
 			consumeReadFailure();
 			const row = approvals[approvalId];
 			if (!row) throw new ApiError(404, 'not_found', 'no approval record for this id');
@@ -543,6 +550,12 @@ const APP_SOURCE = `
 			if (!conversations[runId]) throw new Error('no such fixture conversation');
 			conversations[runId].state = state;
 			conversations[runId].updated_at = '2026-10-16T09:07:00Z';
+		},
+		setApprovalFields(fields) {
+			Object.assign(approvals[APPROVAL_ID], fields);
+		},
+		failApprovalRead(failure) {
+			approvalReadFailure = failure;
 		},
 		armCancel(outcome) {
 			cancelOutcome = outcome;
@@ -878,6 +891,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
+	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
 	await page.addInitScript((value) => {
 		window.__maiChatScenario = value;
 	}, scenario);
@@ -946,6 +960,8 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	// The recorded conversation renders: pinned target, opener message,
 	// recorded attachment handles (identity + integrity only).
 	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
+	await expect(main.getByTestId('conversation-target')).toBeHidden();
+	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-target')).toContainText(SERVER_A.slice(0, 8));
 	await expect(main.getByTestId('conversation-message')).toHaveText(
 		'Review the fixture deployment end to end.'
@@ -1047,6 +1063,7 @@ test('hostile stream content renders inert; the context body never reaches the D
 
 	// Open the recorded conversation from history (no authored labels here).
 	await main.getByTestId('history-open').first().click();
+	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-id')).toBeVisible();
 
 	// Round 1: benign value-free facts.
@@ -1102,6 +1119,7 @@ test('reconnect resumes from Last-Event-ID; the watermark deduplicates replayed 
 	await openFixture(page, 'replay');
 	const main = page.getByTestId('host-main');
 	await main.getByTestId('history-open').first().click();
+	await main.getByTestId('chat-details-trigger').click();
 
 	// Round 1 (fresh subscriptions, cursor absent).
 	await queueStreamPair({
@@ -1175,18 +1193,23 @@ test('approval path: the receipt binding renders field-for-field and the one-use
 	await main.getByTestId('history-open').first().click();
 	await expect(main.getByTestId('conversation-state')).toHaveText('Waiting for approval decision');
 
+	await expect(main.getByTestId('approval-decide')).toBeVisible();
+	await expect(main.getByTestId('approval-decide')).toHaveCount(1);
+	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+	await main.getByTestId('chat-details-trigger').click();
 	const section = main.getByTestId('approval-section');
 	await expect(section).toBeVisible();
 	await expect(section.getByTestId('approval-absent')).toHaveCount(0);
 	await expect(section.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
 	await expect(section.getByTestId('approval-capability')).toHaveText('fixture.exec');
-	await expect(section.getByTestId('approval-server')).toHaveText(SERVER_A.slice(0, 8));
+	await expect(section.getByTestId('approval-server')).toHaveText(SERVER_A);
 	await expect(section.getByTestId('approval-hash')).toHaveText(PAYLOAD_SHA);
 	await expect(section.getByTestId('approval-revision')).toHaveText('7');
 
-	await section.getByTestId('approval-decide').click();
+	await main.getByTestId('approval-decide').click();
 	await expect(section.getByTestId('approval-spent')).toContainText('Decision consumed');
-	await expect(section.getByTestId('approval-decide')).toHaveCount(0);
+	await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+	await expect(main.getByTestId('approval-warning')).toHaveCount(0);
 	const decisions = await callsOf(page, 'decideApproval');
 	expect(decisions).toHaveLength(1);
 	expect(decisions[0].payload).toEqual({
@@ -1210,25 +1233,19 @@ test('a refused one-use decision renders honestly and never invents a consume', 
 
 	await main.getByTestId('history-open').first().click();
 	const section = main.getByTestId('approval-section');
-	await expect(section.getByTestId('approval-decide')).toBeVisible();
+	await expect(main.getByTestId('approval-decide')).toBeVisible();
 
-	await section.getByTestId('approval-decide').click();
+	await main.getByTestId('approval-decide').click();
+	await expect(main.getByTestId('approval-warning')).toContainText('already consumed');
+	await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+	await main.getByTestId('approval-warning').getByRole('button', { name: 'Details' }).click();
 	await expect(section.getByTestId('approval-error')).toContainText('already consumed');
 	await expect(section.getByTestId('approval-spent')).toHaveCount(0);
 	expect((await callsOf(page, 'decideApproval')).length).toBe(1);
 
-	// The control recovers (busy state cleared); the admin may honestly retry,
-	// and the refusal repeats while the recorded approval stays unconsumed.
-	await page.evaluate(() =>
-		window.__maiChatApi!.armDecideFailure({
-			status: 409,
-			code: 'already_consumed',
-			message: 'decision already consumed'
-		})
-	);
-	await section.getByTestId('approval-decide').click();
-	await expect(section.getByTestId('approval-error')).toContainText('already consumed');
-	expect((await callsOf(page, 'decideApproval')).length).toBe(2);
+	// A definitive refusal invalidates the main action even if a stale read
+	// still says pending. Retain the receipt and error; never fabricate consume.
+	await expect(section.getByTestId('approval-status')).toHaveText('pending');
 	// The recorded approval was never consumed by a refused attempt.
 	const stored = await page.evaluate(() => {
 		const calls = window.__maiChatApi!.calls;
@@ -1245,9 +1262,11 @@ test('no bound decision record renders an honest absent state with the recorded 
 
 	await main.getByTestId('history-open').first().click();
 	const section = main.getByTestId('approval-section');
-	await expect(section).toBeVisible();
+	await expect(section).toBeHidden();
+	await expect(main.getByTestId('approval-warning')).toContainText('no actionable bound decision');
+	await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+	await main.getByTestId('approval-warning').getByRole('button', { name: 'Details' }).click();
 	await expect(section.getByTestId('approval-absent')).toBeVisible();
-	await expect(section.getByTestId('approval-decide')).toHaveCount(0);
 
 	// The recorded denial of the un-approved action shows as a value-free
 	// tool outcome (the producer's stable reason), not as a fake success.
@@ -1265,6 +1284,163 @@ test('no bound decision record renders an honest absent state with the recorded 
 		'approval_required_but_absent'
 	]);
 	await expect(section.getByTestId('approval-absent')).toBeVisible();
+});
+
+test('Details defaults closed and preserves draft, transcript, scope and subscriptions', async ({ page }) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	const second = page.getByTestId('host-second');
+	await submitFromHost(page, 'host-main', 'Original prompt');
+	await waitForStreamRequests(2);
+	queueStreamPair({ frames: [
+		frame(1, 'agent.started', { model: 'fixture-model-mini', profile: 'fixture-fast' }),
+		frame(2, 'agent.model_round', { round: 1, status: 'tool_calls', tool_calls: [{ seq: 1, capability_id: 'fixture.read' }] }),
+		frame(3, 'agent.model_round', { round: 2, status: 'final', output: '**Verified answer**', output_chars: 19 })
+	] });
+	await waitForStreamRequests(4);
+	await expect(main.getByTestId('assistant-reply-text').locator('strong')).toHaveText('Verified answer');
+	await expect(main.getByTestId('assistant-tool-calls')).toBeVisible();
+	await expect(main.getByTestId('assistant-thinking-block')).toBeVisible();
+	await expect(main.getByTestId('conversation-message')).toHaveText('Original prompt');
+	await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+	for (const id of ['conversation-children', 'conversation-transcript', 'conversation-attachments', 'conversation-target', 'conversation-id', 'conversation-refresh']) {
+		await expect(main.getByTestId(id)).toBeHidden();
+	}
+	await expect(main.locator('p[data-testid="stream-status"]')).toBeHidden();
+	await main.getByTestId('compose-message').fill('Unsent next question');
+	await second.getByTestId('compose-message').fill('Independent draft');
+	const before = await page.evaluate(() => window.__maiChatApi!.calls);
+	const entries = await main.getByTestId('transcript-entry').allTextContents();
+	await main.getByTestId('chat-details-trigger').click();
+	await expect(main.getByTestId('conversation-children')).toBeVisible();
+	await main.getByTestId('conversation-transcript').locator('summary').click();
+	await expect(main.getByTestId('transcript-list')).toBeVisible();
+	await main.getByTestId('chat-details-trigger').click();
+	await main.getByTestId('chat-details-trigger').click();
+	await expect(main.getByTestId('transcript-list')).toBeVisible();
+	await expect(main.getByTestId('compose-message')).toHaveValue('Unsent next question');
+	await expect(second.getByTestId('compose-message')).toHaveValue('Independent draft');
+	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
+	expect(await main.getByTestId('transcript-entry').allTextContents()).toEqual(entries);
+	expect(await page.evaluate(() => window.__maiChatApi!.calls)).toEqual(before);
+	// Starting a new run resets disclosure state without changing sibling state.
+	const originalRunId = (await callsOf(page, 'submitMessage'))[0].payload as { run_id: string };
+	await main.getByTestId('chat-new-session').click();
+	await submitFromHost(page, 'host-main', 'New prompt');
+	await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+	await main.getByTestId('chat-details-trigger').click();
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+	await main.getByTestId('chat-details-trigger').click();
+	await expect(main.getByTestId('conversation-id')).toHaveText(originalRunId.run_id.slice(0, 8));
+	await expect(second.getByTestId('compose-message')).toHaveValue('Independent draft');
+});
+
+for (const state of ['succeeded', 'failed', 'cancelled']) {
+	test(`terminal ${state} removes approval action but retains exact receipt in Details`, async ({ page }) => {
+		await openFixture(page, 'approval');
+		const main = page.getByTestId('host-main');
+		await main.getByTestId('history-open').first().click();
+		await expect(main.getByTestId('approval-decide')).toBeVisible();
+		await main.getByTestId('chat-details-trigger').click();
+		await page.evaluate(({ runId, state }) => window.__maiChatApi!.setConversationState(runId, state), { runId: ROOT, state });
+		await main.getByTestId('conversation-refresh').click();
+		await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+		await expect(main.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('approval-section')).toBeHidden();
+		await expect(main.getByTestId('approval-warning')).toHaveCount(0);
+		expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
+	});
+}
+
+for (const fields of [
+	{ status: 'expired' },
+	{ status: 'consumed' },
+	{ expires_at: '2026-10-16T09:00:00Z' },
+	{ payload_hash: 'cd'.repeat(32) },
+	{ server_id: SERVER_B },
+	{ policy_revision: 99 }
+]) {
+	test(`non-actionable approval ${JSON.stringify(fields)} never offers a decision`, async ({ page }) => {
+		await openFixture(page, 'approval');
+		await page.evaluate((fields) => window.__maiChatApi!.setApprovalFields(fields), fields);
+		const main = page.getByTestId('host-main');
+		await main.getByTestId('history-open').first().click();
+		await expect.poll(async () => (await callsOf(page, 'readApproval')).length).toBeGreaterThan(0);
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
+		await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+		expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
+	});
+}
+
+test('pending approval expires while open without a decision or automatic Details opening', async ({ page }) => {
+	await openFixture(page, 'approval');
+	await page.clock.install({ time: new Date('2026-10-16T09:30:00Z') });
+	await page.evaluate(() => window.__maiChatApi!.setApprovalFields({ expires_at: '2026-10-16T09:30:02Z' }));
+	const main = page.getByTestId('host-main');
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('approval-decide')).toBeVisible();
+	await page.clock.fastForward(3000);
+	await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+	expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
+});
+
+test('completed conversation keeps reply visible and normal closed stream and empty diagnostics hidden', async ({ page }) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	await submitFromHost(page, 'host-main', 'Completed prompt');
+	const body = (await callsOf(page, 'submitMessage'))[0].payload as { run_id: string };
+	await page.evaluate((id) => window.__maiChatApi!.setConversationState(id, 'succeeded'), body.run_id);
+	queueStreamPair({ frames: [
+		frame(1, 'agent.model_round', { round: 1, status: 'final', output: 'Completed answer', output_chars: 16 }),
+		frame(2, 'agent.completed', { rounds: 1, tool_calls: 0, output_chars: 16 })
+	] });
+	await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+	await expect(main.getByTestId('assistant-reply-text')).toHaveText('Completed answer');
+	await expect(main.locator('p[data-testid="stream-status"]')).toContainText('closed');
+	for (const id of ['chat-details-panel', 'attachments-empty', 'conversation-children', 'conversation-transcript']) {
+		await expect(main.getByTestId(id)).toBeHidden();
+	}
+	await expect(main.locator('p[data-testid="stream-status"]')).toBeHidden();
+	await main.getByTestId('chat-details-trigger').click();
+	await expect(main.getByTestId('attachments-empty')).toBeVisible();
+	await expect(main.getByTestId('conversation-children')).toBeVisible();
+});
+
+test('approval load failure warns outside Details, never fabricates approval, and recovers on refresh', async ({ page }) => {
+	await openFixture(page, 'approval');
+	await page.evaluate(() => window.__maiChatApi!.failApprovalRead({ status: 503, code: 'unavailable', message: 'Fixture approval unavailable' }));
+	const main = page.getByTestId('host-main');
+	await main.getByTestId('history-open').first().click();
+	await expect(main.getByTestId('approval-warning')).toContainText('Fixture approval unavailable');
+	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+	await expect(main.getByTestId('approval-decide')).toHaveCount(0);
+	await main.getByTestId('approval-warning').getByRole('button', { name: 'Details' }).click();
+	await expect(main.getByTestId('approval-error')).toBeVisible();
+	await page.evaluate(() => window.__maiChatApi!.failApprovalRead(null));
+	await main.getByTestId('conversation-refresh').click();
+	await expect(main.getByTestId('approval-decide')).toBeVisible();
+	await expect(main.getByTestId('approval-warning')).toHaveCount(0);
+});
+
+test('stream and refresh failures remain visible with Details closed', async ({ page }) => {
+	await openFixture(page, 'replay');
+	const main = page.getByTestId('host-main');
+	await main.getByTestId('history-open').first().click();
+	queueStreamPair({ abort: true });
+	await expect(main.locator('.mai-chat__inline-alerts [data-testid="stream-problem"]')).toBeVisible();
+	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+	await waitForStreamRequests(4);
+	await main.getByTestId('chat-details-trigger').click();
+	await page.evaluate(() => window.__maiChatApi!.failNextRead({ status: 503, code: 'unavailable', message: 'Fixture refresh unavailable' }));
+	await main.getByTestId('conversation-refresh').click();
+	await expect(main.locator('.mai-chat__inline-alerts [data-testid="refresh-problem"]')).toContainText('Fixture refresh unavailable');
+	await main.getByTestId('chat-details-trigger').click();
+	await expect(main.locator('.mai-chat__inline-alerts [data-testid="refresh-problem"]')).toBeVisible();
+	await expect(main.locator('p[data-testid="stream-status"]')).toBeHidden();
 });
 
 test('mount reads only; unmount submits nothing; sibling drives no traffic', async ({ page }) => {
@@ -1393,6 +1569,7 @@ test('compose validation stays local; a finished conversation replays without in
 	// Open the recorded conversation: the wire carries no task bodies, so the
 	// message reads as the honest unknown and the child renders as an id.
 	await main.getByTestId('history-open').first().click();
+	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-id')).toBeVisible();
 	await expect(main.getByTestId('conversation-message')).toHaveText(
 		'Authored outside this window — the wire carries no task bodies.'
@@ -1565,6 +1742,8 @@ test('the floating chat history selector restores the transcript and the locked 
 	// context in the locked state.
 	await item.click();
 	await expect(main.getByTestId('chat-history-popover')).toHaveCount(0);
+	await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('conversation-id')).toHaveText(HISTORY_RUN.slice(0, 8));
 	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
 	await expect(main.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
