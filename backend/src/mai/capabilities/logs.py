@@ -949,6 +949,11 @@ class HostLogsCapability:
         if not source_text and stderr:
             source_text = stderr
             notes.append("excerpt source: stderr (stdout was empty)")
+        elif stderr and source_text.strip() == "-- No entries --":
+            source_text = f"{source_text.rstrip()}\n{stderr}"
+            notes.append(
+                "excerpt includes stderr diagnostics (journalctl reported no entries)"
+            )
         raw = source_text.encode("utf-8")
         if outcome.stdout_truncated:
             # Explicit truncation notice (C06 rule 3): the artifact is a

@@ -388,9 +388,13 @@ def test_allowed_mutate_requires_approval_only_in_ask_mode() -> None:
     assert ask.advisories == ()
 
 
-@pytest.mark.parametrize("mode", list(PolicyMode))
-def test_allowed_privileged_always_requires_approval_with_forfeiture_advisory(
+@pytest.mark.parametrize(
+    "mode,expected_requires_approval",
+    [(PolicyMode.DELEGATED, False), (PolicyMode.ASK, True)],
+)
+def test_allowed_privileged_requires_approval_in_ask_mode_with_forfeiture_advisory(
     mode: PolicyMode,
+    expected_requires_approval: bool,
 ) -> None:
     decision = _decide(
         descriptor=_descriptor(
@@ -399,7 +403,7 @@ def test_allowed_privileged_always_requires_approval_with_forfeiture_advisory(
         context=_context(mode=mode),
     )
     assert decision.allowed is True
-    assert decision.requires_approval is True
+    assert decision.requires_approval is expected_requires_approval
     assert decision.advisories == (PRIVILEGED_FORFEITS_OS_CONTAINMENT,)
 
 

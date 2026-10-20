@@ -100,12 +100,23 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         HostLogsCapability,
         descriptor as host_logs_descriptor,
     )
+    from mai.capabilities.service_http import (
+        HttpServiceProvider,
+        ServiceHttpCapability,
+        descriptor as service_http_descriptor,
+    )
     from mai.contracts.server import parse_server_profile_text
     from mai.credentials.env import EnvResolver
     from mai.database import create_app_engine
     from mai.execution.ssh import SshIdentity, pin_host_key
     from mai.jobs.engine import EngineClient
     from mai.jobs.resource_locks import ResourceLockService
+    from mai.knowledge.index import GatewayEmbedder
+    from mai.knowledge.retrieve import (
+        DocumentRetrievalCapability,
+        ScopeRetriever,
+        descriptor as docs_retrieve_descriptor,
+    )
     from mai.plugins.registry import CapabilityRegistry
     from mai.policy.approvals import ApprovalStore
     from mai.policy.config import GrantConfigStore
@@ -157,11 +168,37 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     )
     chat_read_cap = ChatReadSessionCapability(sessions)
 
+    class _DynamicEmbedder:
+        async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+            binding = model_store.bind()
+            return await GatewayEmbedder(
+                binding.connection, resolver=_resolve_env()
+            ).embed(texts)
+
+    docs_retrieve_cap = DocumentRetrievalCapability(
+        ScopeRetriever(sessions, _DynamicEmbedder())  # type: ignore[arg-type]
+    )
+    service_http_provider = HttpServiceProvider()
+
+    async def _service_http_cap(call: CapabilityCall) -> ExecutorResult:
+        allowlist: dict[str, str] = {}
+        raw_allow = os.environ.get("MAI_SERVICE_HTTP_ALLOW", "").strip()
+        if raw_allow:
+            for item in raw_allow.split(","):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    if k.strip() and v.strip():
+                        allowlist[k.strip()] = v.strip()
+        cap = ServiceHttpCapability(service_http_provider, services=allowlist)
+        return await cap(call)
+
     registry = CapabilityRegistry()
     for desc in (
         host_shell_descriptor(),
         host_logs_descriptor(),
         chat_read_descriptor(),
+        docs_retrieve_descriptor(),
+        service_http_descriptor(),
     ):
         registry.register(desc)
 
@@ -169,6 +206,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         "host.shell": host_shell_cap,
         "host.logs": host_logs_cap,
         "chat.read_session": chat_read_cap,
+        "docs.retrieve": docs_retrieve_cap,
+        "service.http": _service_http_cap,
     }
 
     async def _composite_executor(call: CapabilityCall) -> ExecutorResult:

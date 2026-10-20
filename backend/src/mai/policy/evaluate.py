@@ -67,11 +67,11 @@ requirement or the policy deny list — all of those checks run
 identically in both modes (pinned by tests). An allowed decision
 reports ``requires_approval``:
 
-- ``privileged`` (raw shell/root class) **always** requires an approval
-  decision, in both modes — G2 step 3 binds the root class to the
-  approval/policy checks *additionally*;
-- ``mutate`` requires approval in ``ask`` mode (C05
-  ``waiting_approval``) and not in ``delegated`` mode;
+- ``privileged`` (raw shell/root class) and ``mutate`` require an
+  approval decision in ``ask`` mode (C05 ``waiting_approval``) and not
+  in ``delegated`` mode (where granted capabilities run autonomously;
+  privileged decisions still record the OS-containment forfeiture
+  advisory);
 - ``read`` never requires approval (no effect to approve).
 
 OS containment honesty (C03 rule 5)
@@ -805,11 +805,13 @@ def evaluate(
         )
 
     # Allowed. Prompting verdict within grants (C03 rule 5, G2 step 3):
-    # the privileged class always needs an approval decision; ask adds
-    # approval for mutate; read never needs one. A mode can only add a
-    # prompt, never a grant.
-    requires_approval = descriptor.effect_class == "privileged" or (
-        descriptor.effect_class == "mutate" and context.mode is PolicyMode.ASK
+    # ask mode requires an approval decision for privileged and mutate;
+    # delegated mode runs granted capabilities without prompting (privileged
+    # still records the forfeiture advisory); read never needs one. A mode
+    # can only add a prompt, never a grant.
+    requires_approval = (
+        descriptor.effect_class in ("privileged", "mutate")
+        and context.mode is PolicyMode.ASK
     )
     advisories: tuple[str, ...] = ()
     if descriptor.effect_class == "privileged":

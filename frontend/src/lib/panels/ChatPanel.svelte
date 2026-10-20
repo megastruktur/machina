@@ -382,6 +382,10 @@
 
 	let composeMessage = $state('');
 	let composeProfile = $state('default');
+	let composeModeOverride = $state<'ask' | 'delegated' | null>(null);
+	const composeMode = $derived<'ask' | 'delegated'>(
+		composeModeOverride ?? (profilesLive ? 'delegated' : SUBMIT_MODE)
+	);
 	let composeCapabilities = $state('');
 	let composeChildren = $state<string[]>(['']);
 	let composeAttachments = $state('');
@@ -424,7 +428,7 @@
 			explicitCaps.length > 0
 				? explicitCaps
 				: profilesLive && serverId !== GLOBAL_CONSULT_SERVER_ID
-					? ['host.logs', 'host.shell']
+					? ['host.logs', 'host.shell', 'service.http', 'docs.retrieve']
 					: [];
 		const body: ChatSubmitBody = {
 			run_id: runId,
@@ -432,7 +436,7 @@
 			message: composeMessage.trim(),
 			profile: composeProfile.trim(),
 			role: SUBMIT_ROLE,
-			mode: SUBMIT_MODE,
+			mode: composeMode,
 			capabilities: effectiveCaps,
 			children: tasks.map((task) => ({ task })),
 			attachments: parseNameList(composeAttachments).map((opId) => ({
@@ -642,6 +646,7 @@
 		detailsOpen = false;
 		composeMessage = '';
 		composeProfile = 'default';
+		composeModeOverride = null;
 		composeChildren = [''];
 		composeAttachments = '';
 		composeCapabilities = '';
@@ -1958,12 +1963,27 @@
 							live={profilesLive}
 						/>
 					</div>
+					<div class="mai-chat__composer-mode">
+						<Select
+							label="Execution mode"
+							value={composeMode}
+							onchange={(e) => {
+								const val = (e.currentTarget as HTMLSelectElement).value;
+								if (val === 'ask' || val === 'delegated') composeModeOverride = val;
+							}}
+							compact={isDocked}
+							data-testid="compose-mode"
+						>
+							<option value="delegated">Delegated — run granted capabilities autonomously</option>
+							<option value="ask">Ask — require approval before privileged/mutate actions</option>
+						</Select>
+					</div>
 					<Field
 						label="Capabilities"
 						bind:value={composeCapabilities}
 						data-testid="compose-capabilities"
 						error={composeFields.capabilities ?? ''}
-						hint="Comma-separated grant request; empty means NO capability."
+						hint="Comma-separated grant request; empty uses default capabilities in live mode."
 					/>
 					<fieldset class="mai-chat__children">
 						<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>

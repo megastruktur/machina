@@ -243,8 +243,13 @@ class TestDescriptor:
         registry = _registry()
         assert registry.versions(CAPABILITY_ID) == ("1.0.0",)
 
-    def test_raw_shell_requires_approval_in_both_modes_with_advisory(self) -> None:
-        for mode in (PolicyMode.ASK, PolicyMode.DELEGATED):
+    def test_raw_shell_requires_approval_in_ask_mode_and_allows_delegated_with_advisory(
+        self,
+    ) -> None:
+        for mode, expected in (
+            (PolicyMode.ASK, True),
+            (PolicyMode.DELEGATED, False),
+        ):
             decision = evaluate(
                 context=_context(mode=mode),
                 capability_id=CAPABILITY_ID,
@@ -254,7 +259,7 @@ class TestDescriptor:
                 adopted=True,
             )
             assert decision.allowed is True
-            assert decision.requires_approval is True, mode
+            assert decision.requires_approval is expected, mode
             assert decision.effect_class == "privileged"
             assert decision.advisories == (PRIVILEGED_FORFEITS_OS_CONTAINMENT,)
 
@@ -886,14 +891,14 @@ class TestDeniedCallsNeverReachTheExecutor:
         assert outcome.effect == "not_attempted"
 
     @pytest.mark.anyio
-    async def test_privileged_call_without_decision_denies(
+    async def test_privileged_call_without_decision_denies_in_ask_mode(
         self, tmp_path: Path
     ) -> None:
-        """The raw-shell class ALWAYS requires an approval decision — an
-        unapproved call stops at the dispatcher seam, executor uninvoked."""
+        """In ask mode, the raw-shell class requires an approval decision —
+        an unapproved call stops at the dispatcher seam, executor uninvoked."""
         dispatcher, _capability = _deny_dispatcher(tmp_path)
         outcome = await dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY_ID,
             payload=GOOD_PAYLOAD,
         )
@@ -1141,7 +1146,7 @@ class TestAgainstShellArch:
         approval_id = await world.approve(payload)
         try:
             outcome = await world.dispatcher.dispatch(
-                context=_context(),
+                context=_context(mode=PolicyMode.ASK),
                 capability_id=CAPABILITY_ID,
                 payload=payload,
                 approval_id=approval_id,
@@ -1182,7 +1187,7 @@ class TestAgainstShellArch:
         approval_id = await world.approve(payload)
         receipts_before = world.receipt_list()
         outcome = await world.dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY_ID,
             payload=payload,
             approval_id=approval_id,
@@ -1207,7 +1212,7 @@ class TestAgainstShellArch:
         approval_id = await world.approve(payload)
         receipts_before = world.receipt_list()
         outcome = await world.dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY_ID,
             payload=payload,
             approval_id=None,
@@ -1232,7 +1237,7 @@ class TestAgainstShellArch:
         approval_id = await world.approve(payload)
         receipts_before = world.receipt_list()
         outcome = await world.dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY_ID,
             payload=payload,
             approval_id=approval_id,
@@ -1254,7 +1259,7 @@ class TestAgainstShellArch:
         payload = {"command": "echo shell-bang >&2; exit 7"}
         approval_id = await world.approve(payload)
         outcome = await world.dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY_ID,
             payload=payload,
             approval_id=approval_id,
@@ -1281,7 +1286,7 @@ class TestAgainstShellArch:
             payload = {"command": "/usr/bin/id -u"}
             approval_id = await world.approve(payload)
             outcome = await world.dispatcher.dispatch(
-                context=_context(),
+                context=_context(mode=PolicyMode.ASK),
                 capability_id=CAPABILITY_ID,
                 payload=payload,
                 approval_id=approval_id,

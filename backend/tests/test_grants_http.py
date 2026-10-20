@@ -975,7 +975,7 @@ async def test_revocation_while_an_operation_waits_denies_at_the_recheck(
         policy=lambda: _snapshot().policy,
     )
     outcome = await dispatcher.dispatch(
-        context=_context(allowed=(PRIVILEGED_CAPABILITY,)),
+        context=_context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
         capability_id=PRIVILEGED_CAPABILITY,
         payload=PAYLOAD,
         approval_id=approval.approval_id,

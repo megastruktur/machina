@@ -856,6 +856,26 @@ class TestReadComposition:
         assert "permission denied" in document["excerpt"]
         assert any("stderr" in note for note in document["notes"])
 
+    def test_excerpt_includes_stderr_when_stdout_reports_no_entries(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        harness = _Harness(monkeypatch, tmp_path)
+        harness.transport.script = [
+            _outcome(
+                stdout="-- No entries --\n",
+                stderr=(
+                    "Hint: You are currently not seeing messages from other "
+                    "users and the system.\n"
+                ),
+            )
+        ]
+        result = harness.run()
+        assert result.ok is True
+        document = json.loads(result.output)
+        assert "-- No entries --" in document["excerpt"]
+        assert "not seeing messages from other users" in document["excerpt"]
+        assert any("stderr diagnostics" in note for note in document["notes"])
+
     def test_transport_truncation_is_reported_not_hidden(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

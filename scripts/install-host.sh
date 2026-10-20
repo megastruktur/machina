@@ -403,8 +403,12 @@ else
 	ACCOUNT_STATE="created"
 	printf 'account: %s created (home %s, key-only login, no password)\n' "$SSH_USER" "$ACCOUNT_HOME"
 fi
-if getent group docker >/dev/null 2>&1 && command -v usermod >/dev/null 2>&1; then
-	usermod -aG docker "$SSH_USER" 2>/dev/null || true
+if command -v usermod >/dev/null 2>&1; then
+	for grp in docker systemd-journal adm; do
+		if getent group "$grp" >/dev/null 2>&1; then
+			usermod -aG "$grp" "$SSH_USER" 2>/dev/null || true
+		fi
+	done
 fi
 
 # ---------------------------------------------------------------------------

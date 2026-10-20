@@ -885,7 +885,7 @@ async def test_deferred_approval_persists_binding_and_resumes_once(
         registry,
         _dispatcher(registry, store, executor=recorder),
         _context(
-            allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.DELEGATED
+            allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK
         ),
     )
     payload = {"command": "systemctl status mai"}
@@ -936,7 +936,11 @@ async def test_resume_with_altered_payload_denies_and_preserves_decision(
 ) -> None:
     recorder = _Recorder(counter)
     registry = _real_registry()
-    bridge = _bridge(registry, _dispatcher(registry, store, executor=recorder))
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, store, executor=recorder),
+        _context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
+    )
     payload = {"command": "systemctl status mai"}
     approval = await store.create(
         _approval_request(
@@ -976,6 +980,7 @@ async def test_resume_after_policy_revision_bump_denies(
             executor=recorder,
             policy=lambda: _policy(revision["value"]),
         ),
+        _context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
     )
     payload = {"command": "systemctl status mai"}
     approval = await store.create(
@@ -1003,7 +1008,11 @@ async def test_mismatched_resume_never_consumes_the_decision(
 ) -> None:
     recorder = _Recorder(counter)
     registry = _real_registry()
-    bridge = _bridge(registry, _dispatcher(registry, store, executor=recorder))
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, store, executor=recorder),
+        _context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
+    )
     payload = {"command": "systemctl status mai"}
     approval = await store.create(
         _approval_request(
@@ -1182,7 +1191,7 @@ async def test_agent_run_defers_privileged_call_for_approval(
     bridge = _bridge(
         registry,
         _dispatcher(registry, _unused_approvals(), executor=recorder),
-        _context(allowed=(PRIVILEGED_CAPABILITY,)),
+        _context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
     )
     agent = _scripted_agent(
         bridge,

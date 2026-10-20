@@ -587,9 +587,9 @@ async def test_grants_provider_failure_denies_without_effect() -> None:
 
 @pytest.mark.anyio
 async def test_approval_required_without_decision_denies_before_credentials() -> None:
-    """Privileged always requires an approval (both modes); ask-mode
-    mutate likewise. No approval ⇒ deny; executor and credentials
-    untouched."""
+    """Ask-mode privileged and mutate require an approval decision;
+    delegated-mode privileged runs without prompting. No approval in ask
+    mode ⇒ deny; executor and credentials untouched."""
     registry = _registry_with(
         _descriptor_document(CAPABILITY, "privileged"),
         _descriptor_document(DENIED_BY_POLICY_CAPABILITY, "mutate"),
@@ -599,7 +599,6 @@ async def test_approval_required_without_decision_denies_before_credentials() ->
         DENIED_BY_POLICY_CAPABILITY: frozenset({SERVER_A}),
     }
     for mode, capability in (
-        (PolicyMode.DELEGATED, CAPABILITY),
         (PolicyMode.ASK, CAPABILITY),
         (PolicyMode.ASK, DENIED_BY_POLICY_CAPABILITY),
     ):
@@ -826,7 +825,9 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
 
     # 2. Approval-required call without a decision → no effect.
     outcome = await dispatcher.dispatch(
-        context=_context(), capability_id=CAPABILITY, payload=operation
+        context=_context(mode=PolicyMode.ASK),
+        capability_id=CAPABILITY,
+        payload=operation,
     )
     assert outcome.reason == DispatchReason.APPROVAL_REQUIRED_BUT_ABSENT.value
     assert await _read_counter(counter_path) == 0
@@ -835,7 +836,7 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
     #    the altered payload ⇒ payload_mismatch, counter unchanged.
     approval = await _create_approval(store, payload=operation)
     outcome = await dispatcher.dispatch(
-        context=_context(),
+        context=_context(mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=altered,
         approval_id=approval.approval_id,
@@ -857,7 +858,7 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
         credentials=lambda: EnvResolver(FXT_ROOT / "fixture.env"),
         executor=subprocess_executor(counter_program),
     ).dispatch(
-        context=_context(server_id=SERVER_B),
+        context=_context(server_id=SERVER_B, mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=operation,
         approval_id=approval.approval_id,
@@ -901,7 +902,7 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
         executor=subprocess_executor(counter_program),
     )
     outcome = await dispatcher_revoked.dispatch(
-        context=_context(),
+        context=_context(mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=operation,
         approval_id=approval.approval_id,
@@ -914,7 +915,7 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
     #    one effect, receipt records the executed boundary.
     approval = await _create_approval(store, payload=operation, policy_revision=7)
     outcome = await dispatcher.dispatch(
-        context=_context(),
+        context=_context(mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=operation,
         approval_id=approval.approval_id,
@@ -931,7 +932,7 @@ async def test_gate_scenario_denied_revoked_altered_leave_counter_unchanged(
 
     # 7. Replay of the same decision: already_consumed, counter frozen.
     outcome = await dispatcher.dispatch(
-        context=_context(),
+        context=_context(mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=operation,
         approval_id=approval.approval_id,
@@ -958,7 +959,7 @@ async def test_recheck_denies_on_revocation_between_gate_and_effect(
     )
     approval = await _create_approval(store)
     outcome = await dispatcher.dispatch(
-        context=_context(),
+        context=_context(mode=PolicyMode.ASK),
         capability_id=CAPABILITY,
         payload=GOOD_PAYLOAD,
         approval_id=approval.approval_id,
@@ -989,7 +990,7 @@ async def test_concurrent_dispatches_share_one_decision_exactly_one_effect(
 
     async def _one() -> object:
         return await dispatcher.dispatch(
-            context=_context(),
+            context=_context(mode=PolicyMode.ASK),
             capability_id=CAPABILITY,
             payload={"op": "count", "counter_path": str(counter_path)},
             approval_id=approval.approval_id,
