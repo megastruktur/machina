@@ -2254,6 +2254,8 @@
 		gap: var(--mai-space-3);
 		min-height: 0;
 		min-width: 0;
+		max-width: 100%;
+		overflow-x: hidden;
 		overflow-y: auto;
 		overscroll-behavior: contain;
 		padding: 0;
@@ -2309,10 +2311,14 @@
 	}
 
 	.mai-chat__thinking-details {
+		min-width: 0;
+		max-width: 100%;
 		border: 0;
 		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
 		background: transparent;
 		padding: var(--mai-space-1) var(--mai-space-2);
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-chat__thinking-summary {
@@ -2331,6 +2337,8 @@
 	.mai-chat__thinking-quote {
 		margin: var(--mai-space-2) 0 0;
 		padding: var(--mai-space-1) var(--mai-space-2);
+		min-width: 0;
+		max-width: 100%;
 		border: 0;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
@@ -2338,13 +2346,18 @@
 		display: flex;
 		flex-direction: column;
 		gap: 3px;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-chat__thinking-line {
 		display: flex;
 		align-items: flex-start;
 		gap: var(--mai-space-2);
+		min-width: 0;
 		line-height: 1.45;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-chat__thinking-prefix {
@@ -2396,6 +2409,10 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
+		min-width: 0;
+		max-width: 100%;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-chat__stream-cursor {

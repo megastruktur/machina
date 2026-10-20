@@ -222,11 +222,17 @@
 		font-size: var(--mai-text-sm);
 		line-height: 1.55;
 		color: var(--mai-color-text);
+		min-width: 0;
+		max-width: 100%;
 		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-md :global(.mai-md__p) {
 		margin: 0;
+		min-width: 0;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-md :global(.mai-md__heading) {
@@ -274,9 +280,17 @@
 		background: var(--mai-color-surface);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-sm);
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+		box-decoration-break: clone;
+		-webkit-box-decoration-break: clone;
 	}
 
 	.mai-md :global(.mai-md__code-wrap) {
+		min-width: 0;
+		max-width: 100%;
+		box-sizing: border-box;
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
 		border-radius: var(--mai-radius-sm);
@@ -298,16 +312,31 @@
 	.mai-md :global(.mai-md__pre) {
 		margin: 0;
 		padding: var(--mai-space-2) var(--mai-space-3);
+		min-width: 0;
+		max-width: 100%;
+		box-sizing: border-box;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
 		line-height: 1.5;
 		color: var(--mai-color-text);
-		overflow-x: auto;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+		overflow-x: hidden;
+	}
+
+	.mai-md :global(.mai-md__pre code) {
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-md :global(.mai-md__quote) {
 		margin: 0;
 		padding: var(--mai-space-2) var(--mai-space-3);
+		min-width: 0;
+		max-width: 100%;
+		box-sizing: border-box;
 		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
 		background: var(--mai-color-surface);
 		color: var(--mai-color-text-muted);
@@ -316,11 +345,14 @@
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-md :global(.mai-md__quote-line) {
 		display: flex;
 		gap: var(--mai-space-2);
+		min-width: 0;
 	}
 
 	.mai-md :global(.mai-md__quote-mark) {
@@ -330,6 +362,9 @@
 	}
 
 	.mai-md :global(.mai-md__table-wrap) {
+		min-width: 0;
+		max-width: 100%;
+		box-sizing: border-box;
 		overflow-x: auto;
 	}
 
@@ -344,6 +379,8 @@
 		padding: var(--mai-space-1) var(--mai-space-2);
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		text-align: left;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.mai-md :global(.mai-md__table th) {
