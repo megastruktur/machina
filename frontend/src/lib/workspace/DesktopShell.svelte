@@ -424,7 +424,9 @@
 		'memory.recall',
 		'memory.reflect',
 		'memory.retain',
-		'service.http'
+		'service.http',
+		'web.read',
+		'web.search'
 	]);
 
 	/** Launcher options: live profiles replace the fixture pair when live. */
@@ -623,11 +625,14 @@
 			async listConversations(serverId, page) {
 				const rows = [...conversations.values()]
 					.filter((row) => row.server_id === serverId)
-					.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at));
+					.sort((a, b) => b.submitted_at.localeCompare(a.submitted_at));
+				const limit = page?.limit ?? 10;
+				const offset = page?.offset ?? 0;
+				const sliced = rows.slice(offset, offset + limit);
 				return {
-					conversations: structuredClone(rows),
-					limit: page?.limit ?? 20,
-					offset: page?.offset ?? 0,
+					conversations: structuredClone(sliced),
+					limit,
+					offset,
 					total: rows.length
 				};
 			},
@@ -691,6 +696,9 @@
 	/** The mounted dock ChatPanel instance + its mirrored history/active state. */
 	let dockChatPanel = $state<ChatPanel | null>(null);
 	let drawerConversations = $state<readonly ConversationView[]>([]);
+	let drawerConversationsTotal = $state<number | undefined>(undefined);
+	let drawerConversationsHasMore = $state(false);
+	let drawerConversationsLoadingMore = $state(false);
 	let drawerActiveRunId = $state<string | null>(null);
 	let drawerCollapsed = $state(false);
 
@@ -1009,6 +1017,9 @@
 
 		<ChatDrawerSection
 			conversations={drawerConversations}
+			totalConversations={drawerConversationsTotal}
+			hasMoreConversations={drawerConversationsHasMore}
+			loadingMoreConversations={drawerConversationsLoadingMore}
 			activeRunId={drawerActiveRunId}
 			onnewchat={() => {
 				focusChatDock();
@@ -1019,6 +1030,7 @@
 				dockChatPanel?.triggerSelectRun(runId);
 			}}
 			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
+			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
 		/>
 
 		<ServerTreeNav
@@ -1167,7 +1179,12 @@
 				bind:this={dockChatPanel}
 				panel={dockPanel}
 				bind:dockCollapsed
-				onhistorychange={(rows) => (drawerConversations = rows)}
+				onhistorychange={(rows, meta) => {
+					drawerConversations = rows;
+					drawerConversationsTotal = meta?.total;
+					drawerConversationsHasMore = meta?.hasMore ?? false;
+					drawerConversationsLoadingMore = meta?.loadingMore ?? false;
+				}}
 				onactivechange={(runId) => (drawerActiveRunId = runId)}
 			/>
 		</div>

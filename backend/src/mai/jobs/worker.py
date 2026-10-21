@@ -138,6 +138,16 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.policy.config import GrantConfigStore
     from mai.policy.evaluate import Policy
     from mai.profiles.files import ProfileFileStore
+    from mai.research.pages import (
+        HttpPageProvider,
+        WebPageCapability,
+        descriptor as web_read_descriptor,
+    )
+    from mai.research.search import (
+        SearXNGProvider,
+        WebSearchCapability,
+        descriptor as web_search_descriptor,
+    )
 
     data_root = Path(data_root_raw).expanduser()
     models_root = data_root / "models"
@@ -242,6 +252,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         docs_retrieve_descriptor(),
         service_http_descriptor(),
         upsert_map_descriptor(),
+        web_search_descriptor(),
+        web_read_descriptor(),
     ):
         registry.register(desc)
 
@@ -289,12 +301,20 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             )
         return await ServiceMapUpsertCapability(service_map_store)(call)
 
+    searxng_url = (
+        os.environ.get("MAI_SEARXNG_URL") or "http://searxng:8080"
+    ).strip()
+    web_search_cap = WebSearchCapability(SearXNGProvider(searxng_url))
+    web_read_cap = WebPageCapability(HttpPageProvider())
+
     executors = {
         "host.shell": host_shell_cap,
         "host.logs": host_logs_cap,
         "chat.read_session": chat_read_cap,
         "docs.retrieve": docs_retrieve_cap,
         "service.http": _service_http_cap,
+        "web.search": web_search_cap,
+        "web.read": web_read_cap,
         UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
     }
@@ -358,9 +378,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             pass
         # Automatically grant internal API capabilities (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
-        # app.delete_map_entry, chat.read_session) to every enrolled server
-        # and General Consult so newly added internal APIs work out of the box.
-        for cap_id in INTERNAL_API_CAPABILITY_IDS:
+        # app.delete_map_entry, chat.read_session) and controller-side web
+        # research capabilities (web.search, web.read) to every enrolled
+        # server and General Consult so they work out of the box.
+        for cap_id in (*INTERNAL_API_CAPABILITY_IDS, "web.search", "web.read"):
             grants.setdefault(cap_id, set()).update(enrolled_servers)
         return {cid: frozenset(sids) for cid, sids in grants.items()}
 

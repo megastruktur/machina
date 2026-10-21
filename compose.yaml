@@ -103,6 +103,8 @@ services:
       # Memory provider (C07): the bundled Hindsight service on the stack
       # network. No credential — the bundled service has no API auth.
       MAI_HINDSIGHT_URL: "http://hindsight:8888"
+      # Bundled metasearch provider (C07 rule 7): internal SearXNG service.
+      MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path
@@ -151,6 +153,7 @@ services:
       MAI_EMBEDDINGS_BASE_URL: "${MAI_EMBEDDINGS_BASE_URL:-http://litellm:4000/v1}"
       MAI_EMBEDDINGS_CREDENTIAL_REF: "MAI_GATEWAY_KEY"
       MAI_HINDSIGHT_URL: "http://hindsight:8888"
+      MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path.

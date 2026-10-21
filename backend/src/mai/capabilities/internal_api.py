@@ -804,6 +804,17 @@ class AppDiscoverPayload(BaseModel):
             "Include the raw host listen_ports table. Defaults to false to keep the response concise."
         ),
     )
+    limit: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Maximum number of discovered applications to return per page (default 25, max 100).",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Zero-based pagination offset for discovered applications (default 0).",
+    )
 
 
 class AppListAdoptedPayload(BaseModel):
@@ -819,11 +830,14 @@ class AppListAdoptedPayload(BaseModel):
         ),
     )
     limit: int | None = Field(
-        default=None,
-        description="Optional maximum number of adopted entries to return.",
+        default=25,
+        ge=1,
+        le=100,
+        description="Optional maximum number of adopted entries to return per page (default 25, max 100).",
     )
     offset: int = Field(
         default=0,
+        ge=0,
         description="Zero-based pagination offset (default 0).",
     )
 
@@ -1128,10 +1142,18 @@ def build_internal_api_capabilities(
                     "detail": asdict(detail) if hasattr(detail, "__dataclass_fields__") else {},
                 }
             )
+        total_apps = len(applications_view)
+        eff_limit = int(payload.get("limit") or 25)
+        eff_offset = max(0, int(payload.get("offset") or 0))
+        paged_apps = applications_view[eff_offset : eff_offset + eff_limit]
         result_doc: dict[str, Any] = {
             "server_id": str(server_id),
             "observed_at": str(inventory.observed_at),
-            "applications": applications_view,
+            "applications": paged_apps,
+            "total": total_apps,
+            "limit": eff_limit,
+            "offset": eff_offset,
+            "has_more": (eff_offset + len(paged_apps)) < total_apps,
             "lanes": [
                 {
                     "lane": lane.lane.value,
@@ -1206,10 +1228,17 @@ def build_internal_api_capabilities(
                     }
                 )
         applications.sort(key=lambda a: (a["name"], a["application_id"]))
+        total = len(applications)
+        eff_limit = int(payload.get("limit") or 25)
+        eff_offset = max(0, int(payload.get("offset") or 0))
+        paged = applications[eff_offset : eff_offset + eff_limit]
         return {
             "server_id": str(server_id),
-            "applications": applications,
-            "total": len(applications),
+            "applications": paged,
+            "total": total,
+            "limit": eff_limit,
+            "offset": eff_offset,
+            "has_more": (eff_offset + len(paged)) < total,
         }
 
     operations.append(_app_list_adopted)
@@ -1241,15 +1270,15 @@ def build_internal_api_capabilities(
         server_id = _resolve_server_id(call, payload, APP_ADOPT_CAPABILITY)
         origin_value = payload.get("origin", "manual")
         name = str(payload["name"])
-        application_id: uuid.UUID | None = None
+        application_id: uuid.UUID
         if payload.get("application_id"):
             application_id = uuid.UUID(str(payload["application_id"]))
+        else:
+            application_id = uuid.uuid4()
 
         if origin_value == "manual":
             # The chat/manual addition: persist directly in the Service Map +
             # canonical identity doc (the UI's `_adopt_manual_entry` flow).
-            if application_id is None:
-                application_id = uuid.uuid4()
             if payload.get("upsert_categories"):
                 for category in payload["upsert_categories"]:
                     service_map.upsert_category(
@@ -1363,19 +1392,19 @@ def build_internal_api_capabilities(
             instructions=payload.get("instructions") or {},
         )
         # Canonical identity document (honest pending on doc-service gaps).
+        record = await adoption.read(server_id, result.application_id)
         doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
-        if docs is not None:
+        if docs is not None and record is not None:
             try:
-                doc = await docs.record_adopted(
-                    server_id=server_id,
-                    application_id=result.application_id,
-                    name=name,
-                )
-                doc_outcome = {
-                    "status": "documented",
-                    "doc_id": str(doc.doc_id),
-                    "reason": None,
-                }
+                outcome = await docs.record_adoption(record)
+                if outcome.document is not None and outcome.documented:
+                    doc_outcome = {
+                        "status": "documented",
+                        "doc_id": str(outcome.document.doc_id),
+                        "reason": None,
+                    }
+                else:
+                    doc_outcome["reason"] = outcome.reason or "not_documented"
             except Exception as exc:
                 doc_outcome["reason"] = type(exc).__name__
         return {

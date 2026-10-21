@@ -499,10 +499,10 @@ def request_from_payload(
 # ---------------------------------------------------------------------------
 
 #: Subtrees dropped wholesale: active content, form controls and
-#: non-evidence material never reach the Markdown output. ``meta``/
-#: ``link``/``base`` are void elements whose attributes are never read;
-#: they are listed so self-closing forms stay balanced in the skip-depth
-#: accounting. There is no DOM and no execution surface — the parser
+#: non-evidence material never reach the Markdown output. Void elements
+#: (``meta``, ``link``, ``base``, ``input``, ``embed``, etc.) live in
+#: ``_VOID_TAGS`` below so unclosed HTML5 void tags never unbalance
+#: ``_drop_depth``. There is no DOM and no execution surface — the parser
 #: only turns markup into text.
 _DROP_SUBTREES = frozenset(
     {
@@ -514,10 +514,8 @@ _DROP_SUBTREES = frozenset(
         "svg",
         "canvas",
         "object",
-        "embed",
         "applet",
         "form",
-        "input",
         "button",
         "select",
         "textarea",
@@ -526,9 +524,23 @@ _DROP_SUBTREES = frozenset(
         "label",
         "datalist",
         "output",
-        "meta",
-        "link",
+    }
+)
+
+#: HTML5 void elements that carry no text children and omit closing tags.
+_VOID_TAGS = frozenset(
+    {
+        "area",
         "base",
+        "col",
+        "embed",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
     }
 )
 
@@ -635,6 +647,8 @@ class _MarkdownExtractor(HTMLParser):
     # -- tag handling ---------------------------------------------------
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _VOID_TAGS:
+            return
         if self._drop_depth:
             if tag in _DROP_SUBTREES:
                 self._drop_depth += 1
@@ -703,6 +717,8 @@ class _MarkdownExtractor(HTMLParser):
         self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in _VOID_TAGS:
+            return
         if self._drop_depth:
             if tag in _DROP_SUBTREES:
                 self._drop_depth -= 1
@@ -920,9 +936,10 @@ class HttpPageProvider:
         host = parts.hostname or ""
         scheme = parts.scheme.lower()
         port = parts.port
-        address = validated_addresses(
+        addresses = validated_addresses(
             url, self._resolver, allow_private=self._allow_private
-        )[0]
+        )
+        address = min(addresses, key=lambda item: (":" in item, item))
         dial_host = f"[{address}]" if ":" in address else address
         default_port = 443 if scheme == "https" else 80
         if port is None or port == default_port:

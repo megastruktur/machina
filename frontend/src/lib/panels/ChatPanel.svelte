@@ -91,6 +91,12 @@
 		type RunDetail
 	} from '../workspace/entries/06-web-chat.js';
 
+	export type ChatHistoryMeta = {
+		total: number;
+		hasMore: boolean;
+		loadingMore: boolean;
+	};
+
 	let {
 		panel,
 		dockCollapsed = $bindable(false),
@@ -99,7 +105,7 @@
 	}: {
 		panel: PanelContext;
 		dockCollapsed?: boolean;
-		onhistorychange?: (rows: readonly ConversationView[]) => void;
+		onhistorychange?: (rows: readonly ConversationView[], meta?: ChatHistoryMeta) => void;
 		onactivechange?: (runId: string | null) => void;
 	} = $props();
 
@@ -276,8 +282,8 @@
 
 	// --- producer bounds mirrored for display only (server re-validates) -----
 
-	/** Bounded history page size (C01 rule 5); the producer clamps the maximum. */
-	const PAGE_LIMIT = 50;
+	/** Bounded history page size (10 most recent chats per page; C01 rule 5). */
+	const PAGE_LIMIT = 10;
 	/** Fixed reconnect delay after a stream close/failure (bounded, visible). */
 	const BACKOFF_MS = 750;
 	/** Debounce for the durable refresh triggered by delivered events. */
@@ -433,6 +439,8 @@
 							'host.shell',
 							'service.http',
 							'docs.retrieve',
+							'web.search',
+							'web.read',
 							'app.discover',
 							'app.list_adopted',
 							'app.adopt',
@@ -443,6 +451,8 @@
 						]
 					: profilesLive
 						? [
+								'web.search',
+								'web.read',
 								'app.discover',
 								'app.list_adopted',
 								'app.adopt',
@@ -587,13 +597,22 @@
 
 	let historyRows = $state<ConversationView[]>([]);
 	let historyTotal = $state(0);
+	let historyOffset = $state(0);
+	let historyRawTotal = $state(0);
+	let historyLoadingMore = $state(false);
 	let historyState = $state<{ status: 'idle' | 'loading' | 'ready' | 'error' }>({ status: 'idle' });
 	let historyProblem = $state<{ code: string; message: string } | null>(null);
+	const historyHasMore = $derived(
+		historyState.status === 'ready' &&
+			historyOffset < historyRawTotal &&
+			historyRows.length < historyTotal
+	);
 
 	async function loadHistory(): Promise<void> {
 		if (api === null || serverScope === null) return;
 		const scope = serverScope;
 		historyState = { status: 'loading' };
+		historyLoadingMore = false;
 		historyProblem = null;
 		try {
 			const page: ChatPage = await api.listConversations(scope, { limit: PAGE_LIMIT });
@@ -604,19 +623,86 @@
 				}
 			}
 			const filtered = page.conversations.filter((row) => !supersededRunIds.has(row.run_id));
+			const removedCount = page.conversations.length - filtered.length;
 			historyRows = filtered;
-			historyTotal = Math.max(0, page.total - (page.conversations.length - filtered.length));
+			historyOffset = page.conversations.length;
+			historyRawTotal = page.total;
+			historyTotal = Math.max(filtered.length, page.total - removedCount);
 			historyState = { status: 'ready' };
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
 			historyRows = [];
 			historyTotal = 0;
+			historyOffset = 0;
+			historyRawTotal = 0;
 			historyState = { status: 'error' };
 			historyProblem = {
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The conversation list could not be read.')
 			};
+		}
+	}
+
+	async function loadMoreHistory(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			historyState.status !== 'ready' ||
+			historyLoadingMore ||
+			!historyHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const nextOffset = historyOffset;
+		historyLoadingMore = true;
+		historyProblem = null;
+		try {
+			const page: ChatPage = await api.listConversations(scope, {
+				limit: PAGE_LIMIT,
+				offset: nextOffset
+			});
+			if (disposed || scope !== serverScope) return;
+			for (const row of page.conversations) {
+				if (typeof row.session_run_id === 'string' && row.session_run_id !== '') {
+					supersededRunIds.add(row.session_run_id);
+				}
+			}
+			const seen = new Set(historyRows.map((row) => row.run_id));
+			const appended: ConversationView[] = [];
+			let skippedSuperseded = 0;
+			for (const row of page.conversations) {
+				if (supersededRunIds.has(row.run_id)) {
+					skippedSuperseded += 1;
+					continue;
+				}
+				if (!seen.has(row.run_id)) {
+					seen.add(row.run_id);
+					appended.push(row);
+				}
+			}
+			historyRows = [...historyRows, ...appended];
+			historyOffset = nextOffset + page.conversations.length;
+			if (page.conversations.length === 0) {
+				historyRawTotal = historyOffset;
+				historyTotal = historyRows.length;
+			} else {
+				historyRawTotal = page.total;
+				historyTotal = Math.max(historyRows.length, page.total - skippedSuperseded);
+			}
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			historyProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ?? 'Additional conversations could not be loaded.'
+				)
+			};
+		} finally {
+			if (!disposed) historyLoadingMore = false;
 		}
 	}
 
@@ -1760,7 +1846,11 @@
 	}
 
 	$effect(() => {
-		onhistorychange?.(historyRows);
+		onhistorychange?.(historyRows, {
+			total: historyTotal,
+			hasMore: historyHasMore,
+			loadingMore: historyLoadingMore
+		});
 	});
 
 	$effect(() => {
@@ -1778,6 +1868,10 @@
 
 	export function triggerRefreshHistory(): void {
 		void loadHistory();
+	}
+
+	export function triggerLoadMoreHistory(): void {
+		void loadMoreHistory();
 	}
 </script>
 
@@ -1850,6 +1944,19 @@
 				<p class="mai-chat__meta" data-testid="history-total">
 					Showing {historyRows.length} of {historyTotal} recorded conversations.
 				</p>
+				{#if historyHasMore}
+					<div class="mai-chat__history-more">
+						<Button
+							size="sm"
+							variant="secondary"
+							loading={historyLoadingMore}
+							onclick={loadMoreHistory}
+							data-testid="history-load-more"
+						>
+							Load more ({historyRows.length} of {historyTotal})
+						</Button>
+					</div>
+				{/if}
 			{/if}
 		</section>
 		{/snippet}

@@ -183,6 +183,9 @@
 	// --- library (projection page of the pinned scope; C02 W2) ----------------
 
 	let documents = $state<DocumentListItem[]>([]);
+	let libraryTotal = $state<number | null>(null);
+	let libraryHasMore = $state(false);
+	let libraryLoadingMore = $state(false);
 	let libraryState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
 	let libraryProblem = $state<{ code: string; message: string } | null>(null);
 	let libraryEpoch = 0;
@@ -192,21 +195,70 @@
 		const scope = serverScope;
 		const epoch = ++libraryEpoch;
 		libraryState = 'loading';
+		libraryLoadingMore = false;
 		libraryProblem = null;
 		try {
 			const page: DocumentPage = await api.listDocuments(scope, { limit: PAGE_LIMIT });
 			if (disposed || epoch !== libraryEpoch || scope !== serverScope) return;
 			documents = page.documents;
+			libraryTotal = page.total ?? null;
+			libraryHasMore =
+				page.total !== undefined
+					? page.documents.length < page.total
+					: page.documents.length >= PAGE_LIMIT;
 			libraryState = 'ready';
 		} catch (error) {
 			if (disposed || epoch !== libraryEpoch) return;
 			const code = codeOf(error) ?? 'unavailable';
 			documents = [];
+			libraryTotal = null;
+			libraryHasMore = false;
 			libraryState = 'error';
 			libraryProblem = {
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The document list could not be read.')
 			};
+		}
+	}
+
+	async function loadMoreLibrary(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			libraryState !== 'ready' ||
+			libraryLoadingMore ||
+			!libraryHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const epoch = libraryEpoch;
+		libraryLoadingMore = true;
+		libraryProblem = null;
+		try {
+			const page: DocumentPage = await api.listDocuments(scope, {
+				limit: PAGE_LIMIT,
+				offset: documents.length
+			});
+			if (disposed || epoch !== libraryEpoch || scope !== serverScope) return;
+			const seen = new Set(documents.map((d) => `${d.namespace}:${d.doc_id}`));
+			const appended = page.documents.filter((d) => !seen.has(`${d.namespace}:${d.doc_id}`));
+			documents = [...documents, ...appended];
+			libraryTotal = page.total ?? libraryTotal;
+			libraryHasMore =
+				page.documents.length > 0 &&
+				(page.total !== undefined
+					? documents.length < page.total
+					: page.documents.length >= PAGE_LIMIT);
+		} catch (error) {
+			if (disposed || epoch !== libraryEpoch) return;
+			const code = codeOf(error) ?? 'unavailable';
+			libraryProblem = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More documents could not be loaded.')
+			};
+		} finally {
+			if (!disposed) libraryLoadingMore = false;
 		}
 	}
 
@@ -733,6 +785,19 @@
 							</li>
 						{/each}
 					</ul>
+					{#if libraryHasMore}
+						<div class="mai-docs__row-actions">
+							<Button
+								variant="secondary"
+								size="sm"
+								loading={libraryLoadingMore}
+								onclick={loadMoreLibrary}
+								data-testid="library-load-more"
+							>
+								Load more ({documents.length}{libraryTotal !== null ? ` of ${libraryTotal}` : ''})
+							</Button>
+						</div>
+					{/if}
 				{/if}
 			</section>
 

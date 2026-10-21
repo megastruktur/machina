@@ -417,3 +417,36 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
 	});
 }
+
+test('drawer Chat History limits to 10 chats, scrolls internally, and loads more on demand', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const dock = page.getByTestId('bottom-chat-dock');
+
+	// Submit 12 distinct chats in the offline dock.
+	for (let i = 1; i <= 12; i++) {
+		if (i > 1) {
+			await page.getByTestId('drawer-new-chat').click();
+		}
+		await dock.getByTestId('compose-message').fill(`Chat session ${i}`);
+		await dock.getByTestId('chat-submit').click();
+		await expect(dock.getByTestId('conversation-state')).toHaveText('Running');
+	}
+
+	const drawerSection = page.getByTestId('drawer-chat-section');
+	await expect(drawerSection.getByTestId('drawer-history-item')).toHaveCount(10);
+	const list = drawerSection.getByTestId('drawer-history-list');
+	await expect(list).toBeVisible();
+	const overflowY = await list.evaluate((el) => getComputedStyle(el).overflowY);
+	expect(overflowY).toBe('auto');
+
+	const loadMore = drawerSection.getByTestId('drawer-history-load-more');
+	await expect(loadMore).toBeVisible();
+	await expect(loadMore).toContainText('Load more (10 of 12)');
+
+	await loadMore.click();
+	await expect(drawerSection.getByTestId('drawer-history-item')).toHaveCount(12);
+	await expect(drawerSection.getByTestId('drawer-history-load-more')).toHaveCount(0);
+});

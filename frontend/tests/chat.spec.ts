@@ -110,6 +110,7 @@ interface ChatWindowApi {
 	armDecideFailure(failure: Fail | null): void;
 	toggleMain(on: boolean): void;
 	toggleSecond(on: boolean): void;
+	seedConversations(serverId: string, count: number): void;
 	registry: {
 		kinds: string[];
 		checkScope(kind: string, scope: unknown): { ok: true } | { ok: false; code: string };
@@ -368,10 +369,13 @@ const APP_SOURCE = `
 			const rows = Object.values(conversations)
 				.filter((row) => row.server_id === serverId)
 				.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at));
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const sliced = rows.slice(offset, offset + limit);
 			return {
-				conversations: clone(rows),
-				limit: page?.limit ?? 20,
-				offset: page?.offset ?? 0,
+				conversations: clone(sliced),
+				limit,
+				offset,
 				total: rows.length
 			};
 		},
@@ -573,6 +577,17 @@ const APP_SOURCE = `
 		},
 		toggleSecond(on) {
 			showSecond = on;
+		},
+		seedConversations(serverId, count) {
+			for (let i = 1; i <= count; i++) {
+				const id = '00000000-0000-4000-8000-' + String(i).padStart(12, '0');
+				conversations[id] = runRow(id, serverId, 'succeeded', {
+					submitted_at: '2026-10-16T09:' + String(i).padStart(2, '0') + ':00Z',
+					service_tags: ['svc-' + i],
+					children: [],
+					attachments: []
+				});
+			}
 		},
 		registry: {
 			kinds: Array.from(registry.knownPanelKinds()).sort(),
@@ -1962,4 +1977,34 @@ test('closed Options validation remains actionable without submitting', async ({
 	await expect(main.getByTestId('compose-profile')).toBeVisible();
 	await expect(main.getByTestId('compose-message')).toHaveValue('Message without a required profile');
 	expect(await callsOf(page, 'submitMessage')).toEqual([]);
+});
+
+test('chat history limits initial page to 10 conversations and loads more on demand', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// Seed 14 conversations on SERVER_A and reload history.
+	await page.evaluate((serverId) => {
+		window.__maiChatApi!.seedConversations(serverId, 14);
+	}, SERVER_A);
+
+	await main.getByTestId('chat-history-toggle').click();
+	await main.getByTestId('history-refresh').click();
+
+	await expect(main.getByTestId('history-row')).toHaveCount(10);
+	await expect(main.getByTestId('history-total')).toHaveText(
+		'Showing 10 of 14 recorded conversations.'
+	);
+	const loadMoreBtn = main.getByTestId('history-load-more');
+	await expect(loadMoreBtn).toBeVisible();
+	await expect(loadMoreBtn).toContainText('Load more (10 of 14)');
+
+	await loadMoreBtn.click();
+	await expect(main.getByTestId('history-row')).toHaveCount(14);
+	await expect(main.getByTestId('history-total')).toHaveText(
+		'Showing 14 of 14 recorded conversations.'
+	);
+	await expect(main.getByTestId('history-load-more')).toHaveCount(0);
 });

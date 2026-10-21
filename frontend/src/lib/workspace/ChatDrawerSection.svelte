@@ -14,6 +14,12 @@
 	type Props = {
 		/** Recent conversation rows across servers. */
 		conversations?: readonly ConversationView[];
+		/** Total recorded conversations available across pages. */
+		totalConversations?: number;
+		/** Whether additional conversation pages can be loaded. */
+		hasMoreConversations?: boolean;
+		/** Whether a "Load more" request is currently in flight. */
+		loadingMoreConversations?: boolean;
 		/** Currently active run id in the chat dock, if any. */
 		activeRunId?: string | null;
 		/** Start a fresh chat session in the bottom dock. */
@@ -22,17 +28,29 @@
 		onselectconversation: (runId: string) => void;
 		/** Refresh the conversation list when opening history. */
 		onrefreshhistory?: () => void;
+		/** Load the next page of conversations. */
+		onloadmorehistory?: () => void;
 	};
 
 	let {
 		conversations = [],
+		totalConversations,
+		hasMoreConversations = false,
+		loadingMoreConversations = false,
 		activeRunId = null,
 		onnewchat,
 		onselectconversation,
-		onrefreshhistory
+		onrefreshhistory,
+		onloadmorehistory
 	}: Props = $props();
 
 	let historyExpanded = $state(true);
+
+	const historyBadge = $derived(
+		totalConversations !== undefined && totalConversations > conversations.length
+			? `${conversations.length}/${totalConversations}`
+			: String(conversations.length)
+	);
 
 	function shortId(id: string): string {
 		return id.length > 8 ? `${id.slice(0, 8)}…` : id;
@@ -62,7 +80,7 @@
 	<AccordionGroup
 		title="Chat History"
 		icon="🕓"
-		badge={String(conversations.length)}
+		badge={historyBadge}
 		bind:open={historyExpanded}
 		ontoggle={(open) => {
 			if (open) onrefreshhistory?.();
@@ -74,16 +92,33 @@
 				No recent conversations.
 			</p>
 		{:else}
-			{#each conversations as row (row.run_id)}
-				<NavItem
-					icon="💬"
-					label={formatConversationLabel(row)}
-					meta={row.state ?? ''}
-					active={activeRunId === row.run_id}
-					data-testid="drawer-history-item"
-					onclick={() => onselectconversation(row.run_id)}
-				/>
-			{/each}
+			<div class="mai-chat-drawer__list" data-testid="drawer-history-list">
+				{#each conversations as row (row.run_id)}
+					<NavItem
+						icon="💬"
+						label={formatConversationLabel(row)}
+						meta={row.state ?? ''}
+						active={activeRunId === row.run_id}
+						data-testid="drawer-history-item"
+						onclick={() => onselectconversation(row.run_id)}
+					/>
+				{/each}
+			</div>
+			{#if hasMoreConversations}
+				<div class="mai-chat-drawer__more">
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={-1}
+						class="mai-chat-drawer__more-btn"
+						loading={loadingMoreConversations}
+						data-testid="drawer-history-load-more"
+						onclick={() => onloadmorehistory?.()}
+					>
+						Load more ({conversations.length}{totalConversations !== undefined ? ` of ${totalConversations}` : ''})
+					</Button>
+				</div>
+			{/if}
 		{/if}
 	</AccordionGroup>
 </div>
@@ -96,6 +131,25 @@
 	}
 
 	:global(.mai-chat-drawer__new-btn) {
+		width: 100%;
+	}
+
+	.mai-chat-drawer__list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		max-height: 15.5rem;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		scrollbar-gutter: stable;
+	}
+
+	.mai-chat-drawer__more {
+		padding-top: var(--mai-space-1);
+		border-top: var(--mai-border-width) solid var(--mai-color-border);
+	}
+
+	:global(.mai-chat-drawer__more-btn) {
 		width: 100%;
 	}
 

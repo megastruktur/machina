@@ -211,11 +211,14 @@
 
 	let runs = $state<RunView[]>([]);
 	let runsTotal = $state(0);
+	let runsLoadingMore = $state(false);
 	let runsState = $state<ListState>({ status: 'loading' });
+	const runsHasMore = $derived(runsState.status === 'ready' && runs.length < runsTotal);
 
 	async function loadRuns(): Promise<void> {
 		if (api === null || serverScope === null) return;
 		runsState = { status: 'loading' };
+		runsLoadingMore = false;
 		try {
 			const page = await api.listRuns(serverScope, { limit: PAGE_LIMIT });
 			if (disposed) return;
@@ -230,6 +233,32 @@
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The run list could not be loaded.')
 			};
+		}
+	}
+
+	async function loadMoreRuns(): Promise<void> {
+		if (api === null || serverScope === null || runsLoadingMore || !runsHasMore) return;
+		runsLoadingMore = true;
+		try {
+			const page = await api.listRuns(serverScope, {
+				limit: PAGE_LIMIT,
+				offset: runs.length
+			});
+			if (disposed) return;
+			const seen = new Set(runs.map((r) => r.run_id));
+			const appended = page.runs.filter((r) => !seen.has(r.run_id));
+			runs = [...runs, ...appended];
+			runsTotal = page.runs.length === 0 ? runs.length : page.total;
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			runsState = {
+				status: 'error',
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More runs could not be loaded.')
+			};
+		} finally {
+			if (!disposed) runsLoadingMore = false;
 		}
 	}
 
@@ -423,13 +452,18 @@
 
 	let schedules = $state<ScheduleView[]>([]);
 	let schedulesTotal = $state(0);
+	let schedulesLoadingMore = $state(false);
 	let schedulesState = $state<ListState>({ status: 'loading' });
 	let schedulesActionError = $state<{ code: string; message: string } | null>(null);
 	let busyScheduleId = $state('');
+	const schedulesHasMore = $derived(
+		schedulesState.status === 'ready' && schedules.length < schedulesTotal
+	);
 
 	async function loadSchedules(): Promise<void> {
 		if (api === null || serverScope === null) return;
 		schedulesState = { status: 'loading' };
+		schedulesLoadingMore = false;
 		try {
 			const page = await api.listSchedules(serverScope, { limit: PAGE_LIMIT });
 			if (disposed) return;
@@ -444,6 +478,31 @@
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The schedule list could not be loaded.')
 			};
+		}
+	}
+
+	async function loadMoreSchedules(): Promise<void> {
+		if (api === null || serverScope === null || schedulesLoadingMore || !schedulesHasMore) return;
+		schedulesLoadingMore = true;
+		try {
+			const page = await api.listSchedules(serverScope, {
+				limit: PAGE_LIMIT,
+				offset: schedules.length
+			});
+			if (disposed) return;
+			const seen = new Set(schedules.map((s) => s.schedule_id));
+			const appended = page.schedules.filter((s) => !seen.has(s.schedule_id));
+			schedules = [...schedules, ...appended];
+			schedulesTotal = page.schedules.length === 0 ? schedules.length : page.total;
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			schedulesActionError = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More schedules could not be loaded.')
+			};
+		} finally {
+			if (!disposed) schedulesLoadingMore = false;
 		}
 	}
 
@@ -660,6 +719,19 @@
 							<p class="mai-jobs__meta" data-testid="runs-total">
 								Showing {runs.length} of {runsTotal} recorded runs.
 							</p>
+							{#if runsHasMore}
+								<div class="mai-jobs__row-actions">
+									<Button
+										variant="secondary"
+										size="sm"
+										loading={runsLoadingMore}
+										onclick={loadMoreRuns}
+										data-testid="runs-load-more"
+									>
+										Load more ({runs.length} of {runsTotal})
+									</Button>
+								</div>
+							{/if}
 						{/if}
 					</div>
 				</section>
@@ -877,6 +949,19 @@
 									</li>
 								{/each}
 							</ul>
+							{#if schedulesHasMore}
+								<div class="mai-jobs__row-actions">
+									<Button
+										variant="secondary"
+										size="sm"
+										loading={schedulesLoadingMore}
+										onclick={loadMoreSchedules}
+										data-testid="schedules-load-more"
+									>
+										Load more ({schedules.length} of {schedulesTotal})
+									</Button>
+								</div>
+							{/if}
 						{/if}
 						{#if schedulesActionError !== null}
 							<p

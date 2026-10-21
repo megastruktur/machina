@@ -1176,5 +1176,9 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
     assert adopt_props["origin"]["enum"] == ["manual", "compose", "systemd_unit"]
     assert "install" in adopt_props["instructions"]["properties"]
     assert "machine_id" in adopt_props["upsert_categories"]["items"]["properties"]
+    discover_props: Any = by_id["app.discover"].input_schema["properties"]
+    assert "limit" in discover_props and "offset" in discover_props
+    list_adopted_props: Any = by_id["app.list_adopted"].input_schema["properties"]
+    assert "limit" in list_adopted_props and "offset" in list_adopted_props
     assert len(INTERNAL_API_CAPABILITY_IDS) == 7
 

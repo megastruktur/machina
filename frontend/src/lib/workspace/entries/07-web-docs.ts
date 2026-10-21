@@ -98,6 +98,9 @@ export interface DocumentPage {
 	app_id: string | null;
 	namespace: string | null;
 	documents: DocumentListItem[];
+	total?: number;
+	limit?: number;
+	offset?: number;
 }
 
 /**

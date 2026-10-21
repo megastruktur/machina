@@ -472,6 +472,23 @@ class TestExtraction:
             extract_markdown(b"<p>bytes</p>")  # type: ignore[arg-type]
         assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
 
+    def test_html5_unclosed_void_tags_do_not_swallow_document(self) -> None:
+        html = (
+            "<!DOCTYPE html><html><head>"
+            '<meta charset="UTF-8">'
+            '<link rel="stylesheet" href="/style.css">'
+            '<base href="https://example.com/">'
+            "<title>ArchWiki Tailscale</title>"
+            "</head><body>"
+            '<input type="hidden" name="csrf" value="x">'
+            "<h1>Tailscale</h1><p>Install the tailscale package.</p>"
+            "</body></html>"
+        )
+        content = extract_markdown(html)
+        assert content.title == "ArchWiki Tailscale"
+        assert "# Tailscale" in content.markdown
+        assert "Install the tailscale package." in content.markdown
+
 
 def _result(content, *, url: str) -> "PageResult":
     from mai.research.pages import PageResult
@@ -517,6 +534,24 @@ class TestPinnedDial:
         assert seen[0].url.host == PUBLIC_IP
         # ...with the original authority on the Host header.
         assert seen[0].headers["host"] == "public.example"
+
+    async def test_connect_prefers_ipv4_when_dual_stack_resolved(self) -> None:
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return _html_response(PAGE_HTML)
+
+        provider = HttpPageProvider(
+            resolver=lambda _host: ("2606:4700:4700::1111", "76.76.21.21"),
+            transport=httpx2.MockTransport(handler),
+        )
+        await provider.fetch(
+            url="https://tailscale.example/kb/1085/install-arch",
+            max_bytes=DEFAULT_MAX_BYTES,
+        )
+        assert seen[0].url.host == "76.76.21.21"
+        assert seen[0].headers["host"] == "tailscale.example"
 
     async def test_https_sets_sni_hostname(self) -> None:
         seen: list[httpx2.Request] = []

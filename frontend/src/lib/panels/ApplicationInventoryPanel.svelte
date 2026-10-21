@@ -389,15 +389,20 @@
 
 	let applications = $state<ApplicationView[]>([]);
 	let inventoryTotal = $state(0);
+	let inventoryLoadingMore = $state(false);
 	let inventoryState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
 	let inventoryProblem = $state<{ code: string; message: string } | null>(null);
 	let inventoryEpoch = 0;
+	const inventoryHasMore = $derived(
+		inventoryState === 'ready' && applications.length < inventoryTotal
+	);
 
 	async function loadInventory(): Promise<void> {
 		if (api === null || serverScope === null) return;
 		const scope = serverScope;
 		const epoch = ++inventoryEpoch;
 		inventoryState = 'loading';
+		inventoryLoadingMore = false;
 		inventoryProblem = null;
 		try {
 			const page: ApplicationPage = await api.listAdopted(scope, { limit: PAGE_LIMIT });
@@ -429,6 +434,46 @@
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The adopted applications could not be read.')
 			};
+		}
+	}
+
+	async function loadMoreInventory(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			inventoryState !== 'ready' ||
+			inventoryLoadingMore ||
+			!inventoryHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const epoch = inventoryEpoch;
+		inventoryLoadingMore = true;
+		inventoryProblem = null;
+		try {
+			const page: ApplicationPage = await api.listAdopted(scope, {
+				limit: PAGE_LIMIT,
+				offset: applications.length
+			});
+			if (disposed || epoch !== inventoryEpoch || scope !== serverScope) return;
+			if (page.server_id !== scope) return;
+			const seen = new Set(applications.map((a) => a.application_id));
+			const appended = page.applications.filter((a) => !seen.has(a.application_id));
+			applications = [...applications, ...appended];
+			inventoryTotal = page.applications.length === 0 ? applications.length : page.total;
+		} catch (error) {
+			if (disposed || epoch !== inventoryEpoch) return;
+			const code = codeOf(error) ?? 'unavailable';
+			inventoryProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ?? 'More adopted applications could not be read.'
+				)
+			};
+		} finally {
+			if (!disposed) inventoryLoadingMore = false;
 		}
 	}
 
@@ -1400,6 +1445,19 @@
 							</li>
 						{/each}
 					</ul>
+					{#if inventoryHasMore}
+						<div class="mai-apps__row-actions">
+							<Button
+								variant="secondary"
+								size="sm"
+								loading={inventoryLoadingMore}
+								onclick={loadMoreInventory}
+								data-testid="inventory-load-more"
+							>
+								Load more ({applications.length} of {inventoryTotal})
+							</Button>
+						</div>
+					{/if}
 					{#if lifecycle === null}
 						<p class="mai-apps__note" data-testid="lifecycle-unavailable">
 							The install/update/remove surfaces are not wired into this composition; the links

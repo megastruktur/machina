@@ -199,8 +199,12 @@
 
 	let observations = $state<ImportedObservation[]>([]);
 	let observationsTotal = $state(0);
+	let observationsLoadingMore = $state(false);
 	let observationsState = $state<ListState>({ status: 'loading' });
 	let observationsEpoch = 0;
+	const observationsHasMore = $derived(
+		observationsState.status === 'ready' && observations.length < observationsTotal
+	);
 
 	/** Local alias so the template stays short; the wire shape is unchanged. */
 	type ImportedObservation = Awaited<ReturnType<OverviewApi['listObservations']>>['observations'][number];
@@ -210,6 +214,7 @@
 		const scope = serverScope;
 		const epoch = ++observationsEpoch;
 		observationsState = { status: 'loading' };
+		observationsLoadingMore = false;
 		try {
 			const page = await api.listObservations(scope, { limit: MONITOR_PAGE_LIMIT });
 			if (disposed || epoch !== observationsEpoch || scope !== serverScope) return;
@@ -239,6 +244,43 @@
 		}
 	}
 
+	async function loadMoreObservations(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			observationsState.status !== 'ready' ||
+			observationsLoadingMore ||
+			!observationsHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const epoch = observationsEpoch;
+		observationsLoadingMore = true;
+		try {
+			const page = await api.listObservations(scope, {
+				limit: MONITOR_PAGE_LIMIT,
+				offset: observations.length
+			});
+			if (disposed || epoch !== observationsEpoch || scope !== serverScope) return;
+			if (page.server_id !== scope) return;
+			const seen = new Set(observations.map((o) => o.observation_id));
+			const appended = page.observations.filter((o) => !seen.has(o.observation_id));
+			observations = [...observations, ...appended];
+			observationsTotal = page.observations.length === 0 ? observations.length : page.total;
+		} catch (error) {
+			if (disposed || epoch !== observationsEpoch) return;
+			const code = codeOf(error) ?? 'unavailable';
+			observationsState = {
+				status: 'error',
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More observations could not be read.')
+			};
+		} finally {
+			if (!disposed) observationsLoadingMore = false;
+		}
+	}
+
 	/** Page-scoped freshness tally — the producer derived every value. */
 	const freshnessCounts = $derived.by(() => {
 		const counts = { fresh: 0, stale: 0, unknown: 0 };
@@ -265,8 +307,12 @@
 
 	let findings = $state<ImportedFinding[]>([]);
 	let findingsTotal = $state(0);
+	let findingsLoadingMore = $state(false);
 	let findingsState = $state<ListState>({ status: 'loading' });
 	let findingsEpoch = 0;
+	const findingsHasMore = $derived(
+		findingsState.status === 'ready' && findings.length < findingsTotal
+	);
 
 	type ImportedFinding = Awaited<ReturnType<OverviewApi['listFindings']>>['findings'][number];
 
@@ -275,6 +321,7 @@
 		const scope = serverScope;
 		const epoch = ++findingsEpoch;
 		findingsState = { status: 'loading' };
+		findingsLoadingMore = false;
 		try {
 			const page: FindingPage = await api.listFindings(scope, {
 				open: true,
@@ -304,6 +351,44 @@
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The finding page could not be read.')
 			};
+		}
+	}
+
+	async function loadMoreFindings(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			findingsState.status !== 'ready' ||
+			findingsLoadingMore ||
+			!findingsHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const epoch = findingsEpoch;
+		findingsLoadingMore = true;
+		try {
+			const page: FindingPage = await api.listFindings(scope, {
+				open: true,
+				limit: MONITOR_PAGE_LIMIT,
+				offset: findings.length
+			});
+			if (disposed || epoch !== findingsEpoch || scope !== serverScope) return;
+			if (page.server_id !== scope) return;
+			const seen = new Set(findings.map((f) => f.finding_id));
+			const appended = page.findings.filter((f) => !seen.has(f.finding_id));
+			findings = [...findings, ...appended];
+			findingsTotal = page.findings.length === 0 ? findings.length : page.total;
+		} catch (error) {
+			if (disposed || epoch !== findingsEpoch) return;
+			const code = codeOf(error) ?? 'unavailable';
+			findingsState = {
+				status: 'error',
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More findings could not be read.')
+			};
+		} finally {
+			if (!disposed) findingsLoadingMore = false;
 		}
 	}
 
@@ -362,8 +447,12 @@
 
 	let notices = $state<AlertView[]>([]);
 	let noticesTotal = $state(0);
+	let noticesLoadingMore = $state(false);
 	let noticesState = $state<ListState>({ status: 'loading' });
 	let noticesEpoch = 0;
+	const noticesHasMore = $derived(
+		noticesState.status === 'ready' && notices.length < noticesTotal
+	);
 	/** The one notice whose ack round trip is in flight. */
 	let ackBusyId = $state<string | null>(null);
 	let ackProblem = $state<{ code: string; message: string } | null>(null);
@@ -373,6 +462,7 @@
 		const scope = serverScope;
 		const epoch = ++noticesEpoch;
 		noticesState = { status: 'loading' };
+		noticesLoadingMore = false;
 		try {
 			const page = await api.listNotifications(scope, {
 				unacknowledged: true,
@@ -402,6 +492,43 @@
 				code,
 				message: friendlyText(code, messageOf(error) ?? 'The notification inbox could not be read.')
 			};
+		}
+	}
+
+	async function loadMoreInbox(): Promise<void> {
+		if (
+			api === null ||
+			serverScope === null ||
+			noticesState.status !== 'ready' ||
+			noticesLoadingMore ||
+			!noticesHasMore
+		) {
+			return;
+		}
+		const scope = serverScope;
+		const epoch = noticesEpoch;
+		noticesLoadingMore = true;
+		try {
+			const page = await api.listNotifications(scope, {
+				unacknowledged: true,
+				limit: MONITOR_PAGE_LIMIT,
+				offset: notices.length
+			});
+			if (disposed || epoch !== noticesEpoch || scope !== serverScope) return;
+			if (page.server_id !== scope) return;
+			const seen = new Set(notices.map((n) => n.alert_id));
+			const appended = page.alerts.filter((n) => !seen.has(n.alert_id));
+			notices = [...notices, ...appended];
+			noticesTotal = page.alerts.length === 0 ? notices.length : page.total;
+		} catch (error) {
+			if (disposed || epoch !== noticesEpoch) return;
+			const code = codeOf(error) ?? 'unavailable';
+			ackProblem = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More notices could not be read.')
+			};
+		} finally {
+			if (!disposed) noticesLoadingMore = false;
 		}
 	}
 
@@ -876,6 +1003,19 @@
 							</li>
 						{/each}
 					</ul>
+					{#if observationsHasMore}
+						<div class="mai-overview__head-actions">
+							<Button
+								variant="secondary"
+								size="sm"
+								loading={observationsLoadingMore}
+								onclick={loadMoreObservations}
+								data-testid="observations-load-more"
+							>
+								Load more ({observations.length} of {observationsTotal})
+							</Button>
+						</div>
+					{/if}
 				{/if}
 			</section>
 
@@ -941,6 +1081,19 @@
 							</li>
 						{/each}
 					</ul>
+					{#if findingsHasMore}
+						<div class="mai-overview__head-actions">
+							<Button
+								variant="secondary"
+								size="sm"
+								loading={findingsLoadingMore}
+								onclick={loadMoreFindings}
+								data-testid="findings-load-more"
+							>
+								Load more ({findings.length} of {findingsTotal})
+							</Button>
+						</div>
+					{/if}
 				{/if}
 				{#if evaluateProblem !== null}
 					<div
@@ -1022,6 +1175,19 @@
 							</li>
 						{/each}
 					</ul>
+					{#if noticesHasMore}
+						<div class="mai-overview__head-actions">
+							<Button
+								variant="secondary"
+								size="sm"
+								loading={noticesLoadingMore}
+								onclick={loadMoreInbox}
+								data-testid="inbox-load-more"
+							>
+								Load more ({notices.length} of {noticesTotal})
+							</Button>
+						</div>
+					{/if}
 				{/if}
 				{#if ackProblem !== null}
 					<div

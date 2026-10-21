@@ -959,10 +959,14 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     capabilities = _dedup_preserving_order(payload.capabilities)
     # Always expose the internal-API tool surface (app.discover, app.list_adopted,
     # app.adopt, app.unadopt, app.upsert_map_entry, app.delete_map_entry,
-    # chat.read_session) alongside any host-scoped capabilities so the chat agent
-    # can operate Machina services in both pinned-server and General Consult chats.
+    # chat.read_session) and controller-side web research tools (web.search,
+    # web.read) alongside any host-scoped capabilities so the chat agent can
+    # operate Machina services and consult external docs in both pinned-server
+    # and General Consult chats.
     capabilities = _dedup_preserving_order(
-        list(capabilities) + list(INTERNAL_API_CAPABILITY_IDS)
+        list(capabilities)
+        + list(INTERNAL_API_CAPABILITY_IDS)
+        + ["web.search", "web.read"]
     )
     root_budget: dict[str, object] | None = None
     if payload.root_budget is not None:
