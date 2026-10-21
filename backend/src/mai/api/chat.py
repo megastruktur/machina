@@ -1500,6 +1500,62 @@ async def read_tool_step(
     receipt = dict(step_row["receipt"]) if isinstance(step_row["receipt"], Mapping) else {}
     params = receipt.get("params")
     response_data = receipt.get("response")
+    if params is None or response_data is None:
+        try:
+            import base64
+            import pickle
+
+            async with factory() as session:
+                dbos_rows = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT function_name, output FROM dbos.operation_outputs "
+                                "WHERE workflow_uuid = :w "
+                                "AND function_name IN ('agents.model_round', 'agents.tool_execute') "
+                                "ORDER BY function_id ASC"
+                            ),
+                            {"w": str(run_id)},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            for drow in dbos_rows:
+                raw_out = drow.get("output")
+                if not isinstance(raw_out, str) or not raw_out:
+                    continue
+                val = pickle.loads(base64.b64decode(raw_out))
+                if not isinstance(val, Mapping):
+                    continue
+                if drow["function_name"] == "agents.model_round" and params is None:
+                    calls = val.get("calls")
+                    if isinstance(calls, list):
+                        for c in calls:
+                            if isinstance(c, Mapping) and int(c.get("seq", -1)) == seq:
+                                params = c.get("payload")
+                                break
+                elif drow["function_name"] == "agents.tool_execute" and response_data is None:
+                    if int(val.get("seq", -1)) == seq:
+                        rtext = val.get("result_text")
+                        if isinstance(rtext, str) and rtext:
+                            try:
+                                parsed_rt = json.loads(rtext)
+                                if (
+                                    isinstance(parsed_rt, Mapping)
+                                    and isinstance(parsed_rt.get("output"), str)
+                                ):
+                                    try:
+                                        response_data = json.loads(parsed_rt["output"])
+                                    except Exception:
+                                        response_data = parsed_rt
+                                else:
+                                    response_data = parsed_rt
+                            except Exception:
+                                response_data = rtext
+                        break
+        except Exception:
+            pass
     return Response(
         status_code=HTTP_200_OK,
         content=json.dumps(
