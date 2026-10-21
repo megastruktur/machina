@@ -617,7 +617,7 @@ class HostShellCapability:
                 "utf-8", errors="ignore"
             )
             stderr_truncated = True
-        return {
+        doc = {
             "capability": CAPABILITY_ID,
             "op_id": op_id,
             "server_id": str(report.server_id),
@@ -644,3 +644,23 @@ class HostShellCapability:
             "events_tail": report.events_tail[-MAX_EVENTS_TAIL_CHARS:],
             "intent_path": str(handle.intent_path),
         }
+        # Guarantee that the JSON-escaped document stays strictly under the
+        # dispatcher's 64 KiB output budget even when control characters,
+        # quotes, or non-ASCII bytes expand under json.dumps.
+        max_json_bytes = DEFAULT_OUTPUT_BUDGET_BYTES - 2048
+        while len(json.dumps(doc, sort_keys=True).encode("utf-8")) > max_json_bytes:
+            cur_out = str(doc["stdout"]).encode("utf-8")
+            cur_err = str(doc["stderr"]).encode("utf-8")
+            if len(cur_out) >= len(cur_err) and len(cur_out) > 0:
+                doc["stdout"] = cur_out[: max(0, len(cur_out) // 2)].decode(
+                    "utf-8", errors="ignore"
+                )
+                doc["stdout_truncated"] = True
+            elif len(cur_err) > 0:
+                doc["stderr"] = cur_err[: max(0, len(cur_err) // 2)].decode(
+                    "utf-8", errors="ignore"
+                )
+                doc["stderr_truncated"] = True
+            else:
+                break
+        return doc
