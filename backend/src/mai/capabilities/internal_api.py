@@ -608,6 +608,30 @@ class InternalApiComposition:
     executors: dict[str, Callable[[CapabilityCall], Any]]
 
 
+def _resolve_server_id(
+    call: CapabilityCall, payload: Mapping[str, Any], capability_id: str
+) -> uuid.UUID:
+    """Resolve the target server_id from the payload override or call context."""
+    raw = payload.get("server_id")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            sid = uuid.UUID(raw.strip())
+            if sid != uuid.UUID(int=0):
+                return sid
+        except ValueError:
+            raise InternalApiError(
+                "invalid_request",
+                f"{capability_id}: server_id must be a canonical UUID",
+            ) from None
+    ctx_sid = call.context.server_id
+    if ctx_sid is not None and ctx_sid != uuid.UUID(int=0):
+        return ctx_sid
+    raise InternalApiError(
+        "invalid_request",
+        f"{capability_id} requires a target server_id (either pinned to the conversation or passed as server_id)",
+    )
+
+
 def build_internal_api_capabilities(
     *,
     applications: "ApplicationManifestStore | None",
@@ -615,6 +639,8 @@ def build_internal_api_capabilities(
     docs: "ApplicationDocService | None",
     service_map: "ServiceMapStore | None",
     session_factory: Callable[[], Any] | None = None,
+    data_root: Any | None = None,
+    env_resolver: Callable[[], Any] | None = None,
 ) -> InternalApiComposition:
     """Build every ``app.*`` descriptor + executor over the composed state.
 
@@ -622,13 +648,29 @@ def build_internal_api_capabilities(
     every call answers ``{"status": "unavailable", ...}`` — the composition
     contract of the HTTP routes, mirrored for the agent lane.
     """
-    # Deferred imports keep the module free of API-layer import cycles.
+    import asyncio
+    from dataclasses import asdict
+    from pathlib import Path
     from mai.api.applications import (
         ApplicationDocService,
         AdoptionRequest,
         ApplicationOrigin,
+        _render_manual_record,
+        resolve_identity_key,
     )
-    from mai.applications.service_map import ServiceMapStore
+    from mai.applications.discover import discover_server
+    from mai.applications.document import record_doc_id
+    from mai.applications.service_map import ServiceMapStore, entry_digest
+    from mai.contracts.server import parse_server_profile_text
+    from mai.knowledge.documents import (
+        DocumentNamespace,
+        DocumentStore,
+        DocumentStoreError,
+        DocumentStoreErrorCode,
+        SourceKind,
+        VerificationStatus,
+    )
+    from mai.profiles.files import ProfileFileStore
 
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
 
@@ -651,18 +693,34 @@ def build_internal_api_capabilities(
     async def _app_discover(
         call: CapabilityCall, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        if adoption is None:
+        if adoption is None or applications is None:
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
-        server_id = call.context.server_id
-        if server_id is None:
-            raise InternalApiError(
-                "invalid_request",
-                "app.discover requires a pinned server context",
-            )
+        server_id = _resolve_server_id(call, payload, APP_DISCOVER_CAPABILITY)
+        root_dir = Path(data_root) if data_root is not None else applications.root
         try:
-            inventory = await adoption.discover(server_id)
+            profile_store = ProfileFileStore(root_dir)
+            stored_prof = profile_store.read(server_id)
+            profile = parse_server_profile_text(stored_prof.text)
+            resolver = env_resolver() if env_resolver is not None else None
+            if resolver is None:
+                raise InternalApiError(
+                    "unavailable", "credential source is not configured"
+                )
+            known_hosts_path = root_dir / "servers" / str(server_id) / "known_hosts"
+            managed_refs = await adoption.managed_references(server_id)
+            key_path = resolve_identity_key(resolver, profile.ssh.credential_ref)
+            inventory = await asyncio.to_thread(
+                discover_server,
+                profile.ssh,
+                server_id=server_id,
+                key_path=str(key_path),
+                known_hosts_path=str(known_hosts_path),
+                managed_refs=managed_refs,
+            )
+        except InternalApiError:
+            raise
         except Exception as exc:
             raise InternalApiError(
                 "discovery_failed",
@@ -673,7 +731,7 @@ def build_internal_api_capabilities(
             detail = observed.detail
             applications_view.append(
                 {
-                    "origin": observed.origin,
+                    "origin": observed.origin.value if hasattr(observed.origin, "value") else str(observed.origin),
                     "managed": observed.managed,
                     "application_id": (
                         str(observed.application_id)
@@ -685,13 +743,14 @@ def build_internal_api_capabilities(
                             getattr(detail, "container", None), "name", "unknown"
                         ))
                     ),
+                    "detail": asdict(detail) if hasattr(detail, "__dataclass_fields__") else {},
                 }
             )
         return {
             "server_id": str(server_id),
-            "observed_at": inventory.observed_at.isoformat(),
+            "observed_at": str(inventory.observed_at),
             "applications": applications_view,
-            "listen_ports": [dict(p) for p in inventory.listen_ports],
+            "listen_ports": [asdict(p) for p in inventory.listen_ports],
             "lanes": [
                 {
                     "lane": lane.lane.value,
@@ -727,12 +786,7 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
-        server_id = call.context.server_id
-        if server_id is None:
-            raise InternalApiError(
-                "invalid_request",
-                "app.list_adopted requires a pinned server context",
-            )
+        server_id = _resolve_server_id(call, payload, APP_LIST_ADOPTED_CAPABILITY)
         records = await adoption.list_adopted(server_id)
         entries = {e.application_id: e for e in service_map.list_entries(server_id)}
         applications = []
@@ -800,13 +854,79 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
-        server_id = call.context.server_id
-        if server_id is None:
-            raise InternalApiError(
-                "invalid_request",
-                "app.adopt requires a pinned server context",
-            )
+        server_id = _resolve_server_id(call, payload, APP_ADOPT_CAPABILITY)
         origin_value = payload.get("origin", "manual")
+        name = str(payload["name"])
+        application_id: uuid.UUID | None = None
+        if payload.get("application_id"):
+            application_id = uuid.UUID(str(payload["application_id"]))
+
+        if origin_value == "manual":
+            # The chat/manual addition: persist directly in the Service Map +
+            # canonical identity doc (the UI's `_adopt_manual_entry` flow).
+            if application_id is None:
+                application_id = uuid.uuid4()
+            if payload.get("upsert_categories"):
+                for category in payload["upsert_categories"]:
+                    service_map.upsert_category(
+                        str(category["machine_id"]),
+                        label=str(category.get("label", category["machine_id"])),
+                        description=str(category.get("description", "")),
+                    )
+            entry = service_map.upsert_entry(
+                server_id,
+                name=name,
+                category=payload.get("category") or "system",
+                origin="manual",
+                application_id=application_id,
+                compose_project=payload.get("compose_project"),
+                working_dir=payload.get("working_dir"),
+                unit_name=payload.get("unit_name"),
+                description=payload.get("description") or "",
+                instructions=payload.get("instructions") or {},
+            )
+            doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
+            if data_root is not None:
+                try:
+                    doc_store = DocumentStore(Path(data_root))
+                    doc_id = record_doc_id(server_id, application_id)
+                    expected_revision = 0
+                    try:
+                        current = doc_store.read(
+                            doc_id, server_id=server_id, app_id=application_id
+                        )
+                        expected_revision = current.revision
+                    except DocumentStoreError as error:
+                        if error.code is not DocumentStoreErrorCode.NOT_FOUND:
+                            raise
+                    document = doc_store.write(
+                        doc_id,
+                        _render_manual_record(entry),
+                        server_id=server_id,
+                        app_id=application_id,
+                        namespace=DocumentNamespace.DOCS,
+                        expected_revision=expected_revision,
+                        source_kind=SourceKind.GENERATED,
+                        origin=f"service-map:{entry.revision}",
+                        origin_revision=str(entry.revision),
+                        verification=VerificationStatus.UNVERIFIED,
+                    )
+                    doc_outcome = {
+                        "status": "documented",
+                        "doc_id": str(document.doc_id),
+                        "reason": None,
+                    }
+                except Exception as exc:
+                    doc_outcome["reason"] = type(exc).__name__
+            return {
+                "application_id": str(application_id),
+                "server_id": str(server_id),
+                "outcome": "reconciled",
+                "revision": entry.revision,
+                "sha256": entry_digest(entry),
+                "record_doc": doc_outcome,
+            }
+
         try:
             origin = ApplicationOrigin(origin_value)
         except ValueError:
@@ -816,12 +936,8 @@ def build_internal_api_capabilities(
             ) from None
         request = AdoptionRequest(
             server_id=server_id,
-            application_id=(
-                uuid.UUID(str(payload["application_id"]))
-                if payload.get("application_id")
-                else None
-            ),
-            name=str(payload["name"]),
+            application_id=application_id,  # type: ignore[arg-type]
+            name=name,
             origin=origin,
             compose_project=payload.get("compose_project"),
             working_dir=payload.get("working_dir"),
@@ -853,7 +969,7 @@ def build_internal_api_capabilities(
         service_map.upsert_entry(
             server_id,
             application_id=result.application_id,
-            name=str(payload["name"]),
+            name=name,
             origin=origin.value,
             compose_project=payload.get("compose_project"),
             working_dir=payload.get("working_dir"),
@@ -869,7 +985,7 @@ def build_internal_api_capabilities(
                 doc = await docs.record_adopted(
                     server_id=server_id,
                     application_id=result.application_id,
-                    name=str(payload["name"]),
+                    name=name,
                 )
                 doc_outcome = {
                     "status": "documented",
@@ -912,12 +1028,7 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
-        server_id = call.context.server_id
-        if server_id is None:
-            raise InternalApiError(
-                "invalid_request",
-                "app.unadopt requires a pinned server context",
-            )
+        server_id = _resolve_server_id(call, payload, APP_UNADOPT_CAPABILITY)
         application_id = uuid.UUID(str(payload["application_id"]))
         expected_revision = payload.get("expected_revision")
         if expected_revision is None:
@@ -973,12 +1084,7 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "service map service is unavailable"
             )
-        server_id = call.context.server_id
-        if server_id is None:
-            raise InternalApiError(
-                "invalid_request",
-                "app.delete_map_entry requires a pinned server context",
-            )
+        server_id = _resolve_server_id(call, payload, APP_DELETE_MAP_ENTRY_CAPABILITY)
         application_id = uuid.UUID(str(payload["application_id"]))
         removed = service_map.delete_entry(server_id, application_id)
         if not removed:

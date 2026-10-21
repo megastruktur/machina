@@ -205,6 +205,32 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                     k, v = item.split("=", 1)
                     if k.strip() and v.strip():
                         allowlist[k.strip()] = v.strip()
+        if not allowlist:
+            req_payload = call.payload if isinstance(call.payload, dict) else {}
+            req_service = str(req_payload.get("service", ""))
+            req_method = str(req_payload.get("method", "GET"))
+            req_path = str(req_payload.get("path", "/"))
+            import json as _json
+
+            return ExecutorResult(
+                ok=False,
+                output=_json.dumps(
+                    {
+                        "status": "refused",
+                        "code": "unknown_service",
+                        "trust": "untrusted_external",
+                        "service": req_service,
+                        "method": req_method,
+                        "endpoint": req_path,
+                        "http_status": None,
+                        "json": None,
+                        "truncated": False,
+                        "redirects": 0,
+                        "error_type": None,
+                    },
+                    sort_keys=True,
+                ),
+            )
         cap = ServiceHttpCapability(service_http_provider, services=allowlist)
         return await cap(call)
 
@@ -249,6 +275,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         docs=app_doc_service,
         service_map=service_map_store,
         session_factory=sessions,
+        data_root=data_root,
+        env_resolver=lambda: _resolve_env(),
     )
     for desc in internal_api.descriptors:
         registry.register(desc)

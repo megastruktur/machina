@@ -340,6 +340,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             docs=app.state.app_docs,
             service_map=app.state.service_map,
             session_factory=app.state.session_factory,
+            data_root=resolve_profiles_root(app.state.env),
+            env_resolver=lambda: app.state.credentials,
         )
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
