@@ -820,6 +820,7 @@
 
 	type VisibleToolCall = {
 		id: string;
+		runId: string;
 		capabilityId: string;
 		stepSeq: string;
 		payloadHash: string;
@@ -827,6 +828,78 @@
 		reason: string;
 		opId: string;
 	};
+
+	type ToolStepDetail = {
+		loading: boolean;
+		error: string | null;
+		params: unknown;
+		response: unknown;
+		receipt: Record<string, unknown> | null;
+	};
+
+	let expandedToolDetails = $state<Record<string, ToolStepDetail>>({});
+
+	async function loadToolStepDetail(tc: VisibleToolCall): Promise<void> {
+		const key = `${tc.runId}:${tc.stepSeq}`;
+		const existing = expandedToolDetails[key];
+		if (existing && (existing.loading || (existing.error === null && existing.response !== null))) {
+			return;
+		}
+		expandedToolDetails = {
+			...expandedToolDetails,
+			[key]: {
+				loading: true,
+				error: null,
+				params: existing?.params ?? null,
+				response: existing?.response ?? null,
+				receipt: existing?.receipt ?? null
+			}
+		};
+		try {
+			const res = await fetch(
+				`/api/v1/chat/runs/${encodeURIComponent(tc.runId)}/steps/${encodeURIComponent(tc.stepSeq)}`,
+				{ credentials: 'same-origin' }
+			);
+			if (!res.ok) {
+				throw new Error(`HTTP ${res.status}`);
+			}
+			const data = (await res.json()) as Record<string, unknown>;
+			expandedToolDetails = {
+				...expandedToolDetails,
+				[key]: {
+					loading: false,
+					error: null,
+					params: data.params ?? null,
+					response: data.response ?? null,
+					receipt:
+						typeof data.receipt === 'object' && data.receipt !== null
+							? (data.receipt as Record<string, unknown>)
+							: null
+				}
+			};
+		} catch (err) {
+			expandedToolDetails = {
+				...expandedToolDetails,
+				[key]: {
+					loading: false,
+					error: err instanceof Error ? err.message : 'Unable to load step details',
+					params: null,
+					response: null,
+					receipt: null
+				}
+			};
+		}
+	}
+
+	function formatStepJson(value: unknown): string {
+		if (value === null || value === undefined) return '—';
+		if (typeof value === 'string') return value;
+		try {
+			return JSON.stringify(value, null, 2);
+		} catch {
+			return String(value);
+		}
+	}
 
 	type PriorTurn = {
 		runId: string;
@@ -1014,6 +1087,7 @@
 							...visibleToolCalls,
 							{
 								id: `${event.seq}-${idx}`,
+								runId: event.run_id ?? activeRunId ?? '',
 								capabilityId: capId,
 								stepSeq: seqStr,
 								payloadHash: hashStr,
@@ -1095,6 +1169,7 @@
 						...visibleToolCalls,
 						{
 							id: `step-${event.seq}`,
+							runId: event.run_id ?? activeRunId ?? '',
 							capabilityId: capId,
 							stepSeq: String(event.seq),
 							payloadHash: '—',
@@ -1170,6 +1245,7 @@
 						...visibleToolCalls,
 						{
 							id: `outcome-${event.seq}`,
+							runId: event.run_id ?? activeRunId ?? '',
 							capabilityId: capId,
 							stepSeq: String(event.seq),
 							payloadHash: '—',
@@ -2028,25 +2104,53 @@
 								{#if turn.toolCalls.length > 0}
 									<div class="mai-chat__tool-calls">
 										{#each turn.toolCalls as tc (tc.id)}
-											<div class="mai-chat__tool-card">
-												<div class="mai-chat__tool-card-head">
-													<span class="mai-chat__tool-card-title">
-														⚙ TOOL CALL // {tc.capabilityId}
-													</span>
-													<span
-														class="mai-chat__badge"
-														class:mai-chat__badge--ok={tc.status === 'succeeded'}
-														class:mai-chat__badge--danger={tc.status === 'failed'}
-													>
-														{tc.status.toUpperCase()}
-													</span>
-												</div>
-												<div class="mai-chat__tool-card-meta">
-													{#if tc.reason !== ''}
-														<span>· outcome: {tc.reason}</span>
+											{@const detailKey = `${tc.runId}:${tc.stepSeq}`}
+											{@const stepDetail = expandedToolDetails[detailKey]}
+											<details
+												class="mai-chat__tool-card"
+												ontoggle={(event) => {
+													if ((event.currentTarget as HTMLDetailsElement).open) {
+														void loadToolStepDetail(tc);
+													}
+												}}
+											>
+												<summary class="mai-chat__tool-card-summary">
+													<div class="mai-chat__tool-card-head">
+														<span class="mai-chat__tool-card-title">
+															▸ ⚙ TOOL CALL // {tc.capabilityId}
+														</span>
+														<span
+															class="mai-chat__badge"
+															class:mai-chat__badge--ok={tc.status === 'succeeded'}
+															class:mai-chat__badge--danger={tc.status === 'failed'}
+														>
+															{tc.status.toUpperCase()}
+														</span>
+													</div>
+													<div class="mai-chat__tool-card-meta">
+														<span>seq #{tc.stepSeq}</span>
+														{#if tc.reason !== ''}
+															<span>· outcome: {tc.reason}</span>
+														{/if}
+													</div>
+												</summary>
+												<div class="mai-chat__tool-card-body">
+													{#if stepDetail?.loading}
+														<div class="mai-chat__tool-card-loading">Loading params &amp; response…</div>
+													{:else if stepDetail?.error}
+														<div class="mai-chat__tool-card-error">{stepDetail.error}</div>
+													{:else if stepDetail}
+														<div class="mai-chat__tool-card-section">
+															<span class="mai-chat__tool-card-label">PARAMS</span>
+															<pre class="mai-chat__tool-card-pre">{formatStepJson(stepDetail.params)}</pre>
+														</div>
+														<div class="mai-chat__tool-card-section">
+															<span class="mai-chat__tool-card-label">RESPONSE</span>
+															<pre class="mai-chat__tool-card-pre">{formatStepJson(stepDetail.response ?? stepDetail.receipt)}</pre>
+														</div>
 													{/if}
 												</div>
-											</div>
+											</details>
 										{/each}
 									</div>
 								{/if}
@@ -2112,26 +2216,55 @@
 							{#if visibleToolCalls.length > 0}
 								<div class="mai-chat__tool-calls" data-testid="assistant-tool-calls">
 									{#each visibleToolCalls as tc (tc.id)}
-										<div class="mai-chat__tool-card" data-testid="assistant-tool-card">
-											<div class="mai-chat__tool-card-head">
-												<span class="mai-chat__tool-card-title">
-													<span class:mai-chat__cog-spin={tc.status === 'running' || tc.status === 'requested'} aria-hidden="true">⚙</span> TOOL CALL // {tc.capabilityId}
-												</span>
-												<span
-													class="mai-chat__badge"
-													class:mai-chat__badge--active={tc.status === 'running' || tc.status === 'requested'}
-													class:mai-chat__badge--ok={tc.status === 'succeeded'}
-													class:mai-chat__badge--danger={tc.status === 'failed'}
-												>
-													{tc.status.toUpperCase()}
-												</span>
-											</div>
-											<div class="mai-chat__tool-card-meta">
-												{#if tc.reason !== ''}
-													<span>· outcome: {tc.reason}</span>
+										{@const detailKey = `${tc.runId}:${tc.stepSeq}`}
+										{@const stepDetail = expandedToolDetails[detailKey]}
+										<details
+											class="mai-chat__tool-card"
+											data-testid="assistant-tool-card"
+											ontoggle={(event) => {
+												if ((event.currentTarget as HTMLDetailsElement).open) {
+													void loadToolStepDetail(tc);
+												}
+											}}
+										>
+											<summary class="mai-chat__tool-card-summary">
+												<div class="mai-chat__tool-card-head">
+													<span class="mai-chat__tool-card-title">
+														▸ <span class:mai-chat__cog-spin={tc.status === 'running' || tc.status === 'requested'} aria-hidden="true">⚙</span> TOOL CALL // {tc.capabilityId}
+													</span>
+													<span
+														class="mai-chat__badge"
+														class:mai-chat__badge--active={tc.status === 'running' || tc.status === 'requested'}
+														class:mai-chat__badge--ok={tc.status === 'succeeded'}
+														class:mai-chat__badge--danger={tc.status === 'failed'}
+													>
+														{tc.status.toUpperCase()}
+													</span>
+												</div>
+												<div class="mai-chat__tool-card-meta">
+													<span>seq #{tc.stepSeq}</span>
+													{#if tc.reason !== ''}
+														<span>· outcome: {tc.reason}</span>
+													{/if}
+												</div>
+											</summary>
+											<div class="mai-chat__tool-card-body">
+												{#if stepDetail?.loading}
+													<div class="mai-chat__tool-card-loading">Loading params &amp; response…</div>
+												{:else if stepDetail?.error}
+													<div class="mai-chat__tool-card-error">{stepDetail.error}</div>
+												{:else if stepDetail}
+													<div class="mai-chat__tool-card-section">
+														<span class="mai-chat__tool-card-label">PARAMS</span>
+														<pre class="mai-chat__tool-card-pre">{formatStepJson(stepDetail.params)}</pre>
+													</div>
+													<div class="mai-chat__tool-card-section">
+														<span class="mai-chat__tool-card-label">RESPONSE</span>
+														<pre class="mai-chat__tool-card-pre">{formatStepJson(stepDetail.response ?? stepDetail.receipt)}</pre>
+													</div>
 												{/if}
 											</div>
-										</div>
+										</details>
 									{/each}
 								</div>
 							{/if}
@@ -2770,6 +2903,62 @@
 		background: transparent;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
+	}
+
+	.mai-chat__tool-card-summary {
+		cursor: pointer;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		user-select: none;
+	}
+
+	.mai-chat__tool-card-summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.mai-chat__tool-card-body {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		padding-top: var(--mai-space-2);
+		margin-top: var(--mai-space-1);
+		border-top: 1px dashed var(--mai-color-border);
+	}
+
+	.mai-chat__tool-card-section {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.mai-chat__tool-card-label {
+		color: var(--mai-color-brass);
+		font-weight: var(--mai-weight-semibold);
+		font-size: 0.7rem;
+		letter-spacing: 0.06em;
+	}
+
+	.mai-chat__tool-card-pre {
+		margin: 0;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		background: var(--mai-color-surface-sunken, rgba(0, 0, 0, 0.25));
+		border: 1px solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm, 3px);
+		max-height: 16rem;
+		overflow: auto;
+		white-space: pre-wrap;
+		word-break: break-word;
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+	}
+
+	.mai-chat__tool-card-loading,
+	.mai-chat__tool-card-error {
+		color: var(--mai-color-text-muted);
+		font-style: italic;
 	}
 
 	.mai-chat__tool-card-head {

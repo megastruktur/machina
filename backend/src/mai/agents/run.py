@@ -1240,6 +1240,18 @@ class AgentRunExecutor:
                         receipt["approval_id"] = str(created_approval.approval_id)
                 except Exception:
                     pass
+        if outcome.output is not None and outcome.output.text:
+            try:
+                parsed_output = json.loads(outcome.output.text)
+                receipt["response"] = (
+                    parsed_output
+                    if len(outcome.output.text) <= 32768
+                    else outcome.output.text[:32768] + "… [truncated]"
+                )
+            except Exception:
+                receipt["response"] = outcome.output.text[:32768]
+        if isinstance(payload, Mapping):
+            receipt["params"] = dict(payload)
         step_state = StepState(state_value)
         await self._steps.apersist_outcome(
             intent.run_id,

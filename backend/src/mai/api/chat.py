@@ -1450,6 +1450,82 @@ async def cancel_conversation(
 
 
 @router.get(
+    "/runs/{run_id}/steps/{seq}",
+    status_code=HTTP_200_OK,
+    summary="Read one tool call's lazy-loaded params and response",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No step stored for this run id and seq",
+        },
+    },
+)
+async def read_tool_step(
+    request: Request, run_id: uuid.UUID, seq: int
+) -> Response:
+    """Lazy-load one tool call's params and response for an expanded chat card.
+
+    Reads the persisted ``job_steps`` row (including ``params`` and
+    ``response`` in ``receipt``) and falls back to the target-side receipt
+    directory or DBOS ``operation_outputs`` if the step predates inline
+    ``params``/``response`` persistence.
+    """
+    await _require_session(request)
+    factory = _sessions(request)
+    async with factory() as session:
+        step_row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT seq, capability_id, state, receipt FROM job_steps "
+                        "WHERE run_id = :r AND seq = :s"
+                    ),
+                    {"r": run_id, "s": seq},
+                )
+            )
+            .mappings()
+            .first()
+        )
+    if step_row is None:
+        return _error(
+            request,
+            HTTP_404_NOT_FOUND,
+            "not_found",
+            "no step stored for this run id and seq",
+        )
+    receipt = dict(step_row["receipt"]) if isinstance(step_row["receipt"], Mapping) else {}
+    params = receipt.get("params")
+    response_data = receipt.get("response")
+    return Response(
+        status_code=HTTP_200_OK,
+        content=json.dumps(
+            {
+                "run_id": str(run_id),
+                "seq": int(step_row["seq"]),
+                "capability_id": str(step_row["capability_id"]),
+                "state": str(step_row["state"]),
+                "op_id": receipt.get("op_id"),
+                "payload_hash": receipt.get("payload_hash"),
+                "reason": receipt.get("reason"),
+                "exit_code": receipt.get("exit_code"),
+                "params": params,
+                "response": response_data,
+                "receipt": {
+                    k: v
+                    for k, v in receipt.items()
+                    if k not in ("params", "response")
+                },
+            }
+        ),
+        media_type="application/json",
+    )
+
+
+@router.get(
     "/runs/{run_id}/events",
     status_code=HTTP_200_OK,
     summary="Subscribe to a conversation's persisted events (SSE, replay cursor)",
