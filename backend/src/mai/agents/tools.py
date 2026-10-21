@@ -465,8 +465,15 @@ class CapabilityToolBridge:
             else "Execution passes the common policy boundary; grants "
             "and policy are rechecked immediately before the effect."
         )
+        root_description = (
+            descriptor.input_schema.get("description")
+            if isinstance(descriptor.input_schema, Mapping)
+            and isinstance(descriptor.input_schema.get("description"), str)
+            else None
+        )
+        prefix = f"{root_description} " if root_description else ""
         description = (
-            f"Capability {capability_id} v{descriptor.version} "
+            f"{prefix}Capability {capability_id} v{descriptor.version} "
             f"({descriptor.effect_class} effect, targets: "
             f"{', '.join(descriptor.execution_environments)}). {advisory} "
             "Arguments must match the declared input schema."

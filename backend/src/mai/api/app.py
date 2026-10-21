@@ -100,6 +100,10 @@ from mai.memory.hindsight import (
     MemoryAdapterError,
     parse_shared_banks,
 )
+from mai.capabilities.internal_api import (
+    INTERNAL_API_CAPABILITY_IDS,
+    build_internal_api_capabilities,
+)
 from mai.applications.adopt import (
     ApplicationAdoption,
     ApplicationManifestStore,
@@ -325,6 +329,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         except OSError:
             app.state.service_map = None
+        # Internal API → Agent Tool surface (C09/C06): every declared
+        # internal API operation (service adoption/unadoption, discovery,
+        # inventory listing, Service Map CRUD) becomes a chat-agent tool
+        # automatically through the ONE shared builder. Fails closed with
+        # 503 when any service is absent.
+        app.state.internal_api = build_internal_api_capabilities(
+            applications=app.state.applications,
+            adoption=app.state.app_adoption,
+            docs=app.state.app_docs,
+            service_map=app.state.service_map,
+            session_factory=app.state.session_factory,
+        )
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
         # store appends its own ``models/`` namespace). Credential material
@@ -514,6 +530,12 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # submits through the EXISTING jobs facade — no Docker/SSH effect ever
     # runs in a route; the data-removal decision is an explicit field.
     register_applications(app)
+    # Internal API → Agent Tool surface (C09/C06): every declared internal
+    # API operation (service adoption/unadoption, discovery, inventory
+    # listing, Service Map CRUD) becomes a chat-agent tool automatically
+    # through the ONE shared builder. The descriptors and executors are
+    # composed at lifespan time (app.state.internal_api) and consumed by
+    # both the HTTP dispatcher and the DBOS worker without drift.
     # The plugin configuration/enablement surface (C03): plugin catalogs
     # with availability separate from grants, versioned connection-config
     # edits validated against the declared schemas (credential references

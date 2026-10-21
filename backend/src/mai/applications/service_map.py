@@ -750,6 +750,28 @@ class ServiceMapStore:
         )
         return entry
 
+    def delete_entry(
+        self, server_id: uuid.UUID, application_id: str | uuid.UUID
+    ) -> bool:
+        """Remove one service entry by identity (atomic).
+
+        Returns ``True`` when an existing entry was removed, ``False``
+        when no entry matched ``application_id``.
+        """
+        _canonical_uuid(server_id, "server_id")
+        aid = _canonical_uuid(application_id, "application_id")
+        existing = self.list_entries(server_id)
+        remaining = [entry for entry in existing if entry.application_id != aid]
+        if len(remaining) == len(existing):
+            return False
+        document = [item.to_json() for item in remaining]
+        self._ensure_root()
+        _atomic_write(
+            self._server_path(server_id),
+            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+        )
+        return True
+
 
 # ---------------------------------------------------------------------------
 # The ``app.upsert_map_entry`` capability (agent-facing seam)
@@ -947,6 +969,7 @@ class ServiceMapUpsertCapability:
         )
         previous_revision = entry.revision - 1
         summary = {
+            "status": "ok",
             "application_id": entry.application_id,
             "server_id": entry.server_id,
             "name": entry.name,

@@ -119,6 +119,7 @@ from mai.api.auth import (
     _require_csrf,
     _require_session,
 )
+from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.api.jobs import (
     CANCEL_OUTCOME_BUDGET_SECONDS,
     DEFAULT_PAGE_LIMIT,
@@ -956,6 +957,14 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         return _validation_error(request, exc.field, exc.detail)
 
     capabilities = _dedup_preserving_order(payload.capabilities)
+    if general_consult:
+        # General Consult (no target host): expose the internal-API surface
+        # automatically so the chat agent can operate the system without a
+        # pinned server. The UI's effectiveCaps union is preserved — the
+        # agent sees the full catalog, not just the host-scoped subset.
+        capabilities = _dedup_preserving_order(
+            list(capabilities) + list(INTERNAL_API_CAPABILITY_IDS)
+        )
     root_budget: dict[str, object] | None = None
     if payload.root_budget is not None:
         budget_document = payload.root_budget.model_dump()

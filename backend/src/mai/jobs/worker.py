@@ -83,6 +83,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
 
     from mai.agents.budgets import BudgetLedger
     from mai.agents.model_store import ModelConfigStore
+    from mai.capabilities.internal_api import build_internal_api_capabilities
     from mai.capabilities.chat_read import (
         ChatReadSessionCapability,
         chat_read_descriptor,
@@ -202,12 +203,28 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     ):
         registry.register(desc)
 
+    # Internal API → Agent Tool surface (C09/C06): every declared internal
+    # API operation (service adoption/unadoption, discovery, inventory
+    # listing, Service Map CRUD) becomes a worker-registered executor
+    # automatically through the ONE shared builder. Fails closed with 503
+    # when any service is absent.
+    internal_api = build_internal_api_capabilities(
+        applications=None,
+        adoption=None,
+        docs=None,
+        service_map=None,
+        session_factory=sessions,
+    )
+    for desc in internal_api.descriptors:
+        registry.register(desc)
+
     executors = {
         "host.shell": host_shell_cap,
         "host.logs": host_logs_cap,
         "chat.read_session": chat_read_cap,
         "docs.retrieve": docs_retrieve_cap,
         "service.http": _service_http_cap,
+        **internal_api.executors,
     }
 
     async def _composite_executor(call: CapabilityCall) -> ExecutorResult:
