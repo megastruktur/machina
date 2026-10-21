@@ -104,6 +104,11 @@ def chat_read_descriptor() -> CapabilityDescriptor:
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": (
+                    "Read a persisted chat conversation session by its canonical "
+                    "run UUID and return its state, model profile, service tags, "
+                    "and bounded event summary."
+                ),
                 "required": ["session_id"],
                 "properties": {
                     "session_id": {

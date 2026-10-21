@@ -798,6 +798,11 @@ def upsert_map_descriptor() -> CapabilityDescriptor:
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": (
+                    "Create or update a Service Map entry for a service on the "
+                    "target server, including its category, origin, description, "
+                    "and operational runbook instructions."
+                ),
                 "required": ["name"],
                 "properties": {
                     "application_id": {
@@ -852,6 +857,9 @@ def upsert_map_descriptor() -> CapabilityDescriptor:
                             key: {
                                 "type": "string",
                                 "maxLength": MAX_INSTRUCTION_CHARS,
+                                "description": (
+                                    f"Operational {key} instructions and verification steps for this service."
+                                ),
                             }
                             for key in INSTRUCTION_KEYS
                         },

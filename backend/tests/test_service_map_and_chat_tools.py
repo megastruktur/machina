@@ -1087,3 +1087,94 @@ async def test_chat_read_session_executes_through_the_tool_bridge(
     assert summary["session_id"] == str(run_id)
     assert summary["service_tags"] == ["jellyfin"]
     assert summary["state"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed documentation enforcement on @internal_api_tool
+# ---------------------------------------------------------------------------
+
+
+def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
+    from pydantic import BaseModel, Field
+
+    from mai.capabilities.internal_api import (
+        INTERNAL_API_CAPABILITY_IDS,
+        assert_agent_ready_descriptor,
+        build_internal_api_capabilities,
+        internal_api_tool,
+    )
+
+    class UndocumentedPayload(BaseModel):
+        model_config = {"extra": "forbid"}
+        name: str
+
+    # 1. Missing/short endpoint description is rejected at decoration time.
+    with pytest.raises(ValueError, match="tool description must be a non-empty string"):
+        @internal_api_tool(
+            capability_id="app.bad_desc",
+            version="1.0.0",
+            effect_class="read",
+            resource_scope=["applications"],
+            environments=["controller"],
+            payload_model=UndocumentedPayload,
+            description="Too short",
+        )
+        async def _bad_desc(call: Any, payload: Any) -> Any:
+            return {}
+
+    # 2. Missing Field(description=...) on a parameter is rejected at decoration time.
+    with pytest.raises(ValueError, match="must declare Field\\(description=...\\)"):
+        @internal_api_tool(
+            capability_id="app.bad_param",
+            version="1.0.0",
+            effect_class="read",
+            resource_scope=["applications"],
+            environments=["controller"],
+            payload_model=UndocumentedPayload,
+            description="A sufficiently detailed endpoint description for the model.",
+        )
+        async def _bad_param(call: Any, payload: Any) -> Any:
+            return {}
+
+    # 3. Nested BaseModel field missing description is rejected recursively.
+    class BadNestedItem(BaseModel):
+        model_config = {"extra": "forbid"}
+        key: str
+
+    class NestedPayload(BaseModel):
+        model_config = {"extra": "forbid"}
+        nested: BadNestedItem = Field(
+            description="Nested configuration object for the operation."
+        )
+
+    with pytest.raises(ValueError, match="parameter 'nested.key'"):
+        @internal_api_tool(
+            capability_id="app.bad_nested",
+            version="1.0.0",
+            effect_class="read",
+            resource_scope=["applications"],
+            environments=["controller"],
+            payload_model=NestedPayload,
+            description="A sufficiently detailed endpoint description for the model.",
+        )
+        async def _bad_nested(call: Any, payload: Any) -> Any:
+            return {}
+
+    # 4. Every composed internal API capability passes assert_agent_ready_descriptor
+    # and projects nested enums and nested object schemas cleanly.
+    comp = build_internal_api_capabilities(
+        applications=None,
+        adoption=None,
+        docs=None,
+        service_map=None,
+    )
+    by_id: dict[str, Any] = {d.identifier: d for d in comp.descriptors}
+    for cap_id in ("app.discover", "app.list_adopted", "app.adopt", "app.unadopt", "app.delete_map_entry"):
+        desc = assert_agent_ready_descriptor(by_id[cap_id])
+        assert len(str(desc.input_schema["description"])) >= 30
+    adopt_props: Any = by_id["app.adopt"].input_schema["properties"]
+    assert adopt_props["origin"]["enum"] == ["manual", "compose", "systemd_unit"]
+    assert "install" in adopt_props["instructions"]["properties"]
+    assert "machine_id" in adopt_props["upsert_categories"]["items"]["properties"]
+    assert len(INTERNAL_API_CAPABILITY_IDS) == 7
+

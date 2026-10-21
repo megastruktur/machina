@@ -48,6 +48,7 @@ from typing import (
     Any,
     Callable,
     Final,
+    Literal,
     Mapping,
     Protocol,
     Sequence,
@@ -166,6 +167,18 @@ class InternalApiError(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_optional(annotation: object) -> object:
+    """Unwrap Optional[X] / X | None to X when there is a single non-None member."""
+    origin = get_origin(annotation)
+    if str(origin) in ("typing.Union", "types.UnionType") or origin is getattr(
+        __import__("typing"), "Union", None
+    ):
+        members = [m for m in get_args(annotation) if m is not type(None)]
+        if len(members) == 1:
+            return members[0]
+    return annotation
+
+
 def _flatten_json_type(annotation: object) -> tuple[str, ...] | None:
     """Project one Python/Pydantic annotation onto descriptor JSON types.
 
@@ -185,7 +198,16 @@ def _flatten_json_type(annotation: object) -> tuple[str, ...] | None:
             return ("integer",)
         if annotation is float:
             return ("number",)
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return ("object",)
         return None
+    if getattr(origin, "__qualname__", "") == "Literal":
+        values = get_args(annotation)
+        if values and all(isinstance(v, str) for v in values):
+            return ("string",)
+        if values and all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            return ("integer",)
+        return ("string",)
     # Optional / Union flattening
     if str(origin) in ("typing.Union", "types.UnionType") or origin is getattr(
         __import__("typing"), "Union", None
@@ -212,16 +234,21 @@ def _project_property(
     Every keyword outside :data:`_ALLOWED_SCHEMA_KEYWORDS` is dropped.
     """
     projected: dict[str, Any] = {}
+    core_annotation = _unwrap_optional(annotation)
 
     # Enum literals (Literal[...] and Enum subclasses) — the pattern that
     # Pydantic renders as {"enum": [...]} directly or via $defs/anyOf.
     enum_values = field_schema.get("enum")
     if isinstance(enum_values, list):
         projected["enum"] = list(enum_values)
+    else:
+        ann_enum = _enum_values_of(core_annotation)
+        if ann_enum is not None:
+            projected["enum"] = ann_enum
 
     # Base JSON type: annotation first (authoritative for the bridge), then
     # the Pydantic fragment's own "type" when the annotation is opaque.
-    json_types = _flatten_json_type(annotation)
+    json_types = _flatten_json_type(core_annotation)
     if json_types is not None:
         projected["type"] = json_types[0] if len(json_types) == 1 else list(json_types)
     elif isinstance(field_schema.get("type"), str) and field_schema["type"] in (
@@ -235,23 +262,34 @@ def _project_property(
     ):
         projected["type"] = field_schema["type"]
 
-    # Array items: project the item annotation's enum/type when known; an
-    # unconstrained item stays an open object (the bridge permits any item
-    # shape when no "items" keyword is declared).
+    # Array items: project the item annotation's enum/type/nested BaseModel
+    # when known; an unconstrained item stays an open object.
     if projected.get("type") == "array":
-        origin = get_origin(annotation)
-        args = get_args(annotation)
+        origin = get_origin(core_annotation)
+        args = get_args(core_annotation)
         if origin in (list, Sequence, tuple, frozenset, set) and args:
-            item_annotation = args[0]
-            item_enum = _enum_values_of(item_annotation)
-            item_schema: dict[str, Any] = {}
-            if item_enum is not None:
-                item_schema["enum"] = item_enum
+            item_annotation = _unwrap_optional(args[0])
+            if isinstance(item_annotation, type) and issubclass(
+                item_annotation, BaseModel
+            ):
+                projected["items"] = _project_model_schema(item_annotation)
+            else:
+                item_enum = _enum_values_of(item_annotation)
                 item_type = _flatten_json_type(item_annotation)
+                item_schema: dict[str, Any] = {}
+                if item_enum is not None:
+                    item_schema["enum"] = item_enum
                 if item_type is not None:
                     item_schema["type"] = item_type[0]
-            if item_schema:
-                projected["items"] = item_schema
+                if item_schema:
+                    projected["items"] = item_schema
+
+    # Nested object properties (inline BaseModel field or Optional[BaseModel]):
+    # Pydantic inlines them as {"$defs":..., "allOf":[{"$ref":...}]} — we
+    # re-project through the referenced model's own schema before copying
+    # field-level annotations so the outer field's description wins.
+    if isinstance(core_annotation, type) and issubclass(core_annotation, BaseModel):
+        projected.update(_project_model_schema(core_annotation))
 
     # Scalar bounds and annotations (carry only the allowed subset).
     for keyword in (
@@ -271,12 +309,6 @@ def _project_property(
     ):
         if keyword in field_schema:
             projected[keyword] = field_schema[keyword]
-
-    # Nested object properties (inline BaseModel field): Pydantic inlines
-    # them as {"$defs":..., "allOf":[{"$ref":...}]} — we re-project through
-    # the referenced model's own schema when the annotation IS a BaseModel.
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        projected.update(_project_model_schema(annotation))
 
     if not projected:
         # Last resort: an unconstrained field is a string slot (never a lie —
@@ -388,6 +420,110 @@ def _check_environments(values: tuple[str, ...]) -> tuple[str, ...]:
     return values
 
 
+MIN_TOOL_DESCRIPTION_CHARS: Final[int] = 30
+MIN_FIELD_DESCRIPTION_CHARS: Final[int] = 12
+
+
+def _check_tool_description(capability_id: str, description: object) -> str:
+    """Enforce that the endpoint/tool description is meaningful for LLM tool matching."""
+    if not isinstance(description, str) or len(description.strip()) < MIN_TOOL_DESCRIPTION_CHARS:
+        raise ValueError(
+            f"{capability_id}: tool description must be a non-empty string of at least "
+            f"{MIN_TOOL_DESCRIPTION_CHARS} characters explaining what the tool does"
+        )
+    cleaned = description.strip()
+    if cleaned.lower() == capability_id.lower():
+        raise ValueError(
+            f"{capability_id}: tool description must not merely repeat capability_id"
+        )
+    return cleaned
+
+
+def _check_model_field_descriptions(
+    capability_id: str,
+    model: type[BaseModel],
+    *,
+    prefix: str = "",
+) -> None:
+    """Recursively enforce that every field on ``model`` (and any nested BaseModel)
+    carries an explicit, LLM-meaningful ``Field(description=...)`` annotation.
+    """
+    if not isinstance(model, type) or not issubclass(model, BaseModel):
+        raise ValueError(
+            f"{capability_id}: payload_model must be a Pydantic BaseModel subclass"
+        )
+    for field_name, field_info in model.model_fields.items():
+        path = f"{prefix}.{field_name}" if prefix else field_name
+        desc = field_info.description
+        if not isinstance(desc, str) or len(desc.strip()) < MIN_FIELD_DESCRIPTION_CHARS:
+            raise ValueError(
+                f"{capability_id}: parameter '{path}' on {model.__name__} must declare "
+                f"Field(description=...) of at least {MIN_FIELD_DESCRIPTION_CHARS} characters"
+            )
+        if desc.strip().lower().replace("_", " ") == field_name.lower().replace("_", " "):
+            raise ValueError(
+                f"{capability_id}: parameter '{path}' description must not merely repeat the field name"
+            )
+        core = _unwrap_optional(field_info.annotation)
+        if isinstance(core, type) and issubclass(core, BaseModel):
+            _check_model_field_descriptions(capability_id, core, prefix=path)
+        else:
+            origin = get_origin(core)
+            args = get_args(core)
+            if origin in (list, Sequence, tuple, frozenset, set) and args:
+                item_core = _unwrap_optional(args[0])
+                if isinstance(item_core, type) and issubclass(item_core, BaseModel):
+                    _check_model_field_descriptions(
+                        capability_id, item_core, prefix=f"{path}[]"
+                    )
+
+
+def _check_schema_property_descriptions(
+    capability_id: str,
+    properties: Mapping[str, Any],
+    *,
+    prefix: str = "",
+) -> None:
+    """Recursively verify that every property in a compiled JSON Schema object has a description."""
+    for prop_name, prop_schema in properties.items():
+        path = f"{prefix}.{prop_name}" if prefix else prop_name
+        if not isinstance(prop_schema, Mapping):
+            raise ValueError(f"{capability_id}: schema property '{path}' must be a mapping")
+        desc = prop_schema.get("description")
+        if not isinstance(desc, str) or len(desc.strip()) < MIN_FIELD_DESCRIPTION_CHARS:
+            raise ValueError(
+                f"{capability_id}: compiled schema property '{path}' is missing a description "
+                f"of at least {MIN_FIELD_DESCRIPTION_CHARS} characters"
+            )
+        nested_props = prop_schema.get("properties")
+        if isinstance(nested_props, Mapping):
+            _check_schema_property_descriptions(
+                capability_id, nested_props, prefix=path
+            )
+        items_schema = prop_schema.get("items")
+        if isinstance(items_schema, Mapping):
+            item_props = items_schema.get("properties")
+            if isinstance(item_props, Mapping):
+                _check_schema_property_descriptions(
+                    capability_id, item_props, prefix=f"{path}[]"
+                )
+
+
+def assert_agent_ready_descriptor(descriptor: CapabilityDescriptor) -> CapabilityDescriptor:
+    """Fail-closed gate verifying a ``CapabilityDescriptor`` has complete LLM-ready
+    endpoint and per-parameter descriptions (including nested objects and array items).
+    """
+    cid = descriptor.identifier
+    schema = descriptor.input_schema
+    if not isinstance(schema, Mapping):
+        raise ValueError(f"{cid}: input_schema must be a JSON object mapping")
+    _check_tool_description(cid, schema.get("description"))
+    props = schema.get("properties")
+    if isinstance(props, Mapping):
+        _check_schema_property_descriptions(cid, props)
+    return descriptor
+
+
 def internal_api_tool(
     *,
     capability_id: str,
@@ -402,14 +538,17 @@ def internal_api_tool(
 
     Decorates the operation's async implementation; returns the frozen
     ``(spec, operation)`` pair :func:`build_internal_api_capabilities`
-    registers. Mis-shaped declarations raise ``ValueError`` at import time
-    (fail-closed composition, the sibling-module contract).
+    registers. Mis-shaped declarations — including missing or insufficient
+    endpoint or parameter descriptions — raise ``ValueError`` at decoration/import
+    time (fail-closed composition).
     """
 
     checked_id = _check_capability_id(capability_id)
     checked_effect = _check_effect_class(effect_class)
     checked_envs = _check_environments(tuple(environments))
     checked_scope = tuple(resource_scope)
+    checked_desc = _check_tool_description(checked_id, description)
+    _check_model_field_descriptions(checked_id, payload_model)
 
     def _wrap(
         operation: InternalApiOperation,
@@ -421,7 +560,7 @@ def internal_api_tool(
             resource_scope=checked_scope,
             environments=checked_envs,
             payload_model=payload_model,
-            description=description,
+            description=checked_desc,
         )
         return spec, operation
 
@@ -430,7 +569,9 @@ def internal_api_tool(
 
 def build_descriptor(spec: InternalApiSpec) -> CapabilityDescriptor:
     """The validated registry descriptor of one declared operation."""
-    return parse_descriptor(
+    _check_tool_description(spec.capability_id, spec.description)
+    _check_model_field_descriptions(spec.capability_id, spec.payload_model)
+    descriptor = parse_descriptor(
         {
             "identifier": spec.capability_id,
             "version": spec.version,
@@ -454,6 +595,7 @@ def build_descriptor(spec: InternalApiSpec) -> CapabilityDescriptor:
         },
         source=f"internal_api:{spec.capability_id}",
     )
+    return assert_agent_ready_descriptor(descriptor)
 
 
 def build_executor(
@@ -582,6 +724,50 @@ def _bound_internal_api_envelope(
 # ---------------------------------------------------------------------------
 
 
+class ServiceInstructionsPayload(BaseModel):
+    """Operational runbook commands/procedures for a managed service."""
+
+    model_config = {"extra": "forbid"}
+
+    install: str = Field(
+        default="",
+        description="Step-by-step commands or procedure to install/deploy this service on the host.",
+    )
+    update: str = Field(
+        default="",
+        description="Step-by-step commands or procedure to update/upgrade this service safely.",
+    )
+    uninstall: str = Field(
+        default="",
+        description="Step-by-step commands or procedure to remove/uninstall this service cleanly.",
+    )
+    backup: str = Field(
+        default="",
+        description="Step-by-step commands or paths to back up this service's state and configuration.",
+    )
+    verify: str = Field(
+        default="",
+        description="Health check or verification commands to confirm this service is operating normally.",
+    )
+
+
+class ServiceCategoryPayload(BaseModel):
+    """Custom Service Map category definition."""
+
+    model_config = {"extra": "forbid"}
+
+    machine_id: str = Field(
+        description="Lowercase slug identifier for the category (e.g. 'automation' or 'devtools')."
+    )
+    label: str = Field(
+        description="Human-readable category display title (e.g. 'Automation' or 'Developer Tools')."
+    )
+    description: str = Field(
+        default="",
+        description="Concise explanation of what kinds of services belong in this category.",
+    )
+
+
 class AppDiscoverPayload(BaseModel):
     """Discover live services on the target server (read-only).
 
@@ -599,7 +785,7 @@ class AppDiscoverPayload(BaseModel):
             "conversation is already pinned to a server."
         ),
     )
-    origin: str | None = Field(
+    origin: Literal["compose", "systemd_unit", "standalone_container"] | None = Field(
         default=None,
         description=(
             "Optional origin filter: 'compose', 'systemd_unit', or "
@@ -664,7 +850,7 @@ class AppAdoptPayload(BaseModel):
     name: str = Field(
         description="Human-readable service display name (required, e.g. 'Immich' or 'omp (oh-my-pi)')."
     )
-    origin: str = Field(
+    origin: Literal["manual", "compose", "systemd_unit"] = Field(
         default="manual",
         description=(
             "Service origin: 'compose' (requires compose_project + working_dir), "
@@ -711,14 +897,14 @@ class AppAdoptPayload(BaseModel):
         default=None,
         description="Concise summary of what the service does and how it is configured on this host.",
     )
-    instructions: dict[str, Any] | None = Field(
+    instructions: ServiceInstructionsPayload | None = Field(
         default=None,
         description=(
             "Operational runbook object with optional string keys: "
             "'install', 'update', 'uninstall', 'backup', 'verify'."
         ),
     )
-    upsert_categories: list[dict[str, Any]] = Field(
+    upsert_categories: list[ServiceCategoryPayload] = Field(
         default_factory=list,
         description=(
             "Optional list of custom categories to create/update: "
@@ -1306,6 +1492,10 @@ def build_internal_api_capabilities(
         descriptor = build_descriptor(spec)
         registry.register(descriptor)
         executors[spec.capability_id] = build_executor(spec, operation)
+    # Also enforce the same fail-closed documentation gate on the sibling
+    # internal-API descriptors included in INTERNAL_API_CAPABILITY_IDS.
+    for sibling_desc in (upsert_map_descriptor(), chat_read_descriptor()):
+        assert_agent_ready_descriptor(sibling_desc)
     return InternalApiComposition(
         descriptors=tuple(registry.list_capabilities()),
         executors=executors,
@@ -1323,6 +1513,11 @@ __all__ = [
     "InternalApiError",
     "InternalApiOperation",
     "InternalApiSpec",
+    "MIN_FIELD_DESCRIPTION_CHARS",
+    "MIN_TOOL_DESCRIPTION_CHARS",
+    "ServiceCategoryPayload",
+    "ServiceInstructionsPayload",
+    "assert_agent_ready_descriptor",
     "build_descriptor",
     "build_executor",
     "build_internal_api_capabilities",
