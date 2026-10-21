@@ -957,14 +957,13 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         return _validation_error(request, exc.field, exc.detail)
 
     capabilities = _dedup_preserving_order(payload.capabilities)
-    if general_consult:
-        # General Consult (no target host): expose the internal-API surface
-        # automatically so the chat agent can operate the system without a
-        # pinned server. The UI's effectiveCaps union is preserved — the
-        # agent sees the full catalog, not just the host-scoped subset.
-        capabilities = _dedup_preserving_order(
-            list(capabilities) + list(INTERNAL_API_CAPABILITY_IDS)
-        )
+    # Always expose the internal-API tool surface (app.discover, app.list_adopted,
+    # app.adopt, app.unadopt, app.upsert_map_entry, app.delete_map_entry,
+    # chat.read_session) alongside any host-scoped capabilities so the chat agent
+    # can operate Machina services in both pinned-server and General Consult chats.
+    capabilities = _dedup_preserving_order(
+        list(capabilities) + list(INTERNAL_API_CAPABILITY_IDS)
+    )
     root_budget: dict[str, object] | None = None
     if payload.root_budget is not None:
         budget_document = payload.root_budget.model_dump()

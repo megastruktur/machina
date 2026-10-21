@@ -428,8 +428,30 @@
 			explicitCaps.length > 0
 				? explicitCaps
 				: profilesLive && serverId !== GLOBAL_CONSULT_SERVER_ID
-					? ['host.logs', 'host.shell', 'service.http', 'docs.retrieve']
-					: [];
+					? [
+							'host.logs',
+							'host.shell',
+							'service.http',
+							'docs.retrieve',
+							'app.discover',
+							'app.list_adopted',
+							'app.adopt',
+							'app.unadopt',
+							'app.upsert_map_entry',
+							'app.delete_map_entry',
+							'chat.read_session'
+						]
+					: profilesLive
+						? [
+								'app.discover',
+								'app.list_adopted',
+								'app.adopt',
+								'app.unadopt',
+								'app.upsert_map_entry',
+								'app.delete_map_entry',
+								'chat.read_session'
+							]
+						: [];
 		const userPrompt = composeMessage.trim();
 		let fullMessage = userPrompt;
 		if (display !== null && !jobInProgress) {

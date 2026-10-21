@@ -83,7 +83,21 @@ def _configure_default_agent_runtime(database_url: str) -> None:
 
     from mai.agents.budgets import BudgetLedger
     from mai.agents.model_store import ModelConfigStore
-    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.applications.adopt import (
+        ApplicationAdoption,
+        ApplicationManifestStore,
+    )
+    from mai.applications.document import ApplicationDocService
+    from mai.applications.service_map import (
+        CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
+        ServiceMapStore,
+        ServiceMapUpsertCapability,
+        upsert_map_descriptor,
+    )
+    from mai.capabilities.internal_api import (
+        INTERNAL_API_CAPABILITY_IDS,
+        build_internal_api_capabilities,
+    )
     from mai.capabilities.chat_read import (
         ChatReadSessionCapability,
         chat_read_descriptor,
@@ -113,6 +127,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.jobs.engine import EngineClient
     from mai.jobs.resource_locks import ResourceLockService
     from mai.knowledge.index import GatewayEmbedder
+    from mai.knowledge.documents import DocumentStore
     from mai.knowledge.retrieve import (
         DocumentRetrievalCapability,
         ScopeRetriever,
@@ -200,8 +215,28 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         chat_read_descriptor(),
         docs_retrieve_descriptor(),
         service_http_descriptor(),
+        upsert_map_descriptor(),
     ):
         registry.register(desc)
+
+    app_manifest_store: ApplicationManifestStore | None = None
+    app_adoption_service: ApplicationAdoption | None = None
+    app_doc_service: ApplicationDocService | None = None
+    service_map_store: ServiceMapStore | None = None
+    try:
+        app_manifest_store = ApplicationManifestStore(data_root)
+        app_adoption_service = ApplicationAdoption(sessions)
+    except Exception:
+        app_manifest_store = None
+        app_adoption_service = None
+    try:
+        app_doc_service = ApplicationDocService(DocumentStore(data_root))
+    except Exception:
+        app_doc_service = None
+    try:
+        service_map_store = ServiceMapStore(data_root / "service_map")
+    except Exception:
+        service_map_store = None
 
     # Internal API → Agent Tool surface (C09/C06): every declared internal
     # API operation (service adoption/unadoption, discovery, inventory
@@ -209,14 +244,22 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     # automatically through the ONE shared builder. Fails closed with 503
     # when any service is absent.
     internal_api = build_internal_api_capabilities(
-        applications=None,
-        adoption=None,
-        docs=None,
-        service_map=None,
+        applications=app_manifest_store,
+        adoption=app_adoption_service,
+        docs=app_doc_service,
+        service_map=service_map_store,
         session_factory=sessions,
     )
     for desc in internal_api.descriptors:
         registry.register(desc)
+
+    async def _upsert_map_cap(call: CapabilityCall) -> ExecutorResult:
+        if service_map_store is None:
+            return ExecutorResult(
+                ok=False,
+                output='{"status":"unavailable","code":"unavailable","message":"service map store unavailable"}',
+            )
+        return await ServiceMapUpsertCapability(service_map_store)(call)
 
     executors = {
         "host.shell": host_shell_cap,
@@ -224,6 +267,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         "chat.read_session": chat_read_cap,
         "docs.retrieve": docs_retrieve_cap,
         "service.http": _service_http_cap,
+        UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
     }
 
@@ -253,6 +297,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
 
     def _read_grants():
         grants: dict[str, set[uuid.UUID]] = {}
+        enrolled_servers: set[uuid.UUID] = {uuid.UUID(int=0)}
         try:
             stored_cfg = grant_store.read()
             for cid, sids in stored_cfg.grants.items():
@@ -268,6 +313,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                         continue
                     try:
                         sid = uuid.UUID(child.name)
+                        enrolled_servers.add(sid)
                         prof = _load_profile(sid)
                         for cap_slug in prof.capabilities:
                             normalized = cap_slug.replace("_", ".")
@@ -282,6 +328,12 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                         continue
         except Exception:
             pass
+        # Automatically grant internal API capabilities (app.discover,
+        # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
+        # app.delete_map_entry, chat.read_session) to every enrolled server
+        # and General Consult so newly added internal APIs work out of the box.
+        for cap_id in INTERNAL_API_CAPABILITY_IDS:
+            grants.setdefault(cap_id, set()).update(enrolled_servers)
         return {cid: frozenset(sids) for cid, sids in grants.items()}
 
     def _read_policy() -> Policy:

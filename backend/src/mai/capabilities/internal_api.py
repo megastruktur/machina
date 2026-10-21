@@ -57,6 +57,16 @@ from typing import (
 
 from pydantic import BaseModel
 
+from mai.applications.service_map import (
+    CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
+    ServiceMapUpsertCapability,
+    upsert_map_descriptor,
+)
+from mai.capabilities.chat_read import (
+    CAPABILITY_ID as CHAT_READ_CAPABILITY,
+    ChatReadSessionCapability,
+    chat_read_descriptor,
+)
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
 from mai.plugins.registry import (
     CapabilityDescriptor,
@@ -82,15 +92,17 @@ APP_ADOPT_CAPABILITY: Final = "app.adopt"
 APP_UNADOPT_CAPABILITY: Final = "app.unadopt"
 APP_DELETE_MAP_ENTRY_CAPABILITY: Final = "app.delete_map_entry"
 
-#: The internal-API capability set the general chat exposes by default (the
-#: UI/agent surface parity anchor). ``mai.api.chat.DEFAULT_GENERAL_CAPABILITIES``
-#: unions this set with the chat-session reader.
+#: The internal-API capability set the chat agent exposes by default across
+#: both pinned-server conversations and General Consult (the UI/agent surface
+#: parity anchor).
 INTERNAL_API_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     APP_DISCOVER_CAPABILITY,
     APP_LIST_ADOPTED_CAPABILITY,
     APP_ADOPT_CAPABILITY,
     APP_UNADOPT_CAPABILITY,
+    UPSERT_MAP_CAPABILITY,
     APP_DELETE_MAP_ENTRY_CAPABILITY,
+    CHAT_READ_CAPABILITY,
 )
 
 # ---------------------------------------------------------------------------
@@ -423,7 +435,10 @@ def build_descriptor(spec: InternalApiSpec) -> CapabilityDescriptor:
             "identifier": spec.capability_id,
             "version": spec.version,
             "config_schema": None,
-            "input_schema": pydantic_to_descriptor_schema(spec.payload_model),
+            "input_schema": {
+                **pydantic_to_descriptor_schema(spec.payload_model),
+                "description": spec.description,
+            },
             "output_schema": {
                 "type": "object",
                 "additionalProperties": False,
@@ -503,6 +518,8 @@ class AppDiscoverPayload(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    server_id: str | None = None
+
 
 class AppListAdoptedPayload(BaseModel):
     """No-argument tool: adopted applications + Service Map entries page.
@@ -515,6 +532,7 @@ class AppListAdoptedPayload(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    server_id: str | None = None
     limit: int | None = None
     offset: int = 0
 
@@ -531,9 +549,10 @@ class AppAdoptPayload(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    server_id: str | None = None
     application_id: str | None = None
     name: str
-    origin: str  # "manual" | "compose" | "systemd_unit"
+    origin: str = "manual"  # "manual" | "compose" | "systemd_unit"
     compose_project: str | None = None
     working_dir: str | None = None
     unit_name: str | None = None
@@ -558,6 +577,7 @@ class AppUnadoptPayload(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    server_id: str | None = None
     application_id: str
     expected_revision: int | None = None
 
@@ -571,6 +591,7 @@ class AppDeleteMapEntryPayload(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    server_id: str | None = None
     application_id: str
 
 

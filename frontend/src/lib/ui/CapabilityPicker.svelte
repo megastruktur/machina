@@ -19,10 +19,17 @@
 	}
 
 	export const BUILTIN_CAPABILITIES: readonly CapabilityOption[] = [
+		{ id: 'app.adopt', description: 'Adopt services into Machina management' },
+		{ id: 'app.delete_map_entry', description: 'Remove Service Map entries' },
+		{ id: 'app.discover', description: 'Discover live services on server' },
 		{ id: 'app.install', description: 'Install applications' },
+		{ id: 'app.list_adopted', description: 'List adopted services & Service Map' },
 		{ id: 'app.remove', description: 'Remove applications (keep data)' },
 		{ id: 'app.remove-data', description: 'Remove applications & purge data' },
+		{ id: 'app.unadopt', description: 'Remove services from adoption' },
 		{ id: 'app.update', description: 'Update applications' },
+		{ id: 'app.upsert_map_entry', description: 'Create or update Service Map entries' },
+		{ id: 'chat.read_session', description: 'Read past chat session transcripts' },
 		{ id: 'docs.retrieve', description: 'Retrieve knowledge documents' },
 		{ id: 'host.logs', description: 'Read systemd & container logs' },
 		{ id: 'host.shell', description: 'Execute SSH shell commands' },

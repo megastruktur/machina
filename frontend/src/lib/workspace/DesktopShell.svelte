@@ -408,9 +408,16 @@
 	let enrollCredentialRef = $state('');
 	let enrollPrivilege = $state<'none' | 'sudo' | 'root'>('sudo');
 	let enrollCapabilities = $state<string[]>([
+		'app.adopt',
+		'app.delete_map_entry',
+		'app.discover',
 		'app.install',
+		'app.list_adopted',
 		'app.remove',
+		'app.unadopt',
 		'app.update',
+		'app.upsert_map_entry',
+		'chat.read_session',
 		'docs.retrieve',
 		'host.logs',
 		'host.shell',
