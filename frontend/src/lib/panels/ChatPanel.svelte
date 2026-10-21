@@ -432,7 +432,7 @@
 					: [];
 		const userPrompt = composeMessage.trim();
 		let fullMessage = userPrompt;
-		if (display !== null && profilesLive) {
+		if (display !== null && !jobInProgress) {
 			const turnsToSummarize: Array<{ user: string; assistant: string }> = [
 				...priorTurns.map((t) => ({ user: t.userMessage, assistant: t.reply })),
 				{ user: messageText, assistant: latestAssistantReply || streamedReply }
@@ -467,6 +467,9 @@
 				op_id: opId
 			}))
 		};
+		if (display !== null) {
+			body.session_run_id = display.run_id;
+		}
 		// Recorded once, immutable thereafter: `@service` chips ride the submit
 		// body ONLY when the draft actually carries them — an empty selection
 		// omits the field entirely (the producer treats omission as no tags).
@@ -487,11 +490,15 @@
 			const created = await api.submitMessage(body);
 			if (disposed) return;
 			const isFollowUp = display !== null;
+			const steeredInPlace =
+				display !== null && created.conversation.run_id === display.run_id;
 			if (isFollowUp && display !== null) {
-				priorTurns = [
+				const nextPriorTurns: PriorTurn[] = [
 					...priorTurns,
 					{
-						runId: display.run_id,
+						runId: steeredInPlace
+							? `${display.run_id}#turn-${priorTurns.length + 1}`
+							: display.run_id,
 						submittedAt: display.submitted_at,
 						userMessage: messageText,
 						modelLabel: resolvedModel ?? display.model_profile,
@@ -500,6 +507,14 @@
 						reply: latestAssistantReply || streamedReply
 					}
 				];
+				priorTurns = nextPriorTurns;
+				storedTurnsByRun.set(created.conversation.run_id, nextPriorTurns);
+				saveStoredTurns(storedTurnsByRun);
+				if (!steeredInPlace) {
+					supersededRunIds.add(display.run_id);
+					saveStoredSuperseded(supersededRunIds);
+					historyRows = historyRows.filter((row) => row.run_id !== display.run_id);
+				}
 			} else {
 				authoredLabels.clear();
 			}
@@ -509,7 +524,17 @@
 			authoredLabels.set(created.conversation.run_id, rawUserPrompt);
 			saveStoredAuthored(authoredLabels);
 			pendingChildTasks = childTasks.map((child) => child.task);
-			openConversation(created.conversation, isFollowUp);
+			if (steeredInPlace && display !== null) {
+				taskLabels = { ...taskLabels, [display.run_id]: rawUserPrompt };
+				stopStreamReveal();
+				latestAssistantReply = '';
+				streamedReply = '';
+				visibleToolCalls = [];
+				thinkingSteps = ['Steering active cogitator session…'];
+				queueMicrotask(scrollToConversationBottom);
+			} else {
+				openConversation(created.conversation, isFollowUp);
+			}
 			composeMessage = '';
 			composeChildren = [''];
 			composeAttachments = '';
@@ -551,8 +576,14 @@
 		try {
 			const page: ChatPage = await api.listConversations(scope, { limit: PAGE_LIMIT });
 			if (disposed || scope !== serverScope) return;
-			historyRows = page.conversations;
-			historyTotal = page.total;
+			for (const row of page.conversations) {
+				if (typeof row.session_run_id === 'string' && row.session_run_id !== '') {
+					supersededRunIds.add(row.session_run_id);
+				}
+			}
+			const filtered = page.conversations.filter((row) => !supersededRunIds.has(row.run_id));
+			historyRows = filtered;
+			historyTotal = Math.max(0, page.total - (page.conversations.length - filtered.length));
 			historyState = { status: 'ready' };
 		} catch (error) {
 			if (disposed) return;
@@ -605,6 +636,8 @@
 	 * conversation opened from history has none — the wire carries no bodies.
 	 */
 	const AUTHORED_STORAGE_KEY = 'mai.chat.authored.v1';
+	const PRIOR_TURNS_STORAGE_KEY = 'mai.chat.prior_turns.v1';
+	const SUPERSEDED_STORAGE_KEY = 'mai.chat.superseded.v1';
 
 	function loadStoredAuthored(): Map<string, string> {
 		if (typeof window === 'undefined') return new Map();
@@ -632,13 +665,63 @@
 		}
 	}
 
+	function loadStoredTurns(): Map<string, PriorTurn[]> {
+		if (typeof window === 'undefined') return new Map();
+		try {
+			const raw = window.localStorage.getItem(PRIOR_TURNS_STORAGE_KEY);
+			if (!raw) return new Map();
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const entries: Array<[string, PriorTurn[]]> = [];
+			for (const [k, v] of Object.entries(parsed)) {
+				if (Array.isArray(v)) entries.push([k, v as PriorTurn[]]);
+			}
+			return new Map(entries);
+		} catch {
+			return new Map();
+		}
+	}
+
+	function saveStoredTurns(map: Map<string, PriorTurn[]>): void {
+		if (typeof window === 'undefined') return;
+		try {
+			const obj = Object.fromEntries(map);
+			window.localStorage.setItem(PRIOR_TURNS_STORAGE_KEY, JSON.stringify(obj));
+		} catch {
+			// Ignore storage quota errors.
+		}
+	}
+
+	function loadStoredSuperseded(): Set<string> {
+		if (typeof window === 'undefined') return new Set();
+		try {
+			const raw = window.localStorage.getItem(SUPERSEDED_STORAGE_KEY);
+			if (!raw) return new Set();
+			const parsed = JSON.parse(raw);
+			if (!Array.isArray(parsed)) return new Set();
+			return new Set(parsed.filter((item): item is string => typeof item === 'string'));
+		} catch {
+			return new Set();
+		}
+	}
+
+	function saveStoredSuperseded(set: Set<string>): void {
+		if (typeof window === 'undefined') return;
+		try {
+			window.localStorage.setItem(SUPERSEDED_STORAGE_KEY, JSON.stringify([...set]));
+		} catch {
+			// Ignore storage quota errors.
+		}
+	}
+
 	let authoredLabels = $state(loadStoredAuthored());
+	let storedTurnsByRun = $state(loadStoredTurns());
+	let supersededRunIds = $state(loadStoredSuperseded());
 	let pendingChildTasks = $state<string[]>([]);
 	let taskLabels = $state<Record<string, string>>({});
 
 	function openConversation(view: ConversationView, keepPriorTurns = false): void {
 		if (!keepPriorTurns) {
-			priorTurns = [];
+			priorTurns = storedTurnsByRun.get(view.run_id) ?? [];
 		}
 		conversation = view;
 		refreshed = null;
@@ -839,6 +922,22 @@
 				});
 				break;
 			}
+			case 'chat.steered': {
+				addThinkingStep(
+					`Steering directive queued for next cogitator round (${rowOf(data, 'message_chars')} chars)`
+				);
+				pushEntry({
+					seq: event.seq,
+					kind: 'submitted',
+					label: 'Steering directive recorded',
+					rows: [
+						{ k: 'steer_id', v: shortId(rowOf(data, 'steer_id')) },
+						{ k: 'message_chars', v: rowOf(data, 'message_chars') },
+						{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
+					]
+				});
+				break;
+			}
 			case 'agent.started': {
 				addThinkingStep(
 					`Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`
@@ -952,6 +1051,23 @@
 				if (matchIdx >= 0) {
 					nextCalls[matchIdx] = { ...nextCalls[matchIdx], status: 'running' };
 					visibleToolCalls = nextCalls;
+				} else if (
+					priorTurns.length > 0 &&
+					priorTurns[priorTurns.length - 1].toolCalls.some(
+						(c) => c.capabilityId === capId && c.status === 'requested'
+					)
+				) {
+					const lastIdx = priorTurns.length - 1;
+					const updatedTools = [...priorTurns[lastIdx].toolCalls];
+					const priorMatch = updatedTools.findIndex(
+						(c) => c.capabilityId === capId && c.status === 'requested'
+					);
+					if (priorMatch >= 0) {
+						updatedTools[priorMatch] = { ...updatedTools[priorMatch], status: 'running' };
+						const nextPrior = [...priorTurns];
+						nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
+						priorTurns = nextPrior;
+					}
 				} else {
 					visibleToolCalls = [
 						...visibleToolCalls,
@@ -1001,6 +1117,32 @@
 						opId: shortId(opId)
 					};
 					visibleToolCalls = nextCalls;
+				} else if (
+					priorTurns.length > 0 &&
+					priorTurns[priorTurns.length - 1].toolCalls.some(
+						(c) =>
+							c.capabilityId === capId &&
+							(c.status === 'running' || c.status === 'requested')
+					)
+				) {
+					const lastIdx = priorTurns.length - 1;
+					const updatedTools = [...priorTurns[lastIdx].toolCalls];
+					const priorMatch = updatedTools.findIndex(
+						(c) =>
+							c.capabilityId === capId &&
+							(c.status === 'running' || c.status === 'requested')
+					);
+					if (priorMatch >= 0) {
+						updatedTools[priorMatch] = {
+							...updatedTools[priorMatch],
+							status: isOk ? 'succeeded' : 'failed',
+							reason: displayReason,
+							opId: shortId(opId)
+						};
+						const nextPrior = [...priorTurns];
+						nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
+						priorTurns = nextPrior;
+					}
 				} else {
 					visibleToolCalls = [
 						...visibleToolCalls,
@@ -1054,11 +1196,23 @@
 				break;
 			}
 			case 'agent.failed': {
+				const failReason = rowOf(data, 'reason');
+				if (visibleToolCalls.some((c) => c.status === 'requested' || c.status === 'running')) {
+					visibleToolCalls = visibleToolCalls.map((c) =>
+						c.status === 'requested' || c.status === 'running'
+							? {
+									...c,
+									status: 'failed',
+									reason: `aborted (${failReason !== '—' ? failReason : 'run failed'})`
+								}
+							: c
+					);
+				}
 				pushEntry({
 					seq: event.seq,
 					kind: 'failed',
 					label: 'Conversation failed',
-					rows: [{ k: 'reason', v: rowOf(data, 'reason') }]
+					rows: [{ k: 'reason', v: failReason }]
 				});
 				break;
 			}
@@ -1101,6 +1255,21 @@
 			if (disposed || id !== activeRunId) return;
 			refreshed = view;
 			refreshProblem = null;
+			if (
+				TERMINAL_RUN_STATES.has(view.state ?? '') &&
+				view.state !== 'succeeded' &&
+				visibleToolCalls.some((c) => c.status === 'requested' || c.status === 'running')
+			) {
+				visibleToolCalls = visibleToolCalls.map((c) =>
+					c.status === 'requested' || c.status === 'running'
+						? {
+								...c,
+								status: 'failed',
+								reason: view.state === 'cancelled' ? 'cancelled' : 'aborted'
+							}
+						: c
+				);
+			}
 			if (view.state === 'waiting_approval') needsApproval = true;
 			if (needsApproval && !TERMINAL_RUN_STATES.has(view.state ?? '')) void probeApproval();
 		} catch (error) {
@@ -2194,7 +2363,7 @@
 								Stop
 							</Button>
 							<Button pill onclick={submitCompose} loading={composeBusy} data-testid="chat-submit">
-								Send
+								{jobInProgress ? 'Steer' : 'Send'}
 							</Button>
 						</div>
 				</div>

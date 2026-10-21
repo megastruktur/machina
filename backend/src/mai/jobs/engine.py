@@ -444,3 +444,24 @@ class EngineClient:
             return self._client.retrieve_workflow(run_id).get_result()
         except dbos_error.DBOSNonExistentWorkflowError:
             raise UnknownRunError(run_id) from None
+
+    def send_message(
+        self,
+        run_id: str,
+        message: object,
+        *,
+        topic: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        """Send a durable workflow message to ``run_id`` on ``topic``."""
+        validate_run_id(run_id)
+        try:
+            self._client.retrieve_workflow(run_id)
+            self._client.send(
+                run_id,
+                message,
+                topic=topic,
+                idempotency_key=idempotency_key,
+            )
+        except dbos_error.DBOSNonExistentWorkflowError:
+            raise UnknownRunError(run_id) from None

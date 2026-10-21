@@ -1845,3 +1845,84 @@ async def test_cancel_records_request_and_stops_the_conversation(
     )
     assert again.status == 200
     assert again.json()["requested_now"] is False
+
+
+async def test_session_continuation_and_steering_keep_single_history_entry(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """Steering an active run keeps the same run_id and records chat.steered;
+    continuing a finished run via session_run_id supersedes the old run in
+    list_conversations so Chat History shows one entry per session."""
+    first_id = uuid.uuid4()
+    created = await submit_chat(
+        chat_app, jar, first_id, server_a, message="initial session turn"
+    )
+    assert created.status == 201, created.body
+
+    # While first_id is still queued/non-terminal, submitting with
+    # session_run_id=first_id steers the existing run in place (200 OK).
+    steer_id = uuid.uuid4()
+    steered = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/messages",
+        json_body={
+            "run_id": str(steer_id),
+            "server_id": str(server_a),
+            "session_run_id": str(first_id),
+            "message": "steer the active session",
+            "profile": "fast",
+            "capabilities": [READ_CAP],
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert steered.status == 200, steered.body
+    steered_body = steered.json()
+    assert steered_body["conversation"]["run_id"] == str(first_id)
+    events = await read_events_direct(bootstrapped_url, first_id)
+    assert any(e.type == "chat.steered" for e in events)
+
+    # Cancel first_id so it becomes terminal, then submit a follow-up turn
+    # referencing session_run_id=first_id.
+    cancel = await call_app(
+        chat_app,
+        "POST",
+        f"/api/v1/chat/runs/{first_id}/cancel",
+        json_body={},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert cancel.status == 200
+
+    followup_id = uuid.uuid4()
+    followup = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/messages",
+        json_body={
+            "run_id": str(followup_id),
+            "server_id": str(server_a),
+            "session_run_id": str(first_id),
+            "message": "follow up after terminal",
+            "profile": "fast",
+            "capabilities": [READ_CAP],
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert followup.status == 201, followup.body
+    assert followup.json()["conversation"]["run_id"] == str(followup_id)
+    assert followup.json()["conversation"]["session_run_id"] == str(first_id)
+
+    # Listing conversations returns only followup_id for this session, not first_id.
+    listed = await call_app(
+        chat_app,
+        "GET",
+        f"/api/v1/chat/runs?server_id={server_a}",
+        cookies=jar,
+    )
+    assert listed.status == 200
+    listed_ids = [row["run_id"] for row in listed.json()["conversations"]]
+    assert str(followup_id) in listed_ids
+    assert str(first_id) not in listed_ids

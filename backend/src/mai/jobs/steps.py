@@ -675,13 +675,32 @@ def _translate_outcome(
         return StepState.FAILED.value, outcome.reason, receipt
     if outcome.effect != EFFECT_EXECUTED:
         return StepState.OUTCOME_UNKNOWN.value, STATUS_UNRESOLVED_REASON, receipt
+    if (
+        isinstance(document, dict)
+        and outcome.capability_id == "chat.read_session"
+        and isinstance(document.get("session_id"), str)
+        and outcome.executor_ok is True
+    ):
+        receipt["status"] = CommandStatus.SUCCEEDED.value
+        return StepState.SUCCEEDED.value, None, receipt
     if not isinstance(document, dict) or not isinstance(document.get("status"), str):
         # An executed effect whose terminal status cannot be resolved from
         # the (bounded) document: honest uncertainty, reconciliation decides.
         receipt["reason"] = STATUS_UNRESOLVED_REASON
         return StepState.OUTCOME_UNKNOWN.value, STATUS_UNRESOLVED_REASON, receipt
+    doc_status = document["status"]
+    if doc_status == "ok" and outcome.executor_ok is True:
+        return StepState.SUCCEEDED.value, None, receipt
+    if doc_status in ("unavailable", "refused") and outcome.executor_ok is False:
+        fail_reason = (
+            str(document["code"])
+            if isinstance(document.get("code"), str) and document["code"]
+            else doc_status
+        )
+        receipt["reason"] = fail_reason
+        return StepState.FAILED.value, fail_reason, receipt
     try:
-        state = step_state_from_command_status(CommandStatus(document["status"]))
+        state = step_state_from_command_status(CommandStatus(doc_status))
     except ValueError:
         receipt["reason"] = STATUS_UNRESOLVED_REASON
         return StepState.OUTCOME_UNKNOWN.value, STATUS_UNRESOLVED_REASON, receipt

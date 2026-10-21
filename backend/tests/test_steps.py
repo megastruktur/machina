@@ -1011,6 +1011,52 @@ class TestOutcomeTranslation:
         assert outcome["op_id"] == receipt["op_id"]
         assert outcome["receipt"] == receipt
 
+    def test_non_command_capability_statuses_translate_cleanly(self) -> None:
+        """docs.retrieve, service.http, and chat.read_session outputs resolve
+        without falling into status_unresolved / outcome_unknown."""
+        state_ok, reason_ok, _ = steps._translate_outcome(
+            _dispatch_outcome(
+                capability_id="docs.retrieve",
+                executor_ok=True,
+                output=BoundedOutput(
+                    text=json.dumps({"status": "ok", "results": []}),
+                    truncated=False,
+                    omitted_bytes=0,
+                ),
+            )
+        )
+        assert state_ok == StepState.SUCCEEDED.value
+        assert reason_ok is None
+
+        state_unavail, reason_unavail, receipt_unavail = steps._translate_outcome(
+            _dispatch_outcome(
+                capability_id="docs.retrieve",
+                executor_ok=False,
+                output=BoundedOutput(
+                    text=json.dumps({"status": "unavailable", "code": "index_missing"}),
+                    truncated=False,
+                    omitted_bytes=0,
+                ),
+            )
+        )
+        assert state_unavail == StepState.FAILED.value
+        assert reason_unavail == "index_missing"
+        assert receipt_unavail["reason"] == "index_missing"
+
+        state_chat, reason_chat, _ = steps._translate_outcome(
+            _dispatch_outcome(
+                capability_id="chat.read_session",
+                executor_ok=True,
+                output=BoundedOutput(
+                    text=json.dumps({"session_id": str(uuid.uuid4()), "event_count": 3}),
+                    truncated=False,
+                    omitted_bytes=0,
+                ),
+            )
+        )
+        assert state_chat == StepState.SUCCEEDED.value
+        assert reason_chat is None
+
 
 # ---------------------------------------------------------------------------
 # unit half: composition wiring

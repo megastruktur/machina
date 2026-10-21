@@ -45,17 +45,25 @@ export const CHAT_PANEL_KIND = 'chat';
 export const GLOBAL_CONSULT_SERVER_ID = '00000000-0000-0000-0000-000000000000';
 
 /** Generated wire shape: one submit body (client-minted idempotency key, C05 rule 5). */
-export type ChatSubmitBody = components['schemas']['ChatSubmitBody'];
+export type ChatSubmitBody = components['schemas']['ChatSubmitBody'] & {
+	session_run_id?: string | null;
+};
 /** Generated wire shape: one explicitly scoped child task (no target field, C06 rule 5). */
 export type ChildBody = components['schemas']['ChildBody'];
 /** Generated wire shape: one permitted-artifact context reference (identity only). */
 export type AttachmentBody = components['schemas']['AttachmentBody'];
 /** Generated wire shape: submit outcome (conversation view + dedup verdict). */
-export type ChatCreated = components['schemas']['ChatCreated'];
+export type ChatCreated = Omit<components['schemas']['ChatCreated'], 'conversation'> & {
+	conversation: ConversationView;
+};
 /** Generated wire shape: one bounded, explicitly server-scoped conversation page. */
-export type ChatPage = components['schemas']['ChatPage'];
+export type ChatPage = Omit<components['schemas']['ChatPage'], 'conversations'> & {
+	conversations: ConversationView[];
+};
 /** Generated wire shape: one conversation plus recorded references and children. */
-export type ConversationView = components['schemas']['ConversationView'];
+export type ConversationView = components['schemas']['ConversationView'] & {
+	session_run_id?: string | null;
+};
 /** Generated wire shape: explicit tree cancellation body (guard rule 4). */
 export type ChatCancelBody = components['schemas']['ChatCancelBody'];
 /** Generated wire shape: KNOWN engine outcome or an honest pending. */

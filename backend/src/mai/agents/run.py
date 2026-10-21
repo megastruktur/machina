@@ -100,7 +100,7 @@ import json
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Final
 
@@ -187,6 +187,7 @@ __all__ = [
     "MAX_WAIT_POLL_SECONDS",
     "MIN_RECV_TIMEOUT_SECONDS",
     "RUN_PAYLOAD_VERSION",
+    "STEER_TOPIC",
     "TOOL_STEP_SEQ_BASE",
     "AgentRunError",
     "AgentRunErrorCode",
@@ -247,6 +248,9 @@ MIN_RECV_TIMEOUT_SECONDS: Final[float] = 0.5
 
 #: Stable failure reasons (value-free; envelope-style).
 RECONCILE_WAIT_DEADLINE_REASON: Final[str] = "reconcile_wait_deadline"
+
+#: Durable DBOS topic for mid-run user steering messages.
+STEER_TOPIC: Final[str] = "mai.chat.steer"
 ROUND_BUDGET_REASON: Final[str] = "round_budget_exhausted"
 HISTORY_BUDGET_REASON: Final[str] = "history_budget_exhausted"
 TOOL_BUDGET_REASON: Final[str] = "tool_call_budget_exhausted"
@@ -896,6 +900,7 @@ class AgentRunExecutor:
         history_json: str,
         deferred_json: str | None,
         round_index: int,
+        steered_json: str | None = None,
     ) -> dict[str, object]:
         """One durable model round (see module docstring).
 
@@ -944,8 +949,22 @@ class AgentRunExecutor:
             if deferred_json is not None
             else None
         )
+        steered_prompt: str | None = None
+        if steered_json is not None:
+            raw_steered = json.loads(steered_json)
+            if isinstance(raw_steered, list):
+                cleaned = [
+                    str(item).strip()
+                    for item in raw_steered
+                    if isinstance(item, str) and str(item).strip()
+                ]
+                if cleaned:
+                    steered_prompt = "\n\n".join(
+                        f"[User steering message]: {msg}" for msg in cleaned
+                    )
         try:
             result = await agent.run(
+                steered_prompt,
                 message_history=history,
                 deferred_tool_results=deferred,
             )
@@ -1194,6 +1213,33 @@ class AgentRunExecutor:
             # records the honest terminal answer (nothing ran).
             state_value = StepState.FAILED.value
             reason = outcome.reason
+            if (
+                receipt.get("approval_id") is None
+                and isinstance(receipt.get("payload_hash"), str)
+                and isinstance(receipt.get("policy_revision"), int)
+            ):
+                try:
+                    approvals_store = getattr(
+                        self._steps._dispatcher, "_approvals", None
+                    )
+                    if approvals_store is not None:
+                        from mai.policy.approvals import ApprovalRequest
+
+                        payload_hash_str = str(receipt["payload_hash"])
+                        policy_rev_int = int(str(receipt["policy_revision"]))
+                        created_approval = await approvals_store.create(
+                            ApprovalRequest(
+                                capability_id=outcome.capability_id,
+                                server_id=uuid.UUID(intent.server_id),
+                                payload_hash=payload_hash_str,
+                                policy_revision=policy_rev_int,
+                                created_by=f"agent.run:{intent.run_id}",
+                                expires_at=_utcnow() + timedelta(hours=1),
+                            )
+                        )
+                        receipt["approval_id"] = str(created_approval.approval_id)
+                except Exception:
+                    pass
         step_state = StepState(state_value)
         await self._steps.apersist_outcome(
             intent.run_id,
@@ -1510,6 +1556,7 @@ def _agent_model_round(
     history_json: str,
     deferred_json: str | None,
     round_index: int,
+    steered_json: str | None = None,
 ) -> dict[str, object]:
     """One durable conversation round (checkpointed)."""
     intent = parse_agent_run_intent(payload_json)
@@ -1521,6 +1568,7 @@ def _agent_model_round(
             history_json,
             deferred_json,
             round_index,
+            steered_json,
         )
     )
 
@@ -1618,6 +1666,25 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 
 
+def _drain_steering_messages() -> list[str]:
+    """Drain any mid-run user steering messages queued on ``STEER_TOPIC``."""
+    messages: list[str] = []
+    while True:
+        try:
+            raw = DBOS.recv(topic=STEER_TOPIC, timeout_seconds=0)
+        except Exception:
+            break
+        if raw is None:
+            break
+        if isinstance(raw, Mapping):
+            text = raw.get("message")
+            if isinstance(text, str) and text.strip():
+                messages.append(text.strip())
+        elif isinstance(raw, str) and raw.strip():
+            messages.append(raw.strip())
+    return messages
+
+
 def run_agent_conversation(payload_json: str) -> dict[str, object]:
     """Execute one durable agent conversation (see module docstring).
 
@@ -1639,17 +1706,37 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             str(assembled["system_prompt"]), str(assembled["user_message"])
         )
         deferred_json: str | None = None
+        pending_steered: list[str] = []
         rounds = 0
         tool_records: list[dict[str, object]] = []
         output_chars = 0
         while True:
+            if rounds > 0:
+                pending_steered.extend(_drain_steering_messages())
+            steered_json = (
+                canonical_json(pending_steered) if pending_steered else None
+            )
+            pending_steered = []
             round_record = _agent_model_round(
-                payload_json, pins_json, history_json, deferred_json, rounds
+                payload_json,
+                pins_json,
+                history_json,
+                deferred_json,
+                rounds,
+                steered_json,
             )
             history_json = str(round_record["history_json"])
             if str(round_record["status"]) == "final":
-                output_chars = int(round_record["output_chars"])
-                break
+                output_chars = int(str(round_record["output_chars"]))
+                late_steered = _drain_steering_messages()
+                if not late_steered:
+                    break
+                pending_steered.extend(late_steered)
+                deferred_json = None
+                rounds += 1
+                if rounds >= intent.max_rounds:
+                    raise AgentStageError(ROUND_BUDGET_REASON)
+                continue
             calls = list(round_record["calls"])
             existing_rows = int(
                 _resolve_agent_run().run(

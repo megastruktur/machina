@@ -179,6 +179,7 @@ __all__ = ["register_chat", "resolve_artifacts_root"]
 #: attachment references) so an idempotent re-submit compares everything
 #: the administrator asked for, plus the value-free attachment handles.
 CHAT_SUBMITTED_EVENT_TYPE: Final[str] = "chat.submitted"
+CHAT_STEERED_EVENT_TYPE: Final[str] = "chat.steered"
 
 #: The General Consult sentinel server id (``uuid.UUID(int=0)``): the
 #: conversation has NO target host (no server selected in the UI). Chat
@@ -315,6 +316,7 @@ class ChatSubmitBody(BaseModel):
         default_factory=list, max_length=MAX_ATTACHMENTS
     )
     service_tags: list[ServiceTag] = Field(default_factory=list, max_length=16)
+    session_run_id: str | None = Field(default=None)
 
 
 class ChatCancelBody(BaseModel):
@@ -350,6 +352,7 @@ class ConversationView(RunView):
     attachments: list[AttachmentView] = Field(default_factory=list)
     children: list[RunView] = Field(default_factory=list)
     service_tags: list[str] = Field(default_factory=list)
+    session_run_id: str | None = Field(default=None)
 
 
 class ChatCreated(BaseModel):
@@ -555,6 +558,8 @@ def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
     }
     if body.service_tags:
         document["service_tags"] = list(body.service_tags)
+    if body.session_run_id is not None:
+        document["session_run_id"] = body.session_run_id
     return document
 
 
@@ -630,6 +635,7 @@ async def _record_chat_submission(
     child_count: int,
     service_tags: list[str],
     now: datetime,
+    session_run_id: str | None = None,
 ) -> None:
     """Append the ``chat.submitted`` submission record (one transaction).
 
@@ -647,7 +653,7 @@ async def _record_chat_submission(
             {"r": uuid.UUID(run_id)},
         )
     ).scalar_one()
-    data = {
+    data: dict[str, object] = {
         "submission_sha256": digest,
         "handler": handler,
         "children": child_count,
@@ -662,6 +668,8 @@ async def _record_chat_submission(
         ],
         "service_tags": list(service_tags),
     }
+    if session_run_id is not None:
+        data["session_run_id"] = session_run_id
     await session.execute(
         text(
             """
@@ -675,6 +683,46 @@ async def _record_chat_submission(
             "seq": seq,
             "ts": now,
             "type": CHAT_SUBMITTED_EVENT_TYPE,
+            "v": EVENT_PAYLOAD_VERSION,
+            "data": json.dumps(data),
+        },
+    )
+
+
+async def _record_chat_steered(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    steer_id: str,
+    digest: str,
+    message_chars: int,
+    now: datetime,
+) -> None:
+    """Append a value-free ``chat.steered`` event when an active run is steered."""
+    seq = (
+        await session.execute(
+            text("SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :r"),
+            {"r": uuid.UUID(run_id)},
+        )
+    ).scalar_one()
+    data = {
+        "steer_id": steer_id,
+        "submission_sha256": digest,
+        "message_chars": message_chars,
+    }
+    await session.execute(
+        text(
+            """
+            INSERT INTO job_events (event_id, run_id, seq, ts, type, v, data)
+            VALUES (:event_id, :run_id, :seq, :ts, :type, :v, :data)
+            """
+        ),
+        {
+            "event_id": uuid.uuid4(),
+            "run_id": uuid.UUID(run_id),
+            "seq": seq,
+            "ts": now,
+            "type": CHAT_STEERED_EVENT_TYPE,
             "v": EVENT_PAYLOAD_VERSION,
             "data": json.dumps(data),
         },
@@ -775,6 +823,7 @@ async def _conversation_view(
     child_states = await _child_states(factory, children_rows)
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
+    session_run_id: str | None = None
     if submission_event is not None:
         data = submission_event["data"]
         if isinstance(data, Mapping):
@@ -791,6 +840,9 @@ async def _conversation_view(
             raw_tags = data.get("service_tags") or []
             if isinstance(raw_tags, list):
                 service_tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
+            raw_session_run = data.get("session_run_id")
+            if isinstance(raw_session_run, str) and raw_session_run:
+                session_run_id = raw_session_run
     return ConversationView(
         **_run_view(row, state).model_dump(),
         attachments=attachments,
@@ -799,6 +851,7 @@ async def _conversation_view(
             for child in children_rows
         ],
         service_tags=service_tags,
+        session_run_id=session_run_id,
     )
 
 
@@ -995,8 +1048,62 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         _canonical(_submission_document(payload)).encode("ascii")
     ).hexdigest()
 
+    session_run_id: str | None = None
+    if payload.session_run_id is not None:
+        try:
+            session_run_id = validate_run_id(payload.session_run_id)
+        except EngineError:
+            return _validation_error(
+                request, "session_run_id", "must be a canonical UUID string"
+            )
+
     factory = _sessions(request)
     now = datetime.now(timezone.utc)
+    if session_run_id is not None and session_run_id != run_id:
+        async with factory() as session:
+            existing_session_row = await _load_run_row(session, session_run_id)
+        if existing_session_row is not None:
+            existing_state = await _replayed_state(lifecycle, session_run_id)
+            if existing_state is not None and existing_state not in (
+                RunState.SUCCEEDED.value,
+                RunState.FAILED.value,
+                RunState.CANCELLED.value,
+            ):
+                steered_ok = False
+                try:
+                    await asyncio.to_thread(
+                        recovery.client.send_message,
+                        session_run_id,
+                        {"steer_id": run_id, "message": payload.message},
+                        topic=agent_run.STEER_TOPIC,
+                        idempotency_key=run_id,
+                    )
+                    steered_ok = True
+                except Exception:
+                    steered_ok = False
+                if steered_ok:
+                    async with factory() as session:
+                        async with session.begin():
+                            await _record_chat_steered(
+                                session,
+                                run_id=session_run_id,
+                                steer_id=run_id,
+                                digest=submission_digest,
+                                message_chars=len(payload.message),
+                                now=now,
+                            )
+                    view = await _conversation_view(
+                        factory, existing_session_row, existing_state
+                    )
+                    steered_view = ChatCreated(
+                        conversation=view, deduplicated=False
+                    )
+                    return Response(
+                        status_code=HTTP_200_OK,
+                        content=steered_view.model_dump_json(),
+                        media_type="application/json",
+                    )
+
     async with factory() as session:
         async with session.begin():
             created = await _record_submit_intent(
@@ -1021,6 +1128,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                     child_count=len(payload.children),
                     service_tags=list(payload.service_tags),
                     now=now,
+                    session_run_id=session_run_id,
                 )
     if not created:
         # Duplicate submit: same key must carry the SAME submission
@@ -1113,7 +1221,18 @@ async def list_conversations(
     _lifecycle, _recovery = _jobs_services(request)
     factory = _sessions(request)
     scope = None if server_id is None else str(server_id)
-    where = "depth = 0" if scope is None else "server_id = :s AND depth = 0"
+    not_superseded = (
+        "NOT EXISTS ("
+        "SELECT 1 FROM job_events je "
+        f"WHERE je.type = '{CHAT_SUBMITTED_EVENT_TYPE}' "
+        "AND je.data->>'session_run_id' = job_runs.run_id::text"
+        ")"
+    )
+    where = (
+        f"depth = 0 AND {not_superseded}"
+        if scope is None
+        else f"server_id = :s AND depth = 0 AND {not_superseded}"
+    )
     async with factory() as session:
         rows = list(
             (
