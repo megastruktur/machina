@@ -55,7 +55,7 @@ from typing import (
     get_origin,
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from mai.applications.service_map import (
     CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
@@ -496,10 +496,85 @@ def build_executor(
                 "capability_id": spec.capability_id,
             }
             return ExecutorResult(ok=False, output=json.dumps(envelope, sort_keys=True))
-        envelope = {"status": "ok", **dict(result)}
+        envelope = _bound_internal_api_envelope({"status": "ok", **dict(result)})
         return ExecutorResult(ok=True, output=json.dumps(envelope, sort_keys=True))
 
     return _execute
+
+
+def _bound_internal_api_envelope(
+    envelope: dict[str, Any], max_bytes: int = 60000
+) -> dict[str, Any]:
+    """Guarantee that the JSON-serialized envelope stays strictly under the
+    dispatcher's 64 KiB output budget so ``CapabilityDispatcher._bound``
+    never slices the JSON string in half (which would cause ``status_unresolved``).
+    """
+    raw = json.dumps(envelope, sort_keys=True).encode("utf-8")
+    if len(raw) <= max_bytes:
+        return envelope
+
+    # 1. If listen_ports is present and large, cap it first.
+    if isinstance(envelope.get("listen_ports"), list) and len(envelope["listen_ports"]) > 25:
+        envelope["listen_ports_total"] = len(envelope["listen_ports"])
+        envelope["listen_ports"] = envelope["listen_ports"][:25]
+        envelope["listen_ports_truncated"] = True
+        raw = json.dumps(envelope, sort_keys=True).encode("utf-8")
+        if len(raw) <= max_bytes:
+            return envelope
+
+    # 2. If applications have verbose container/port details (e.g. app.discover),
+    # compact the nested container lists before trimming the applications list itself.
+    if isinstance(envelope.get("applications"), list):
+        compact_apps: list[Any] = []
+        for app in envelope["applications"]:
+            if not isinstance(app, dict):
+                compact_apps.append(app)
+                continue
+            app_copy = dict(app)
+            detail = app_copy.get("detail")
+            if isinstance(detail, dict):
+                detail_copy = dict(detail)
+                if isinstance(detail_copy.get("containers"), list):
+                    detail_copy["containers"] = [
+                        {
+                            "name": c.get("name"),
+                            "compose_service": c.get("compose_service"),
+                            "image": c.get("image"),
+                            "state": c.get("state"),
+                        }
+                        if isinstance(c, dict)
+                        else c
+                        for c in detail_copy["containers"][:8]
+                    ]
+                app_copy["detail"] = detail_copy
+            compact_apps.append(app_copy)
+        envelope["applications"] = compact_apps
+        raw = json.dumps(envelope, sort_keys=True).encode("utf-8")
+        if len(raw) <= max_bytes:
+            return envelope
+
+        # 3. Still over budget: strip detail.containers and cap applications list.
+        for app_copy in compact_apps:
+            if isinstance(app_copy, dict) and isinstance(app_copy.get("detail"), dict):
+                app_copy["detail"].pop("containers", None)
+        envelope["applications"] = compact_apps
+        raw = json.dumps(envelope, sort_keys=True).encode("utf-8")
+        if len(raw) <= max_bytes:
+            return envelope
+
+        while (
+            len(envelope["applications"]) > 1
+            and len(json.dumps(envelope, sort_keys=True).encode("utf-8")) > max_bytes
+        ):
+            envelope["applications_total"] = envelope.get(
+                "applications_total", len(envelope["applications"])
+            )
+            envelope["applications"] = envelope["applications"][
+                : max(1, len(envelope["applications"]) // 2)
+            ]
+            envelope["applications_truncated"] = True
+
+    return envelope
 
 
 # ---------------------------------------------------------------------------
@@ -508,91 +583,186 @@ def build_executor(
 
 
 class AppDiscoverPayload(BaseModel):
-    """No-argument tool: the server's live inventory through the reviewed lanes.
+    """Discover live services on the target server (read-only).
 
-    Discover live Docker Compose projects, systemd units, and standalone
-    containers on the target server through the reviewed read-only lanes.
-    Returns the observed inventory with origins, managed flags, and suggested
-    categories — never writes.
+    Scans Docker Compose projects, systemd units, and standalone containers.
+    Optional ``origin`` filter ("compose", "systemd_unit", "standalone_container")
+    and optional ``query`` substring filter narrow the returned applications.
     """
 
     model_config = {"extra": "forbid"}
 
-    server_id: str | None = None
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override. Omit when the chat "
+            "conversation is already pinned to a server."
+        ),
+    )
+    origin: str | None = Field(
+        default=None,
+        description=(
+            "Optional origin filter: 'compose', 'systemd_unit', or "
+            "'standalone_container'. Omit to return all origins."
+        ),
+    )
+    query: str | None = Field(
+        default=None,
+        description=(
+            "Optional case-insensitive substring filter on application/project/unit/container name."
+        ),
+    )
+    include_ports: bool = Field(
+        default=False,
+        description=(
+            "Include the raw host listen_ports table. Defaults to false to keep the response concise."
+        ),
+    )
 
 
 class AppListAdoptedPayload(BaseModel):
-    """No-argument tool: adopted applications + Service Map entries page.
-
-    List the adopted applications of the target server: the reconciled
-    projection records (revision, sha256, adopted_at) merged with their
-    Service Map entries (category, description, instructions). Discovery
-    observations never merge into this list.
-    """
+    """List adopted applications and Service Map entries on the target server."""
 
     model_config = {"extra": "forbid"}
 
-    server_id: str | None = None
-    limit: int | None = None
-    offset: int = 0
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override. Omit when the chat "
+            "conversation is already pinned to a server."
+        ),
+    )
+    limit: int | None = Field(
+        default=None,
+        description="Optional maximum number of adopted entries to return.",
+    )
+    offset: int = Field(
+        default=0,
+        description="Zero-based pagination offset (default 0).",
+    )
 
 
 class AppAdoptPayload(BaseModel):
-    """The adoption request (mirrors the HTTP ``AdoptBody`` surface).
-
-    Adopt one application into Machina management: writes the canonical
-    adoption manifest, reconciles the projection, seeds the application
-    document, and upserts the Service Map entry in one operation. The origin
-    must be a frozen selector (manual, compose, systemd_unit); standalone
-    containers are refused.
-    """
+    """Adopt a service/application into Machina management and Service Map."""
 
     model_config = {"extra": "forbid"}
 
-    server_id: str | None = None
-    application_id: str | None = None
-    name: str
-    origin: str = "manual"  # "manual" | "compose" | "systemd_unit"
-    compose_project: str | None = None
-    working_dir: str | None = None
-    unit_name: str | None = None
-    external_working_dir: str | None = None
-    external_config_files: list[str] = []
-    external_environment_files: list[str] = []
-    expected_revision: int = 0
-    category: str | None = None
-    description: str | None = None
-    instructions: dict[str, Any] | None = None
-    upsert_categories: list[dict[str, Any]] = []
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override. Omit when the chat "
+            "conversation is already pinned to a server."
+        ),
+    )
+    application_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical UUID for the application. Omit to mint a "
+            "deterministic UUID from (server_id, name)."
+        ),
+    )
+    name: str = Field(
+        description="Human-readable service display name (required, e.g. 'Immich' or 'omp (oh-my-pi)')."
+    )
+    origin: str = Field(
+        default="manual",
+        description=(
+            "Service origin: 'compose' (requires compose_project + working_dir), "
+            "'systemd_unit' (requires unit_name), or 'manual' (for standalone "
+            "CLI tools, binaries, or custom services)."
+        ),
+    )
+    compose_project: str | None = Field(
+        default=None,
+        description="Docker Compose project name (required when origin='compose').",
+    )
+    working_dir: str | None = Field(
+        default=None,
+        description="Absolute path to the Compose working directory on the host (required when origin='compose').",
+    )
+    unit_name: str | None = Field(
+        default=None,
+        description="Systemd unit name ending in .service/.socket/.timer (required when origin='systemd_unit').",
+    )
+    external_working_dir: str | None = Field(
+        default=None,
+        description="Optional external working directory path on the host.",
+    )
+    external_config_files: list[str] = Field(
+        default_factory=list,
+        description="Optional list of absolute config file paths on the host.",
+    )
+    external_environment_files: list[str] = Field(
+        default_factory=list,
+        description="Optional list of absolute environment (.env) file paths on the host.",
+    )
+    expected_revision: int = Field(
+        default=0,
+        description="Optimistic concurrency revision: 0 when adopting a new service, or the current revision when updating.",
+    )
+    category: str | None = Field(
+        default=None,
+        description=(
+            "Service Map category slug (e.g. 'system', 'ai', 'media', 'network', "
+            "'storage', 'monitoring', 'security', 'games', or a custom slug)."
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        description="Concise summary of what the service does and how it is configured on this host.",
+    )
+    instructions: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Operational runbook object with optional string keys: "
+            "'install', 'update', 'uninstall', 'backup', 'verify'."
+        ),
+    )
+    upsert_categories: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Optional list of custom categories to create/update: "
+            "[{'machine_id': '...', 'label': '...', 'description': '...'}]."
+        ),
+    )
 
 
 class AppUnadoptPayload(BaseModel):
-    """Revoke/unadopt request; ``expected_revision`` auto-resolves when omitted.
-
-    Remove one application from adoption (revoke): writes the canonical
-    tombstone, deletes the projection row, and removes the Service Map entry.
-    Machina stops managing the application; the running containers/units on
-    the host are NOT touched.
-    """
+    """Remove (unadopt/revoke) an application from Machina management and Service Map."""
 
     model_config = {"extra": "forbid"}
 
-    server_id: str | None = None
-    application_id: str
-    expected_revision: int | None = None
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override. Omit when the chat "
+            "conversation is already pinned to a server."
+        ),
+    )
+    application_id: str = Field(
+        description="Canonical UUID of the adopted application to remove (from app.list_adopted)."
+    )
+    expected_revision: int | None = Field(
+        default=None,
+        description="Optional expected revision; auto-resolved from the current record when omitted.",
+    )
 
 
 class AppDeleteMapEntryPayload(BaseModel):
-    """Remove one Service Map entry by identity.
-
-    Remove one Service Map entry by identity. Only manual (un-adopted)
-    entries can be removed; adopted entries require app.unadopt first.
-    """
+    """Remove a manual Service Map entry by application_id."""
 
     model_config = {"extra": "forbid"}
 
-    server_id: str | None = None
-    application_id: str
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override. Omit when the chat "
+            "conversation is already pinned to a server."
+        ),
+    )
+    application_id: str = Field(
+        description="Canonical UUID of the manual Service Map entry to delete."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -727,30 +897,55 @@ def build_internal_api_capabilities(
                 f"bounded discovery failed: {type(exc).__name__}",
             ) from None
         applications_view: list[dict[str, Any]] = []
+        raw_origin = payload.get("origin")
+        want_origin = (
+            raw_origin.strip().lower()
+            if isinstance(raw_origin, str) and raw_origin.strip()
+            else None
+        )
+        raw_query = payload.get("query")
+        want_query = (
+            raw_query.strip().lower()
+            if isinstance(raw_query, str) and raw_query.strip()
+            else None
+        )
         for observed in inventory.applications:
             detail = observed.detail
+            origin_str = (
+                observed.origin.value
+                if hasattr(observed.origin, "value")
+                else str(observed.origin)
+            )
+            name_str = getattr(
+                detail,
+                "project_name",
+                getattr(
+                    detail,
+                    "unit",
+                    getattr(getattr(detail, "container", None), "name", "unknown"),
+                ),
+            )
+            if want_origin and origin_str.lower() != want_origin:
+                continue
+            if want_query and want_query not in str(name_str).lower():
+                continue
             applications_view.append(
                 {
-                    "origin": observed.origin.value if hasattr(observed.origin, "value") else str(observed.origin),
+                    "origin": origin_str,
                     "managed": observed.managed,
                     "application_id": (
                         str(observed.application_id)
                         if observed.application_id is not None
                         else None
                     ),
-                    "name": getattr(
-                        detail, "project_name", getattr(detail, "unit", getattr(
-                            getattr(detail, "container", None), "name", "unknown"
-                        ))
-                    ),
+                    "name": name_str,
                     "detail": asdict(detail) if hasattr(detail, "__dataclass_fields__") else {},
                 }
             )
-        return {
+        result_doc: dict[str, Any] = {
             "server_id": str(server_id),
             "observed_at": str(inventory.observed_at),
             "applications": applications_view,
-            "listen_ports": [asdict(p) for p in inventory.listen_ports],
             "lanes": [
                 {
                     "lane": lane.lane.value,
@@ -760,6 +955,9 @@ def build_internal_api_capabilities(
                 for lane in inventory.lanes
             ],
         }
+        if payload.get("include_ports"):
+            result_doc["listen_ports"] = [asdict(p) for p in inventory.listen_ports]
+        return result_doc
 
     operations.append(_app_discover)
 
