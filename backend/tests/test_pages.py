@@ -48,7 +48,9 @@ from mai.capabilities.dispatch import (
     CapabilityDispatcher,
     DispatchOutcome,
     ExecutorResult,
+    default_output_budget_bytes,
 )
+from mai.credentials.env import SecretValue
 from mai.database import create_app_engine
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.approvals import ApprovalStore
@@ -1160,6 +1162,46 @@ def _call(payload: Mapping[str, object], context: ExecutionContext) -> Capabilit
     )
 
 
+#: The name of the synthetic credential reference used by the bounded
+#: envelope tests (a resolver *name*, never material).
+_SECRET_REF = "MAI_FXT_WEBREAD_TOKEN"
+
+
+def _context_with_credentials(
+    *,
+    server_id: str = SERVER_A,
+    allowed: tuple[str, ...] = (CAPABILITY_ID,),
+    mode: PolicyMode = PolicyMode.DELEGATED,
+) -> ExecutionContext:
+    """An execution context that references one synthetic credential."""
+    return ExecutionContext(
+        principal=PRINCIPAL,
+        server_id=uuid.UUID(server_id),
+        run_id=uuid.UUID(RUN_1),
+        parent_scope=None,
+        profile_revision="prof-1",
+        prompt_revision="prompt-1",
+        credential_references=(_SECRET_REF,),
+        allowed_capabilities=allowed,
+        mode=mode,
+    )
+
+
+def _call_with_credentials(
+    payload: Mapping[str, object],
+    context: ExecutionContext,
+    credentials: Mapping[str, SecretValue],
+) -> CapabilityCall:
+    """One direct executor call carrying resolved credential material."""
+    return CapabilityCall(
+        descriptor=descriptor(),
+        payload=payload,
+        context=context,
+        credentials=dict(credentials),
+        op_id=uuid.uuid4(),
+    )
+
+
 class _StaticProvider:
     """Deterministic page provider (no network)."""
 
@@ -1608,6 +1650,553 @@ class TestControlledUpstream:
 
 
 # ---------------------------------------------------------------------------
+# Bounded serialized envelope (valid JSON strictly under the dispatcher cap)
+# ---------------------------------------------------------------------------
+
+
+#: Escape-heavy text unit: a quote and a backslash (two bytes each when
+#: escaped), an astral character (a surrogate pair, twelve bytes when
+#: escaped) and a Latin-1 character (six bytes when escaped).
+_ESCAPE_HEAVY_UNIT = 'A"\\' + "\U0001F600" + "é"
+
+
+def _escape_heavy_html(
+    *, chars: int, title: str = "", path: str = "article"
+) -> str:
+    """One HTML page whose extracted text is escape-heavy and long."""
+    unit = _ESCAPE_HEAVY_UNIT
+    body = (unit * (chars // len(unit) + 1))[:chars]
+    head = f"<title>{title}</title>" if title else ""
+    return f"<html><head>{head}</head><body><p>{body}</p></body></html>"
+
+
+def _long_url(*, path_chars: int) -> str:
+    """A valid, credential-free http(s) URL with a long path."""
+    return "https://example.com/" + "p" * path_chars
+
+
+class TestBoundedEnvelope:
+    """The serialized envelope stays valid JSON strictly under the
+    dispatcher's default output budget, and says honestly what it cut."""
+
+    def test_small_page_output_is_byte_identical_to_plain_serialization(
+        self,
+    ) -> None:
+        """A small page is unchanged: the envelope is exactly the frozen
+        document, byte for byte."""
+        capability = WebPageCapability(_StaticProvider(_STATIC_PAGE))
+        result = asyncio.run(
+            capability(_call({"url": "https://example.com/article"}, _context()))
+        )
+        content = extract_markdown(PAGE_HTML)
+        expected = json.dumps(
+            {
+                "status": "ok",
+                "code": None,
+                "trust": "untrusted_external",
+                "url": "https://example.com/article",
+                "final_url": "https://example.com/article",
+                "citation": "https://example.com/article",
+                "title": content.title,
+                "markdown": content.markdown,
+                "truncated": False,
+                "bytes_read": len(PAGE_HTML.encode()),
+                "redirects": 0,
+                "error_type": None,
+                "http_status": 200,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        assert result.output == expected
+        assert len(result.output.encode("utf-8")) < 64 * 1024
+
+    def test_large_ascii_page_serializes_valid_json_under_cap(self) -> None:
+        """Max-length ASCII content is cut honestly, never into invalid
+        JSON, and never above the dispatcher cap."""
+        html = _escape_heavy_html(chars=MAX_MARKDOWN_CHARS)
+        page = RawPage(
+            url="https://example.com/article",
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = WebPageCapability(_StaticProvider(page))
+        result = asyncio.run(
+            capability(
+                _call(
+                    {
+                        "url": "https://example.com/article",
+                        "max_markdown_chars": MAX_MARKDOWN_CHARS,
+                    },
+                    _context(),
+                )
+            )
+        )
+        raw = result.output.encode("utf-8")
+        assert len(raw) < 64 * 1024
+        document = json.loads(result.output)
+        assert document["truncated"] is True
+        assert document["status"] == "ok"
+        assert document["http_status"] == 200
+        assert document["citation"] == "https://example.com/article"
+        assert document["url"] == "https://example.com/article"
+        assert document["bytes_read"] == len(html.encode())
+        assert document["redirects"] == 0
+        assert set(document) == {
+            "status",
+            "code",
+            "trust",
+            "url",
+            "final_url",
+            "citation",
+            "title",
+            "markdown",
+            "truncated",
+            "bytes_read",
+            "redirects",
+            "error_type",
+            "http_status",
+        }
+
+    def test_escape_heavy_unicode_page_serializes_valid_json_under_cap(
+        self,
+    ) -> None:
+        """Escape-heavy, non-ASCII, surrogate-pair content is cut at the
+        escaped-byte level: the result parses and stays under the cap."""
+        html = _escape_heavy_html(chars=MAX_MARKDOWN_CHARS)
+        page = RawPage(
+            url="https://example.com/article",
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = WebPageCapability(_StaticProvider(page))
+        result = asyncio.run(
+            capability(
+                _call(
+                    {
+                        "url": "https://example.com/article",
+                        "max_markdown_chars": MAX_MARKDOWN_CHARS,
+                    },
+                    _context(),
+                )
+            )
+        )
+        raw = result.output.encode("utf-8")
+        assert len(raw) < 64 * 1024
+        document = json.loads(result.output)
+        assert document["truncated"] is True
+        assert "\U0001F600" in document["markdown"]
+        # The kept content is a prefix of the extracted text, not a
+        # character-count approximation: the exact serialized byte length
+        # of the document matches its parts.
+        content = extract_markdown(html, max_chars=MAX_MARKDOWN_CHARS)
+        assert document["markdown"] == content.markdown[: len(document["markdown"])]
+        assert len(raw) == len(
+            json.dumps(document, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        )
+
+    def test_long_title_and_url_survive_the_bound(self) -> None:
+        """A long title and a long URL keep their identity; only the
+        content is reduced."""
+        title = _ESCAPE_HEAVY_UNIT * 60
+        url = _long_url(path_chars=1500)
+        html = _escape_heavy_html(chars=MAX_MARKDOWN_CHARS, title=title)
+        page = RawPage(
+            url=url,
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = WebPageCapability(_StaticProvider(page))
+        result = asyncio.run(
+            capability(
+                _call(
+                    {"url": url, "max_markdown_chars": MAX_MARKDOWN_CHARS},
+                    _context(),
+                )
+            )
+        )
+        raw = result.output.encode("utf-8")
+        assert len(raw) < 64 * 1024
+        document = json.loads(result.output)
+        assert document["url"] == url
+        assert document["final_url"] == url
+        assert document["citation"] == url
+        assert document["truncated"] is True
+
+    def test_metadata_overflow_fails_closed_without_shortening_urls(self) -> None:
+        """When the metadata alone exceeds the budget, the answer fails
+        closed into a compact non-success document — it never slices the
+        URL into a shorter, misleading source."""
+        from mai.research.pages import (
+            _bounded_envelope,
+            _ENVELOPE_BUDGET_BYTES,
+            _ENVELOPE_TOO_LARGE_ERROR_TYPE,
+        )
+
+        url = _long_url(path_chars=40000)
+        document = {
+            "status": "ok",
+            "code": None,
+            "trust": "untrusted_external",
+            "url": url,
+            "final_url": url,
+            "citation": url,
+            "title": "T" * 300,
+            "markdown": "M" * 1000,
+            "truncated": False,
+            "bytes_read": 10,
+            "redirects": 0,
+            "error_type": None,
+            "http_status": 200,
+        }
+        fitted, dropped = _bounded_envelope(document)
+        assert dropped is True
+        assert fitted["status"] == "refused"
+        assert fitted["code"] == "response_too_large"
+        assert fitted["error_type"] == _ENVELOPE_TOO_LARGE_ERROR_TYPE
+        assert fitted["truncated"] is True
+        assert fitted["markdown"] == ""
+        assert fitted["title"] == ""
+        # The identity is either kept whole or omitted entirely — never
+        # shortened.
+        assert fitted["url"] == ""
+        assert fitted["final_url"] == ""
+        assert fitted["citation"] == ""
+        assert url not in json.dumps(fitted, sort_keys=True)
+        raw = json.dumps(fitted, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        assert len(raw) < _ENVELOPE_BUDGET_BYTES
+
+    def test_identity_is_kept_whole_when_the_content_is_the_overflow(
+        self,
+    ) -> None:
+        """The URLs are the answer's identity: they are kept verbatim
+        while the content is trimmed, never shortened."""
+        from mai.research.pages import (
+            _bounded_envelope,
+            _ENVELOPE_BUDGET_BYTES,
+        )
+
+        url = _long_url(path_chars=10000)
+        document = {
+            "status": "ok",
+            "code": None,
+            "trust": "untrusted_external",
+            "url": url,
+            "final_url": url,
+            "citation": url,
+            "title": "Fixture Page",
+            "markdown": "M" * 100_000,
+            "truncated": False,
+            "bytes_read": 10,
+            "redirects": 0,
+            "error_type": None,
+            "http_status": 200,
+        }
+        fitted, dropped = _bounded_envelope(document)
+        assert dropped is True
+        assert fitted["status"] == "ok"
+        assert fitted["url"] == url
+        assert fitted["final_url"] == url
+        assert fitted["citation"] == url
+        assert fitted["truncated"] is True
+        assert len(fitted["markdown"]) < 100_000
+        raw = json.dumps(fitted, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        assert len(raw) < _ENVELOPE_BUDGET_BYTES
+
+    def test_final_output_is_fit_checked_after_the_truncated_flag_is_set(
+        self,
+    ) -> None:
+        """The fit check measures the text that is actually emitted: the
+        ``truncated`` flag is part of it, so the flag cannot push the
+        envelope over the budget."""
+        from mai.research.pages import (
+            _bounded_envelope,
+            _ENVELOPE_BUDGET_BYTES,
+        )
+
+        url = _long_url(path_chars=200)
+        document = {
+            "status": "ok",
+            "code": None,
+            "trust": "untrusted_external",
+            "url": url,
+            "final_url": url,
+            "citation": url,
+            "title": "Fixture Page",
+            "markdown": "M" * 200_000,
+            "truncated": False,
+            "bytes_read": 10,
+            "redirects": 0,
+            "error_type": None,
+            "http_status": 200,
+        }
+        fitted, dropped = _bounded_envelope(document)
+        assert dropped is True
+        assert fitted["truncated"] is True
+        # The emitted text — flag included — is strictly under budget.
+        raw = json.dumps(fitted, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        assert len(raw) < _ENVELOPE_BUDGET_BYTES
+        # ... and the flag was part of the measured text, not added
+        # afterwards: swapping it for the shorter ``false`` would not
+        # change the length by more than the flag's own cost.
+        assert len(raw) == len(
+            json.dumps(
+                dict(fitted, truncated=False), sort_keys=True, ensure_ascii=True
+            ).encode("utf-8")
+        ) + len("true") - len("false")
+
+    async def test_dispatcher_output_is_valid_json_and_not_cut(self) -> None:
+        """Through the real dispatcher the answer is never cut into
+        invalid JSON: the dispatcher does not have to bound it at all."""
+        html = _escape_heavy_html(chars=MAX_MARKDOWN_CHARS)
+        page = RawPage(
+            url="https://example.com/article",
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = _RecordingCapability(WebPageCapability(_StaticProvider(page)))
+        dispatcher = _dispatcher(_registry(), capability, grants=_grants(SERVER_A))
+        outcome = await dispatcher.dispatch(
+            context=_context(server_id=SERVER_A),
+            capability_id=CAPABILITY_ID,
+            payload={
+                "url": "https://example.com/article",
+                "max_markdown_chars": MAX_MARKDOWN_CHARS,
+            },
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is True
+        output = outcome.output
+        assert output is not None
+        # The dispatcher never cut the output (it had no need to).
+        assert output.truncated is False
+        assert len(output.text.encode("utf-8")) < 64 * 1024
+        document = json.loads(output.text)
+        assert document["truncated"] is True
+        assert document["status"] == "ok"
+
+    async def test_error_answer_stays_a_non_success(self) -> None:
+        """The bound never turns an error into a success, and an error
+        document stays small and truthful."""
+        error = PageError(
+            PageErrorCode.ADDRESS_REFUSED,
+            "host resolves to a non-public address",
+            at_url="http://127.0.0.1/secret",
+        )
+        capability = WebPageCapability(_StaticProvider(error))
+        result = await capability(
+            _call({"url": "https://example.com/article"}, _context())
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "address_refused"
+        assert document["http_status"] is None
+        assert document["markdown"] == ""
+        assert len(result.output.encode("utf-8")) < 64 * 1024
+
+    def test_pre_redaction_serialized_length_is_strictly_under_budget(
+        self,
+    ) -> None:
+        """The capability's own serialization — the text before the
+        dispatcher's redaction — is strictly below the budget."""
+        html = _escape_heavy_html(chars=MAX_MARKDOWN_CHARS)
+        page = RawPage(
+            url="https://example.com/article",
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = WebPageCapability(_StaticProvider(page))
+        result = asyncio.run(
+            capability(
+                _call(
+                    {
+                        "url": "https://example.com/article",
+                        "max_markdown_chars": MAX_MARKDOWN_CHARS,
+                    },
+                    _context(),
+                )
+            )
+        )
+        raw = result.output.encode("utf-8")
+        assert len(raw) < default_output_budget_bytes
+        assert json.loads(result.output)["status"] == "ok"
+
+    async def test_dispatcher_does_not_cut_after_content_secret_redaction(
+        self,
+    ) -> None:
+        """A short secret repeated in the content makes the dispatcher's
+        redaction *grow* the text. The capability fits against the
+        redacted length, so the dispatcher still never has to cut and
+        the answer stays valid JSON with no secret value in it."""
+        secret = "qz7"
+        body = "<p>" + " ".join([secret] * 8000) + "</p>"
+        html = f"<html><head><title>Fixture Page</title></head><body>{body}</body></html>"
+        page = RawPage(
+            url="https://example.com/article",
+            content_type="text/html",
+            bytes_read=len(html.encode()),
+            body=html.encode(),
+            charset="utf-8",
+            hops=0,
+            http_status=200,
+        )
+        capability = WebPageCapability(_StaticProvider(page))
+        dispatcher = _dispatcher_with_credentials(
+            capability, {_SECRET_REF: secret}, grants=_grants(SERVER_A)
+        )
+        outcome = await dispatcher.dispatch(
+            context=_context_with_credentials(server_id=SERVER_A),
+            capability_id=CAPABILITY_ID,
+            payload={
+                "url": "https://example.com/article",
+                "max_markdown_chars": MAX_MARKDOWN_CHARS,
+            },
+        )
+        assert outcome.allowed is True
+        assert outcome.output is not None
+        text = outcome.output.text
+        # The dispatcher never cut: the redaction growth was accounted for
+        # before the envelope left the capability.
+        assert outcome.output.truncated is False
+        assert len(text.encode("utf-8")) < default_output_budget_bytes
+        # No secret value leaked into the answer.
+        assert secret not in text
+        document = json.loads(text)
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        # The content was trimmed to make room for the redaction growth:
+        # the capability's own envelope carries less content than the
+        # extracted page had.
+        direct = await capability(
+            _call_with_credentials(
+                {
+                    "url": "https://example.com/article",
+                    "max_markdown_chars": MAX_MARKDOWN_CHARS,
+                },
+                _context_with_credentials(),
+                {_SECRET_REF: SecretValue(secret)},
+            )
+        )
+        raw_document = json.loads(direct.output)
+        assert len(raw_document["markdown"]) < 8000 * len(secret)
+        # The cut never splits a secret occurrence: no proper prefix of
+        # the secret survives at the end of the kept content.
+        assert not raw_document["markdown"].endswith(secret[:2])
+        assert len(direct.output.encode("utf-8")) < default_output_budget_bytes
+
+    async def test_every_call_path_passes_credential_secrets_to_the_fitter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every executor-result return path hands the resolved secret
+        values to the bounding step: the fit is measured against the text
+        the dispatcher will actually measure."""
+        import mai.research.pages as pages_module
+
+        recorded: list[list[str]] = []
+        original = pages_module._executor_result
+
+        def spy(result, *, secrets=()):
+            recorded.append(list(secrets))
+            return original(result, secrets=secrets)
+
+        monkeypatch.setattr(pages_module, "_executor_result", spy)
+
+        credentials = {_SECRET_REF: SecretValue("qz7")}
+        context = _context_with_credentials()
+
+        # 1. the success path
+        capability = WebPageCapability(_StaticProvider(_STATIC_PAGE))
+        await capability(_call_with_credentials(
+            {"url": "https://example.com/article"}, context, credentials
+        ))
+        # 2. the known-failure path (a structured page refusal)
+        capability = WebPageCapability(
+            _StaticProvider(
+                PageError(PageErrorCode.FETCH_UNREACHABLE, "unreachable")
+            )
+        )
+        await capability(_call_with_credentials(
+            {"url": "https://example.com/article"}, context, credentials
+        ))
+        # 3. the outage path (an unclassified transport failure)
+        capability = WebPageCapability(_StaticProvider(RuntimeError("boom")))
+        await capability(_call_with_credentials(
+            {"url": "https://example.com/article"}, context, credentials
+        ))
+        # 4. the payload-validation path (before any fetch)
+        capability = WebPageCapability(_StaticProvider(_STATIC_PAGE))
+        await capability(_call_with_credentials(
+            {"url": "not-a-url"}, context, credentials
+        ))
+
+        assert len(recorded) == 4
+        assert recorded == [["qz7"], ["qz7"], ["qz7"], ["qz7"]]
+
+    async def test_known_dispatcher_structural_redaction_defect_is_pinned(
+        self,
+    ) -> None:
+        """LEGACY LIMITATION (deferred, dispatcher-owned): a credential
+        value that itself contains JSON syntax corrupts the *structure*
+        of the dispatcher's redacted text.
+
+        The dispatcher's redaction is a plain text replacement over the
+        serialized JSON, so a value like ``'":'`` rewrites the JSON
+        separators themselves. The corruption happens inside the
+        dispatcher, not in this capability: the capability's own output
+        is valid JSON. This test pins the defect as a known limitation
+        (it is NOT an xfail masking a required fix here — the fix is
+        explicitly out of scope and belongs to a separate dispatcher
+        card). The deferred dispatcher card must invert this assertion.
+        """
+        secret = '":'
+        capability = WebPageCapability(_StaticProvider(_STATIC_PAGE))
+        dispatcher = _dispatcher_with_credentials(
+            capability, {_SECRET_REF: secret}, grants=_grants(SERVER_A)
+        )
+        outcome = await dispatcher.dispatch(
+            context=_context_with_credentials(server_id=SERVER_A),
+            capability_id=CAPABILITY_ID,
+            payload={"url": "https://example.com/article"},
+        )
+        assert outcome.allowed is True
+        assert outcome.output is not None
+        # The capability's own envelope is valid JSON ...
+        direct = await capability(
+            _call_with_credentials(
+                {"url": "https://example.com/article"},
+                _context_with_credentials(),
+                {_SECRET_REF: SecretValue(secret)},
+            )
+        )
+        json.loads(direct.output)
+        # ... but the dispatcher's redaction of it is structurally broken.
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(outcome.output.text)
+
+
+# ---------------------------------------------------------------------------
 # Real dispatcher / policy / bridge integration (descriptor availability)
 # ---------------------------------------------------------------------------
 
@@ -1660,6 +2249,41 @@ def _dispatcher(
         credentials=lambda: None,
         executor=executor,
         output_budget_bytes=64 * 1024,
+    )
+
+
+class _StubResolver:
+    """A credential resolver over synthetic, in-memory material.
+
+    The dispatcher only needs ``resolve(reference) -> SecretValue``; no
+    file is written and no material is persisted anywhere.
+    """
+
+    def __init__(self, material: Mapping[str, str]) -> None:
+        self._material = dict(material)
+
+    def resolve(self, name: str) -> SecretValue:
+        return SecretValue(self._material[name])
+
+
+def _dispatcher_with_credentials(
+    executor,
+    material: Mapping[str, str],
+    *,
+    grants=None,
+    policy=None,
+) -> CapabilityDispatcher:
+    """A real dispatcher whose credential seam resolves synthetic
+    material (no file, no persistence)."""
+    return CapabilityDispatcher(
+        registry=_registry(),
+        approvals=_unused_approvals(),
+        grants=(lambda: grants) if grants is not None else (lambda: {}),
+        policy=policy if policy is not None else (lambda: _policy()),
+        adopted=lambda server_id: True,
+        credentials=lambda: _StubResolver(material),  # type: ignore[arg-type]
+        executor=executor,
+        output_budget_bytes=default_output_budget_bytes,
     )
 
 

@@ -112,10 +112,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.dispatch import (
+    REDACTED,
+    CapabilityCall,
+    ExecutorResult,
+    default_output_budget_bytes,
+)
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.research.search import normalize_citation_url
@@ -1294,13 +1299,300 @@ def _refusal_result(
     )
 
 
-def _executor_result(result: PageResult) -> ExecutorResult:
-    """The executor answer of one page result (success only for ``ok``)."""
+#: The serialized page-result envelope must fit inside the dispatcher's
+#: default output budget (64 KiB). The dispatcher enforces that budget by
+#: cutting the output *string* — a cut JSON string is invalid JSON — so
+#: the capability bounds its own serialized envelope before it leaves.
+#:
+#: Two lengths matter and both are checked:
+#:
+#: 1. the capability's own serialized envelope, and
+#: 2. the *mirrored* post-redaction envelope — the dispatcher replaces
+#:    every resolved secret value with
+#:    :data:`mai.capabilities.dispatch.REDACTED` *before* it measures
+#:    the output, and that replacement can make the text longer (a short
+#:    secret repeated often) or shorter (a long secret). No fixed
+#:    redaction reserve can bound the growth, so the same replacement is
+#:    applied here and the result measured: correctness comes from the
+#:    final fit check, never from an estimated reserve.
+#:
+#: Scope note (deferred, not fixed here): the dispatcher's redaction is
+#: a plain text replacement over the serialized JSON. A credential value
+#: that itself contains JSON syntax (e.g. ``'":'``) therefore corrupts
+#: the *structure* of the redacted text — a pre-existing dispatcher
+#: defect, reproducible on a 246-byte refusal envelope with all content
+#: emptied. It is out of scope for this capability: no pages-side change
+#: can make an arbitrary credential value structurally safe, and no
+#: universal guarantee is claimed here.
+_ENVELOPE_BUDGET_BYTES: Final[int] = default_output_budget_bytes
+
+#: The error type of the compact non-success envelope emitted when the
+#: answer's own metadata cannot fit the budget.
+_ENVELOPE_TOO_LARGE_ERROR_TYPE: Final[str] = "OutputEnvelopeTooLarge"
+
+#: The characters JSON escapes with a two-byte escape sequence.
+_JSON_SHORT_ESCAPES: Final[frozenset[str]] = frozenset(
+    ('"', "\\", "\b", "\t", "\n", "\f", "\r")
+)
+
+
+def _json_escape_cost(char: str) -> int:
+    """The number of bytes one character costs in a JSON string literal.
+
+    The envelope is serialized with ``ensure_ascii=True``, so every
+    serialized byte is ASCII and the byte cost of a string is the sum
+    of the per-character costs below.
+    """
+    code = ord(char)
+    if char in _JSON_SHORT_ESCAPES:
+        return 2
+    if code < 0x20 or code == 0x7F:
+        return 6  # \u00XX
+    if code < 0x80:
+        return 1
+    if code <= 0xFFFF:
+        return 6  # \uXXXX
+    return 12  # surrogate pair \uXXXX\uXXXX
+
+
+def _serialized_text(document: Mapping[str, object]) -> str:
+    """The exact serialized form of one document (the dispatcher's form)."""
+    return json.dumps(document, sort_keys=True, ensure_ascii=True)
+
+
+def _redacted_length(text: str, secrets: Sequence[str]) -> int:
+    """The length of the dispatcher's redacted output, exactly.
+
+    The dispatcher replaces every resolved secret value with the
+    redaction marker *before* it bounds the output. This applies the
+    very same replacement (in the same order) and returns the resulting
+    length, so the envelope can be fitted against the text the
+    dispatcher will actually measure instead of against an estimate.
+    """
+    for value in secrets:
+        if value:
+            text = text.replace(value, REDACTED)
+    return len(text)
+
+
+def _fits(document: Mapping[str, object], secrets: Sequence[str]) -> bool:
+    """Whether one document stays strictly below the output budget.
+
+    Both lengths are checked: the capability's own serialized envelope
+    and the mirrored post-redaction envelope. Either one at or above
+    the budget means the document does not fit.
+    """
+    text = _serialized_text(document)
+    if len(text.encode("utf-8")) >= _ENVELOPE_BUDGET_BYTES:
+        return False
+    return _redacted_length(text, secrets) < _ENVELOPE_BUDGET_BYTES
+
+
+def _split_free_cut(
+    value: str, length: int, secrets: Sequence[str]
+) -> int:
+    """The largest cut length that does not *split* a secret value.
+
+    Cutting the content at an arbitrary offset can land in the middle
+    of a secret occurrence: the kept text would then end with a proper
+    prefix of the secret (``"qz"`` for the secret ``"qz7"``). The
+    dispatcher's redaction replaces whole occurrences only, so such a
+    fragment would survive into the answer. The cut therefore backs off
+    to the last offset that leaves no proper secret prefix at the end
+    of the kept text.
+
+    The back-off is bounded by the longest secret, so the cost is
+    bounded and the fit check still decides the final length.
+    """
+    for secret in secrets:
+        if not secret or len(secret) < 2:
+            continue
+        for size in range(min(len(secret) - 1, length), 0, -1):
+            if value[length - size : length] == secret[:size]:
+                return length - size
+    return length
+
+
+def _trim_field_to_fit(
+    document: dict[str, object], field: str, secrets: Sequence[str]
+) -> bool:
+    """Shrink one content field until the document fits.
+
+    The field is cut from its end: the kept part is a prefix of the
+    original text. The cut is driven by measured fit, not by a
+    predicted reserve: the prefix length is first bounded by the
+    serialized byte cost of the field, then refined by a bounded
+    search, and the result is verified against the real fit test. The
+    search is *not* claimed to be maximal — redaction makes the
+    serialized size non-monotone in the prefix length, so the kept
+    prefix may be shorter than the largest fitting one. A shorter
+    prefix costs content, never validity.
+    """
+    value = document.get(field)
+    if not isinstance(value, str) or not value:
+        return _fits(document, secrets)
+
+    # The trim happens against the document as it will be *emitted*:
+    # the ``truncated`` flag is set to ``true`` once a cut happened, and
+    # the flag itself costs bytes. The fit test therefore always sees
+    # the flagged shape.
+    document["truncated"] = True
+
+    # A first, cheap bound: the serialized cost of everything *except*
+    # this field leaves this many bytes for the field itself.
+    without = dict(document)
+    without[field] = ""
+    overhead = len(_serialized_text(without).encode("utf-8"))
+    allowed = _ENVELOPE_BUDGET_BYTES - 1 - overhead
+    if allowed <= 0:
+        allowed = 0
+    cost = 0
+    cut = 0
+    for char in value:
+        step = _json_escape_cost(char)
+        if cost + step > allowed:
+            break
+        cost += step
+        cut += 1
+
+    # Refine by a bounded search over the prefix length (logarithmic in
+    # the number of serializations, never one serialization per
+    # character).
+    low, high, best = 0, cut, 0
+    while low <= high:
+        middle = (low + high) // 2
+        probe = dict(document)
+        probe[field] = value[:middle]
+        if _fits(probe, secrets):
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+
+    # Verify the candidate; a non-monotone fit can only cost content.
+    length = best
+    probe = dict(document)
+    probe[field] = value[:length]
+    while length and not _fits(probe, secrets):
+        length = length // 2
+        probe[field] = value[:length]
+    # The cut must not split a secret occurrence: a fragment would
+    # survive the dispatcher's whole-occurrence redaction.
+    length = _split_free_cut(value, length, secrets)
+    document[field] = value[:length]
+    return _fits(document, secrets)
+
+
+def _too_large_envelope(
+    document: Mapping[str, object], secrets: Sequence[str]
+) -> dict[str, object]:
+    """The compact non-success envelope of an answer that cannot fit.
+
+    The answer's own metadata (status, code, trust, byte/redirect
+    counts, HTTP status) is preserved; the content is empty. The URLs
+    are never sliced: the *full* safe URLs are kept when they fit, and
+    otherwise the URL, final-URL and citation fields are cleared
+    together — the failure envelope then explains that the answer's
+    identity was omitted rather than showing a shortened, misleading
+    URL.
+    """
+    compact: dict[str, object] = {
+        "status": PageStatus.REFUSED.value,
+        "code": PageErrorCode.RESPONSE_TOO_LARGE.value,
+        "trust": "untrusted_external",
+        "url": "",
+        "final_url": "",
+        "citation": "",
+        "title": "",
+        "markdown": "",
+        "truncated": True,
+        "bytes_read": document.get("bytes_read", 0),
+        "redirects": document.get("redirects", 0),
+        "error_type": _ENVELOPE_TOO_LARGE_ERROR_TYPE,
+        "http_status": document.get("http_status"),
+    }
+    with_identity = dict(compact)
+    for field in ("url", "final_url", "citation"):
+        value = document.get(field)
+        if isinstance(value, str):
+            with_identity[field] = value
+    if _fits(with_identity, secrets):
+        return with_identity
+    return compact
+
+
+def _bounded_envelope(
+    document: Mapping[str, object], *, secrets: Sequence[str] = ()
+) -> tuple[dict[str, object], bool]:
+    """Fit one page-result document into the output budget honestly.
+
+    The required metadata (status, code, trust, URLs, citation, byte
+    count, redirect count, error type and HTTP status) is preserved
+    verbatim; only the *content* fields (the Markdown and, after that,
+    the title) are reduced, and the cut is reported honestly through
+    ``truncated``.
+
+    The URLs, the final URL and the citation are never sliced: they are
+    the answer's identity and a shortened URL would be a false source.
+    If the identity itself does not fit the budget, the answer fails
+    closed into a compact non-success envelope (see
+    :func:`_too_large_envelope`) instead of emitting a cut or
+    misleading identity.
+
+    Returns the fitted document and whether anything was dropped.
+    """
+    document = dict(document)
+    if _fits(document, secrets):
+        return document, False
+
+    dropped = False
+    for field in ("markdown", "title"):
+        value = document.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        _trim_field_to_fit(document, field, secrets)
+        if len(document[field]) < len(value):
+            dropped = True
+        if _fits(document, secrets):
+            break
+
+    if not _fits(document, secrets):
+        # The metadata alone does not fit: fail closed into a compact,
+        # truthful non-success envelope.
+        return _too_large_envelope(document, secrets), True
+
+    if dropped:
+        # The flag was already set by the trim (the fit test always saw
+        # the flagged shape). The check below re-measures the exact
+        # emitted text; if it no longer fits, the answer fails closed
+        # rather than shipping an envelope the dispatcher would cut.
+        document["truncated"] = True
+        if not _fits(document, secrets):
+            return _too_large_envelope(document, secrets), True
+    else:
+        document["truncated"] = False
+    return document, dropped
+
+
+def _executor_result(
+    result: PageResult, *, secrets: Sequence[str] = ()
+) -> ExecutorResult:
+    """The executor answer of one page result (success only for ``ok``).
+
+    The serialized envelope is bounded *before* it leaves the
+    capability: it stays strictly below the output budget and stays
+    valid JSON, both as the capability serializes it and after the
+    dispatcher's own secret redaction. The dispatcher never has to cut
+    a JSON string into an invalid one.
+
+    ``ok`` is derived from the *fitted* document, not from the original
+    result: an answer that had to fail closed is a non-success.
+    """
+    document = result_document(result)
+    fitted, _dropped = _bounded_envelope(document, secrets=secrets)
     return ExecutorResult(
-        ok=result.status is PageStatus.OK,
-        output=json.dumps(
-            result_document(result), sort_keys=True, ensure_ascii=True
-        ),
+        ok=fitted.get("status") == PageStatus.OK.value,
+        output=json.dumps(fitted, sort_keys=True, ensure_ascii=True),
     )
 
 
@@ -1491,6 +1783,16 @@ class WebPageCapability:
                 PageErrorCode.INVALID_PAYLOAD,
                 "call context must be an ExecutionContext",
             )
+        # The dispatcher redacts every resolved secret from the executor
+        # output *before* it measures the output against the budget. The
+        # envelope is therefore fitted against the redacted text, so the
+        # bound holds for the text the dispatcher actually measures.
+        secrets = [
+            secret.value
+            for secret in call.credentials.values()
+            if isinstance(getattr(secret, "value", None), str)
+            and secret.value
+        ]
         try:
             request = request_from_payload(
                 call.payload,
@@ -1508,7 +1810,8 @@ class WebPageCapability:
                     code=exc.code,
                     url="",
                     at_url=None,
-                )
+                ),
+                secrets=secrets,
             )
         try:
             raw = await self._provider.fetch(
@@ -1560,7 +1863,7 @@ class WebPageCapability:
                 redirects=raw.hops,
                 http_status=raw.http_status,
             )
-        return _executor_result(result)
+        return _executor_result(result, secrets=secrets)
 
 
 # ---------------------------------------------------------------------------
