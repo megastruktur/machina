@@ -140,13 +140,21 @@ def _context_doc(
     return context.to_json()
 
 
-def _intent_document(run_id: str, *, allowed: tuple[str, ...] | None = None, **overrides: object) -> dict:
+def _intent_document(
+    run_id: str,
+    *,
+    allowed: tuple[str, ...] | None = None,
+    mode: str = "delegated",
+    **overrides: object,
+) -> dict:
     document: dict[str, object] = {
         "v": agent_run.RUN_PAYLOAD_VERSION,
         "run_id": run_id,
         "server_id": SERVER_ID,
         "context": (
-            _context_doc(run_id) if allowed is None else _context_doc(run_id, allowed=allowed)
+            _context_doc(run_id, mode=mode)
+            if allowed is None
+            else _context_doc(run_id, mode=mode, allowed=allowed)
         ),
         "role": ROLE,
         "task": TASK,
@@ -1689,7 +1697,13 @@ class TestDurableAgentRuns:
     def test_privileged_call_records_approval_binding_and_run_continues(
         self, agent_url, factory, insert_run, scenario, composition
     ) -> None:
-        """The approval_required answer carries the durable binding; nothing runs."""
+        """The approval_required answer carries the durable binding; nothing runs.
+
+        ASK mode is the prompting mode (C03 rule 5): a granted privileged
+        capability still needs an approval decision, so the call is
+        refused before any effect and the durable binding the resume
+        surface consumes is recorded.
+        """
         composition()
         _write_policy_files(scenario, grants=[{READ_CAP: True}, {PRIV_CAP: True}])
         _script(
@@ -1701,7 +1715,11 @@ class TestDurableAgentRuns:
         )
         run_id = str(uuid.uuid4())
         document = _intent_document(
-            run_id, allowed=(READ_CAP, PRIV_CAP), connection="gateway", profile="fast"
+            run_id,
+            allowed=(READ_CAP, PRIV_CAP),
+            mode="ask",
+            connection="gateway",
+            profile="fast",
         )
         client = EngineClient(agent_url)
         worker = None
@@ -1731,6 +1749,79 @@ class TestDurableAgentRuns:
         # The durable binding the resume surface consumes (C03 rule 4).
         assert receipt["payload_hash"]
         assert receipt["policy_revision"] == 1
+        assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
+
+    def test_privileged_call_executes_once_in_delegated_mode(
+        self, agent_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """DELEGATED mode runs a granted privileged capability without prompting.
+
+        The counterpart of the ASK-mode refusal above: the same granted
+        privileged capability, inside the same grants, executes EXACTLY
+        once when the context's mode is delegated (C03 rule 5 — the mode
+        never widens a grant, it only decides whether a decision is
+        prompted). The fixture capability is the controlled one; no real
+        privileged operation runs.
+        """
+        composition()
+        _write_policy_files(scenario, grants=[{READ_CAP: True}, {PRIV_CAP: True}])
+        _script(
+            scenario,
+            [
+                _tool_call_entry(name="fixture_priv"),
+                {"text": "delegated run finished"},
+            ],
+        )
+        run_id = str(uuid.uuid4())
+        document = _intent_document(
+            run_id,
+            allowed=(READ_CAP, PRIV_CAP),
+            mode="delegated",
+            connection="gateway",
+            profile="fast",
+        )
+        client = EngineClient(agent_url)
+        worker = None
+        try:
+            worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+            _run(_enqueue_run(client, insert_run, run_id, document))
+            _wait_until(
+                lambda: (_terminal_engine_state(client, run_id) or "") == "succeeded",
+                RUN_TIMEOUT,
+                "run success",
+            )
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        # The effect happened EXACTLY once and the model saw the executed
+        # result on its continuation round.
+        assert _journal_lines(scenario) == [
+            "model_call",
+            "begin:fixture.priv:m1",
+            "effect:fixture.priv:m1",
+            "model_call",
+            "tool_return:executed",
+        ]
+
+        row = _read_step_row(agent_url, run_id, 1)
+        assert row is not None and row["state"] == "succeeded"
+        receipt = row["receipt"]
+        assert receipt["allowed"] is True
+        assert receipt["reason"] == "allowed"
+        assert receipt["effect"] == "executed"
+        assert receipt["executor_ok"] is True
+        assert receipt["policy_revision"] == 1
+        assert receipt["payload_hash"]
+        assert receipt["capability_id"] == PRIV_CAP
+        # No approval was needed in delegated mode, so none was spent and
+        # none was created.
+        assert receipt["approval_spent"] is False
+        assert receipt["approval_id"] is None
+        # The privilege advisory lives on the policy decision; the durable
+        # receipt is value-free and carries no advisory claim of its own.
+        assert "advisories" not in receipt
         assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
 
     def test_production_model_errors_classify_and_fail_without_effect(
