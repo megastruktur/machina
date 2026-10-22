@@ -41,7 +41,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -76,7 +76,7 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Scratch namespace per runtime-environment ADR D2/D4 (recorded + cleaned
 # in the card evidence). Each live scenario gets a fresh subdirectory.
-FIXTURE_ROOT = Path("/tmp/mai-fxt-06-agent-run")
+FIXTURE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / "mai-fxt-06-agent-run"
 
 READY_TIMEOUT = 90.0
 RUN_TIMEOUT = 120.0
@@ -140,13 +140,21 @@ def _context_doc(
     return context.to_json()
 
 
-def _intent_document(run_id: str, *, allowed: tuple[str, ...] | None = None, **overrides: object) -> dict:
+def _intent_document(
+    run_id: str,
+    *,
+    allowed: tuple[str, ...] | None = None,
+    mode: str = "delegated",
+    **overrides: object,
+) -> dict:
     document: dict[str, object] = {
         "v": agent_run.RUN_PAYLOAD_VERSION,
         "run_id": run_id,
         "server_id": SERVER_ID,
         "context": (
-            _context_doc(run_id) if allowed is None else _context_doc(run_id, allowed=allowed)
+            _context_doc(run_id, mode=mode)
+            if allowed is None
+            else _context_doc(run_id, mode=mode, allowed=allowed)
         ),
         "role": ROLE,
         "task": TASK,
@@ -396,15 +404,19 @@ def _drop_app_tables(url: str) -> None:
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "admin_credential, alembic_version, notification_alerts, "
+            "observation_findings, server_observations, knowledge_doc_chunks, "
+            "knowledge_documents, application_projection_journal, "
+            "application_projection"
         )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
 @pytest.fixture(scope="session")
-def agent_url() -> str:
-    """Disposable fixture database: Alembic chain + engine-owned schema."""
+def agent_url() -> Iterator[str]:
+    """Migrate the disposable DB, then restore pre-bootstrap state at teardown."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -415,16 +427,22 @@ def agent_url() -> str:
     previous = os.environ.get("MAI_DATABASE_URL")
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
-        _drop_app_tables(url)
-        command.upgrade(_alembic_config(), "head")
+        try:
+            _drop_app_tables(url)
+            command.upgrade(_alembic_config(), "head")
+        finally:
+            if previous is None:
+                os.environ.pop("MAI_DATABASE_URL", None)
+            else:
+                os.environ["MAI_DATABASE_URL"] = previous
+        engine.launch_worker(url)  # creates the engine-owned dbos schema
+        engine.shutdown()
+        yield url
     finally:
-        if previous is None:
-            os.environ.pop("MAI_DATABASE_URL", None)
-        else:
-            os.environ["MAI_DATABASE_URL"] = previous
-    engine.launch_worker(url)  # creates the engine-owned dbos schema
-    engine.shutdown()
-    return url
+        # Dependent fixtures dispose their engines before session teardown;
+        # stop this process's worker before dropping its schema as well.
+        engine.shutdown()
+        _drop_app_tables(url)
 
 
 @pytest.fixture
@@ -461,7 +479,7 @@ def factory(agent_url: str) -> async_sessionmaker[AsyncSession]:
 def insert_run(factory: async_sessionmaker[AsyncSession]):
     """Insert a ``job_runs`` row (the submit owner's row, by SQL helper)."""
 
-    async def _insert(run_id: str) -> None:
+    async def _insert(run_id: str, *, requested_grants: tuple[str, ...] = (READ_CAP,)) -> None:
         async with factory() as session:
             await session.execute(
                 text(
@@ -472,10 +490,11 @@ def insert_run(factory: async_sessionmaker[AsyncSession]):
                          submitted_at, updated_at)
                     VALUES
                         (:run_id, :server_id, 0, 3, 7, 'fixture-fast',
-                         '["fixture.read"]', now(), now())
+                         :requested_grants, now(), now())
                     """
                 ),
-                {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID)},
+                {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID),
+                 "requested_grants": json.dumps(requested_grants)},
             )
             await session.commit()
 
@@ -518,7 +537,7 @@ def _write_model_root(root: Path, *, base_url: str, credential: bool) -> None:
     store.set_selection("gateway", "fast", expected_revision=0)
 
 
-def _write_data_root(root: Path) -> None:
+def _write_data_root(root: Path, *, capability: str = READ_CAP) -> None:
     from mai.profiles.files import ProfileFileStore
 
     store = ProfileFileStore(root)
@@ -536,7 +555,7 @@ def _write_data_root(root: Path) -> None:
         '  credential_ref: "MAI_SSH_KEY_FIXTURE"\n'
         "privilege: none\n"
         "capabilities:\n"
-        "  - fixture.read\n"
+        f"  - {capability}\n"
     )
     store.write(uuid.UUID(SERVER_ID), profile_text, expected_revision=0)
     server_dir = root / "servers" / SERVER_ID
@@ -553,12 +572,13 @@ def composition(
     """Write the fixture model/data roots once per scenario."""
 
     def _compose(
-        *, base_url: str = "http://127.0.0.1:9/v1", credential: bool = True
+        *, base_url: str = "http://127.0.0.1:9/v1", credential: bool = True,
+        capability: str = READ_CAP,
     ) -> dict[str, Path]:
         model_root = scenario / "model-root"
         data_root = scenario / "data-root"
         _write_model_root(model_root, base_url=base_url, credential=credential)
-        _write_data_root(data_root)
+        _write_data_root(data_root, capability=capability)
         (scenario / "fixture.env").write_text(
             f"{SECRET_NAME}={SECRET_VALUE}\n", encoding="utf-8"
         )
@@ -737,6 +757,43 @@ def _script_model():
         index = (len(messages) - 1) // 2
         if index >= len(script):
             raise AssertionError("model script exhausted")
+        expected = script[index].get("expect_web_read")
+        if expected is not None:
+            returns = [
+                part for part in messages[-1].parts
+                if getattr(part, "part_kind", "") == "tool-return"
+                and part.tool_name == "web_read"
+            ]
+            assert len(returns) == 1, "missing real web_read tool return"
+            envelope = json.loads(returns[0].content)
+            # Record actual bridge output before validating the scripted reply.
+            target = os.environ["MAI_FX_WEB_READ"] + ".result"
+            capture = expected.get("capture")
+            if capture:
+                target = os.environ["MAI_FX_WEB_READ"] + "." + capture + ".result"
+            with open(target, "w") as handle:
+                json.dump(envelope, handle)
+            # The ACTUAL contract: an ordinary read failure reaches the model
+            # as a non-success tool result (denied) whose parsed page carries
+            # the honest code/status - never an exception, never a success.
+            assert envelope["status"] == expected.get("status", "executed"), envelope
+            assert envelope["executor_ok"] is expected["executor_ok"], envelope
+            if "effect" in expected:
+                assert envelope["effect"] == expected["effect"], envelope
+            output = envelope["output"]
+            if expected.get("output_none"):
+                # A pre-dispatch refusal (the bridge gate): nothing ran and
+                # no executor output exists.
+                assert output is None, envelope
+            else:
+                assert output is not None, envelope
+                assert output["truncated"] is False, envelope
+                page = json.loads(output["text"])
+                for key, value in expected["page"].items():
+                    assert page[key] == value, (key, page)
+                if "marker" in expected:
+                    assert expected["marker"] in page["markdown"], page
+            _mark("web_read_output_verified")
         return _entry_payload(script[index])
 
     return FunctionModel(_model_fn)
@@ -757,6 +814,74 @@ def _build():
     registry = CapabilityRegistry()
     registry.register(_descriptor("fixture.read", "read"))
     registry.register(_descriptor("fixture.priv", "privileged"))
+    executor = FixtureExecutor()
+    web_fixture = os.environ.get("MAI_FX_WEB_READ")
+    if web_fixture:
+        import httpx2
+        from mai.jobs.worker import _build_web_read_capability
+        from mai.research import pages
+
+        with open(web_fixture, encoding="utf-8") as handle:
+            response = json.load(handle)
+        registry.register(pages.descriptor())
+
+        if "responses" in response:
+            # Scripted SEQUENCE of real capability results: every request
+            # consumes the next scripted answer, in order. The host set
+            # and the per-answer path are asserted, so a drifted request
+            # fails the scenario instead of silently consuming the wrong
+            # answer. No public site is contacted: the transport is the
+            # httpx2 MockTransport and the resolver is a stub.
+            hosts = list(response.get("hosts") or [])
+            sequence = list(response["responses"])
+            cursor = {"index": 0}
+
+            def resolve(host):
+                assert host in hosts, host
+                return ("93.184.216.34",)
+
+            def transport(request):
+                index = cursor["index"]
+                assert index < len(sequence), "unscripted web.read request"
+                cursor["index"] = index + 1
+                entry = sequence[index]
+                if "host" in entry:
+                    assert request.headers["host"] == entry["host"]
+                if "path" in entry:
+                    assert request.url.path == entry["path"]
+                executor._mark("transport:web.read")
+                executor._mark("transport:web.read:" + str(entry.get("path", "?")))
+                return httpx2.Response(
+                    entry["status"],
+                    headers={"Content-Type": entry["content_type"]},
+                    content=entry["body"].encode("utf-8"),
+                )
+        else:
+            # The single-answer shape (the W6a fixture).
+            def resolve(host):
+                assert host == "developer.valvesoftware.com"
+                return ("93.184.216.34",)
+
+            def transport(request):
+                assert request.headers["host"] == "developer.valvesoftware.com"
+                assert request.url.path == "/wiki/Server_queries"
+                executor._mark("transport:web.read")
+                return httpx2.Response(
+                    response["status"],
+                    headers={"Content-Type": response["content_type"]},
+                    content=response["body"].encode("utf-8"),
+                )
+
+        reader = _build_web_read_capability(
+            transport=httpx2.MockTransport(transport), resolver=resolve
+        )
+
+        async def dispatch_fixture(call):
+            if call.descriptor.identifier == pages.CAPABILITY_ID:
+                return await reader(call)
+            return await executor(call)
+    else:
+        dispatch_fixture = executor
     dispatcher = CapabilityDispatcher(
         registry=registry,
         approvals=ApprovalStore(sessions),
@@ -767,7 +892,7 @@ def _build():
         ),
         adopted=lambda server_id: True,
         credentials=lambda: EnvResolver(os.environ["MAI_FX_ENV"]),
-        executor=FixtureExecutor(),
+        executor=dispatch_fixture,
     )
     model_store = ModelConfigStore(os.environ["MAI_FX_MODEL_ROOT"])
     scripted = os.environ.get("MAI_FX_MODEL_SCRIPT")
@@ -844,6 +969,10 @@ def _spawn_worker(
     env["MAI_FX_ENV"] = str(scenario / "fixture.env")
     env["MAI_FX_MODEL_ROOT"] = str(scenario / "model-root")
     env["MAI_FX_DATA_ROOT"] = str(scenario / "data-root")
+    web_path = scenario / "web-read.json"
+    env.pop("MAI_FX_WEB_READ", None)
+    if web_path.exists():
+        env["MAI_FX_WEB_READ"] = str(web_path)
     behavior_path = scenario / "behavior.json"
     env.pop("MAI_FX_BEHAVIOR", None)
     if behavior_path.exists():
@@ -1019,6 +1148,429 @@ def _tool_call_entry(
 
 
 class TestDurableAgentRuns:
+    def test_real_web_read_incident_budget_succeeds(
+        self, agent_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """Real reader/bridge/DBOS journey; only HTTP and model are controlled."""
+        url = "https://developer.valvesoftware.com/wiki/Server_queries"
+        marker = "W6A-DURABLE-PAGE-7f329b"
+        body = f"<html><body><h1>Server queries</h1><p>{marker}</p></body></html>"
+        composition(capability="web.read")
+        _write_policy_files(scenario, grants=[{"web.read": True}])
+        (scenario / "web-read.json").write_text(
+            json.dumps({"status": 200, "content_type": "text/html", "body": body}),
+            encoding="utf-8",
+        )
+        _script(scenario, [
+            _tool_call_entry(name="web_read", args={
+                "url": url, "max_bytes": 524288, "max_markdown_chars": 10000,
+            }),
+            {"expect_web_read": {
+                "executor_ok": True,
+                "page": {"status": "ok", "http_status": 200},
+                "marker": marker,
+            }, "text": "Verified page marker; all done"},
+        ])
+        run_id = str(uuid.uuid4())
+        document = _intent_document(
+            run_id, allowed=("web.read",), connection="gateway", profile="fast",
+            wait_poll_seconds=0.5,
+        )
+        client = EngineClient(agent_url)
+        worker = None
+        try:
+            worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "web")
+            _run(insert_run(run_id, requested_grants=("web.read",)))
+            client.enqueue_run(run_id, agent_run.HANDLER_NAME, _canonical(document))
+            _wait_until(
+                lambda: _terminal_engine_state(client, run_id) in ("succeeded", "failed"),
+                RUN_TIMEOUT, "web.read terminal run",
+            )
+            assert _terminal_engine_state(client, run_id) == "succeeded", _journal_lines(scenario)
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        assert _journal_lines(scenario) == [
+            "model_call", "transport:web.read", "model_call",
+            "tool_return:executed", "web_read_output_verified",
+        ]
+        envelope = json.loads((scenario / "web-read.json.result").read_text())
+        assert envelope["executor_ok"] is True
+        assert envelope["approval_id"] is None
+        assert envelope["approval_spent"] is False
+        output = envelope["output"]
+        assert output["truncated"] is False and output["omitted_bytes"] == 0
+        assert len(output["text"].encode("utf-8")) < 65536
+        page = json.loads(output["text"])
+        assert page["status"] == "ok" and page["http_status"] == 200
+        assert marker in page["markdown"]
+        assert 0 < len(page["markdown"]) <= 10000
+        assert page["bytes_read"] == len(body.encode("utf-8"))
+        assert page["truncated"] is False
+        assert page["url"] == page["final_url"] == page["citation"] == url
+        assert page["trust"] == "untrusted_external"
+
+        rows = _read_step_rows(agent_url, run_id)
+        assert len(rows) == 1
+        assert rows[0]["seq"] == 1 and rows[0]["capability_id"] == "web.read"
+        assert rows[0]["state"] == "succeeded"
+        receipt = rows[0]["receipt"]
+        assert receipt["allowed"] is True and receipt["effect"] == "executed"
+        assert receipt["status"] == "ok"
+        assert receipt["response"] == page
+        assert receipt["params"] == {
+            "url": url, "max_bytes": 524288, "max_markdown_chars": 10000,
+        }
+        events = _read_events(agent_url, run_id)
+        types = [event.type for event in events]
+        assert "agent.completed" in types
+        assert "agent.awaiting_reconciliation" not in types
+        assert "agent.failed" not in types
+        assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
+
+    def test_real_web_read_recovers_after_ordinary_read_failures(
+        self, agent_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """W6b: ordinary read failures are honest answers, not stalls.
+
+        A scripted sequence of REAL capability results — a size refusal, a
+        200 plain-text read, a 403 and a 404 (both carrying their numeric
+        ``http_status``), a valid 512 KiB-budget read and a successful
+        alternative — is delivered to the model through the real worker,
+        dispatcher, bridge and durable conversation. The model observes each
+        actual tool response; the run finishes successfully, every ordinary
+        failure is recorded as a KNOWN outcome (never ``outcome_unknown``),
+        the run never parks in reconciliation, and the successful answer
+        keeps its valid JSON, citation and trust label intact.
+
+        Only the HTTP boundary and the model are controlled: the transport is
+        the httpx2 MockTransport and the resolver is a stub, so no public site
+        is contacted.
+        """
+        host = "wiki.example.com"
+        base = f"https://{host}"
+        size_marker = "W6B-SIZE-REFUSAL-51c8"
+        plain_marker = "W6B-PLAINTEXT-9ae2"
+        big_marker = "W6B-BIG-512K-3f77"
+        alt_marker = "W6B-ALTERNATIVE-7b40"
+        big_body = f"{big_marker}\n" + "y" * 400000
+        big_bytes = len(big_body.encode("utf-8"))
+        (scenario / "web-read.json").write_text(
+            json.dumps({
+                "hosts": [host],
+                "responses": [
+                    {   # 1. size refusal: the body is over the byte budget
+                        "host": host,
+                        "path": "/too-big",
+                        "status": 200,
+                        "content_type": "text/plain",
+                        "body": "x" * 100000,
+                    },
+                    {   # 2. a 200 plain-text read (returned verbatim)
+                        "host": host,
+                        "path": "/plain",
+                        "status": 200,
+                        "content_type": "text/plain",
+                        "body": f"plain text body {plain_marker}\n",
+                    },
+                    {   # 3. a 403 carrying its numeric http_status
+                        "host": host,
+                        "path": "/forbidden",
+                        "status": 403,
+                        "content_type": "text/html",
+                        "body": "<html><body>forbidden</body></html>",
+                    },
+                    {   # 4. a 404 carrying its numeric http_status
+                        "host": host,
+                        "path": "/missing",
+                        "status": 404,
+                        "content_type": "text/html",
+                        "body": "<html><body>missing</body></html>",
+                    },
+                    {   # 5. a valid 512 KiB-budget read (a big plain body)
+                        "host": host,
+                        "path": "/big",
+                        "status": 200,
+                        "content_type": "text/plain",
+                        "body": big_body,
+                    },
+                    {   # 6. the successful alternative the model switches to
+                        "host": host,
+                        "path": "/alternative",
+                        "status": 200,
+                        "content_type": "text/plain",
+                        "body": f"alternative source {alt_marker}\n",
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        composition(capability="web.read")
+        _write_policy_files(scenario, grants=[{"web.read": True}])
+        _script(scenario, [
+            # round 0: the size refusal (max_bytes under the declared body)
+            _tool_call_entry(
+                name="web_read", call_id="c1",
+                args={
+                    "url": f"{base}/too-big", "max_bytes": 32768,
+                    "max_markdown_chars": 10000,
+                },
+            ),
+            # round 1: observes read 1 (refused), then reads the plain page
+            {
+                "expect_web_read": {
+                    "capture": "r1",
+                    "status": "denied",
+                    "executor_ok": False,
+                    "effect": "executed",
+                    "page": {
+                        "status": "refused",
+                        "code": "response_too_large",
+                        "http_status": None,
+                    },
+                },
+                **_tool_call_entry(
+                    name="web_read", call_id="c2",
+                    args={
+                        "url": f"{base}/plain", "max_bytes": 524288,
+                        "max_markdown_chars": 10000,
+                    },
+                ),
+            },
+            # round 2: observes read 2 (ok), then hits the 403
+            {
+                "expect_web_read": {
+                    "capture": "r2",
+                    "status": "executed",
+                    "executor_ok": True,
+                    "effect": "executed",
+                    "page": {"status": "ok", "http_status": 200},
+                    "marker": plain_marker,
+                },
+                **_tool_call_entry(
+                    name="web_read", call_id="c3",
+                    args={
+                        "url": f"{base}/forbidden", "max_bytes": 524288,
+                        "max_markdown_chars": 10000,
+                    },
+                ),
+            },
+            # round 3: observes read 3 (403), then hits the 404
+            {
+                "expect_web_read": {
+                    "capture": "r3",
+                    "status": "denied",
+                    "executor_ok": False,
+                    "effect": "executed",
+                    "page": {
+                        "status": "unavailable",
+                        "code": "fetch_error",
+                        "http_status": 403,
+                    },
+                },
+                **_tool_call_entry(
+                    name="web_read", call_id="c4",
+                    args={
+                        "url": f"{base}/missing", "max_bytes": 524288,
+                        "max_markdown_chars": 10000,
+                    },
+                ),
+            },
+            # round 4: observes read 4 (404), then makes the valid 512 KiB request
+            {
+                "expect_web_read": {
+                    "capture": "r4",
+                    "status": "denied",
+                    "executor_ok": False,
+                    "effect": "executed",
+                    "page": {
+                        "status": "unavailable",
+                        "code": "fetch_error",
+                        "http_status": 404,
+                    },
+                },
+                **_tool_call_entry(
+                    name="web_read", call_id="c5",
+                    args={
+                        "url": f"{base}/big", "max_bytes": 524288,
+                        "max_markdown_chars": 10000,
+                    },
+                ),
+            },
+            # round 5: observes read 5 (the valid 512 KiB request), then the
+            # successful alternative, and finally reports honestly.
+            {
+                "expect_web_read": {
+                    "capture": "r5",
+                    "status": "executed",
+                    "executor_ok": True,
+                    "effect": "executed",
+                    "page": {
+                        "status": "ok", "http_status": 200,
+                        "bytes_read": big_bytes, "truncated": True,
+                    },
+                    "marker": big_marker,
+                },
+                **_tool_call_entry(
+                    name="web_read", call_id="c6",
+                    args={
+                        "url": f"{base}/alternative", "max_bytes": 524288,
+                        "max_markdown_chars": 10000,
+                    },
+                ),
+            },
+            # round 6: observes read 6 (the successful alternative) and finishes
+            {
+                "expect_web_read": {
+                    "capture": "r6",
+                    "status": "executed",
+                    "executor_ok": True,
+                    "effect": "executed",
+                    "page": {"status": "ok", "http_status": 200},
+                    "marker": alt_marker,
+                },
+                "text": (
+                    "The refused, forbidden and missing pages were reported "
+                    "honestly; the alternative source answered and is cited."
+                ),
+            },
+        ])
+        run_id = str(uuid.uuid4())
+        document = _intent_document(
+            run_id, allowed=("web.read",), connection="gateway", profile="fast",
+            wait_poll_seconds=0.5,
+            # A short reconciliation deadline: if an ordinary failure ever
+            # parked the run as an unknown effect, the park would expire
+            # quickly and the run would fail HONESTLY instead of hanging.
+            reconcile_wait_seconds=5.0,
+        )
+        client = EngineClient(agent_url)
+        worker = None
+        try:
+            worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "web")
+            _run(insert_run(run_id, requested_grants=("web.read",)))
+            client.enqueue_run(run_id, agent_run.HANDLER_NAME, _canonical(document))
+            _wait_until(
+                lambda: _terminal_engine_state(client, run_id) in ("succeeded", "failed"),
+                RUN_TIMEOUT, "web.read recovery terminal run",
+            )
+            assert _terminal_engine_state(client, run_id) == "succeeded", _journal_lines(scenario)
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        # -- the model observed six real tool responses, in order ----------
+        lines = _journal_lines(scenario)
+        assert lines.count("model_call") == 7  # six tool rounds + the final one
+        assert lines.count("transport:web.read") == 6
+        for path in (
+            "/too-big", "/plain", "/forbidden", "/missing", "/big", "/alternative",
+        ):
+            assert lines.count(f"transport:web.read:{path}") == 1, path
+        assert lines.count("web_read_output_verified") == 6
+        # The tool results the model received: the ordinary failures are
+        # honest non-success answers, the successes are executions.
+        assert [
+            line for line in lines if line.startswith("tool_return:")
+        ] == [
+            "tool_return:denied",    # size refusal
+            "tool_return:executed",  # 200 plain-text read
+            "tool_return:denied",    # 403
+            "tool_return:denied",    # 404
+            "tool_return:executed",  # valid 512 KiB request
+            "tool_return:executed",  # successful alternative
+        ], lines
+
+        # -- each recorded envelope is the honest answer -------------------
+        r1 = json.loads((scenario / "web-read.json.r1.result").read_text())
+        assert r1["status"] == "denied" and r1["executor_ok"] is False
+        page1 = json.loads(r1["output"]["text"])
+        assert page1["status"] == "refused"
+        assert page1["code"] == "response_too_large"
+        assert page1["http_status"] is None
+        assert page1["trust"] == "untrusted_external"
+        assert size_marker not in page1["markdown"]
+
+        r2 = json.loads((scenario / "web-read.json.r2.result").read_text())
+        assert r2["status"] == "executed" and r2["executor_ok"] is True
+        page2 = json.loads(r2["output"]["text"])
+        assert page2["status"] == "ok" and page2["http_status"] == 200
+        assert plain_marker in page2["markdown"]
+        assert page2["url"] == page2["final_url"] == page2["citation"] == (
+            f"{base}/plain"
+        )
+        assert page2["trust"] == "untrusted_external"
+
+        r3 = json.loads((scenario / "web-read.json.r3.result").read_text())
+        assert r3["status"] == "denied" and r3["executor_ok"] is False
+        page3 = json.loads(r3["output"]["text"])
+        assert page3["status"] == "unavailable"
+        assert page3["code"] == "fetch_error"
+        assert page3["http_status"] == 403
+
+        r4 = json.loads((scenario / "web-read.json.r4.result").read_text())
+        assert r4["status"] == "denied" and r4["executor_ok"] is False
+        page4 = json.loads(r4["output"]["text"])
+        assert page4["status"] == "unavailable"
+        assert page4["code"] == "fetch_error"
+        assert page4["http_status"] == 404
+
+        r5 = json.loads((scenario / "web-read.json.r5.result").read_text())
+        assert r5["status"] == "executed" and r5["executor_ok"] is True
+        page5 = json.loads(r5["output"]["text"])
+        assert page5["status"] == "ok" and page5["http_status"] == 200
+        assert big_marker in page5["markdown"]
+        assert page5["truncated"] is True  # the Markdown budget cut it, honestly
+        assert page5["trust"] == "untrusted_external"
+
+        r6 = json.loads((scenario / "web-read.json.r6.result").read_text())
+        assert r6["status"] == "executed" and r6["executor_ok"] is True
+        page6 = json.loads(r6["output"]["text"])
+        assert page6["status"] == "ok" and page6["http_status"] == 200
+        assert alt_marker in page6["markdown"]
+        assert page6["citation"] == f"{base}/alternative"
+        assert page6["trust"] == "untrusted_external"
+
+        # -- the durable rows: every failure is a KNOWN outcome ------------
+        rows = _read_step_rows(agent_url, run_id)
+        # Round-major seq derivation (one tool call per round).
+        assert [row["seq"] for row in rows] == [
+            1, 9, 17, 25, 33, 41,
+        ]
+        assert [row["state"] for row in rows] == [
+            "failed", "succeeded", "failed", "failed", "succeeded", "succeeded",
+        ]
+        assert all(row["state"] != "outcome_unknown" for row in rows)
+        assert [row["receipt"]["reason"] for row in rows] == [
+            "response_too_large", "allowed", "fetch_error", "fetch_error",
+            "allowed", "allowed",
+        ]
+        assert [row["receipt"]["executor_ok"] for row in rows] == [
+            False, True, False, False, True, True,
+        ]
+        # The recorded payload of every attempt (the explicit request).
+        assert [row["receipt"]["params"]["url"] for row in rows] == [
+            f"{base}/too-big", f"{base}/plain", f"{base}/forbidden",
+            f"{base}/missing", f"{base}/big", f"{base}/alternative",
+        ]
+        assert rows[4]["receipt"]["params"]["max_bytes"] == 524288
+        assert rows[0]["receipt"]["params"]["max_bytes"] == 32768
+        # The refusals carried their honest answer into the durable receipt.
+        assert rows[0]["receipt"]["response"]["code"] == "response_too_large"
+        assert rows[2]["receipt"]["response"]["http_status"] == 403
+        assert rows[3]["receipt"]["response"]["http_status"] == 404
+
+        # -- the run finished cleanly and never parked --------------------
+        events = _read_events(agent_url, run_id)
+        types = [event.type for event in events]
+        assert "agent.completed" in types
+        assert "agent.awaiting_reconciliation" not in types
+        assert "agent.failed" not in types
+        assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
+
     def test_conversation_executes_tool_once_and_succeeds(
         self, agent_url, factory, insert_run, scenario, composition
     ) -> None:
@@ -1155,7 +1707,13 @@ class TestDurableAgentRuns:
     def test_privileged_call_records_approval_binding_and_run_continues(
         self, agent_url, factory, insert_run, scenario, composition
     ) -> None:
-        """The approval_required answer carries the durable binding; nothing runs."""
+        """The approval_required answer carries the durable binding; nothing runs.
+
+        ASK mode is the prompting mode (C03 rule 5): a granted privileged
+        capability still needs an approval decision, so the call is
+        refused before any effect and the durable binding the resume
+        surface consumes is recorded.
+        """
         composition()
         _write_policy_files(scenario, grants=[{READ_CAP: True}, {PRIV_CAP: True}])
         _script(
@@ -1167,7 +1725,11 @@ class TestDurableAgentRuns:
         )
         run_id = str(uuid.uuid4())
         document = _intent_document(
-            run_id, allowed=(READ_CAP, PRIV_CAP), connection="gateway", profile="fast"
+            run_id,
+            allowed=(READ_CAP, PRIV_CAP),
+            mode="ask",
+            connection="gateway",
+            profile="fast",
         )
         client = EngineClient(agent_url)
         worker = None
@@ -1197,6 +1759,79 @@ class TestDurableAgentRuns:
         # The durable binding the resume surface consumes (C03 rule 4).
         assert receipt["payload_hash"]
         assert receipt["policy_revision"] == 1
+        assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
+
+    def test_privileged_call_executes_once_in_delegated_mode(
+        self, agent_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """DELEGATED mode runs a granted privileged capability without prompting.
+
+        The counterpart of the ASK-mode refusal above: the same granted
+        privileged capability, inside the same grants, executes EXACTLY
+        once when the context's mode is delegated (C03 rule 5 — the mode
+        never widens a grant, it only decides whether a decision is
+        prompted). The fixture capability is the controlled one; no real
+        privileged operation runs.
+        """
+        composition()
+        _write_policy_files(scenario, grants=[{READ_CAP: True}, {PRIV_CAP: True}])
+        _script(
+            scenario,
+            [
+                _tool_call_entry(name="fixture_priv"),
+                {"text": "delegated run finished"},
+            ],
+        )
+        run_id = str(uuid.uuid4())
+        document = _intent_document(
+            run_id,
+            allowed=(READ_CAP, PRIV_CAP),
+            mode="delegated",
+            connection="gateway",
+            profile="fast",
+        )
+        client = EngineClient(agent_url)
+        worker = None
+        try:
+            worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+            _run(_enqueue_run(client, insert_run, run_id, document))
+            _wait_until(
+                lambda: (_terminal_engine_state(client, run_id) or "") == "succeeded",
+                RUN_TIMEOUT,
+                "run success",
+            )
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        # The effect happened EXACTLY once and the model saw the executed
+        # result on its continuation round.
+        assert _journal_lines(scenario) == [
+            "model_call",
+            "begin:fixture.priv:m1",
+            "effect:fixture.priv:m1",
+            "model_call",
+            "tool_return:executed",
+        ]
+
+        row = _read_step_row(agent_url, run_id, 1)
+        assert row is not None and row["state"] == "succeeded"
+        receipt = row["receipt"]
+        assert receipt["allowed"] is True
+        assert receipt["reason"] == "allowed"
+        assert receipt["effect"] == "executed"
+        assert receipt["executor_ok"] is True
+        assert receipt["policy_revision"] == 1
+        assert receipt["payload_hash"]
+        assert receipt["capability_id"] == PRIV_CAP
+        # No approval was needed in delegated mode, so none was spent and
+        # none was created.
+        assert receipt["approval_spent"] is False
+        assert receipt["approval_id"] is None
+        # The privilege advisory lives on the policy decision; the durable
+        # receipt is value-free and carries no advisory claim of its own.
+        assert "advisories" not in receipt
         assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
 
     def test_production_model_errors_classify_and_fail_without_effect(

@@ -192,9 +192,133 @@ _CHALLENGE_SURFACE = frozenset(
     }
 )
 
+#: The frozen feature surface registered by the later api modules
+#: (05-jobs, 06-chat, 06-model, 07-docs, 08-app, 09-plugins, 10-monitor,
+#: 11-knowledge). Every pair below is transcribed from the actual route
+#: definitions in the owning api module — the pin is a deliberate,
+#: reviewable list, never derived from the running app.
+_FEATURE_SURFACE = frozenset(
+    {
+        # (05-jobs-api: durable runs + the run event stream.)
+        ("GET", "/api/v1/jobs/runs"),
+        ("POST", "/api/v1/jobs/runs"),
+        ("GET", "/api/v1/jobs/runs/{run_id}"),
+        ("POST", "/api/v1/jobs/runs/{run_id}/cancel"),
+        ("GET", "/api/v1/jobs/runs/{run_id}/events"),
+        # (05-jobs-api: the durable schedule configuration surface.)
+        ("GET", "/api/v1/schedules"),
+        ("POST", "/api/v1/schedules"),
+        ("GET", "/api/v1/schedules/{schedule_id}"),
+        ("PATCH", "/api/v1/schedules/{schedule_id}"),
+        ("DELETE", "/api/v1/schedules/{schedule_id}"),
+        ("GET", "/api/v1/schedules/{schedule_id}/fires"),
+        # (06-chat-api: conversations, the conversation event stream and the
+        # lazy-loaded single tool step.)
+        ("GET", "/api/v1/chat/runs"),
+        ("GET", "/api/v1/chat/runs/{run_id}"),
+        ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
+        ("POST", "/api/v1/chat/messages"),
+        ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
+        # (06-model-api: stored connections/profiles/selection + probe.)
+        ("GET", "/api/v1/models/connections"),
+        ("GET", "/api/v1/models/connections/{name}"),
+        ("PUT", "/api/v1/models/connections/{name}"),
+        ("DELETE", "/api/v1/models/connections/{name}"),
+        ("GET", "/api/v1/models/profiles"),
+        ("GET", "/api/v1/models/profiles/{name}"),
+        ("PUT", "/api/v1/models/profiles/{name}"),
+        ("DELETE", "/api/v1/models/profiles/{name}"),
+        ("GET", "/api/v1/models/selection"),
+        ("PUT", "/api/v1/models/selection"),
+        ("DELETE", "/api/v1/models/selection"),
+        ("POST", "/api/v1/models/test"),
+        # (07-docs-api: canonical documents, retrieval, index, generate,
+        # research.)
+        ("GET", "/api/v1/docs"),
+        ("POST", "/api/v1/docs"),
+        ("GET", "/api/v1/docs/{doc_id}"),
+        ("PUT", "/api/v1/docs/{doc_id}"),
+        ("DELETE", "/api/v1/docs/{doc_id}"),
+        ("POST", "/api/v1/docs/retrieve"),
+        ("GET", "/api/v1/docs/index"),
+        ("POST", "/api/v1/docs/index/reconcile"),
+        ("POST", "/api/v1/docs/generate"),
+        ("POST", "/api/v1/docs/research"),
+        # (08-app-api: observed inventory + explicit adoptions + lifecycle
+        # intent submits.)
+        ("GET", "/api/v1/servers/{server_id}/applications"),
+        ("GET", "/api/v1/servers/{server_id}/applications/discoveries"),
+        ("POST", "/api/v1/servers/{server_id}/applications"),
+        ("DELETE", "/api/v1/servers/{server_id}/applications/{application_id}"),
+        ("POST", "/api/v1/servers/{server_id}/applications/plan"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/update"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/remove"),
+        # (09-plugins-api: plugin configs/bindings/discovery + skills.)
+        ("GET", "/api/v1/plugins"),
+        ("GET", "/api/v1/plugins/{plugin}/config"),
+        ("PUT", "/api/v1/plugins/{plugin}/config"),
+        ("DELETE", "/api/v1/plugins/{plugin}/config"),
+        ("GET", "/api/v1/plugins/{plugin}/schema"),
+        ("GET", "/api/v1/plugins/{plugin}/bindings"),
+        ("PUT", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("DELETE", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
+        ("POST", "/api/v1/plugins/{plugin}/discovery"),
+        ("GET", "/api/v1/skills"),
+        ("GET", "/api/v1/skills/{skill}"),
+        # (10-monitor-api: observations/findings/notifications + policy.)
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/findings/evaluate"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications"),
+        ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
+        ("GET", "/api/v1/monitoring/notification-policy"),
+        # (11-knowledge-api: memory surface + local model install/pull.)
+        ("GET", "/api/v1/servers/{server_id}/memory/status"),
+        ("POST", "/api/v1/servers/{server_id}/memory/recall"),
+        ("POST", "/api/v1/servers/{server_id}/memory/retain"),
+        ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
+        ("GET", "/api/v1/servers/{server_id}/memory/export"),
+        ("POST", "/api/v1/servers/{server_id}/memory/delete"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
+        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
+        # (mai-wire-desktop: the launcher's server list route.)
+        ("GET", "/api/v1/servers"),
+    }
+)
+
+#: The whole registered table, pinned explicitly: health + the boundary +
+#: the profile/approval/grants/challenge surfaces + the frozen feature
+#: surface. Any new route must extend this pin consciously.
+_FROZEN_SURFACE = (
+    frozenset({("GET", HEALTH_PATH), ("GET", READINESS_PATH)})
+    | _AUTH_SURFACE
+    | _PROFILE_SURFACE
+    | _APPROVAL_SURFACE
+    | _GRANTS_SURFACE
+    | _CHALLENGE_SURFACE
+    | _FEATURE_SURFACE
+)
+
+#: The setup-state public surface of the auth ADR §8 G1 gate: the two
+#: health reads and the one-shot bootstrap. Every other operation is
+#: session-gated and declares its 401 refusal in the generated schema.
+_SETUP_PUBLIC_SURFACE = frozenset(
+    {
+        ("GET", HEALTH_PATH),
+        ("GET", READINESS_PATH),
+        ("POST", "/api/v1/auth/bootstrap"),
+    }
+)
+
 
 def test_app_registers_exactly_the_g1_health_surface() -> None:
-    """P02 surface: health + auth boundary + profile surface; nothing else.
+    """The whole frozen route table is registered — nothing more, nothing less.
 
     (02-profile-api remediation: the P02 route-table pin expanded by the
     frozen profile routes; intent unchanged — every privileged operation is
@@ -202,8 +326,11 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     everything under the /api/v1 prefix. 03-approval-api remediation: the
     pin expanded again by the frozen approval preview/decision routes.
     03-grants-api remediation: the pin expanded by the frozen
-    grant-configuration read/edit routes. 04-password-api remediation:
-    the pin expanded by the frozen submit-only challenge route.)
+    grant-configuration read/edit routes. 04-password-api remediation: the
+    pin expanded by the frozen submit-only challenge route. Later api
+    modules (05–11 and the desktop launcher route) expanded it again;
+    every pair is transcribed from the owning api module's route
+    definition, so the pin stays a deliberate, reviewable list.)
     """
     app = create_app(env={})
     api_routes = [
@@ -219,14 +346,7 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     table = {
         (method, route.path) for route in api_routes for method in route.methods
     }
-    assert table == (
-        {("GET", HEALTH_PATH), ("GET", READINESS_PATH)}
-        | _AUTH_SURFACE
-        | _PROFILE_SURFACE
-        | _APPROVAL_SURFACE
-        | _GRANTS_SURFACE
-        | _CHALLENGE_SURFACE
-    )
+    assert table == _FROZEN_SURFACE
     mutating = {
         route.path
         for route in api_routes
@@ -234,12 +354,8 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     }
     assert mutating == {
         path
-        for method, path in _AUTH_SURFACE
-        | _PROFILE_SURFACE
-        | _APPROVAL_SURFACE
-        | _GRANTS_SURFACE
-        | _CHALLENGE_SURFACE
-        if method in {"POST", "PUT"}
+        for method, path in _FROZEN_SURFACE
+        if method in {"POST", "PUT", "PATCH", "DELETE"}
     }
     for route in api_routes:
         assert route.path.startswith(API_PREFIX)
@@ -247,6 +363,21 @@ def test_app_registers_exactly_the_g1_health_surface() -> None:
     paths = {route.path for route in api_routes}
     assert "/docs" not in paths
     assert "/openapi.json" not in paths
+    # G1 public-surface guarantee: the setup-state public surface is pinned
+    # explicitly (auth ADR §8) — every other registered operation must
+    # declare its 401 refusal in the generated schema. A new route that
+    # reaches a privileged effect without a session-gated refusal breaks
+    # the boundary contract.
+    schema = app.openapi()
+    for path, operations in schema["paths"].items():
+        for method, operation in operations.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            declared = set(operation.get("responses", {}))
+            if (method.upper(), path) in _SETUP_PUBLIC_SURFACE:
+                assert "401" not in declared, (method, path)
+            else:
+                assert "401" in declared, (method, path)
 
 
 @pytest.mark.anyio
@@ -276,7 +407,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
     schema = app.openapi()
     assert schema["openapi"].startswith("3.")
     # (02-profile-api remediation: the P02 path pin expanded by the frozen
-    # profile routes; the health contract itself is unchanged.)
+    # profile routes; the health contract itself is unchanged. Later api
+    # modules expanded it again — every path below is transcribed from the
+    # owning api module's route definition.)
     assert set(schema["paths"]) == {
         HEALTH_PATH,
         READINESS_PATH,
@@ -296,6 +429,76 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         # (04-password-api remediation: the path pin expanded by the frozen
         # submit-only challenge route; health contract unchanged.)
         "/api/v1/password-challenges",
+        # (05-jobs-api: durable runs + schedules + the run event stream.)
+        "/api/v1/jobs/runs",
+        "/api/v1/jobs/runs/{run_id}",
+        "/api/v1/jobs/runs/{run_id}/cancel",
+        "/api/v1/jobs/runs/{run_id}/events",
+        "/api/v1/schedules",
+        "/api/v1/schedules/{schedule_id}",
+        "/api/v1/schedules/{schedule_id}/fires",
+        # (06-chat-api: conversations + the conversation event stream + the
+        # lazy-loaded single tool step.)
+        "/api/v1/chat/messages",
+        "/api/v1/chat/runs",
+        "/api/v1/chat/runs/{run_id}",
+        "/api/v1/chat/runs/{run_id}/cancel",
+        "/api/v1/chat/runs/{run_id}/events",
+        "/api/v1/chat/runs/{run_id}/steps/{seq}",
+        # (06-model-api: stored connections/profiles/selection + probe.)
+        "/api/v1/models/connections",
+        "/api/v1/models/connections/{name}",
+        "/api/v1/models/profiles",
+        "/api/v1/models/profiles/{name}",
+        "/api/v1/models/selection",
+        "/api/v1/models/test",
+        # (07-docs-api: canonical documents, retrieval, index, generate,
+        # research.)
+        "/api/v1/docs",
+        "/api/v1/docs/{doc_id}",
+        "/api/v1/docs/retrieve",
+        "/api/v1/docs/index",
+        "/api/v1/docs/index/reconcile",
+        "/api/v1/docs/generate",
+        "/api/v1/docs/research",
+        # (08-app-api: observed inventory + explicit adoptions + lifecycle
+        # intent submits.)
+        "/api/v1/servers/{server_id}/applications",
+        "/api/v1/servers/{server_id}/applications/discoveries",
+        "/api/v1/servers/{server_id}/applications/plan",
+        "/api/v1/servers/{server_id}/applications/{application_id}",
+        "/api/v1/servers/{server_id}/applications/{application_id}/install",
+        "/api/v1/servers/{server_id}/applications/{application_id}/update",
+        "/api/v1/servers/{server_id}/applications/{application_id}/remove",
+        # (09-plugins-api: plugin configs/bindings/discovery + skills.)
+        "/api/v1/plugins",
+        "/api/v1/plugins/{plugin}/config",
+        "/api/v1/plugins/{plugin}/schema",
+        "/api/v1/plugins/{plugin}/bindings",
+        "/api/v1/plugins/{plugin}/bindings/{server_id}",
+        "/api/v1/plugins/{plugin}/discovery",
+        "/api/v1/skills",
+        "/api/v1/skills/{skill}",
+        # (10-monitor-api: observations/findings/notifications + policy.)
+        "/api/v1/monitoring/servers/{server_id}/observations",
+        "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}",
+        "/api/v1/monitoring/servers/{server_id}/findings",
+        "/api/v1/monitoring/servers/{server_id}/findings/{finding_id}",
+        "/api/v1/monitoring/servers/{server_id}/findings/evaluate",
+        "/api/v1/monitoring/servers/{server_id}/notifications",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
+        "/api/v1/monitoring/notification-policy",
+        # (11-knowledge-api: memory surface + local model install/pull.)
+        "/api/v1/servers/{server_id}/memory/status",
+        "/api/v1/servers/{server_id}/memory/recall",
+        "/api/v1/servers/{server_id}/memory/retain",
+        "/api/v1/servers/{server_id}/memory/reflect",
+        "/api/v1/servers/{server_id}/memory/export",
+        "/api/v1/servers/{server_id}/memory/delete",
+        "/api/v1/servers/{server_id}/models/local/preview",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
+        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]
@@ -313,7 +516,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         schema["paths"]["/api/v1/auth/logout"]["post"]["responses"]
     )
     # 02-profile-api surface: generated models, not handwritten types.
-    assert set(schema["paths"]["/api/v1/servers"]) == {"post"}
+    # (mai-wire-desktop added the launcher's server list read to the same
+    # path — the profile surface pin grew with it.)
+    assert set(schema["paths"]["/api/v1/servers"]) == {"get", "post"}
     assert set(schema["paths"]["/api/v1/servers/{server_id}"]) == {"get", "put"}
     assert "requestBody" in schema["paths"]["/api/v1/servers"]["post"]
     assert {"ProfileCreate", "ProfileEdit", "ProfileResponse"} <= set(

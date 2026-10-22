@@ -980,9 +980,14 @@ async def list_adopted(
     Safe method: session layer only. Adoption records are the managed
     truth; discovery observations are a SEPARATE resource and never merge
     into this page (C09 rule 1). Service Map entries with no SQL adoption
-    row (``origin="manual"`` chat/agent additions) appear seamlessly at
-    the tail of the page, and the merged category taxonomy rides the page
-    for the picker.
+    row appear seamlessly at the tail of the page ONLY when they are
+    genuine map-only additions (``origin="manual"`` chat/agent entries,
+    which never own a live compose/systemd/docker target). A Service Map
+    sidecar whose adoption record is gone (revoked) keeps its
+    non-manual origin and is therefore ORPHANED metadata: it is hidden
+    from this listing (the sidecar itself is retained on disk, untouched),
+    so a revoked application disappears from the adopted list. The merged
+    category taxonomy rides the page for the picker.
     """
     await _require_session(request)
     adoption = _adoption(request)
@@ -994,10 +999,19 @@ async def list_adopted(
         for record in records
     ]
     adopted_ids = {view.application_id for view in views}
+    # Map-only fallback: a sidecar without an adoption row is listed only
+    # when it is a manual map addition. Non-manual sidecars
+    # (compose/systemd_unit/docker_container) mirror a live target that
+    # the SQL projection owns; with no projection row they are orphaned
+    # adoption metadata (e.g. after a revoke) and must not be listed.
     views.extend(
         _map_entry_view(entry)
         for entry in sorted(
-            (entry for aid, entry in entries.items() if aid not in adopted_ids),
+            (
+                entry
+                for aid, entry in entries.items()
+                if aid not in adopted_ids and entry.origin == "manual"
+            ),
             key=lambda entry: (entry.name, entry.application_id),
         )
     )

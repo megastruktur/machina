@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,8 +55,9 @@ ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 #: The constant tracks the full chain; head assertions target the TIP, so
-#: appending 0003_approvals keeps every chain-aware test truthful.
-REVISION_IDS = ("0001", "0002", "0003")
+#: every later chain appender (0004 jobs, 0005 knowledge, 0006 applications,
+#: 0007 observations) keeps these chain-aware tests truthful.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
 #: Disposable in-fixture stand-in for the privileged effect whose execution
 #: the approval would authorize (APPROVAL-PAYLOAD observable: unchanged on
@@ -87,9 +89,30 @@ ALTERED_PAYLOAD_HASH = _payload_hash(b'{"op": "deploy", "v": 2}')
 # ---------------------------------------------------------------------------
 
 
+def _reset_fixture_db(url: str) -> None:
+    """Reset the disposable database with the explicit full-chain drop list.
+
+    Earlier modules can leave tables from migrations 0001 through 0007.
+    The observation sequence is not owned by its table and needs its own
+    drop, matching the reset in tests/test_servers_http.py.
+    """
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
+            "job_schedules, job_events, job_steps, job_runs, approvals, "
+            "profile_projection_journal, profile_projection, admin_sessions, "
+            "admin_credential, alembic_version, notification_alerts, "
+            "observation_findings, server_observations, knowledge_doc_chunks, "
+            "knowledge_documents, application_projection_journal, "
+            "application_projection"
+        )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        conn.commit()
+
+
 @pytest.fixture(scope="session")
-def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0003``."""
+def migrated_url() -> Iterator[str]:
+    """Migrate from zero, then restore pre-bootstrap state for repeat runs."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -99,20 +122,15 @@ def migrated_url() -> str:
     previous = os.environ.get("MAI_DATABASE_URL")
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
-        with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS approvals, admin_sessions, "
-                "admin_credential, profile_projection_journal, "
-                "profile_projection, alembic_version"
-            )
-            conn.commit()
+        _reset_fixture_db(url)
         command.upgrade(_alembic_config(), "head")
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)
         else:
             os.environ["MAI_DATABASE_URL"] = previous
-    return url
+    yield url
+    _reset_fixture_db(url)
 
 
 @pytest.fixture
@@ -240,7 +258,7 @@ def test_migration_chain_is_linear_and_approvals_follow_sessions(
 def test_upgrade_from_zero_lands_on_head_and_is_idempotent(
     migrated_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at 0003."""
+    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at the tip."""
     monkeypatch.setenv("MAI_DATABASE_URL", migrated_url)
     command.upgrade(_alembic_config(), "head")
     with psycopg.connect(migrated_url) as conn:

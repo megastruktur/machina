@@ -338,6 +338,8 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/chat/runs/{run_id}"),
         ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
         ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        # (mai-wire-desktop/chat: the lazy-loaded single tool step read.)
+        ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
         ("GET", "/api/v1/models/connections"),
         ("GET", "/api/v1/models/connections/{name}"),
         ("PUT", "/api/v1/models/connections/{name}"),
@@ -476,6 +478,7 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/chat/runs/{run_id}",
         "/api/v1/chat/runs/{run_id}/cancel",
         "/api/v1/chat/runs/{run_id}/events",
+        "/api/v1/chat/runs/{run_id}/steps/{seq}",
         "/api/v1/models/connections",
         "/api/v1/models/connections/{name}",
         "/api/v1/models/profiles",

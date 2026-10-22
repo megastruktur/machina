@@ -35,10 +35,18 @@ exclusively as a trusted capability implementation behind
   not just the retained bytes) stops at budget+1 decoded bytes, so an
   oversized page is ``response_too_large`` after at most ``max_bytes + 1``
   bytes of work. The fetch has a bounded timeout, at most
-  ``MAX_REDIRECTS`` hops are followed, and only HTML-family content types
-  are extracted (anything else is ``unsupported_content_type``). The
-  capability is a reader, not a generic downloader: binary documents are
-  out of scope by design.
+  ``MAX_REDIRECTS`` hops are followed, and only the HTML family and
+  plain-text/Markdown documents are read (anything else is
+  ``unsupported_content_type``). The capability is a reader, not a
+  generic downloader: binary documents are out of scope by design.
+- **Plain text and Markdown are returned verbatim** — an explicit
+  media-type allowlist (``text/plain``, ``text/markdown``) routes those
+  documents around the HTML parser entirely, so code samples, angle
+  brackets and non-ASCII characters survive unchanged. There is no
+  sniffing, no wildcard type and no binary/PDF/JSON branch: the list is
+  the contract. A response may declare an unknown charset; the reader
+  then falls back to UTF-8 with replacement characters instead of
+  failing the read.
 - **Clean Markdown, no script execution (feature-gate scenario)** —
   extraction is a pure stdlib ``html.parser`` pass: ``script``/``style``/
   ``noscript``/``template``/embedded-object subtrees never reach the
@@ -57,12 +65,32 @@ exclusively as a trusted capability implementation behind
   capability performs fetching/bounding/quoting only (C06 rule 2 —
   retrieved text is context, never system authority).
 - **Honest failure taxonomy** — a timeout is ``fetch_timeout``, a
-  transport/DNS failure is ``fetch_unreachable``, an HTTP error status is
-  ``fetch_error``; policy and budget refusals
+  transport/DNS failure is ``fetch_unreachable``, an HTTP error status
+  is ``fetch_error``; policy and budget refusals
   (``address_refused``/``response_too_large``/``too_many_redirects``/
   ``unsupported_content_type``) are ``status="refused"`` — the policy
   decision succeeded, the fetch did not run. Errors carry stable codes
   and the exception *type* only, never messages.
+- **The HTTP status is decided before the document is touched** — once
+  the redirect hops are handled, a response with a status of 400 or
+  above is an HTTP error, judged from the response headers alone: the
+  MIME gate, the byte budget and the body never run, and the error
+  body is never read. Such an answer carries its numeric
+  ``http_status`` (``404``, ``403``, ``429``, ``5xx`` …) — a number and
+  nothing else, never a header, a body or a message — together with the
+  logical (validated) URL of the failing hop, never the pinned
+  transport address. A successful read reports ``http_status=200``; a
+  policy refusal reports ``null``.
+- **Recoverable failures, not stalls** — every *known* page failure
+  (request/URL validation, provider wiring validation, policy/budget
+  refusals) is returned as a structured non-success result with
+  ``ok=false``, never raised past the executor. A recoverable refusal
+  must not become an unproven effect (an "unknown effect" stall) at
+  the dispatcher: the executor answered, so the effect is known. Only
+  a malformed executor object/context — a programming contract
+  violation — still raises. Diagnostics stay redacted: a rejected
+  URL is never reflected, so a credential-bearing or malformed target
+  can never reappear as a citable citation.
 
 Effect class ``read``; the module reads no process environment and takes
 no clock. The network seam is the injected provider alone (the httpx2
@@ -83,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import ipaddress
 import json
 import socket
@@ -92,13 +121,21 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
-from typing import Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.dispatch import (
+    REDACTED,
+    CapabilityCall,
+    ExecutorResult,
+    default_output_budget_bytes,
+)
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.research.search import normalize_citation_url
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import httpx2
 
 __all__ = [
     "CAPABILITY_ID",
@@ -125,6 +162,7 @@ __all__ = [
     "check_address_policy",
     "descriptor",
     "extract_markdown",
+    "extract_raw_text",
     "ip_allowed",
     "request_from_payload",
     "result_document",
@@ -162,10 +200,103 @@ DEFAULT_MAX_MARKDOWN_CHARS = 20_000
 MIN_MAX_MARKDOWN_CHARS = 1_000
 MAX_MARKDOWN_CHARS = 100_000
 
-#: The HTML-family content types this reader extracts. Anything else is
-#: ``unsupported_content_type`` — the capability reads pages, it is not a
-#: generic file downloader (bounded scope by design).
-_ALLOWED_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+#: The HTML-family content types this reader extracts through the HTML
+#: parser. Anything outside the two allowlists below is
+#: ``unsupported_content_type`` — the capability reads documents, it is
+#: not a generic file downloader (bounded scope by design).
+_HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+#: The raw-text content types this reader returns verbatim: plain text
+#: and Markdown are *already* text and must not be run through the HTML
+#: parser — a code sample with ``<div>`` in it would lose content to
+#: markup extraction. The list is explicit on purpose: no wildcard, no
+#: sniffing, no PDF/JSON/binary branch.
+_TEXT_CONTENT_TYPES = frozenset({"text/plain", "text/markdown"})
+
+#: Every media type this reader accepts.
+_ALLOWED_CONTENT_TYPES = _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES
+
+#: The charset used when a response declares none, or declares one the
+#: runtime cannot decode. UTF-8 with replacement characters is the safe
+#: fallback: a malformed charset label must never turn a readable
+#: document into a failed read.
+_DEFAULT_CHARSET = "utf-8"
+
+
+def _media_type(content_type: str | None) -> str:
+    """The lowercased media type of a ``Content-Type`` header.
+
+    Parameters (``; charset=utf-8``) are dropped and the type is
+    lowercased, so ``Text/Plain; Charset=UTF-8`` and ``text/plain``
+    are the same media type.
+    """
+    if not isinstance(content_type, str):
+        return ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+#: The bytes used to prove that a candidate charset label can actually
+#: decode text. The probe MUST be non-empty: several non-text codecs
+#: (``rot13``) decode an empty byte string without complaining and only
+#: fail once real bytes arrive, so an empty probe would bless a label
+#: that raises on the actual body.
+_CHARSET_PROBE_BYTES = b"probe"
+
+
+def _safe_charset(charset: str | None) -> str:
+    """A decodable charset label, or the safe default.
+
+    A response may declare a charset the runtime does not know
+    (``charset=definitely-not-a-charset``). Decoding with it would
+    raise and turn a readable document into a failed read, so an
+    unknown label falls back to UTF-8 with replacement characters —
+    the document stays readable and the substitution is visible in the
+    text, never hidden.
+
+    A label that resolves but cannot decode *text* is equally unsafe:
+    ``codecs.lookup`` succeeds for non-text codecs (``rot13``,
+    ``base64``, ``hex``, ``zlib``, ``uu``, ``quopri``, ``bz2``) whose
+    ``bytes.decode`` raises ``LookupError``, and a text codec may
+    still reject the error handler (``idna`` rejects
+    ``errors="replace"`` with ``UnicodeError``). Both classes are
+    rejected here, by a non-empty decode probe, and fall back to the
+    default charset.
+    """
+    if not isinstance(charset, str) or not charset.strip():
+        return _DEFAULT_CHARSET
+    candidate = charset.strip()
+    try:
+        info = codecs.lookup(candidate)
+    except (LookupError, ValueError):
+        return _DEFAULT_CHARSET
+    if not getattr(info, "_is_text_encoding", False):
+        return _DEFAULT_CHARSET
+    try:
+        _CHARSET_PROBE_BYTES.decode(candidate, errors="replace")
+    except (LookupError, UnicodeError, ValueError):
+        return _DEFAULT_CHARSET
+    return candidate
+
+
+def _decode_body(body: bytes, charset: str | None) -> str:
+    """The readable text of a response body, whatever it declares.
+
+    ``_safe_charset`` already rejects labels that cannot decode text,
+    but a codec can still fail on the *actual* bytes (content-dependent
+    failures), and a future ``RawPage`` producer may supply a charset
+    label that never passed through ``_safe_charset`` at all. This
+    narrow boundary keeps such a failure from escaping the capability:
+    the body is decoded again as UTF-8 with replacement characters, so
+    the read stays readable and the substitution stays visible.
+
+    Only codec failures are caught (``LookupError``, ``UnicodeError``,
+    ``ValueError``); cancellation and programmer errors are not
+    swallowed.
+    """
+    try:
+        return body.decode(_safe_charset(charset), errors="replace")
+    except (LookupError, UnicodeError, ValueError):
+        return body.decode(_DEFAULT_CHARSET, errors="replace")
 
 #: Redirect statuses followed as hops (GET semantics throughout; this
 #: capability never sends a body).
@@ -387,6 +518,25 @@ def validate_fetch_url(url: str) -> str:
             "url port is not parseable",
         ) from None
     return stripped
+
+
+def _safe_url(url: object) -> str:
+    """The URL if it is a fetchable, credential-free http(s) URL.
+
+    A URL that fails :func:`validate_fetch_url` (bad scheme, embedded
+    userinfo, unparseable, oversized) is never reflected back: the
+    empty string stands in for "no citable target". This keeps a
+    malformed or credential-bearing request out of the result document
+    and out of the citation entirely.
+    """
+    if not isinstance(url, str):
+        return ""
+    try:
+        return validate_fetch_url(url)
+    except PageError:
+        return ""
+    except Exception:  # noqa: BLE001 - a malformed target is simply no target
+        return ""
 
 
 def _default_resolver(host: str) -> Sequence[str]:
@@ -794,6 +944,29 @@ def _collapse_markdown(text: str) -> str:
     return "\n".join(out)
 
 
+def extract_raw_text(
+    text: str, *, max_chars: int = DEFAULT_MAX_MARKDOWN_CHARS
+) -> PageContent:
+    """Return one plain-text/Markdown document verbatim, character-capped.
+
+    Plain text and Markdown are already text: they are *not* run through
+    the HTML parser, so code samples, angle brackets, pipe tables and
+    non-ASCII characters survive exactly as the server sent them. The
+    only transformation is the character cap with an honest
+    ``truncated`` flag — a cut document keeps its citation downstream.
+
+    There is no title in a plain-text document, so the title is empty.
+    """
+    if not isinstance(text, str):
+        raise _reject(
+            PageErrorCode.INVALID_PAYLOAD,
+            "text must be a decoded string",
+        )
+    truncated = len(text) > max_chars
+    body = text[:max_chars] if truncated else text
+    return PageContent(title="", markdown=body, truncated=truncated)
+
+
 def extract_markdown(
     html: str, *, max_chars: int = DEFAULT_MAX_MARKDOWN_CHARS
 ) -> PageContent:
@@ -831,6 +1004,9 @@ class RawPage:
 
     ``url`` is the final URL after any redirect hops; ``hops`` counts
     them; ``charset`` is the response-declared encoding (or ``utf-8``).
+    ``http_status`` is the numeric status of the accepted response
+    (``200`` for a read page), or ``None`` when the seam did not report
+    one (a hand-built page in a test fixture).
     """
 
     url: str
@@ -839,6 +1015,7 @@ class RawPage:
     body: bytes
     charset: str
     hops: int
+    http_status: int | None = None
 
 
 class PageProvider(Protocol):
@@ -866,14 +1043,74 @@ def _classify_fetch_exception(exc: BaseException) -> PageErrorCode:
     return PageErrorCode.FETCH_ERROR
 
 
+def _http_status_error(
+    response: object, url: str, hops: int
+) -> "httpx2.HTTPStatusError":
+    """The HTTP-error verdict of one response, raised before its body.
+
+    The status is the only fact carried: the numeric code, the logical
+    (validated) URL of the failing hop and the hop count. The pinned
+    transport address never travels with it, and neither the error body
+    nor any header is read or copied — the error is a status, not a
+    document.
+    """
+    import httpx2
+
+    resp: httpx2.Response = response  # type: ignore[assignment]
+    error = httpx2.HTTPStatusError(
+        f"HTTP {resp.status_code}",
+        request=resp.request,
+        response=resp,
+    )
+    # The logical hop identity travels as attributes, never as the
+    # pinned-IP request URL httpx carries. ``setattr`` keeps the
+    # third-party exception type intact (its class stays
+    # ``HTTPStatusError`` for the value-free ``error_type``).
+    setattr(error, "http_status", int(resp.status_code))
+    setattr(error, "at_url", url)
+    setattr(error, "hops", hops)
+    return error
+
+
+def _http_status_of(exc: BaseException) -> int | None:
+    """The numeric HTTP status carried by one error, if it has one.
+
+    Only a number is ever extracted — never a header, a body or a
+    message. The status comes from the response object httpx carries on
+    its status errors.
+    """
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
+def _logical_url_of(exc: BaseException, fallback: str) -> str:
+    """The logical (validated) URL of a failed hop, never the pinned IP.
+
+    The provider attaches the validated hop URL to its own errors; when
+    an error carries none, the requested URL is the honest fallback.
+    """
+    at_url = getattr(exc, "at_url", None)
+    if isinstance(at_url, str) and at_url:
+        return at_url
+    return fallback
+
+
 class HttpPageProvider:
     """The bounded egress-controlled page fetch over an httpx2 client.
 
     Enforces, in order per hop: syntax validation, the address policy
     (resolve + validate, then dial the validated address — the connect
-    is pinned), the hop count, the content-type gate, and the byte
-    budget (``Content-Length`` pre-check, then a streaming read
-    abandoned at budget+1 decoded bytes). Sends a descriptive
+    is pinned), the hop count, the HTTP status gate (a status of 400 or
+    above is an HTTP error, judged before the body is touched), the
+    content-type gate, and the byte budget (``Content-Length``
+    pre-check, then a streaming read abandoned at budget+1 decoded
+    bytes). Sends a descriptive
     non-identifying User-Agent — no caller headers, no credentials, no
     host identity beyond the capability label (sanitized outbound
     context). The resolver and transport are constructor seams
@@ -1013,6 +1250,16 @@ class HttpPageProvider:
                         current = validate_fetch_url(urljoin(current, location))
                         hops += 1
                         continue
+                    if response.status_code >= 400:
+                        # The status verdict comes from the response
+                        # headers, before any MIME gate, length check or
+                        # body consumption: an error page is an HTTP
+                        # error, not an oversized or unsupported
+                        # document, and its body is never read. The
+                        # logical (validated) URL and hop count travel
+                        # with the error — never the pinned transport
+                        # address.
+                        raise _http_status_error(response, current, hops)
                     # The stream context owns closing the response (normal
                     # exit, refusal raise, or budget abort alike).
                     return await self._read_body(
@@ -1029,17 +1276,16 @@ class HttpPageProvider:
         Runs inside the caller's ``client.stream`` context: the response
         is closed by that context on every exit path, and the streaming
         abort at budget+1 *decoded* bytes bounds the transfer itself.
+        Only a response the status gate already accepted (``< 400``)
+        reaches this method, so an error body is never read here.
         """
-        import httpx2
-
         resp: httpx2.Response = response  # type: ignore[assignment]
-        content_type = (
-            resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        )
+        content_type = _media_type(resp.headers.get("content-type", ""))
         if content_type not in _ALLOWED_CONTENT_TYPES:
             raise _reject(
                 PageErrorCode.UNSUPPORTED_CONTENT_TYPE,
-                f"content type {content_type!r} is not an HTML page",
+                f"content type {content_type!r} is not a supported document "
+                "type",
                 at_url=url,
             )
         declared = resp.headers.get("content-length")
@@ -1065,16 +1311,7 @@ class HttpPageProvider:
                     f"response exceeded the {max_bytes}-byte budget",
                     at_url=url,
                 )
-        if resp.status_code >= 400:
-            # Read-then-status keeps the refusal taxonomy honest about
-            # where the bytes went; an error page is fetch_error, not a
-            # page.
-            raise httpx2.HTTPStatusError(
-                f"HTTP {resp.status_code}",
-                request=resp.request,
-                response=resp,
-            )
-        charset = resp.charset_encoding or "utf-8"
+        charset = _safe_charset(resp.charset_encoding)
         return RawPage(
             url=url,
             content_type=content_type,
@@ -1082,6 +1319,7 @@ class HttpPageProvider:
             body=b"".join(chunks),
             charset=charset,
             hops=hops,
+            http_status=int(resp.status_code),
         )
 
 
@@ -1099,6 +1337,11 @@ class PageResult:
     not run); ``unavailable`` names which seam failed via ``code`` and
     the exception *type* only. The requested/final/citation URLs keep
     every outcome traceable to its source (C07 rule 4).
+    ``http_status`` is the numeric HTTP status of the answered
+    response (``200`` for a read page, ``404``/``403``/``429``/``5xx``
+    for an HTTP error) or ``None`` when no status was observed. It is
+    a number and nothing else: no header, body or message detail ever
+    rides with it.
     """
 
     status: PageStatus
@@ -1111,30 +1354,412 @@ class PageResult:
     bytes_read: int
     redirects: int
     error_type: str | None = None
+    http_status: int | None = None
 
 
 def result_document(result: PageResult) -> dict[str, object]:
     """The frozen JSON document of one page-read result (stable keys)."""
-    citation = normalize_citation_url(result.final_url)
+    citation = _citation_of(result.final_url)
     return {
         "status": result.status.value,
         "code": result.code.value if result.code is not None else None,
         "trust": "untrusted_external",
         "url": result.url,
         "final_url": result.final_url,
-        "citation": citation if citation is not None else result.final_url,
+        "citation": citation,
         "title": result.title,
         "markdown": result.markdown,
         "truncated": result.truncated,
         "bytes_read": result.bytes_read,
         "redirects": result.redirects,
         "error_type": result.error_type,
+        "http_status": result.http_status,
     }
+
+
+def _citation_of(url: str) -> str:
+    """The citable form of one URL, or ``""`` when it is not citable.
+
+    A malformed or credential-bearing URL yields no citation at all:
+    the fallback never re-introduces a target that failed URL
+    validation, so a rejected request cannot be quoted as a source.
+    """
+    safe = _safe_url(url)
+    if not safe:
+        return ""
+    normalized = normalize_citation_url(safe)
+    return normalized if normalized is not None else ""
+
+
+def _refusal_result(
+    *,
+    code: PageErrorCode,
+    url: str,
+    at_url: str | None,
+    http_status: int | None = None,
+    redirects: int = 0,
+) -> PageResult:
+    """One structured, value-free refusal result for a known failure.
+
+    The requested and refusing URLs are reflected only when they are
+    fetchable, credential-free http(s) URLs: a malformed or
+    userinfo-bearing URL is dropped (empty string), so a rejected
+    request never becomes a citable citation and never echoes a
+    credential back to the caller. ``http_status`` is the numeric
+    status only — never a header, a body or a message.
+    """
+    safe_requested = _safe_url(url)
+    safe_at_url = _safe_url(at_url) if at_url is not None else ""
+    return PageResult(
+        status=PageStatus.REFUSED,
+        code=code,
+        url=safe_requested,
+        final_url=safe_at_url or safe_requested,
+        title="",
+        markdown="",
+        truncated=False,
+        bytes_read=0,
+        redirects=redirects,
+        http_status=http_status,
+    )
+
+
+#: The serialized page-result envelope must fit inside the dispatcher's
+#: default output budget (64 KiB). The dispatcher enforces that budget by
+#: cutting the output *string* — a cut JSON string is invalid JSON — so
+#: the capability bounds its own serialized envelope before it leaves.
+#:
+#: Two lengths matter and both are checked:
+#:
+#: 1. the capability's own serialized envelope, and
+#: 2. the *mirrored* post-redaction envelope — the dispatcher replaces
+#:    every resolved secret value with
+#:    :data:`mai.capabilities.dispatch.REDACTED` *before* it measures
+#:    the output, and that replacement can make the text longer (a short
+#:    secret repeated often) or shorter (a long secret). No fixed
+#:    redaction reserve can bound the growth, so the same replacement is
+#:    applied here and the result measured: correctness comes from the
+#:    final fit check, never from an estimated reserve.
+#:
+#: Scope note (deferred, not fixed here): the dispatcher's redaction is
+#: a plain text replacement over the serialized JSON. A credential value
+#: that itself contains JSON syntax (e.g. ``'":'``) therefore corrupts
+#: the *structure* of the redacted text — a pre-existing dispatcher
+#: defect, reproducible on a 246-byte refusal envelope with all content
+#: emptied. It is out of scope for this capability: no pages-side change
+#: can make an arbitrary credential value structurally safe, and no
+#: universal guarantee is claimed here.
+_ENVELOPE_BUDGET_BYTES: Final[int] = default_output_budget_bytes
+
+#: The error type of the compact non-success envelope emitted when the
+#: answer's own metadata cannot fit the budget.
+_ENVELOPE_TOO_LARGE_ERROR_TYPE: Final[str] = "OutputEnvelopeTooLarge"
+
+#: The characters JSON escapes with a two-byte escape sequence.
+_JSON_SHORT_ESCAPES: Final[frozenset[str]] = frozenset(
+    ('"', "\\", "\b", "\t", "\n", "\f", "\r")
+)
+
+
+def _json_escape_cost(char: str) -> int:
+    """The number of bytes one character costs in a JSON string literal.
+
+    The envelope is serialized with ``ensure_ascii=True``, so every
+    serialized byte is ASCII and the byte cost of a string is the sum
+    of the per-character costs below.
+    """
+    code = ord(char)
+    if char in _JSON_SHORT_ESCAPES:
+        return 2
+    if code < 0x20 or code == 0x7F:
+        return 6  # \u00XX
+    if code < 0x80:
+        return 1
+    if code <= 0xFFFF:
+        return 6  # \uXXXX
+    return 12  # surrogate pair \uXXXX\uXXXX
+
+
+def _serialized_text(document: Mapping[str, object]) -> str:
+    """The exact serialized form of one document (the dispatcher's form)."""
+    return json.dumps(document, sort_keys=True, ensure_ascii=True)
+
+
+def _redacted_length(text: str, secrets: Sequence[str]) -> int:
+    """The length of the dispatcher's redacted output, exactly.
+
+    The dispatcher replaces every resolved secret value with the
+    redaction marker *before* it bounds the output. This applies the
+    very same replacement (in the same order) and returns the resulting
+    length, so the envelope can be fitted against the text the
+    dispatcher will actually measure instead of against an estimate.
+    """
+    for value in secrets:
+        if value:
+            text = text.replace(value, REDACTED)
+    return len(text)
+
+
+def _fits(document: Mapping[str, object], secrets: Sequence[str]) -> bool:
+    """Whether one document stays strictly below the output budget.
+
+    Both lengths are checked: the capability's own serialized envelope
+    and the mirrored post-redaction envelope. Either one at or above
+    the budget means the document does not fit.
+    """
+    text = _serialized_text(document)
+    if len(text.encode("utf-8")) >= _ENVELOPE_BUDGET_BYTES:
+        return False
+    return _redacted_length(text, secrets) < _ENVELOPE_BUDGET_BYTES
+
+
+def _split_free_cut(
+    value: str, length: int, secrets: Sequence[str]
+) -> int:
+    """The largest cut length that does not *split* a secret value.
+
+    Cutting the content at an arbitrary offset can land in the middle
+    of a secret occurrence: the kept text would then end with a proper
+    prefix of the secret (``"qz"`` for the secret ``"qz7"``). The
+    dispatcher's redaction replaces whole occurrences only, so such a
+    fragment would survive into the answer. The cut therefore backs off
+    to the last offset that leaves no proper secret prefix at the end
+    of the kept text.
+
+    The back-off is bounded by the longest secret, so the cost is
+    bounded and the fit check still decides the final length.
+    """
+    for secret in secrets:
+        if not secret or len(secret) < 2:
+            continue
+        for size in range(min(len(secret) - 1, length), 0, -1):
+            if value[length - size : length] == secret[:size]:
+                return length - size
+    return length
+
+
+def _trim_field_to_fit(
+    document: dict[str, object], field: str, secrets: Sequence[str]
+) -> bool:
+    """Shrink one content field until the document fits.
+
+    The field is cut from its end: the kept part is a prefix of the
+    original text. The cut is driven by measured fit, not by a
+    predicted reserve: the prefix length is first bounded by the
+    serialized byte cost of the field, then refined by a bounded
+    search, and the result is verified against the real fit test. The
+    search is *not* claimed to be maximal — redaction makes the
+    serialized size non-monotone in the prefix length, so the kept
+    prefix may be shorter than the largest fitting one. A shorter
+    prefix costs content, never validity.
+    """
+    value = document.get(field)
+    if not isinstance(value, str) or not value:
+        return _fits(document, secrets)
+
+    # The trim happens against the document as it will be *emitted*:
+    # the ``truncated`` flag is set to ``true`` once a cut happened, and
+    # the flag itself costs bytes. The fit test therefore always sees
+    # the flagged shape.
+    document["truncated"] = True
+
+    # A first, cheap bound: the serialized cost of everything *except*
+    # this field leaves this many bytes for the field itself.
+    without = dict(document)
+    without[field] = ""
+    overhead = len(_serialized_text(without).encode("utf-8"))
+    allowed = _ENVELOPE_BUDGET_BYTES - 1 - overhead
+    if allowed <= 0:
+        allowed = 0
+    cost = 0
+    cut = 0
+    for char in value:
+        step = _json_escape_cost(char)
+        if cost + step > allowed:
+            break
+        cost += step
+        cut += 1
+
+    # Refine by a bounded search over the prefix length (logarithmic in
+    # the number of serializations, never one serialization per
+    # character).
+    low, high, best = 0, cut, 0
+    while low <= high:
+        middle = (low + high) // 2
+        probe = dict(document)
+        probe[field] = value[:middle]
+        if _fits(probe, secrets):
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+
+    # Verify the candidate; a non-monotone fit can only cost content.
+    length = best
+    probe = dict(document)
+    probe[field] = value[:length]
+    while length and not _fits(probe, secrets):
+        length = length // 2
+        probe[field] = value[:length]
+    # The cut must not split a secret occurrence: a fragment would
+    # survive the dispatcher's whole-occurrence redaction.
+    length = _split_free_cut(value, length, secrets)
+    document[field] = value[:length]
+    return _fits(document, secrets)
+
+
+def _too_large_envelope(
+    document: Mapping[str, object], secrets: Sequence[str]
+) -> dict[str, object]:
+    """The compact non-success envelope of an answer that cannot fit.
+
+    The answer's own metadata (status, code, trust, byte/redirect
+    counts, HTTP status) is preserved; the content is empty. The URLs
+    are never sliced: the *full* safe URLs are kept when they fit, and
+    otherwise the URL, final-URL and citation fields are cleared
+    together — the failure envelope then explains that the answer's
+    identity was omitted rather than showing a shortened, misleading
+    URL.
+    """
+    compact: dict[str, object] = {
+        "status": PageStatus.REFUSED.value,
+        "code": PageErrorCode.RESPONSE_TOO_LARGE.value,
+        "trust": "untrusted_external",
+        "url": "",
+        "final_url": "",
+        "citation": "",
+        "title": "",
+        "markdown": "",
+        "truncated": True,
+        "bytes_read": document.get("bytes_read", 0),
+        "redirects": document.get("redirects", 0),
+        "error_type": _ENVELOPE_TOO_LARGE_ERROR_TYPE,
+        "http_status": document.get("http_status"),
+    }
+    with_identity = dict(compact)
+    for field in ("url", "final_url", "citation"):
+        value = document.get(field)
+        if isinstance(value, str):
+            with_identity[field] = value
+    if _fits(with_identity, secrets):
+        return with_identity
+    return compact
+
+
+def _bounded_envelope(
+    document: Mapping[str, object], *, secrets: Sequence[str] = ()
+) -> tuple[dict[str, object], bool]:
+    """Fit one page-result document into the output budget honestly.
+
+    The required metadata (status, code, trust, URLs, citation, byte
+    count, redirect count, error type and HTTP status) is preserved
+    verbatim; only the *content* fields (the Markdown and, after that,
+    the title) are reduced, and the cut is reported honestly through
+    ``truncated``.
+
+    The URLs, the final URL and the citation are never sliced: they are
+    the answer's identity and a shortened URL would be a false source.
+    If the identity itself does not fit the budget, the answer fails
+    closed into a compact non-success envelope (see
+    :func:`_too_large_envelope`) instead of emitting a cut or
+    misleading identity.
+
+    Returns the fitted document and whether anything was dropped.
+    """
+    document = dict(document)
+    if _fits(document, secrets):
+        return document, False
+
+    dropped = False
+    for field in ("markdown", "title"):
+        value = document.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        _trim_field_to_fit(document, field, secrets)
+        if len(document[field]) < len(value):
+            dropped = True
+        if _fits(document, secrets):
+            break
+
+    if not _fits(document, secrets):
+        # The metadata alone does not fit: fail closed into a compact,
+        # truthful non-success envelope.
+        return _too_large_envelope(document, secrets), True
+
+    if dropped:
+        # The flag was already set by the trim (the fit test always saw
+        # the flagged shape). The check below re-measures the exact
+        # emitted text; if it no longer fits, the answer fails closed
+        # rather than shipping an envelope the dispatcher would cut.
+        document["truncated"] = True
+        if not _fits(document, secrets):
+            return _too_large_envelope(document, secrets), True
+    else:
+        document["truncated"] = False
+    return document, dropped
+
+
+def _executor_result(
+    result: PageResult, *, secrets: Sequence[str] = ()
+) -> ExecutorResult:
+    """The executor answer of one page result (success only for ``ok``).
+
+    The serialized envelope is bounded *before* it leaves the
+    capability: it stays strictly below the output budget and stays
+    valid JSON, both as the capability serializes it and after the
+    dispatcher's own secret redaction. The dispatcher never has to cut
+    a JSON string into an invalid one.
+
+    ``ok`` is derived from the *fitted* document, not from the original
+    result: an answer that had to fail closed is a non-success.
+    """
+    document = result_document(result)
+    fitted, _dropped = _bounded_envelope(document, secrets=secrets)
+    return ExecutorResult(
+        ok=fitted.get("status") == PageStatus.OK.value,
+        output=json.dumps(fitted, sort_keys=True, ensure_ascii=True),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Capability descriptor (C03 rule 1 frozen vocabulary)
 # ---------------------------------------------------------------------------
+
+
+#: The root description of the capability's input schema. The tool
+#: bridge publishes this schema verbatim as the model-facing function
+#: schema and prefixes the generated tool's description with this text,
+#: so it is the one place where usage and recovery guidance reaches the
+#: model. It states only what this reader actually does — no implied
+#: retries, no implied rendering, no widened policy.
+_ROOT_TOOL_DESCRIPTION = (
+    "Read one public web page over plain HTTP(S) and return its text "
+    "with source provenance. Supported document types: HTML "
+    "(text/html), XHTML (application/xhtml+xml), plain text "
+    "(text/plain) and Markdown (text/markdown); plain text and "
+    "Markdown are returned verbatim. No JavaScript runs and no "
+    "browser rendering happens, so a page that needs scripts to show its "
+    "content will read as its static HTML only. Only public URLs are "
+    "reachable: private, loopback and other non-public addresses are "
+    "refused before any connection (code address_refused). The answer "
+    "carries the requested URL, the final URL after redirects, a "
+    "citation and a trust label, so quoted text stays traceable to the "
+    "fetchable source. Size budgets are separate: the raw-body byte "
+    "budget defaults to 262144 bytes and is capped at 1048576 bytes "
+    "(code response_too_large beyond it); the extracted-text character "
+    "budget is separate again (default 20000, maximum 100000), and a "
+    "cut answer is flagged truncated. "
+    "Recovery guidance: prefer a URL that was already discovered or "
+    "given to you; on http_status 404 correct the URL or search for the "
+    "page instead of retrying; on 403 use a different, accessible source "
+    "rather than trying to get around the refusal; on 429 wait instead "
+    "of retrying rapidly; on response_too_large raise max_bytes only a "
+    "bounded step, and only when the document is genuinely worth it. "
+    "Do not repeat an identical request that already failed. Failures "
+    "are structured answers, not exceptions: status is ok, refused or "
+    "unavailable, with a stable code and the numeric http_status of the "
+    "response (null when no status was observed)."
+)
 
 
 def descriptor() -> CapabilityDescriptor:
@@ -1159,6 +1784,7 @@ def descriptor() -> CapabilityDescriptor:
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": _ROOT_TOOL_DESCRIPTION,
                 "required": ["url"],
                 "properties": {
                     "url": {
@@ -1166,7 +1792,8 @@ def descriptor() -> CapabilityDescriptor:
                         "minLength": 1,
                         "maxLength": MAX_URL_CHARS,
                         "description": (
-                            "Absolute http(s) page URL to read. Private, "
+                            "Absolute http(s) page URL to read; prefer a URL "
+                            "already discovered or given to you. Private, "
                             "loopback and otherwise non-public addresses "
                             "refuse before any connection, at every "
                             "redirect hop (code address_refused); URLs "
@@ -1179,10 +1806,12 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_MAX_BYTES,
                         "default": DEFAULT_MAX_BYTES,
                         "description": (
-                            "Raw-body byte budget; a Content-Length over "
-                            "budget refuses before reading, the streaming "
-                            "read stops at budget+1 (code "
-                            "response_too_large)."
+                            "Raw-body byte budget (default 262144, maximum "
+                            "1048576); a Content-Length over budget refuses "
+                            "before reading, the streaming read stops at "
+                            "budget+1 (code response_too_large). Raise it "
+                            "only for a document that is genuinely too big; "
+                            "the maximum is the hard cap."
                         ),
                     },
                     "timeout_seconds": {
@@ -1191,8 +1820,12 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_TIMEOUT_SECONDS,
                         "default": DEFAULT_TIMEOUT_SECONDS,
                         "description": (
-                            "Whole-fetch time budget; a timeout classifies "
-                            "as fetch_timeout, value-free."
+                            "Requested fetch timeout in seconds, validated "
+                            "within (0, 60]; the provider's configured "
+                            "fetch timeout governs the actual deadline "
+                            "today, so a smaller value does not yet shorten "
+                            "a read. A timeout classifies as fetch_timeout, "
+                            "value-free."
                         ),
                     },
                     "max_markdown_chars": {
@@ -1201,9 +1834,10 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_MARKDOWN_CHARS,
                         "default": DEFAULT_MAX_MARKDOWN_CHARS,
                         "description": (
-                            "Extracted Markdown character budget; a cut "
-                            "page keeps its citation and is flagged "
-                            "truncated."
+                            "Extracted-text character budget (default 20000, "
+                            "maximum 100000); distinct from the raw-body "
+                            "byte budget. A cut page keeps its citation and "
+                            "is flagged truncated."
                         ),
                     },
                 },
@@ -1243,6 +1877,16 @@ def descriptor() -> CapabilityDescriptor:
                     "bytes_read": {"type": "integer"},
                     "redirects": {"type": "integer"},
                     "error_type": {"type": ["string", "null"]},
+                    "http_status": {
+                        "type": ["integer", "null"],
+                        "description": (
+                            "Numeric HTTP status of the answered response "
+                            "(200 for a read page; 403/404/429/5xx for an "
+                            "HTTP error, which reports code fetch_error). "
+                            "A number only — never a header, a body or a "
+                            "message."
+                        ),
+                    },
                 },
             },
             "execution_environments": ["controller"],
@@ -1268,8 +1912,10 @@ class WebPageCapability:
     upstream of this executor. Order per call: validate payload → one
     bounded fetch (syntax + address re-validation per hop inside the
     provider) → decode → extract bounded Markdown → one frozen JSON
-    document. Policy/budget refusals and provider outages are honest
-    statuses in the result document; only malformed direct calls raise.
+    document. Policy/budget refusals, provider outages and request
+    validation failures are honest statuses in the result document
+    (``ok=false``); only a malformed executor object/context — a
+    programming contract violation — raises.
     """
 
     def __init__(
@@ -1307,67 +1953,96 @@ class WebPageCapability:
                 PageErrorCode.INVALID_PAYLOAD,
                 "call context must be an ExecutionContext",
             )
-        request = request_from_payload(
-            call.payload,
-            default_max_bytes=self._default_max_bytes,
-            default_timeout_seconds=self._default_timeout,
-            default_max_markdown_chars=self._default_max_markdown,
-        )
+        # The dispatcher redacts every resolved secret from the executor
+        # output *before* it measures the output against the budget. The
+        # envelope is therefore fitted against the redacted text, so the
+        # bound holds for the text the dispatcher actually measures.
+        secrets = [
+            secret.value
+            for secret in call.credentials.values()
+            if isinstance(getattr(secret, "value", None), str)
+            and secret.value
+        ]
+        try:
+            request = request_from_payload(
+                call.payload,
+                default_max_bytes=self._default_max_bytes,
+                default_timeout_seconds=self._default_timeout,
+                default_max_markdown_chars=self._default_max_markdown,
+            )
+        except PageError as exc:
+            # Request validation failed before a PageRequest existed:
+            # a known, structured refusal — not an executor crash. The
+            # rejected payload is never reflected (no URL, no field
+            # values), so nothing citable or credential-bearing leaks.
+            return _executor_result(
+                _refusal_result(
+                    code=exc.code,
+                    url="",
+                    at_url=None,
+                ),
+                secrets=secrets,
+            )
         try:
             raw = await self._provider.fetch(
                 url=request.url, max_bytes=request.max_bytes
             )
         except PageError as exc:
-            if exc.code is PageErrorCode.INVALID_PAYLOAD:
-                # A malformed direct call is a caller error, not a policy
-                # outcome — raise exactly like payload validation does.
-                raise
-            # Policy/budget refusal (possibly at a redirect hop): the
-            # refusal is the honest answer, value-free.
-            result = PageResult(
-                status=PageStatus.REFUSED,
+            # A known page failure — a policy/budget refusal, a provider
+            # wiring rejection (e.g. a request over the provider's own
+            # ceiling) or an outage class — is the honest answer of this
+            # read, shaped like any other page result. It is not an
+            # executor crash and never becomes an unknown effect.
+            result = _refusal_result(
                 code=exc.code,
                 url=request.url,
-                final_url=exc.at_url or request.url,
-                title="",
-                markdown="",
-                truncated=False,
-                bytes_read=0,
-                redirects=0,
+                at_url=exc.at_url,
             )
         except Exception as exc:  # noqa: BLE001 - classified, value-free
+            # An HTTP error is classified by its numeric status, never
+            # by its body or headers: the status number and the
+            # logical (validated) hop URL are the only facts carried.
+            hops = getattr(exc, "hops", None)
             result = PageResult(
                 status=PageStatus.UNAVAILABLE,
                 code=_classify_fetch_exception(exc),
-                url=request.url,
-                final_url=request.url,
+                url=_safe_url(request.url),
+                final_url=_safe_url(
+                    _logical_url_of(exc, request.url)
+                ),
                 title="",
                 markdown="",
                 truncated=False,
                 bytes_read=0,
-                redirects=0,
+                redirects=hops if isinstance(hops, int) else 0,
                 error_type=type(exc).__name__,
+                http_status=_http_status_of(exc),
             )
         else:
-            text = raw.body.decode(raw.charset, errors="replace")
-            content = extract_markdown(text, max_chars=request.max_markdown_chars)
+            text = _decode_body(raw.body, raw.charset)
+            if _media_type(raw.content_type) in _TEXT_CONTENT_TYPES:
+                # Plain text and Markdown are returned verbatim: they
+                # are already text and must not lose content to HTML
+                # markup extraction (a code sample with ``<div>`` in
+                # it would survive the HTML parser only by accident).
+                content = extract_raw_text(
+                    text, max_chars=request.max_markdown_chars
+                )
+            else:
+                content = extract_markdown(text, max_chars=request.max_markdown_chars)
             result = PageResult(
                 status=PageStatus.OK,
                 code=None,
-                url=request.url,
+                url=_safe_url(request.url),
                 final_url=normalize_citation_url(raw.url) or raw.url,
                 title=content.title,
                 markdown=content.markdown,
                 truncated=content.truncated,
                 bytes_read=raw.bytes_read,
                 redirects=raw.hops,
+                http_status=raw.http_status,
             )
-        return ExecutorResult(
-            ok=result.status is PageStatus.OK,
-            output=json.dumps(
-                result_document(result), sort_keys=True, ensure_ascii=True
-            ),
-        )
+        return _executor_result(result, secrets=secrets)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,9 +2092,20 @@ async def _read_async(args: argparse.Namespace) -> int:
         op_id=uuid.uuid4(),
     )
     try:
+        # The operator entrypoint keeps its documented exit contract
+        # (1 = structured rejection): a syntactically invalid target is
+        # rejected here, before the capability runs. Everything else is
+        # an honest page status in the emitted document (exit 0).
+        validate_fetch_url(args.url)
+    except PageError as exc:
+        # The detail is the module's own authored diagnostic — never the
+        # rejected target, so no credential-bearing URL is echoed back.
+        _emit({"kind": "error", "code": exc.code.value, "detail": exc.detail})
+        return 1
+    try:
         result = await capability(call)
     except PageError as exc:
-        _emit({"kind": "error", "code": exc.code.value, "detail": str(exc)})
+        _emit({"kind": "error", "code": exc.code.value, "detail": exc.detail})
         return 1
     _emit(json.loads(result.output))
     return 0

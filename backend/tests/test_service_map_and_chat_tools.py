@@ -1182,3 +1182,285 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
     assert "limit" in list_adopted_props and "offset" in list_adopted_props
     assert len(INTERNAL_API_CAPABILITY_IDS) == 7
 
+
+# ---------------------------------------------------------------------------
+# app.list_adopted (agent tool): the SAME membership rule as the HTTP list
+# ---------------------------------------------------------------------------
+
+
+LIST_ADOPTED_CAPABILITY = "app.list_adopted"
+
+#: Every non-manual Service Map origin — all of them must be hidden when
+#: their canonical adoption record is gone.
+NONMANUAL_ORIGINS = ("compose", "systemd_unit", "docker_container")
+
+
+def _internal_api_bridge(
+    app: FastAPI,
+    server_ids: tuple[uuid.UUID, ...],
+) -> CapabilityToolBridge:
+    """The REAL internal-API capability surface behind the agent tool.
+
+    The composition is the production one: the very same
+    ``build_internal_api_capabilities`` builder (with the app's own
+    adoption service + Service Map store) drives the descriptors and the
+    executors, and the tool call travels through the reviewed
+    ``CapabilityToolBridge`` → ``CapabilityDispatcher`` seam.
+    """
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    composition = build_internal_api_capabilities(
+        applications=app.state.applications,
+        adoption=app.state.app_adoption,
+        docs=app.state.app_docs,
+        service_map=app.state.service_map,
+        session_factory=app.state.session_factory,
+    )
+    registry = CapabilityRegistry()
+    for descriptor in composition.descriptors:
+        registry.register(descriptor)
+    env_file = Path(os.environ.get("MAI_ENV_FILE", "/tmp/mai-fxt-mui-02.env"))
+    env_file.write_text("MAI_FIXTURE=value\n")
+    scope = frozenset(server_ids)
+    dispatcher = CapabilityDispatcher(
+        registry=registry,
+        approvals=_unused_approvals(),
+        grants=lambda: {LIST_ADOPTED_CAPABILITY: scope},
+        policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
+        adopted=lambda server_id: True,
+        credentials=lambda: EnvResolver(env_file),
+        executor=composition.executors[LIST_ADOPTED_CAPABILITY],
+    )
+    return CapabilityToolBridge(
+        registry=registry,
+        dispatcher=dispatcher,
+        context=_context((LIST_ADOPTED_CAPABILITY,), server_id=server_ids[0]),
+    )
+
+
+async def _tool_list_adopted(
+    bridge: CapabilityToolBridge, server_id: uuid.UUID, **payload: Any
+) -> dict[str, Any]:
+    """One agent-tool listing call; returns the executor's envelope."""
+    tool = next(
+        t
+        for t in bridge.tools
+        if t.name == tool_name_for(LIST_ADOPTED_CAPABILITY)
+    )
+    result = json.loads(
+        await tool.function(server_id=str(server_id), **payload)
+    )
+    assert result["status"] == "executed", result
+    assert result["allowed"] is True, result
+    return json.loads(result["output"]["text"])
+
+
+async def test_agent_tool_list_adopted_matches_http_membership(
+    live_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    server_b = await create_profile(live_app, jar, "mui-02-b")
+
+    # A live adopted compose application (canonical adoption row).
+    live_id = uuid.uuid4()
+    adopted = await call_app(
+        live_app,
+        "POST",
+        _apps_root(server_a),
+        json_body={
+            "application_id": str(live_id),
+            "name": "live-app",
+            "origin": "compose",
+            "compose_project": "live-project",
+            "working_dir": "/srv/live",
+            "category": "dev",
+            "description": "the live service",
+            "expected_revision": 0,
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert adopted.status == 201, adopted.body
+    revision = adopted.json()["revision"]
+
+    # A legitimate manual map-only entry (no canonical adoption row).
+    manual_id = uuid.uuid4()
+    manual = await call_app(
+        live_app,
+        "POST",
+        _apps_root(server_a),
+        json_body={
+            "application_id": str(manual_id),
+            "name": "manual-app",
+            "origin": "manual",
+            "category": "media",
+            "description": "the manual service",
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert manual.status == 201, manual.body
+
+    # Orphan sidecars: Service Map metadata whose canonical adoption
+    # record is gone (or never existed). Every non-manual origin is
+    # covered.
+    store = live_app.state.service_map
+    orphan_ids: set[str] = set()
+    for origin in NONMANUAL_ORIGINS:
+        orphan_id = uuid.uuid4()
+        orphan_ids.add(str(orphan_id))
+        store.upsert_entry(
+            server_a,
+            name=f"orphan-{origin}",
+            origin=origin,
+            application_id=orphan_id,
+            compose_project=f"orphan-{origin}-project",
+        )
+
+    # Another server's own manual entry (target-server isolation).
+    other_manual_id = uuid.uuid4()
+    other = await call_app(
+        live_app,
+        "POST",
+        _apps_root(server_b),
+        json_body={
+            "application_id": str(other_manual_id),
+            "name": "other-manual-app",
+            "origin": "manual",
+            "category": "media",
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert other.status == 201, other.body
+
+    bridge = _internal_api_bridge(live_app, (server_a, server_b))
+
+    # 1. The tool and the HTTP list agree on MEMBERSHIP and total.
+    tool_page = await _tool_list_adopted(bridge, server_a)
+    http_response = await call_app(
+        live_app, "GET", _apps_root(server_a), cookies=jar
+    )
+    assert http_response.status == 200, http_response.body
+    http_page = http_response.json()
+    tool_ids = [a["application_id"] for a in tool_page["applications"]]
+    http_ids = [a["application_id"] for a in http_page["applications"]]
+    assert tool_page["total"] == http_page["total"]
+    assert set(tool_ids) == set(http_ids)
+    assert set(tool_ids) == {str(live_id), str(manual_id)}
+    assert orphan_ids.isdisjoint(tool_ids)
+    assert str(other_manual_id) not in tool_ids
+
+    # The canonical record keeps its Service Map metadata (enrichment).
+    live_view = next(
+        a for a in tool_page["applications"] if a["application_id"] == str(live_id)
+    )
+    assert live_view["category"] == "dev"
+    assert live_view["description"] == "the live service"
+    assert live_view["origin"] == "compose"
+
+    # 2. Revoke the live application: its orphaned sidecar disappears
+    #    from BOTH listings, the manual entry stays visible, and the
+    #    sidecar itself is retained on disk (non-destructive).
+    revoked = await call_app(
+        live_app,
+        "DELETE",
+        f"{_apps_root(server_a)}/{live_id}",
+        json_body={"expected_revision": revision},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert revoked.status == 204, revoked.body
+    tool_page = await _tool_list_adopted(bridge, server_a)
+    tool_ids = [a["application_id"] for a in tool_page["applications"]]
+    assert tool_page["total"] == 1
+    assert tool_ids == [str(manual_id)]
+    http_response = await call_app(
+        live_app, "GET", _apps_root(server_a), cookies=jar
+    )
+    http_page = http_response.json()
+    assert http_page["total"] == 1
+    assert [a["application_id"] for a in http_page["applications"]] == [
+        str(manual_id)
+    ]
+    stored_ids = {
+        entry.application_id for entry in store.list_entries(server_a)
+    }
+    assert str(live_id) in stored_ids
+    assert str(manual_id) in stored_ids
+
+    # 3. Repeated calls are stable (no mutation, no drift).
+    again = await _tool_list_adopted(bridge, server_a)
+    assert again["total"] == tool_page["total"]
+    assert [a["application_id"] for a in again["applications"]] == tool_ids
+
+    # 4. The other server sees ONLY its own entries (target isolation).
+    other_page = await _tool_list_adopted(bridge, server_b)
+    assert other_page["total"] == 1
+    assert [a["application_id"] for a in other_page["applications"]] == [
+        str(other_manual_id)
+    ]
+
+
+async def test_agent_tool_list_adopted_pagination_counts_filtered_set(
+    live_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    manual_ids: list[str] = []
+    for index in range(3):
+        application_id = uuid.uuid4()
+        manual_ids.append(str(application_id))
+        created = await call_app(
+            live_app,
+            "POST",
+            _apps_root(server_a),
+            json_body={
+                "application_id": str(application_id),
+                "name": f"manual-{index}",
+                "origin": "manual",
+                "category": "media",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+
+    store = live_app.state.service_map
+    for index in range(3):
+        store.upsert_entry(
+            server_a,
+            name=f"orphan-{index}",
+            origin=NONMANUAL_ORIGINS[index % len(NONMANUAL_ORIGINS)],
+            application_id=uuid.uuid4(),
+            compose_project=f"orphan-project-{index}",
+        )
+
+    bridge = _internal_api_bridge(live_app, (server_a,))
+
+    first = await _tool_list_adopted(bridge, server_a, limit=2, offset=0)
+    assert first["total"] == 3
+    assert first["limit"] == 2
+    assert first["offset"] == 0
+    first_ids = [a["application_id"] for a in first["applications"]]
+    assert len(first_ids) == 2
+
+    second = await _tool_list_adopted(bridge, server_a, limit=2, offset=2)
+    assert second["total"] == 3
+    assert second["limit"] == 2
+    assert second["offset"] == 2
+    second_ids = [a["application_id"] for a in second["applications"]]
+    assert len(second_ids) == 1
+
+    # Deterministic repeated pages, and the pages cover exactly the
+    # manual entries (the orphans are filtered out).
+    again = await _tool_list_adopted(bridge, server_a, limit=2, offset=0)
+    assert [a["application_id"] for a in again["applications"]] == first_ids
+    assert set(first_ids + second_ids) == set(manual_ids)
+
+    # has_more reflects the FILTERED set: a page that consumes the whole
+    # filtered set reports no more, a partial page reports more.
+    full = await _tool_list_adopted(bridge, server_a, limit=3, offset=0)
+    assert full["total"] == 3
+    assert len(full["applications"]) == 3
+    assert full["has_more"] is False
+    partial = await _tool_list_adopted(bridge, server_a, limit=2, offset=0)
+    assert partial["has_more"] is True
+

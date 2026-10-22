@@ -35,10 +35,14 @@ import os
 import signal
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 from mai.database import resolve_database_url
 from mai.jobs import engine
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mai.research.pages import WebPageCapability
 
 _STOP = threading.Event()
 
@@ -65,6 +69,36 @@ def _import_handlers(spec: str) -> int:
             )
             return 2
     return 0
+
+
+def _build_web_read_capability(
+    *,
+    transport: object | None = None,
+    resolver: Callable[[str], Sequence[str]] | None = None,
+) -> "WebPageCapability":
+    """Construct the production ``web.read`` capability.
+
+    The provider's byte ceiling is the schema's advertised maximum
+    (:data:`mai.research.pages.MAX_MAX_BYTES`), so a schema-valid
+    ``max_bytes`` request is never refused by the wiring itself — the
+    advertised range and the enforced ceiling agree. The capability keeps
+    its own defaults (default byte budget, timeout, Markdown budget)
+    unchanged; only the provider ceiling moves.
+
+    ``transport``/``resolver`` are the provider's own constructor seams
+    (httpx2 transport and DNS resolver); the production call site passes
+    neither, so production keeps real DNS and a real dial.
+    """
+    from mai.research.pages import (
+        MAX_MAX_BYTES,
+        HttpPageProvider,
+        WebPageCapability,
+    )
+
+    provider = HttpPageProvider(
+        max_bytes=MAX_MAX_BYTES, transport=transport, resolver=resolver
+    )
+    return WebPageCapability(provider)
 
 
 def _configure_default_agent_runtime(database_url: str) -> None:
@@ -148,11 +182,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.policy.config import GrantConfigStore
     from mai.policy.evaluate import Policy
     from mai.profiles.files import ProfileFileStore
-    from mai.research.pages import (
-        HttpPageProvider,
-        WebPageCapability,
-        descriptor as web_read_descriptor,
-    )
+    from mai.research.pages import descriptor as web_read_descriptor
     from mai.research.search import (
         SearXNGProvider,
         WebSearchCapability,
@@ -321,7 +351,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         os.environ.get("MAI_SEARXNG_URL") or "http://searxng:8080"
     ).strip()
     web_search_cap = WebSearchCapability(SearXNGProvider(searxng_url))
-    web_read_cap = WebPageCapability(HttpPageProvider())
+    web_read_cap = _build_web_read_capability()
 
     executors = {
         "host.shell": host_shell_cap,

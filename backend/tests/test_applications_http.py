@@ -339,6 +339,21 @@ def _truncate(url: str) -> None:
             "admin_sessions",
             "admin_credential",
         ]
+        # 0007 observation domain: notification_alerts references
+        # job_runs.run_id, so TRUNCATE of job_runs is refused unless the
+        # referencing table is emptied in the same statement. Only the
+        # tables that actually exist are named.
+        observation_tables = [
+            "notification_alerts",
+            "observation_findings",
+            "server_observations",
+        ]
+        for table in observation_tables:
+            exists = conn.execute(
+                "SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",)
+            ).fetchone()
+            if exists and exists[0]:
+                tables.append(table)
         if present and present[0]:
             tables.extend(
                 ["application_projection_journal", "application_projection"]
@@ -789,6 +804,248 @@ class TestRevoke:
             cookies=jar,
         )
         assert gone.status == 404
+
+
+# ---------------------------------------------------------------------------
+# listing: orphan adoption metadata is hidden, manual map entries survive
+# ---------------------------------------------------------------------------
+
+
+def _map_entries(app: FastAPI, server_id: uuid.UUID) -> list[dict[str, Any]]:
+    """The raw Service Map sidecar records for one server (on-disk truth)."""
+    store = app.state.service_map
+    return [entry.to_json() for entry in store.list_entries(server_id)]
+
+
+async def _adopt_manual(
+    app: FastAPI, jar: dict[str, str], server_id: uuid.UUID, name: str
+) -> uuid.UUID:
+    """Adopt one manual (chat/agent) map entry through the HTTP surface."""
+    application_id = uuid.uuid4()
+    created = await call_app(
+        app,
+        "POST",
+        _apps_root(server_id),
+        json_body={
+            "application_id": str(application_id),
+            "name": name,
+            "origin": "manual",
+            "category": "media",
+            "description": f"the {name} service",
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert created.status == 201, created.body
+    return application_id
+
+
+class TestListingOrphanMetadata:
+    async def test_orphan_sidecars_are_excluded_and_manual_entry_survives(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        # A live adopted compose application (canonical projection row).
+        live_id = uuid.uuid4()
+        adopted = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body={
+                "application_id": str(live_id),
+                "name": "live-app",
+                "origin": "compose",
+                "compose_project": "live-project",
+                "working_dir": "/srv/live",
+                "category": "dev",
+                "description": "the live service",
+                "expected_revision": 0,
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert adopted.status == 201, adopted.body
+        revision = adopted.json()["revision"]
+
+        # A legitimate manual map-only entry (no SQL adoption row).
+        manual_id = await _adopt_manual(apps_app, jar, server_a, "manual-app")
+
+        # Orphan sidecars: Service Map metadata whose adoption record is
+        # gone (revoke) or never existed. They are written straight into the
+        # sidecar store to reproduce the post-revoke shape.
+        store = apps_app.state.service_map
+        orphan_compose = uuid.uuid4()
+        store.upsert_entry(
+            server_a,
+            name="orphan-compose",
+            origin="compose",
+            application_id=orphan_compose,
+            compose_project="orphan-project",
+        )
+        orphan_systemd = uuid.uuid4()
+        store.upsert_entry(
+            server_a,
+            name="orphan-systemd",
+            origin="systemd_unit",
+            application_id=orphan_systemd,
+            unit_name="orphan.service",
+        )
+        orphan_docker = uuid.uuid4()
+        store.upsert_entry(
+            server_a,
+            name="orphan-docker",
+            origin="docker_container",
+            application_id=orphan_docker,
+        )
+
+        listed = await call_app(apps_app, "GET", _apps_root(server_a), cookies=jar)
+        assert listed.status == 200, listed.body
+        page = listed.json()
+        ids = [app["application_id"] for app in page["applications"]]
+        assert page["total"] == 2
+        assert set(ids) == {str(live_id), str(manual_id)}
+        assert str(orphan_compose) not in ids
+        assert str(orphan_systemd) not in ids
+        assert str(orphan_docker) not in ids
+
+        # The live adopted entry keeps its Service Map metadata.
+        live_view = next(
+            a for a in page["applications"] if a["application_id"] == str(live_id)
+        )
+        assert live_view["category"] == "dev"
+        assert live_view["description"] == "the live service"
+
+        # Revoke the live application: its orphaned sidecar must not
+        # reappear in the listing.
+        revoked = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{live_id}",
+            json_body={"expected_revision": revision},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert revoked.status == 204, revoked.body
+        listed = await call_app(apps_app, "GET", _apps_root(server_a), cookies=jar)
+        assert listed.status == 200, listed.body
+        page = listed.json()
+        ids = [app["application_id"] for app in page["applications"]]
+        assert page["total"] == 1
+        assert ids == [str(manual_id)]
+
+        # The sidecar itself is retained on disk (non-destructive), and the
+        # manual entry is still there.
+        stored = _map_entries(apps_app, server_a)
+        stored_ids = {entry["application_id"] for entry in stored}
+        assert str(live_id) in stored_ids
+        assert str(manual_id) in stored_ids
+
+    async def test_pagination_counts_only_the_filtered_set(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        manual_ids = [
+            await _adopt_manual(apps_app, jar, server_a, f"manual-{index}")
+            for index in range(3)
+        ]
+        store = apps_app.state.service_map
+        for index in range(2):
+            store.upsert_entry(
+                server_a,
+                name=f"orphan-{index}",
+                origin="compose",
+                application_id=uuid.uuid4(),
+                compose_project=f"orphan-project-{index}",
+            )
+
+        first = await call_app(
+            apps_app,
+            "GET",
+            f"{_apps_root(server_a)}?limit=2&offset=0",
+            cookies=jar,
+        )
+        assert first.status == 200, first.body
+        page = first.json()
+        assert page["total"] == 3
+        assert page["limit"] == 2
+        assert page["offset"] == 0
+        first_ids = [app["application_id"] for app in page["applications"]]
+        assert len(first_ids) == 2
+
+        second = await call_app(
+            apps_app,
+            "GET",
+            f"{_apps_root(server_a)}?limit=2&offset=2",
+            cookies=jar,
+        )
+        assert second.status == 200, second.body
+        page = second.json()
+        assert page["total"] == 3
+        assert page["limit"] == 2
+        assert page["offset"] == 2
+        second_ids = [app["application_id"] for app in page["applications"]]
+        assert len(second_ids) == 1
+
+        # Deterministic repeated pages: the same request yields the same
+        # ids, and the pages cover exactly the manual entries.
+        again = await call_app(
+            apps_app,
+            "GET",
+            f"{_apps_root(server_a)}?limit=2&offset=0",
+            cookies=jar,
+        )
+        assert again.status == 200, again.body
+        assert [
+            app["application_id"] for app in again.json()["applications"]
+        ] == first_ids
+        assert set(first_ids + second_ids) == {str(aid) for aid in manual_ids}
+
+    async def test_readoption_does_not_duplicate_the_listed_entry(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        application_id = uuid.uuid4()
+        body = {
+            "application_id": str(application_id),
+            "name": "recycled-app",
+            "origin": "compose",
+            "compose_project": "recycled-project",
+            "working_dir": "/srv/recycled",
+            "expected_revision": 0,
+        }
+        created = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=body,
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+        revision = created.json()["revision"]
+        revoked = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{application_id}",
+            json_body={"expected_revision": revision},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert revoked.status == 204, revoked.body
+
+        readopted = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=body,
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert readopted.status == 201, readopted.body
+
+        listed = await call_app(apps_app, "GET", _apps_root(server_a), cookies=jar)
+        assert listed.status == 200, listed.body
+        page = listed.json()
+        ids = [app["application_id"] for app in page["applications"]]
+        assert page["total"] == 1
+        assert ids == [str(application_id)]
 
 
 # ---------------------------------------------------------------------------
