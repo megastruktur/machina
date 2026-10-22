@@ -144,6 +144,15 @@ dependencies = [
     # installed environment.
 ]
 
+[project.entry-points."mai.capabilities"]
+# Built-in native plugin (s2-native-plugin, C1/C3): one plugin owning
+# secret.list / secret.get / secret.store via the plural CAPABILITIES
+# declaration. Compositions that execute built-ins load it explicitly
+# (NativePluginRuntime(include_builtins=True) — the worker runtime and
+# the `python -m mai.plugins.native inspect` CLI); the default
+# third-party-only composition skips host-distribution entry points.
+onepassword = "mai.plugins.builtin_onepassword"
+
 [dependency-groups]
 dev = ["pytest"]
 

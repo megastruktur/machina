@@ -203,10 +203,22 @@ class CapabilityCall:
 
 @dataclass(frozen=True, slots=True)
 class ExecutorResult:
-    """One honest executor answer: outcome flag plus textual output."""
+    """One honest executor answer: outcome flag plus textual output.
+
+    ``error_code`` is the executor's optional stable machine token for a
+    structured refusal (e.g. ``vault_not_allowed``); it is executor-side
+    metadata and never overrides the dispatcher's own decision vocabulary.
+
+    ``redact_values`` names raw secret material the executor placed in
+    ``output`` (C03 rule 6 defense-in-depth beyond the resolved
+    credentials): the dispatcher scrubs every non-empty string before the
+    :class:`DispatchOutcome` becomes durable audit surface.
+    """
 
     ok: bool
     output: str
+    error_code: str | None = None
+    redact_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,15 +357,39 @@ def canonical_payload_hash(payload: object) -> str:
     return hashlib.sha256(canonical_payload_json(payload).encode("utf-8")).hexdigest()
 
 
+def _secret_output_forms(secrets: list[str]) -> list[str]:
+    """Every serialized form one secret value can take in output text.
+
+    A value may appear raw, or inside a JSON-serialized string where
+    ``json.dumps`` escapes ``"``, ``\\`` and control characters — and,
+    with ``ensure_ascii=True`` (the default for durable JSON documents),
+    every non-ASCII codepoint as ``\\uXXXX``. Each escape mode yields
+    different bytes, so scrubbing must try them all or a JSON-encoded
+    copy of the secret survives redaction (C2).
+    """
+    forms: set[str] = set()
+    for value in secrets:
+        if not value:
+            continue
+        forms.add(value)
+        forms.add(json.dumps(value, ensure_ascii=True)[1:-1])
+        forms.add(json.dumps(value, ensure_ascii=False)[1:-1])
+    # Longest first: an escaped form can only contain its raw form when
+    # it IS the raw form (no escapable characters), and replacing the
+    # longest match first never strands a partial secret.
+    return sorted(forms, key=len, reverse=True)
+
+
 def _redact(text: str, secrets: list[str]) -> str:
     """Replace every resolved secret value in ``text`` (defense-in-depth).
 
     Runs *before* bounding so a budget cut can never split a secret
-    around the marker.
+    around the marker. Raw and JSON-escaped forms both scrub: executor
+    output is frequently ``json.dumps`` text, and replacing only the raw
+    value would leave the ``\\n``/``\\uXXXX``-escaped copy intact.
     """
-    for value in secrets:
-        if value:
-            text = text.replace(value, REDACTED)
+    for value in _secret_output_forms(secrets):
+        text = text.replace(value, REDACTED)
     return text
 
 
@@ -731,8 +767,15 @@ class CapabilityDispatcher:
             )
 
         # -- 7. output boundary: redact first, then bound --------------------
+        # Executor-declared secret material (C2) scrubs alongside the
+        # resolved credential values; non-string/empty entries are the
+        # executor's bug and are dropped, never matched.
+        secrets = [secret.value for secret in credentials.values()]
+        secrets.extend(
+            s for s in result.redact_values if isinstance(s, str) and s
+        )
         bounded = _bound(
-            _redact(result.output, [secret.value for secret in credentials.values()]),
+            _redact(result.output, secrets),
             self._budget,
         )
         return outcome(

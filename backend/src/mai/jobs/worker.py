@@ -365,6 +365,11 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         **internal_api.executors,
     }
     plugin_executors: dict[str, object] = {}
+    # Capability identifier → owning loaded NativePlugin (built-ins are
+    # composed here: the worker executes the host distribution's own
+    # plugins). _composite_executor uses it for the per-plugin scoped
+    # credential seam (C4) and the dispatch-time enabled recheck.
+    native_plugin_owners: dict[str, object] = {}
     mcp_cache: dict[tuple[str, str, tuple[str, ...]], McpServerRuntime] = {}
 
     async def _sync_plugin_capabilities() -> None:
@@ -373,12 +378,17 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             native_rt = NativePluginRuntime(
                 registry=native_reg,
                 disabled=plugin_store.disabled_plugins(),
+                include_builtins=True,
             )
             native_rt.discover()
-            for desc in native_reg.list_capabilities():
-                if registry.get(desc.identifier, desc.version) is None:
-                    registry.register(desc)
-                plugin_executors[desc.identifier] = native_rt.executor
+            for loaded in native_rt.plugins:
+                for desc in native_reg.list_capabilities():
+                    if desc.identifier not in loaded.descriptor_names:
+                        continue
+                    if registry.get(desc.identifier, desc.version) is None:
+                        registry.register(desc)
+                    plugin_executors[desc.identifier] = native_rt.executor
+                    native_plugin_owners[desc.identifier] = loaded
         except Exception:
             pass
         try:
@@ -457,6 +467,68 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                         )
                 except Exception:
                     pass
+        owner = native_plugin_owners.get(cid)
+        if owner is not None:
+            # Scoped per-plugin credential seam (C4/H2/M7): the plugin's
+            # declared CREDENTIAL_REFERENCES plus its configured
+            # credential_refs resolve here, on demand, ONLY when one of
+            # the plugin's own capabilities dispatches — a missing plugin
+            # secret can never break host.shell/web.search/etc. Unlike
+            # the MCP lane above, a missing required secret fails THIS
+            # call with a structured answer instead of degrading to the
+            # handler without credentials.
+            import json as _json
+
+            try:
+                stored_doc = plugin_store.read_config(owner.plugin)
+                doc = parse_plugin_config_text(stored_doc.text)
+            except Exception:
+                doc = None
+            if doc is not None and not doc.enabled:
+                return ExecutorResult(
+                    ok=False,
+                    error_code="plugin_disabled",
+                    output=_json.dumps(
+                        {
+                            "status": "error",
+                            "code": "plugin_disabled",
+                            "detail": (
+                                f"native plugin {owner.plugin!r} is "
+                                "disabled in the stored configuration"
+                            ),
+                        }
+                    ),
+                )
+            refs: list[str] = list(owner.credential_references)
+            if doc is not None:
+                for ref in doc.credential_refs:
+                    if ref not in refs:
+                        refs.append(ref)
+            unresolved = [ref for ref in refs if ref not in call.credentials]
+            if unresolved:
+                try:
+                    env_res = _resolve_env()
+                    resolved = {ref: env_res.resolve(ref) for ref in unresolved}
+                except Exception as error:
+                    return ExecutorResult(
+                        ok=False,
+                        error_code="credential_resolution_failed",
+                        output=_json.dumps(
+                            {
+                                "status": "error",
+                                "code": "credential_resolution_failed",
+                                "detail": (
+                                    f"native plugin {owner.plugin!r} "
+                                    f"credential {unresolved[0]!r} did "
+                                    f"not resolve ({type(error).__name__})"
+                                ),
+                            }
+                        ),
+                    )
+                call = dataclasses.replace(
+                    call,
+                    credentials={**call.credentials, **resolved},
+                )
         return await target(call)  # type: ignore[misc]
 
     def _read_grants():

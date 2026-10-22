@@ -16,9 +16,17 @@ importlib.metadata entry-point group :data:`ENTRY_POINT_GROUP`
 - entry point **name** = plugin name (configuration/disable key);
 - entry point **value** = a dotted module path (no ``:attr``) — the
   plugin module;
-- the module declares a module-level ``CAPABILITY`` mapping in exactly
-  the frozen C03 rule 1 descriptor vocabulary (same declaration name and
-  validation path as ``mai.plugins.registry``, the vocabulary owner);
+- the module declares a module-level ``CAPABILITY`` mapping (singular,
+  the original 1:1 contract) **or** a non-empty module-level
+  ``CAPABILITIES`` sequence of mappings (one plugin owning several
+  capability identifiers) — each in exactly the frozen C03 rule 1
+  descriptor vocabulary (same declaration name and validation path as
+  ``mai.plugins.registry``, the vocabulary owner). A multi-capability
+  plugin must declare one identical ``config_schema`` across all its
+  descriptors (the plugin has one configuration form) and, unlike the
+  legacy singular declaration, every descriptor must pass the
+  agent-readiness gate (:func:`mai.capabilities.internal_api.assert_agent_ready_descriptor`
+  — LLM-facing tool and parameter descriptions);
 - the module declares a callable ``execute`` — the trusted handler
   receiving a :class:`~mai.capabilities.dispatch.CapabilityCall` and
   returning an :class:`~mai.capabilities.dispatch.ExecutorResult`
@@ -65,6 +73,13 @@ What this runtime does — and deliberately does not
   disable is this knob. Changing the disabled set means composing a new
   runtime with a fresh registry — the registry itself is append-only by
   contract (registration is a declared fact, not an upsert).
+- **Built-ins are opt-in per composition.** The host distribution itself
+  (``BUILTIN_DISTRIBUTION``) may ship its own plugins (today
+  ``onepassword``). By default a runtime composes *third-party installed*
+  plugins only — entry points backed by the host distribution are skipped
+  before import — so fixture/diagnostic compositions see exactly the
+  installed third-party set. Hosts that execute built-ins (the worker,
+  the inspector CLI) pass ``include_builtins=True`` explicitly.
 - **Zero unmediated execution.** The only invocation surface is the
   :attr:`NativePluginRuntime.executor` async callable, built to be wired
   into :class:`mai.capabilities.dispatch.CapabilityDispatcher` as its
@@ -102,11 +117,19 @@ from importlib.metadata import EntryPoint, entry_points
 from types import ModuleType
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.internal_api import assert_agent_ready_descriptor
 from mai.plugins.registry import (
     CAPABILITY_DECLARATION,
+    CapabilityDescriptor,
     CapabilityErrorCode,
     CapabilityError,
     CapabilityRegistry,
@@ -114,6 +137,8 @@ from mai.plugins.registry import (
 )
 
 __all__ = [
+    "BUILTIN_DISTRIBUTION",
+    "CAPABILITIES_DECLARATION",
     "CREDENTIAL_DECLARATION",
     "CREDENTIAL_REFERENCE_RE",
     "ENTRY_POINT_GROUP",
@@ -135,6 +160,19 @@ ENTRY_POINT_GROUP = "mai.capabilities"
 
 #: Module-level attribute holding the trusted handler callable.
 HANDLER_DECLARATION = "execute"
+
+#: Module-level attribute holding the plural capability-declaration
+#: sequence: one plugin owning several capability identifiers. Exactly
+#: one of ``CAPABILITY`` (singular, 1:1) / ``CAPABILITIES`` (plural,
+#: non-empty) may be declared.
+CAPABILITIES_DECLARATION = "CAPABILITIES"
+
+#: The distribution shipping the built-in plugins (this package). A
+#: runtime composed with ``include_builtins=False`` (the default:
+#: fixtures, store diagnostics) skips entry points backed by this
+#: distribution before any import; hosts that execute built-ins opt in
+#: explicitly.
+BUILTIN_DISTRIBUTION = "mai"
 
 #: Module-level attribute holding the credential reference names the
 #: handler needs (names only, C03 rule 2/6 — values resolve at effect
@@ -159,22 +197,79 @@ CREDENTIAL_REFERENCE_RE = r"^[A-Z][A-Z0-9_]{0,127}$"
 _PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
 
+def _json_documents_equal(left: object, right: object) -> bool:
+    """Strict JSON-document equality: bools are their own type.
+
+    Used for the multi-capability ``config_schema`` identity rule; JSON
+    round-trip keeps the comparison key-order independent, and the bool
+    guard keeps ``True`` distinct from ``1`` (the plugin store's rule).
+    """
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    try:
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+    except (TypeError, ValueError):
+        return left == right
+
+
+def _is_builtin_entry_point(ep: EntryPoint) -> bool:
+    """Whether one entry point is backed by the host distribution itself.
+
+    Dist-less entry points (never the platform's shape for a discovered
+    plugin) are treated as third-party and always load.
+    """
+    dist = getattr(ep, "dist", None)
+    return dist is not None and getattr(dist, "name", None) == BUILTIN_DISTRIBUTION
+
+
 class NativePluginManifest(BaseModel):
     """Validated manifest envelope of one native plugin module.
 
     The pydantic layer owns only the native envelope: the capability
-    document is carried opaquely (``dict[str, object]``) and validated by
-    :func:`mai.plugins.registry.parse_descriptor` — the C03 rule 1
+    documents are carried opaquely (``dict[str, object]``) and validated
+    by :func:`mai.plugins.registry.parse_descriptor` — the C03 rule 1
     vocabulary owner. ``extra="forbid"`` mirrors the descriptor's strict
     vocabulary: an envelope cannot smuggle undeclared fields.
+
+    Exactly one declaration is required: ``capability`` (singular,
+    normalized to a one-element ``capabilities`` tuple) or
+    ``capabilities`` (plural, non-empty). Every descriptor of a
+    multi-capability plugin must declare an identical ``config_schema``
+    (one plugin, one configuration form; C3) — divergence is the
+    explicit compatibility failure.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    capability: dict[str, object]
+    capability: dict[str, object] | None = None
+    capabilities: tuple[dict[str, object], ...] = ()
     credential_references: tuple[
         Annotated[str, StringConstraints(pattern=CREDENTIAL_REFERENCE_RE)], ...
     ] = ()
+
+    @model_validator(mode="after")
+    def _exactly_one_declaration(self) -> "NativePluginManifest":
+        if self.capability is not None and self.capabilities:
+            raise ValueError(
+                "declare exactly one of capability / capabilities "
+                "(a plugin owns one declaration form)"
+            )
+        if self.capability is not None:
+            self.capabilities = (self.capability,)
+        if not self.capabilities:
+            raise ValueError(
+                "at least one capability descriptor must be declared "
+                "(capability or non-empty capabilities)"
+            )
+        schemas = [doc.get("config_schema") for doc in self.capabilities]
+        first = schemas[0]
+        for other in schemas[1:]:
+            if not _json_documents_equal(first, other):
+                raise ValueError(
+                    "all descriptors of a multi-capability plugin must "
+                    "declare an identical config_schema"
+                )
+        return self
 
 
 class NativePluginErrorCode(StrEnum):
@@ -213,6 +308,7 @@ class PluginRejectionCode(StrEnum):
     IMPORT_FAILED = "import_failed"
     MANIFEST_INVALID = "manifest_invalid"
     HANDLER_MISSING = "capability_handler_missing"
+    NOT_AGENT_READY = "capability_not_agent_ready"
     IDENTIFIER_CONFLICT = "capability_identifier_conflict"
 
 
@@ -231,21 +327,32 @@ class PluginRejection:
 
 @dataclass(frozen=True, slots=True)
 class NativePlugin:
-    """One loaded, enabled plugin: descriptor plus trusted handler.
+    """One loaded, enabled plugin: descriptor(s) plus trusted handler.
 
     ``handler`` is the module's ``execute`` callable — trusted installed
     code (C03 rule 7). It is reachable only through
     :attr:`NativePluginRuntime.executor`, the dispatcher's executor seam;
     keeping the handler here (unlike the registry's declaration-only
     records) is this runtime's one deliberate code reference.
+
+    ``descriptor_names`` lists every capability identifier the plugin
+    owns in declaration order; ``version``/``effect_class`` are the
+    primary (first) descriptor's values. ``descriptor_name`` remains the
+    primary identifier for backward compatibility with single-capability
+    callers.
     """
 
     plugin: str
-    descriptor_name: str
+    descriptor_names: tuple[str, ...]
     version: str
     effect_class: str
     credential_references: tuple[str, ...]
     handler: Callable[[CapabilityCall], ExecutorResult | Awaitable[ExecutorResult]]
+
+    @property
+    def descriptor_name(self) -> str:
+        """The primary (first declared) capability identifier."""
+        return self.descriptor_names[0]
 
 
 class NativePluginRuntime:
@@ -264,6 +371,7 @@ class NativePluginRuntime:
         *,
         registry: CapabilityRegistry,
         disabled: Collection[str] = (),
+        include_builtins: bool = False,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise NativePluginError(
@@ -286,8 +394,14 @@ class NativePluginRuntime:
                 NativePluginErrorCode.INVALID_WIRING,
                 "disabled contains duplicates",
             )
+        if not isinstance(include_builtins, bool):
+            raise NativePluginError(
+                NativePluginErrorCode.INVALID_WIRING,
+                "include_builtins must be a boolean",
+            )
         self._registry = registry
         self._disabled = frozenset(disabled_names)
+        self._include_builtins = include_builtins
         self._discovered = False
         self._plugins: dict[str, NativePlugin] = {}
         self._handlers: dict[str, NativePlugin] = {}
@@ -329,6 +443,8 @@ class NativePluginRuntime:
         found = sorted(entry_points(group=ENTRY_POINT_GROUP), key=lambda ep: ep.name)
         for ep in found:
             name = ep.name
+            if not self._include_builtins and _is_builtin_entry_point(ep):
+                continue
             if not isinstance(name, str) or not _PLUGIN_NAME_RE.fullmatch(name):
                 self._rejections.append(
                     PluginRejection(
@@ -365,19 +481,24 @@ class NativePluginRuntime:
             )
             return
         declaration = getattr(module, CAPABILITY_DECLARATION, None)
-        if declaration is None:
+        plural_declaration = getattr(module, CAPABILITIES_DECLARATION, None)
+        if declaration is None and plural_declaration is None:
             self._reject(
                 name,
                 CapabilityErrorCode.DECLARATION_MISSING.value,
-                f"{name}: module does not declare {CAPABILITY_DECLARATION}",
+                f"{name}: module does not declare {CAPABILITY_DECLARATION} "
+                f"or {CAPABILITIES_DECLARATION}",
             )
             return
-        document = {
-            "capability": declaration,
+        document: dict[str, object] = {
             "credential_references": list(
                 getattr(module, CREDENTIAL_DECLARATION, ()) or ()
             ),
         }
+        if declaration is not None:
+            document["capability"] = declaration
+        if plural_declaration is not None:
+            document["capabilities"] = plural_declaration
         try:
             manifest = NativePluginManifest.model_validate(document)
         except ValidationError as error:
@@ -399,11 +520,29 @@ class NativePluginRuntime:
                 f"{name}: {CREDENTIAL_DECLARATION} contains duplicates",
             )
             return
-        try:
-            descriptor = parse_descriptor(manifest.capability, source=name)
-        except CapabilityError as error:
-            self._reject(name, error.code.value, error.detail)
-            return
+        # Multi-capability plugins are the agent-facing surface (C1):
+        # every descriptor must carry LLM-ready tool and parameter
+        # descriptions. The legacy singular declaration keeps its
+        # historical leniency (synthetic fixtures, in-repo experiments).
+        enforce_agent_ready = declaration is None
+        descriptors: list[CapabilityDescriptor] = []
+        for capability_document in manifest.capabilities:
+            try:
+                descriptor = parse_descriptor(capability_document, source=name)
+            except CapabilityError as error:
+                self._reject(name, error.code.value, error.detail)
+                return
+            if enforce_agent_ready:
+                try:
+                    assert_agent_ready_descriptor(descriptor)
+                except ValueError as error:
+                    self._reject(
+                        name,
+                        PluginRejectionCode.NOT_AGENT_READY.value,
+                        f"{name}: {error}",
+                    )
+                    return
+            descriptors.append(descriptor)
         handler = getattr(module, HANDLER_DECLARATION, None)
         if not callable(handler):
             self._reject(
@@ -413,26 +552,36 @@ class NativePluginRuntime:
                 f"{HANDLER_DECLARATION}",
             )
             return
-        if descriptor.identifier in self._handlers:
-            self._reject(
-                name,
-                PluginRejectionCode.IDENTIFIER_CONFLICT.value,
-                f"{name}: identifier {descriptor.identifier!r} is already "
-                "bound to another plugin; one owner per capability "
-                "identifier",
-            )
-            return
-        self._registry.register(descriptor)
+        # One owner per capability identifier — within the plugin and
+        # across the discovered set. Checked for every descriptor before
+        # the first registration, so a rejected plugin never leaves a
+        # partial registration behind (atomic per plugin, AC2).
+        claimed: set[str] = set()
+        for descriptor in descriptors:
+            if descriptor.identifier in claimed or descriptor.identifier in self._handlers:
+                self._reject(
+                    name,
+                    PluginRejectionCode.IDENTIFIER_CONFLICT.value,
+                    f"{name}: identifier {descriptor.identifier!r} is already "
+                    "bound to another plugin; one owner per capability "
+                    "identifier",
+                )
+                return
+            claimed.add(descriptor.identifier)
+        for descriptor in descriptors:
+            self._registry.register(descriptor)
+        primary = descriptors[0]
         plugin = NativePlugin(
             plugin=name,
-            descriptor_name=descriptor.identifier,
-            version=descriptor.version,
-            effect_class=descriptor.effect_class,
+            descriptor_names=tuple(d.identifier for d in descriptors),
+            version=primary.version,
+            effect_class=primary.effect_class,
             credential_references=manifest.credential_references,
             handler=handler,
         )
         self._plugins[name] = plugin
-        self._handlers[descriptor.identifier] = plugin
+        for descriptor in descriptors:
+            self._handlers[descriptor.identifier] = plugin
 
     # -- state ----------------------------------------------------------------
 
@@ -530,14 +679,25 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("command", choices=["inspect"])
+    parser.add_argument(
+        "--no-builtins",
+        action="store_true",
+        help=(
+            "skip the host distribution's own built-in plugins and list "
+            "only third-party installed plugins"
+        ),
+    )
     return parser
 
 
 def main(argv: Collection[str] | None = None) -> int:
     """CLI entrypoint: 0 when every discovered plugin loaded, else 1."""
-    _ = _build_parser().parse_args(argv)
+    args = _build_parser().parse_args(argv)
     registry = CapabilityRegistry()
-    runtime = NativePluginRuntime(registry=registry)
+    runtime = NativePluginRuntime(
+        registry=registry,
+        include_builtins=not getattr(args, "no_builtins", False),
+    )
     runtime.discover()
     payload = {
         "group": ENTRY_POINT_GROUP,
@@ -545,6 +705,7 @@ def main(argv: Collection[str] | None = None) -> int:
             {
                 "plugin": plugin.plugin,
                 "identifier": plugin.descriptor_name,
+                "descriptor_names": list(plugin.descriptor_names),
                 "version": plugin.version,
                 "effect_class": plugin.effect_class,
                 "credential_references": list(plugin.credential_references),

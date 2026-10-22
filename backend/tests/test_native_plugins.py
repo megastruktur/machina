@@ -49,7 +49,11 @@ from mai.capabilities.dispatch import (
     DispatchOutcome,
     ExecutorResult,
 )
+from mai.capabilities.internal_api import assert_agent_ready_descriptor
 from mai.credentials.env import EnvResolver
+from mai.plugins.builtin_onepassword import (
+    CAPABILITIES as ONEPASSWORD_CAPABILITIES,
+)
 from mai.plugins.native import (
     CREDENTIAL_DECLARATION,
     ENTRY_POINT_GROUP,
@@ -62,6 +66,8 @@ from mai.plugins.native import (
 from mai.plugins.registry import CapabilityRegistry, parse_descriptor
 from mai.policy.approvals import ApprovalStore
 from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
+
+import test_onepassword as _op_fixtures
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 SOURCE = BACKEND_DIR / "src" / "mai" / "plugins" / "native.py"
@@ -310,15 +316,30 @@ class TestDiscoveryAndRegistration:
         assert runtime.skipped_disabled == ()
 
     def test_manifest_envelope_is_frozen(self) -> None:
-        """The envelope vocabulary is exactly {capability, references};
-        anything else is the explicit compatibility failure."""
+        """The envelope vocabulary is exactly {capability, capabilities,
+        references}; anything else is the explicit compatibility failure."""
         schema = NativePluginManifest.model_json_schema()
-        assert sorted(schema["properties"]) == ["capability", "credential_references"]
+        assert sorted(schema["properties"]) == [
+            "capabilities",
+            "capability",
+            "credential_references",
+        ]
         assert schema["additionalProperties"] is False
 
         valid = {"capability": CAPABILITY_DOC, "credential_references": []}
         manifest = NativePluginManifest.model_validate(valid)
         assert manifest.capability == CAPABILITY_DOC
+        # The singular declaration normalizes into the one-element
+        # plural tuple the runtime consumes.
+        assert manifest.capabilities == (CAPABILITY_DOC,)
+        plural = NativePluginManifest.model_validate(
+            {
+                "capabilities": [CAPABILITY_DOC, CAPABILITY_DOC],
+                "credential_references": [],
+            }
+        )
+        assert plural.capability is None
+        assert plural.capabilities == (CAPABILITY_DOC, CAPABILITY_DOC)
         try:
             NativePluginManifest.model_validate({**valid, "handler": "os.system"})
         except ValidationError:
@@ -349,7 +370,7 @@ class TestDiscoveryAndRegistration:
             [str(root), env.get("PYTHONPATH", "")]
         ).removesuffix(os.pathsep)
         proc = subprocess.run(
-            [sys.executable, "-m", "mai.plugins.native", "inspect"],
+            [sys.executable, "-m", "mai.plugins.native", "inspect", "--no-builtins"],
             capture_output=True,
             text=True,
             env=env,
@@ -364,6 +385,7 @@ class TestDiscoveryAndRegistration:
             {
                 "plugin": "mai_fx_cli",
                 "identifier": IDENTIFIER,
+                "descriptor_names": [IDENTIFIER],
                 "version": "1.0.0",
                 "effect_class": "read",
                 "credential_references": [SECRET_NAME],
@@ -395,7 +417,7 @@ class TestDiscoveryAndRegistration:
         env = dict(os.environ)
         env["PYTHONPATH"] = str(root)
         proc = subprocess.run(
-            [sys.executable, "-m", "mai.plugins.native", "inspect"],
+            [sys.executable, "-m", "mai.plugins.native", "inspect", "--no-builtins"],
             capture_output=True,
             text=True,
             env=env,
@@ -1026,3 +1048,895 @@ class TestExposureFollowsGrant:
         )
         assert bridge.enabled_capabilities == ()
         assert len(registry) == 0
+
+
+# ---------------------------------------------------------------------------
+# s2: multi-capability native plugins (CAPABILITIES, plan contract C3)
+# ---------------------------------------------------------------------------
+
+_MULTI_A: dict[str, Any] = {**CAPABILITY_DOC, "identifier": "fxt.multi.a"}
+_MULTI_B: dict[str, Any] = {**CAPABILITY_DOC, "identifier": "fxt.multi.b"}
+
+# Agent-ready variant: schema-level description (>= 30 chars) plus a
+# >= 12-char description on every property (assert_agent_ready_descriptor).
+_AGENT_READY_A: dict[str, Any] = {
+    **CAPABILITY_DOC,
+    "identifier": "fxt.ready.a",
+    "input_schema": {
+        "type": "object",
+        "description": "Compile the given name through the fixture handler.",
+        "properties": {"name": {"type": "string", "description": "The name to compile."}},
+        "required": ["name"],
+        "additionalProperties": False,
+    },
+}
+
+_AGENT_READY_B: dict[str, Any] = {
+    **_AGENT_READY_A,
+    "identifier": "fxt.ready.b",
+}
+
+
+def _multi_plugin_module(
+    log: Path,
+    *docs: dict[str, Any],
+    credential_references: str = (
+        f"{CREDENTIAL_DECLARATION} = [\"{SECRET_NAME}\"]\n"
+    ),
+    extra_declarations: str = "",
+    handler: str = _GOOD_HANDLER,
+) -> str:
+    """One fixture plugin module declaring the plural CAPABILITIES."""
+    if docs:
+        docs_source = ", ".join(repr(doc) for doc in docs)
+        declaration = f"CAPABILITIES = ({docs_source},)\n"
+    else:
+        declaration = "CAPABILITIES = ()\n"
+    return (
+        _HANDLER_IMPORTS
+        + f"_LOG = Path({str(log)!r})\n"
+        + declaration
+        + extra_declarations
+        + credential_references
+        + handler
+    )
+
+
+def _executor_call(identifier: str, document: dict[str, Any]) -> CapabilityCall:
+    return CapabilityCall(
+        descriptor=parse_descriptor(document),
+        payload={"name": "kernel"},
+        context=_context(),
+        credentials={},
+        op_id=uuid.uuid4(),
+    )
+
+
+class TestMultiCapability:
+    def test_multi_capability_module_loads_all_descriptors(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        log = tmp_path / "multi.log"
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {
+                "module": "mai_fx_multi",
+                "src": _multi_plugin_module(log, _AGENT_READY_A, _AGENT_READY_B),
+            },
+        )
+        registry = CapabilityRegistry()
+        runtime = NativePluginRuntime(registry=registry)
+        runtime.discover()
+
+        assert len(runtime.plugins) == 1
+        plugin = runtime.plugins[0]
+        assert plugin.descriptor_names == ("fxt.ready.a", "fxt.ready.b")
+        # Backward-compatible primary-descriptor property.
+        assert plugin.descriptor_name == "fxt.ready.a"
+        assert plugin.version == "1.0.0"
+        assert plugin.effect_class == "read"
+        assert plugin.credential_references == (SECRET_NAME,)
+        assert len(registry) == 2
+        assert runtime.rejections == ()
+        assert runtime.credential_references == (SECRET_NAME,)
+
+        # Every descriptor routes to the plugin's one execute handler.
+        for identifier, document in (
+            ("fxt.ready.a", _AGENT_READY_A),
+            ("fxt.ready.b", _AGENT_READY_B),
+        ):
+            result = _run(runtime.executor(_executor_call(identifier, document)))
+            assert isinstance(result, ExecutorResult)
+            assert result.ok is True
+
+    def test_multi_capability_requires_identical_config_schema(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        log = tmp_path / "divergent.log"
+        divergent = (
+            {**CAPABILITY_DOC, "identifier": "fxt.multi.a",
+             "config_schema": {"type": "object"}},
+            {**CAPABILITY_DOC, "identifier": "fxt.multi.b",
+             "config_schema": {"type": "object", "additionalProperties": False}},
+        )
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {"module": "mai_fx_multi", "src": _multi_plugin_module(log, *divergent)},
+        )
+        registry = CapabilityRegistry()
+        runtime = NativePluginRuntime(registry=registry)
+        runtime.discover()
+        (rejection,) = runtime.rejections
+        assert rejection.code == PluginRejectionCode.MANIFEST_INVALID.value
+        assert runtime.plugins == ()
+        assert len(registry) == 0
+
+    def test_bool_is_never_an_int_in_config_schema_identity(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        log = tmp_path / "bool.log"
+        docs = (
+            {**CAPABILITY_DOC, "identifier": "fxt.multi.a",
+             "config_schema": True},
+            {**CAPABILITY_DOC, "identifier": "fxt.multi.b",
+             "config_schema": 1},
+        )
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {"module": "mai_fx_multi", "src": _multi_plugin_module(log, *docs)},
+        )
+        runtime = NativePluginRuntime(registry=CapabilityRegistry())
+        runtime.discover()
+        (rejection,) = runtime.rejections
+        assert rejection.code == PluginRejectionCode.MANIFEST_INVALID.value
+
+    def test_multi_capability_rejects_both_declarations(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        log = tmp_path / "both.log"
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {
+                "module": "mai_fx_multi",
+                "src": _multi_plugin_module(
+                    log,
+                    _MULTI_A,
+                    extra_declarations=f"CAPABILITY = {CAPABILITY_DOC!r}\n",
+                ),
+            },
+        )
+        runtime = NativePluginRuntime(registry=CapabilityRegistry())
+        runtime.discover()
+        (rejection,) = runtime.rejections
+        assert rejection.code == PluginRejectionCode.MANIFEST_INVALID.value
+        assert runtime.plugins == ()
+
+    def test_multi_capability_rejects_empty_sequence(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        log = tmp_path / "empty.log"
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {
+                "module": "mai_fx_multi",
+                "src": _multi_plugin_module(log),
+            },
+        )
+        runtime = NativePluginRuntime(registry=CapabilityRegistry())
+        runtime.discover()
+        (rejection,) = runtime.rejections
+        assert rejection.code == PluginRejectionCode.MANIFEST_INVALID.value
+        assert runtime.plugins == ()
+
+    def test_multi_capability_enforces_agent_ready_descriptions(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Plural declarations are the agent-facing surface (C1): every
+        descriptor must pass assert_agent_ready_descriptor; the legacy
+        singular declaration keeps its leniency (all other fixtures)."""
+        log = tmp_path / "bare.log"
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            # _MULTI_A has no descriptions: rejected under CAPABILITIES.
+            {"module": "mai_fx_bare", "src": _multi_plugin_module(log, _MULTI_A)},
+        )
+        registry = CapabilityRegistry()
+        runtime = NativePluginRuntime(registry=registry)
+        runtime.discover()
+        (rejection,) = runtime.rejections
+        assert rejection.code == PluginRejectionCode.NOT_AGENT_READY.value
+        assert rejection.plugin == "mai_fx_bare"
+        assert runtime.plugins == ()
+        # Atomic per plugin: nothing leaked a registration.
+        assert len(registry) == 0
+
+        ready_log = tmp_path / "ready.log"
+        _install_plugins(
+            tmp_path,
+            monkeypatch,
+            {
+                "module": "mai_fx_ready",
+                "src": _multi_plugin_module(
+                    ready_log,
+                    _AGENT_READY_A,
+                    credential_references=f"{CREDENTIAL_DECLARATION} = []\n",
+                ),
+            },
+            dist_name="ready-fxt",
+        )
+        ready_registry = CapabilityRegistry()
+        ready_runtime = NativePluginRuntime(registry=ready_registry)
+        ready_runtime.discover()
+        assert [p.descriptor_names for p in ready_runtime.plugins] == [
+            ("fxt.ready.a",)
+        ]
+        # The bare fixture from the first half is still installed and
+        # keeps failing the same readiness gate; the ready plugin loads.
+        assert [r.plugin for r in ready_runtime.rejections] == ["mai_fx_bare"]
+
+
+# ---------------------------------------------------------------------------
+# s2: the built-in onepassword plugin (C1/C2, dispatcher-level)
+# ---------------------------------------------------------------------------
+
+OP_VAULT = "mai-dev"
+OP_TOKEN = "op-token-sentinel-not-a-secret"
+_OP_LISTING = [
+    {
+        "id": "it-a",
+        "title": "alpha",
+        "category": "LOGIN",
+        "vault": OP_VAULT,
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
+]
+
+#: C2 regression material: a value whose JSON serialization escapes it
+#: (``"``, ``\``, newline, non-ASCII) so a byte-form distinct from the
+#: raw secret reaches ``json.dumps`` output. Raw-substring scrubbing
+#: used to miss exactly this form.
+ESCAPING_SECRET = 'INQ-GEN-"q7\\Wx2#mK\n€'
+
+
+def _op_env_file(tmp_path: Path) -> Path:
+    path = tmp_path / "op.env"
+    path.write_text(f"OP_SERVICE_ACCOUNT_TOKEN={OP_TOKEN}\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _assert_secret_absent(outcome: DispatchOutcome, secret: str) -> None:
+    """C2: neither the raw value nor either JSON-escaped form survives.
+
+    ``outcome.output`` is the durable dispatcher answer; ``to_json()``
+    is the receipt serialization the audit surface persists.
+    """
+    assert outcome.output is not None
+    for form in (
+        secret,
+        json.dumps(secret, ensure_ascii=True)[1:-1],
+        json.dumps(secret, ensure_ascii=False)[1:-1],
+    ):
+        assert form not in outcome.output.text
+        _sweep(outcome.to_json(), form)
+
+
+class TestBuiltinOnepassword:
+    """The host distribution's own plugin: opt-in composition (worker
+    runtime semantics) exercised through the real dispatcher."""
+
+    def _compose(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        *,
+        bin_dir: Path | None = None,
+    ) -> tuple[CapabilityRegistry, NativePluginRuntime, CapabilityDispatcher]:
+        if bin_dir is not None:
+            monkeypatch.setenv(
+                "PATH",
+                os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")]),
+            )
+        registry = CapabilityRegistry()
+        runtime = NativePluginRuntime(registry=registry, include_builtins=True)
+        runtime.discover()
+        dispatcher = CapabilityDispatcher(
+            registry=registry,
+            approvals=_unused_approvals(),
+            grants=lambda: {
+                cid: {SERVER_ID}
+                for cid in ("secret.list", "secret.get", "secret.store")
+            },
+            policy=lambda: Policy(revision=1),
+            adopted=lambda server_id: True,
+            credentials=lambda: EnvResolver(_op_env_file(tmp_path)),
+            executor=runtime.executor,
+        )
+        return registry, runtime, dispatcher
+
+    def _context(
+        self, *, credential_references: tuple[str, ...] = ("OP_SERVICE_ACCOUNT_TOKEN",)
+    ) -> ExecutionContext:
+        return ExecutionContext(
+            principal="fxt-principal",
+            server_id=SERVER_ID,
+            run_id=RUN_ID,
+            parent_scope=None,
+            profile_revision="prof-1",
+            prompt_revision="prompt-1",
+            credential_references=credential_references,
+            allowed_capabilities=("secret.list", "secret.get", "secret.store"),
+            mode=PolicyMode.DELEGATED,
+        )
+
+    def test_builtin_excluded_by_default_and_opted_in(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Default composition (store diagnostics, fixtures) sees no
+        host-distribution entry points; opt-in (worker) composes them."""
+        default_registry = CapabilityRegistry()
+        default_runtime = NativePluginRuntime(registry=default_registry)
+        default_runtime.discover()
+        assert default_registry.list_capabilities() == ()
+        assert default_runtime.plugins == ()
+        assert default_runtime.rejections == ()
+
+        registry = CapabilityRegistry()
+        runtime = NativePluginRuntime(registry=registry, include_builtins=True)
+        runtime.discover()
+        assert [p.plugin for p in runtime.plugins] == ["onepassword"]
+        plugin = runtime.plugins[0]
+        assert plugin.descriptor_names == (
+            "secret.list",
+            "secret.get",
+            "secret.store",
+        )
+        assert plugin.descriptor_name == "secret.list"
+        assert plugin.version == "1.0.0"
+        assert plugin.effect_class == "read"
+        assert plugin.credential_references == ("OP_SERVICE_ACCOUNT_TOKEN",)
+        assert sorted(d.identifier for d in registry.list_capabilities()) == [
+            "secret.get",
+            "secret.list",
+            "secret.store",
+        ]
+        # Plural declarations are agent-ready (C1): the real plugin passes.
+        for document in ONEPASSWORD_CAPABILITIES:
+            assert_agent_ready_descriptor(parse_descriptor(document))
+
+    def test_secret_list_through_dispatcher(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=_OP_LISTING)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.list",
+                payload={"vault": OP_VAULT},
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.effect == "executed"
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+        assert document["vault"] == OP_VAULT
+        assert [item["title"] for item in document["items"]] == ["alpha"]
+        assert document["total"] == 1
+        assert document["has_more"] is False
+        # The service-account token never echoes into the answer.
+        assert OP_TOKEN not in outcome.output.text
+        _sweep(outcome.to_json(), OP_TOKEN)
+
+    def test_secret_store_redacts_value_in_outcome(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=[])
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.store",
+                payload={
+                    "vault": OP_VAULT,
+                    "title": "deploy-key",
+                    "field": "password",
+                    "value": _op_fixtures.SENTINEL,
+                },
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+        assert document["reference"] == f"op://{OP_VAULT}/deploy-key/password"
+        # C2 pinned: the store value scrubs out of the durable outcome.
+        assert REDACTED in outcome.output.text
+        assert _op_fixtures.SENTINEL not in outcome.output.text
+        # L3: no digest oracle for human-chosen secrets.
+        assert "sha256" not in document
+        _sweep(outcome.to_json(), _op_fixtures.SENTINEL, OP_TOKEN)
+
+    def test_secret_get_json_escaped_secret_fully_redacted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """C2: a value ``json.dumps`` escapes (`", ``\\``, newline,
+        non-ASCII) must not survive in its escaped byte form — raw
+        substring scrubbing used to miss exactly that copy."""
+        bin_dir = _op_fixtures._install_fake_op(
+            tmp_path, value=ESCAPING_SECRET
+        )
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                },
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+        # The escaped copy in the JSON document scrubs to the marker:
+        # the parsed answer carries no readable material.
+        assert document["value"] == REDACTED
+        _assert_secret_absent(outcome, ESCAPING_SECRET)
+        _sweep(outcome.to_json(), OP_TOKEN)
+
+    def test_secret_store_json_escaped_secret_fully_redacted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """C2: the store surface with an escaping value — the value the
+        model supplied never survives the dispatcher output, raw or
+        JSON-escaped."""
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=[])
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.store",
+                payload={
+                    "vault": OP_VAULT,
+                    "title": "nasty-key",
+                    "field": "password",
+                    "value": ESCAPING_SECRET,
+                },
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+        assert document["reference"] == f"op://{OP_VAULT}/nasty-key/password"
+        assert document["value"] == REDACTED
+        # L3: no digest oracle for human-chosen secrets.
+        assert "sha256" not in document
+        _assert_secret_absent(outcome, ESCAPING_SECRET)
+        _sweep(outcome.to_json(), OP_TOKEN)
+
+    def test_secret_get_export_credential_ref_persists_env(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from mai.credentials.env import parse_env_text
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        bin_dir = _op_fixtures._install_fake_op(tmp_path)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": "EXPORTED_TOKEN",
+                },
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["exported_credential_ref"] == "EXPORTED_TOKEN"
+        assert REDACTED in outcome.output.text
+        assert _op_fixtures.SENTINEL not in outcome.output.text
+        credentials_path = data_root / "credentials.env"
+        assert credentials_path.is_file()
+        assert (credentials_path.stat().st_mode & 0o777) == 0o600
+        assert parse_env_text(credentials_path.read_text(encoding="utf-8")) == {
+            "EXPORTED_TOKEN": _op_fixtures.SENTINEL
+        }
+
+        # A malformed reference is a structured refusal, never a write.
+        bad: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": "bad-ref",
+                },
+            )
+        )
+        assert bad.executor_ok is False
+        assert bad.output is not None
+        assert "invalid_credential_ref" in bad.output.text
+
+    def test_vault_allowlist_default_and_disabled_config(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from mai.plugins.builtin_onepassword import CONFIG_SCHEMA
+        from mai.plugins.config import PluginConfigStore
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=_OP_LISTING)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        store = PluginConfigStore(data_root)
+        store.write_config(
+            "onepassword",
+            (
+                "schema_version: 1\n"
+                "plugin: onepassword\n"
+                "enabled: true\n"
+                "credential_refs: []\n"
+                "config:\n"
+                "  default_vault: mai-dev\n"
+                "  allowed_vaults:\n"
+                "    - mai-dev\n"
+            ),
+            expected_revision=0,
+            config_schema=CONFIG_SCHEMA,
+        )
+
+        # No vault in the payload: the configured default applies.
+        default_outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.list",
+                payload={},
+            )
+        )
+        assert default_outcome.executor_ok is True
+        assert default_outcome.output is not None
+        assert json.loads(default_outcome.output.text)["vault"] == OP_VAULT
+
+        # Strict allowlist enforcement on the stored config.
+        denied: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.list",
+                payload={"vault": "other-vault"},
+            )
+        )
+        assert denied.executor_ok is False
+        assert denied.output is not None
+        assert "vault_not_allowed" in denied.output.text
+
+        # Dispatch-time enabled recheck (worker refuses upstream, too).
+        store.write_config(
+            "onepassword",
+            (
+                "schema_version: 1\n"
+                "plugin: onepassword\n"
+                "enabled: false\n"
+                "credential_refs: []\n"
+                "config:\n"
+                "  default_vault: mai-dev\n"
+                "  allowed_vaults:\n"
+                "    - mai-dev\n"
+            ),
+            expected_revision=1,
+            config_schema=CONFIG_SCHEMA,
+        )
+        disabled: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(),
+                capability_id="secret.list",
+                payload={"vault": OP_VAULT},
+            )
+        )
+        assert disabled.executor_ok is False
+        assert disabled.output is not None
+        assert "plugin_disabled" in disabled.output.text
+
+    def test_missing_token_fails_structurally(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=_OP_LISTING)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(credential_references=()),
+                capability_id="secret.list",
+                payload={"vault": OP_VAULT},
+            )
+        )
+        assert outcome.allowed is True
+        assert outcome.executor_ok is False
+        assert outcome.output is not None
+        assert "token_missing" in outcome.output.text
+        assert OP_TOKEN not in outcome.output.text
+
+
+# ---------------------------------------------------------------------------
+# s2: step-receipt secret hygiene (run.py helpers, C2)
+# ---------------------------------------------------------------------------
+
+
+class TestStepReceiptSecretHygiene:
+    def test_secret_value_field_is_unconditionally_scrubbed(self) -> None:
+        from mai.agents.run import _scrubbed_step_params
+
+        params = _scrubbed_step_params(
+            "secret.store",
+            {"value": "plaintext-sentinel", "title": "deploy-key"},
+            [],
+        )
+        assert params["value"] == REDACTED
+        assert params["title"] == "deploy-key"
+
+    def test_non_secret_capability_keeps_value(self) -> None:
+        from mai.agents.run import _scrubbed_step_params
+
+        params = _scrubbed_step_params(
+            "host.shell", {"value": "plain", "cmd": "ls"}, []
+        )
+        assert params == {"value": "plain", "cmd": "ls"}
+
+    def test_resolved_credentials_are_scrubbed_from_strings(self) -> None:
+        from mai.agents.run import _scrubbed_step_params
+
+        params = _scrubbed_step_params(
+            "host.shell",
+            {"cmd": "echo resolved-token; ls"},
+            ["resolved-token"],
+        )
+        assert params["cmd"] == f"echo {REDACTED}; ls"
+
+    def test_scrub_document_walks_nested_documents(self) -> None:
+        from mai.agents.run import _scrub_secret_document
+
+        scrubbed = _scrub_secret_document(
+            {"a": ["tok", {"b": "tok"}], "n": 1, "keep": "safe"}, ["tok"]
+        )
+        assert scrubbed == {"a": [REDACTED, {"b": REDACTED}], "n": 1, "keep": "safe"}
+
+    def test_json_escaped_secret_scrubbed_from_receipt_strings(self) -> None:
+        """C2: receipt strings embedding JSON-encoded copies of a
+        resolved secret (double-encoded payloads, echoed tool output)
+        scrub too — raw-substring replace used to miss them."""
+        from mai.agents.run import _scrub_secret_text
+
+        for form in (
+            json.dumps(ESCAPING_SECRET, ensure_ascii=True)[1:-1],
+            json.dumps(ESCAPING_SECRET, ensure_ascii=False)[1:-1],
+        ):
+            line = f'op-echo --payload "{{"value": "{form}"}}"'
+            assert _scrub_secret_text(line, [ESCAPING_SECRET]) == (
+                f'op-echo --payload "{{"value": "{REDACTED}"}}"'
+            )
+
+    def test_json_escaped_secret_scrubbed_from_receipt_document(self) -> None:
+        """The durable receipt surface: params and parsed-response
+        strings carry only JSON-escaped secret bytes, and both the raw
+        and the escaped form scrub to the marker."""
+        from mai.agents.run import _scrub_secret_document, _scrubbed_step_params
+
+        escaped = json.dumps(ESCAPING_SECRET, ensure_ascii=True)[1:-1]
+        params = _scrubbed_step_params(
+            "secret.store",
+            {"value": ESCAPING_SECRET, "note": f"stored {escaped}"},
+            [ESCAPING_SECRET],
+        )
+        assert params["value"] == REDACTED
+        assert params["note"] == f"stored {REDACTED}"
+
+        # A parsed executor answer whose strings embed JSON text.
+        encoded = json.dumps({"value": ESCAPING_SECRET})
+        assert ESCAPING_SECRET not in encoded  # only escaped bytes inside
+        scrubbed = _scrub_secret_document(
+            {"stdout": encoded, "repeat": [encoded]}, [ESCAPING_SECRET]
+        )
+        assert scrubbed == {
+            "stdout": json.dumps({"value": REDACTED}),
+            "repeat": [json.dumps({"value": REDACTED})],
+        }
+
+    def test_resolved_credential_values_degrade_value_free(self) -> None:
+        from mai.agents.run import _resolved_credential_values
+
+        assert _resolved_credential_values(object(), ("X",)) == []
+        assert _resolved_credential_values(object(), ()) == []
+
+        class _NoProvider:
+            pass
+
+        assert _resolved_credential_values(_NoProvider(), ("X",)) == []
+
+
+# ---------------------------------------------------------------------------
+# s2: worker-scoped per-plugin credentials (C4/H2/M7) — the REAL worker
+# composition, isolated in a fresh OS process (globals stay out of this
+# pytest process).
+# ---------------------------------------------------------------------------
+
+_WORKER_PROBE_SCRIPT = """\
+import asyncio
+import json
+import os
+import sys
+import uuid
+
+from mai.agents import run as agent_run
+from mai.capabilities.dispatch import CapabilityCall
+from mai.jobs.worker import _configure_default_agent_runtime
+from mai.plugins.builtin_onepassword import SECRET_LIST_CAPABILITY, CONFIG_SCHEMA
+from mai.plugins.config import PluginConfigStore
+from mai.plugins.registry import parse_descriptor
+from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+_configure_default_agent_runtime(os.environ["MAI_DATABASE_URL"])
+composite = agent_run._EXECUTOR._steps._dispatcher._executor
+
+
+def _call() -> CapabilityCall:
+    return CapabilityCall(
+        descriptor=parse_descriptor(SECRET_LIST_CAPABILITY),
+        payload={"vault": "mai-dev"},
+        context=ExecutionContext(
+            principal="probe",
+            server_id=uuid.UUID(int=0),
+            run_id=uuid.uuid4(),
+            parent_scope=None,
+            profile_revision="1",
+            prompt_revision="1",
+            # Scoped seam: the chat context carries NO plugin references.
+            credential_references=(),
+            allowed_capabilities=("secret.list",),
+            mode=PolicyMode.DELEGATED,
+        ),
+        credentials={},
+        op_id=uuid.uuid4(),
+    )
+
+
+phase = sys.argv[1]
+results = {}
+
+first = asyncio.run(composite(_call()))
+results["first"] = {
+    "ok": first.ok,
+    "error_code": first.error_code,
+    "output": first.output,
+}
+
+if phase == "resolved":
+    data_root = os.environ["MAI_DATA_ROOT"]
+    PluginConfigStore(data_root).write_config(
+        "onepassword",
+        (
+            "schema_version: 1\\n"
+            "plugin: onepassword\\n"
+            "enabled: false\\n"
+            "credential_refs: []\\n"
+            "config:\\n"
+            "  default_vault: mai-dev\\n"
+            "  allowed_vaults:\\n"
+            "    - mai-dev\\n"
+        ),
+        expected_revision=0,
+        config_schema=CONFIG_SCHEMA,
+    )
+    second = asyncio.run(composite(_call()))
+    results["second"] = {
+        "ok": second.ok,
+        "error_code": second.error_code,
+        "output": second.output,
+    }
+
+print(json.dumps(results))
+"""
+
+
+class TestWorkerScopedCredentials:
+    def test_composite_executor_resolves_plugin_scoped_credentials(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=_OP_LISTING)
+        data_root = tmp_path / "data"
+        data_root.mkdir()
+        env_file = tmp_path / "operator.env"
+        env_file.write_text(
+            f"OP_SERVICE_ACCOUNT_TOKEN={OP_TOKEN}\n", encoding="utf-8"
+        )
+        os.chmod(env_file, 0o600)
+        script = tmp_path / "worker_probe.py"
+        script.write_text(_WORKER_PROBE_SCRIPT, encoding="utf-8")
+
+        base_env = dict(os.environ)
+        base_env["MAI_DATA_ROOT"] = str(data_root)
+        base_env["MAI_DATABASE_URL"] = (
+            "postgresql://unused:unused@127.0.0.1:1/unused"
+        )
+        base_env["PATH"] = os.pathsep.join(
+            [str(bin_dir), base_env.get("PATH", "")]
+        )
+        base_env.pop("MAI_WORKER_HANDLERS", None)
+
+        # Phase 1 — no .env lane: the plugin's declared reference cannot
+        # resolve, so THIS call fails with a structured answer instead of
+        # reaching the handler (and nothing else in the worker breaks).
+        unresolved = subprocess.run(
+            [sys.executable, str(script), "unresolved"],
+            capture_output=True,
+            text=True,
+            env={**base_env, "MAI_ENV_FILE": ""},
+            cwd=BACKEND_DIR,
+            check=False,
+            timeout=180,
+        )
+        assert unresolved.returncode == 0, unresolved.stdout + unresolved.stderr
+        phase_one = json.loads(unresolved.stdout)
+        assert phase_one["first"]["ok"] is False
+        assert (
+            phase_one["first"]["error_code"] == "credential_resolution_failed"
+        )
+        assert OP_TOKEN not in phase_one["first"]["output"]
+
+        # Phase 2 — with the .env lane: the secret resolves on demand,
+        # ONLY for this dispatch, and the plugin executes through the
+        # fake op. Then a stored enabled:false config flips the seam to
+        # a plugin_disabled refusal without a runtime restart.
+        resolved = subprocess.run(
+            [sys.executable, str(script), "resolved"],
+            capture_output=True,
+            text=True,
+            env={**base_env, "MAI_ENV_FILE": str(env_file)},
+            cwd=BACKEND_DIR,
+            check=False,
+            timeout=180,
+        )
+        assert resolved.returncode == 0, resolved.stdout + resolved.stderr
+        phase_two = json.loads(resolved.stdout)
+        assert phase_two["first"]["ok"] is True, phase_two["first"]
+        document = json.loads(phase_two["first"]["output"])
+        assert [item["title"] for item in document["items"]] == ["alpha"]
+        # The scoped seam attaches the credential; it never surfaces.
+        assert OP_TOKEN not in phase_two["first"]["output"]
+        assert phase_two["second"]["ok"] is False
+        assert phase_two["second"]["error_code"] == "plugin_disabled"

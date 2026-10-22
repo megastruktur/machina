@@ -965,7 +965,6 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     # operate Machina services and consult external docs in both pinned-server
     # and General Consult chats.
     plugin_caps: list[str] = []
-    plugin_cred_refs: list[str] = []
     plugin_store = getattr(request.app.state, "plugins", None)
     if isinstance(plugin_store, PluginConfigStore):
         try:
@@ -977,16 +976,12 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                     continue
                 if not doc.enabled:
                     continue
-                bound_here = False
                 try:
                     for b in plugin_store.list_bindings(plugin_name):
                         if b.server_id in (server_uuid, uuid.UUID(int=0)):
                             plugin_caps.extend(b.capabilities)
-                            bound_here = True
                 except Exception:
                     continue
-                if bound_here:
-                    plugin_cred_refs.extend(doc.credential_refs)
         except Exception:
             pass
     capabilities = _dedup_preserving_order(
@@ -995,8 +990,14 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         + ["web.search", "web.read"]
         + plugin_caps
     )
+    # Scoped per-plugin credentials (C4/H2/M7): plugin credential_refs
+    # deliberately stay OUT of the chat context's credential_references.
+    # A native plugin's secrets resolve on demand in the worker's
+    # _composite_executor only when one of that plugin's own capability
+    # dispatches — a missing OP_SERVICE_ACCOUNT_TOKEN must never break
+    # host.shell, web.search or any other capability in the same chat.
     effective_cred_refs = _dedup_preserving_order(
-        list(payload.credential_references) + plugin_cred_refs
+        list(payload.credential_references)
     )
     root_budget: dict[str, object] | None = None
     if payload.root_budget is not None:

@@ -152,7 +152,9 @@ from mai.agents.tools import (
 )
 from mai.capabilities.dispatch import (
     EFFECT_NOT_ATTEMPTED,
+    REDACTED,
     CapabilityDispatcher,
+    _secret_output_forms,
     canonical_payload_hash,
 )
 from mai.contracts.jobs import TERMINAL_STEP_STATES, RunState, StepState
@@ -203,6 +205,95 @@ __all__ = [
     "run_agent_conversation",
     "tool_step_seq",
 ]
+
+# ---------------------------------------------------------------------------
+# step-receipt secret hygiene (C2: zero secret persistence in receipts)
+# ---------------------------------------------------------------------------
+
+#: Capability-id prefix whose payloads may carry raw secret material
+#: (the built-in native plugin's store surface).
+_SECRET_CAPABILITY_PREFIX = "secret."
+
+
+def _resolved_credential_values(steps: object, references: tuple[str, ...]) -> list[str]:
+    """Best-effort resolved values of one dispatch's credential references.
+
+    Reads the composed dispatcher's credential seam exactly like the
+    approval reach-in above reads its approval store: the values are
+    needed *here* only to keep them out of the durable receipt. Every
+    failure (provider absent, reference unresolved) degrades to no
+    scrubbing for that name — the dispatcher's own output boundary is
+    the primary redaction layer.
+    """
+    if not references:
+        return []
+    dispatcher = getattr(steps, "_dispatcher", None)
+    provider = getattr(dispatcher, "_credentials", None)
+    if not callable(provider):
+        return []
+    try:
+        resolver = provider()
+    except Exception:
+        return []
+    values: list[str] = []
+    for name in references:
+        try:
+            resolved = resolver.resolve(name)
+        except Exception:
+            continue
+        raw = getattr(resolved, "value", None)
+        if isinstance(raw, str) and raw:
+            values.append(raw)
+    return values
+
+
+def _scrub_secret_text(text: str, secrets: list[str]) -> str:
+    """Replace every resolved secret value in one receipt string.
+
+    Raw and JSON-escaped forms both scrub: receipts embed
+    JSON-serialized strings (double-encoded payloads, echoed tool
+    output), where only the escaped form of the secret appears (C2).
+    """
+    for value in _secret_output_forms(secrets):
+        text = text.replace(value, REDACTED)
+    return text
+
+
+def _scrub_secret_document(value: object, secrets: list[str]) -> object:
+    """Recursively scrub resolved secret values out of a receipt document."""
+    if isinstance(value, str):
+        return _scrub_secret_text(value, secrets)
+    if isinstance(value, Mapping):
+        return {
+            key: _scrub_secret_document(item, secrets)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_scrub_secret_document(item, secrets) for item in value]
+    return value
+
+
+def _scrubbed_step_params(
+    capability_id: str,
+    params: dict[str, object],
+    resolved_values: list[str],
+) -> dict[str, object]:
+    """The durable ``receipt["params"]`` document, secret-free (C2).
+
+    ``secret.*`` calls scrub their ``value`` field unconditionally — the
+    plaintext the model supplied never becomes persisted audit surface —
+    and every string field is scrubbed of resolved credential material.
+    """
+    scrubbed = dict(params)
+    if capability_id.startswith(_SECRET_CAPABILITY_PREFIX) and "value" in scrubbed:
+        scrubbed["value"] = REDACTED
+    return {
+        key: _scrub_secret_document(item, resolved_values)
+        if isinstance(item, str)
+        else item
+        for key, item in scrubbed.items()
+    }
+
 
 # ---------------------------------------------------------------------------
 # frozen vocabulary + bounds
@@ -1270,17 +1361,28 @@ class AgentRunExecutor:
                 except Exception:
                     pass
         if outcome.output is not None and outcome.output.text:
+            resolved_values = _resolved_credential_values(
+                self._steps, outcome.credential_references
+            )
             try:
                 parsed_output = json.loads(outcome.output.text)
                 receipt["response"] = (
-                    parsed_output
+                    _scrub_secret_document(parsed_output, resolved_values)
                     if len(outcome.output.text) <= 32768
                     else outcome.output.text[:32768] + "… [truncated]"
                 )
             except Exception:
-                receipt["response"] = outcome.output.text[:32768]
+                receipt["response"] = _scrub_secret_text(
+                    outcome.output.text[:32768], resolved_values
+                )
         if isinstance(payload, Mapping):
-            receipt["params"] = dict(payload)
+            receipt["params"] = _scrubbed_step_params(
+                str(capability_id),
+                dict(payload),
+                _resolved_credential_values(
+                    self._steps, outcome.credential_references
+                ),
+            )
         step_state = StepState(state_value)
         await self._steps.apersist_outcome(
             intent.run_id,
