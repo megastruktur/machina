@@ -3231,6 +3231,162 @@ class TestDescriptorContract:
 
 
 # ---------------------------------------------------------------------------
+# The generated model-facing tool contract (descriptions + guidance)
+# ---------------------------------------------------------------------------
+
+
+def _generated_tool():
+    """The real tool the bridge generates for ``web.read``.
+
+    The descriptor is registered in the real registry, the real
+    dispatcher and the real tool bridge build the PydanticAI tool — the
+    assertion target is the *generated* tool definition, never a source
+    string.
+    """
+    from mai.agents.tools import CapabilityToolBridge
+
+    registry = _registry()
+    dispatcher = _dispatcher(
+        registry,
+        WebPageCapability(_StaticProvider(_STATIC_PAGE)),
+        grants=_grants(SERVER_A),
+    )
+    bridge = CapabilityToolBridge(
+        registry=registry,
+        dispatcher=dispatcher,
+        context=_context(server_id=SERVER_A),
+    )
+    return next(tool for tool in bridge.tools if "read" in tool.name)
+
+
+def _root_description() -> str:
+    """The descriptor's root description as text (a plain string)."""
+    value = descriptor().input_schema.get("description")
+    assert isinstance(value, str) and value
+    return value
+
+
+def _property_schema(name: str) -> Mapping[str, Any]:
+    """One input-schema property schema as a plain mapping."""
+    properties = descriptor().input_schema.get("properties")
+    assert isinstance(properties, Mapping)
+    property_schema = properties[name]
+    assert isinstance(property_schema, Mapping)
+    return property_schema
+
+
+class TestGeneratedToolDescription:
+    def test_generated_tool_carries_the_root_description(self) -> None:
+        """The generated tool definition carries the schema's root
+        description — the usage guidance reaches the model through the
+        tool the bridge really builds."""
+        tool = _generated_tool()
+        root = _root_description()
+        assert tool.description is not None
+        assert root in tool.description
+        schema = tool.function_schema.json_schema
+        assert schema["description"] == root
+
+    def test_root_description_states_the_real_contract(self) -> None:
+        """Purpose, supported document types, no-JS/plain-HTTP scope,
+        public-URL policy, provenance and the two separate budgets."""
+        root = _root_description()
+        lowered = root.lower()
+        # Purpose and supported document types.
+        assert "read" in lowered
+        for media_type in (
+            "text/html",
+            "application/xhtml+xml",
+            "text/plain",
+            "text/markdown",
+        ):
+            assert media_type in root
+        # Plain HTTP, no JavaScript, no browser rendering.
+        assert "http" in lowered
+        assert "javascript" in lowered
+        assert "no javascript runs" in lowered
+        # Public URLs only, with the honest refusal code.
+        assert "public" in lowered
+        assert "address_refused" in root
+        # Source provenance.
+        assert "citation" in lowered
+        assert "provenance" in lowered
+        # The byte budget: default 262144, hard cap 1048576.
+        assert "262144" in root
+        assert "1048576" in root
+        # The extracted-text budget is distinct from the byte budget.
+        assert "20000" in root
+        assert "100000" in root
+        assert "separate" in lowered
+
+    def test_root_description_carries_recovery_guidance(self) -> None:
+        """The guidance names the status-specific recovery, and it never
+        promises a retry the reader does not perform."""
+        root = _root_description()
+        lowered = root.lower()
+        # Prefer a discovered/provided URL.
+        assert "discovered" in lowered
+        # 404 -> correct or search; 403 -> another accessible source, no
+        # bypass; 429 -> wait, no rapid retries.
+        assert "404" in root
+        assert "correct" in lowered
+        assert "search" in lowered
+        assert "403" in root
+        assert "429" in root
+        assert "retrying rapidly" in lowered
+        # Size increase stays bounded.
+        assert "response_too_large" in root
+        assert "bounded" in lowered
+        # No identical repeat of a failed request.
+        assert "do not repeat an identical request" in lowered
+        # Structured failures and the numeric HTTP status.
+        assert "http_status" in root
+        assert "refused" in lowered
+        assert "unavailable" in lowered
+        # No hidden retry promise anywhere in the wording.
+        assert "automatically retries" not in lowered
+        assert "will retry" not in lowered
+
+    def test_parameter_descriptions_match_the_implemented_budgets(self) -> None:
+        """The per-parameter documentation states the real bounds and does
+        not imply a per-call timeout deadline that is not enforced."""
+        max_bytes = _property_schema("max_bytes")
+        assert max_bytes["default"] == DEFAULT_MAX_BYTES == 262144
+        assert max_bytes["maximum"] == MAX_MAX_BYTES == 1048576
+        assert "262144" in str(max_bytes["description"])
+        assert "1048576" in str(max_bytes["description"])
+        markdown = _property_schema("max_markdown_chars")
+        assert markdown["default"] == DEFAULT_MAX_MARKDOWN_CHARS == 20000
+        assert markdown["maximum"] == MAX_MARKDOWN_CHARS == 100000
+        assert "20000" in str(markdown["description"])
+        assert "100000" in str(markdown["description"])
+        timeout = _property_schema("timeout_seconds")
+        assert timeout["default"] == DEFAULT_TIMEOUT_SECONDS
+        assert timeout["maximum"] == MAX_TIMEOUT_SECONDS
+        # The timeout is validated but not yet enforced per call: the
+        # wording must not claim a whole-fetch deadline it does not own.
+        assert "does not yet shorten" in str(timeout["description"])
+
+    def test_generated_tool_keeps_the_payload_surface_and_effect(self) -> None:
+        """The description slice changes documentation only: the payload
+        surface, the effect class and the grants stay exactly as they
+        were."""
+        schema = _generated_tool().function_schema.json_schema
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == ["url"]
+        assert sorted(schema["properties"]) == [
+            "max_bytes",
+            "max_markdown_chars",
+            "timeout_seconds",
+            "url",
+        ]
+        desc = descriptor()
+        assert desc.effect_class == "read"
+        assert tuple(desc.required_grants) == (CAPABILITY_ID,)
+        assert desc.resource_scope == ()
+
+
+# ---------------------------------------------------------------------------
 # Production entrypoint: real subprocess against the controlled upstream
 # ---------------------------------------------------------------------------
 

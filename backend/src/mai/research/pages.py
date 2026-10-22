@@ -1726,6 +1726,42 @@ def _executor_result(
 # ---------------------------------------------------------------------------
 
 
+#: The root description of the capability's input schema. The tool
+#: bridge publishes this schema verbatim as the model-facing function
+#: schema and prefixes the generated tool's description with this text,
+#: so it is the one place where usage and recovery guidance reaches the
+#: model. It states only what this reader actually does — no implied
+#: retries, no implied rendering, no widened policy.
+_ROOT_TOOL_DESCRIPTION = (
+    "Read one public web page over plain HTTP(S) and return its text "
+    "with source provenance. Supported document types: HTML "
+    "(text/html), XHTML (application/xhtml+xml), plain text "
+    "(text/plain) and Markdown (text/markdown); plain text and "
+    "Markdown are returned verbatim. No JavaScript runs and no "
+    "browser rendering happens, so a page that needs scripts to show its "
+    "content will read as its static HTML only. Only public URLs are "
+    "reachable: private, loopback and other non-public addresses are "
+    "refused before any connection (code address_refused). The answer "
+    "carries the requested URL, the final URL after redirects, a "
+    "citation and a trust label, so quoted text stays traceable to the "
+    "fetchable source. Size budgets are separate: the raw-body byte "
+    "budget defaults to 262144 bytes and is capped at 1048576 bytes "
+    "(code response_too_large beyond it); the extracted-text character "
+    "budget is separate again (default 20000, maximum 100000), and a "
+    "cut answer is flagged truncated. "
+    "Recovery guidance: prefer a URL that was already discovered or "
+    "given to you; on http_status 404 correct the URL or search for the "
+    "page instead of retrying; on 403 use a different, accessible source "
+    "rather than trying to get around the refusal; on 429 wait instead "
+    "of retrying rapidly; on response_too_large raise max_bytes only a "
+    "bounded step, and only when the document is genuinely worth it. "
+    "Do not repeat an identical request that already failed. Failures "
+    "are structured answers, not exceptions: status is ok, refused or "
+    "unavailable, with a stable code and the numeric http_status of the "
+    "response (null when no status was observed)."
+)
+
+
 def descriptor() -> CapabilityDescriptor:
     """The validated capability descriptor (C03 rule 1 vocabulary).
 
@@ -1748,6 +1784,7 @@ def descriptor() -> CapabilityDescriptor:
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": _ROOT_TOOL_DESCRIPTION,
                 "required": ["url"],
                 "properties": {
                     "url": {
@@ -1755,7 +1792,8 @@ def descriptor() -> CapabilityDescriptor:
                         "minLength": 1,
                         "maxLength": MAX_URL_CHARS,
                         "description": (
-                            "Absolute http(s) page URL to read. Private, "
+                            "Absolute http(s) page URL to read; prefer a URL "
+                            "already discovered or given to you. Private, "
                             "loopback and otherwise non-public addresses "
                             "refuse before any connection, at every "
                             "redirect hop (code address_refused); URLs "
@@ -1768,10 +1806,12 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_MAX_BYTES,
                         "default": DEFAULT_MAX_BYTES,
                         "description": (
-                            "Raw-body byte budget; a Content-Length over "
-                            "budget refuses before reading, the streaming "
-                            "read stops at budget+1 (code "
-                            "response_too_large)."
+                            "Raw-body byte budget (default 262144, maximum "
+                            "1048576); a Content-Length over budget refuses "
+                            "before reading, the streaming read stops at "
+                            "budget+1 (code response_too_large). Raise it "
+                            "only for a document that is genuinely too big; "
+                            "the maximum is the hard cap."
                         ),
                     },
                     "timeout_seconds": {
@@ -1780,8 +1820,12 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_TIMEOUT_SECONDS,
                         "default": DEFAULT_TIMEOUT_SECONDS,
                         "description": (
-                            "Whole-fetch time budget; a timeout classifies "
-                            "as fetch_timeout, value-free."
+                            "Requested fetch timeout in seconds, validated "
+                            "within (0, 60]; the provider's configured "
+                            "fetch timeout governs the actual deadline "
+                            "today, so a smaller value does not yet shorten "
+                            "a read. A timeout classifies as fetch_timeout, "
+                            "value-free."
                         ),
                     },
                     "max_markdown_chars": {
@@ -1790,9 +1834,10 @@ def descriptor() -> CapabilityDescriptor:
                         "maximum": MAX_MARKDOWN_CHARS,
                         "default": DEFAULT_MAX_MARKDOWN_CHARS,
                         "description": (
-                            "Extracted Markdown character budget; a cut "
-                            "page keeps its citation and is flagged "
-                            "truncated."
+                            "Extracted-text character budget (default 20000, "
+                            "maximum 100000); distinct from the raw-body "
+                            "byte budget. A cut page keeps its citation and "
+                            "is flagged truncated."
                         ),
                     },
                 },
