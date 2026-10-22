@@ -235,6 +235,14 @@ def _media_type(content_type: str | None) -> str:
     return content_type.split(";", 1)[0].strip().lower()
 
 
+#: The bytes used to prove that a candidate charset label can actually
+#: decode text. The probe MUST be non-empty: several non-text codecs
+#: (``rot13``) decode an empty byte string without complaining and only
+#: fail once real bytes arrive, so an empty probe would bless a label
+#: that raises on the actual body.
+_CHARSET_PROBE_BYTES = b"probe"
+
+
 def _safe_charset(charset: str | None) -> str:
     """A decodable charset label, or the safe default.
 
@@ -244,15 +252,51 @@ def _safe_charset(charset: str | None) -> str:
     unknown label falls back to UTF-8 with replacement characters —
     the document stays readable and the substitution is visible in the
     text, never hidden.
+
+    A label that resolves but cannot decode *text* is equally unsafe:
+    ``codecs.lookup`` succeeds for non-text codecs (``rot13``,
+    ``base64``, ``hex``, ``zlib``, ``uu``, ``quopri``, ``bz2``) whose
+    ``bytes.decode`` raises ``LookupError``, and a text codec may
+    still reject the error handler (``idna`` rejects
+    ``errors="replace"`` with ``UnicodeError``). Both classes are
+    rejected here, by a non-empty decode probe, and fall back to the
+    default charset.
     """
     if not isinstance(charset, str) or not charset.strip():
         return _DEFAULT_CHARSET
     candidate = charset.strip()
     try:
-        codecs.lookup(candidate)
+        info = codecs.lookup(candidate)
     except (LookupError, ValueError):
         return _DEFAULT_CHARSET
+    if not getattr(info, "_is_text_encoding", False):
+        return _DEFAULT_CHARSET
+    try:
+        _CHARSET_PROBE_BYTES.decode(candidate, errors="replace")
+    except (LookupError, UnicodeError, ValueError):
+        return _DEFAULT_CHARSET
     return candidate
+
+
+def _decode_body(body: bytes, charset: str | None) -> str:
+    """The readable text of a response body, whatever it declares.
+
+    ``_safe_charset`` already rejects labels that cannot decode text,
+    but a codec can still fail on the *actual* bytes (content-dependent
+    failures), and a future ``RawPage`` producer may supply a charset
+    label that never passed through ``_safe_charset`` at all. This
+    narrow boundary keeps such a failure from escaping the capability:
+    the body is decoded again as UTF-8 with replacement characters, so
+    the read stays readable and the substitution stays visible.
+
+    Only codec failures are caught (``LookupError``, ``UnicodeError``,
+    ``ValueError``); cancellation and programmer errors are not
+    swallowed.
+    """
+    try:
+        return body.decode(_safe_charset(charset), errors="replace")
+    except (LookupError, UnicodeError, ValueError):
+        return body.decode(_DEFAULT_CHARSET, errors="replace")
 
 #: Redirect statuses followed as hops (GET semantics throughout; this
 #: capability never sends a body).
@@ -1930,7 +1974,7 @@ class WebPageCapability:
                 http_status=_http_status_of(exc),
             )
         else:
-            text = raw.body.decode(_safe_charset(raw.charset), errors="replace")
+            text = _decode_body(raw.body, raw.charset)
             if _media_type(raw.content_type) in _TEXT_CONTENT_TYPES:
                 # Plain text and Markdown are returned verbatim: they
                 # are already text and must not lose content to HTML

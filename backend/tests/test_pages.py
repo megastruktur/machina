@@ -30,6 +30,7 @@ against public pages is owned by ``07-verify``.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import gzip
 import json
 import subprocess
@@ -39,6 +40,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import pytest
@@ -72,6 +74,7 @@ from mai.research.pages import (
     PageStatus,
     RawPage,
     WebPageCapability,
+    _safe_charset,
     check_address_policy,
     descriptor,
     extract_markdown,
@@ -1580,6 +1583,233 @@ class TestRawTextDocuments:
         assert document["status"] == "refused"
         assert document["code"] == "response_too_large"
         assert document["bytes_read"] == 0
+
+
+# ---------------------------------------------------------------------------
+# W4b-F1: no charset label may make a decode exception escape the capability
+# ---------------------------------------------------------------------------
+
+
+#: Charset labels that resolve in ``codecs`` but cannot decode *text*:
+#: ``bytes.decode`` raises ``LookupError`` for them ("is not a text
+#: encoding"). ``idna`` is the other class: it is a text encoding but
+#: rejects ``errors="replace"`` with ``UnicodeError``.
+_NON_TEXT_CHARSETS = (
+    "rot13",
+    "base64",
+    "hex",
+    "zlib",
+    "uu",
+    "quopri",
+    "bz2",
+    "idna",
+)
+
+#: The media types the reader accepts; every one of them must survive a
+#: hostile charset label.
+_SUPPORTED_MEDIA_TYPES = (
+    "text/plain",
+    "text/markdown",
+    "text/html",
+    "application/xhtml+xml",
+)
+
+
+def _mai_test_codec_decode(
+    data: Any, errors: str = "strict"
+) -> tuple[str, int]:
+    """A synthetic codec that decodes one probe shape and nothing else.
+
+    It models the content-dependent failure the probe cannot see: the
+    label is a valid text encoding and decodes the probe, yet the
+    *actual* body still makes the codec raise.
+    """
+    if data == b"probe":
+        return ("probe", len(data))
+    raise UnicodeError("mai_test_codec refuses this body")
+
+
+def _mai_test_codec_find(name: str):
+    if name.replace("-", "_") != "mai_test_codec":
+        return None
+    return codecs.CodecInfo(
+        name="mai-test-codec",
+        encode=lambda s, errors="strict": (b"probe", len(s)),
+        decode=_mai_test_codec_decode,
+    )
+
+
+# Registered once at import: the codec exists only so the test can prove
+# the decode boundary holds for a body-dependent failure.
+codecs.register(_mai_test_codec_find)
+
+
+class TestCharsetSafety:
+    """A hostile charset label never escapes the capability."""
+
+    def test_safe_charset_rejects_non_text_and_unsupported_codecs(
+        self,
+    ) -> None:
+        """Labels that resolve but cannot decode text fall back to the
+        default charset."""
+
+        for label in _NON_TEXT_CHARSETS:
+            assert _safe_charset(label) == "utf-8", label
+
+    def test_safe_charset_keeps_usable_labels(self) -> None:
+        """A real text encoding is preserved verbatim."""
+
+        for label in ("utf-8", "utf-16", "latin-1", "shift_jis", "cp1251"):
+            assert _safe_charset(label) == label
+
+    def test_safe_charset_falls_back_for_unknown_or_empty_labels(self) -> None:
+        """An unknown, blank or missing label falls back to UTF-8."""
+
+        assert _safe_charset(None) == "utf-8"
+        assert _safe_charset("") == "utf-8"
+        assert _safe_charset("   ") == "utf-8"
+        assert _safe_charset("definitely-not-a-charset") == "utf-8"
+
+    @pytest.mark.parametrize("charset", _NON_TEXT_CHARSETS)
+    @pytest.mark.parametrize("media_type", _SUPPORTED_MEDIA_TYPES)
+    async def test_hostile_charset_never_raises(
+        self, charset: str, media_type: str
+    ) -> None:
+        """A response that declares a non-text (or error-hostile) charset
+        is read as text: the read answers, nothing escapes."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _html_response(
+                README_TEXT.encode("utf-8"),
+                content_type=f"{media_type}; charset={charset}",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider)
+        result = await capability(
+            _call({"url": "https://public.example/doc"}, _context())
+        )
+        assert result.ok is True
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["code"] is None
+        assert document["trust"] == "untrusted_external"
+        assert document["markdown"]
+        if media_type in ("text/plain", "text/markdown"):
+            # The text branch is verbatim: the UTF-8 bytes came back
+            # unchanged, not mangled by the hostile label.
+            assert document["markdown"] == README_TEXT
+
+    async def test_valid_charset_is_still_honoured(self) -> None:
+        """The fix does not weaken the normal path: a declared charset
+        that can decode the body is used."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _html_response(
+                "café".encode("latin-1"),
+                content_type="text/plain; charset=iso-8859-1",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider)
+        result = await capability(
+            _call({"url": "https://public.example/doc.txt"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["markdown"] == "café"
+
+    async def test_body_dependent_decode_failure_is_contained(self) -> None:
+        """A codec that passes validation but fails on the actual body
+        still yields a readable answer — the decode boundary holds."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _html_response(
+                README_TEXT.encode("utf-8"),
+                content_type="text/plain; charset=mai-test-codec",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider)
+        result = await capability(
+            _call({"url": "https://public.example/doc.txt"}, _context())
+        )
+        assert result.ok is True
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        # The UTF-8 fallback decoded the body as UTF-8.
+        assert document["markdown"] == README_TEXT
+
+    async def test_hostile_charset_is_not_an_unknown_effect(self) -> None:
+        """Through the real dispatcher, a hostile charset label is an
+        executed read — not ``executor_failed`` and not an unknown
+        effect."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _html_response(
+                README_TEXT.encode("utf-8"),
+                content_type="text/plain; charset=rot13",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = _RecordingCapability(WebPageCapability(provider))
+        registry = _registry()
+        dispatcher = _dispatcher(registry, capability, grants=_grants(SERVER_A))
+        outcome: DispatchOutcome = await dispatcher.dispatch(
+            context=_context(server_id=SERVER_A),
+            capability_id=CAPABILITY_ID,
+            payload={"url": "https://public.example/doc.txt"},
+        )
+        assert outcome.allowed is True
+        assert outcome.reason != "executor_failed"
+        assert outcome.effect == "executed"
+        assert outcome.effect != "unknown"
+        assert outcome.executor_ok is True
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+
+    async def test_hostile_charset_through_the_bridge_is_executed(self) -> None:
+        """Through the real tool bridge, a hostile charset label is an
+        executed call with a readable answer."""
+
+        from mai.agents.tools import CapabilityToolBridge
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _html_response(
+                README_TEXT.encode("utf-8"),
+                content_type="text/plain; charset=idna",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        registry = _registry()
+        dispatcher = _dispatcher(
+            registry, WebPageCapability(provider), grants=_grants(SERVER_A)
+        )
+        bridge = CapabilityToolBridge(
+            registry=registry,
+            dispatcher=dispatcher,
+            context=_context(server_id=SERVER_A),
+        )
+        tool = next(t for t in bridge.tools if "read" in t.name)
+        result = json.loads(
+            await tool.function(url="https://public.example/doc.txt")
+        )
+        assert result["status"] == "executed"
+        assert result["effect"] == "executed"
+        assert result["executor_ok"] is True
+        document = json.loads(result["output"]["text"])
+        assert document["status"] == "ok"
+        assert document["markdown"] == README_TEXT
 
 
 # ---------------------------------------------------------------------------
