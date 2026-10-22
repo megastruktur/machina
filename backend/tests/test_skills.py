@@ -1058,3 +1058,24 @@ class TestCli:
             skills_main(["--help"])
         assert excinfo.value.code == 0
         assert "inspect" in capsys.readouterr().out
+
+    def test_seed_builtin_skills_and_collect_evidence(
+        self, root: Path
+    ) -> None:
+        from mai.skills.builtin import (
+            BUILTIN_SKILLS,
+            collect_skills_evidence,
+            seed_builtin_skills,
+        )
+
+        seeded = seed_builtin_skills(root)
+        assert len(seeded) == len(BUILTIN_SKILLS)
+        # Re-seeding is idempotent and does not overwrite existing packages.
+        assert seed_builtin_skills(root) == ()
+        items = collect_skills_evidence(
+            root,
+            allowed_capabilities=("web.search", "web.read", "host.shell", "app.discover"),
+        )
+        sources = [item.source for item in items]
+        assert "skill/web-research-runbook" in sources
+        assert "skill/security-posture-audit" in sources

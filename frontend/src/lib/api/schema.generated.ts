@@ -606,6 +606,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/runs/{run_id}/steps/{seq}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one tool call's lazy-loaded params and response
+         * @description Lazy-load one tool call's params and response for an expanded chat card.
+         *
+         *     Reads the persisted ``job_steps`` row (including ``params`` and
+         *     ``response`` in ``receipt``) and falls back to the target-side receipt
+         *     directory or DBOS ``operation_outputs`` if the step predates inline
+         *     ``params``/``response`` persistence.
+         */
+        get: operations["read_tool_step_api_v1_chat_runs__run_id__steps__seq__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chat/runs/{run_id}/events": {
         parameters: {
             query?: never;
@@ -2455,6 +2480,8 @@ export interface components {
             attachments?: components["schemas"]["AttachmentBody"][];
             /** Service Tags */
             service_tags?: string[];
+            /** Session Run Id */
+            session_run_id?: string | null;
         };
         /**
          * ChildBody
@@ -2590,6 +2617,8 @@ export interface components {
             children?: components["schemas"]["RunView"][];
             /** Service Tags */
             service_tags?: string[];
+            /** Session Run Id */
+            session_run_id?: string | null;
         };
         /**
          * DecisionBody
@@ -3682,6 +3711,13 @@ export interface components {
             enabled: boolean;
             /** Credential Refs */
             credential_refs?: string[];
+            /**
+             * Credential Values
+             * @description Optional write-only map of credential_ref name to secret value persisted in the controller's 0600 credentials.env store and never written to plugin config YAML or returned on read.
+             */
+            credential_values?: {
+                [key: string]: string;
+            };
             /** Config */
             config?: {
                 [key: string]: unknown;
@@ -3796,7 +3832,8 @@ export interface components {
             prompt_revision?: number | null;
             /** Prompt Text */
             prompt_text?: string | null;
-            environment?: components["schemas"]["ExecutionEnvironment"];
+            /** @default linux_ssh */
+            environment: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
@@ -3813,7 +3850,8 @@ export interface components {
             prompt_revision?: number | null;
             /** Prompt Text */
             prompt_text?: string | null;
-            environment?: components["schemas"]["ExecutionEnvironment"];
+            /** @default linux_ssh */
+            environment: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
@@ -3862,8 +3900,11 @@ export interface components {
             name: string;
             /** Prompt Revision */
             prompt_revision: number;
-            /** Prompt Text */
-            prompt_text?: string;
+            /**
+             * Prompt Text
+             * @default
+             */
+            prompt_text: string;
             environment: components["schemas"]["ExecutionEnvironment"];
             ssh: components["schemas"]["SshIdentityBody"];
             privilege: components["schemas"]["PrivilegeMode"];
@@ -6213,6 +6254,56 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_tool_step_api_v1_chat_runs__run_id__steps__seq__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+                seq: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No step stored for this run id and seq */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

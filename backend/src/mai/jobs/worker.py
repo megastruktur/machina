@@ -121,7 +121,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         descriptor as service_http_descriptor,
     )
     from mai.contracts.server import parse_server_profile_text
-    from mai.credentials.env import EnvResolver
+    from mai.credentials.env import EnvResolver, build_runtime_env_resolver
     from mai.database import create_app_engine
     from mai.execution.ssh import SshIdentity, pin_host_key
     from mai.jobs.engine import EngineClient
@@ -133,6 +133,16 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         ScopeRetriever,
         descriptor as docs_retrieve_descriptor,
     )
+    from mai.plugins.config import (
+        PluginConfigStore,
+        parse_plugin_config_text,
+    )
+    from mai.plugins.mcp import (
+        McpServerRuntime,
+        granted_capability_ids,
+        server_plugins,
+    )
+    from mai.plugins.native import NativePluginRuntime
     from mai.plugins.registry import CapabilityRegistry
     from mai.policy.approvals import ApprovalStore
     from mai.policy.config import GrantConfigStore
@@ -148,6 +158,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         WebSearchCapability,
         descriptor as web_search_descriptor,
     )
+    from mai.skills.builtin import seed_builtin_skills
 
     data_root = Path(data_root_raw).expanduser()
     models_root = data_root / "models"
@@ -160,7 +171,12 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     _, sessions = create_app_engine(database_url)
     profile_store = ProfileFileStore(data_root)
     grant_store = GrantConfigStore(data_root)
+    plugin_store = PluginConfigStore(data_root)
     env_file = os.environ.get("MAI_ENV_FILE", "").strip()
+    try:
+        seed_builtin_skills(data_root)
+    except Exception:
+        pass
 
     def _load_profile(server_id: uuid.UUID):
         stored = profile_store.read(server_id)
@@ -318,13 +334,65 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
     }
+    plugin_executors: dict[str, object] = {}
+    mcp_cache: dict[tuple[str, str, tuple[str, ...]], McpServerRuntime] = {}
+
+    async def _sync_plugin_capabilities() -> None:
+        try:
+            native_reg = CapabilityRegistry()
+            native_rt = NativePluginRuntime(
+                registry=native_reg,
+                disabled=plugin_store.disabled_plugins(),
+            )
+            native_rt.discover()
+            for desc in native_reg.list_capabilities():
+                if registry.get(desc.identifier, desc.version) is None:
+                    registry.register(desc)
+                plugin_executors[desc.identifier] = native_rt.executor
+        except Exception:
+            pass
+        try:
+            for mcp_cfg in server_plugins(plugin_store):
+                granted = granted_capability_ids(plugin_store, mcp_cfg.plugin)
+                if not granted:
+                    continue
+                cache_key = (
+                    mcp_cfg.plugin,
+                    repr(mcp_cfg),
+                    tuple(sorted(granted)),
+                )
+                cached = mcp_cache.get(cache_key)
+                if cached is not None:
+                    for cid in cached.tools:
+                        plugin_executors[cid] = cached.executor
+                    continue
+                mcp_reg = CapabilityRegistry()
+                mcp_rt = McpServerRuntime(
+                    config=mcp_cfg,
+                    registry=mcp_reg,
+                    credentials=_resolve_env,
+                )
+                try:
+                    await mcp_rt.discover(granted=granted)
+                except Exception:
+                    continue
+                for desc in mcp_reg.list_capabilities():
+                    if registry.get(desc.identifier, desc.version) is None:
+                        registry.register(desc)
+                    plugin_executors[desc.identifier] = mcp_rt.executor
+                mcp_cache[cache_key] = mcp_rt
+        except Exception:
+            pass
 
     async def _composite_executor(call: CapabilityCall) -> ExecutorResult:
         import dataclasses
 
         cid = call.descriptor.identifier
-        target = executors.get(cid)
+        target = executors.get(cid) or plugin_executors.get(cid)
         if target is None:
+            await _sync_plugin_capabilities()
+            target = executors.get(cid) or plugin_executors.get(cid)
+        if target is None or not callable(target):
             return ExecutorResult(
                 ok=False,
                 output=f"capability {cid!r} has no runtime executor",
@@ -341,7 +409,25 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                     )
             except Exception:
                 pass
-        return await target(call)
+        if cid.startswith("mcp."):
+            parts = cid.split(".")
+            if len(parts) >= 3:
+                plugin_slug = ".".join(parts[1:-1])
+                try:
+                    stored_doc = plugin_store.read_config(plugin_slug)
+                    doc = parse_plugin_config_text(stored_doc.text)
+                    extra_creds = dict(call.credentials)
+                    env_res = _resolve_env()
+                    for ref in doc.credential_refs:
+                        if ref not in extra_creds:
+                            extra_creds[ref] = env_res.resolve(ref)
+                    if len(extra_creds) != len(call.credentials):
+                        call = dataclasses.replace(
+                            call, credentials=extra_creds
+                        )
+                except Exception:
+                    pass
+        return await target(call)  # type: ignore[misc]
 
     def _read_grants():
         grants: dict[str, set[uuid.UUID]] = {}
@@ -376,6 +462,26 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                         continue
         except Exception:
             pass
+        # Include plugin bindings (both per-server and global 00000000-0000-0000-0000-000000000000).
+        try:
+            for plugin_name in plugin_store.list_plugins():
+                try:
+                    stored_doc = plugin_store.read_config(plugin_name)
+                    doc = parse_plugin_config_text(stored_doc.text)
+                except Exception:
+                    continue
+                if not doc.enabled:
+                    continue
+                for binding in plugin_store.list_bindings(plugin_name):
+                    target_servers = (
+                        enrolled_servers
+                        if binding.server_id == uuid.UUID(int=0)
+                        else {binding.server_id}
+                    )
+                    for cap_id in binding.capabilities:
+                        grants.setdefault(cap_id, set()).update(target_servers)
+        except Exception:
+            pass
         # Automatically grant internal API capabilities (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
         # app.delete_map_entry, chat.read_session) and controller-side web
@@ -402,8 +508,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             return False
 
     def _resolve_env() -> EnvResolver:
-        if env_file and Path(env_file).is_file():
-            return EnvResolver(env_file)
+        primary = env_file if env_file and Path(env_file).is_file() else None
+        resolved = build_runtime_env_resolver(primary, data_root)
+        if resolved is not None:
+            return resolved
         fallback = data_root / ".env"
         if not fallback.is_file():
             fallback.write_text("", encoding="utf-8")
@@ -420,7 +528,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         executor=_composite_executor,
     )
     model_store = ModelConfigStore(data_root)
-    resolver = _resolve_env()
     agent_executor = agent_run.AgentRunExecutor(
         sessions=sessions,
         dispatcher=dispatcher,
@@ -428,7 +535,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         model_store=model_store,
         data_root=data_root,
         locks=ResourceLockService(database_url),
-        resolver=resolver,
+        resolver=_resolve_env,
+        plugin_sync=_sync_plugin_capabilities,
     )
     agent_run.configure_agent_run(agent_executor)
     agent_delegate.configure_delegation(

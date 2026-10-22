@@ -105,6 +105,7 @@ services:
       MAI_HINDSIGHT_URL: "http://hindsight:8888"
       # Bundled metasearch provider (C07 rule 7): internal SearXNG service.
       MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
+      MAI_SEED_BUILTIN_SKILLS: "1"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path
@@ -154,6 +155,7 @@ services:
       MAI_EMBEDDINGS_CREDENTIAL_REF: "MAI_GATEWAY_KEY"
       MAI_HINDSIGHT_URL: "http://hindsight:8888"
       MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
+      MAI_SEED_BUILTIN_SKILLS: "1"
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path.

@@ -252,6 +252,15 @@ SERVER_CONFIG_SCHEMA: dict[str, object] = {
             "minLength": 1,
             "maxLength": MAX_URL_CHARS,
         },
+        "auth_header": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+        },
+        "auth_scheme": {
+            "type": "string",
+            "maxLength": 64,
+        },
         "connect_timeout_s": {
             "type": "number",
             "exclusiveMinimum": 0,
@@ -278,8 +287,11 @@ _CONFIG_FIELDS = frozenset(SERVER_CONFIG_SCHEMA["properties"])  # type: ignore[a
 #: Schema subset cannot express; enforced by :class:`McpServerConfig`).
 _TRANSPORT_FIELDS: dict[str, frozenset[str]] = {
     TRANSPORT_STDIO: frozenset({"command", "args", "cwd"}),
-    TRANSPORT_HTTP: frozenset({"url"}),
+    TRANSPORT_HTTP: frozenset({"url", "auth_header", "auth_scheme"}),
 }
+
+_AUTH_HEADER_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_AUTH_SCHEME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 _TOOL_NAME_FORBIDDEN = re.compile(r"[^a-z0-9_-]")
 
@@ -406,6 +418,8 @@ class McpServerConfig:
     args: tuple[str, ...] = ()
     cwd: str | None = None
     url: str | None = None
+    auth_header: str | None = None
+    auth_scheme: str | None = None
     connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S
     call_timeout_s: float = DEFAULT_CALL_TIMEOUT_S
     max_tools: int = DEFAULT_MAX_TOOLS
@@ -466,19 +480,11 @@ class McpServerConfig:
                 f"config field {foreign[0]!r} does not apply to "
                 f"transport {transport!r}",
             )
-        if transport == TRANSPORT_HTTP and refs:
-            # v1 has no credential injection point into a separately
-            # hosted HTTP server (headers would need a design, values are
-            # forbidden in configuration) — declaring refs would pretend
-            # an injection exists. Fail closed instead.
-            raise McpBridgeError(
-                McpBridgeErrorCode.INVALID_CONFIG,
-                "credential_refs on a streamable_http server has no "
-                "injection point in this version; remove the references",
-            )
         command = _opt_string(raw, "command", MAX_COMMAND_CHARS)
         cwd = _opt_string(raw, "cwd", MAX_CWD_CHARS)
         url = _opt_string(raw, "url", MAX_URL_CHARS)
+        auth_header = _opt_auth_header(raw)
+        auth_scheme = _opt_auth_scheme(raw, has_header=auth_header is not None)
         args = _opt_args(raw)
         if transport == TRANSPORT_STDIO:
             if command is None:
@@ -493,6 +499,19 @@ class McpServerConfig:
                     "streamable_http transport requires the url field",
                 )
             _check_http_url(url)
+            if auth_header is None and refs:
+                raise McpBridgeError(
+                    McpBridgeErrorCode.INVALID_CONFIG,
+                    "credential_refs on a streamable_http server requires "
+                    "auth_header as the injection point; set auth_header or "
+                    "remove the references",
+                )
+            if auth_header is not None and len(refs) != 1:
+                raise McpBridgeError(
+                    McpBridgeErrorCode.INVALID_CONFIG,
+                    "auth_header on streamable_http requires exactly one "
+                    "entry in credential_refs",
+                )
         connect_timeout = _opt_timeout(raw, "connect_timeout_s")
         call_timeout = _opt_timeout(raw, "call_timeout_s")
         max_tools = _opt_int(raw, "max_tools")
@@ -505,10 +524,53 @@ class McpServerConfig:
             args=args,
             cwd=cwd,
             url=url,
+            auth_header=auth_header,
+            auth_scheme=auth_scheme,
             connect_timeout_s=connect_timeout,
             call_timeout_s=call_timeout,
             max_tools=max_tools,
         )
+
+
+def _opt_auth_header(raw: Mapping[str, object]) -> str | None:
+    value = raw.get("auth_header")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or not _AUTH_HEADER_RE.fullmatch(value)
+    ):
+        raise McpBridgeError(
+            McpBridgeErrorCode.INVALID_CONFIG,
+            "auth_header must be a valid HTTP header name (1..128 chars)",
+        )
+    return value
+
+
+def _opt_auth_scheme(
+    raw: Mapping[str, object], *, has_header: bool
+) -> str | None:
+    value = raw.get("auth_scheme")
+    if value is None:
+        return "Bearer" if has_header else None
+    if not has_header:
+        raise McpBridgeError(
+            McpBridgeErrorCode.INVALID_CONFIG,
+            "auth_scheme requires auth_header to be set",
+        )
+    if not isinstance(value, str) or len(value) > 64:
+        raise McpBridgeError(
+            McpBridgeErrorCode.INVALID_CONFIG,
+            "auth_scheme must be a string up to 64 chars",
+        )
+    if value and not _AUTH_SCHEME_RE.fullmatch(value):
+        raise McpBridgeError(
+            McpBridgeErrorCode.INVALID_CONFIG,
+            "auth_scheme must contain only [A-Za-z0-9._-] characters",
+        )
+    return value
 
 
 def _opt_string(raw: Mapping[str, object], field: str, cap: int) -> str | None:
@@ -1035,7 +1097,7 @@ class McpServerRuntime:
                     ),
                 )
             values: dict[str, str] = {}
-            if config.transport == TRANSPORT_STDIO and config.credential_refs:
+            if config.credential_refs:
                 missing = [
                     reference
                     for reference in config.credential_refs
@@ -1111,10 +1173,14 @@ class McpServerRuntime:
                     stack.enter_async_context(stdio_client(parameters))
                 )
             else:
+                http_headers = _scoped_http_headers(
+                    config, credential_values
+                )
                 read, write, _session_id = await self._bounded(
                     stack.enter_async_context(
                         streamablehttp_client(
                             config.url,
+                            headers=http_headers,
                             timeout=config.connect_timeout_s,
                             sse_read_timeout=config.call_timeout_s,
                         )
@@ -1155,6 +1221,32 @@ class McpServerRuntime:
         return await asyncio.wait_for(
             awaitable, timeout=self._config.connect_timeout_s
         )
+
+
+def _scoped_http_headers(
+    config: McpServerConfig, values: Mapping[str, str]
+) -> dict[str, str] | None:
+    """Build scoped HTTP headers for streamable_http when auth_header is configured."""
+    if config.auth_header is None or not config.credential_refs:
+        return None
+    reference = config.credential_refs[0]
+    raw_secret = values.get(reference)
+    if raw_secret is None:
+        raise McpBridgeError(
+            McpBridgeErrorCode.CREDENTIAL_RESOLUTION_FAILED,
+            f"reference {reference} has no resolved value",
+        )
+    if "\r" in raw_secret or "\n" in raw_secret:
+        raise McpBridgeError(
+            McpBridgeErrorCode.CREDENTIAL_RESOLUTION_FAILED,
+            f"reference {reference} contains invalid header control characters",
+        )
+    header_val = (
+        f"{config.auth_scheme} {raw_secret}"
+        if config.auth_scheme
+        else raw_secret
+    )
+    return {config.auth_header: header_val}
 
 
 def _scoped_environment(

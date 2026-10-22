@@ -42,19 +42,25 @@ import json
 import os
 import re
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
 __all__ = [
+    "DATA_ROOT_CREDENTIALS_FILENAME",
     "MAX_ENV_FILE_BYTES",
     "EnvErrorCode",
     "EnvFileError",
     "EnvResolver",
     "SecretValue",
+    "build_runtime_env_resolver",
     "main",
     "parse_env_text",
+    "upsert_env_credentials",
 ]
+
+#: Managed credential store inside the writable data root (mode 0600).
+DATA_ROOT_CREDENTIALS_FILENAME = "credentials.env"
 
 #: Byte cap for one ``.env`` file, enforced before parsing. Same rationale
 #: as the canonical profile cap (mai.profiles.files): an operator-written
@@ -226,7 +232,12 @@ class EnvResolver:
     half-exists.
     """
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        overlay_path: str | os.PathLike[str] | None = None,
+    ) -> None:
         raw = str(path)
         if not raw.strip():
             raise EnvFileError(
@@ -236,8 +247,15 @@ class EnvResolver:
             )
         self._path = Path(path)
         self._entries: dict[str, str] = parse_env_text(
-            self._read(), source=raw
+            self._read(self._path), source=raw
         )
+        if overlay_path is not None and str(overlay_path).strip():
+            overlay = Path(overlay_path)
+            if overlay.exists():
+                overlay_entries = parse_env_text(
+                    self._read(overlay), source=str(overlay)
+                )
+                self._entries.update(overlay_entries)
 
     @property
     def path(self) -> Path:
@@ -281,24 +299,25 @@ class EnvResolver:
             )
         return SecretValue(value)
 
-    def _read(self) -> str:
+    def _read(self, target_path: Path | None = None) -> str:
+        path = self._path if target_path is None else target_path
         try:
-            fd = os.open(self._path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
             raise EnvFileError(
                 EnvErrorCode.NOT_FOUND,
-                f"configured credential source does not exist: {self._path}",
+                f"configured credential source does not exist: {path}",
             ) from None
         except IsADirectoryError:
             raise EnvFileError(
                 EnvErrorCode.NOT_A_FILE,
-                f"configured credential source is a directory: {self._path}",
+                f"configured credential source is a directory: {path}",
             ) from None
         except OSError as error:
             if error.errno == errno.ELOOP:
                 raise EnvFileError(
                     EnvErrorCode.SYMLINK_FORBIDDEN,
-                    f"configured credential source is a symlink: {self._path}",
+                    f"configured credential source is a symlink: {path}",
                 ) from None
             raise EnvFileError(
                 EnvErrorCode.NOT_READABLE,
@@ -314,13 +333,13 @@ class EnvResolver:
                 # raw IsADirectoryError first on Python 3.14).
                 raise EnvFileError(
                     EnvErrorCode.NOT_A_FILE,
-                    f"configured credential source is a directory: {self._path}",
+                    f"configured credential source is a directory: {path}",
                 )
             mode = stat.S_IMODE(info.st_mode)
             if mode & 0o077:
                 raise EnvFileError(
                     EnvErrorCode.PERMISSIONS_TOO_OPEN,
-                    f"configured credential source {self._path} is readable "
+                    f"configured credential source {path} is readable "
                     f"beyond its owner (mode {mode:04o}); restrict it to "
                     "owner-only access (e.g. 0600)",
                 )
@@ -333,7 +352,7 @@ class EnvResolver:
         if len(data) > MAX_ENV_FILE_BYTES:
             raise EnvFileError(
                 EnvErrorCode.TOO_LARGE,
-                f"configured credential source {self._path} exceeds "
+                f"configured credential source {path} exceeds "
                 f"{MAX_ENV_FILE_BYTES} bytes",
             )
         try:
@@ -341,9 +360,89 @@ class EnvResolver:
         except UnicodeDecodeError:
             raise EnvFileError(
                 EnvErrorCode.INVALID_ENCODING,
-                f"configured credential source {self._path} is not valid "
+                f"configured credential source {path} is not valid "
                 "UTF-8",
             ) from None
+
+
+def upsert_env_credentials(
+    path: str | os.PathLike[str], updates: Mapping[str, str]
+) -> None:
+    """Atomically create or update credential references in a 0600 .env file."""
+    if not updates:
+        return
+    validated: dict[str, str] = {}
+    for key, value in updates.items():
+        if not isinstance(key, str) or not _CREDENTIAL_REF_RE.fullmatch(key):
+            raise EnvFileError(
+                EnvErrorCode.INVALID_REF,
+                "credential reference must match [A-Z][A-Z0-9_]{0,127}",
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise EnvFileError(
+                EnvErrorCode.EMPTY_VALUE,
+                f"credential reference {key} cannot have an empty value",
+            )
+        if "\n" in value or "\r" in value or "\x00" in value or "'" in value:
+            raise EnvFileError(
+                EnvErrorCode.PARSE_ERROR,
+                f"credential reference {key} contains unsupported control/quote characters",
+            )
+        validated[key] = value
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    entries: dict[str, str] = {}
+    if target.exists():
+        if target.is_symlink():
+            raise EnvFileError(
+                EnvErrorCode.SYMLINK_FORBIDDEN,
+                f"configured credential source is a symlink: {target}",
+            )
+        existing = EnvResolver(target)
+        entries.update(existing._entries)
+    entries.update(validated)
+    lines = [f"{k}='{entries[k]}'" for k in sorted(entries)]
+    payload = ("\n".join(lines) + "\n").encode("utf-8")
+    if len(payload) > MAX_ENV_FILE_BYTES:
+        raise EnvFileError(
+            EnvErrorCode.TOO_LARGE,
+            f"configured credential source {target} exceeds {MAX_ENV_FILE_BYTES} bytes",
+        )
+    tmp_path = target.parent / f".{target.name}.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def build_runtime_env_resolver(
+    env_file: str | os.PathLike[str] | None,
+    data_root: str | os.PathLike[str] | None = None,
+) -> EnvResolver | None:
+    """Construct an EnvResolver layering `<data_root>/credentials.env` over `env_file`."""
+    raw_env = str(env_file).strip() if env_file is not None else ""
+    overlay: Path | None = None
+    if data_root is not None and str(data_root).strip():
+        candidate = Path(data_root) / DATA_ROOT_CREDENTIALS_FILENAME
+        if candidate.is_file() and not candidate.is_symlink():
+            overlay = candidate
+    if raw_env:
+        return EnvResolver(raw_env, overlay_path=overlay)
+    if overlay is not None:
+        return EnvResolver(overlay)
+    return None
 
 
 # ---------------------------------------------------------------------------

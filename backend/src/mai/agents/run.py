@@ -170,6 +170,7 @@ from mai.jobs.steps import (
 )
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext, execution_context_from_json
+from mai.skills.builtin import collect_skills_evidence
 
 __all__ = [
     "AGENT_TOOL_MAX_PER_ROUND",
@@ -706,8 +707,9 @@ class AgentRunExecutor:
         model_store: ModelConfigStore,
         data_root: Any,
         locks: ResourceLockService,
-        resolver: EnvResolver | None = None,
+        resolver: Any = None,
         model_builder: Any = None,
+        plugin_sync: Any = None,
     ) -> None:
         if not isinstance(sessions, async_sessionmaker):
             raise AgentRunError(
@@ -751,6 +753,7 @@ class AgentRunExecutor:
         self._data_root = data_root
         self._resolver = resolver
         self._model_builder = model_builder
+        self._plugin_sync = plugin_sync
         self._sessions = sessions
         #: The reviewed steps machinery: guarded transitions, the shared
         #: whole-stream event cursor, the crash-window translation and
@@ -852,12 +855,28 @@ class AgentRunExecutor:
         binding = _binding_from_pins(pins)
         try:
             materials = load_server_context(self._data_root, intent.context.server_id)
-            assembled = assemble(
-                binding,
-                materials,
-                role=intent.role,
-                task=intent.task,
+            skill_items = collect_skills_evidence(
+                self._data_root,
+                intent.context.allowed_capabilities,
+                max_items=8,
             )
+            try:
+                assembled = assemble(
+                    binding,
+                    materials,
+                    role=intent.role,
+                    task=intent.task,
+                    evidence=skill_items,
+                )
+            except ContextError:
+                if not skill_items:
+                    raise
+                assembled = assemble(
+                    binding,
+                    materials,
+                    role=intent.role,
+                    task=intent.task,
+                )
         except ContextError as error:
             raise AgentStageError(
                 f"context_{error.code.value}",
@@ -911,13 +930,23 @@ class AgentRunExecutor:
         """
         binding = _binding_from_pins(pins)
         selection = binding.selection()
+        if self._plugin_sync is not None:
+            try:
+                await self._plugin_sync()
+            except Exception:
+                pass
+        active_resolver: Any = (
+            self._resolver()
+            if callable(self._resolver)
+            else self._resolver
+        )
         try:
             if self._model_builder is not None:
                 resolved = self._model_builder(
-                    selection=selection, resolver=self._resolver
+                    selection=selection, resolver=active_resolver
                 )
             else:
-                resolved = build_model(selection, resolver=self._resolver)
+                resolved = build_model(selection, resolver=active_resolver)
         except (ModelConfigError, EnvFileError) as error:
             code = getattr(error, "code", None)
             code_value = getattr(code, "value", str(code))

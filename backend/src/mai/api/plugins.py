@@ -108,6 +108,12 @@ from mai.api.auth import (
     _require_session,
     render_error_envelope,
 )
+from mai.credentials.env import (
+    DATA_ROOT_CREDENTIALS_FILENAME,
+    EnvFileError,
+    build_runtime_env_resolver,
+    upsert_env_credentials,
+)
 from mai.plugins.config import (
     SCHEMA_VERSION as PLUGIN_SCHEMA_VERSION,
 )
@@ -249,6 +255,14 @@ class PluginConfigEditBody(BaseModel):
     enabled: bool
     credential_refs: list[CredentialRef] = Field(
         default_factory=list, max_length=MAX_CREDENTIAL_REFS
+    )
+    credential_values: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional write-only map of credential_ref name to secret value "
+            "persisted in the controller's 0600 credentials.env store and "
+            "never written to plugin config YAML or returned on read."
+        ),
     )
     config: dict[str, Any] = Field(default_factory=dict)
 
@@ -768,6 +782,19 @@ async def edit_config(
     _require_allowed_origin(request)  # layer 2
     _require_csrf(request)  # layer 3
     store = _plugin_store(request)
+    if payload.credential_values:
+        declared_refs = set(payload.credential_refs)
+        undeclared = [
+            key for key in payload.credential_values if key not in declared_refs
+        ]
+        if undeclared:
+            return render_error_envelope(
+                request,
+                HTTP_422_UNPROCESSABLE_CONTENT,
+                "validation_error",
+                "credential_values keys must appear in credential_refs",
+                fields={"credential_values": "undeclared_credential_ref"},
+            )
     declared = _declared_config_schema(plugin, payload.config)
     try:
         stored = store.write_config(
@@ -778,6 +805,26 @@ async def edit_config(
         )
     except PluginConfigError as exc:
         return _config_error(request, exc)
+    if payload.credential_values:
+        try:
+            data_root = store.root.parent
+            upsert_env_credentials(
+                data_root / DATA_ROOT_CREDENTIALS_FILENAME,
+                payload.credential_values,
+            )
+            env_map = getattr(request.app.state, "env", None) or {}
+            source = env_map.get("MAI_ENV_FILE")
+            request.app.state.credentials = build_runtime_env_resolver(
+                source, data_root
+            )
+        except EnvFileError as exc:
+            return render_error_envelope(
+                request,
+                HTTP_422_UNPROCESSABLE_CONTENT,
+                "validation_error",
+                "credential value failed validation",
+                fields={"credential_values": exc.code.value},
+            )
     return RevisionTriple(
         revision=stored.revision,
         schema_revision=stored.schema_revision,

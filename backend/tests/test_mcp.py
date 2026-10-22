@@ -1674,3 +1674,37 @@ class TestStoreCompositionFragments:
         assert [config.plugin for config in configs] == [PLUGIN]
         assert granted_capability_ids(store, PLUGIN) == (ECHO_ID,)
         assert granted_capability_ids(store, "native-plugin") == ()
+
+    def test_http_accepts_auth_header_with_single_credential_ref(
+        self, tmp_path: Path
+    ) -> None:
+        from mai.credentials.env import (
+            build_runtime_env_resolver,
+            upsert_env_credentials,
+        )
+        from mai.plugins.mcp import _scoped_http_headers
+
+        text = _config_yaml(
+            PLUGIN,
+            {
+                "transport": "streamable_http",
+                "url": "https://mcp.example.internal/mcp",
+                "auth_header": "Authorization",
+                "auth_scheme": "Bearer",
+            },
+            refs=(SECRET_NAME,),
+        )
+        cfg = McpServerConfig.from_document(parse_plugin_config_text(text))
+        assert cfg.auth_header == "Authorization"
+        assert cfg.auth_scheme == "Bearer"
+        assert cfg.credential_refs == (SECRET_NAME,)
+        upsert_env_credentials(
+            tmp_path / "credentials.env", {SECRET_NAME: "tok_abc123"}
+        )
+        resolver = build_runtime_env_resolver(None, tmp_path)
+        assert resolver is not None
+        assert resolver.resolve(SECRET_NAME).value == "tok_abc123"
+        headers = _scoped_http_headers(
+            cfg, {SECRET_NAME: resolver.resolve(SECRET_NAME).value}
+        )
+        assert headers == {"Authorization": "Bearer tok_abc123"}

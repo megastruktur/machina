@@ -144,14 +144,13 @@ export interface PluginFormsServices {
 export function pluginFormsEntry(): PanelEntryInput {
 	return {
 		panel_kind: PLUGIN_FORMS_PANEL_KIND,
-		title: 'Plugin forms',
-		scope_types: ['global'],
+		title: 'MCP & Plugins',
+		scope_types: ['global', 'server'],
 		component: () =>
 			import('../../components/PluginConfigForm.svelte').then((module) => module.default),
 		default_geometry: { x: 72, y: 64, width: 900, height: 640 },
 		min_geometry: { x: 0, y: 0, width: 480, height: 360 },
-		// One desktop holds one plugin-forms panel: the catalogue is a
-		// controller-host resource with per-operation explicit targets.
+		// One instance per scope (one global controller window and one per server).
 		singleton: true,
 		capabilities_note:
 			'Schema-generated plugin configuration forms, MCP server registration and ' +

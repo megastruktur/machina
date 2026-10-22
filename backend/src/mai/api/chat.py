@@ -120,6 +120,7 @@ from mai.api.auth import (
     _require_session,
 )
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
+from mai.plugins.config import PluginConfigStore, parse_plugin_config_text
 from mai.api.jobs import (
     CANCEL_OUTCOME_BUDGET_SECONDS,
     DEFAULT_PAGE_LIMIT,
@@ -963,10 +964,39 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     # web.read) alongside any host-scoped capabilities so the chat agent can
     # operate Machina services and consult external docs in both pinned-server
     # and General Consult chats.
+    plugin_caps: list[str] = []
+    plugin_cred_refs: list[str] = []
+    plugin_store = getattr(request.app.state, "plugins", None)
+    if isinstance(plugin_store, PluginConfigStore):
+        try:
+            for plugin_name in plugin_store.list_plugins():
+                try:
+                    stored_doc = plugin_store.read_config(plugin_name)
+                    doc = parse_plugin_config_text(stored_doc.text)
+                except Exception:
+                    continue
+                if not doc.enabled:
+                    continue
+                bound_here = False
+                try:
+                    for b in plugin_store.list_bindings(plugin_name):
+                        if b.server_id in (server_uuid, uuid.UUID(int=0)):
+                            plugin_caps.extend(b.capabilities)
+                            bound_here = True
+                except Exception:
+                    continue
+                if bound_here:
+                    plugin_cred_refs.extend(doc.credential_refs)
+        except Exception:
+            pass
     capabilities = _dedup_preserving_order(
         list(capabilities)
         + list(INTERNAL_API_CAPABILITY_IDS)
         + ["web.search", "web.read"]
+        + plugin_caps
+    )
+    effective_cred_refs = _dedup_preserving_order(
+        list(payload.credential_references) + plugin_cred_refs
     )
     root_budget: dict[str, object] | None = None
     if payload.root_budget is not None:
@@ -991,7 +1021,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
             parent_scope=None,
             profile_revision=str(profile_revision),
             prompt_revision=str(prompt_revision),
-            credential_references=tuple(payload.credential_references),
+            credential_references=tuple(effective_cred_refs),
             allowed_capabilities=capabilities,
             mode=payload.mode,
         )

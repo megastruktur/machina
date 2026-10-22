@@ -930,7 +930,7 @@ test('the catalogue keeps installed, configured and enabled distinct beside a si
 	const { registry: summary } = await apiState(page);
 	expect(summary.kinds).toEqual(['fixture-notes', 'plugin-forms']);
 	expect(summary.scopeChecks.globalScope).toBe('ok');
-	expect(summary.scopeChecks.serverScope).toBe('scope_kind_not_allowed');
+	expect(summary.scopeChecks.serverScope).toBe('ok');
 	expect(summary.scopeChecks.unknownKind).toBe('unknown_panel_kind');
 	expect(summary.defaultGeometry).toEqual({ x: 72, y: 64, width: 900, height: 640 });
 	expect(summary.minGeometry).toEqual({ x: 0, y: 0, width: 480, height: 360 });
@@ -1422,5 +1422,43 @@ test('fail-closed seams, honest errors and stale-revision discipline', async ({ 
 	await apiCall(page, 'releaseSave', [{ revision: 42, schema_revision: 1, sha256: '9'.repeat(64) }]);
 	await savePromise;
 	await expect(hostMain.getByTestId('config-status')).toContainText('r42');
+	expect(pageErrors).toEqual([]);
+});
+
+test('MCP streamable_http authentication preset and write-only secret provisioning plus one-click global/server attachment', async ({
+	page
+}) => {
+	const hostMain = await mainMounted(page);
+	await hostMain.getByTestId('catalog-attach-mcp').click();
+	await expect(hostMain.getByTestId('configure-new')).toBeVisible();
+	await hostMain.getByTestId('configure-new-input').fill('remote-mcp');
+	await hostMain.getByTestId('configure-new').locator('button[type=submit]').click();
+
+	await expect(hostMain.getByTestId('mcp-register-form')).toBeVisible();
+	await hostMain.getByTestId('mcp-transport').selectOption('streamable_http');
+	await hostMain.getByTestId('mcp-url').fill('https://mcp.example.internal/mcp');
+	await hostMain.getByTestId('mcp-auth-preset').selectOption('bearer');
+	await expect(hostMain.getByTestId('mcp-auth-header')).toHaveValue('Authorization');
+	await expect(hostMain.getByTestId('mcp-auth-scheme')).toHaveValue('Bearer');
+	await expect(hostMain.getByTestId('cred-ref-input').nth(0)).toHaveValue('MCP_BEARER_TOKEN');
+	await hostMain.getByTestId('cred-val-input').nth(0).fill('super-secret-token-123');
+	await hostMain.getByTestId('enabled-toggle').check();
+	await hostMain.getByTestId('config-save').click();
+
+	const { calls } = await apiState(page);
+	const edit = lastCall(calls, 'editConfig');
+	expect(edit.args).toEqual(['remote-mcp']);
+	expect(edit.payload).toEqual({
+		expected_revision: 0,
+		enabled: true,
+		credential_refs: ['MCP_BEARER_TOKEN'],
+		credential_values: { MCP_BEARER_TOKEN: 'super-secret-token-123' },
+		config: {
+			transport: 'streamable_http',
+			url: 'https://mcp.example.internal/mcp',
+			auth_header: 'Authorization',
+			auth_scheme: 'Bearer'
+		}
+	});
 	expect(pageErrors).toEqual([]);
 });

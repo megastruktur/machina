@@ -125,9 +125,15 @@
 
 	const plugins = $derived(readBag<PluginsApi>(panel.services, 'plugins', PLUGIN_METHODS));
 	const skills = $derived(readBag<SkillsApi>(panel.services, 'skills', SKILL_METHODS));
-	/** Global controller view: a server-scoped mount contradicts the entry contract. */
+	const GLOBAL_SERVER_ID = '00000000-0000-0000-0000-000000000000';
 	const globalScope = $derived(panel.scope.kind === 'global');
-	const usable = $derived(plugins !== null && globalScope);
+	const serverScope = $derived(
+		panel.scope.kind === 'server' &&
+			typeof panel.scope.server_id === 'string' &&
+			panel.scope.server_id.length > 0
+	);
+	const pinnedServerId = $derived(panel.scope.kind === 'server' ? panel.scope.server_id : null);
+	const usable = $derived(plugins !== null && (globalScope || serverScope));
 
 	// --- producer-bound constants (server re-validates everything) ----------
 
@@ -230,6 +236,7 @@
 	let draft = $state<Record<string, string | boolean>>({});
 	let draftEnabled = $state(false);
 	let draftRefs = $state<string[]>([]);
+	let draftSecretValues = $state<Record<string, string>>({});
 	let fieldErrors = $state<Record<string, string>>({});
 	let formError = $state<string | null>(null);
 	let formNotice = $state<string | null>(null);
@@ -389,6 +396,7 @@
 		draft = {};
 		draftEnabled = false;
 		draftRefs = [];
+		draftSecretValues = {};
 		fieldErrors = {};
 		formError = null;
 		formNotice = null;
@@ -854,6 +862,12 @@
 		if (transport === 'streamable_http') {
 			const url = String(draft['__mcp_url'] ?? '').trim();
 			if (url !== '') config['url'] = url;
+			const authHeader = String(draft['__mcp_auth_header'] ?? '').trim();
+			if (authHeader !== '') {
+				config['auth_header'] = authHeader;
+				const authScheme = String(draft['__mcp_auth_scheme'] ?? '');
+				config['auth_scheme'] = authScheme;
+			}
 		}
 		const connect = Number(String(draft['__mcp_connect_timeout_s'] ?? '').trim());
 		if (Number.isFinite(connect) && String(draft['__mcp_connect_timeout_s'] ?? '').trim() !== '') {
@@ -923,14 +937,24 @@
 		}
 		const stored = configState.view;
 		const expectedRevision = stored === null ? 0 : stored.revision;
+		const credValues: Record<string, string> = {};
+		for (const ref of draftRefs) {
+			const secret = (draftSecretValues[ref] ?? '').trim();
+			if (secret !== '') credValues[ref] = secret;
+		}
 		saving = true;
 		try {
-			const triple = await plugins.editConfig(selected, {
+			const payload: Parameters<PluginsApi['editConfig']>[1] = {
 				expected_revision: expectedRevision,
 				enabled: draftEnabled,
 				credential_refs: [...draftRefs],
 				config: buildConfigCandidate()
-			});
+			};
+			if (Object.keys(credValues).length > 0) {
+				payload.credential_values = credValues;
+			}
+			const triple = await plugins.editConfig(selected, payload);
+			draftSecretValues = {};
 			conflict = false;
 			formNotice = `Saved revision r${triple.revision}`;
 			// Re-read what the producer now declares (a transport key flips the
@@ -1007,10 +1031,48 @@
 		bindingNotice = null;
 	}
 
-	function newBinding(): void {
-		bindingEditor = { open: true, serverId: '', capabilities: '', expectedRevision: 0 };
+	function newBinding(targetServerId?: string): void {
+		const target = targetServerId ?? pinnedServerId ?? '';
+		const existing =
+			target !== '' && bindingsState.view !== null
+				? bindingsState.view.find((b) => b.server_id === target) ?? null
+				: null;
+		bindingEditor = {
+			open: true,
+			serverId: target,
+			capabilities: existing !== null ? existing.capabilities.join('\n') : '',
+			expectedRevision: existing !== null ? existing.revision : 0
+		};
 		bindingError = null;
 		bindingNotice = null;
+	}
+
+	async function attachDiscoveredTools(targetServerId: string): Promise<void> {
+		if (plugins === null || selected === null || discoveryState.view === null) return;
+		const allTools = Array.from(
+			new Set([...discoveryState.view.registered, ...discoveryState.view.ungranted])
+		).sort();
+		if (allTools.length === 0) return;
+		bindingBusy = true;
+		bindingError = null;
+		try {
+			const currentBindings = await plugins.listBindings(selected);
+			const existing = currentBindings.find((b) => b.server_id === targetServerId) ?? null;
+			const merged = Array.from(
+				new Set([...(existing?.capabilities ?? []), ...allTools])
+			).sort();
+			await plugins.editBinding(selected, targetServerId, {
+				expected_revision: existing?.revision ?? 0,
+				capabilities: merged
+			});
+			await runDiscovery();
+			await loadCatalog();
+		} catch (error) {
+			const fail = failOf(error);
+			discoveryState = { view: discoveryState.view, phase: 'error', error: fail };
+		} finally {
+			bindingBusy = false;
+		}
 	}
 
 	async function saveBinding(): Promise<void> {
@@ -1133,14 +1195,23 @@
 
 <div class="mai-plugins" data-testid="plugins-root">
 	<header class="mai-plugins__header">
-		<h2><span class="mai-plugins__icon"><Cog size={16} aria-hidden="true" /></span> Plugins &amp; skills</h2>
+		<h2>
+			<span class="mai-plugins__icon"><Cog size={16} aria-hidden="true" /></span>
+			{#if serverScope}
+				Server MCP &amp; Plugins
+			{:else}
+				Global MCP &amp; Plugins
+			{/if}
+		</h2>
 		<p class="mai-plugins__scope">
 			{#if globalScope}
-				Controller-host catalogue. Every operation names its plugin — and, for grant
-				bindings, its server — explicitly.
+				Controller-host catalogue. Attach MCP servers globally (<span class="mai-plugins__mono">{GLOBAL_SERVER_ID}</span>) or to specific servers, and configure authentication.
+			{:else if serverScope}
+				Server-scoped MCP &amp; plugin attachments for
+				<span class="mai-plugins__mono" data-testid="plugins-server-scope">{pinnedServerId}</span>.
+				Attach MCP servers to this server or globally across all servers.
 			{:else}
-				Server-scoped mount: this panel is a global controller view; the entry contract
-				is contradicted.
+				Invalid panel scope.
 			{/if}
 		</p>
 	</header>
@@ -1150,9 +1221,9 @@
 			The plugins API seam is missing or incomplete — the panel fails closed and performs
 			nothing. No fallback client is substituted.
 		</div>
-	{:else if !globalScope}
+	{:else if !usable}
 		<div class="mai-plugins__state mai-plugins__state--error" role="alert" data-testid="plugins-scope-error">
-			This panel registers under the global scope only.
+			This panel requires a valid global or server scope.
 		</div>
 	{:else}
 		<nav class="mai-plugins__tabs" aria-label="Plugin panel sections">
@@ -1175,6 +1246,15 @@
 				<div class="mai-plugins__toolbar">
 					<Button variant="secondary" loading={catalogState.phase === 'loading'} onclick={loadCatalog}>
 						Refresh catalogue
+					</Button>
+					<Button
+						onclick={() => {
+							closeConfigure();
+							tab = 'configure';
+						}}
+						data-testid="catalog-attach-mcp"
+					>
+						+ Attach MCP server
 					</Button>
 				</div>
 				{#if catalogState.phase === 'error'}
@@ -1245,6 +1325,16 @@
 										>
 											{row.enabled ? 'enabled' : 'disabled'}
 										</span>
+										{#if row.bindings.some((b) => b.server_id === GLOBAL_SERVER_ID)}
+											<span class="mai-plugins__badge mai-plugins__badge--on" data-testid="configured-global-bound">
+												global
+											</span>
+										{/if}
+										{#if pinnedServerId !== null && row.bindings.some((b) => b.server_id === pinnedServerId)}
+											<span class="mai-plugins__badge mai-plugins__badge--on" data-testid="configured-server-bound">
+												attached to server
+											</span>
+										{/if}
 										<span class="mai-plugins__meta" data-testid="configured-revision">r{row.revision}</span>
 									</div>
 									<dl class="mai-plugins__facts">
@@ -1431,6 +1521,50 @@
 											error={fieldErrors['__mcp_url'] ?? ''}
 											data-testid="mcp-url"
 										/>
+										<Select
+											label="HTTP Authentication Preset"
+											hint="Optional header injection for remote streamable_http MCP servers."
+											value={String(draft['__mcp_auth_preset'] ?? 'none')}
+											onchange={(event) => {
+												const preset = event.currentTarget.value;
+												draft['__mcp_auth_preset'] = preset;
+												if (preset === 'none') {
+													draft['__mcp_auth_header'] = '';
+													draft['__mcp_auth_scheme'] = '';
+												} else if (preset === 'bearer') {
+													draft['__mcp_auth_header'] = 'Authorization';
+													draft['__mcp_auth_scheme'] = 'Bearer';
+													if (draftRefs.length === 0) draftRefs = ['MCP_BEARER_TOKEN'];
+												} else if (preset === 'api_key') {
+													draft['__mcp_auth_header'] = 'X-API-Key';
+													draft['__mcp_auth_scheme'] = '';
+													if (draftRefs.length === 0) draftRefs = ['MCP_API_KEY'];
+												} else if (preset === 'custom') {
+													if (!draft['__mcp_auth_header']) draft['__mcp_auth_header'] = 'Authorization';
+													if (draftRefs.length === 0) draftRefs = ['MCP_AUTH_SECRET'];
+												}
+											}}
+											data-testid="mcp-auth-preset"
+										>
+											<option value="none">None (unauthenticated HTTP)</option>
+											<option value="bearer">Bearer Token (Authorization: Bearer …)</option>
+											<option value="api_key">API Key Header (X-API-Key: …)</option>
+											<option value="custom">Custom HTTP Header</option>
+										</Select>
+										{#if String(draft['__mcp_auth_preset'] ?? 'none') !== 'none' || String(draft['__mcp_auth_header'] ?? '') !== ''}
+											<Field
+												label="Auth Header Name"
+												hint="HTTP header name (e.g. Authorization, X-API-Key)."
+												bind:value={() => String(draft['__mcp_auth_header'] ?? ''), (v) => (draft['__mcp_auth_header'] = String(v))}
+												data-testid="mcp-auth-header"
+											/>
+											<Field
+												label="Auth Scheme Prefix"
+												hint="Optional prefix before secret (e.g. Bearer); leave empty for raw header value."
+												bind:value={() => String(draft['__mcp_auth_scheme'] ?? ''), (v) => (draft['__mcp_auth_scheme'] = String(v))}
+												data-testid="mcp-auth-scheme"
+											/>
+										{/if}
 									{/if}
 									<Field
 										label="Connect timeout (s)"
@@ -1511,7 +1645,15 @@
 						<Button variant="secondary" onclick={() => loadBindings(selected ?? '')} data-testid="bindings-refresh">
 							Refresh
 						</Button>
-						<Button onclick={newBinding} data-testid="binding-new">New binding</Button>
+						<Button onclick={() => newBinding()} data-testid="binding-new">New binding</Button>
+						<Button variant="secondary" onclick={() => newBinding(GLOBAL_SERVER_ID)} data-testid="binding-new-global">
+							Bind Globally (All Servers)
+						</Button>
+						{#if pinnedServerId !== null}
+							<Button variant="secondary" onclick={() => newBinding(pinnedServerId)} data-testid="binding-new-server">
+								Bind to This Server
+							</Button>
+						{/if}
 					</div>
 					<p class="mai-plugins__hint">
 						A binding grants the listed capabilities to ONE canonical server. Writing a
@@ -1668,6 +1810,27 @@
 									</span>
 								{/if}
 							</div>
+							{#if discoveryState.view.registered.length + discoveryState.view.ungranted.length > 0}
+								<div class="mai-plugins__row-actions" data-testid="discovery-attach-actions">
+									{#if pinnedServerId !== null}
+										<Button
+											loading={bindingBusy}
+											onclick={() => attachDiscoveredTools(pinnedServerId)}
+											data-testid="discovery-attach-server"
+										>
+											Attach all {discoveryState.view.registered.length + discoveryState.view.ungranted.length} tools to this server
+										</Button>
+									{/if}
+									<Button
+										variant="secondary"
+										loading={bindingBusy}
+										onclick={() => attachDiscoveredTools(GLOBAL_SERVER_ID)}
+										data-testid="discovery-attach-global"
+									>
+										Attach all {discoveryState.view.registered.length + discoveryState.view.ungranted.length} tools globally
+									</Button>
+								</div>
+							{/if}
 							<h4>Registered (granted subset)</h4>
 							{#if discoveryState.view.registered.length === 0}
 								<p class="mai-plugins__empty" data-testid="discovery-registered-empty">
@@ -1951,13 +2114,15 @@
 			Credential references (C03 rule 6) — .env NAMES only, never values
 		</legend>
 		<p class="mai-plugins__hint">
-			References resolve server-side from the configured source at call time. There is no
-			credential-value field on this panel because there is no value.
+			Plugin configs store only the reference name (e.g. <code>MCP_BEARER_TOKEN</code>). Optionally
+			provide a secret value below to write-only persist it into the controller's
+			<code>0600 credentials.env</code> store.
 		</p>
 		{#each draftRefs as ref, index (index)}
 			<div class="mai-plugins__ref-row" data-testid="cred-ref-row">
 				<input
 					type="text"
+					placeholder="ENV_VAR_NAME"
 					aria-label="Credential reference {index + 1}"
 					value={ref}
 					oninput={(event) => {
@@ -1966,6 +2131,22 @@
 						draftRefs = next;
 					}}
 					data-testid="cred-ref-input"
+				/>
+				<input
+					type="text"
+					class="mai-plugins__secret-input"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder="Optional secret value (write-only to credentials.env)"
+					aria-label="Credential secret value {index + 1}"
+					value={draftSecretValues[ref] ?? ''}
+					oninput={(event) => {
+						draftSecretValues = {
+							...draftSecretValues,
+							[ref]: event.currentTarget.value
+						};
+					}}
+					data-testid="cred-val-input"
 				/>
 				<Button
 					variant="danger"

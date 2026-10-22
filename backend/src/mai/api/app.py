@@ -110,9 +110,14 @@ from mai.applications.adopt import (
 )
 from mai.applications.document import ApplicationDocService
 from mai.applications.service_map import ServiceMapStore
+from mai.skills.builtin import seed_builtin_skills
 from mai.auth.sessions import AuthError, SessionStore
 from mai.capabilities.dispatch import CapabilityDispatcher
-from mai.credentials.env import EnvFileError, EnvResolver
+from mai.credentials.env import (
+    EnvFileError,
+    EnvResolver,
+    build_runtime_env_resolver,
+)
 from mai.database import (
     DatabaseConfigError,
     DatabaseHealth,
@@ -168,9 +173,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # unavailable and touches no state.
     app.state.credentials = None
     source = (app.state.env or os.environ).get("MAI_ENV_FILE")
-    if source:
+    try:
+        data_root_for_creds = resolve_profiles_root(app.state.env)
+    except OSError:
+        data_root_for_creds = None
+    if source or data_root_for_creds is not None:
         try:
-            app.state.credentials = EnvResolver(source)
+            app.state.credentials = build_runtime_env_resolver(
+                source, data_root_for_creds
+            )
         except EnvFileError:
             app.state.credentials = None
     try:
@@ -374,6 +385,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.skills_error = None
         try:
             app.state.skills_root = resolve_profiles_root(app.state.env)
+            if (app.state.env or os.environ).get("MAI_SEED_BUILTIN_SKILLS") == "1":
+                seed_builtin_skills(app.state.skills_root)
         except OSError:
             app.state.skills_error = "skills_root_unusable"
         # Memory surface (C07 rule 6): the bank-scoped Hindsight provider
