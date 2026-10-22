@@ -160,9 +160,8 @@ export function pluginsEntry(): PanelEntryInput {
 		// One instance per scope (one global window and one per server).
 		singleton: true,
 		capabilities_note:
-			'Native plugin cards with secret readiness and value-free connection probes, ' +
-			'default_vault/allowed_vaults configuration with write-only credential values, ' +
-			'explicit agent grant bindings (global or per server); grants never follow ' +
-			'from configuring, enabling or probing.'
+			'Native plugin cards with readiness probes, vault configuration, ' +
+			'and explicit server or global capability grant bindings; ' +
+			'references only, registration grants no permissions.'
 	};
 }
