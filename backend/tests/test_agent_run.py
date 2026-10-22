@@ -76,7 +76,7 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Scratch namespace per runtime-environment ADR D2/D4 (recorded + cleaned
 # in the card evidence). Each live scenario gets a fresh subdirectory.
-FIXTURE_ROOT = Path("/tmp/mai-fxt-06-agent-run")
+FIXTURE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / "mai-fxt-06-agent-run"
 
 READY_TIMEOUT = 90.0
 RUN_TIMEOUT = 120.0
@@ -461,7 +461,7 @@ def factory(agent_url: str) -> async_sessionmaker[AsyncSession]:
 def insert_run(factory: async_sessionmaker[AsyncSession]):
     """Insert a ``job_runs`` row (the submit owner's row, by SQL helper)."""
 
-    async def _insert(run_id: str) -> None:
+    async def _insert(run_id: str, *, requested_grants: tuple[str, ...] = (READ_CAP,)) -> None:
         async with factory() as session:
             await session.execute(
                 text(
@@ -472,10 +472,11 @@ def insert_run(factory: async_sessionmaker[AsyncSession]):
                          submitted_at, updated_at)
                     VALUES
                         (:run_id, :server_id, 0, 3, 7, 'fixture-fast',
-                         '["fixture.read"]', now(), now())
+                         :requested_grants, now(), now())
                     """
                 ),
-                {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID)},
+                {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID),
+                 "requested_grants": json.dumps(requested_grants)},
             )
             await session.commit()
 
@@ -518,7 +519,7 @@ def _write_model_root(root: Path, *, base_url: str, credential: bool) -> None:
     store.set_selection("gateway", "fast", expected_revision=0)
 
 
-def _write_data_root(root: Path) -> None:
+def _write_data_root(root: Path, *, capability: str = READ_CAP) -> None:
     from mai.profiles.files import ProfileFileStore
 
     store = ProfileFileStore(root)
@@ -536,7 +537,7 @@ def _write_data_root(root: Path) -> None:
         '  credential_ref: "MAI_SSH_KEY_FIXTURE"\n'
         "privilege: none\n"
         "capabilities:\n"
-        "  - fixture.read\n"
+        f"  - {capability}\n"
     )
     store.write(uuid.UUID(SERVER_ID), profile_text, expected_revision=0)
     server_dir = root / "servers" / SERVER_ID
@@ -553,12 +554,13 @@ def composition(
     """Write the fixture model/data roots once per scenario."""
 
     def _compose(
-        *, base_url: str = "http://127.0.0.1:9/v1", credential: bool = True
+        *, base_url: str = "http://127.0.0.1:9/v1", credential: bool = True,
+        capability: str = READ_CAP,
     ) -> dict[str, Path]:
         model_root = scenario / "model-root"
         data_root = scenario / "data-root"
         _write_model_root(model_root, base_url=base_url, credential=credential)
-        _write_data_root(data_root)
+        _write_data_root(data_root, capability=capability)
         (scenario / "fixture.env").write_text(
             f"{SECRET_NAME}={SECRET_VALUE}\n", encoding="utf-8"
         )
@@ -737,6 +739,27 @@ def _script_model():
         index = (len(messages) - 1) // 2
         if index >= len(script):
             raise AssertionError("model script exhausted")
+        expected = script[index].get("expect_web_read")
+        if expected is not None:
+            returns = [
+                part for part in messages[-1].parts
+                if getattr(part, "part_kind", "") == "tool-return"
+                and part.tool_name == "web_read"
+            ]
+            assert len(returns) == 1, "missing real web_read tool return"
+            envelope = json.loads(returns[0].content)
+            # Record actual bridge output before validating the scripted reply.
+            with open(os.environ["MAI_FX_WEB_READ"] + ".result", "w") as handle:
+                json.dump(envelope, handle)
+            assert envelope["status"] == "executed", envelope
+            assert envelope["executor_ok"] is expected["executor_ok"], envelope
+            assert envelope["output"]["truncated"] is False, envelope
+            page = json.loads(envelope["output"]["text"])
+            for key, value in expected["page"].items():
+                assert page[key] == value, (key, page)
+            if "marker" in expected:
+                assert expected["marker"] in page["markdown"], page
+            _mark("web_read_output_verified")
         return _entry_payload(script[index])
 
     return FunctionModel(_model_fn)
@@ -757,6 +780,40 @@ def _build():
     registry = CapabilityRegistry()
     registry.register(_descriptor("fixture.read", "read"))
     registry.register(_descriptor("fixture.priv", "privileged"))
+    executor = FixtureExecutor()
+    web_fixture = os.environ.get("MAI_FX_WEB_READ")
+    if web_fixture:
+        import httpx2
+        from mai.jobs.worker import _build_web_read_capability
+        from mai.research import pages
+
+        with open(web_fixture, encoding="utf-8") as handle:
+            response = json.load(handle)
+        registry.register(pages.descriptor())
+
+        def resolve(host):
+            assert host == "developer.valvesoftware.com"
+            return ("93.184.216.34",)
+
+        def transport(request):
+            assert request.headers["host"] == "developer.valvesoftware.com"
+            assert request.url.path == "/wiki/Server_queries"
+            executor._mark("transport:web.read")
+            return httpx2.Response(
+                response["status"], headers={"Content-Type": response["content_type"]},
+                content=response["body"].encode("utf-8"),
+            )
+
+        reader = _build_web_read_capability(
+            transport=httpx2.MockTransport(transport), resolver=resolve
+        )
+
+        async def dispatch_fixture(call):
+            if call.descriptor.identifier == pages.CAPABILITY_ID:
+                return await reader(call)
+            return await executor(call)
+    else:
+        dispatch_fixture = executor
     dispatcher = CapabilityDispatcher(
         registry=registry,
         approvals=ApprovalStore(sessions),
@@ -767,7 +824,7 @@ def _build():
         ),
         adopted=lambda server_id: True,
         credentials=lambda: EnvResolver(os.environ["MAI_FX_ENV"]),
-        executor=FixtureExecutor(),
+        executor=dispatch_fixture,
     )
     model_store = ModelConfigStore(os.environ["MAI_FX_MODEL_ROOT"])
     scripted = os.environ.get("MAI_FX_MODEL_SCRIPT")
@@ -844,6 +901,10 @@ def _spawn_worker(
     env["MAI_FX_ENV"] = str(scenario / "fixture.env")
     env["MAI_FX_MODEL_ROOT"] = str(scenario / "model-root")
     env["MAI_FX_DATA_ROOT"] = str(scenario / "data-root")
+    web_path = scenario / "web-read.json"
+    env.pop("MAI_FX_WEB_READ", None)
+    if web_path.exists():
+        env["MAI_FX_WEB_READ"] = str(web_path)
     behavior_path = scenario / "behavior.json"
     env.pop("MAI_FX_BEHAVIOR", None)
     if behavior_path.exists():
@@ -1019,6 +1080,88 @@ def _tool_call_entry(
 
 
 class TestDurableAgentRuns:
+    def test_real_web_read_incident_budget_succeeds(
+        self, agent_url, factory, insert_run, scenario, composition
+    ) -> None:
+        """Real reader/bridge/DBOS journey; only HTTP and model are controlled."""
+        url = "https://developer.valvesoftware.com/wiki/Server_queries"
+        marker = "W6A-DURABLE-PAGE-7f329b"
+        body = f"<html><body><h1>Server queries</h1><p>{marker}</p></body></html>"
+        composition(capability="web.read")
+        _write_policy_files(scenario, grants=[{"web.read": True}])
+        (scenario / "web-read.json").write_text(
+            json.dumps({"status": 200, "content_type": "text/html", "body": body}),
+            encoding="utf-8",
+        )
+        _script(scenario, [
+            _tool_call_entry(name="web_read", args={
+                "url": url, "max_bytes": 524288, "max_markdown_chars": 10000,
+            }),
+            {"expect_web_read": {
+                "executor_ok": True,
+                "page": {"status": "ok", "http_status": 200},
+                "marker": marker,
+            }, "text": "Verified page marker; all done"},
+        ])
+        run_id = str(uuid.uuid4())
+        document = _intent_document(
+            run_id, allowed=("web.read",), connection="gateway", profile="fast",
+            wait_poll_seconds=0.5,
+        )
+        client = EngineClient(agent_url)
+        worker = None
+        try:
+            worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "web")
+            _run(insert_run(run_id, requested_grants=("web.read",)))
+            client.enqueue_run(run_id, agent_run.HANDLER_NAME, _canonical(document))
+            _wait_until(
+                lambda: _terminal_engine_state(client, run_id) in ("succeeded", "failed"),
+                RUN_TIMEOUT, "web.read terminal run",
+            )
+            assert _terminal_engine_state(client, run_id) == "succeeded", _journal_lines(scenario)
+        finally:
+            if worker is not None:
+                _stop(worker)
+            client.close()
+
+        assert _journal_lines(scenario) == [
+            "model_call", "transport:web.read", "model_call",
+            "tool_return:executed", "web_read_output_verified",
+        ]
+        envelope = json.loads((scenario / "web-read.json.result").read_text())
+        assert envelope["executor_ok"] is True
+        assert envelope["approval_id"] is None
+        assert envelope["approval_spent"] is False
+        output = envelope["output"]
+        assert output["truncated"] is False and output["omitted_bytes"] == 0
+        assert len(output["text"].encode("utf-8")) < 65536
+        page = json.loads(output["text"])
+        assert page["status"] == "ok" and page["http_status"] == 200
+        assert marker in page["markdown"]
+        assert 0 < len(page["markdown"]) <= 10000
+        assert page["bytes_read"] == len(body.encode("utf-8"))
+        assert page["truncated"] is False
+        assert page["url"] == page["final_url"] == page["citation"] == url
+        assert page["trust"] == "untrusted_external"
+
+        rows = _read_step_rows(agent_url, run_id)
+        assert len(rows) == 1
+        assert rows[0]["seq"] == 1 and rows[0]["capability_id"] == "web.read"
+        assert rows[0]["state"] == "succeeded"
+        receipt = rows[0]["receipt"]
+        assert receipt["allowed"] is True and receipt["effect"] == "executed"
+        assert receipt["status"] == "ok"
+        assert receipt["response"] == page
+        assert receipt["params"] == {
+            "url": url, "max_bytes": 524288, "max_markdown_chars": 10000,
+        }
+        events = _read_events(agent_url, run_id)
+        types = [event.type for event in events]
+        assert "agent.completed" in types
+        assert "agent.awaiting_reconciliation" not in types
+        assert "agent.failed" not in types
+        assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
+
     def test_conversation_executes_tool_once_and_succeeds(
         self, agent_url, factory, insert_run, scenario, composition
     ) -> None:
