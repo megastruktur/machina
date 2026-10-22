@@ -1026,25 +1026,93 @@ class TestExecutorClassification:
         assert document["status"] == "refused"
         assert document["code"] == "response_too_large"
 
-    async def test_invalid_url_raises_like_payload_rejection(self) -> None:
+    async def test_invalid_url_is_a_structured_refusal_not_a_crash(self) -> None:
+        """A semantically invalid URL (schema-valid, wrong scheme) is a
+        known page failure: a refused result, never an executor crash."""
         provider = _StaticProvider(
             PageError(PageErrorCode.INVALID_PAYLOAD, "url scheme must be http or https")
         )
         capability = WebPageCapability(provider)
-        with pytest.raises(PageError) as excinfo:
-            await capability(_call({"url": "ftp://example.com/a"}, _context()))
-        assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
+        result = await capability(_call({"url": "ftp://example.com/a"}, _context()))
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        assert document["markdown"] == ""
 
     async def test_direct_call_validates_inputs(self) -> None:
+        # A malformed executor object/context is a programming contract
+        # failure and keeps raising...
         capability = WebPageCapability(_StaticProvider(_STATIC_PAGE))
         with pytest.raises(PageError) as excinfo:
             await capability("not-a-call")  # type: ignore[arg-type]
         assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
-        with pytest.raises(PageError) as excinfo:
-            await capability(_call({}, _context()))
-        assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
         with pytest.raises(PageError):
             WebPageCapability(object())
+
+    async def test_invalid_payload_before_provider_call_is_structured(self) -> None:
+        """Request validation that fails before a PageRequest exists is a
+        known refusal, not an unknown effect — and the provider is never
+        called."""
+        provider = _StaticProvider(_STATIC_PAGE)
+        capability = WebPageCapability(provider)
+        result = await capability(
+            _call({"url": "https://example.com/a", "max_bytes": "big"}, _context())
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        assert document["markdown"] == ""
+        # No provider I/O happened.
+        assert provider.calls == []
+
+    async def test_provider_ceiling_below_request_is_structured_refusal(self) -> None:
+        """A provider wired with a smaller ceiling than the request asks
+        for refuses with a known code — a structured result, not a thrown
+        PageError and not an unknown effect."""
+        provider = HttpPageProvider(
+            max_bytes=MIN_MAX_BYTES,
+            resolver=_public_resolver,
+            transport=httpx2.MockTransport(
+                lambda request: _html_response(PAGE_HTML)
+            ),
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call(
+                {
+                    "url": "https://public.example/a",
+                    "max_bytes": DEFAULT_MAX_BYTES,
+                },
+                _context(),
+            )
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        assert document["markdown"] == ""
+
+    async def test_credential_bearing_url_is_never_reflected(self) -> None:
+        """A URL with embedded credentials is refused and reflected
+        nowhere — not in the url/final_url fields, not in the citation."""
+        provider = _StaticProvider(
+            PageError(PageErrorCode.INVALID_PAYLOAD, "url must not embed userinfo credentials")
+        )
+        capability = WebPageCapability(provider)
+        result = await capability(
+            _call({"url": "http://user:sup3rsecret@example.com/a"}, _context())
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        assert document["url"] == ""
+        assert document["final_url"] == ""
+        assert document["citation"] == ""
+        assert "sup3rsecret" not in result.output
+        assert "user" not in document["citation"]
 
 
 # ---------------------------------------------------------------------------
@@ -1408,6 +1476,35 @@ class TestDispatcherIntegration:
         assert document["status"] == "refused"
         assert document["code"] == "address_refused"
 
+    async def test_known_failure_is_not_an_unknown_effect(self) -> None:
+        """A schema-valid but semantically invalid URL is a known failure:
+        the dispatcher sees an executor that answered, so the effect is
+        executed (not unknown), the executor flag is false and no
+        approval is consumed."""
+        provider = _StaticProvider(
+            PageError(
+                PageErrorCode.INVALID_PAYLOAD, "url scheme must be http or https"
+            )
+        )
+        capability = _RecordingCapability(WebPageCapability(provider))
+        registry = _registry()
+        dispatcher = _dispatcher(registry, capability, grants=_grants(SERVER_A))
+        outcome = await dispatcher.dispatch(
+            context=_context(server_id=SERVER_A),
+            capability_id=CAPABILITY_ID,
+            payload={"url": "ftp://example.com/a"},
+        )
+        assert outcome.allowed is True
+        assert outcome.effect == "executed"
+        assert outcome.executor_ok is False
+        assert outcome.approval_id is None
+        assert outcome.approval_spent is False
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        # The rejected target is not reflected as a citation.
+        assert document["citation"] == ""
+
 
 class TestToolBridgeAvailability:
     def test_descriptor_exposed_only_when_allowed(self) -> None:
@@ -1478,6 +1575,58 @@ class TestToolBridgeAvailability:
         assert result["error"]["code"] == "payload_schema_mismatch"
         assert capability.calls == []
         assert result["effect"] == "not_attempted"
+
+    async def test_bridge_malformed_schema_never_reaches_executor(self) -> None:
+        """A schema-invalid payload (no url at all) is rejected by the
+        bridge gate before the executor runs."""
+        from mai.agents.tools import CapabilityToolBridge
+
+        capability = _RecordingCapability(
+            WebPageCapability(_StaticProvider(_STATIC_PAGE))
+        )
+        registry = _registry()
+        dispatcher = _dispatcher(registry, capability, grants=_grants(SERVER_A))
+        bridge = CapabilityToolBridge(
+            registry=registry,
+            dispatcher=dispatcher,
+            context=_context(server_id=SERVER_A),
+        )
+        tool = next(t for t in bridge.tools if "read" in t.name)
+        result = json.loads(await tool.function())
+        assert result["status"] == "denied"
+        assert result["error"]["code"] == "payload_schema_mismatch"
+        assert capability.calls == []
+        assert result["effect"] == "not_attempted"
+
+    async def test_bridge_known_failure_is_executed_not_unknown(self) -> None:
+        """Through the real bridge, a known page failure is an executed
+        call whose executor flag is false — never an unknown effect and
+        never an approval."""
+        from mai.agents.tools import CapabilityToolBridge
+
+        provider = _StaticProvider(
+            PageError(
+                PageErrorCode.INVALID_PAYLOAD, "url scheme must be http or https"
+            )
+        )
+        capability = _RecordingCapability(WebPageCapability(provider))
+        registry = _registry()
+        dispatcher = _dispatcher(registry, capability, grants=_grants(SERVER_A))
+        bridge = CapabilityToolBridge(
+            registry=registry,
+            dispatcher=dispatcher,
+            context=_context(server_id=SERVER_A),
+        )
+        tool = next(t for t in bridge.tools if "read" in t.name)
+        result = json.loads(await tool.function(url="ftp://example.com/a"))
+        assert result["status"] == "executed"
+        assert result["effect"] == "executed"
+        assert result["executor_ok"] is False
+        assert result["approval_id"] is None
+        document = json.loads(result["output"]["text"])
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
+        assert document["citation"] == ""
 
 
 class TestDescriptorContract:

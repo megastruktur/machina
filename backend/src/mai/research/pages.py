@@ -57,12 +57,22 @@ exclusively as a trusted capability implementation behind
   capability performs fetching/bounding/quoting only (C06 rule 2 —
   retrieved text is context, never system authority).
 - **Honest failure taxonomy** — a timeout is ``fetch_timeout``, a
-  transport/DNS failure is ``fetch_unreachable``, an HTTP error status is
-  ``fetch_error``; policy and budget refusals
+  transport/DNS failure is ``fetch_unreachable``, an HTTP error status
+  is ``fetch_error``; policy and budget refusals
   (``address_refused``/``response_too_large``/``too_many_redirects``/
   ``unsupported_content_type``) are ``status="refused"`` — the policy
   decision succeeded, the fetch did not run. Errors carry stable codes
   and the exception *type* only, never messages.
+- **Recoverable failures, not stalls** — every *known* page failure
+  (request/URL validation, provider wiring validation, policy/budget
+  refusals) is returned as a structured non-success result with
+  ``ok=false``, never raised past the executor. A recoverable refusal
+  must not become an unproven effect (an "unknown effect" stall) at
+  the dispatcher: the executor answered, so the effect is known. Only
+  a malformed executor object/context — a programming contract
+  violation — still raises. Diagnostics stay redacted: a rejected
+  URL is never reflected, so a credential-bearing or malformed target
+  can never reappear as a citable citation.
 
 Effect class ``read``; the module reads no process environment and takes
 no clock. The network seam is the injected provider alone (the httpx2
@@ -387,6 +397,25 @@ def validate_fetch_url(url: str) -> str:
             "url port is not parseable",
         ) from None
     return stripped
+
+
+def _safe_url(url: object) -> str:
+    """The URL if it is a fetchable, credential-free http(s) URL.
+
+    A URL that fails :func:`validate_fetch_url` (bad scheme, embedded
+    userinfo, unparseable, oversized) is never reflected back: the
+    empty string stands in for "no citable target". This keeps a
+    malformed or credential-bearing request out of the result document
+    and out of the citation entirely.
+    """
+    if not isinstance(url, str):
+        return ""
+    try:
+        return validate_fetch_url(url)
+    except PageError:
+        return ""
+    except Exception:  # noqa: BLE001 - a malformed target is simply no target
+        return ""
 
 
 def _default_resolver(host: str) -> Sequence[str]:
@@ -1115,14 +1144,14 @@ class PageResult:
 
 def result_document(result: PageResult) -> dict[str, object]:
     """The frozen JSON document of one page-read result (stable keys)."""
-    citation = normalize_citation_url(result.final_url)
+    citation = _citation_of(result.final_url)
     return {
         "status": result.status.value,
         "code": result.code.value if result.code is not None else None,
         "trust": "untrusted_external",
         "url": result.url,
         "final_url": result.final_url,
-        "citation": citation if citation is not None else result.final_url,
+        "citation": citation,
         "title": result.title,
         "markdown": result.markdown,
         "truncated": result.truncated,
@@ -1130,6 +1159,56 @@ def result_document(result: PageResult) -> dict[str, object]:
         "redirects": result.redirects,
         "error_type": result.error_type,
     }
+
+
+def _citation_of(url: str) -> str:
+    """The citable form of one URL, or ``""`` when it is not citable.
+
+    A malformed or credential-bearing URL yields no citation at all:
+    the fallback never re-introduces a target that failed URL
+    validation, so a rejected request cannot be quoted as a source.
+    """
+    safe = _safe_url(url)
+    if not safe:
+        return ""
+    normalized = normalize_citation_url(safe)
+    return normalized if normalized is not None else ""
+
+
+def _refusal_result(
+    *, code: PageErrorCode, url: str, at_url: str | None
+) -> PageResult:
+    """One structured, value-free refusal result for a known failure.
+
+    The requested and refusing URLs are reflected only when they are
+    fetchable, credential-free http(s) URLs: a malformed or
+    userinfo-bearing URL is dropped (empty string), so a rejected
+    request never becomes a citable citation and never echoes a
+    credential back to the caller.
+    """
+    safe_requested = _safe_url(url)
+    safe_at_url = _safe_url(at_url) if at_url is not None else ""
+    return PageResult(
+        status=PageStatus.REFUSED,
+        code=code,
+        url=safe_requested,
+        final_url=safe_at_url or safe_requested,
+        title="",
+        markdown="",
+        truncated=False,
+        bytes_read=0,
+        redirects=0,
+    )
+
+
+def _executor_result(result: PageResult) -> ExecutorResult:
+    """The executor answer of one page result (success only for ``ok``)."""
+    return ExecutorResult(
+        ok=result.status is PageStatus.OK,
+        output=json.dumps(
+            result_document(result), sort_keys=True, ensure_ascii=True
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1268,8 +1347,10 @@ class WebPageCapability:
     upstream of this executor. Order per call: validate payload → one
     bounded fetch (syntax + address re-validation per hop inside the
     provider) → decode → extract bounded Markdown → one frozen JSON
-    document. Policy/budget refusals and provider outages are honest
-    statuses in the result document; only malformed direct calls raise.
+    document. Policy/budget refusals, provider outages and request
+    validation failures are honest statuses in the result document
+    (``ok=false``); only a malformed executor object/context — a
+    programming contract violation — raises.
     """
 
     def __init__(
@@ -1307,40 +1388,46 @@ class WebPageCapability:
                 PageErrorCode.INVALID_PAYLOAD,
                 "call context must be an ExecutionContext",
             )
-        request = request_from_payload(
-            call.payload,
-            default_max_bytes=self._default_max_bytes,
-            default_timeout_seconds=self._default_timeout,
-            default_max_markdown_chars=self._default_max_markdown,
-        )
+        try:
+            request = request_from_payload(
+                call.payload,
+                default_max_bytes=self._default_max_bytes,
+                default_timeout_seconds=self._default_timeout,
+                default_max_markdown_chars=self._default_max_markdown,
+            )
+        except PageError as exc:
+            # Request validation failed before a PageRequest existed:
+            # a known, structured refusal — not an executor crash. The
+            # rejected payload is never reflected (no URL, no field
+            # values), so nothing citable or credential-bearing leaks.
+            return _executor_result(
+                _refusal_result(
+                    code=exc.code,
+                    url="",
+                    at_url=None,
+                )
+            )
         try:
             raw = await self._provider.fetch(
                 url=request.url, max_bytes=request.max_bytes
             )
         except PageError as exc:
-            if exc.code is PageErrorCode.INVALID_PAYLOAD:
-                # A malformed direct call is a caller error, not a policy
-                # outcome — raise exactly like payload validation does.
-                raise
-            # Policy/budget refusal (possibly at a redirect hop): the
-            # refusal is the honest answer, value-free.
-            result = PageResult(
-                status=PageStatus.REFUSED,
+            # A known page failure — a policy/budget refusal, a provider
+            # wiring rejection (e.g. a request over the provider's own
+            # ceiling) or an outage class — is the honest answer of this
+            # read, shaped like any other page result. It is not an
+            # executor crash and never becomes an unknown effect.
+            result = _refusal_result(
                 code=exc.code,
                 url=request.url,
-                final_url=exc.at_url or request.url,
-                title="",
-                markdown="",
-                truncated=False,
-                bytes_read=0,
-                redirects=0,
+                at_url=exc.at_url,
             )
         except Exception as exc:  # noqa: BLE001 - classified, value-free
             result = PageResult(
                 status=PageStatus.UNAVAILABLE,
                 code=_classify_fetch_exception(exc),
-                url=request.url,
-                final_url=request.url,
+                url=_safe_url(request.url),
+                final_url=_safe_url(request.url),
                 title="",
                 markdown="",
                 truncated=False,
@@ -1354,7 +1441,7 @@ class WebPageCapability:
             result = PageResult(
                 status=PageStatus.OK,
                 code=None,
-                url=request.url,
+                url=_safe_url(request.url),
                 final_url=normalize_citation_url(raw.url) or raw.url,
                 title=content.title,
                 markdown=content.markdown,
@@ -1362,12 +1449,7 @@ class WebPageCapability:
                 bytes_read=raw.bytes_read,
                 redirects=raw.hops,
             )
-        return ExecutorResult(
-            ok=result.status is PageStatus.OK,
-            output=json.dumps(
-                result_document(result), sort_keys=True, ensure_ascii=True
-            ),
-        )
+        return _executor_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,9 +1499,20 @@ async def _read_async(args: argparse.Namespace) -> int:
         op_id=uuid.uuid4(),
     )
     try:
+        # The operator entrypoint keeps its documented exit contract
+        # (1 = structured rejection): a syntactically invalid target is
+        # rejected here, before the capability runs. Everything else is
+        # an honest page status in the emitted document (exit 0).
+        validate_fetch_url(args.url)
+    except PageError as exc:
+        # The detail is the module's own authored diagnostic — never the
+        # rejected target, so no credential-bearing URL is echoed back.
+        _emit({"kind": "error", "code": exc.code.value, "detail": exc.detail})
+        return 1
+    try:
         result = await capability(call)
     except PageError as exc:
-        _emit({"kind": "error", "code": exc.code.value, "detail": str(exc)})
+        _emit({"kind": "error", "code": exc.code.value, "detail": exc.detail})
         return 1
     _emit(json.loads(result.output))
     return 0

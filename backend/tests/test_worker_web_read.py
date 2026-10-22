@@ -33,8 +33,6 @@ from mai.research.pages import (
     MAX_MAX_BYTES,
     MIN_MAX_BYTES,
     HttpPageProvider,
-    PageError,
-    PageErrorCode,
     descriptor,
 )
 
@@ -229,30 +227,37 @@ class TestIncidentPayload:
         assert document["markdown"] == ""
 
     async def test_above_schema_maximum_rejected_before_transport(self) -> None:
+        # W2: an out-of-schema payload is a known, structured refusal —
+        # a refused result, not a raised exception and never an unknown
+        # effect. It is still rejected before any transport I/O.
         upstream = _RecordingTransport()
         capability = _wired_capability(upstream)
-        with pytest.raises(PageError) as excinfo:
-            await capability(
-                _call(
-                    {
-                        "url": INCIDENT_URL,
-                        "max_bytes": MAX_MAX_BYTES + 1,
-                        "max_markdown_chars": INCIDENT_MAX_MARKDOWN_CHARS,
-                    }
-                )
+        result = await capability(
+            _call(
+                {
+                    "url": INCIDENT_URL,
+                    "max_bytes": MAX_MAX_BYTES + 1,
+                    "max_markdown_chars": INCIDENT_MAX_MARKDOWN_CHARS,
+                }
             )
-        assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
         # Rejected before any transport I/O.
         assert upstream.requests == []
 
     async def test_below_floor_rejected_before_transport(self) -> None:
         upstream = _RecordingTransport()
         capability = _wired_capability(upstream)
-        with pytest.raises(PageError) as excinfo:
-            await capability(
-                _call({"url": INCIDENT_URL, "max_bytes": MIN_MAX_BYTES - 1})
-            )
-        assert excinfo.value.code is PageErrorCode.INVALID_PAYLOAD
+        result = await capability(
+            _call({"url": INCIDENT_URL, "max_bytes": MIN_MAX_BYTES - 1})
+        )
+        assert result.ok is False
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_payload"
         assert upstream.requests == []
 
 
