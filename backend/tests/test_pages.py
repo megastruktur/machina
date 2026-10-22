@@ -457,6 +457,7 @@ class TestExtraction:
             "title",
             "markdown",
             "truncated",
+            "http_status",
         }
 
     def test_truncation_flag_is_honest(self) -> None:
@@ -865,6 +866,267 @@ class TestRedirectHandling:
 
 
 # ---------------------------------------------------------------------------
+# HTTP status gate: the status is decided before the MIME/size/body checks
+# ---------------------------------------------------------------------------
+
+
+class _SpyStream(httpx2.AsyncByteStream):
+    """A response body that records how much of it was consumed.
+
+    The spy proves the application-level claim of the status gate: an
+    HTTP error answer never reads the error body — no chunk is yielded
+    to the reader.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.chunks_yielded = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        self.chunks_yielded += 1
+        yield self._payload
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _status_response(
+    status: int,
+    *,
+    content_type: str = "text/html",
+    content_length: str | None = None,
+    payload: bytes = b"",
+    spy: _SpyStream | None = None,
+) -> httpx2.Response:
+    headers = {"Content-Type": content_type}
+    if content_length is not None:
+        headers["Content-Length"] = content_length
+    if spy is not None:
+        return httpx2.Response(status, headers=headers, stream=spy)
+    return httpx2.Response(status, headers=headers, content=payload)
+
+
+class TestHttpStatusOrdering:
+    async def test_oversized_html_404_is_http_error_not_size_refusal(self) -> None:
+        """A 404 whose body declares an over-budget length is an HTTP
+        error, not ``response_too_large``: the status verdict comes
+        first and the body is never measured."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                404,
+                content_type="text/html",
+                content_length=str(MIN_MAX_BYTES * 4),
+                payload=b"<p>missing</p>",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        with pytest.raises(httpx2.HTTPStatusError) as excinfo:
+            await provider.fetch(
+                url="http://public.example/missing", max_bytes=MIN_MAX_BYTES
+            )
+        assert excinfo.value.response.status_code == 404
+        assert getattr(excinfo.value, "http_status") == 404
+        # The same answer through the capability: fetch_error with the
+        # numeric status, not a size refusal.
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/missing"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "unavailable"
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == 404
+        assert document["bytes_read"] == 0
+
+    async def test_text_plain_404_is_http_error_not_type_refusal(self) -> None:
+        """A plaintext 404 is an HTTP error, not
+        ``unsupported_content_type``: the MIME gate never runs on an
+        error response."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                404,
+                content_type="text/plain",
+                payload=b"not found",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        with pytest.raises(httpx2.HTTPStatusError) as excinfo:
+            await provider.fetch(
+                url="http://public.example/missing", max_bytes=MIN_MAX_BYTES
+            )
+        assert getattr(excinfo.value, "http_status") == 404
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/missing"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == 404
+        assert document["bytes_read"] == 0
+
+    @pytest.mark.parametrize("status", [403, 404, 429, 500, 503])
+    async def test_error_statuses_stay_distinguishable(self, status: int) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(status, payload=b"<p>error</p>")
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        document = json.loads(result.output)
+        assert result.ok is False
+        assert document["status"] == "unavailable"
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == status
+        # A number only: no header, body or message detail rides along.
+        assert document["markdown"] == ""
+        assert "error" not in document["markdown"]
+
+    async def test_error_body_is_never_consumed(self) -> None:
+        """The stream spy proves the application reads no byte of an
+        error body."""
+        spy = _SpyStream(b"<p>server error</p>" * 100)
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(500, spy=spy)
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == 500
+        assert spy.chunks_yielded == 0
+        assert spy.closed is True
+        assert document["bytes_read"] == 0
+        assert "server error" not in result.output
+
+    async def test_no_hidden_retry_on_error_status(self) -> None:
+        requests: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            requests.append(request)
+            return _status_response(404, payload=b"<p>missing</p>")
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        assert json.loads(result.output)["http_status"] == 404
+        assert len(requests) == 1
+
+    async def test_oversized_200_still_response_too_large(self) -> None:
+        """The status gate changes nothing for a successful response:
+        an oversized 200 page is still a size refusal."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                200,
+                content_type="text/html",
+                content_length=str(MIN_MAX_BYTES + 1),
+                payload=b"x" * (MIN_MAX_BYTES + 1),
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "response_too_large"
+        assert document["http_status"] is None
+
+    async def test_unsupported_binary_200_still_type_refusal(self) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                200,
+                content_type="application/pdf",
+                payload=b"%PDF-1.7 binary",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "refused"
+        assert document["code"] == "unsupported_content_type"
+        assert document["http_status"] is None
+
+    async def test_successful_read_reports_200(self) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(200, payload=PAGE_HTML.encode())
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/a"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["http_status"] == 200
+
+    async def test_redirected_error_keeps_logical_url_not_pinned_address(
+        self,
+    ) -> None:
+        """A redirected HTTP error reports the logical (validated) URL
+        of the failing hop — never the pinned transport address."""
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            if request.headers["host"] == "public.example":
+                return httpx2.Response(
+                    302,
+                    headers={"Location": "http://other.example/missing"},
+                    content=b"",
+                )
+            return _status_response(404, payload=b"<p>missing</p>")
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/start"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == 404
+        assert document["final_url"] == "http://other.example/missing"
+        assert document["citation"] == "http://other.example/missing"
+        assert document["redirects"] == 1
+        # The pinned address is transport-internal and never reported.
+        assert PUBLIC_IP not in result.output
+        assert PUBLIC_IP not in document["final_url"]
+
+
+# ---------------------------------------------------------------------------
 # Capability: classification of refusals/outages (value-free, stable codes)
 # ---------------------------------------------------------------------------
 
@@ -919,6 +1181,7 @@ _STATIC_PAGE = RawPage(
     body=PAGE_HTML.encode(),
     charset="utf-8",
     hops=0,
+    http_status=200,
 )
 
 
@@ -940,6 +1203,7 @@ class TestExecutorClassification:
         assert "# Fixture Heading" in document["markdown"]
         assert document["truncated"] is False
         assert document["redirects"] == 0
+        assert document["http_status"] == 200
         assert provider.calls == [
             {"url": "https://example.com/article", "max_bytes": DEFAULT_MAX_BYTES}
         ]
@@ -981,6 +1245,7 @@ class TestExecutorClassification:
         document = json.loads(result.output)
         assert document["code"] == "fetch_error"
         assert document["error_type"] == "HTTPStatusError"
+        assert document["http_status"] == 500
 
     async def test_unknown_failure_is_fetch_error_and_value_free(self) -> None:
         provider = _StaticProvider(RuntimeError("internal upstream message"))
@@ -991,6 +1256,8 @@ class TestExecutorClassification:
         document = json.loads(result.output)
         assert document["code"] == "fetch_error"
         assert "internal upstream message" not in result.output
+        # No status was observed: the field is null, never invented.
+        assert document["http_status"] is None
 
     async def test_refusal_at_hop_is_refused_with_hop_url(self) -> None:
         error = PageError(
@@ -1714,6 +1981,40 @@ class TestCliEntrypoint:
         document = json.loads(proc.stdout.strip().splitlines()[-1])
         assert document["kind"] == "error"
         assert document["code"] == "invalid_payload"
+
+    def test_cli_http_error_reports_numeric_status(self, upstream: str) -> None:
+        """The CLI document carries the numeric HTTP status of an error
+        answer — the additive nullable field is present and numeric."""
+        proc = self._run(
+            "read",
+            "--url",
+            f"{upstream}/error",
+            "--allow-private-addresses",
+            "--max-bytes",
+            str(MIN_MAX_BYTES),
+        )
+        assert proc.returncode == 0, proc.stderr
+        document = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert document["status"] == "unavailable"
+        assert document["code"] == "fetch_error"
+        assert document["http_status"] == 500
+        # The error body never reaches the document.
+        assert document["markdown"] == ""
+        assert "boom" not in proc.stdout
+
+    def test_cli_successful_read_reports_200(self, upstream: str) -> None:
+        proc = self._run(
+            "read",
+            "--url",
+            f"{upstream}/page",
+            "--allow-private-addresses",
+            "--max-bytes",
+            str(MIN_MAX_BYTES),
+        )
+        assert proc.returncode == 0, proc.stderr
+        document = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert document["status"] == "ok"
+        assert document["http_status"] == 200
 
     def test_cli_unavailable_upstream_is_honest_status(self) -> None:
         proc = self._run(

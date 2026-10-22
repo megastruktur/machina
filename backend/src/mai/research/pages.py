@@ -63,6 +63,16 @@ exclusively as a trusted capability implementation behind
   ``unsupported_content_type``) are ``status="refused"`` — the policy
   decision succeeded, the fetch did not run. Errors carry stable codes
   and the exception *type* only, never messages.
+- **The HTTP status is decided before the document is touched** — once
+  the redirect hops are handled, a response with a status of 400 or
+  above is an HTTP error, judged from the response headers alone: the
+  MIME gate, the byte budget and the body never run, and the error
+  body is never read. Such an answer carries its numeric
+  ``http_status`` (``404``, ``403``, ``429``, ``5xx`` …) — a number and
+  nothing else, never a header, a body or a message — together with the
+  logical (validated) URL of the failing hop, never the pinned
+  transport address. A successful read reports ``http_status=200``; a
+  policy refusal reports ``null``.
 - **Recoverable failures, not stalls** — every *known* page failure
   (request/URL validation, provider wiring validation, policy/budget
   refusals) is returned as a structured non-success result with
@@ -102,13 +112,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.research.search import normalize_citation_url
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import httpx2
 
 __all__ = [
     "CAPABILITY_ID",
@@ -860,6 +873,9 @@ class RawPage:
 
     ``url`` is the final URL after any redirect hops; ``hops`` counts
     them; ``charset`` is the response-declared encoding (or ``utf-8``).
+    ``http_status`` is the numeric status of the accepted response
+    (``200`` for a read page), or ``None`` when the seam did not report
+    one (a hand-built page in a test fixture).
     """
 
     url: str
@@ -868,6 +884,7 @@ class RawPage:
     body: bytes
     charset: str
     hops: int
+    http_status: int | None = None
 
 
 class PageProvider(Protocol):
@@ -895,14 +912,74 @@ def _classify_fetch_exception(exc: BaseException) -> PageErrorCode:
     return PageErrorCode.FETCH_ERROR
 
 
+def _http_status_error(
+    response: object, url: str, hops: int
+) -> "httpx2.HTTPStatusError":
+    """The HTTP-error verdict of one response, raised before its body.
+
+    The status is the only fact carried: the numeric code, the logical
+    (validated) URL of the failing hop and the hop count. The pinned
+    transport address never travels with it, and neither the error body
+    nor any header is read or copied — the error is a status, not a
+    document.
+    """
+    import httpx2
+
+    resp: httpx2.Response = response  # type: ignore[assignment]
+    error = httpx2.HTTPStatusError(
+        f"HTTP {resp.status_code}",
+        request=resp.request,
+        response=resp,
+    )
+    # The logical hop identity travels as attributes, never as the
+    # pinned-IP request URL httpx carries. ``setattr`` keeps the
+    # third-party exception type intact (its class stays
+    # ``HTTPStatusError`` for the value-free ``error_type``).
+    setattr(error, "http_status", int(resp.status_code))
+    setattr(error, "at_url", url)
+    setattr(error, "hops", hops)
+    return error
+
+
+def _http_status_of(exc: BaseException) -> int | None:
+    """The numeric HTTP status carried by one error, if it has one.
+
+    Only a number is ever extracted — never a header, a body or a
+    message. The status comes from the response object httpx carries on
+    its status errors.
+    """
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
+def _logical_url_of(exc: BaseException, fallback: str) -> str:
+    """The logical (validated) URL of a failed hop, never the pinned IP.
+
+    The provider attaches the validated hop URL to its own errors; when
+    an error carries none, the requested URL is the honest fallback.
+    """
+    at_url = getattr(exc, "at_url", None)
+    if isinstance(at_url, str) and at_url:
+        return at_url
+    return fallback
+
+
 class HttpPageProvider:
     """The bounded egress-controlled page fetch over an httpx2 client.
 
     Enforces, in order per hop: syntax validation, the address policy
     (resolve + validate, then dial the validated address — the connect
-    is pinned), the hop count, the content-type gate, and the byte
-    budget (``Content-Length`` pre-check, then a streaming read
-    abandoned at budget+1 decoded bytes). Sends a descriptive
+    is pinned), the hop count, the HTTP status gate (a status of 400 or
+    above is an HTTP error, judged before the body is touched), the
+    content-type gate, and the byte budget (``Content-Length``
+    pre-check, then a streaming read abandoned at budget+1 decoded
+    bytes). Sends a descriptive
     non-identifying User-Agent — no caller headers, no credentials, no
     host identity beyond the capability label (sanitized outbound
     context). The resolver and transport are constructor seams
@@ -1042,6 +1119,16 @@ class HttpPageProvider:
                         current = validate_fetch_url(urljoin(current, location))
                         hops += 1
                         continue
+                    if response.status_code >= 400:
+                        # The status verdict comes from the response
+                        # headers, before any MIME gate, length check or
+                        # body consumption: an error page is an HTTP
+                        # error, not an oversized or unsupported
+                        # document, and its body is never read. The
+                        # logical (validated) URL and hop count travel
+                        # with the error — never the pinned transport
+                        # address.
+                        raise _http_status_error(response, current, hops)
                     # The stream context owns closing the response (normal
                     # exit, refusal raise, or budget abort alike).
                     return await self._read_body(
@@ -1058,9 +1145,9 @@ class HttpPageProvider:
         Runs inside the caller's ``client.stream`` context: the response
         is closed by that context on every exit path, and the streaming
         abort at budget+1 *decoded* bytes bounds the transfer itself.
+        Only a response the status gate already accepted (``< 400``)
+        reaches this method, so an error body is never read here.
         """
-        import httpx2
-
         resp: httpx2.Response = response  # type: ignore[assignment]
         content_type = (
             resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -1094,15 +1181,6 @@ class HttpPageProvider:
                     f"response exceeded the {max_bytes}-byte budget",
                     at_url=url,
                 )
-        if resp.status_code >= 400:
-            # Read-then-status keeps the refusal taxonomy honest about
-            # where the bytes went; an error page is fetch_error, not a
-            # page.
-            raise httpx2.HTTPStatusError(
-                f"HTTP {resp.status_code}",
-                request=resp.request,
-                response=resp,
-            )
         charset = resp.charset_encoding or "utf-8"
         return RawPage(
             url=url,
@@ -1111,6 +1189,7 @@ class HttpPageProvider:
             body=b"".join(chunks),
             charset=charset,
             hops=hops,
+            http_status=int(resp.status_code),
         )
 
 
@@ -1128,6 +1207,11 @@ class PageResult:
     not run); ``unavailable`` names which seam failed via ``code`` and
     the exception *type* only. The requested/final/citation URLs keep
     every outcome traceable to its source (C07 rule 4).
+    ``http_status`` is the numeric HTTP status of the answered
+    response (``200`` for a read page, ``404``/``403``/``429``/``5xx``
+    for an HTTP error) or ``None`` when no status was observed. It is
+    a number and nothing else: no header, body or message detail ever
+    rides with it.
     """
 
     status: PageStatus
@@ -1140,6 +1224,7 @@ class PageResult:
     bytes_read: int
     redirects: int
     error_type: str | None = None
+    http_status: int | None = None
 
 
 def result_document(result: PageResult) -> dict[str, object]:
@@ -1158,6 +1243,7 @@ def result_document(result: PageResult) -> dict[str, object]:
         "bytes_read": result.bytes_read,
         "redirects": result.redirects,
         "error_type": result.error_type,
+        "http_status": result.http_status,
     }
 
 
@@ -1176,7 +1262,12 @@ def _citation_of(url: str) -> str:
 
 
 def _refusal_result(
-    *, code: PageErrorCode, url: str, at_url: str | None
+    *,
+    code: PageErrorCode,
+    url: str,
+    at_url: str | None,
+    http_status: int | None = None,
+    redirects: int = 0,
 ) -> PageResult:
     """One structured, value-free refusal result for a known failure.
 
@@ -1184,7 +1275,8 @@ def _refusal_result(
     fetchable, credential-free http(s) URLs: a malformed or
     userinfo-bearing URL is dropped (empty string), so a rejected
     request never becomes a citable citation and never echoes a
-    credential back to the caller.
+    credential back to the caller. ``http_status`` is the numeric
+    status only — never a header, a body or a message.
     """
     safe_requested = _safe_url(url)
     safe_at_url = _safe_url(at_url) if at_url is not None else ""
@@ -1197,7 +1289,8 @@ def _refusal_result(
         markdown="",
         truncated=False,
         bytes_read=0,
-        redirects=0,
+        redirects=redirects,
+        http_status=http_status,
     )
 
 
@@ -1322,6 +1415,16 @@ def descriptor() -> CapabilityDescriptor:
                     "bytes_read": {"type": "integer"},
                     "redirects": {"type": "integer"},
                     "error_type": {"type": ["string", "null"]},
+                    "http_status": {
+                        "type": ["integer", "null"],
+                        "description": (
+                            "Numeric HTTP status of the answered response "
+                            "(200 for a read page; 403/404/429/5xx for an "
+                            "HTTP error, which reports code fetch_error). "
+                            "A number only — never a header, a body or a "
+                            "message."
+                        ),
+                    },
                 },
             },
             "execution_environments": ["controller"],
@@ -1423,17 +1526,24 @@ class WebPageCapability:
                 at_url=exc.at_url,
             )
         except Exception as exc:  # noqa: BLE001 - classified, value-free
+            # An HTTP error is classified by its numeric status, never
+            # by its body or headers: the status number and the
+            # logical (validated) hop URL are the only facts carried.
+            hops = getattr(exc, "hops", None)
             result = PageResult(
                 status=PageStatus.UNAVAILABLE,
                 code=_classify_fetch_exception(exc),
                 url=_safe_url(request.url),
-                final_url=_safe_url(request.url),
+                final_url=_safe_url(
+                    _logical_url_of(exc, request.url)
+                ),
                 title="",
                 markdown="",
                 truncated=False,
                 bytes_read=0,
-                redirects=0,
+                redirects=hops if isinstance(hops, int) else 0,
                 error_type=type(exc).__name__,
+                http_status=_http_status_of(exc),
             )
         else:
             text = raw.body.decode(raw.charset, errors="replace")
@@ -1448,6 +1558,7 @@ class WebPageCapability:
                 truncated=content.truncated,
                 bytes_read=raw.bytes_read,
                 redirects=raw.hops,
+                http_status=raw.http_status,
             )
         return _executor_result(result)
 
