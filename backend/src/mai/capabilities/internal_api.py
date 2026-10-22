@@ -1213,7 +1213,17 @@ def build_internal_api_capabilities(
             )
         adopted_ids = {a["application_id"] for a in applications}
         for aid, entry in entries.items():
-            if aid not in adopted_ids:
+            # Map-only fallback: a Service Map sidecar without a canonical
+            # adoption record is listed ONLY when it is a genuine manual
+            # map addition (chat/agent entries, which never own a live
+            # compose/systemd/docker target). A non-manual sidecar whose
+            # adoption record is gone (revoked) is ORPHANED adoption
+            # metadata and stays hidden — the same membership rule the
+            # HTTP listing applies (agent-tool parity). The sidecar itself
+            # is retained on disk, untouched; filtering happens BEFORE
+            # sort/total/pagination, so total/limit/offset/has_more
+            # describe the filtered set.
+            if aid not in adopted_ids and entry.origin == "manual":
                 applications.append(
                     {
                         "application_id": aid,
