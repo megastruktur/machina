@@ -55,7 +55,11 @@ ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
-REVISION_IDS = ("0001", "0002", "0003")
+#: Linear migration chain (exclusive migration-chain resource): head
+#: assertions below target the chain TIP, so this constant tracks the full
+#: chain (0001 profiles, 0002 sessions, 0003 approvals, 0004 jobs, 0005
+#: knowledge, 0006 applications, 0007 observations) rather than pinning a head.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-02-auth-store-only"

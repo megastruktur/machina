@@ -66,9 +66,11 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 HOST_KEY = "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
 
 # Linear migration chain (exclusive migration-chain resource). 02-auth-store
-# appended 0002_sessions and 0003_approvals; head assertions below target the
-# chain TIP, so this constant tracks the full chain rather than pinning a head.
-REVISION_IDS = ("0001", "0002", "0003")
+# appended 0002_sessions and 0003_approvals; later cards appended 0004 jobs,
+# 0005 knowledge, 0006 applications and 0007 observations. Head assertions
+# below target the chain TIP, so this constant tracks the full chain rather
+# than pinning a head.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
 
 def _profile_text(server_id: uuid.UUID, name: str = "build-host") -> str:
@@ -106,7 +108,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0001``."""
+    """Disposable fixture database migrated from zero through the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(

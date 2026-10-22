@@ -54,8 +54,9 @@ ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 #: The constant tracks the full chain; head assertions target the TIP, so
-#: appending 0003_approvals keeps every chain-aware test truthful.
-REVISION_IDS = ("0001", "0002", "0003")
+#: every later chain appender (0004 jobs, 0005 knowledge, 0006 applications,
+#: 0007 observations) keeps these chain-aware tests truthful.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
 
 #: Disposable in-fixture stand-in for the privileged effect whose execution
 #: the approval would authorize (APPROVAL-PAYLOAD observable: unchanged on
@@ -89,7 +90,7 @@ ALTERED_PAYLOAD_HASH = _payload_hash(b'{"op": "deploy", "v": 2}')
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0003``."""
+    """Disposable fixture database migrated from zero through the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -240,7 +241,7 @@ def test_migration_chain_is_linear_and_approvals_follow_sessions(
 def test_upgrade_from_zero_lands_on_head_and_is_idempotent(
     migrated_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at 0003."""
+    """``migrated_url`` upgraded from zero; re-upgrade is a no-op at the tip."""
     monkeypatch.setenv("MAI_DATABASE_URL", migrated_url)
     command.upgrade(_alembic_config(), "head")
     with psycopg.connect(migrated_url) as conn:
