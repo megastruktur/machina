@@ -41,7 +41,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -404,15 +404,19 @@ def _drop_app_tables(url: str) -> None:
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "admin_credential, alembic_version, notification_alerts, "
+            "observation_findings, server_observations, knowledge_doc_chunks, "
+            "knowledge_documents, application_projection_journal, "
+            "application_projection"
         )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
 @pytest.fixture(scope="session")
-def agent_url() -> str:
-    """Disposable fixture database: Alembic chain + engine-owned schema."""
+def agent_url() -> Iterator[str]:
+    """Migrate the disposable DB, then restore pre-bootstrap state at teardown."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -423,16 +427,22 @@ def agent_url() -> str:
     previous = os.environ.get("MAI_DATABASE_URL")
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
-        _drop_app_tables(url)
-        command.upgrade(_alembic_config(), "head")
+        try:
+            _drop_app_tables(url)
+            command.upgrade(_alembic_config(), "head")
+        finally:
+            if previous is None:
+                os.environ.pop("MAI_DATABASE_URL", None)
+            else:
+                os.environ["MAI_DATABASE_URL"] = previous
+        engine.launch_worker(url)  # creates the engine-owned dbos schema
+        engine.shutdown()
+        yield url
     finally:
-        if previous is None:
-            os.environ.pop("MAI_DATABASE_URL", None)
-        else:
-            os.environ["MAI_DATABASE_URL"] = previous
-    engine.launch_worker(url)  # creates the engine-owned dbos schema
-    engine.shutdown()
-    return url
+        # Dependent fixtures dispose their engines before session teardown;
+        # stop this process's worker before dropping its schema as well.
+        engine.shutdown()
+        _drop_app_tables(url)
 
 
 @pytest.fixture
