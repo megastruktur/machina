@@ -27,11 +27,15 @@ import pytest
 
 from mai.credentials.env import EnvResolver
 from mai.credentials.onepassword import (
+    MAX_LIST_OUTPUT_BYTES,
     MAX_OUTPUT_BYTES,
     OP_SERVICE_ACCOUNT_FLOOR,
     OnePasswordError,
     OnePasswordErrorCode,
+    OnePasswordItemPage,
+    OnePasswordProbeReport,
     OnePasswordResolver,
+    StoredSecretReceipt,
 )
 
 SENTINEL = "mai-11-onepassword-value-sentinel-not-a-secret"
@@ -61,6 +65,28 @@ import time
 
 here = pathlib.Path(__file__).resolve().parent
 config = json.loads((here / "op-config.json").read_text(encoding="utf-8"))
+store_path = here / "op-store.json"
+
+
+def load_store():
+    if store_path.exists():
+        return json.loads(store_path.read_text(encoding="utf-8"))
+    return {"next_id": 1, "items": []}
+
+
+def save_store(store):
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+
+def option_value(argv, flag, default=None):
+    if flag in argv:
+        return argv[argv.index(flag) + 1]
+    return default
+
+
+stdin_bytes = b""
+if sys.stdin is not None and sys.stdin.buffer is not None:
+    stdin_bytes = sys.stdin.buffer.read()
 
 with (here / "invocations.jsonl").open("a", encoding="utf-8") as dump:
     dump.write(
@@ -69,16 +95,18 @@ with (here / "invocations.jsonl").open("a", encoding="utf-8") as dump:
                 "argv": sys.argv[1:],
                 "env_keys": sorted(os.environ),
                 "env_token": os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"),
+                "stdin": stdin_bytes.decode("utf-8", "replace"),
+                "stdin_len": len(stdin_bytes),
             }
         )
         + "\\n"
     )
 
-if len(sys.argv) > 1 and sys.argv[1] == "--version":
+if sys.argv[1] == "--version":
     print(config["version"])
     raise SystemExit(0)
 
-if len(sys.argv) > 2 and sys.argv[1] == "read":
+if sys.argv[1] == "read":
     behavior = config["behavior"]
     if behavior == "timeout":
         time.sleep(float(config["sleep"]))
@@ -95,11 +123,111 @@ if len(sys.argv) > 2 and sys.argv[1] == "read":
         raise SystemExit(0)
     if behavior == "empty":
         raise SystemExit(0)
+    # Stored items win: read-back sees what item create/edit wrote.
+    parts = sys.argv[2].split("/")
+    if len(parts) == 5:
+        for item in load_store()["items"]:
+            if item["title"] == parts[3] and parts[4] in item.get("fields", {}):
+                override = config.get("read_value_override")
+                sys.stdout.write(override if override else item["fields"][parts[4]])
+                raise SystemExit(0)
     if sys.argv[2] != config["reference"]:
         sys.stderr.write("unexpected reference")
         raise SystemExit(3)
     sys.stdout.write(config["value"])
     raise SystemExit(0)
+
+if sys.argv[1] == "item" and sys.argv[2] == "list":
+    behavior = config.get("list_behavior", "ok")
+    if behavior == "timeout":
+        time.sleep(float(config["sleep"]))
+        raise SystemExit(0)
+    if behavior == "fail":
+        sys.stderr.write(config.get("stderr", "list failed"))
+        raise SystemExit(int(config.get("rc", 4)))
+    vault = option_value(sys.argv[1:], "--vault")
+    category = option_value(sys.argv[1:], "--categories")
+    rows = list(config.get("items", [])) + load_store()["items"]
+    if vault is not None:
+        rows = [row for row in rows if row.get("vault") == vault]
+    if category:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("category", "")).lower() == category.lower()
+        ]
+    sys.stdout.write(json.dumps(rows))
+    if behavior == "overlarge":
+        sys.stdout.write("x" * int(config.get("pad", 0)))
+    raise SystemExit(0)
+
+if sys.argv[1] == "item" and sys.argv[2] in ("create", "edit"):
+    if config.get("create_behavior", "ok") == "fail":
+        sys.stderr.write(config.get("create_stderr", "conflict"))
+        raise SystemExit(int(config.get("create_rc", 5)))
+    template = json.loads(stdin_bytes.decode("utf-8"))
+    store = load_store()
+    if sys.argv[2] == "create":
+        item_id = "it-%03d" % store["next_id"]
+        store["next_id"] += 1
+    else:
+        item_id = sys.argv[3]
+    generated = None
+    length = 0
+    for arg in sys.argv[1:]:
+        if arg.startswith("--generate-password="):
+            generated = arg.split("=", 1)[1]
+            length = int(generated.split(",")[0])
+            break
+    fields = {}
+    for field in template.get("fields", []):
+        if field.get("value") is not None:
+            fields[field["label"]] = field["value"]
+        elif generated and field.get("purpose") == "PASSWORD":
+            fields[field["label"]] = ("Aa1!" + "x" * max(length - 4, 0))[:length]
+    item = None
+    for existing in store["items"]:
+        if existing["id"] == item_id:
+            item = existing
+            break
+    if item is None:
+        item = {
+            "id": item_id,
+            "vault": option_value(sys.argv[1:], "--vault", ""),
+            "category": template.get("category", "LOGIN"),
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        store["items"].append(item)
+    if template.get("title"):
+        item["title"] = template["title"]
+    if fields:
+        item["fields"] = fields
+    if template.get("notes"):
+        item["notes"] = template["notes"]
+    save_store(store)
+    print(
+        json.dumps(
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "category": item["category"],
+                "vault": item["vault"],
+                "updated_at": item["updated_at"],
+            }
+        )
+    )
+    raise SystemExit(0)
+
+if sys.argv[1] == "vault":
+    if config.get("vault_behavior", "ok") == "fail":
+        sys.stderr.write(config.get("stderr", "vault unavailable"))
+        raise SystemExit(int(config.get("rc", 4)))
+    if sys.argv[2] == "get":
+        print(json.dumps({"id": "vault-1", "name": sys.argv[3]}))
+        raise SystemExit(0)
+    if sys.argv[2] == "list":
+        print(json.dumps(config.get("vaults", [{"id": "vault-1", "name": "mai-dev"}])))
+        raise SystemExit(0)
 
 sys.stderr.write("usage")
 raise SystemExit(2)
@@ -117,25 +245,52 @@ def _install_fake_op(
     stderr: str = "item not found",
     sleep: str = "30",
     pad: int = 0,
+    items: list[dict[str, object]] | None = None,
+    list_behavior: str = "ok",
+    create_behavior: str = "ok",
+    create_rc: int = 5,
+    create_stderr: str = "conflict",
+    read_value_override: str | None = None,
+    vault_behavior: str = "ok",
+    vaults: list[dict[str, object]] | None = None,
+    store_items: list[dict[str, object]] | None = None,
 ) -> Path:
-    """Write the fake `op` into ``tmp_path/bin``; return that directory."""
+    """Write the fake `op` into ``tmp_path/bin``; return that directory.
+
+    ``items`` seeds the ``op item list`` rows, ``store_items`` pre-seeds
+    the fake's on-disk item store (what ``item create``/``item edit``
+    write and ``read`` reads back), and the ``*_behavior`` knobs stage
+    per-subcommand failures.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    (bin_dir / "op-config.json").write_text(
-        json.dumps(
-            {
-                "behavior": behavior,
-                "version": version,
-                "reference": reference,
-                "value": value,
-                "rc": rc,
-                "stderr": stderr,
-                "sleep": sleep,
-                "pad": pad,
-            }
-        ),
-        encoding="utf-8",
-    )
+    config: dict[str, object] = {
+        "behavior": behavior,
+        "version": version,
+        "reference": reference,
+        "value": value,
+        "rc": rc,
+        "stderr": stderr,
+        "sleep": sleep,
+        "pad": pad,
+        "items": items if items is not None else [],
+        "list_behavior": list_behavior,
+        "create_behavior": create_behavior,
+        "create_rc": create_rc,
+        "create_stderr": create_stderr,
+        "vault_behavior": vault_behavior,
+        "vaults": vaults
+        if vaults is not None
+        else [{"id": "vault-1", "name": "mai-dev"}],
+    }
+    if read_value_override is not None:
+        config["read_value_override"] = read_value_override
+    (bin_dir / "op-config.json").write_text(json.dumps(config), encoding="utf-8")
+    if store_items is not None:
+        (bin_dir / "op-store.json").write_text(
+            json.dumps({"next_id": 100 + len(store_items), "items": store_items}),
+            encoding="utf-8",
+        )
     script = bin_dir / "op"
     script.write_text(FAKE_OP_SCRIPT, encoding="utf-8")
     script.chmod(0o755)
@@ -220,9 +375,7 @@ def test_version_at_floor_is_accepted(
 def test_valid_reference_boundaries_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    long_ref = (
-        "op://" + "v" * 128 + "/" + "i" * 128 + "/" + "f" * 128
-    )
+    long_ref = "op://" + "v" * 128 + "/" + "i" * 128 + "/" + "f" * 128
     bin_dir = _install_fake_op(tmp_path, reference=long_ref)
     provider = _env_lane(monkeypatch, bin_dir)
     assert provider.resolve(long_ref).value == SENTINEL
@@ -388,7 +541,10 @@ def test_op_nonzero_exit_is_classified_value_free(
     )
     # Decoy: a fallback scanner would happily "resolve" from this .env.
     provider = _ref_lane(
-        tmp_path, monkeypatch, bin_dir, extra_env_text=f"MAI_FALLBACK={DECOY_SENTINEL}\n"
+        tmp_path,
+        monkeypatch,
+        bin_dir,
+        extra_env_text=f"MAI_FALLBACK={DECOY_SENTINEL}\n",
     )
     with pytest.raises(OnePasswordError) as raised:
         provider.resolve(REFERENCE)
@@ -535,9 +691,7 @@ def test_unparsable_version_is_classified(
 ) -> None:
     bin_dir = _install_fake_op(tmp_path, version="not-a-version")
     provider = _env_lane(monkeypatch, bin_dir)
-    assert (
-        provider.availability().code is OnePasswordErrorCode.OP_FAILED
-    )
+    assert provider.availability().code is OnePasswordErrorCode.OP_FAILED
 
 
 def test_invalid_token_lane_combinations_rejected() -> None:
@@ -611,6 +765,340 @@ def test_availability_detail_is_value_free(
     status = provider.availability()
     assert status.available
     assert TOKEN_SENTINEL not in status.detail + repr(status)
+
+
+# ---------------------------------------------------------------------------
+# Collection + write surface: list_items / store_secret / probe
+# ---------------------------------------------------------------------------
+
+
+def _listing_items() -> list[dict[str, object]]:
+    """Fixture rows for pagination/ordering proof (deliberately unsorted)."""
+    return [
+        {
+            "id": "it-b",
+            "title": "Bravo",
+            "category": "LOGIN",
+            "vault": "mai-dev",
+            "updated_at": "2026-01-02T00:00:00Z",
+        },
+        {
+            "id": "it-a",
+            "title": "alpha",
+            "category": "PASSWORD",
+            "vault": "mai-dev",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "id": "it-c",
+            "title": "charlie",
+            "category": "LOGIN",
+            "vault": "other-vault",
+            "updated_at": None,
+        },
+        {
+            "id": "it-d",
+            "title": "ALPHA-two",
+            "category": "LOGIN",
+            "vault": "mai-dev",
+            "updated_at": "2026-01-03T00:00:00Z",
+        },
+    ]
+
+
+def test_list_items_paginates_deterministically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path, items=_listing_items())
+    provider = _env_lane(monkeypatch, bin_dir)
+    page = provider.list_items("mai-dev", limit=2, offset=0)
+    assert isinstance(page, OnePasswordItemPage)
+    # Deterministic (title.lower(), id) order across case variants; the
+    # --vault filter bounds the result (it-c lives in other-vault).
+    assert [item.id for item in page.items] == ["it-a", "it-d"]
+    assert page.items[0].title == "alpha"
+    assert page.items[1].title == "ALPHA-two"
+    assert page.items[0].vault == "mai-dev"
+    assert page.items[0].updated_at == "2026-01-01T00:00:00Z"
+    assert (page.limit, page.offset, page.total, page.has_more) == (2, 0, 3, True)
+    second = provider.list_items("mai-dev", limit=2, offset=2)
+    assert [item.id for item in second.items] == ["it-b"]
+    assert (second.total, second.has_more) == (3, False)
+    beyond = provider.list_items("mai-dev", limit=2, offset=3)
+    assert beyond.items == () and (beyond.total, beyond.has_more) == (3, False)
+
+
+def test_list_items_filters_by_query_and_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path, items=_listing_items())
+    provider = _env_lane(monkeypatch, bin_dir)
+    by_title = provider.list_items("mai-dev", query="AlPhA")
+    assert [item.id for item in by_title.items] == ["it-a", "it-d"]
+    assert by_title.total == 2
+    by_id = provider.list_items("mai-dev", query="IT-B")
+    assert [item.id for item in by_id.items] == ["it-b"]
+    categorized = provider.list_items("mai-dev", category="login")
+    assert [item.id for item in categorized.items] == ["it-d", "it-b"]
+    records = [x for x in _invocations(bin_dir) if x["argv"][:2] == ["item", "list"]]
+    assert len(records) == 3
+    assert records[-1]["argv"] == [
+        "item",
+        "list",
+        "--vault",
+        "mai-dev",
+        "--format",
+        "json",
+        "--categories",
+        "login",
+    ]
+
+
+def test_list_items_rejects_invalid_arguments_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path, items=_listing_items())
+    provider = _env_lane(monkeypatch, bin_dir)
+    with pytest.raises(OnePasswordError) as bad_vault:
+        provider.list_items("mai/dev")
+    assert bad_vault.value.code is OnePasswordErrorCode.INVALID_REFERENCE
+    for kwargs in (
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": True},
+        {"offset": -1},
+        {"category": "-v"},
+        {"category": "a/b"},
+    ):
+        with pytest.raises(OnePasswordError) as raised:
+            provider.list_items("mai-dev", **kwargs)  # type: ignore[arg-type]
+        assert raised.value.code is OnePasswordErrorCode.INVALID_CONFIGURATION
+    assert _invocations(bin_dir) == []  # validated before any child ran
+
+
+def test_list_items_overlarge_output_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(
+        tmp_path, list_behavior="overlarge", pad=MAX_LIST_OUTPUT_BYTES
+    )
+    provider = _env_lane(monkeypatch, bin_dir)
+    with pytest.raises(OnePasswordError) as raised:
+        provider.list_items("mai-dev")
+    assert raised.value.code is OnePasswordErrorCode.OUTPUT_TOO_LARGE
+    assert SENTINEL not in str(raised.value)
+
+
+def test_list_items_op_failure_is_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(
+        tmp_path, list_behavior="fail", rc=7, stderr="vault locked"
+    )
+    provider = _env_lane(monkeypatch, bin_dir)
+    with pytest.raises(OnePasswordError) as raised:
+        provider.list_items("mai-dev")
+    assert raised.value.code is OnePasswordErrorCode.OP_FAILED
+    assert "rc=7" in raised.value.detail
+    assert "vault locked" in raised.value.detail
+
+
+def test_store_secret_explicit_value_rides_stdin_never_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path)
+    provider = _env_lane(monkeypatch, bin_dir)
+    receipt = provider.store_secret(
+        "mai-dev", title="deploy-key", field="password", value=SENTINEL
+    )
+    assert isinstance(receipt, StoredSecretReceipt)
+    assert receipt.vault == "mai-dev"
+    assert receipt.title == "deploy-key" and receipt.field == "password"
+    assert receipt.reference == "op://mai-dev/deploy-key/password"
+    assert receipt.item_id  # id from the op item create output
+    assert receipt.value.value == SENTINEL  # read-back material
+    assert receipt.sha256 is None  # L3: no digest oracle for chosen values
+    assert receipt.generated is False
+    records = _invocations(bin_dir)
+    (create,) = [x for x in records if x["argv"][:2] == ["item", "create"]]
+    template = json.loads(str(create["stdin"]))
+    assert template["title"] == "deploy-key"
+    assert template["category"] == "PASSWORD"
+    assert template["fields"][0]["label"] == "password"
+    assert template["fields"][0]["value"] == SENTINEL  # the secret rides stdin
+    # Zero-argv rule: the value NEVER appears in any child argv.
+    for record in records:
+        assert SENTINEL not in json.dumps(record["argv"])
+    # Read-back verification ran through op read on the resolved reference.
+    (read,) = [
+        x for x in records if x["argv"] == ["read", "op://mai-dev/deploy-key/password"]
+    ]
+    assert read["env_token"] == TOKEN_SENTINEL
+
+
+def test_store_secret_generated_uses_flag_and_populates_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path)
+    provider = _env_lane(monkeypatch, bin_dir)
+    receipt = provider.store_secret(
+        "mai-dev", title="gen-key", generate=True, length=32
+    )
+    assert receipt.generated is True
+    assert len(receipt.value.value) == 32
+    assert (
+        receipt.sha256
+        == hashlib.sha256(receipt.value.value.encode("utf-8")).hexdigest()
+    )
+    records = _invocations(bin_dir)
+    (create,) = [x for x in records if x["argv"][:2] == ["item", "create"]]
+    assert "--generate-password=32,letters,digits,symbols" in create["argv"]
+    # Generated material is known only after the read-back: never on argv.
+    assert receipt.value.value not in json.dumps([x["argv"] for x in records])
+
+
+def test_store_secret_updates_existing_item_idempotently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeded = [
+        {
+            "id": "it-042",
+            "title": "deploy-key",
+            "category": "PASSWORD",
+            "vault": "mai-dev",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "fields": {"password": "old-value-not-a-secret"},
+        }
+    ]
+    bin_dir = _install_fake_op(tmp_path, store_items=seeded)
+    provider = _env_lane(monkeypatch, bin_dir)
+    receipt = provider.store_secret("mai-dev", title="deploy-key", value=SENTINEL)
+    assert receipt.item_id == "it-042"  # updated in place, not duplicated
+    records = _invocations(bin_dir)
+    assert [x for x in records if x["argv"][:2] == ["item", "create"]] == []
+    (edit,) = [x for x in records if x["argv"][:2] == ["item", "edit"]]
+    assert edit["argv"][2] == "it-042"
+    assert SENTINEL in str(edit["stdin"])
+    assert SENTINEL not in json.dumps(edit["argv"])
+    assert provider.resolve("op://mai-dev/deploy-key/password").value == SENTINEL
+
+
+def test_store_secret_read_back_mismatch_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(
+        tmp_path, read_value_override="decoy-mismatch-not-stored"
+    )
+    provider = _env_lane(monkeypatch, bin_dir)
+    with pytest.raises(OnePasswordError) as raised:
+        provider.store_secret("mai-dev", title="mismatch-key", value=SENTINEL)
+    assert raised.value.code is OnePasswordErrorCode.OP_FAILED
+    assert "read-back verification mismatch" in raised.value.detail
+    assert SENTINEL not in str(raised.value)
+
+
+def test_store_secret_scrubs_value_and_token_from_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(
+        tmp_path,
+        create_behavior="fail",
+        create_rc=9,
+        create_stderr=f"conflict echo {SENTINEL} {TOKEN_SENTINEL}",
+    )
+    provider = _env_lane(monkeypatch, bin_dir)
+    with pytest.raises(OnePasswordError) as raised:
+        provider.store_secret("mai-dev", title="doomed-key", value=SENTINEL)
+    assert raised.value.code is OnePasswordErrorCode.OP_FAILED
+    assert raised.value.detail.count("<redacted>") >= 2
+    assert SENTINEL not in str(raised.value)
+    assert TOKEN_SENTINEL not in str(raised.value)
+
+
+def test_store_secret_validation_errors_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path)
+    provider = _env_lane(monkeypatch, bin_dir)
+    cases: list[dict[str, object]] = [
+        {"vault": "mai/dev", "title": "t"},
+        {"vault": "mai-dev", "title": "-t"},
+        {"vault": "mai-dev", "title": "t", "field": "a/b"},
+        {"vault": "mai-dev", "title": "t", "category": "bank-card"},
+        {"vault": "mai-dev", "title": "t", "generate": True, "length": 15},
+        {"vault": "mai-dev", "title": "t", "generate": True, "length": 129},
+        {"vault": "mai-dev", "title": "t", "value": ""},
+        {"vault": "mai-dev", "title": "t", "generate": True, "value": SENTINEL},
+    ]
+    for kwargs in cases:
+        with pytest.raises(OnePasswordError) as raised:
+            provider.store_secret(**kwargs)  # type: ignore[arg-type]
+        assert raised.value.code in (
+            OnePasswordErrorCode.INVALID_REFERENCE,
+            OnePasswordErrorCode.INVALID_CONFIGURATION,
+        )
+    assert _invocations(bin_dir) == []  # nothing executed
+
+
+def test_probe_ready_with_and_without_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path)
+    provider = _env_lane(monkeypatch, bin_dir)
+    report = provider.probe("mai-dev")
+    assert isinstance(report, OnePasswordProbeReport)
+    assert report.available and report.code == "ready"
+    assert report.checked_vault == "mai-dev"
+    assert report.detail  # value-free availability detail
+    assert TOKEN_SENTINEL not in report.detail
+    listing = provider.probe()
+    assert listing.available and listing.code == "ready"
+    assert listing.checked_vault is None
+    argvs = [x["argv"] for x in _invocations(bin_dir)]
+    assert ["vault", "get", "mai-dev", "--format", "json"] in argvs
+    assert ["vault", "list", "--format", "json"] in argvs
+
+
+def test_probe_vault_failure_is_scrubbed_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(
+        tmp_path, vault_behavior="fail", rc=6, stderr=f"vault locked {TOKEN_SENTINEL}"
+    )
+    provider = _env_lane(monkeypatch, bin_dir)
+    report = provider.probe("mai-dev")
+    assert not report.available
+    assert report.code == "op_failed"
+    assert report.checked_vault == "mai-dev"
+    assert "<redacted>" in report.detail
+    assert TOKEN_SENTINEL not in report.detail + repr(report)
+
+
+def test_probe_unavailable_provider_reports_without_vault_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_dir = tmp_path / "empty-bin"
+    empty_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_dir))
+    monkeypatch.setenv(ENV_TOKEN_KEY, TOKEN_SENTINEL)
+    provider = OnePasswordResolver()
+    report = provider.probe("mai-dev")
+    assert not report.available
+    assert report.code == "op_not_found"
+    assert report.checked_vault == "mai-dev"
+
+
+def test_probe_invalid_vault_segment_is_structured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _install_fake_op(tmp_path)
+    provider = _env_lane(monkeypatch, bin_dir)
+    report = provider.probe("mai/dev")
+    assert not report.available
+    assert report.code == "invalid_reference"
+    assert report.checked_vault == "mai/dev"
+    # Only the availability probe ran; no vault call was attempted.
+    assert all(x["argv"] == ["--version"] for x in _invocations(bin_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +1187,9 @@ def test_cli_usage_errors_exit_two(
     monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     assert _run_cli("resolve", env=dict(os.environ)).returncode == 2
     assert _run_cli("frobnicate", env=dict(os.environ)).returncode == 2
-    assert _run_cli(
-        "resolve", REFERENCE, "--env-file", "/tmp/x", env=dict(os.environ)
-    ).returncode == 2
+    assert (
+        _run_cli(
+            "resolve", REFERENCE, "--env-file", "/tmp/x", env=dict(os.environ)
+        ).returncode
+        == 2
+    )

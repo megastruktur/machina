@@ -11,12 +11,14 @@ module's own discovery boundary, never as a core import failure).
 
 **Supported interface** (the documented 1Password CLI, never a bundled
 distribution — the same selection rule as the system OpenSSH client):
-``op read op://<vault>/<item>/<field>`` authenticates non-interactively
-through the ``OP_SERVICE_ACCOUNT_TOKEN`` environment variable; service
-accounts require CLI >= 2.18.0 (developer.1password.com, "Use service
-accounts with 1Password CLI"). The ``onepassword-sdk`` distribution is NOT
-selected (11-dependencies freeze): its wheels stop at CPython 3.13 and the
-CLI it wraps is the documented interface anyway.
+``op read op://<vault>/<item>/<field>``, ``op item list``, ``op item
+create``/``op item edit`` and ``op vault get``/``op vault list``
+authenticate non-interactively through the ``OP_SERVICE_ACCOUNT_TOKEN``
+environment variable; service accounts require CLI >= 2.18.0
+(developer.1password.com, "Use service accounts with 1Password CLI"). The
+``onepassword-sdk`` distribution is NOT selected (11-dependencies freeze):
+its wheels stop at CPython 3.13 and the CLI it wraps is the documented
+interface anyway.
 
 **Fail-closed availability.** Construction never probes: a resolver object
 exists on every host. :meth:`OnePasswordResolver.availability` classifies
@@ -40,18 +42,32 @@ argv, never logged (the module performs no logging at all), never persisted
 token before any error detail is built.
 
 **Bounded execution.** Every ``op`` invocation is a fresh ``argv``-list
-subprocess (``shell=False``, ``stdin=DEVNULL`` so the CLI can never prompt
-and hang) with a per-call timeout and output budgets: accepted ``stdout`` is
-capped and over-budget output fails closed (``output_too_large`` — a
-silently truncated credential would be a correctness landmine), ``stderr``
-contributes only a bounded, token-scrubbed head to error details. The child
-environment is scrubbed to exactly ``PATH``, ``HOME`` and (for ``read``) the
-token key — no other ambient variable reaches the CLI. Residual limit,
+subprocess (``shell=False``; ``stdin`` is ``DEVNULL`` except for
+:meth:`OnePasswordResolver.store_secret`, which feeds its JSON item template
+on the stdin pipe
+so secret material never touches ``argv``) with a per-call timeout and
+output budgets: accepted ``stdout`` is capped and over-budget output fails
+closed (``output_too_large`` — a silently truncated credential would be a
+correctness landmine), ``stderr`` contributes only a bounded,
+token-scrubbed head to error details. The child
+environment is scrubbed to exactly ``PATH``, ``HOME`` and (for
+authenticated calls) the token key — no other ambient variable reaches the
+CLI. Residual limit,
 owned honestly: between spawn and the timeout, a hostile ``op`` binary
 could write unbounded bytes to the temp capture files; ``op`` is
 EULA-licensed host software outside the threat model, and the budget
 governs what the resolver *accepts*, which is the fail-closed boundary this
 module owns.
+
+**Write path.** :meth:`OnePasswordResolver.store_secret` is the one
+deliberate write. The plaintext never travels through ``argv``: it is
+embedded in a JSON item template fed to ``op item create``/``op item edit``
+on the stdin pipe, every stderr-derived detail scrubs both the token and
+any caller-supplied value, and a write is verified by reading the stored
+material back through :meth:`OnePasswordResolver.resolve`. A write to an
+existing title updates that item (idempotent), never duplicates it. Only
+generated secrets carry a SHA-256 digest in the receipt (L3: no digest
+oracle for human-chosen material).
 
 ``op://`` references validate against a documented strict subset of the
 upstream grammar — ``op://<vault>/<item>/<field>``, three non-empty
@@ -84,7 +100,6 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
 
 from mai.credentials.env import (
     EnvErrorCode,
@@ -96,6 +111,7 @@ from mai.credentials.env import (
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TOKEN_ENV",
+    "MAX_LIST_OUTPUT_BYTES",
     "MAX_OUTPUT_BYTES",
     "MAX_REFERENCE_CHARS",
     "MAX_STDERR_TAIL_BYTES",
@@ -103,8 +119,12 @@ __all__ = [
     "OP_SERVICE_ACCOUNT_FLOOR",
     "OnePasswordError",
     "OnePasswordErrorCode",
+    "OnePasswordItemPage",
+    "OnePasswordItemSummary",
+    "OnePasswordProbeReport",
     "OnePasswordResolver",
     "ProviderStatus",
+    "StoredSecretReceipt",
     "main",
 ]
 
@@ -127,6 +147,11 @@ MAX_TIMEOUT_SECONDS = 120.0
 #: fails closed (never silently truncated credential material).
 MAX_OUTPUT_BYTES = 256 * 1024
 
+#: Accepted ``stdout`` budget for collection reads (``op item list``): a
+#: page of item summaries is small, but a hostile/huge vault listing fails
+#: closed at 2 MiB instead of growing without bound.
+MAX_LIST_OUTPUT_BYTES = 2 * 1024 * 1024
+
 #: ``stderr`` head kept for error details (token-scrubbed, value-free of
 #: secrets by construction).
 MAX_STDERR_TAIL_BYTES = 2048
@@ -143,6 +168,21 @@ _OP_REFERENCE_RE = re.compile(
     r"/[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
     r"/[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+
+#: Single ``op://``-segment shape (vault, item title, field label): the
+#: same documented strict subset used by :data:`_OP_REFERENCE_RE`, shared
+#: by ``list_items``/``store_secret`` argument validation. Full-match; the
+#: first-character rule again makes option injection unrepresentable.
+_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+#: ``op item list --categories`` value shape. Category names may contain a
+#: space ("API Credential"); the leading-alnum rule still makes option
+#: injection unrepresentable.
+_CATEGORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}")
+
+#: Categories accepted by :meth:`OnePasswordResolver.store_secret`
+#: (uppercase form is what the ``op`` item template grammar expects).
+_STORE_CATEGORIES = ("password", "login", "api_credential")
 
 #: Token-lane shapes. Kept local with the same review note as every other
 #: consumer: the shapes are frozen by ``mai.contracts.server`` (credential
@@ -212,13 +252,149 @@ class ProviderStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class OnePasswordItemSummary:
+    """One vault item as listed by ``op item list`` (metadata only).
+
+    Carries configuration-shaped fields (ids, titles, category names,
+    timestamps) — never secret material: ``op item list`` output has no
+    field values by construction.
+    """
+
+    id: str
+    title: str
+    category: str
+    vault: str
+    updated_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OnePasswordItemPage:
+    """One bounded, pre-sliced page of :class:`OnePasswordItemSummary`.
+
+    ``total`` is the pre-slice matching count and ``has_more`` reports
+    whether another offset exists (repository-wide pagination envelope,
+    AGENTS.md §1).
+    """
+
+    items: tuple[OnePasswordItemSummary, ...]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSecretReceipt:
+    """One verified ``store_secret`` outcome.
+
+    ``value`` is the read-back material behind the usual redacted
+    ``SecretValue`` disclosure. ``sha256`` is the digest of the read-back
+    value and is populated **only** for generated secrets (L3: no digest
+    oracle for human-chosen material).
+    """
+
+    vault: str
+    item_id: str
+    title: str
+    field: str
+    reference: str
+    value: SecretValue
+    sha256: str | None
+    generated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OnePasswordProbeReport:
+    """One value-free readiness classification, optionally vault-scoped.
+
+    ``code`` is ``"ready"`` or a :class:`OnePasswordErrorCode` value;
+    ``detail`` never embeds a token or secret material.
+    """
+
+    available: bool
+    code: str
+    detail: str
+    checked_vault: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _Completed:
     """Bounded capture of one finished child process."""
 
     returncode: int
     stdout: bytes
     stderr: bytes
-    stdout_overlarge: bool
+
+
+def _validated_segment(kind: str, value: object) -> str:
+    """Validate one ``op://``-style segment; fail closed before execution."""
+    if not isinstance(value, str) or _SEGMENT_RE.fullmatch(value) is None:
+        raise OnePasswordError(
+            OnePasswordErrorCode.INVALID_REFERENCE,
+            f"{kind} segment must be a non-empty "
+            "[A-Za-z0-9][A-Za-z0-9._-]{0,127} string (no '/', no control "
+            "characters, no option shapes)",
+        )
+    return value
+
+
+def _parse_json_rows(stdout: bytes, what: str) -> list[dict[str, object]]:
+    """Decode one ``--format json`` listing; fail closed, value-free."""
+    try:
+        parsed = json.loads(stdout.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise OnePasswordError(
+            OnePasswordErrorCode.INVALID_ENCODING,
+            f"op {what} output is not valid UTF-8",
+        ) from None
+    except json.JSONDecodeError:
+        raise OnePasswordError(
+            OnePasswordErrorCode.OP_FAILED,
+            f"op {what} produced unparsable JSON",
+        ) from None
+    if not isinstance(parsed, list):
+        raise OnePasswordError(
+            OnePasswordErrorCode.OP_FAILED,
+            f"op {what} produced an unexpected JSON shape",
+        )
+    return [row for row in parsed if isinstance(row, dict)]
+
+
+def _item_summary(row: dict[str, object]) -> OnePasswordItemSummary:
+    """One ``op item list`` row → metadata summary (vault name or id)."""
+    vault_field = row.get("vault")
+    if isinstance(vault_field, dict):
+        vault = str(vault_field.get("name") or vault_field.get("id") or "")
+    elif isinstance(vault_field, str):
+        vault = vault_field
+    else:
+        vault = ""
+    updated_at = row.get("updated_at")
+    return OnePasswordItemSummary(
+        id=str(row.get("id") or ""),
+        title=str(row.get("title") or ""),
+        category=str(row.get("category") or ""),
+        vault=vault,
+        updated_at=updated_at if isinstance(updated_at, str) else None,
+    )
+
+
+def _extract_item_id(stdout: bytes, verb: str) -> str:
+    """Pull the created/updated item id from ``--format json`` output."""
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except UnicodeDecodeError, json.JSONDecodeError:
+        raise OnePasswordError(
+            OnePasswordErrorCode.OP_FAILED,
+            f"op item {verb} produced unparsable JSON",
+        ) from None
+    item_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(item_id, str) or not item_id:
+        raise OnePasswordError(
+            OnePasswordErrorCode.OP_FAILED,
+            f"op item {verb} produced no item id",
+        )
+    return item_id
 
 
 class OnePasswordResolver:
@@ -343,7 +519,9 @@ class OnePasswordResolver:
                 f"op --version exited with rc={probe.returncode}; stderr: "
                 f"{self._scrub(probe.stderr)}",
             )
-        match = re.match(r"(\d+)\.(\d+)\.(\d+)", probe.stdout.decode("utf-8", "replace"))
+        match = re.match(
+            r"(\d+)\.(\d+)\.(\d+)", probe.stdout.decode("utf-8", "replace")
+        )
         if match is None:
             return ProviderStatus(
                 OnePasswordErrorCode.OP_FAILED,
@@ -366,9 +544,7 @@ class OnePasswordResolver:
             # The .env source itself is hostile (permissions, encoding…):
             # that is the first resolver's structured condition, propagate.
             if error.code in (EnvErrorCode.MISSING_KEY, EnvErrorCode.EMPTY_VALUE):
-                return ProviderStatus(
-                    OnePasswordErrorCode.TOKEN_MISSING, error.detail
-                )
+                return ProviderStatus(OnePasswordErrorCode.TOKEN_MISSING, error.detail)
             raise
         return ProviderStatus(
             OnePasswordErrorCode.AVAILABLE,
@@ -412,17 +588,10 @@ class OnePasswordResolver:
                 f"op read exited with rc={completed.returncode}; stderr: "
                 f"{self._scrub(completed.stderr)}",
             )
-        if completed.stdout_overlarge:
-            raise OnePasswordError(
-                OnePasswordErrorCode.OUTPUT_TOO_LARGE,
-                f"op read output exceeds the {MAX_OUTPUT_BYTES}-byte "
-                "credential budget; refusing over-sized material "
-                "(fail-closed, never truncated)",
-            )
         if not completed.stdout:
             raise OnePasswordError(
                 OnePasswordErrorCode.OP_FAILED,
-                f"op read produced no output for the resolved reference; "
+                "op read produced no output for the resolved reference; "
                 "an empty credential is a configuration error (fail-closed)",
             )
         try:
@@ -434,9 +603,287 @@ class OnePasswordResolver:
             ) from None
         return SecretValue(value)
 
+    def list_items(
+        self,
+        vault: str,
+        *,
+        query: str | None = None,
+        category: str | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> OnePasswordItemPage:
+        """List vault item metadata through ``op item list``, paginated.
+
+        One bounded CLI call (2 MiB budget, fail-closed), deterministic
+        ordering ``(title.lower(), id)``, case-insensitive substring
+        ``query`` on title/id, and the repository-wide page envelope
+        (``items``/``limit``/``offset``/``total``/``has_more``; AGENTS.md
+        §1). The output carries metadata only — ``op item list`` has no
+        field values by construction.
+        """
+        _validated_segment("vault", vault)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_CONFIGURATION,
+                "limit must be an integer within [1, 100]",
+            )
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_CONFIGURATION,
+                "offset must be an integer >= 0",
+            )
+        argv = ["item", "list", "--vault", vault, "--format", "json"]
+        if category:
+            if not isinstance(category, str) or not _CATEGORY_RE.fullmatch(category):
+                raise OnePasswordError(
+                    OnePasswordErrorCode.INVALID_CONFIGURATION,
+                    "category must match [A-Za-z0-9][A-Za-z0-9 ._-]{0,63} "
+                    "(documented strict subset; no option shapes)",
+                )
+            argv += ["--categories", category]
+        binary, token = self._execution_lane()
+        completed = self._invoke(
+            binary, argv, token=token, max_output_bytes=MAX_LIST_OUTPUT_BYTES
+        )
+        if completed.returncode != 0:
+            raise OnePasswordError(
+                OnePasswordErrorCode.OP_FAILED,
+                f"op item list exited with rc={completed.returncode}; "
+                f"stderr: {self._scrub(completed.stderr)}",
+            )
+        items = [
+            _item_summary(row)
+            for row in _parse_json_rows(completed.stdout, "item list")
+        ]
+        if query:
+            needle = query.lower()
+            items = [
+                item
+                for item in items
+                if needle in item.title.lower() or needle in item.id.lower()
+            ]
+        items.sort(key=lambda item: (item.title.lower(), item.id))
+        total = len(items)
+        return OnePasswordItemPage(
+            items=tuple(items[offset : offset + limit]),
+            limit=limit,
+            offset=offset,
+            total=total,
+            has_more=offset + limit < total,
+        )
+
+    def store_secret(
+        self,
+        vault: str,
+        *,
+        title: str,
+        field: str = "password",
+        value: str | None = None,
+        generate: bool = False,
+        length: int = 32,
+        category: str = "password",
+        username: str | None = None,
+        url: str | None = None,
+        notes: str | None = None,
+    ) -> StoredSecretReceipt:
+        """Create or update one vault item; verify by reading it back.
+
+        The plaintext never touches ``argv``: it (or the
+        ``--generate-password`` mandate) rides in a JSON item template on
+        the child's stdin pipe. An existing item with the same title is
+        updated via ``op item edit`` (idempotent), never duplicated. The
+        write is verified by resolving ``op://<vault>/<title>/<field>``;
+        for caller-chosen values a read-back mismatch fails closed. Only
+        generated secrets return a SHA-256 digest (L3: no digest oracle
+        for human-chosen material).
+        """
+        _validated_segment("vault", vault)
+        _validated_segment("title", title)
+        _validated_segment("field", field)
+        if category not in _STORE_CATEGORIES:
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_CONFIGURATION,
+                "category must be one of " + ", ".join(_STORE_CATEGORIES),
+            )
+        if (
+            isinstance(length, bool)
+            or not isinstance(length, int)
+            or not 16 <= length <= 128
+        ):
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_CONFIGURATION,
+                "length must be an integer within [16, 128]",
+            )
+        if value is not None and not isinstance(value, str):
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_CONFIGURATION,
+                "value must be a string",
+            )
+        if not generate and not value:
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_REFERENCE,
+                "store_secret requires either generate=True or a non-empty value",
+            )
+        if generate and value is not None:
+            raise OnePasswordError(
+                OnePasswordErrorCode.INVALID_REFERENCE,
+                "store_secret cannot combine generate=True with an explicit value",
+            )
+        fields: list[dict[str, str]] = []
+        if value is not None:
+            fields.append(
+                {
+                    "id": field,
+                    "label": field,
+                    "type": "CONCEALED",
+                    "purpose": "PASSWORD",
+                    "value": value,
+                }
+            )
+        elif generate:
+            # ``--generate-password`` fills the designated password field;
+            # the template declares it without a value.
+            fields.append(
+                {
+                    "id": field,
+                    "label": field,
+                    "type": "CONCEALED",
+                    "purpose": "PASSWORD",
+                }
+            )
+        if username is not None:
+            fields.append(
+                {
+                    "id": "username",
+                    "label": "username",
+                    "type": "STRING",
+                    "purpose": "USERNAME",
+                    "value": username,
+                }
+            )
+        template: dict[str, object] = {
+            "title": title,
+            "category": category.upper(),
+            "fields": fields,
+        }
+        if notes is not None:
+            template["notes"] = notes
+        if url is not None:
+            template["urls"] = [{"href": url}]
+        payload = json.dumps(template).encode("utf-8")
+        # The stored value is scrubbed from every stderr-derived detail.
+        extra_scrub: tuple[str, ...] = (value,) if value else ()
+        binary, token = self._execution_lane()
+        existing = self.list_items(vault, query=title, limit=100)
+        match = next((item for item in existing.items if item.title == title), None)
+        if match is not None:
+            verb = "edit"
+            argv = [
+                "item",
+                "edit",
+                match.id,
+                "--vault",
+                vault,
+                "--format",
+                "json",
+                "-",
+            ]
+        else:
+            verb = "create"
+            argv = ["item", "create", "--vault", vault, "--format", "json", "-"]
+        if generate:
+            argv.append(f"--generate-password={length},letters,digits,symbols")
+        completed = self._invoke(
+            binary, argv, token=token, stdin_bytes=payload, extra_scrub=extra_scrub
+        )
+        if completed.returncode != 0:
+            raise OnePasswordError(
+                OnePasswordErrorCode.OP_FAILED,
+                f"op item {verb} exited with rc={completed.returncode}; "
+                f"stderr: {self._scrub(completed.stderr, extra_scrub)}",
+            )
+        item_id = _extract_item_id(completed.stdout, verb)
+        reference = f"op://{vault}/{title}/{field}"
+        resolved = self.resolve(reference)
+        if not generate and resolved.value != value:
+            raise OnePasswordError(
+                OnePasswordErrorCode.OP_FAILED,
+                "stored secret read-back verification mismatch",
+            )
+        return StoredSecretReceipt(
+            vault=vault,
+            item_id=item_id,
+            title=title,
+            field=field,
+            reference=reference,
+            value=resolved,
+            sha256=(
+                hashlib.sha256(resolved.value.encode("utf-8")).hexdigest()
+                if generate
+                else None
+            ),
+            generated=generate,
+        )
+
+    def probe(self, vault: str | None = None) -> OnePasswordProbeReport:
+        """Classify provider readiness, optionally one vault, non-destructively.
+
+        Value-free outcome either way: ``available=True`` with code
+        ``"ready"``, or ``available=False`` with a structured code
+        (``op_not_found``, unsupported version, missing token,
+        ``invalid_reference`` for a malformed vault segment,
+        ``op_failed`` for an unknown vault, ``output_too_large`` for an
+        over-budget vault listing). Classification shapes never raise;
+        a hostile ``.env`` token source still propagates its own
+        ``EnvFileError`` (same contract as :meth:`availability`).
+        """
+        avail = self.availability()
+        if not avail.available or avail.binary is None:
+            return OnePasswordProbeReport(
+                available=False,
+                code=avail.code.value,
+                detail=avail.detail,
+                checked_vault=vault,
+            )
+        try:
+            if vault is not None:
+                _validated_segment("vault", vault)
+                argv = ["vault", "get", vault, "--format", "json"]
+            else:
+                argv = ["vault", "list", "--format", "json"]
+            token = self._service_account_token()
+            completed = self._invoke(avail.binary, argv, token=token)
+            if completed.returncode != 0:
+                raise OnePasswordError(
+                    OnePasswordErrorCode.OP_FAILED,
+                    f"op {argv[1]} exited with rc={completed.returncode}; "
+                    f"stderr: {self._scrub(completed.stderr)}",
+                )
+        except OnePasswordError as error:
+            return OnePasswordProbeReport(
+                available=False,
+                code=error.code.value,
+                detail=error.detail,
+                checked_vault=vault,
+            )
+        return OnePasswordProbeReport(
+            available=True, code="ready", detail=avail.detail, checked_vault=vault
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _execution_lane(self) -> tuple[str, SecretValue]:
+        """Binary path + token for an authenticated call, fail-closed."""
+        status = self.availability()
+        if not status.available or status.binary is None:
+            raise OnePasswordError(status.code, status.detail)
+        return status.binary, self._service_account_token()
 
     def _service_account_token(self) -> SecretValue:
         """Fetch the token through the configured lane (names only above)."""
@@ -472,24 +919,52 @@ class OnePasswordResolver:
         return env
 
     def _invoke(
-        self, binary: str, argv: list[str], *, token: SecretValue | None
+        self,
+        binary: str,
+        argv: list[str],
+        *,
+        token: SecretValue | None,
+        stdin_bytes: bytes | None = None,
+        max_output_bytes: int = MAX_OUTPUT_BYTES,
+        extra_scrub: Sequence[str] = (),
     ) -> _Completed:
-        """One bounded, scrubbed child execution; value-free failures."""
+        """One bounded, scrubbed child execution; value-free failures.
+
+        ``stdin_bytes`` feeds a child stdin pipe (``subprocess.run``
+        wraps ``stdin=PIPE`` + ``communicate(input=...)``); the default
+        stays ``DEVNULL`` so plain reads can never be prompted into
+        hanging. ``max_output_bytes`` is enforced here: over-budget
+        ``stdout`` raises ``output_too_large`` (fail-closed, never
+        truncated). ``extra_scrub`` strings (e.g. a stored value) are
+        scrubbed from stderr-derived details by the callers that own
+        them, alongside the token.
+        """
         env = self._child_env(token)
         # Temp capture files keep memory flat and avoid pipe deadlocks;
         # read-back enforces the accept budgets (module docstring owns the
         # residual pre-timeout disk-write limit).
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             try:
-                completed = subprocess.run(
-                    [binary, *argv],
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    env=env,
-                    timeout=self._timeout,
-                    check=False,
-                )
+                if stdin_bytes is None:
+                    completed = subprocess.run(
+                        [binary, *argv],
+                        stdin=subprocess.DEVNULL,
+                        stdout=out,
+                        stderr=err,
+                        env=env,
+                        timeout=self._timeout,
+                        check=False,
+                    )
+                else:
+                    completed = subprocess.run(
+                        [binary, *argv],
+                        input=stdin_bytes,
+                        stdout=out,
+                        stderr=err,
+                        env=env,
+                        timeout=self._timeout,
+                        check=False,
+                    )
             except subprocess.TimeoutExpired:
                 raise OnePasswordError(
                     OnePasswordErrorCode.OP_TIMEOUT,
@@ -502,18 +977,28 @@ class OnePasswordResolver:
                     f"op could not be executed: {error.strerror}",
                 ) from None
             out.seek(0)
-            stdout = out.read(MAX_OUTPUT_BYTES + 1)
+            stdout = out.read(max_output_bytes + 1)
             err.seek(0)
             stderr = err.read(MAX_STDERR_TAIL_BYTES + 1)
+        if len(stdout) > max_output_bytes:
+            raise OnePasswordError(
+                OnePasswordErrorCode.OUTPUT_TOO_LARGE,
+                f"op {argv[0]} output exceeds the {max_output_bytes}-byte "
+                "budget; refusing over-sized output (fail-closed, never "
+                "truncated)",
+            )
         return _Completed(
             returncode=completed.returncode,
-            stdout=stdout[:MAX_OUTPUT_BYTES],
+            stdout=stdout,
             stderr=stderr[:MAX_STDERR_TAIL_BYTES],
-            stdout_overlarge=len(stdout) > MAX_OUTPUT_BYTES,
         )
 
-    def _scrub(self, stderr: bytes) -> str:
-        """Bounded stderr head with the token replaced, never emitted."""
+    def _scrub(self, stderr: bytes, extra_scrub: Sequence[str] = ()) -> str:
+        """Bounded stderr head with the token replaced, never emitted.
+
+        ``extra_scrub`` strings (e.g. a caller-supplied secret value) are
+        replaced after the token; empty needles are skipped.
+        """
         try:
             text = stderr.decode("utf-8", "replace")
         except Exception:  # noqa: BLE001 - decode with replace cannot raise
@@ -521,14 +1006,17 @@ class OnePasswordResolver:
         if self._credential_ref is not None and self._resolver is not None:
             try:
                 token = self._resolver.resolve(self._credential_ref).value
-            except (EnvFileError, OnePasswordError):
+            except EnvFileError, OnePasswordError:
                 return text
             if token:
                 text = text.replace(token, "<redacted>")
-            return text
-        value = os.environ.get(self._token_env or "", "")
-        if value:
-            text = text.replace(value, "<redacted>")
+        else:
+            value = os.environ.get(self._token_env or "", "")
+            if value:
+                text = text.replace(value, "<redacted>")
+        for needle in extra_scrub:
+            if needle:
+                text = text.replace(needle, "<redacted>")
         return text
 
 

@@ -29,9 +29,26 @@ FROM python:3.14-slim
 # (mai.execution.ssh ssh_arguments / commands.execute_command) — the slim
 # base ships no ssh binary, and Popen raises OSError → 503 "transport
 # unavailable" without it. Found in M-3 smoke.
+# 1password-cli: the optional op:// credential provider
+# (mai.credentials.onepassword) execs the real op(1) the same way. Installed
+# from the official 1Password apt repository
+# (developer.1password.com/docs/cli/get-started, "APT" lane): the archive
+# key is dearmored into a signed-by keyring, the repo is bound to dpkg's
+# architecture and the `stable` suite, and apt verifies the repo metadata
+# against that keyring. The op >= 2.18.0 service-account floor is enforced
+# at runtime by OP_SERVICE_ACCOUNT_FLOOR, so no apt-level pin is needed.
+# curl+gnupg are fetch/verify tooling and stay installed (same posture as
+# openssh-client).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-client \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg openssh-client \
+ && curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+    | gpg --dearmor -o /usr/share/keyrings/1password-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
+    > /etc/apt/sources.list.d/1password.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends 1password-cli \
  && rm -rf /var/lib/apt/lists/* \
+ && op --version \
  && groupadd --system --gid 10001 mai \
  && useradd --system --uid 10001 --gid mai --home-dir /var/lib/mai --no-create-home mai \
  && mkdir -p /var/lib/mai \
