@@ -444,6 +444,8 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/chat/runs/{run_id}"),
         ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
         ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        # (mai-wire-desktop/chat: the lazy-loaded single tool step read.)
+        ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
         # (06-model-api: stored connections/profiles/selection + probe.)
         ("GET", "/api/v1/models/connections"),
         ("GET", "/api/v1/models/connections/{name}"),
