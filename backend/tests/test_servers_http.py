@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,9 +96,43 @@ def _alembic_config() -> AlembicConfig:
 # ---------------------------------------------------------------------------
 
 
+def _reset_fixture_db(url: str) -> None:
+    """Reset the disposable fixture database to pre-bootstrap state.
+
+    The list is explicit and dependency-safe: every application table
+    created by the migration chain (``0001``..``0007``) plus the
+    ``server_observations_seq`` sequence, which ``0007`` owns and does
+    not drop with its table. The same pattern is used by
+    ``tests/test_jobs_http.py`` and ``tests/test_schedules_http.py``.
+    No wildcard, no ``CASCADE``, no constraint-disabling and no product
+    migration is involved.
+    """
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
+            "job_schedules, job_events, job_steps, job_runs, approvals, "
+            "profile_projection_journal, profile_projection, admin_sessions, "
+            "admin_credential, alembic_version, notification_alerts, "
+            "observation_findings, server_observations, knowledge_doc_chunks, "
+            "knowledge_documents, application_projection_journal, "
+            "application_projection"
+        )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        conn.commit()
+
+
 @pytest.fixture(scope="session")
-def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0002``."""
+def migrated_url() -> Iterator[str]:
+    """Disposable fixture database migrated from zero through ``head`` (0007).
+
+    The reset must be complete: an earlier module in the same pytest
+    process may have migrated the shared disposable database all the way
+    to ``0007``, so dropping only the profile-era tables would leave the
+    later-schema tables behind and make ``upgrade head`` fail with
+    ``DuplicateTable`` (observed on ``job_runs``). The session teardown
+    resets the same database back to pre-bootstrap state so a repeated
+    run against the very same disposable database starts clean again.
+    """
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -108,20 +142,15 @@ def migrated_url() -> str:
     previous = os.environ.get("MAI_DATABASE_URL")
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
-        with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS approvals, admin_sessions, "
-                "admin_credential, profile_projection_journal, "
-                "profile_projection, alembic_version"
-            )
-            conn.commit()
+        _reset_fixture_db(url)
         command.upgrade(_alembic_config(), "head")
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)
         else:
             os.environ["MAI_DATABASE_URL"] = previous
-    return url
+    yield url
+    _reset_fixture_db(url)
 
 
 def _truncate(url: str) -> None:
