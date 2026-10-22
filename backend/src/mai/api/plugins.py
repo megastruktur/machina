@@ -20,7 +20,11 @@ Routes (C01 prefix/envelope; C02 rule-4 revision triple; C08 boundary):
   (metadata-only names; no plugin code runs on a read), *configured*
   plugins from the canonical store (connection state, kind, credential
   reference names) and their **server grant bindings listed separately**
-  (AC2: availability is never conflated with a grant).
+  (AC2: availability is never conflated with a grant). ``configured`` is
+  one bounded page (``limit``/``offset``/``total``); ``installed_plugins``
+  adds the rich per-plugin view (presentation metadata, owned
+  capabilities, required-vs-configured credential badge, declared config
+  schema) over the loaded native set, built-ins included.
 - ``GET  /api/v1/plugins/{plugin}/config`` — the stored connection
   document (parsed, revision triple). Credential references travel as
   *names* only; no resolution is attempted and no resolved material can
@@ -53,6 +57,13 @@ Routes (C01 prefix/envelope; C02 rule-4 revision triple; C08 boundary):
   return the value-free report. Grants are read from the stored bindings —
   discovery never grants (C03 rule 7); the report separates registered
   from merely offered tools.
+- ``POST /api/v1/plugins/{plugin}/probe`` — one bounded, value-free
+  provider readiness classification (mutation boundary: session → origin
+  → CSRF, the provider check runs real subprocess work). The built-in
+  vault plugin is probed through the reviewed resolver lane; the checked
+  vault is the explicit body value, else the stored ``default_vault``;
+  installed plugins without a probe report a structured ``unsupported``
+  classification.
 - ``GET  /api/v1/skills`` — loaded-adjacent inspection of the portable
   skill packages below the data root (``09-skills`` format): summaries
   plus value-free per-package rejections (a corrupt package never hides
@@ -80,7 +91,10 @@ resource (this card does not hand-edit generated client types).
 
 from __future__ import annotations
 
+import asyncio
+import sys
 import uuid
+from collections.abc import Mapping
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Annotated, Any, Final
@@ -111,9 +125,12 @@ from mai.api.auth import (
 from mai.credentials.env import (
     DATA_ROOT_CREDENTIALS_FILENAME,
     EnvFileError,
+    EnvResolver,
     build_runtime_env_resolver,
     upsert_env_credentials,
 )
+from mai.credentials.onepassword import OnePasswordResolver
+from mai.plugins.builtin_onepassword import CREDENTIAL_REFERENCES, PLUGIN_NAME
 from mai.plugins.config import (
     SCHEMA_VERSION as PLUGIN_SCHEMA_VERSION,
 )
@@ -135,6 +152,7 @@ from mai.plugins.mcp import (
 from mai.plugins.native import (
     CREDENTIAL_REFERENCE_RE,
     ENTRY_POINT_GROUP,
+    NativePlugin,
     NativePluginRuntime,
 )
 from mai.plugins.registry import CapabilityRegistry
@@ -200,6 +218,7 @@ class ConfiguredPluginView(BaseModel):
     enabled: bool
     kind: str
     credential_refs: list[str]
+    configured_credentials: list[str] = Field(default_factory=list)
     config: dict[str, object]
     revision: int
     schema_revision: int
@@ -208,10 +227,43 @@ class ConfiguredPluginView(BaseModel):
 
 
 class PluginCatalogView(BaseModel):
-    """Availability and grants as deliberately separate sections (AC2)."""
+    """Availability and grants as deliberately separate sections (AC2).
+
+    ``configured`` is one bounded page over every configured plugin
+    (``total`` is the pre-slice count; ``limit``/``offset`` echo the
+    request). ``installed`` stays metadata-only names; ``installed_plugins``
+    is the rich per-plugin view for the plugins window (presentation
+    metadata, owned capabilities, required vs configured credential
+    references, declared config schema).
+    """
 
     installed: list[str]
     configured: list[ConfiguredPluginView]
+    installed_plugins: list[InstalledPluginView] = Field(default_factory=list)
+    limit: int
+    offset: int
+    total: int
+
+
+class InstalledPluginView(BaseModel):
+    """One installed native plugin's rich catalog view (plugins window).
+
+    ``capabilities`` are the declared capability identifiers in
+    declaration order (a plugin may own several); ``required_credentials``
+    are the declared reference *names*; ``configured_credentials`` is the
+    sorted subset of those names present in the active runtime
+    ``EnvResolver.configured_keys()`` — a status badge, never a value
+    (C03 rule 6). ``config_schema`` is the shared declared configuration
+    schema (every descriptor of the plugin declares the same object).
+    """
+
+    plugin: str
+    title: str
+    description: str
+    capabilities: list[str]
+    required_credentials: list[str]
+    configured_credentials: list[str] = Field(default_factory=list)
+    config_schema: dict[str, Any] | None = None
 
 
 class PluginConfigView(BaseModel):
@@ -220,6 +272,7 @@ class PluginConfigView(BaseModel):
     plugin: str
     enabled: bool
     credential_refs: list[str]
+    configured_credentials: list[str] = Field(default_factory=list)
     config: dict[str, object]
     revision: int
     schema_revision: int
@@ -265,6 +318,39 @@ class PluginConfigEditBody(BaseModel):
         ),
     )
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+class PluginProbeBody(BaseModel):
+    """Optional readiness-probe input: one explicit vault name.
+
+    Omitted, the probe falls back to the stored config's
+    ``default_vault`` (and then to the provider's unscoped listing).
+    """
+
+    vault: str | None = Field(
+        default=None,
+        description=(
+            "Target provider vault name or ID to check; omitted means the "
+            "plugin's stored default_vault (or the unscoped provider check)."
+        ),
+    )
+
+
+class PluginProbeView(BaseModel):
+    """One value-free provider readiness classification (the probe result).
+
+    ``code`` is the provider's stable vocabulary (``ready``, or a
+    structured failure code); ``detail`` names references and
+    classifications, never credential material. ``checked_vault`` echoes
+    the vault the probe actually checked (explicit, stored default or
+    ``null`` for the unscoped check).
+    """
+
+    plugin: str
+    available: bool
+    code: str
+    detail: str
+    checked_vault: str | None = None
 
 
 class PluginBindingEditBody(BaseModel):
@@ -507,6 +593,74 @@ def _installed_plugin_names() -> tuple[str, ...]:
     return tuple(sorted({ep.name for ep in found if isinstance(ep.name, str)}))
 
 
+def _build_runtime_resolver(
+    request: Request, store: PluginConfigStore
+) -> EnvResolver | None:
+    """The active runtime credential source (data-root store over env file).
+
+    Fresh per call, so just-upserted credential values are visible to the
+    same request that upserted them.
+    """
+    env_map = getattr(request.app.state, "env", None) or {}
+    return build_runtime_env_resolver(
+        env_map.get("MAI_ENV_FILE"), store.root
+    )
+
+
+def _runtime_env_keys(
+    request: Request, store: PluginConfigStore
+) -> frozenset[str]:
+    """The active runtime's configured credential reference names.
+
+    The runtime resolver layers ``<data_root>/credentials.env`` over the
+    configured ``MAI_ENV_FILE``; without any configured source the key
+    set is empty. Names only — never values (C03 rule 6).
+    """
+    resolver = _build_runtime_resolver(request, store)
+    if resolver is None:
+        return frozenset()
+    return resolver.configured_keys()
+
+
+def _plugin_metadata_map(
+    plugins: tuple[NativePlugin, ...],
+) -> dict[str, dict[str, str]]:
+    """``PLUGIN_METADATA`` per loaded plugin, when its module exports it.
+
+    The presentation metadata (title/description) is a module-level
+    constant of trusted installed code (C03 rule 7 — the same trust the
+    worker's discovery applies; discovery has already imported these
+    modules in this process). A plugin without the export falls back to
+    the plugin name as title and an empty description.
+    """
+    metadata: dict[str, dict[str, str]] = {}
+    for loaded in plugins:
+        module = sys.modules.get(loaded.handler.__module__)
+        declared = getattr(module, "PLUGIN_METADATA", None)
+        metadata[loaded.plugin] = (
+            {str(key): str(value) for key, value in declared.items()}
+            if isinstance(declared, dict)
+            else {}
+        )
+    return metadata
+
+
+def _shared_config_schema(
+    loaded: NativePlugin, descriptors: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The plugin's shared declared config schema (its primary declaration).
+
+    Every descriptor of one plugin declares the same schema object (C3);
+    the primary (first declared) descriptor's schema is the shared one.
+    """
+    for name in loaded.descriptor_names:
+        descriptor = descriptors.get(name)
+        schema = getattr(descriptor, "config_schema", None)
+        if schema is not None:
+            return dict(schema)
+    return None
+
+
 def _declared_config_schema(
     plugin: str, document_config: dict[str, Any] | None
 ) -> PluginSchemaView:
@@ -514,10 +668,16 @@ def _declared_config_schema(
 
     - a config carrying ``transport`` is an MCP server connection: the
       frozen ``SERVER_CONFIG_SCHEMA`` applies;
-    - otherwise an installed native entry point's descriptor declares the
+    - otherwise an installed native entry point's descriptors declare the
       schema — resolved through a fresh fail-closed native discovery over
       a throwaway registry (trusted installed code, C03 rule 7; per-plugin
-      rejections are reported value-free, never hidden);
+      rejections are reported value-free, never hidden). Built-in plugins
+      are included: their entry points live on this very distribution, so
+      schema-strict validation must cover them exactly like the worker's
+      restart composition does;
+    - a plugin owning several capabilities declares one shared schema
+      across all of its descriptors (C3) — the primary descriptor's
+      declaration is it;
     - an uninstalled plugin declares nothing: ``None`` — the write path
       then rejects any non-empty config instead of storing unvalidated
       values.
@@ -535,7 +695,9 @@ def _declared_config_schema(
             config_schema=None,
         )
     registry = CapabilityRegistry()
-    runtime = NativePluginRuntime(registry=registry, disabled=())
+    runtime = NativePluginRuntime(
+        registry=registry, disabled=(), include_builtins=True
+    )
     runtime.discover()
     rejection = next(
         (
@@ -552,27 +714,25 @@ def _declared_config_schema(
             config_schema=None,
             load_rejection=rejection,
         )
-    descriptor_name = next(
-        (
-            loaded.descriptor_name
-            for loaded in runtime.plugins
-            if loaded.plugin == plugin
-        ),
+    loaded = next(
+        (entry for entry in runtime.plugins if entry.plugin == plugin),
         None,
     )
-    descriptor = next(
-        (
-            candidate
-            for candidate in registry.list_capabilities()
-            if candidate.identifier == descriptor_name
-        ),
-        None,
+    schema = (
+        None
+        if loaded is None
+        else _shared_config_schema(
+            loaded,
+            {
+                candidate.identifier: candidate
+                for candidate in registry.list_capabilities()
+            },
+        )
     )
-    schema = None if descriptor is None else descriptor.config_schema
     return PluginSchemaView(
         plugin=plugin,
         kind=_NATIVE_KIND,
-        config_schema=None if schema is None else dict(schema),
+        config_schema=schema,
     )
 
 
@@ -654,18 +814,28 @@ _UNAVAILABLE_503: Final[dict[str, object]] = {
         HTTP_503_SERVICE_UNAVAILABLE: _UNAVAILABLE_503,  # type: ignore[arg-type]
     },
 )
-async def list_plugins(request: Request) -> Response:
+async def list_plugins(
+    request: Request,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Response:
     """Availability (installed/configured/enabled) and grants, separately.
 
     Safe method: session layer only. Installed names come from
-    distribution metadata (no plugin code runs); configured documents and
-    bindings come from the canonical store. A configured plugin whose
-    binding names a capability nothing registers is reported through the
-    store's own views by the worker; this catalog never unions the two.
+    distribution metadata (no plugin code runs for ``installed``);
+    configured documents and bindings come from the canonical store,
+    served as one deterministic bounded page (``total`` is the pre-slice
+    count). ``installed_plugins`` enriches the loaded native set (built-ins
+    included, the worker's own composition trust) with presentation
+    metadata, owned capabilities and the required-vs-configured credential
+    badge — names only, never values (C03 rule 6). A configured plugin
+    whose binding names a capability nothing registers is reported through
+    the store's own views by the worker; this catalog never unions the two.
     """
     await _require_session(request)
     store = _plugin_store(request)
     installed = list(_installed_plugin_names())
+    env_keys = _runtime_env_keys(request, store)
     configured: list[ConfiguredPluginView] = []
     for plugin in store.list_plugins():
         try:
@@ -696,6 +866,9 @@ async def list_plugins(request: Request) -> Response:
                 enabled=document.enabled,
                 kind=kind,
                 credential_refs=list(document.credential_refs),
+                configured_credentials=sorted(
+                    set(document.credential_refs) & env_keys
+                ),
                 config=dict(document.config),
                 revision=stored.revision,
                 schema_revision=stored.schema_revision,
@@ -703,7 +876,40 @@ async def list_plugins(request: Request) -> Response:
                 bindings=bindings,
             )
         )
-    return PluginCatalogView(installed=installed, configured=configured)
+    total = len(configured)
+    page = configured[offset : offset + limit]
+    registry = CapabilityRegistry()
+    runtime = NativePluginRuntime(
+        registry=registry, disabled=(), include_builtins=True
+    )
+    runtime.discover()
+    descriptors = {
+        candidate.identifier: candidate
+        for candidate in registry.list_capabilities()
+    }
+    metadata = _plugin_metadata_map(runtime.plugins)
+    installed_plugins = [
+        InstalledPluginView(
+            plugin=loaded.plugin,
+            title=metadata.get(loaded.plugin, {}).get("title") or loaded.plugin,
+            description=metadata.get(loaded.plugin, {}).get("description", ""),
+            capabilities=list(loaded.descriptor_names),
+            required_credentials=list(loaded.credential_references),
+            configured_credentials=sorted(
+                set(loaded.credential_references) & env_keys
+            ),
+            config_schema=_shared_config_schema(loaded, descriptors),
+        )
+        for loaded in runtime.plugins
+    ]
+    return PluginCatalogView(
+        installed=installed,
+        configured=page,
+        installed_plugins=installed_plugins,
+        limit=limit,
+        offset=offset,
+        total=total,
+    )
 
 
 @router.get(
@@ -736,6 +942,9 @@ async def read_config(request: Request, plugin: PluginName) -> Response:
         plugin=document.plugin,
         enabled=document.enabled,
         credential_refs=list(document.credential_refs),
+        configured_credentials=sorted(
+            set(document.credential_refs) & _runtime_env_keys(request, store)
+        ),
         config=dict(document.config),
         revision=stored.revision,
         schema_revision=stored.schema_revision,
@@ -770,8 +979,16 @@ async def edit_config(
     """Validate against the declared schema, then atomically commit.
 
     Full boundary order (session → origin → CSRF) runs before any state
-    is touched. The store re-validates authoritatively: frozen envelope
-    vocabulary, credential-token keys rejected outright
+    is touched. Credential values go first: ``credential_values`` are
+    validated and upserted into the controller's 0600
+    ``credentials.env`` and the runtime credential source rebuilt
+    *before* the canonical config write, so a rejected value never
+    leaves a half-applied edit behind (config.yaml untouched, 422).
+    The built-in vault plugin additionally refuses ``enabled: true``
+    while its service-account reference has no configured value (the
+    gate answers from the updated key set, before ``enabled: true`` can
+    land in config.yaml). The store re-validates authoritatively: frozen
+    envelope vocabulary, credential-token keys rejected outright
     (``inline_credential_forbidden``) and ``config`` values checked
     against the plugin's *declared* ``config_schema`` — resolved here so
     stored values can never skip validation (schema-strict). A stale
@@ -795,6 +1012,38 @@ async def edit_config(
                 "credential_values keys must appear in credential_refs",
                 fields={"credential_values": "undeclared_credential_ref"},
             )
+        # Credential-first ordering: the values land in the 0600
+        # credentials.env store (and the runtime source is rebuilt) before
+        # the canonical document is written — an invalid value fails the
+        # whole request with config.yaml untouched.
+        try:
+            upsert_env_credentials(
+                store.root / DATA_ROOT_CREDENTIALS_FILENAME,
+                payload.credential_values,
+            )
+        except EnvFileError as exc:
+            return render_error_envelope(
+                request,
+                HTTP_422_UNPROCESSABLE_CONTENT,
+                "validation_error",
+                "credential value failed validation",
+                fields={"credential_values": exc.code.value},
+            )
+        request.app.state.credentials = _build_runtime_resolver(request, store)
+    if plugin == PLUGIN_NAME and payload.enabled:
+        configured = _runtime_env_keys(request, store)
+        missing = [
+            ref for ref in CREDENTIAL_REFERENCES if ref not in configured
+        ]
+        if missing:
+            return render_error_envelope(
+                request,
+                HTTP_422_UNPROCESSABLE_CONTENT,
+                "validation_error",
+                "enabling the plugin requires its credential references to "
+                "have configured values",
+                fields={"credential_refs": "missing_credential_value"},
+            )
     declared = _declared_config_schema(plugin, payload.config)
     try:
         stored = store.write_config(
@@ -805,26 +1054,6 @@ async def edit_config(
         )
     except PluginConfigError as exc:
         return _config_error(request, exc)
-    if payload.credential_values:
-        try:
-            data_root = store.root.parent
-            upsert_env_credentials(
-                data_root / DATA_ROOT_CREDENTIALS_FILENAME,
-                payload.credential_values,
-            )
-            env_map = getattr(request.app.state, "env", None) or {}
-            source = env_map.get("MAI_ENV_FILE")
-            request.app.state.credentials = build_runtime_env_resolver(
-                source, data_root
-            )
-        except EnvFileError as exc:
-            return render_error_envelope(
-                request,
-                HTTP_422_UNPROCESSABLE_CONTENT,
-                "validation_error",
-                "credential value failed validation",
-                fields={"credential_values": exc.code.value},
-            )
     return RevisionTriple(
         revision=stored.revision,
         schema_revision=stored.schema_revision,
@@ -1162,6 +1391,95 @@ async def run_discovery(request: Request, plugin: PluginName) -> Response:
             for item in payload["rejections"]  # type: ignore[union-attr]
         ],
         limit_exceeded=bool(payload["limit_exceeded"]),
+    )
+
+
+@router.post(
+    "/{plugin}/probe",
+    status_code=HTTP_200_OK,
+    response_model=PluginProbeView,
+    summary="Probe one plugin's provider readiness (value-free)",
+    responses={
+        HTTP_401_UNAUTHORIZED: _SESSION_401,  # type: ignore[arg-type]
+        HTTP_403_FORBIDDEN: _MUTATION_403,  # type: ignore[arg-type]
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "Plugin neither installed nor configured",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: _UNAVAILABLE_503,  # type: ignore[arg-type]
+    },
+)
+async def probe_plugin(
+    request: Request,
+    plugin: PluginName,
+    payload: PluginProbeBody = PluginProbeBody(),
+) -> Response:
+    """One bounded, non-destructive readiness classification.
+
+    POST under the full mutation boundary (session → origin → CSRF)
+    because the provider check runs real subprocess work. The built-in
+    vault plugin is probed through the reviewed resolver lane (its token
+    resolves by reference from the active runtime ``.env`` source — never
+    a process-environment scan); the checked vault is the explicit body
+    value, else the stored config's ``default_vault``, else the
+    unscoped provider check. The report is value-free by construction.
+    A plugin that is neither installed nor configured is ``404``; an
+    installed plugin without a probe reports a structured
+    ``unsupported`` classification instead of pretending readiness.
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    store = _plugin_store(request)
+    stored_names = store.list_plugins()
+    installed = _installed_plugin_names()
+    if plugin not in stored_names and plugin not in installed:
+        return render_error_envelope(
+            request,
+            HTTP_404_NOT_FOUND,
+            "not_found",
+            "plugin is neither configured nor installed",
+        )
+    if plugin != PLUGIN_NAME:
+        return PluginProbeView(
+            plugin=plugin,
+            available=False,
+            code="unsupported",
+            detail="plugin exposes no readiness probe",
+        )
+    target_vault = payload.vault
+    if target_vault is None and plugin in stored_names:
+        try:
+            _, document = _parse_stored_config(store, plugin)
+        except PluginConfigError as exc:
+            return _config_error(request, exc)
+        configured_vault = document.config.get("default_vault")
+        if isinstance(configured_vault, str) and configured_vault:
+            target_vault = configured_vault
+    runtime_resolver = _build_runtime_resolver(request, store)
+    if runtime_resolver is None:
+        return PluginProbeView(
+            plugin=plugin,
+            available=False,
+            code="token_missing",
+            detail=(
+                "credential source is not configured; the service-account "
+                "token reference cannot resolve (no fallback scan)"
+            ),
+            checked_vault=target_vault,
+        )
+    resolver = OnePasswordResolver(
+        credential_ref=CREDENTIAL_REFERENCES[0],
+        resolver=runtime_resolver,
+        token_env=None,
+    )
+    report = await asyncio.to_thread(resolver.probe, target_vault)
+    return PluginProbeView(
+        plugin=plugin,
+        available=report.available,
+        code=report.code,
+        detail=report.detail,
+        checked_vault=report.checked_vault,
     )
 
 

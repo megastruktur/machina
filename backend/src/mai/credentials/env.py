@@ -299,6 +299,17 @@ class EnvResolver:
             )
         return SecretValue(value)
 
+    def configured_keys(self) -> frozenset[str]:
+        """The configured reference names of the merged source, never values.
+
+        The snapshot covers the configured ``.env`` file plus the optional
+        overlay layer (merged at construction, overlay wins), so callers
+        can answer "is this reference name configured?" — a name-only
+        availability question — without ever touching or transmitting the
+        mapped material (C03 rule 6: credentials resolve by reference).
+        """
+        return frozenset(self._entries.keys())
+
     def _read(self, target_path: Path | None = None) -> str:
         path = self._path if target_path is None else target_path
         try:

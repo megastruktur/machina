@@ -43,6 +43,7 @@ from mai.credentials.env import (
     EnvFileError,
     EnvResolver,
     SecretValue,
+    build_runtime_env_resolver,
     parse_env_text,
 )
 
@@ -401,6 +402,50 @@ def test_resolver_repr_carries_only_path_and_count(tmp_path: Path) -> None:
     rendered = repr(EnvResolver(env_file))
     assert SENTINEL not in rendered
     assert "real.env" in rendered
+
+
+# ---------------------------------------------------------------------------
+# configured_keys: reference-name availability, never values
+# ---------------------------------------------------------------------------
+
+
+def test_configured_keys_reports_names_never_values(tmp_path: Path) -> None:
+    env_file = _write_env(
+        tmp_path / "real.env", f"MAI_KEY={SENTINEL}\nMAI_OTHER=v\n"
+    )
+    keys = EnvResolver(env_file).configured_keys()
+    assert isinstance(keys, frozenset)
+    assert keys == frozenset({"MAI_KEY", "MAI_OTHER"})
+    assert SENTINEL not in repr(keys)
+    assert SENTINEL not in str(keys)
+
+
+def test_configured_keys_covers_the_overlay_layer(tmp_path: Path) -> None:
+    base = _write_env(tmp_path / "base.env", "MAI_BASE=v\n")
+    overlay = _write_env(tmp_path / "overlay.env", f"MAI_OVERLAY={SENTINEL}\n")
+    resolver = EnvResolver(base, overlay_path=overlay)
+    assert resolver.configured_keys() == frozenset(
+        {"MAI_BASE", "MAI_OVERLAY"}
+    )
+
+
+def test_configured_keys_on_an_empty_source_is_empty(tmp_path: Path) -> None:
+    env_file = _write_env(tmp_path / "empty.env", "")
+    assert EnvResolver(env_file).configured_keys() == frozenset()
+
+
+def test_build_runtime_env_resolver_configured_keys_use_data_root_store(
+    tmp_path: Path,
+) -> None:
+    """The data-root credentials.env overlay is the runtime key source."""
+    _write_env(
+        tmp_path / "credentials.env", f"MAI_RUNTIME_KEY={SENTINEL}\n"
+    )
+    resolver = build_runtime_env_resolver(None, tmp_path)
+    assert resolver is not None
+    assert resolver.configured_keys() == frozenset({"MAI_RUNTIME_KEY"})
+    # No configured source and no store: no resolver, no keys.
+    assert build_runtime_env_resolver(None, tmp_path / "absent-root") is None
 
 
 # ---------------------------------------------------------------------------

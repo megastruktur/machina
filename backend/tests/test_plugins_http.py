@@ -91,6 +91,14 @@ MCP_TOOL = "echo"
 MCP_CAPABILITY = f"mcp.{MCP_PLUGIN}.{MCP_TOOL}"
 UNOFFERED_CAPABILITY = f"mcp.{MCP_PLUGIN}.absent"
 
+#: Built-in vault plugin (real installed distribution of this package) and
+#: its service-account reference name. The fixture token value below is a
+#: disposable marker, never a secret: sweeps prove it never travels.
+PLUGIN_ONEPASSWORD = "onepassword"
+OP_TOKEN = "OP_SERVICE_ACCOUNT_TOKEN"
+OP_BADGE_VALUE = "op-fixture-value-never-echoed"
+OP_CONFIG: dict[str, Any] = {"default_vault": "Dev", "allowed_vaults": ["Dev"]}
+
 #: Skill fixture (09-skills frozen format).
 SKILL_NAME = "deploy-notes"
 SKILL_OTHER = "patch-notes"
@@ -223,10 +231,10 @@ def _install_plugins(root: Path, monkeypatch: Any) -> Path:
         sys.modules.pop(stem, None)
         (root / f"{stem}.py").write_text(source, encoding="utf-8")
         lines.append(f"{name} = {stem}")
-    dist_info = root / "mai-fxt-api-plugins-1.0.0.dist-info"
+    dist_info = root / "fxtapi-plugins-1.0.0.dist-info"
     dist_info.mkdir(exist_ok=True)
     (dist_info / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: mai-fxt-api-plugins\nVersion: 1.0.0\n",
+        "Metadata-Version: 2.1\nName: fxtapi-plugins\nVersion: 1.0.0\n",
         encoding="utf-8",
     )
     (dist_info / "entry_points.txt").write_text(
@@ -546,6 +554,7 @@ Routes = [
         None,
     ),
     ("POST", f"/api/v1/plugins/{NATIVE_PLUGIN}/discovery", {}),
+    ("POST", f"/api/v1/plugins/{NATIVE_PLUGIN}/probe", {}),
     ("GET", "/api/v1/skills", None),
     ("GET", f"/api/v1/skills/{SKILL_NAME}", None),
 ]
@@ -747,6 +756,127 @@ class TestCatalog:
         assert catalog["configured"] == []
         _sweep(catalog, _CANARY)
 
+    @pytest.mark.anyio
+    async def test_catalog_pagination_envelope_and_defaults(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        native_dist: Path,
+    ) -> None:
+        """``configured`` is one deterministic bounded page (AGENTS §1)."""
+        assert (
+            await _put_config(plugins_app, jar, NATIVE_PLUGIN, _config_body(0, config={"region": "eu"}))
+        ).status == 200
+        assert (
+            await _put_config(plugins_app, jar, GHOST_PLUGIN, _config_body(0, enabled=False))
+        ).status == 200
+        default = (await _get(plugins_app, jar, "/api/v1/plugins")).json()
+        assert default["limit"] == 50 and default["offset"] == 0
+        assert default["total"] == 2
+        assert len(default["configured"]) == 2
+        first = (await _get(plugins_app, jar, "/api/v1/plugins?limit=1&offset=0")).json()
+        assert first["limit"] == 1 and first["offset"] == 0 and first["total"] == 2
+        assert len(first["configured"]) == 1
+        second = (await _get(plugins_app, jar, "/api/v1/plugins?limit=1&offset=1")).json()
+        assert second["offset"] == 1 and second["total"] == 2
+        assert len(second["configured"]) == 1
+        assert second["configured"][0]["plugin"] != first["configured"][0]["plugin"]
+        # Beyond the end: an empty page, but the total stays honest.
+        beyond = (await _get(plugins_app, jar, "/api/v1/plugins?limit=1&offset=9")).json()
+        assert beyond["configured"] == [] and beyond["total"] == 2
+        # Deterministic order: pages tile the sorted plugin list.
+        names = [first["configured"][0]["plugin"], second["configured"][0]["plugin"]]
+        assert names == sorted(names)
+
+    @pytest.mark.anyio
+    async def test_catalog_limit_offset_bounds_are_transport_enforced(
+        self, plugins_app: FastAPI, jar: dict[str, str]
+    ) -> None:
+        for query in ("limit=0", "limit=201", "offset=-1", "limit=bad"):
+            response = await _get(plugins_app, jar, f"/api/v1/plugins?{query}")
+            assert response.status == 422, query
+            assert _error(response)["code"] == "validation_failed"
+        # The documented upper bound itself answers 200.
+        assert (
+            await _get(plugins_app, jar, "/api/v1/plugins?limit=200")
+        ).status == 200
+
+    @pytest.mark.anyio
+    async def test_installed_plugins_enrichment_includes_builtins(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        native_dist: Path,
+    ) -> None:
+        """The rich catalog covers built-in and third-party loaded plugins."""
+        catalog = (await _get(plugins_app, jar, "/api/v1/plugins")).json()
+        by_plugin = {view["plugin"]: view for view in catalog["installed_plugins"]}
+        assert NATIVE_PLUGIN in by_plugin
+        native = by_plugin[NATIVE_PLUGIN]
+        assert native["title"] == NATIVE_PLUGIN  # no PLUGIN_METADATA declared
+        assert native["description"] == ""
+        assert native["capabilities"] == [NATIVE_IDENTIFIER]
+        assert native["required_credentials"] == [CREDENTIAL_NAME]
+        assert native["configured_credentials"] == []
+        assert native["config_schema"] == NATIVE_CONFIG_SCHEMA
+        # The built-in vault plugin (include_builtins runtime).
+        assert PLUGIN_ONEPASSWORD in by_plugin
+        op = by_plugin[PLUGIN_ONEPASSWORD]
+        assert op["title"] == "1Password Vault"
+        assert "1Password" in op["description"]
+        assert op["required_credentials"] == [OP_TOKEN]
+        assert len(op["capabilities"]) == 3
+        assert all(cap.startswith("secret.") for cap in op["capabilities"])
+        assert op["config_schema"] is not None
+        assert op["config_schema"]["required"] == ["default_vault", "allowed_vaults"]
+        assert op["configured_credentials"] == []
+        _sweep(catalog, CREDENTIAL_VALUE)
+
+    @pytest.mark.anyio
+    async def test_configured_credentials_badge_reflects_runtime_keys(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        native_dist: Path,
+        data_root: Path,
+    ) -> None:
+        """The badge is the configured subset of the declared references."""
+        badge_value = "badge-fixture-value-never-echoed"
+        assert (
+            await _put_config(
+                plugins_app,
+                jar,
+                NATIVE_PLUGIN,
+                _config_body(
+                    0,
+                    refs=[CREDENTIAL_NAME],
+                    config={"region": "eu"},
+                    credential_values={CREDENTIAL_NAME: badge_value},
+                ),
+            )
+        ).status == 200
+        # A configured plugin whose references have no values: empty badge.
+        assert (
+            await _put_config(
+                plugins_app, jar, GHOST_PLUGIN, _config_body(0, enabled=False, refs=[CREDENTIAL_NAME])
+            )
+        ).status == 200
+        catalog = (await _get(plugins_app, jar, "/api/v1/plugins")).json()
+        views = {view["plugin"]: view for view in catalog["configured"]}
+        assert views[NATIVE_PLUGIN]["configured_credentials"] == [CREDENTIAL_NAME]
+        # The ghost plugin declares the same reference name; its badge is
+        # honest about the runtime key set (the value is configured).
+        assert views[GHOST_PLUGIN]["configured_credentials"] == [CREDENTIAL_NAME]
+        # The stored-document read carries the same badge.
+        view = (
+            await _get(plugins_app, jar, f"/api/v1/plugins/{NATIVE_PLUGIN}/config")
+        ).json()
+        assert view["configured_credentials"] == [CREDENTIAL_NAME]
+        # The 0600 store exists below the data root; the value never travels.
+        assert (data_root / "credentials.env").is_file()
+        _sweep(catalog, badge_value, CREDENTIAL_VALUE)
+        _sweep(view, badge_value)
+
 
 # ---------------------------------------------------------------------------
 # Config lifecycle: versioned edits, schema-strict writes (AC1)
@@ -904,6 +1034,110 @@ class TestConfigLifecycle:
         )
         assert response.status == 404
         assert _error(response)["code"] == "not_found"
+
+    @pytest.mark.anyio
+    async def test_credential_value_rejection_leaves_config_untouched(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        native_dist: Path,
+        data_root: Path,
+    ) -> None:
+        """Credential-first ordering: an invalid value fails the whole edit.
+
+        The credential store write (and its validation) happens before the
+        canonical config write, so a rejected value never leaves a
+        half-applied edit behind.
+        """
+        response = await _put_config(
+            plugins_app,
+            jar,
+            NATIVE_PLUGIN,
+            _config_body(
+                0,
+                refs=[CREDENTIAL_NAME],
+                config={"region": "eu"},
+                credential_values={CREDENTIAL_NAME: ""},
+            ),
+        )
+        assert response.status == 422
+        error = _error(response)
+        assert error["code"] == "validation_error"
+        assert error["fields"] == {"credential_values": "empty_value"}
+        _sweep(error, CREDENTIAL_VALUE)
+        # Nothing was stored and no credentials.env was created.
+        assert (
+            await _get(plugins_app, jar, f"/api/v1/plugins/{NATIVE_PLUGIN}/config")
+        ).status == 404
+        assert not (data_root / "credentials.env").exists()
+        # Undeclared keys are refused at the same boundary, before any write.
+        undeclared = await _put_config(
+            plugins_app,
+            jar,
+            NATIVE_PLUGIN,
+            _config_body(
+                0,
+                config={"region": "eu"},
+                credential_values={"UNDECLARED_TOKEN": "x"},
+            ),
+        )
+        assert undeclared.status == 422
+        assert _error(undeclared)["fields"] == {
+            "credential_values": "undeclared_credential_ref"
+        }
+        assert not (data_root / "credentials.env").exists()
+
+    @pytest.mark.anyio
+    async def test_onepassword_enable_requires_a_configured_token(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        data_root: Path,
+    ) -> None:
+        """``enabled: true`` is refused while the token has no value.
+
+        The gate answers from the runtime key set *after* upserting the
+        request's ``credential_values`` and *before* the config write.
+        References with externally mounted values (no credential_values in
+        the request) stay valid for every other plugin — only the built-in
+        vault plugin is gated.
+        """
+        gated = await _put_config(
+            plugins_app,
+            jar,
+            PLUGIN_ONEPASSWORD,
+            _config_body(0, refs=[OP_TOKEN], config=dict(OP_CONFIG)),
+        )
+        assert gated.status == 422
+        error = _error(gated)
+        assert error["code"] == "validation_error"
+        assert error["fields"] == {"credential_refs": "missing_credential_value"}
+        # The refusal precedes the config write: nothing stored.
+        assert (
+            await _get(plugins_app, jar, f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/config")
+        ).status == 404
+        assert not (data_root / "credentials.env").exists()
+        # Supplying the value in the same request passes the gate.
+        enabled = await _put_config(
+            plugins_app,
+            jar,
+            PLUGIN_ONEPASSWORD,
+            _config_body(
+                0,
+                refs=[OP_TOKEN],
+                config=dict(OP_CONFIG),
+                credential_values={OP_TOKEN: OP_BADGE_VALUE},
+            ),
+        )
+        assert enabled.status == 200, enabled.body
+        assert (data_root / "credentials.env").is_file()
+        view = (
+            await _get(plugins_app, jar, f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/config")
+        ).json()
+        assert view["enabled"] is True
+        assert view["credential_refs"] == [OP_TOKEN]
+        assert view["configured_credentials"] == [OP_TOKEN]
+        _sweep(view, OP_BADGE_VALUE)
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1481,141 @@ class TestMcpDiscovery:
 
 
 # ---------------------------------------------------------------------------
+# Readiness probe (POST /probe; value-free provider classification)
+# ---------------------------------------------------------------------------
+
+_FAKE_OP = """\
+#!/bin/sh
+case "$1" in
+  --version)
+    echo "2.18.0"
+    exit 0
+    ;;
+  vault)
+    case "$2" in
+      get) echo "{}" ; exit 0 ;;
+      list) echo "[]" ; exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_op(tmp_path: Path, monkeypatch: Any) -> Path:
+    """A fake ``op`` CLI on PATH answering version and vault reads."""
+    bin_dir = tmp_path / "op-bin"
+    bin_dir.mkdir()
+    binary = bin_dir / "op"
+    binary.write_text(_FAKE_OP, encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return binary
+
+
+class TestProbe:
+    @pytest.mark.anyio
+    async def test_unknown_plugin_is_404(
+        self, plugins_app: FastAPI, jar: dict[str, str]
+    ) -> None:
+        response = await _mutate(
+            plugins_app, jar, "POST", "/api/v1/plugins/never.heard-of/probe", {}
+        )
+        assert response.status == 404
+        assert _error(response)["code"] == "not_found"
+
+    @pytest.mark.anyio
+    async def test_installed_plugin_without_probe_reports_unsupported(
+        self, plugins_app: FastAPI, jar: dict[str, str], native_dist: Path
+    ) -> None:
+        """A structured no-probe classification, never invented readiness."""
+        response = await _mutate(
+            plugins_app, jar, "POST", f"/api/v1/plugins/{NATIVE_PLUGIN}/probe", {}
+        )
+        assert response.status == 200
+        view = response.json()
+        assert view["plugin"] == NATIVE_PLUGIN
+        assert view["available"] is False
+        assert view["code"] == "unsupported"
+        assert view["checked_vault"] is None
+
+    @pytest.mark.anyio
+    async def test_onepassword_without_token_reports_token_missing(
+        self, plugins_app: FastAPI, jar: dict[str, str]
+    ) -> None:
+        """No configured value for the reference ⇒ structured unavailability."""
+        response = await _mutate(
+            plugins_app, jar, "POST", f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/probe", {}
+        )
+        assert response.status == 200
+        view = response.json()
+        assert view["plugin"] == PLUGIN_ONEPASSWORD
+        assert view["available"] is False
+        assert view["code"] == "token_missing"
+        assert view["checked_vault"] is None
+
+    @pytest.mark.anyio
+    async def test_onepassword_probe_ready_with_configured_token(
+        self,
+        plugins_app: FastAPI,
+        jar: dict[str, str],
+        fake_op: Path,
+    ) -> None:
+        """Real resolver lane + real CLI subprocess; vault resolution order."""
+        assert (
+            await _put_config(
+                plugins_app,
+                jar,
+                PLUGIN_ONEPASSWORD,
+                _config_body(
+                    0,
+                    refs=[OP_TOKEN],
+                    config=dict(OP_CONFIG),
+                    credential_values={OP_TOKEN: OP_BADGE_VALUE},
+                ),
+            )
+        ).status == 200
+        # No explicit vault: the stored config's default_vault is checked.
+        unscoped = await _mutate(
+            plugins_app, jar, "POST", f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/probe", {}
+        )
+        assert unscoped.status == 200, unscoped.body
+        view = unscoped.json()
+        assert view["available"] is True
+        assert view["code"] == "ready"
+        assert view["checked_vault"] == "Dev"
+        # An explicit body vault wins over the stored default.
+        scoped = await _mutate(
+            plugins_app,
+            jar,
+            "POST",
+            f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/probe",
+            {"vault": "Prod"},
+        )
+        assert scoped.status == 200
+        view = scoped.json()
+        assert view["available"] is True
+        assert view["checked_vault"] == "Prod"
+        # A malformed vault segment is a structured, value-free rejection.
+        malformed = await _mutate(
+            plugins_app,
+            jar,
+            "POST",
+            f"/api/v1/plugins/{PLUGIN_ONEPASSWORD}/probe",
+            {"vault": "../evil"},
+        )
+        assert malformed.status == 200
+        view = malformed.json()
+        assert view["available"] is False
+        assert view["code"] == "invalid_reference"
+        _sweep(view, OP_BADGE_VALUE)
+
+
+# ---------------------------------------------------------------------------
 # Skills inspection (read-only; prerequisite binding report)
 # ---------------------------------------------------------------------------
 
@@ -1365,6 +1734,7 @@ class TestOpenApiContract:
             "/api/v1/plugins/{plugin}/bindings": {"get"},
             "/api/v1/plugins/{plugin}/bindings/{server_id}": {"put", "delete"},
             "/api/v1/plugins/{plugin}/discovery": {"post"},
+            "/api/v1/plugins/{plugin}/probe": {"post"},
             "/api/v1/skills": {"get"},
             "/api/v1/skills/{skill}": {"get"},
         }

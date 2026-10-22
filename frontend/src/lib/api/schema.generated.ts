@@ -1265,9 +1265,14 @@ export interface paths {
          *     Safe method: session layer only. Adoption records are the managed
          *     truth; discovery observations are a SEPARATE resource and never merge
          *     into this page (C09 rule 1). Service Map entries with no SQL adoption
-         *     row (``origin="manual"`` chat/agent additions) appear seamlessly at
-         *     the tail of the page, and the merged category taxonomy rides the page
-         *     for the picker.
+         *     row appear seamlessly at the tail of the page ONLY when they are
+         *     genuine map-only additions (``origin="manual"`` chat/agent entries,
+         *     which never own a live compose/systemd/docker target). A Service Map
+         *     sidecar whose adoption record is gone (revoked) keeps its
+         *     non-manual origin and is therefore ORPHANED metadata: it is hidden
+         *     from this listing (the sidecar itself is retained on disk, untouched),
+         *     so a revoked application disappears from the adopted list. The merged
+         *     category taxonomy rides the page for the picker.
          */
         get: operations["list_adopted_api_v1_servers__server_id__applications_get"];
         put?: never;
@@ -1455,10 +1460,15 @@ export interface paths {
          * @description Availability (installed/configured/enabled) and grants, separately.
          *
          *     Safe method: session layer only. Installed names come from
-         *     distribution metadata (no plugin code runs); configured documents and
-         *     bindings come from the canonical store. A configured plugin whose
-         *     binding names a capability nothing registers is reported through the
-         *     store's own views by the worker; this catalog never unions the two.
+         *     distribution metadata (no plugin code runs for ``installed``);
+         *     configured documents and bindings come from the canonical store,
+         *     served as one deterministic bounded page (``total`` is the pre-slice
+         *     count). ``installed_plugins`` enriches the loaded native set (built-ins
+         *     included, the worker's own composition trust) with presentation
+         *     metadata, owned capabilities and the required-vs-configured credential
+         *     badge — names only, never values (C03 rule 6). A configured plugin
+         *     whose binding names a capability nothing registers is reported through
+         *     the store's own views by the worker; this catalog never unions the two.
          */
         get: operations["list_plugins_api_v1_plugins_get"];
         put?: never;
@@ -1486,8 +1496,16 @@ export interface paths {
          * @description Validate against the declared schema, then atomically commit.
          *
          *     Full boundary order (session → origin → CSRF) runs before any state
-         *     is touched. The store re-validates authoritatively: frozen envelope
-         *     vocabulary, credential-token keys rejected outright
+         *     is touched. Credential values go first: ``credential_values`` are
+         *     validated and upserted into the controller's 0600
+         *     ``credentials.env`` and the runtime credential source rebuilt
+         *     *before* the canonical config write, so a rejected value never
+         *     leaves a half-applied edit behind (config.yaml untouched, 422).
+         *     The built-in vault plugin additionally refuses ``enabled: true``
+         *     while its service-account reference has no configured value (the
+         *     gate answers from the updated key set, before ``enabled: true`` can
+         *     land in config.yaml). The store re-validates authoritatively: frozen
+         *     envelope vocabulary, credential-token keys rejected outright
          *     (``inline_credential_forbidden``) and ``config`` values checked
          *     against the plugin's *declared* ``config_schema`` — resolved here so
          *     stored values can never skip validation (schema-strict). A stale
@@ -1605,6 +1623,37 @@ export interface paths {
          *     failures).
          */
         post: operations["run_discovery_api_v1_plugins__plugin__discovery_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plugins/{plugin}/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Probe one plugin's provider readiness (value-free)
+         * @description One bounded, non-destructive readiness classification.
+         *
+         *     POST under the full mutation boundary (session → origin → CSRF)
+         *     because the provider check runs real subprocess work. The built-in
+         *     vault plugin is probed through the reviewed resolver lane (its token
+         *     resolves by reference from the active runtime ``.env`` source — never
+         *     a process-environment scan); the checked vault is the explicit body
+         *     value, else the stored config's ``default_vault``, else the
+         *     unscoped provider check. The report is value-free by construction.
+         *     A plugin that is neither installed nor configured is ``404``; an
+         *     installed plugin without a probe reports a structured
+         *     ``unsupported`` classification instead of pretending readiness.
+         */
+        post: operations["probe_plugin_api_v1_plugins__plugin__probe_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2544,6 +2593,8 @@ export interface components {
             kind: string;
             /** Credential Refs */
             credential_refs: string[];
+            /** Configured Credentials */
+            configured_credentials?: string[];
             /** Config */
             config: {
                 [key: string]: unknown;
@@ -2995,6 +3046,36 @@ export interface components {
             retries: number;
             /** Start Period Seconds */
             start_period_seconds: number;
+        };
+        /**
+         * InstalledPluginView
+         * @description One installed native plugin's rich catalog view (plugins window).
+         *
+         *     ``capabilities`` are the declared capability identifiers in
+         *     declaration order (a plugin may own several); ``required_credentials``
+         *     are the declared reference *names*; ``configured_credentials`` is the
+         *     sorted subset of those names present in the active runtime
+         *     ``EnvResolver.configured_keys()`` — a status badge, never a value
+         *     (C03 rule 6). ``config_schema`` is the shared declared configuration
+         *     schema (every descriptor of the plugin declares the same object).
+         */
+        InstalledPluginView: {
+            /** Plugin */
+            plugin: string;
+            /** Title */
+            title: string;
+            /** Description */
+            description: string;
+            /** Capabilities */
+            capabilities: string[];
+            /** Required Credentials */
+            required_credentials: string[];
+            /** Configured Credentials */
+            configured_credentials?: string[];
+            /** Config Schema */
+            config_schema?: {
+                [key: string]: unknown;
+            } | null;
         };
         /**
          * LaneView
@@ -3688,12 +3769,27 @@ export interface components {
         /**
          * PluginCatalogView
          * @description Availability and grants as deliberately separate sections (AC2).
+         *
+         *     ``configured`` is one bounded page over every configured plugin
+         *     (``total`` is the pre-slice count; ``limit``/``offset`` echo the
+         *     request). ``installed`` stays metadata-only names; ``installed_plugins``
+         *     is the rich per-plugin view for the plugins window (presentation
+         *     metadata, owned capabilities, required vs configured credential
+         *     references, declared config schema).
          */
         PluginCatalogView: {
             /** Installed */
             installed: string[];
             /** Configured */
             configured: components["schemas"]["ConfiguredPluginView"][];
+            /** Installed Plugins */
+            installed_plugins?: components["schemas"]["InstalledPluginView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
         };
         /**
          * PluginConfigEditBody
@@ -3734,6 +3830,8 @@ export interface components {
             enabled: boolean;
             /** Credential Refs */
             credential_refs: string[];
+            /** Configured Credentials */
+            configured_credentials?: string[];
             /** Config */
             config: {
                 [key: string]: unknown;
@@ -3744,6 +3842,42 @@ export interface components {
             schema_revision: number;
             /** Sha256 */
             sha256: string;
+        };
+        /**
+         * PluginProbeBody
+         * @description Optional readiness-probe input: one explicit vault name.
+         *
+         *     Omitted, the probe falls back to the stored config's
+         *     ``default_vault`` (and then to the provider's unscoped listing).
+         */
+        PluginProbeBody: {
+            /**
+             * Vault
+             * @description Target provider vault name or ID to check; omitted means the plugin's stored default_vault (or the unscoped provider check).
+             */
+            vault?: string | null;
+        };
+        /**
+         * PluginProbeView
+         * @description One value-free provider readiness classification (the probe result).
+         *
+         *     ``code`` is the provider's stable vocabulary (``ready``, or a
+         *     structured failure code); ``detail`` names references and
+         *     classifications, never credential material. ``checked_vault`` echoes
+         *     the vault the probe actually checked (explicit, stored default or
+         *     ``null`` for the unscoped check).
+         */
+        PluginProbeView: {
+            /** Plugin */
+            plugin: string;
+            /** Available */
+            available: boolean;
+            /** Code */
+            code: string;
+            /** Detail */
+            detail: string;
+            /** Checked Vault */
+            checked_vault?: string | null;
         };
         /**
          * PluginSchemaView
@@ -8793,7 +8927,10 @@ export interface operations {
     };
     list_plugins_api_v1_plugins_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -8816,6 +8953,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             /** @description Plugin configuration service unavailable */
@@ -9371,6 +9517,77 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin configuration service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    probe_plugin_api_v1_plugins__plugin__probe_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plugin: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PluginProbeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginProbeView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Plugin neither installed nor configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             /** @description Plugin configuration service unavailable */

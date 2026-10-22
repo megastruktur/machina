@@ -153,6 +153,9 @@ export type PluginBindingEditBody = components['schemas']['PluginBindingEditBody
 export type PluginCatalogView = components['schemas']['PluginCatalogView'];
 export type PluginConfigEditBody = components['schemas']['PluginConfigEditBody'];
 export type PluginConfigView = components['schemas']['PluginConfigView'];
+export type InstalledPluginView = components['schemas']['InstalledPluginView'];
+export type PluginProbeBody = components['schemas']['PluginProbeBody'];
+export type PluginProbeView = components['schemas']['PluginProbeView'];
 export type PluginSchemaView = components['schemas']['PluginSchemaView'];
 export type ReconcileBody = components['schemas']['ReconcileBody'];
 export type ResearchBody = components['schemas']['ResearchBody'];
@@ -583,7 +586,9 @@ export interface MaiApiClient {
 	): Promise<void>;
 
 	/** GET /api/v1/plugins — availability + configured documents, separately. */
-	pluginCatalog(): Promise<PluginCatalogView>;
+	pluginCatalog(page?: PageQuery): Promise<PluginCatalogView>;
+	/** POST /api/v1/plugins/{plugin}/probe — value-free readiness check. */
+	probePlugin(plugin: string, body?: PluginProbeBody): Promise<PluginProbeView>;
 	/** GET /api/v1/plugins/{plugin}/config — the stored document, refs only. */
 	readPluginConfig(plugin: string): Promise<PluginConfigView>;
 	/** PUT /api/v1/plugins/{plugin}/config — versioned full-document edit. */
@@ -920,7 +925,22 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			),
 
 		// Plugins + skills (P09).
-		pluginCatalog: () => requestJson<PluginCatalogView>('GET', '/api/v1/plugins'),
+		pluginCatalog: (page) => {
+			const params = new URLSearchParams();
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<PluginCatalogView>(
+				'GET',
+				`/api/v1/plugins${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		probePlugin: (plugin, body) =>
+			requestJson<PluginProbeView>(
+				'POST',
+				`/api/v1/plugins/${encodeURIComponent(plugin)}/probe`,
+				body
+			),
 		readPluginConfig: (plugin) =>
 			requestJson<PluginConfigView>(
 				'GET',
