@@ -339,6 +339,21 @@ def _truncate(url: str) -> None:
             "admin_sessions",
             "admin_credential",
         ]
+        # 0007 observation domain: notification_alerts references
+        # job_runs.run_id, so TRUNCATE of job_runs is refused unless the
+        # referencing table is emptied in the same statement. Only the
+        # tables that actually exist are named.
+        observation_tables = [
+            "notification_alerts",
+            "observation_findings",
+            "server_observations",
+        ]
+        for table in observation_tables:
+            exists = conn.execute(
+                "SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",)
+            ).fetchone()
+            if exists and exists[0]:
+                tables.append(table)
         if present and present[0]:
             tables.extend(
                 ["application_projection_journal", "application_projection"]

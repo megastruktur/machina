@@ -422,8 +422,12 @@ def _drop_app_tables(url: str) -> None:
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "admin_credential, alembic_version, notification_alerts, "
+            "observation_findings, server_observations, knowledge_doc_chunks, "
+            "knowledge_documents, application_projection_journal, "
+            "application_projection"
         )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -444,6 +448,21 @@ def _truncate(url: str) -> None:
             "admin_sessions",
             "admin_credential",
         ]
+        # 0007 observation domain: notification_alerts references
+        # job_runs.run_id, so TRUNCATE of job_runs is refused unless the
+        # referencing table is emptied in the same statement. Only the
+        # tables that actually exist are named.
+        observation_tables = [
+            "notification_alerts",
+            "observation_findings",
+            "server_observations",
+        ]
+        for table in observation_tables:
+            exists = conn.execute(
+                "SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",)
+            ).fetchone()
+            if exists and exists[0]:
+                tables.append(table)
         if present and present[0]:
             tables.insert(0, "job_resource_locks")
         conn.execute(f"TRUNCATE {', '.join(tables)}")
