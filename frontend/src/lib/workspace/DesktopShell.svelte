@@ -44,6 +44,7 @@
 	import { modelSettingsEntry } from './entries/06-web-models.js';
 	import { overviewEntry } from './entries/10-web-dashboard.js';
 	import { pluginFormsEntry } from './entries/09-web-plugin-forms.js';
+	import { pluginsEntry } from './entries/12-web-plugins.js';
 	import { serverProfileEntry } from './entries/02-web-server.js';
 
 	/**
@@ -163,6 +164,7 @@
 			applicationsEntry(),
 			overviewEntry(),
 			pluginFormsEntry(),
+			pluginsEntry(),
 			knowledgeModelsEntry()
 		]);
 		if (!result.ok) {
@@ -270,6 +272,10 @@
 		type PluginsApi,
 		type SkillsApi
 	} from './entries/09-web-plugin-forms.js';
+	import {
+		PLUGINS_PANEL_KIND,
+		pluginsPanelServices
+	} from './entries/12-web-plugins.js';
 	import { SERVER_PROFILE_PANEL_KIND, serverProfileServices } from './entries/02-web-server.js';
 	import type { PanelServices } from './registry.js';
 
@@ -864,6 +870,8 @@
 				);
 			case PLUGIN_FORMS_PANEL_KIND:
 				return asBag(pluginFormsServices(pluginsApi, skillsApi));
+			case PLUGINS_PANEL_KIND:
+				return asBag(pluginsPanelServices(api));
 			default:
 				return {};
 		}

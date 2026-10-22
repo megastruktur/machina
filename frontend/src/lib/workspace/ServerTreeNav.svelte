@@ -76,7 +76,7 @@
 		{
 			id: 'gov',
 			title: 'Governance & Extensions',
-			kinds: ['capability-policy', 'plugin-forms']
+			kinds: ['capability-policy', 'plugin-forms', 'plugins']
 		}
 	];
 
@@ -90,6 +90,7 @@
 		'model-settings': '⚙',
 		'capability-policy': '🛡',
 		'plugin-forms': '🧩',
+		plugins: '🔌',
 		overview: '🌐',
 		'fixture-notes': '📝',
 		'fixture-prefs': '⚙',
