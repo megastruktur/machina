@@ -35,10 +35,18 @@ exclusively as a trusted capability implementation behind
   not just the retained bytes) stops at budget+1 decoded bytes, so an
   oversized page is ``response_too_large`` after at most ``max_bytes + 1``
   bytes of work. The fetch has a bounded timeout, at most
-  ``MAX_REDIRECTS`` hops are followed, and only HTML-family content types
-  are extracted (anything else is ``unsupported_content_type``). The
-  capability is a reader, not a generic downloader: binary documents are
-  out of scope by design.
+  ``MAX_REDIRECTS`` hops are followed, and only the HTML family and
+  plain-text/Markdown documents are read (anything else is
+  ``unsupported_content_type``). The capability is a reader, not a
+  generic downloader: binary documents are out of scope by design.
+- **Plain text and Markdown are returned verbatim** — an explicit
+  media-type allowlist (``text/plain``, ``text/markdown``) routes those
+  documents around the HTML parser entirely, so code samples, angle
+  brackets and non-ASCII characters survive unchanged. There is no
+  sniffing, no wildcard type and no binary/PDF/JSON branch: the list is
+  the contract. A response may declare an unknown charset; the reader
+  then falls back to UTF-8 with replacement characters instead of
+  failing the read.
 - **Clean Markdown, no script execution (feature-gate scenario)** —
   extraction is a pure stdlib ``html.parser`` pass: ``script``/``style``/
   ``noscript``/``template``/embedded-object subtrees never reach the
@@ -103,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import ipaddress
 import json
 import socket
@@ -153,6 +162,7 @@ __all__ = [
     "check_address_policy",
     "descriptor",
     "extract_markdown",
+    "extract_raw_text",
     "ip_allowed",
     "request_from_payload",
     "result_document",
@@ -190,10 +200,59 @@ DEFAULT_MAX_MARKDOWN_CHARS = 20_000
 MIN_MAX_MARKDOWN_CHARS = 1_000
 MAX_MARKDOWN_CHARS = 100_000
 
-#: The HTML-family content types this reader extracts. Anything else is
-#: ``unsupported_content_type`` — the capability reads pages, it is not a
-#: generic file downloader (bounded scope by design).
-_ALLOWED_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+#: The HTML-family content types this reader extracts through the HTML
+#: parser. Anything outside the two allowlists below is
+#: ``unsupported_content_type`` — the capability reads documents, it is
+#: not a generic file downloader (bounded scope by design).
+_HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+#: The raw-text content types this reader returns verbatim: plain text
+#: and Markdown are *already* text and must not be run through the HTML
+#: parser — a code sample with ``<div>`` in it would lose content to
+#: markup extraction. The list is explicit on purpose: no wildcard, no
+#: sniffing, no PDF/JSON/binary branch.
+_TEXT_CONTENT_TYPES = frozenset({"text/plain", "text/markdown"})
+
+#: Every media type this reader accepts.
+_ALLOWED_CONTENT_TYPES = _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES
+
+#: The charset used when a response declares none, or declares one the
+#: runtime cannot decode. UTF-8 with replacement characters is the safe
+#: fallback: a malformed charset label must never turn a readable
+#: document into a failed read.
+_DEFAULT_CHARSET = "utf-8"
+
+
+def _media_type(content_type: str | None) -> str:
+    """The lowercased media type of a ``Content-Type`` header.
+
+    Parameters (``; charset=utf-8``) are dropped and the type is
+    lowercased, so ``Text/Plain; Charset=UTF-8`` and ``text/plain``
+    are the same media type.
+    """
+    if not isinstance(content_type, str):
+        return ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _safe_charset(charset: str | None) -> str:
+    """A decodable charset label, or the safe default.
+
+    A response may declare a charset the runtime does not know
+    (``charset=definitely-not-a-charset``). Decoding with it would
+    raise and turn a readable document into a failed read, so an
+    unknown label falls back to UTF-8 with replacement characters —
+    the document stays readable and the substitution is visible in the
+    text, never hidden.
+    """
+    if not isinstance(charset, str) or not charset.strip():
+        return _DEFAULT_CHARSET
+    candidate = charset.strip()
+    try:
+        codecs.lookup(candidate)
+    except (LookupError, ValueError):
+        return _DEFAULT_CHARSET
+    return candidate
 
 #: Redirect statuses followed as hops (GET semantics throughout; this
 #: capability never sends a body).
@@ -841,6 +900,29 @@ def _collapse_markdown(text: str) -> str:
     return "\n".join(out)
 
 
+def extract_raw_text(
+    text: str, *, max_chars: int = DEFAULT_MAX_MARKDOWN_CHARS
+) -> PageContent:
+    """Return one plain-text/Markdown document verbatim, character-capped.
+
+    Plain text and Markdown are already text: they are *not* run through
+    the HTML parser, so code samples, angle brackets, pipe tables and
+    non-ASCII characters survive exactly as the server sent them. The
+    only transformation is the character cap with an honest
+    ``truncated`` flag — a cut document keeps its citation downstream.
+
+    There is no title in a plain-text document, so the title is empty.
+    """
+    if not isinstance(text, str):
+        raise _reject(
+            PageErrorCode.INVALID_PAYLOAD,
+            "text must be a decoded string",
+        )
+    truncated = len(text) > max_chars
+    body = text[:max_chars] if truncated else text
+    return PageContent(title="", markdown=body, truncated=truncated)
+
+
 def extract_markdown(
     html: str, *, max_chars: int = DEFAULT_MAX_MARKDOWN_CHARS
 ) -> PageContent:
@@ -1154,13 +1236,12 @@ class HttpPageProvider:
         reaches this method, so an error body is never read here.
         """
         resp: httpx2.Response = response  # type: ignore[assignment]
-        content_type = (
-            resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        )
+        content_type = _media_type(resp.headers.get("content-type", ""))
         if content_type not in _ALLOWED_CONTENT_TYPES:
             raise _reject(
                 PageErrorCode.UNSUPPORTED_CONTENT_TYPE,
-                f"content type {content_type!r} is not an HTML page",
+                f"content type {content_type!r} is not a supported document "
+                "type",
                 at_url=url,
             )
         declared = resp.headers.get("content-length")
@@ -1186,7 +1267,7 @@ class HttpPageProvider:
                     f"response exceeded the {max_bytes}-byte budget",
                     at_url=url,
                 )
-        charset = resp.charset_encoding or "utf-8"
+        charset = _safe_charset(resp.charset_encoding)
         return RawPage(
             url=url,
             content_type=content_type,
@@ -1849,8 +1930,17 @@ class WebPageCapability:
                 http_status=_http_status_of(exc),
             )
         else:
-            text = raw.body.decode(raw.charset, errors="replace")
-            content = extract_markdown(text, max_chars=request.max_markdown_chars)
+            text = raw.body.decode(_safe_charset(raw.charset), errors="replace")
+            if _media_type(raw.content_type) in _TEXT_CONTENT_TYPES:
+                # Plain text and Markdown are returned verbatim: they
+                # are already text and must not lose content to HTML
+                # markup extraction (a code sample with ``<div>`` in
+                # it would survive the HTML parser only by accident).
+                content = extract_raw_text(
+                    text, max_chars=request.max_markdown_chars
+                )
+            else:
+                content = extract_markdown(text, max_chars=request.max_markdown_chars)
             result = PageResult(
                 status=PageStatus.OK,
                 code=None,
