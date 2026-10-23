@@ -639,6 +639,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         locks=ResourceLockService(database_url),
         resolver=_resolve_env,
         plugin_sync=_sync_plugin_capabilities,
+        host_supervisor=host_shell_cap,
     )
     agent_run.configure_agent_run(agent_executor)
     agent_delegate.configure_delegation(

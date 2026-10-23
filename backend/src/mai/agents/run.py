@@ -96,6 +96,7 @@ evidence assembly plugs in at the context seam (empty by default here).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Mapping
@@ -159,10 +160,12 @@ from mai.capabilities.dispatch import (
 )
 from mai.contracts.jobs import TERMINAL_STEP_STATES, RunState, StepState
 from mai.credentials.env import EnvFileError, EnvResolver
+from mai.execution.commands import CommandRequest, CommandStatus
 from mai.jobs import engine as _engine
 from mai.jobs.engine import EngineError, validate_run_id
 from mai.jobs.resource_locks import ResourceLockService
 from mai.jobs.steps import (
+    EXECUTION_TIMEOUT_REASON,
     RESUME_TOPIC,
     WAIT_FOR_APPROVAL,
     StepExecutor,
@@ -801,6 +804,7 @@ class AgentRunExecutor:
         resolver: Any = None,
         model_builder: Any = None,
         plugin_sync: Any = None,
+        host_supervisor: Any = None,
     ) -> None:
         if not isinstance(sessions, async_sessionmaker):
             raise AgentRunError(
@@ -845,6 +849,7 @@ class AgentRunExecutor:
         self._resolver = resolver
         self._model_builder = model_builder
         self._plugin_sync = plugin_sync
+        self._host_supervisor = host_supervisor
         self._sessions = sessions
         #: The reviewed steps machinery: guarded transitions, the shared
         #: whole-stream event cursor, the crash-window translation and
@@ -865,6 +870,111 @@ class AgentRunExecutor:
     def close(self) -> None:
         """Stop the executor's loop thread (worker shutdown convenience)."""
         self._steps.close()
+
+    # -- host reconciliation (self-healing unknown steps) ----------------
+
+    async def areconcile_step(self, run_id: str, seq: int) -> bool:
+        """Inspect one ``outcome_unknown`` step's remote receipt; resolve it.
+
+        Returns ``True`` when the step row was updated to a terminal state.
+        """
+        row = await self._steps.aread_step(run_id, seq)
+        if row is None:
+            return False
+        receipt = row.get("receipt")
+        if not isinstance(receipt, Mapping):
+            return False
+        op_id_value = receipt.get("op_id")
+        if not isinstance(op_id_value, str) or not op_id_value.strip():
+            return False
+        capability_id = str(row.get("capability_id", ""))
+        if capability_id != "host.shell":
+            return False
+        if self._host_supervisor is None:
+            return False
+        try:
+            op_id = uuid.UUID(op_id_value)
+        except ValueError:
+            return False
+        try:
+            payload = json.loads(str(row.get("payload", "{}")))
+            timeout = float(payload.get("timeout", 120.0))
+        except Exception:
+            timeout = 120.0
+        supervisor = self._host_supervisor
+        try:
+            if callable(self._resolver):
+                resolver = self._resolver()
+            else:
+                resolver = self._resolver
+            report = await asyncio.to_thread(
+                supervisor.inspect_operation,
+                uuid.UUID(run_id),
+                op_id,
+                resolver,
+                timeout,
+            )
+        except Exception:
+            return False
+        if report.status not in (
+            CommandStatus.SUCCEEDED,
+            CommandStatus.FAILED,
+            CommandStatus.CANCELLED,
+        ):
+            return False
+        step_state = (
+            StepState.SUCCEEDED
+            if report.status is CommandStatus.SUCCEEDED
+            else StepState.FAILED
+        )
+        reason = "reconciled_succeeded" if step_state is StepState.SUCCEEDED else "reconciled_failed"
+        receipt_patch = dict(receipt)
+        receipt_patch["resolution"] = "reconciled"
+        if report.stdout is not None:
+            receipt_patch["response"] = report.stdout
+        if report.stderr is not None:
+            receipt_patch["stderr"] = report.stderr
+        if report.exit_code is not None:
+            receipt_patch["exit_code"] = report.exit_code
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    updated = await session.execute(
+                        text(
+                            "UPDATE job_steps SET state = :target, receipt = :receipt "
+                            "WHERE run_id = :run AND seq = :seq AND state = :expected "
+                            "RETURNING step_id"
+                        ),
+                        {
+                            "target": step_state.value,
+                            "receipt": json.dumps(receipt_patch),
+                            "run": uuid.UUID(run_id),
+                            "seq": seq,
+                            "expected": StepState.OUTCOME_UNKNOWN.value,
+                        },
+                    )
+                    if updated.scalar() is None:
+                        return False
+                    await session.execute(
+                        text(
+                            "INSERT INTO job_events (run_id, seq, kind, payload) "
+                            "VALUES (:run, (SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :run), :kind, :payload)"
+                        ),
+                        {
+                            "run": uuid.UUID(run_id),
+                            "kind": "step.completed",
+                            "payload": json.dumps(
+                                {
+                                    "capability_id": str(row.get("capability_id", "unknown")),
+                                    "reason": reason,
+                                    "op_id": op_id_value,
+                                }
+                            ),
+                        },
+                    )
+        except Exception:
+            return False
+        return True
 
     # -- run-state observation (delegated to the reviewed machinery) ------
 
@@ -1951,6 +2061,7 @@ def _settle_unknown(
     deadline = _deadline_of(
         _agent_reconciling(payload_json, call_json, canonical_json(dict(outcome)))
     )
+    reconcile_attempts = 0
     while True:
         row = _agent_read_step(payload_json, int(call["seq"]))
         if row is not None and str(row["state"]) in {
@@ -1974,7 +2085,59 @@ def _settle_unknown(
         remaining = (deadline - _utcnow()).total_seconds()
         if remaining <= 0:
             _agent_wait_resumed(payload_json, RunState.RECONCILING.value)
-            raise AgentStageError(RECONCILE_WAIT_DEADLINE_REASON)
+            executor = _resolve_agent_run()
+            receipt = row["receipt"] if row and isinstance(row["receipt"], Mapping) else {}
+            receipt_patch = dict(receipt)
+            receipt_patch["reason"] = EXECUTION_TIMEOUT_REASON
+            receipt_patch["resolution"] = "timeout"
+            async def _persist_timeout() -> None:
+                async with executor._sessions() as session:
+                    async with session.begin():
+                        await session.execute(
+                            text(
+                                "UPDATE job_steps SET state = :target, receipt = :receipt "
+                                "WHERE run_id = :run AND seq = :seq AND state = :expected"
+                            ),
+                            {
+                                "target": StepState.FAILED.value,
+                                "receipt": json.dumps(receipt_patch),
+                                "run": uuid.UUID(intent.run_id),
+                                "seq": int(call["seq"]),
+                                "expected": StepState.OUTCOME_UNKNOWN.value,
+                            },
+                        )
+                        await session.execute(
+                            text(
+                                "INSERT INTO job_events (run_id, seq, kind, payload) "
+                                "VALUES (:run, (SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :run), :kind, :payload)"
+                            ),
+                            {
+                                "run": uuid.UUID(intent.run_id),
+                                "kind": "step.completed",
+                                "payload": json.dumps(
+                                    {
+                                        "capability_id": str(call.get("capability_id", "unknown")),
+                                        "reason": EXECUTION_TIMEOUT_REASON,
+                                        "op_id": receipt.get("op_id"),
+                                    }
+                                ),
+                            },
+                        )
+            try:
+                executor.run(_persist_timeout())
+            except Exception:
+                pass
+            return {
+                "seq": int(call["seq"]),
+                "state": StepState.FAILED.value,
+                "reason": EXECUTION_TIMEOUT_REASON,
+                "op_id": receipt.get("op_id"),
+                "result_text": (
+                    "The command exceeded the maximum reconciliation window "
+                    "and was terminated. Break the task into smaller chunks "
+                    "or optimize the command."
+                ),
+            }
         DBOS.recv(
             topic=RESUME_TOPIC,
             timeout_seconds=min(
@@ -1982,6 +2145,17 @@ def _settle_unknown(
                 max(MIN_RECV_TIMEOUT_SECONDS, remaining),
             ),
         )
+        reconcile_attempts += 1
+        if reconcile_attempts % 6 == 0:
+            executor = _resolve_agent_run()
+            try:
+                resolved = executor.run(
+                    executor.areconcile_step(intent.run_id, int(call["seq"]))
+                )
+                if resolved:
+                    continue
+            except Exception:
+                pass
 
 
 # Registration at import (the engine trampoline resolves the handler by

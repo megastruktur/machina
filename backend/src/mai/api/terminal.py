@@ -85,6 +85,7 @@ from mai.profiles.files import (
 )
 
 __all__ = [
+    "DEFAULT_TERM",
     "PTY_COLUMNS",
     "PTY_ROWS",
     "REMOTE_SHELL_CMD",
@@ -98,10 +99,13 @@ __all__ = [
 router = APIRouter(prefix="/api/v1/servers", tags=["terminal"])
 
 
+#: Default terminal type exported to the local ssh process and remote shell.
+DEFAULT_TERM: Final = "xterm-256color"
 #: tmux session name every terminal attaches to (``tmux new-session -A -s mai``).
 TMUX_SESSION: Final = "mai"
 #: The remote command: attach to tmux when present, login shell otherwise.
 REMOTE_SHELL_CMD: Final = (
+    f'if [ -z "${{TERM:-}}" ] || [ "${{TERM}}" = "dumb" ]; then export TERM={DEFAULT_TERM}; fi; '
     "if command -v tmux >/dev/null 2>&1; then "
     f"exec tmux new-session -A -s {TMUX_SESSION}; "
     'else exec "${SHELL:-/bin/sh}" -l; fi'
@@ -438,11 +442,15 @@ def _spawn(
     try:
         _resize(master_fd, cols, rows)
         os.set_blocking(master_fd, False)
+        child_env = os.environ.copy()
+        if not child_env.get("TERM") or child_env.get("TERM") == "dumb":
+            child_env["TERM"] = DEFAULT_TERM
         process = subprocess.Popen(  # noqa: S603 - fixed argv, never a shell
             argv,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
+            env=child_env,
             close_fds=True,
             start_new_session=True,
         )

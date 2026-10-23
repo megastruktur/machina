@@ -276,6 +276,7 @@ WAIT_FOR_APPROVAL: Final[str] = "waiting_approval"
 #: Stable receipt reasons owned by this module.
 CRASH_RECOVERY_REASON: Final[str] = "crash_recovery"
 STATUS_UNRESOLVED_REASON: Final[str] = "status_unresolved"
+EXECUTION_TIMEOUT_REASON: Final[str] = "execution_timeout_exceeded"
 
 #: Stable reasons for wait-budget expiry (translate to ``failed`` runs).
 APPROVAL_WAIT_DEADLINE_REASON: Final[str] = "approval_wait_deadline"
@@ -1155,7 +1156,7 @@ class StepExecutor:
                 (
                     await session.execute(
                         text(
-                            "SELECT step_id, state, receipt FROM job_steps "
+                            "SELECT step_id, capability_id, state, receipt FROM job_steps "
                             "WHERE run_id = :run AND seq = :seq"
                         ),
                         {"run": uuid.UUID(run_id), "seq": seq},
@@ -1168,6 +1169,7 @@ class StepExecutor:
             return None
         return {
             "step_id": str(row["step_id"]),
+            "capability_id": row["capability_id"],
             "state": row["state"],
             "receipt": row["receipt"],
         }

@@ -111,6 +111,7 @@ class TestArgvComposition:
         assert composed[-1] == "x"
 
     def test_remote_command_attaches_tmux_with_login_shell_fallback(self) -> None:
+        assert f"export TERM={terminal.DEFAULT_TERM}" in REMOTE_SHELL_CMD
         assert f"tmux new-session -A -s {TMUX_SESSION}" in REMOTE_SHELL_CMD
         assert '${SHELL:-/bin/sh}" -l' in REMOTE_SHELL_CMD
         assert REMOTE_SHELL_CMD.index("command -v tmux") < REMOTE_SHELL_CMD.index(
@@ -154,6 +155,32 @@ class TestPtyPlumbing:
             _terminate_group(process)
             os.close(master_fd)
         assert process.poll() is not None
+
+    def test_spawn_sets_default_term_when_unset_or_dumb(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TERM", raising=False)
+        process, master_fd = _spawn(["/bin/sh", "-c", 'printf "TERM=%s\\n" "$TERM"'], PTY_ROWS, PTY_COLUMNS)
+        try:
+            deadline = time.monotonic() + 5.0
+            collected = b""
+            while time.monotonic() < deadline:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                    if not chunk:
+                        break
+                    collected += chunk
+                except BlockingIOError, InterruptedError:
+                    time.sleep(0.01)
+                    continue
+                except OSError:
+                    break
+                if f"TERM={terminal.DEFAULT_TERM}".encode() in collected:
+                    break
+            assert f"TERM={terminal.DEFAULT_TERM}".encode() in collected
+        finally:
+            _terminate_group(process)
+            os.close(master_fd)
 
 
 # ---------------------------------------------------------------------------

@@ -80,6 +80,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
 from mai.contracts.server import (
@@ -567,7 +568,8 @@ class HostShellCapability:
             timeout=DEFAULT_PROBE_TIMEOUT,
         )
         report = self._inspect(identity, handle, key_path, known_hosts)
-        deadline = time.monotonic() + self._settle
+        settle = min(MAX_SETTLE_SECONDS, max(self._settle, request.timeout + 5.0))
+        deadline = time.monotonic() + settle
         while report.status not in _TERMINAL_STATUSES and time.monotonic() < deadline:
             time.sleep(SETTLE_POLL_SECONDS)
             report = self._inspect(identity, handle, key_path, known_hosts)
@@ -591,6 +593,32 @@ class HostShellCapability:
             known_hosts_path=known_hosts,
             output_budget=self._budget,
             timeout=DEFAULT_PROBE_TIMEOUT,
+        )
+
+    def inspect_operation(
+        self, run_id: uuid.UUID, op_id: uuid.UUID, resolver: Any, timeout: float
+    ) -> SupervisionReport:
+        """Inspect one remote receipt for a reconciler (synchronous)."""
+        from mai.execution.supervisor import load_intent
+        from mai.credentials.env import EnvResolver
+
+        intent = load_intent(self._intents_dir, op_id)
+        profile = self._profiles(intent.server_id)
+        key_path: str = ""
+        if isinstance(resolver, EnvResolver) and profile.ssh.credential_ref:
+            key_path = resolver.resolve(profile.ssh.credential_ref).value
+        if not key_path:
+            raise HostShellError(
+                HostShellErrorCode.INVALID_CONTEXT,
+                "credential resolution failed for inspection",
+            )
+        return inspect_supervised_command(
+            profile.ssh,
+            intent,
+            key_path=key_path,
+            known_hosts_path=self._known_hosts(intent.server_id),
+            output_budget=self._budget,
+            timeout=min(timeout, 300.0),
         )
 
     def _result_document(

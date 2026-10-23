@@ -62,7 +62,8 @@ COPY --from=build --chown=10001:10001 /app/.venv /app/.venv
 COPY backend/alembic.ini /app/alembic.ini
 COPY backend/migrations/ /app/migrations/
 ENV PATH="/app/.venv/bin:${PATH}" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TERM=xterm-256color
 WORKDIR /app
 USER 10001:10001
 EXPOSE 8000
