@@ -30,12 +30,17 @@ import pydantic_ai
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 # The one selected agent-runtime requirement: distribution, its single enabled
-# extra, and the manifest bounds (floor = the version whose API is verified
-# below; cap = deliberate major-bump reconciliation, repo convention).
+# extra, and the exact pin. The version is pinned EXACTLY (not floored) in
+# lockstep with pydantic-ai-harness, whose own hard pin
+# pydantic-ai-slim==2.60.0 forces the pair to move together deliberately.
 AGENT_RUNTIME_DISTRIBUTION = "pydantic-ai-slim"
 AGENT_RUNTIME_EXTRA = "openai"
-AGENT_RUNTIME_FLOOR = ">=2.56"
-AGENT_RUNTIME_MAJOR_CAP = "<3"
+AGENT_RUNTIME_PIN = "==2.60.0"
+# The conversation-compaction capability library (TieredCompaction and its
+# tier strategies attach to the per-round Agent); pinned exactly because the
+# harness itself hard-pins pydantic-ai-slim.
+HARNESS_DISTRIBUTION = "pydantic-ai-harness"
+HARNESS_PIN = "==0.60.0"
 
 # Provider SDKs pydantic-ai supports but MAI did not select: the configured
 # gateway is OpenAI-compatible (criterion 2 — no automatic proprietary-provider
@@ -144,8 +149,11 @@ def test_manifest_declares_exactly_the_selected_agent_runtime() -> None:
     assert _extras_of(entry) == [AGENT_RUNTIME_EXTRA], (
         f"minimal extras violated — expected only [{AGENT_RUNTIME_EXTRA}]: {entry}"
     )
-    assert AGENT_RUNTIME_FLOOR in entry, f"floor {AGENT_RUNTIME_FLOOR} missing: {entry}"
-    assert AGENT_RUNTIME_MAJOR_CAP in entry, f"major cap {AGENT_RUNTIME_MAJOR_CAP} missing: {entry}"
+    assert AGENT_RUNTIME_PIN in entry, f"exact pin {AGENT_RUNTIME_PIN} missing: {entry}"
+    harness_entries = _requirements_for(_declared_requirements(), HARNESS_DISTRIBUTION)
+    assert harness_entries == [HARNESS_DISTRIBUTION + HARNESS_PIN], (
+        f"harness must be declared exactly once as {HARNESS_DISTRIBUTION}{HARNESS_PIN}: {harness_entries}"
+    )
     # The meta-package would silently pull additional provider SDKs: never
     # declare it alongside the slim distribution.
     assert "pydantic-ai" not in _distribution_names(_declared_requirements()), (

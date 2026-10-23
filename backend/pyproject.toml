@@ -38,11 +38,19 @@ dependencies = [
     # dbos==3.2.0 direct pin, contracts.md C05 — pydantic-ai's dbos/temporal/
     # prefect extras are alternate-engine vectors) may enter silently;
     # backend/tests/test_agent_dependencies.py holds both negative controls
-    # across manifest, lock and installed environment. Bounded <3 so the
-    # framework's next major API break is a deliberate reconciliation with
-    # its downstream consumers (06-agent-run/06-tool-bridge), not a silent
-    # upgrade; within 2.x the lock file fixes the exact resolved version.
-    "pydantic-ai-slim[openai]>=2.56,<3",
+    # across manifest, lock and installed environment. Pinned EXACTLY (with
+    # the harness below in lockstep) so the verified compaction API surface
+    # and the framework's behavior move together, deliberately, never as a
+    # silent upgrade.
+    "pydantic-ai-slim[openai]==2.60.0",
+    # Conversation-compaction capability library for the agent runtime
+    # (compaction card): TieredCompaction and its tier strategies attach to
+    # the per-round Agent as capabilities and run inside the model request,
+    # so the compacted history lands in the same checkpointed round record
+    # (no separate DBOS step). Harness 0.60.0 hard-pins
+    # pydantic-ai-slim==2.60.0, so the runtime pin above moves in
+    # lockstep with it; the frozen dbos==3.2.0 engine pin is untouched.
+    "pydantic-ai-harness==0.60.0",
     # Document-chunk embeddings client (contracts.md C07 rule 3/7; ADR
     # docs/architecture/knowledge-packaging.md §4): the doc index embeds via
     # POST {base_url}/v1/embeddings on the SAME configured OpenAI-compatible
