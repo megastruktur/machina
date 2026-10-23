@@ -396,9 +396,6 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
         ("GET", "/api/v1/servers/{server_id}/memory/export"),
         ("POST", "/api/v1/servers/{server_id}/memory/delete"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
     }
     mutating = {route.path for route in api_routes if route.methods - {"GET", "HEAD"}}
     assert mutating == {
@@ -441,9 +438,6 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/servers/{server_id}/memory/retain",
         "/api/v1/servers/{server_id}/memory/reflect",
         "/api/v1/servers/{server_id}/memory/delete",
-        "/api/v1/servers/{server_id}/models/local/preview",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     assert "/docs" not in {route.path for route in api_routes}
     assert "/openapi.json" not in {route.path for route in api_routes}
@@ -522,9 +516,6 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/servers/{server_id}/memory/reflect",
         "/api/v1/servers/{server_id}/memory/export",
         "/api/v1/servers/{server_id}/memory/delete",
-        "/api/v1/servers/{server_id}/models/local/preview",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     login = schema["paths"]["/api/v1/auth/login"]["post"]
     assert {"204", "401", "403", "422", "429"} == set(login["responses"])

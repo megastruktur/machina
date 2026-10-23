@@ -523,14 +523,11 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # conversations stay worker-owned; the probe is a single bounded
     # diagnostic round owned by this surface.
     register_models(app)
-    # The knowledge/memory and local-model surfaces (C07/C09): the
-    # session-derived, grant-gated Hindsight memory operations
-    # (status/recall/retain/reflect/export/delete — bank scope derived
-    # from the context, never a client-supplied name) and the local-model
-    # planned lifecycle (measured prerequisite preview; durable
-    # install/pull intents through the jobs facade — the pull's
-    # executor-owned completion registers the verified endpoint). No
-    # memory content or target effect ever bypasses the producers.
+    # The memory surface (C07): the session-derived, grant-gated
+    # Hindsight memory operations (status/recall/retain/reflect/
+    # export/delete — bank scope derived from the context, never a
+    # client-supplied name). No memory content or target effect ever
+    # bypasses the producer.
     register_knowledge_models(app)
     # The canonical documents surface (C02/C07): docs/runbook CRUD with
     # provenance and revision checks, hybrid cited retrieval, explicit

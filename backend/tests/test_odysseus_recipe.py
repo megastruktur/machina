@@ -8,9 +8,9 @@ website/setup.md), never from its implementation (IDEA.md: inspiration only,
 no code reuse). This module validates the recipe through the canonical
 schema frozen by 08-recipe-schema (``parse_recipe_text`` ->
 ``render_recipe`` -> ``build_deployment_plan``), pins the digest pin, the
-declared resource budget (hw.* tokens evaluated with the producer semantics
-imported from the 11-model-recipe test module — one vocabulary, one
-evaluator, no second convention), and the standalone single-service
+declared resource budget (hw.* tokens evaluated with the producer
+semantics frozen below — one vocabulary, one evaluator, no second
+convention), and the standalone single-service
 curation: the schema v1 deploys exactly one service, and the upstream
 bundled chromadb/searxng/ntfy stack must NOT be re-deployed beside MAI's
 own production stack (C09, acceptance 2 — verified degraded-not-fatal on
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import re
 import uuid
 from pathlib import Path
 
@@ -48,12 +49,87 @@ from mai.applications.recipes import (
     render_compose,
     render_recipe,
 )
-from test_inference_recipe import (
-    _GIB,
-    _HARDWARE_TOKEN_RE,
-    APPROVED_TARGET_FACTS,
-    evaluate_hardware_checks,
-)
+
+# ---------------------------------------------------------------------------
+# The hardware prerequisite schema: token vocabulary + check semantics
+# (producer definition for the executor's verify_prerequisites operation;
+# fail-closed: a token that cannot be evaluated counts as NOT satisfied)
+# ---------------------------------------------------------------------------
+
+#: Token grammar families of the prerequisite schema (enforced on every
+#: curated token).
+_HARDWARE_TOKEN_RE = re.compile(r"^hw\.(arch|cpu|ram|vram|disk)\.[a-z0-9_.+-]+$")
+
+_GIB = 1024**3
+
+
+#: The measured facts of the approved host class (coordinator host,
+#: 2026-10-18): x86_64, AVX2, 121.5 GiB RAM, ~499 GiB free at the Docker
+#: data root, no NVIDIA GPU (CPU-only target). Feeding these through
+#: :func:`evaluate_hardware_checks` must satisfy every declared token.
+APPROVED_TARGET_FACTS = {
+    "docker_compose_ready": True,
+    "arch": "x86_64",
+    "cpu_flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr "
+    "pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall "
+    "nx rdtscp lm constant_tsc arch_perfmon avx2 bmi1 bmi2",
+    "ram_bytes": 122 * _GIB,
+    "disk_free_bytes": 490 * _GIB,
+}
+
+
+def evaluate_hardware_checks(
+    declared: frozenset[str] | set[str], facts: dict[str, object]
+) -> frozenset[str]:
+    """Return the declared prerequisite tokens the facts do NOT satisfy.
+
+    Check semantics (frozen producer semantics):
+      docker          facts["docker_compose_ready"] is true
+      hw.arch.<a>     facts["arch"] equals <a>
+      hw.cpu.<f>      facts["cpu_flags"] contains <f> as a whitespace token
+      hw.ram.<N>gb    facts["ram_bytes"] >= N GiB
+      hw.vram.<N>gb   facts["vram_bytes"] >= N GiB (reserved; never declared
+                      by the CPU-only recipe)
+      hw.disk.<N>gb   facts["disk_free_bytes"] >= N GiB
+    """
+    unsatisfied: set[str] = set()
+    for token in sorted(declared):
+        if token == "docker":
+            if facts.get("docker_compose_ready") is not True:
+                unsatisfied.add(token)
+            continue
+        match = _HARDWARE_TOKEN_RE.fullmatch(token)
+        if match is None:
+            # Outside the frozen families: a check the executor cannot
+            # interpret must fail closed, never silently pass.
+            unsatisfied.add(token)
+            continue
+        family = match.group(1)
+        spec = token.removeprefix(f"hw.{family}.")
+        if family == "arch":
+            if facts.get("arch") != spec:
+                unsatisfied.add(token)
+        elif family in ("cpu",):
+            flags = facts.get("cpu_flags", "")
+            satisfied = isinstance(flags, str) and spec in flags.split()
+            if not satisfied:
+                unsatisfied.add(token)
+        else:
+            try:
+                budget = int(spec.removesuffix("gb"))
+            except ValueError:
+                unsatisfied.add(token)
+                continue
+            key = {
+                "ram": "ram_bytes",
+                "vram": "vram_bytes",
+                "disk": "disk_free_bytes",
+            }[family]
+            value = facts.get(key)
+            if not isinstance(value, int) or value < budget * _GIB:
+                unsatisfied.add(token)
+    return frozenset(unsatisfied)
+
 
 #: The catalogue lives at repository root, beside ``backend/``.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -85,8 +161,7 @@ UPSTREAM_MAINTENANCE_DOCS = "website/setup.md"
 #: unpacked image 2.62 GiB, idle RSS 508.6 MiB. The disk token covers the
 #: unpacked image plus a user-data headroom (sqlite DB, uploads, caches);
 #: Cookbook model downloads are explicit in-app admin acquisitions with
-#: their own budgets, outside this deployment budget (same rule as the
-#: sibling local-inference recipe).
+#: their own budgets, outside this deployment budget.
 IMAGE_UNPACKED_GIB = 3
 DATA_HEADROOM_GIB = 5
 DISK_BUDGET_TOKEN = "hw.disk.10gb"

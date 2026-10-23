@@ -136,10 +136,6 @@ export type McpDiscoveryReportView = components['schemas']['McpDiscoveryReportVi
 export type ModelConnectionBody = components['schemas']['ModelConnectionBody'];
 export type ModelConnectionList = components['schemas']['ModelConnectionList'];
 export type ModelConnectionView = components['schemas']['ModelConnectionView'];
-export type ModelLocalPreviewBody = components['schemas']['ModelLocalPreviewBody'];
-export type ModelLocalPreviewView = components['schemas']['ModelLocalPreviewView'];
-export type ModelLocalPullBody = components['schemas']['ModelLocalPullBody'];
-export type ModelLocalSubmitBody = components['schemas']['ModelLocalSubmitBody'];
 export type ModelMutationResult = components['schemas']['ModelMutationResult'];
 export type ModelProbeBody = components['schemas']['ModelProbeBody'];
 export type ModelProbeOutcome = components['schemas']['ModelProbeOutcome'];
@@ -637,23 +633,6 @@ export interface MaiApiClient {
 	exportMemory(serverId: string, scope: string): Promise<MemoryExportDocument>;
 	/** POST /api/v1/servers/{id}/memory/delete — explicit, receipted. */
 	deleteMemory(serverId: string, payload: MemoryDeleteBody): Promise<MemoryDeleteDocument>;
-	/** POST /api/v1/servers/{id}/models/local/preview — effect-free measurement. */
-	previewModelInstall(
-		serverId: string,
-		payload: ModelLocalPreviewBody
-	): Promise<ModelLocalPreviewView>;
-	/** POST /api/v1/servers/{id}/models/local/{app}/install — durable intent. */
-	installModelService(
-		serverId: string,
-		applicationId: string,
-		payload: ModelLocalSubmitBody
-	): Promise<RunCreated>;
-	/** POST /api/v1/servers/{id}/models/local/{app}/pull — pull IS registration. */
-	pullModelWeights(
-		serverId: string,
-		applicationId: string,
-		payload: ModelLocalPullBody
-	): Promise<RunCreated>;
 }
 
 /**
@@ -1039,7 +1018,7 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				`/api/v1/monitoring/servers/${encodeURIComponent(serverId)}/notifications/${encodeURIComponent(alertId)}/ack`
 			),
 
-		// Memory + local models (P11).
+		// Memory (P11).
 		memoryStatus: (serverId) =>
 			requestJson<MemoryStatusDocument>(
 				'GET',
@@ -1072,24 +1051,6 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<MemoryDeleteDocument>(
 				'POST',
 				`/api/v1/servers/${encodeURIComponent(serverId)}/memory/delete`,
-				payload
-			),
-		previewModelInstall: (serverId, payload) =>
-			requestJson<ModelLocalPreviewView>(
-				'POST',
-				`/api/v1/servers/${encodeURIComponent(serverId)}/models/local/preview`,
-				payload
-			),
-		installModelService: (serverId, applicationId, payload) =>
-			requestJson<RunCreated>(
-				'POST',
-				`/api/v1/servers/${encodeURIComponent(serverId)}/models/local/${encodeURIComponent(applicationId)}/install`,
-				payload
-			),
-		pullModelWeights: (serverId, applicationId, payload) =>
-			requestJson<RunCreated>(
-				'POST',
-				`/api/v1/servers/${encodeURIComponent(serverId)}/models/local/${encodeURIComponent(applicationId)}/pull`,
 				payload
 			)
 	};

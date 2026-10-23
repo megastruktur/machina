@@ -863,8 +863,6 @@
 			case KNOWLEDGE_MODELS_PANEL_KIND:
 				return asBag(
 					knowledgeModelsServices(api, {
-						openApplications: (serverId) => openServerPanel(APPLICATIONS_PANEL_KIND, serverId),
-						openJobs: (serverId) => openServerPanel(JOBS_PANEL_KIND, serverId),
 						openModelSettings: () => openPanel(MODEL_SETTINGS_PANEL_KIND, { kind: 'global' })
 					})
 				);
@@ -905,16 +903,18 @@
 	 * Launcher open: registry scope check first (the composed open path),
 	 * then the validated state transition. The scope is built from the
 	 * entry's declared scope types and the CURRENT selection — one explicit
-	 * target per open, never a shared mutable target.
+	 * target per open, never a shared mutable target. Entries declaring a
+	 * global scope (the Global / Fleet kinds) pin `{ kind: 'global' }`;
+	 * server-only entries pin the current selection.
 	 */
 	function openPanel(kind: PanelKind, scopeOverride?: WindowScope): void {
 		const entry = registry.entry(kind);
 		if (!entry) return;
 		const scope: WindowScope =
 			scopeOverride ??
-			(entry.scope_types.has('server')
-				? { kind: 'server', server_id: selectedServerId }
-				: { kind: 'global' });
+			(entry.scope_types.has('global')
+				? { kind: 'global' }
+				: { kind: 'server', server_id: selectedServerId });
 		const scopeCheck = registry.checkScope(kind, scope);
 		if (!scopeCheck.ok) {
 			status = `Cannot open ${entry.title}: ${scopeCheck.issue.message}`;

@@ -277,16 +277,13 @@ _FEATURE_SURFACE = frozenset(
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
         ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
         ("GET", "/api/v1/monitoring/notification-policy"),
-        # (11-knowledge-api: memory surface + local model install/pull.)
+        # (11-knowledge-api: memory surface.)
         ("GET", "/api/v1/servers/{server_id}/memory/status"),
         ("POST", "/api/v1/servers/{server_id}/memory/recall"),
         ("POST", "/api/v1/servers/{server_id}/memory/retain"),
         ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
         ("GET", "/api/v1/servers/{server_id}/memory/export"),
         ("POST", "/api/v1/servers/{server_id}/memory/delete"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
         # (mai-wire-desktop: the launcher's server list route.)
         ("GET", "/api/v1/servers"),
     }
@@ -489,16 +486,13 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}",
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
         "/api/v1/monitoring/notification-policy",
-        # (11-knowledge-api: memory surface + local model install/pull.)
+        # (11-knowledge-api: memory surface.)
         "/api/v1/servers/{server_id}/memory/status",
         "/api/v1/servers/{server_id}/memory/recall",
         "/api/v1/servers/{server_id}/memory/retain",
         "/api/v1/servers/{server_id}/memory/reflect",
         "/api/v1/servers/{server_id}/memory/export",
         "/api/v1/servers/{server_id}/memory/delete",
-        "/api/v1/servers/{server_id}/models/local/preview",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/install",
-        "/api/v1/servers/{server_id}/models/local/{application_id}/pull",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]

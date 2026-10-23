@@ -1,11 +1,9 @@
-"""Focused tests for the knowledge/memory and local-model HTTP surfaces
-(card 11-knowledge-api).
+"""Focused tests for the memory HTTP surface (card 11-knowledge-api).
 
 Card ``11-knowledge-api`` against contracts.md **C07** (bank-scoped memory,
-KB-H2 honesty), **C03** (grant-gated, credential-reference-only), **C09**
-(durable planned lifecycle, real prerequisite facts), **C08** (session/
-origin/CSRF boundary, registration under the shared app factory), **C01**
-(envelope, identity, scope), **C02** (canonical stores).
+KB-H2 honesty), **C03** (grant-gated, credential-reference-only), **C08**
+(session/origin/CSRF boundary, registration under the shared app factory),
+**C01** (envelope, identity, scope), **C02** (canonical stores).
 
 Boundary discipline (test policy): every HTTP claim runs through the real
 ASGI app (``create_app`` + lifespan + middleware + handlers) against a real
@@ -13,18 +11,11 @@ disposable Postgres (fixture ``migrated_url``) through the real linear
 Alembic chain. Memory operations run the PRODUCER's own capability
 executors over a recording provider double (the canned documents are the
 upstream shapes the ``11-memory-adapter`` tests froze); grant denials run
-through the REAL ``GrantConfigStore`` + policy evaluator; the preview
-transport tests exercise the REAL pinned-identity SSH lane against a
-loopback-refused endpoint (real transport classification, no mock).
-Durable install/pull submits run through the REAL jobs facade and DBOS
-engine schema.
+through the REAL ``GrantConfigStore`` + policy evaluator.
 
 Registered limitations: no live Hindsight instance (bank naming, scoping,
 payload screening and honest failure documents are producer-executor truth;
-the assembled two-bank live journey is ``11-verify``'s scenario); no real
-sshd fixture on this surface (host-key pinning and measured-facts verdicts
-are covered by the producer cards; ``11-verify`` owns the assembled
-hardware-budget journey).
+the assembled two-bank live journey is ``11-verify``'s scenario).
 """
 
 from __future__ import annotations
@@ -66,7 +57,6 @@ ORIGIN = "http://127.0.0.1:8443"  # loopback allowlist entry
 EVIL_ORIGIN = "https://attacker.example"
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-RECIPE_PATH = BACKEND_ROOT.parent / "catalogue" / "local-inference.yaml"
 
 SERVER_ID = "11a6c2e4-1b3d-4f5a-8c7e-2d3b4a5f6e70"
 SERVER_B_ID = "22b7d3f5-2c4e-5a6b-9d8f-3e4c5b6a7f81"
@@ -1064,267 +1054,9 @@ class TestBodyShapes:
             ),
             (surface.MemoryReflectBody, {"scope": "server", "query": "q"}),
             (surface.MemoryDeleteBody, {"scope": "server", "target": "bank"}),
-            (
-                surface.ModelLocalPreviewBody,
-                {
-                    "application_id": str(uuid.uuid4()),
-                    "recipe": "x",
-                    "target_os": "linux",
-                    "target_arch": "x86_64",
-                },
-            ),
-            (
-                surface.ModelLocalSubmitBody,
-                {
-                    "run_id": str(uuid.uuid4()),
-                    "recipe": "x",
-                    "target_os": "linux",
-                    "target_arch": "x86_64",
-                },
-            ),
-            (
-                surface.ModelLocalPullBody,
-                {
-                    "run_id": str(uuid.uuid4()),
-                    "recipe": "x",
-                    "target_os": "linux",
-                    "target_arch": "x86_64",
-                    "model": "qwen2.5:0.5b",
-                    "license": "MIT",
-                    "base_url": "http://127.0.0.1:9/v1",
-                },
-            ),
         ):
             with pytest.raises(ValidationError):
                 body_class.model_validate({**seed, "api_key": "sk-forged"})  # type: ignore[call-arg]
-
-
-# ---------------------------------------------------------------------------
-# local-model surface (acceptance 1: durable planned lifecycle, real facts)
-# ---------------------------------------------------------------------------
-
-
-def _recipe_text() -> str:
-    return RECIPE_PATH.read_text(encoding="utf-8")
-
-
-class TestModelLocalSurface:
-    async def test_nt_preview_unknown_target_is_not_found(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/preview",
-            json_body={
-                "application_id": str(uuid.uuid4()),
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert response.status == 404, response.body
-        assert _error(response)["code"] == "not_found"
-
-    async def test_nt_preview_bad_recipe_is_rejected(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=False)  # type: ignore[arg-type]
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/preview",
-            json_body={
-                "application_id": str(uuid.uuid4()),
-                "recipe": ":::: not yaml",
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert response.status == 422, response.body
-        error = _error(response)
-        assert error["code"] == "validation_failed"
-        assert "recipe" in error["fields"]
-
-    async def test_nt_preview_without_transport_key_is_invalid_configuration(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=False)  # type: ignore[arg-type]
-        # The .env fixture for this test lacks the SSH key reference: the
-        # transport prerequisite refuses BEFORE any connection attempt.
-        env_file = knowledge_app.state.env["MAI_ENV_FILE"]  # type: ignore[arg-type]
-        Path(env_file).write_text("# no ssh key reference\n")
-        os.chmod(env_file, 0o600)
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/preview",
-            json_body={
-                "application_id": str(uuid.uuid4()),
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert response.status == 422, response.body
-        assert _error(response)["code"] == "invalid_configuration"
-
-    async def test_preview_classifies_unreachable_target_as_unavailable(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=True)  # type: ignore[arg-type]
-        # Real pinned-identity transport against a loopback-refused
-        # endpoint: the measurement lane reports the transport class
-        # honestly (503 unavailable) — no invented facts.
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/preview",
-            json_body={
-                "application_id": str(uuid.uuid4()),
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert response.status == 503, response.body
-        assert _error(response)["code"] == "unavailable"
-
-    async def test_install_submit_is_durable_idempotent_and_gated_by_name(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=False)  # type: ignore[arg-type]
-        application_id = uuid.uuid4()
-        body = {
-            "run_id": str(uuid.uuid4()),
-            "recipe": _recipe_text(),
-            "target_os": "linux",
-            "target_arch": "x86_64",
-        }
-        first = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{application_id}/install",
-            json_body=body,
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert first.status == 201, first.body
-        created = first.json()
-        assert created["deduplicated"] is False
-        assert created["run"]["requested_grants"] == ["model.install"]
-        duplicate = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{application_id}/install",
-            json_body=body,
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert duplicate.status == 200, duplicate.body
-        assert duplicate.json()["deduplicated"] is True
-        assert duplicate.json()["run"]["run_id"] == created["run"]["run_id"]
-
-    async def test_pull_submit_names_the_same_locked_lifecycle_capability(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=False)  # type: ignore[arg-type]
-        application_id = uuid.uuid4()
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{application_id}/pull",
-            json_body={
-                "run_id": str(uuid.uuid4()),
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-                "model": "qwen2.5:0.5b-instruct-q4_K_M",
-                "license": "Apache-2.0 (fixture metadata)",
-                "base_url": "http://127.0.0.1:11434/v1",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert response.status == 201, response.body
-        created = response.json()
-        # The pull intent names the SAME granted capability as install: the
-        # worker's G2 gate (grant + policy + one-use approval bound to THIS
-        # payload) owns the effect; the executor's pull flow locks the same
-        # exclusive per-application lease identity (C05 rule 6, producer-
-        # tested in test_local_models).
-        assert created["run"]["requested_grants"] == ["model.install"]
-
-    async def test_nt_install_duplicate_run_id_with_other_intent_conflicts(
-        self, knowledge_app: FastAPI, jar: dict[str, str]
-    ) -> None:
-        root = knowledge_app.state.env["MAI_DATA_ROOT"]  # type: ignore[arg-type]
-        _seed_server(root, SERVER_ID, known_hosts=False)  # type: ignore[arg-type]
-        application_id = uuid.uuid4()
-        run_id = str(uuid.uuid4())
-        first = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{application_id}/install",
-            json_body={
-                "run_id": run_id,
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert first.status == 201, first.body
-        conflict = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{application_id}/pull",
-            json_body={
-                "run_id": run_id,
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-                "model": "qwen2.5:0.5b-instruct-q4_K_M",
-                "license": "Apache-2.0 (fixture metadata)",
-                "base_url": "http://127.0.0.1:11434/v1",
-            },
-            headers=_mutation_headers(jar),
-            cookies=_read_cookies(jar),
-        )
-        assert conflict.status == 409, conflict.body
-        assert _error(conflict)["code"] == "conflict"
-
-    async def test_nt_install_without_session_is_unauthenticated(
-        self, knowledge_app: FastAPI
-    ) -> None:
-        response = await call_app(
-            knowledge_app,
-            "POST",
-            f"/api/v1/servers/{SERVER_ID}/models/local/{uuid.uuid4()}/install",
-            json_body={
-                "run_id": str(uuid.uuid4()),
-                "recipe": _recipe_text(),
-                "target_os": "linux",
-                "target_arch": "x86_64",
-            },
-            headers={"origin": ORIGIN},
-        )
-        assert response.status == 401, response.body
-        assert _error(response)["code"] == "unauthenticated"
 
 
 # ---------------------------------------------------------------------------
@@ -1346,9 +1078,6 @@ class TestOpenApiContract:
                 "export",
                 "delete",
             )
-        } | {
-            f"/api/v1/servers/{{server_id}}/models/local/{tail}"
-            for tail in ("preview", "{application_id}/install", "{application_id}/pull")
         }
         assert expected <= paths, sorted(expected - paths)
         components = set(contract["components"]["schemas"])
@@ -1356,10 +1085,6 @@ class TestOpenApiContract:
             "MemoryRecallBody",
             "MemoryRetainBody",
             "MemoryDeleteBody",
-            "ModelLocalPreviewBody",
-            "ModelLocalSubmitBody",
-            "ModelLocalPullBody",
-            "ModelLocalPreviewView",
         ):
             assert name in components
         # Earlier surfaces' components stay intact (no namespace collision).

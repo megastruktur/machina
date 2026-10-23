@@ -8,7 +8,10 @@
 	 *
 	 * Inside each server accordion, panels are organized by logical category
 	 * (`Operations`, `AI & Knowledge`, `Governance`) using `<NavItem>` without
-	 * repeating the server name on every button.
+	 * repeating the server name on every button. Global / Fleet panel kinds
+	 * (`knowledge-models`, `model-settings`, `plugins`) plus every global-only
+	 * entry render ONCE under the `Global / Fleet` section and pin the global
+	 * scope on open.
 	 */
 	import AccordionGroup from '$lib/ui/AccordionGroup.svelte';
 	import NavItem from '$lib/ui/NavItem.svelte';
@@ -54,12 +57,26 @@
 		expandedByServer = { ...expandedByServer, [serverId]: open };
 	}
 
+	/**
+	 * Panel kinds rendered ONCE in the Global / Fleet section. They never
+	 * repeat inside a server accordion, and a global-section open pins the
+	 * `{ kind: 'global' }` scope.
+	 */
+	const GLOBAL_KINDS: readonly string[] = ['knowledge-models', 'model-settings', 'plugins'];
+
 	const serverScopedEntries = $derived(
-		entries.filter((entry) => entry.scope_types.has('server') && entry.panel_kind !== 'chat')
+		entries.filter(
+			(entry) =>
+				entry.scope_types.has('server') &&
+				!GLOBAL_KINDS.includes(entry.panel_kind) &&
+				entry.panel_kind !== 'chat'
+		)
 	);
 
 	const globalEntries = $derived(
-		entries.filter((entry) => !entry.scope_types.has('server'))
+		entries.filter(
+			(entry) => !entry.scope_types.has('server') || GLOBAL_KINDS.includes(entry.panel_kind)
+		)
 	);
 
 	const CATEGORY_ORDER: readonly { id: string; title: string; kinds: readonly string[] }[] = [
@@ -71,12 +88,12 @@
 		{
 			id: 'ai',
 			title: 'AI & Knowledge',
-			kinds: ['docs', 'knowledge-models', 'model-settings']
+			kinds: ['docs']
 		},
 		{
 			id: 'gov',
 			title: 'Governance & Extensions',
-			kinds: ['capability-policy', 'plugin-forms', 'plugins']
+			kinds: ['capability-policy', 'plugin-forms']
 		}
 	];
 

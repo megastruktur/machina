@@ -1,19 +1,21 @@
 <script module lang="ts">
 	/**
-	 * KnowledgeAndModels — reusable Hindsight memory + local-models panel body
-	 * (card `mai-11-web-memory-models`, P11; service row `mai-web`, contracts
+	 * KnowledgeAndModels — reusable Hindsight memory panel body (card
+	 * `mai-11-web-memory-models`, P11; service row `mai-web`, contracts
 	 * C01/C03/C06/C07/C08/C11).
 	 *
 	 * Layer: feature panel body (windowed-workspace ADR-0001 §2 layer table).
 	 * It owns its one domain view and nothing else:
 	 *
-	 *  - Explicit context only: a SERVER-scoped view. `panel.scope.server_id`
-	 *    is the pinned target of every call — this module reads no launcher/
-	 *    current-server value anywhere, so there is no hidden global mutation
-	 *    target (ADR §3.2, NT5). Memory scopes are the producer's vocabulary:
-	 *    `"server"` (the context's own bank) or `"shared:<name>"` (the
-	 *    configured allowlist); a payload can never name a raw bank.
-	 *  - Explicit services only: the memory/local-model API enters through
+	 *  - Explicit context only: a pinned-scope view. A server window targets
+	 *    `panel.scope.server_id`; a global (Global / Fleet) window targets
+	 *    the fleet sentinel server id (`MEMORY_GLOBAL_SERVER_ID`) — this
+	 *    module reads no launcher/current-server value anywhere, so there is
+	 *    no hidden global mutation target (ADR §3.2, NT5). Memory scopes are
+	 *    the producer's vocabulary: `"server"` (the target's own bank) or
+	 *    `"shared:<name>"` (the configured allowlist); a payload can never
+	 *    name a raw bank.
+	 *  - Explicit services only: the memory API enters through
 	 *    `panel.services.api` (the typed `KnowledgeModelsApi` shape owned by
 	 *    the feature entry module). A missing/incomplete bag fails closed
 	 *    with a visible state — no service locator, no fallback client.
@@ -24,27 +26,15 @@
 	 *    document says `status: "ok"`, and an outage document paints the
 	 *    classified outage (`provider_timeout` / `provider_unreachable` /
 	 *    `provider_error` / `memory_disabled` / …) with no results list.
-	 *  - No UI-only model state (brief acceptance 2): installed/registered
-	 *    truth is exactly what the producer reports — the prerequisite
-	 *    verdict of a REAL measurement (`verdict` over `facts`/`unknown`),
-	 *    the durable run receipts (`RunDetail` steps), and the registered
-	 *    connection document (`credential_ref` absent for the unauthenticated
-	 *    local endpoint). The panel never infers or remembers success.
-	 *  - Credential non-disclosure (C03 rule 6): no value field exists. The
-	 *    1Password integration is the REFERENCE vocabulary only: the
-	 *    credential-reference checker classifies `.env` names and `op://`
-	 *    references (strict producer grammar from
-	 *    `mai.credentials.onepassword`) value-free, client-side, with zero
-	 *    network use — a value is never entered, sent, stored or displayed.
-	 *  - The pull IS the registration path (11-model-install): no separate
-	 *    registration control exists; the registered connection surface
-	 *    reads the stored C02 record (deterministic per-server name).
+	 *  - No UI-only memory state: retained/deleted truth is exactly what the
+	 *    producer's receipt reports. The panel never infers or remembers
+	 *    success.
+	 *  - Credential non-disclosure (C03 rule 6): no value field exists on
+	 *    this surface — memory payloads never accept or return a credential
+	 *    value, and none is entered, sent, stored, displayed or logged.
 	 *  - Mount reads, never writes (ADR §7.2): opening issues only the
-	 *    status probe and the connection-list read. Every write happens on
-	 *    an explicit action; destructive bank deletion requires an explicit
-	 *    typed confirmation. The only poll is a watched submit run (bounded
-	 *    1.5 s cadence, stopped at terminal states and torn down on hide/
-	 *    close — the reviewed ApplicationActions convention).
+	 *    status probe. Every write happens on an explicit action;
+	 *    destructive bank deletion requires an explicit typed confirmation.
 	 *  - No window mechanics: no drag/geometry/focus/persistence code and no
 	 *    workspace-state imports; the window host supplies all of that.
 	 *  - No module-level state and no `window`/`document` access (ADR §5
@@ -58,23 +48,18 @@
 	import { onDestroy } from 'svelte';
 	import {
 		Brain,
-		Cable,
-		Cog,
 		Database,
-		Download,
 		FileDown,
-		KeyRound,
 		Lightbulb,
-		ListChecks,
 		NotebookPen,
 		Search,
-		Trash2,
-		Wrench
+		Trash2
 	} from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
 	import Select from '../ui/Select.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
+	import { MEMORY_GLOBAL_SERVER_ID } from '../workspace/entries/11-web-memory-models.js';
 	import type {
 		MemoryDeleteBody,
 		MemoryDeleteDocument,
@@ -87,15 +72,7 @@
 		MemoryRetainDocument,
 		MemoryRetainItemBody,
 		MemoryStatusDocument,
-		ModelConnectionList,
-		ModelConnectionView,
-		ModelLocalPreviewBody,
-		ModelLocalPreviewView,
-		ModelLocalPullBody,
-		ModelLocalSubmitBody,
-		KnowledgeModelsApi,
-		RunCreated,
-		RunDetail
+		KnowledgeModelsApi
 	} from '../workspace/entries/11-web-memory-models.js';
 
 	let { panel }: { panel: PanelContext } = $props();
@@ -108,13 +85,7 @@
 		'retainMemory',
 		'reflectMemory',
 		'exportMemory',
-		'deleteMemory',
-		'previewModelInstall',
-		'installModelService',
-		'pullModelWeights',
-		'readRun',
-		'listConnections',
-		'readConnection'
+		'deleteMemory'
 	] as const;
 
 	/** Runtime narrowing of the opaque services bag; absent api ⇒ safe state. */
@@ -128,14 +99,14 @@
 	}
 
 	/** The members of the optional panel-links seam. */
-	type LinkName = 'openApplications' | 'openJobs' | 'openModelSettings';
+	type LinkName = 'openModelSettings';
 
 	/** One linkage seam member, narrowed alone (each fails closed alone). */
 	function linkFn(
 		name: LinkName
 	): ((...args: string[]) => void) | null {
 		const links = panel.services.links as
-			| Partial<{ openApplications(serverId: string): void; openJobs(serverId: string): void; openModelSettings(): void }>
+			| Partial<{ openModelSettings(): void }>
 			| null
 			| undefined;
 		if (typeof links !== 'object' || links === null) return null;
@@ -144,11 +115,14 @@
 	}
 
 	const api = $derived(readApi(panel.services));
-	/** The pinned target: server scope only — a global mount contradicts the entry. */
-	const serverId = $derived(panel.scope.kind === 'server' ? panel.scope.server_id : null);
-	const usable = $derived(api !== null && serverId !== null);
-	const openApplications = $derived(linkFn('openApplications'));
-	const openJobs = $derived(linkFn('openJobs'));
+	/**
+	 * The pinned target: the pinned server's id, or the fleet sentinel for a
+	 * global window — every call names it explicitly, nothing is remembered.
+	 */
+	const serverId = $derived(
+		panel.scope.kind === 'global' ? MEMORY_GLOBAL_SERVER_ID : panel.scope.server_id
+	);
+	const usable = $derived(api !== null);
 	const openModelSettings = $derived(linkFn('openModelSettings'));
 
 	// --- producer-bound input checks (server re-validates) -------------------
@@ -166,22 +140,6 @@
 	const BUDGETS: readonly string[] = ['low', 'mid', 'high'];
 	const MIN_TOKEN_BUDGET = 256;
 	const MAX_TOKEN_BUDGET = 4096;
-	// Local-model wire bounds (mai.api.knowledge_models + local_models).
-	const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-	const MAX_TARGET_CHARS = 64;
-	const MODEL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-	const MAX_LICENSE_CHARS = 256;
-	const MAX_BASE_URL_CHARS = 2048;
-	// Credential-reference vocabulary (C03 rule 6 + the optional 1Password
-	// provider's documented strict subset; value-free shapes only).
-	const ENV_NAME_RE = /^[A-Z][A-Z0-9_]{0,127}$/;
-	const OP_REFERENCE_RE =
-		/^op:\/\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-	const MAX_OP_REFERENCE_CHARS = 400;
-	/** Fixed poll cadence for the watched submit run (bounded; torn down on hide). */
-	const POLL_MS = 1500;
-	/** Run lifecycle states after which nothing new can be learned (C05 rule 2). */
-	const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(['succeeded', 'failed', 'cancelled']);
 
 	function parseOptionalInt(raw: string, low: number, high: number): number | 'invalid' | null {
 		const value = raw.trim();
@@ -205,28 +163,6 @@
 			return null;
 		}
 		return 'Scope must be exactly "server" or "shared:<name>".';
-	}
-
-	function validateBaseUrl(raw: string): string | null {
-		const value = raw.trim();
-		if (value === '') return 'Base URL is required.';
-		if (value.length > MAX_BASE_URL_CHARS) return `Base URL must be at most ${MAX_BASE_URL_CHARS} characters.`;
-		let parts: URL;
-		try {
-			parts = new URL(value);
-		} catch {
-			return 'Base URL must be an absolute http(s) URL with a host.';
-		}
-		if (parts.protocol !== 'http:' && parts.protocol !== 'https:') {
-			return 'Only http and https endpoints are allowed.';
-		}
-		if (parts.username !== '' || parts.password !== '') {
-			return 'Inline URL credentials are not allowed — declare a credential reference instead.';
-		}
-		if (parts.search !== '' || parts.hash !== '') {
-			return 'Query strings and fragments are not part of an endpoint base URL.';
-		}
-		return null;
 	}
 
 	// --- error helpers (frozen C01 vocabulary, value-free display) -----------
@@ -263,40 +199,6 @@
 	function memoryCodeText(code: string | null, fallback: string): string {
 		if (code === null) return fallback;
 		return MEMORY_CODE_TEXT[code] ?? fallback;
-	}
-
-	const RUN_STATE_TEXT: Readonly<Record<string, string>> = Object.freeze({
-		queued: 'Queued',
-		running: 'Running',
-		waiting_approval: 'Waiting for approval decision',
-		waiting_children: 'Waiting for child runs',
-		reconciling: 'Reconciling an unproven outcome',
-		succeeded: 'Succeeded',
-		failed: 'Failed',
-		cancelled: 'Cancelled (verified)'
-	});
-
-	const STEP_STATE_TEXT: Readonly<Record<string, string>> = Object.freeze({
-		pending: 'Pending',
-		running: 'Running',
-		succeeded: 'Succeeded',
-		failed: 'Failed',
-		outcome_unknown: 'Outcome unknown — reconciliation required',
-		cancel_requested: 'Cancellation requested — not yet verified',
-		cancelled: 'Cancelled (host-verified)'
-	});
-
-	function runStateText(state: string | null): string {
-		if (state === null) return 'State not recorded yet';
-		return RUN_STATE_TEXT[state] ?? `Recorded state: ${state}`;
-	}
-
-	function stepStateText(state: string): string {
-		return STEP_STATE_TEXT[state] ?? `Recorded state: ${state}`;
-	}
-
-	function shortHash(hash: string): string {
-		return hash.length > 16 ? `${hash.slice(0, 12)}…` : hash;
 	}
 
 	// --- shared per-operation outcome state -----------------------------------
@@ -365,43 +267,6 @@
 	let deleteBusy = $state(false);
 	let deleteOutcome = $state<MemoryOutcome<MemoryDeleteDocument>>({ kind: 'idle' });
 
-	// Local-model forms. Recipe + target bind preview AND submits: a submit
-	// without a satisfied preview of the SAME recipe+target is refused
-	// client-side (the producer rebuilds and re-verifies the plan anyway).
-	let modelAppId = $state('');
-	let recipeText = $state('');
-	let targetOs = $state('linux');
-	let targetArch = $state('x86_64');
-	let previewBusy = $state(false);
-	let previewView = $state<ModelLocalPreviewView | null>(null);
-	/** The exact recipe+target the shown preview was built from. */
-	let previewIdentity = $state<{ recipe: string; target: string } | null>(null);
-	let previewProblem = $state<{ code: string; message: string } | null>(null);
-
-	let backupConfirmed = $state(false);
-	let installBusy = $state(false);
-	let installProblem = $state<{ code: string; message: string } | null>(null);
-
-	let pullForm = $state<{ model: string; license: string; baseUrl: string }>({ model: '', license: '', baseUrl: '' });
-	let pullBusy = $state(false);
-	let pullProblem = $state<{ code: string; message: string } | null>(null);
-
-	/** The currently watched submit run (install or pull); polled to terminal. */
-	type WatchedRun = { runId: string; kind: 'install' | 'pull'; deduplicated: boolean };
-	let watchedRun = $state<WatchedRun | null>(null);
-	let watchedDetail = $state<RunDetail | null>(null);
-	let watchProblem = $state<{ code: string; message: string } | null>(null);
-	let pollTimer: ReturnType<typeof setTimeout> | null = null;
-
-	// Registered connections (the pull's registration outcome, read-only).
-	let connections = $state<ModelConnectionList['connections']>([]);
-	let connectionView = $state<ModelConnectionView | null>(null);
-	let connectionProblem = $state<{ code: string; message: string } | null>(null);
-
-	// Credential-reference checker (1Password integration): pure client-side
-	// classification of a reference SHAPE. Nothing here is transmitted.
-	let refCheckInput = $state('');
-
 	// --- derived validation ---------------------------------------------------
 
 	const recallErrors = $derived.by<Record<string, string>>(() => {
@@ -469,73 +334,10 @@
 	});
 	const deleteValid = $derived(Object.keys(deleteErrors).length === 0);
 
-	const previewFormValid = $derived(
-		UUID_RE.test(modelAppId.trim()) && recipeText.trim().length > 0 && targetOs.trim().length > 0 && targetOs.trim().length <= MAX_TARGET_CHARS && targetArch.trim().length > 0 && targetArch.trim().length <= MAX_TARGET_CHARS
-	);
-	/** A submit is honored only behind a satisfied preview of the SAME recipe+target. */
-	const previewIdentityMatches = $derived(
-		previewIdentity !== null &&
-			previewIdentity.recipe === recipeText &&
-			previewIdentity.target === `${targetOs.trim()}/${targetArch.trim()}`
-	);
-	const installReady = $derived(
-		previewIdentityMatches &&
-			previewView !== null &&
-			previewView.verdict === 'satisfied' &&
-			previewView.server_id === serverId &&
-			previewView.application_id === modelAppId.trim()
-	);
-	const pullErrors = $derived.by<Record<string, string>>(() => {
-		const errors: Record<string, string> = {};
-		if (!MODEL_NAME_RE.test(pullForm.model.trim())) errors.model = 'Model must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127}.';
-		const license = pullForm.license.trim();
-		if (license === '') errors.license = 'License metadata is required on every explicit acquisition.';
-		else if (license.length > MAX_LICENSE_CHARS) errors.license = `License must be at most ${MAX_LICENSE_CHARS} characters.`;
-		const urlError = validateBaseUrl(pullForm.baseUrl);
-		if (urlError !== null) errors.baseUrl = urlError;
-		return errors;
-	});
-	const pullReady = $derived(previewIdentityMatches && Object.keys(pullErrors).length === 0);
-
-	/** Honest local verdict line for the preview section header. */
-	const previewVerdictText = $derived.by(() => {
-		const shown = previewView;
-		if (shown === null || !previewIdentityMatches) return null;
-		if (shown.verdict === 'satisfied') return 'Prerequisites measured and satisfied.';
-		const unknown = shown.unknown.length > 0 ? `${shown.unknown.length} unmeasurable` : 'none unmeasurable';
-		return `Unsatisfied: ${shown.hardware_unsatisfied.join(', ') || 'none named'}; ${unknown}.`;
-	});
-
-	// Credential-reference classification (pure functions over the SHAPE).
-	type RefClassification =
-		| { kind: 'empty' }
-		| { kind: 'env-name' }
-		| { kind: 'op-reference' }
-		| { kind: 'invalid'; reason: string };
-	const refClassification = $derived.by<RefClassification>(() => {
-		const value = refCheckInput.trim();
-		if (value === '') return { kind: 'empty' };
-		if (ENV_NAME_RE.test(value)) return { kind: 'env-name' };
-		if (value.startsWith('op://')) {
-			if (value.length > MAX_OP_REFERENCE_CHARS) {
-				return { kind: 'invalid', reason: `A 1Password reference must be at most ${MAX_OP_REFERENCE_CHARS} characters.` };
-			}
-			if (OP_REFERENCE_RE.test(value)) return { kind: 'op-reference' };
-			return {
-				kind: 'invalid',
-				reason: 'A 1Password reference is op://<vault>/<item>/<field> — three non-empty segments of [A-Za-z0-9][A-Za-z0-9._-]{0,127}; no spaces, percent-encoding, "." or ".." segments.'
-			};
-		}
-		return {
-			kind: 'invalid',
-			reason: 'Not a credential reference shape. A .env name is [A-Z][A-Z0-9_]{0,127}; a 1Password reference is op://<vault>/<item>/<field>. Never paste a secret VALUE.'
-		};
-	});
-
 	// --- load / refresh -------------------------------------------------------
 
 	async function probeStatus(): Promise<void> {
-		if (api === null || serverId === null || statusBusy) return;
+		if (api === null || statusBusy) return;
 		statusBusy = true;
 		try {
 			const document = await api.memoryStatus(serverId);
@@ -555,64 +357,40 @@
 		}
 	}
 
-	async function refreshConnections(): Promise<void> {
-		if (api === null) return;
-		try {
-			const list = await api.listConnections();
-			if (disposed) return;
-			connections = list.connections;
-		} catch {
-			// Registration visibility catches up on the next explicit reload;
-			// the section keeps its last honest state.
-		}
-	}
-
 	async function loadAll(): Promise<void> {
-		if (api === null || serverId === null) return;
+		if (api === null) return;
 		view = { status: 'loading' };
 		// The status probe ANSWERS 200 with an honest unavailable document when
 		// the service is unconfigured/down — it is not an envelope failure, so
 		// it must not fail the mount load (C08 rule 6: show the real state).
-		const [status, connectionList] = await Promise.allSettled([
-			api.memoryStatus(serverId),
-			api.listConnections()
-		]);
-		if (disposed) return;
-		if (status.status === 'fulfilled') {
+		try {
+			const document = await api.memoryStatus(serverId);
+			if (disposed) return;
 			statusOutcome =
-				status.value.status === 'ok'
-					? { kind: 'ok', document: status.value }
-					: { kind: 'unavailable', document: status.value };
+				document.status === 'ok'
+					? { kind: 'ok', document }
+					: { kind: 'unavailable', document };
 			view = { status: 'ready' };
-		} else if (codeOf(status.reason) === 'unauthenticated' || codeOf(status.reason) === 'csrf_rejected') {
-			// Session-boundary failures are load errors (every section would
-			// fail the same way); anything else keeps the panel usable with a
-			// per-section outage.
-			const code = codeOf(status.reason) ?? 'unavailable';
-			view = {
-				status: 'error',
-				code,
-				message: friendlyText(code, messageOf(status.reason) ?? 'The memory service could not be reached.')
-			};
-			return;
-		} else {
-			const code = codeOf(status.reason) ?? 'unavailable';
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			if (code === 'unauthenticated' || code === 'csrf_rejected') {
+				// Session-boundary failures are load errors (every section would
+				// fail the same way); anything else keeps the panel usable with a
+				// per-section outage.
+				view = {
+					status: 'error',
+					code,
+					message: friendlyText(code, messageOf(error) ?? 'The memory service could not be reached.')
+				};
+				return;
+			}
 			statusOutcome = {
 				kind: 'problem',
 				code,
-				message: messageOf(status.reason) ?? memoryCodeText(code, 'The availability probe failed.')
+				message: messageOf(error) ?? memoryCodeText(code, 'The availability probe failed.')
 			};
 			view = { status: 'ready' };
-		}
-		if (connectionList.status === 'fulfilled') {
-			connections = connectionList.value.connections;
-		} else {
-			connectionProblem = {
-				code: codeOf(connectionList.reason) ?? 'unavailable',
-				message:
-					messageOf(connectionList.reason) ??
-					'The registered-connection list could not be loaded.'
-			};
 		}
 	}
 
@@ -621,7 +399,7 @@
 	async function runRecall(): Promise<void> {
 		const client = api;
 		const target = serverId;
-		if (client === null || target === null || recallBusy || !recallValid) return;
+		if (client === null || recallBusy || !recallValid) return;
 		recallBusy = true;
 		recallOutcome = { kind: 'idle' };
 		const types = [recallForm.world && 'world', recallForm.experience && 'experience', recallForm.observation && 'observation'].filter(
@@ -665,7 +443,7 @@
 	async function runRetain(): Promise<void> {
 		const client = api;
 		const target = serverId;
-		if (client === null || target === null || retainBusy || !retainValid) return;
+		if (client === null || retainBusy || !retainValid) return;
 		retainBusy = true;
 		retainOutcome = { kind: 'idle' };
 		const items: MemoryRetainItemBody[] = retainItems.map((item) => ({
@@ -696,7 +474,7 @@
 	async function runReflect(): Promise<void> {
 		const client = api;
 		const target = serverId;
-		if (client === null || target === null || reflectBusy || !reflectValid) return;
+		if (client === null || reflectBusy || !reflectValid) return;
 		reflectBusy = true;
 		reflectOutcome = { kind: 'idle' };
 		const maxTokens = parseOptionalInt(reflectForm.maxTokens, MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET);
@@ -726,7 +504,7 @@
 	async function runExport(): Promise<void> {
 		const client = api;
 		const target = serverId;
-		if (client === null || target === null || exportBusy || exportScopeError !== null) return;
+		if (client === null || exportBusy || exportScopeError !== null) return;
 		exportBusy = true;
 		exportOutcome = { kind: 'idle' };
 		try {
@@ -750,7 +528,7 @@
 	async function runDelete(): Promise<void> {
 		const client = api;
 		const target = serverId;
-		if (client === null || target === null || deleteBusy || !deleteValid) return;
+		if (client === null || deleteBusy || !deleteValid) return;
 		deleteBusy = true;
 		deleteOutcome = { kind: 'idle' };
 		const body: MemoryDeleteBody = {
@@ -776,206 +554,31 @@
 		}
 	}
 
-	// --- local-model operations ----------------------------------------------
-
-	async function runPreview(): Promise<void> {
-		const client = api;
-		const target = serverId;
-		if (client === null || target === null || previewBusy || !previewFormValid) return;
-		previewBusy = true;
-		previewProblem = null;
-		previewView = null;
-		previewIdentity = null;
-		const body: ModelLocalPreviewBody = {
-			application_id: modelAppId.trim(),
-			recipe: recipeText,
-			target_os: targetOs.trim(),
-			target_arch: targetArch.trim()
-		};
-		try {
-			const shown = await client.previewModelInstall(target, body);
-			if (disposed) return;
-			// Identity guard: only THIS server's preview may paint.
-			if (shown.server_id !== target) {
-				previewProblem = {
-					code: 'scope_mismatch',
-					message: 'The preview names a different server — nothing is displayed.'
-				};
-				return;
-			}
-			previewView = shown;
-			previewIdentity = { recipe: recipeText, target: `${targetOs.trim()}/${targetArch.trim()}` };
-		} catch (error) {
-			if (disposed) return;
-			const code = codeOf(error) ?? 'unavailable';
-			previewProblem = {
-				code,
-				message: messageOf(error) ?? friendlyText(code, 'The prerequisite preview could not run.')
-			};
-		} finally {
-			if (!disposed) previewBusy = false;
-		}
-	}
-
-	/** Stop the bounded poll (terminal state or teardown); the watch block
-	 * keeps displaying the last honest run view — the terminal receipt is
-	 * the operator's proof and is never wiped by the poll stopping. */
-	function stopPolling(): void {
-		if (pollTimer !== null) {
-			clearTimeout(pollTimer);
-			pollTimer = null;
-		}
-	}
-
-	async function pollWatchedRun(): Promise<void> {
-		pollTimer = null;
-		const client = api;
-		const run = watchedRun;
-		if (client === null || run === null || disposed) return;
-		try {
-			const detail = await client.readRun(run.runId);
-			if (disposed || watchedRun === null || watchedRun.runId !== run.runId) return;
-			watchedDetail = detail;
-			const state = detail.state;
-			if (state !== null && TERMINAL_RUN_STATES.has(state)) {
-				stopPolling();
-				// Registration truth (the pull writes the connection) — refresh
-				// the registered-connection surface after a terminal pull.
-				if (run.kind === 'pull') void refreshConnections();
-				return;
-			}
-		} catch (error) {
-			if (disposed || watchedRun === null || watchedRun.runId !== run.runId) return;
-			const code = codeOf(error) ?? 'unavailable';
-			watchProblem = {
-				code,
-				message: messageOf(error) ?? friendlyText(code, 'The run view could not be loaded.')
-			};
-			// A transient poll failure keeps the last honest detail; the loop
-			// continues only for non-terminal runs.
-		}
-		if (!disposed && watchedRun !== null && watchedRun.runId === run.runId) {
-			pollTimer = setTimeout(() => void pollWatchedRun(), POLL_MS);
-		}
-	}
-
-	function beginWatching(run: WatchedRun): void {
-		stopPolling();
-		watchProblem = null;
-		watchedRun = run;
-		watchedDetail = null;
-		pollTimer = setTimeout(() => void pollWatchedRun(), POLL_MS);
-	}
-
-	async function submitInstall(): Promise<void> {
-		const client = api;
-		const target = serverId;
-		if (client === null || target === null || installBusy || !installReady) return;
-		installBusy = true;
-		installProblem = null;
-		const body: ModelLocalSubmitBody = {
-			run_id: crypto.randomUUID(),
-			recipe: recipeText,
-			target_os: targetOs.trim(),
-			target_arch: targetArch.trim(),
-			backup_confirmed: backupConfirmed
-		};
-		try {
-			const created = await client.installModelService(target, modelAppId.trim(), body);
-			if (disposed) return;
-			beginWatching({
-				runId: created.run.run_id,
-				kind: 'install',
-				deduplicated: created.deduplicated
-			});
-		} catch (error) {
-			if (disposed) return;
-			const code = codeOf(error) ?? 'unavailable';
-			installProblem = {
-				code,
-				message: messageOf(error) ?? friendlyText(code, 'The install intent could not be submitted.')
-			};
-		} finally {
-			if (!disposed) installBusy = false;
-		}
-	}
-
-	async function submitPull(): Promise<void> {
-		const client = api;
-		const target = serverId;
-		if (client === null || target === null || pullBusy || !pullReady) return;
-		pullBusy = true;
-		pullProblem = null;
-		const body: ModelLocalPullBody = {
-			run_id: crypto.randomUUID(),
-			recipe: recipeText,
-			target_os: targetOs.trim(),
-			target_arch: targetArch.trim(),
-			model: pullForm.model.trim(),
-			license: pullForm.license.trim(),
-			base_url: pullForm.baseUrl.trim()
-		};
-		try {
-			const created = await client.pullModelWeights(target, modelAppId.trim(), body);
-			if (disposed) return;
-			beginWatching({ runId: created.run.run_id, kind: 'pull', deduplicated: created.deduplicated });
-		} catch (error) {
-			if (disposed) return;
-			const code = codeOf(error) ?? 'unavailable';
-			pullProblem = {
-				code,
-				message: messageOf(error) ?? friendlyText(code, 'The pull intent could not be submitted.')
-			};
-		} finally {
-			if (!disposed) pullBusy = false;
-		}
-	}
-
-	async function openConnection(name: string): Promise<void> {
-		const client = api;
-		if (client === null) return;
-		connectionProblem = null;
-		try {
-			const stored = await client.readConnection(name);
-			if (disposed) return;
-			connectionView = stored;
-		} catch (error) {
-			if (disposed) return;
-			const code = codeOf(error) ?? 'unavailable';
-			connectionProblem = {
-				code,
-				message: messageOf(error) ?? friendlyText(code, `Connection "${name}" could not be loaded.`)
-			};
-		}
-	}
-
 	// Mount reads once; teardown (hide/unmount/error containment) flips
-	// `disposed` and stops the bounded poll (ADR §7.2).
+	// `disposed` (ADR §7.2).
 	$effect(() => {
 		if (!usable) return;
 		disposed = false;
 		void loadAll();
 		return () => {
 			disposed = true;
-			stopPolling();
 		};
 	});
 	// Standalone mounts (outside PanelHost) release through onDestroy; inside
 	// PanelHost both paths fire and the guard keeps disposal idempotent.
 	onDestroy(() => {
 		disposed = true;
-		stopPolling();
 	});
 </script>
 
 <div class="mai-km" data-testid="knowledge-models-root">
 	{#if !usable}
 		<div class="mai-km__state mai-km__state--error" role="alert" data-testid="panel-config-error">
-			<p>This panel was opened without its memory/local-model service or outside a server scope.</p>
+			<p>This panel was opened without its memory service bag (panel.services.api).</p>
 		</div>
 	{:else if view.status === 'loading'}
 		<div class="mai-km__state" role="status" data-testid="km-loading">
-			<p>Loading memory and local-model status…</p>
+			<p>Loading memory status…</p>
 		</div>
 	{:else if view.status === 'error'}
 		<div
@@ -1419,309 +1022,6 @@
 				</div>
 			{/if}
 		</section>
-
-		<!-- ===================== Local models ===================== -->
-		<section class="mai-km__section" aria-label="Local models" data-testid="local-models-section">
-			<header class="mai-km__header">
-				<Cog size={16} aria-hidden="true" />
-				<h3 class="mai-km__heading">Local models</h3>
-			</header>
-			<p class="mai-km__hint">
-				Prerequisite preview measures REAL target facts; the executor re-verifies fresh facts
-				behind the full gate chain before any effect. The pull IS the registration path —
-				there is no separate registration control.
-			</p>
-
-			<div class="mai-km__form">
-				<Field
-					label="Application id"
-					bind:value={modelAppId}
-					error={modelAppId.trim() !== '' && !UUID_RE.test(modelAppId.trim()) ? 'Application id must be a canonical UUID.' : ''}
-					hint={openApplications !== null ? 'The adopted local-inference application (Applications panel).' : 'The adopted local-inference application id.'}
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-app-id-input"
-				/>
-				{#if openApplications !== null}
-					<Button variant="secondary" onclick={() => openApplications(serverId ?? '')} data-testid="model-open-applications">
-						Open Applications
-					</Button>
-				{/if}
-				<label class="mai-km__select-label">
-					<span>Recipe document</span>
-					<textarea
-						class="mai-km__textarea"
-						bind:value={recipeText}
-						rows={8}
-						spellcheck="false"
-						autocomplete="off"
-						aria-label="Recipe document"
-						data-testid="model-recipe-input"
-					></textarea>
-				</label>
-				<p class="mai-km__hint">ONE canonical recipe document (catalogue revision, e.g. local-inference.yaml) — split at document boundaries.</p>
-				<Field
-					label="Target OS"
-					bind:value={targetOs}
-					error={targetOs.trim().length > MAX_TARGET_CHARS ? `Target OS must be at most ${MAX_TARGET_CHARS} characters.` : ''}
-					hint="The explicit observed target the plan binds."
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-target-os-input"
-				/>
-				<Field
-					label="Target arch"
-					bind:value={targetArch}
-					error={targetArch.trim().length > MAX_TARGET_CHARS ? `Target arch must be at most ${MAX_TARGET_CHARS} characters.` : ''}
-					hint="The explicit observed target the plan binds."
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-target-arch-input"
-				/>
-				<Button onclick={runPreview} loading={previewBusy} disabled={!previewFormValid} data-testid="model-preview-run">
-					Preview prerequisites
-				</Button>
-			</div>
-
-			{#if previewProblem !== null}
-				<div class="mai-km__notice mai-km__notice--danger" role="alert" data-testid="model-preview-problem" data-error-code={previewProblem.code}>
-					<p>{previewProblem.message}</p>
-				</div>
-			{/if}
-
-			{#if previewView !== null && previewIdentityMatches}
-				<div
-					class="mai-km__preview"
-					data-testid="model-preview"
-					data-verdict={previewView.verdict}
-				>
-					<p
-						class="mai-km__notice {previewView.verdict === 'satisfied' ? 'mai-km__notice--success' : 'mai-km__notice--warning'}"
-						role="status"
-						data-testid="model-preview-verdict"
-					>
-						{previewVerdictText}
-					</p>
-					<dl class="mai-km__rows">
-						<div class="mai-km__row"><dt>Plan</dt><dd><code>{shortHash(previewView.plan.plan_sha256)}</code> · recipe {shortHash(previewView.plan.recipe_sha256)}</dd></div>
-						<div class="mai-km__row"><dt>Image</dt><dd><code>{previewView.plan.image}</code></dd></div>
-						<div class="mai-km__row"><dt>Project</dt><dd>{previewView.plan.project_name} · {previewView.plan.target_os}/{previewView.plan.target_arch}</dd></div>
-						<div class="mai-km__row"><dt>Prerequisites</dt><dd data-testid="model-preview-prereqs">{previewView.plan.prerequisites.join(', ')}</dd></div>
-						<div class="mai-km__row"><dt>Required grants</dt><dd>{previewView.plan.required_grants.join(', ')}</dd></div>
-						<div class="mai-km__row"><dt>Measured facts</dt><dd data-testid="model-preview-facts">{Object.keys(previewView.facts).length} fact(s)</dd></div>
-						<div class="mai-km__row"><dt>Limitations</dt><dd>{previewView.plan.limitations.join('; ')}</dd></div>
-					</dl>
-					{#if previewView.hardware_unsatisfied.length > 0}
-						<p class="mai-km__muted" data-testid="model-preview-unsatisfied">
-							Unsatisfied: {previewView.hardware_unsatisfied.join(', ')}
-						</p>
-					{/if}
-					{#if previewView.unknown.length > 0}
-						<p class="mai-km__muted" data-testid="model-preview-unknown">
-							Unmeasurable (counts as NOT satisfied): {previewView.unknown.join(', ')}
-						</p>
-					{/if}
-					{#if previewView.measurement_notes.length > 0}
-						<p class="mai-km__muted" data-testid="model-preview-notes">
-							Notes: {previewView.measurement_notes.join('; ')}
-						</p>
-					{/if}
-				</div>
-			{/if}
-
-			<div class="mai-km__form">
-				<div class="mai-km__subhead">
-					<Wrench size={14} aria-hidden="true" />
-					<h4 class="mai-km__subheading">Install service</h4>
-				</div>
-				<label class="mai-km__cap">
-					<input type="checkbox" bind:checked={backupConfirmed} data-testid="model-backup-confirmed" />
-					Backup confirmed (explicit operator decision for pre-existing volume data)
-				</label>
-				<Button onclick={submitInstall} loading={installBusy} disabled={!installReady} data-testid="model-install-run">
-					Submit install intent
-				</Button>
-				{#if !installReady && previewView !== null && !previewIdentityMatches}
-					<p class="mai-km__muted" role="status" data-testid="model-install-stale">
-						The recipe or target changed since the preview — run a new preview first.
-					</p>
-				{/if}
-				{#if installProblem !== null}
-					<div class="mai-km__notice mai-km__notice--danger" role="alert" data-testid="model-install-problem" data-error-code={installProblem.code}>
-						<p>{installProblem.message}</p>
-					</div>
-				{/if}
-
-				<div class="mai-km__subhead">
-					<Download size={14} aria-hidden="true" />
-					<h4 class="mai-km__subheading">Pull weights (the pull IS the registration)</h4>
-				</div>
-				<Field
-					label="Model"
-					bind:value={pullForm.model}
-					error={pullErrors.model ?? ''}
-					hint="Upstream reference, e.g. qwen2.5:7b-instruct-q4_K_M."
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-pull-model-input"
-				/>
-				<Field
-					label="License"
-					bind:value={pullForm.license}
-					error={pullErrors.license ?? ''}
-					hint={`REQUIRED metadata naming the license you acquire the weights under (at most ${MAX_LICENSE_CHARS} characters).`}
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-pull-license-input"
-				/>
-				<Field
-					label="Endpoint base URL"
-					bind:value={pullForm.baseUrl}
-					error={pullErrors.baseUrl ?? ''}
-					hint="Controller-reachable OpenAI-compatible endpoint of the installed service."
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="model-pull-base-url-input"
-				/>
-				<Button onclick={submitPull} loading={pullBusy} disabled={!pullReady} data-testid="model-pull-run">
-					Submit pull intent
-				</Button>
-				{#if pullProblem !== null}
-					<div class="mai-km__notice mai-km__notice--danger" role="alert" data-testid="model-pull-problem" data-error-code={pullProblem.code}>
-						<p>{pullProblem.message}</p>
-					</div>
-				{/if}
-			</div>
-
-			{#if watchedRun !== null}
-				<div class="mai-km__watch" data-testid="model-run-watch" data-run-kind={watchedRun.kind}>
-					<div class="mai-km__cardhead">
-						<ListChecks size={14} aria-hidden="true" />
-						<p class="mai-km__cardhead-meta" data-testid="model-run-id">
-							{watchedRun.kind} run <code>{watchedRun.runId}</code>
-							{#if watchedRun.deduplicated}(deduplicated: an identical intent was already running){/if}
-						</p>
-					</div>
-					{#if watchProblem !== null}
-						<div class="mai-km__notice mai-km__notice--warning" role="alert" data-testid="model-run-problem" data-error-code={watchProblem.code}>
-							<p>{watchProblem.message}</p>
-						</div>
-					{/if}
-					{#if watchedDetail !== null}
-						<p class="mai-km__runstate" data-testid="model-run-state">{runStateText(watchedDetail.state)}</p>
-						{#if watchedDetail.state !== null && TERMINAL_RUN_STATES.has(watchedDetail.state)}
-							<p class="mai-km__muted" data-testid="model-run-terminal">
-								{watchedDetail.state === 'succeeded'
-									? 'The producer verified this run as succeeded.'
-									: 'This run did NOT succeed — nothing is claimed as installed.'}
-							</p>
-						{/if}
-						<ul class="mai-km__list" data-testid="model-run-steps">
-							{#each watchedDetail.steps as step (step.seq)}
-								<li class="mai-km__list-row mai-km__step" data-testid="model-run-step">
-									<span class="mai-km__step-seq">{step.seq}</span>
-									<code>{step.capability_id}</code>
-									<span class="mai-km__step-state">— {stepStateText(step.state)}</span>
-								</li>
-							{/each}
-						</ul>
-					{:else}
-						<p class="mai-km__muted" role="status" data-testid="model-run-pending">Waiting for the first run view…</p>
-					{/if}
-					{#if openJobs !== null}
-						<Button variant="secondary" onclick={() => openJobs(serverId ?? '')} data-testid="model-run-open-jobs">
-							Open Jobs
-						</Button>
-					{/if}
-				</div>
-			{/if}
-
-			<div class="mai-km__form">
-				<div class="mai-km__subhead">
-					<Cable size={14} aria-hidden="true" />
-					<h4 class="mai-km__subheading">Registered connections</h4>
-				</div>
-				<ul class="mai-km__list" data-testid="connection-list">
-					{#each connections as ref (ref.name)}
-						<li class="mai-km__list-row">
-							<code data-testid="connection-ref-{ref.name}">{ref.name}</code>
-							<span class="mai-km__refmeta">revision {ref.revision}</span>
-							<Button variant="secondary" onclick={() => openConnection(ref.name)} data-testid="connection-open-{ref.name}">
-								View
-							</Button>
-						</li>
-					{/each}
-				</ul>
-				{#if connections.length === 0}
-					<p class="mai-km__muted" role="status" data-testid="connections-empty">
-						No model connections stored yet — a pull registers one only after the endpoint
-						really answers.
-					</p>
-				{/if}
-				<Button variant="secondary" onclick={refreshConnections} data-testid="connection-refresh">
-					Refresh connections
-				</Button>
-				{#if connectionProblem !== null}
-					<div class="mai-km__notice mai-km__notice--danger" role="alert" data-testid="connection-problem" data-error-code={connectionProblem.code}>
-						<p>{connectionProblem.message}</p>
-					</div>
-				{/if}
-				{#if connectionView !== null}
-					<div class="mai-km__preview" data-testid="connection-view">
-						<dl class="mai-km__rows">
-							<div class="mai-km__row"><dt>Record</dt><dd><code data-testid="connection-view-name">{connectionView.name}</code></dd></div>
-							<div class="mai-km__row"><dt>Base URL</dt><dd><code data-testid="connection-view-url">{connectionView.base_url}</code></dd></div>
-							<div class="mai-km__row">
-								<dt>Credential reference</dt>
-								<dd data-testid="connection-view-credential-ref">
-									{connectionView.credential_ref === null
-										? 'none — unauthenticated endpoint'
-										: connectionView.credential_ref}
-								</dd>
-							</div>
-							<div class="mai-km__row"><dt>Tool calls</dt><dd data-testid="connection-view-tool-calls">{connectionView.capabilities.tool_calls ? 'declared (observed by the producer probe)' : 'not observed'}</dd></div>
-							<div class="mai-km__row"><dt>Reasoning</dt><dd data-testid="connection-view-reasoning">{connectionView.capabilities.reasoning ? 'declared' : 'not claimed'}</dd></div>
-							<div class="mai-km__row"><dt>Revision</dt><dd>{connectionView.revision}</dd></div>
-						</dl>
-					</div>
-				{/if}
-			</div>
-
-			<div class="mai-km__form">
-				<div class="mai-km__subhead">
-					<KeyRound size={14} aria-hidden="true" />
-					<h4 class="mai-km__subheading">Credential references (1Password-aware)</h4>
-				</div>
-				<p class="mai-km__hint">
-					Credentials resolve by REFERENCE (C03 rule 6): a connection stores the .env variable
-					NAME; the optional 1Password provider reads op://&lt;vault&gt;/&lt;item&gt;/&lt;field&gt;
-					references host-side. Never paste a secret value — nothing typed here is sent anywhere.
-				</p>
-				<Field
-					label="Check a reference shape"
-					bind:value={refCheckInput}
-					hint="Paste a .env name or an op:// reference — never a value."
-					autocomplete="off"
-					spellcheck="false"
-					data-testid="credential-ref-check-input"
-				/>
-				{#if refClassification.kind === 'env-name'}
-					<p class="mai-km__notice mai-km__notice--success" role="status" data-testid="credential-ref-classified">
-						Valid .env reference name — this is what a connection's credential-reference field
-						stores (edit it in Model settings).
-					</p>
-				{:else if refClassification.kind === 'op-reference'}
-					<p class="mai-km__notice mai-km__notice--success" role="status" data-testid="credential-ref-classified">
-						Valid 1Password reference — it belongs as the .env VALUE of a credential reference;
-						the optional provider resolves it host-side and the secret never enters MAI.
-					</p>
-				{:else if refClassification.kind === 'invalid'}
-					<p class="mai-km__notice mai-km__notice--warning" role="alert" data-testid="credential-ref-invalid">
-						{refClassification.reason}
-					</p>
-				{/if}
-			</div>
-		</section>
 	{/if}
 </div>
 
@@ -1812,28 +1112,6 @@
 		background: var(--mai-color-surface);
 	}
 
-	.mai-km__subhead {
-		display: flex;
-		align-items: center;
-		gap: var(--mai-space-2);
-		margin-top: var(--mai-space-2);
-	}
-
-	.mai-km__subhead :global(svg) {
-		flex: none;
-		color: var(--mai-color-brass-dim);
-	}
-
-	.mai-km__subheading {
-		margin: 0;
-		color: var(--mai-color-brass-dim);
-		font-family: var(--mai-font-display);
-		font-size: var(--mai-text-sm);
-		font-weight: var(--mai-weight-semibold);
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-	}
-
 	.mai-km__hint,
 	.mai-km__muted {
 		margin: 0;
@@ -1909,24 +1187,6 @@
 		font-size: var(--mai-text-sm);
 	}
 
-	.mai-km__select-label {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-1);
-		width: 100%;
-		font-size: var(--mai-text-sm);
-	}
-
-	.mai-km__textarea {
-		width: 100%;
-		padding: var(--mai-space-1) var(--mai-space-2);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-bg);
-		color: var(--mai-color-text);
-		font: var(--mai-text-sm) var(--mai-font-mono);
-	}
-
 	.mai-km__notice {
 		margin: 0;
 		padding: var(--mai-space-2);
@@ -1961,18 +1221,6 @@
 		margin: 0;
 		padding: 0;
 		list-style: none;
-	}
-
-	.mai-km__list-row {
-		display: flex;
-		align-items: center;
-		gap: var(--mai-space-2);
-		padding: var(--mai-space-1) 0;
-	}
-
-	.mai-km__refmeta {
-		color: var(--mai-color-text-muted);
-		font: var(--mai-text-xs) var(--mai-font-mono);
 	}
 
 	.mai-km__hit {
@@ -2043,88 +1291,6 @@
 		color: var(--mai-color-text-muted);
 		font: var(--mai-text-xs) var(--mai-font-mono);
 		overflow-wrap: anywhere;
-	}
-
-	.mai-km__rows {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-1);
-		width: 100%;
-		margin: 0;
-	}
-
-	.mai-km__row {
-		display: grid;
-		grid-template-columns: 160px 1fr;
-		gap: var(--mai-space-2);
-	}
-
-	.mai-km__row > dt {
-		color: var(--mai-color-text-muted);
-		font-size: var(--mai-text-xs);
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-	}
-
-	.mai-km__row > dd {
-		margin: 0;
-		font-size: var(--mai-text-sm);
-		overflow-wrap: anywhere;
-	}
-
-	.mai-km__preview,
-	.mai-km__watch {
-		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-2);
-		width: 100%;
-		padding: var(--mai-space-3);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-md);
-		background: var(--mai-color-surface);
-	}
-
-	.mai-km__preview[data-verdict='satisfied'] {
-		border-color: var(--mai-status-success-border);
-	}
-
-	.mai-km__preview[data-verdict='unsatisfied'] {
-		border-color: var(--mai-status-warning-border);
-	}
-
-	.mai-km__watch[data-run-kind='pull'] {
-		border-color: var(--mai-color-brass-dim);
-	}
-
-	/* Watched-run state line and step rows. */
-	.mai-km__runstate {
-		margin: 0;
-		font-size: var(--mai-text-base);
-		font-weight: var(--mai-weight-semibold);
-	}
-
-	.mai-km__step {
-		padding: var(--mai-space-1) var(--mai-space-2);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-surface-raised);
-	}
-
-	.mai-km__step-seq {
-		flex: none;
-		min-width: 3ch;
-		padding: 0 var(--mai-space-1);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-sm);
-		background: var(--mai-color-surface-header);
-		color: var(--mai-color-brass);
-		font: var(--mai-text-xs) var(--mai-font-mono);
-		text-align: center;
-	}
-
-	.mai-km__step-state {
-		color: var(--mai-color-text-muted);
-		font-size: var(--mai-text-sm);
 	}
 
 	code {

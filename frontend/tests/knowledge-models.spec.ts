@@ -3,31 +3,26 @@ import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 /**
- * mai-11-web-memory-models — real-browser proofs for the Hindsight memory +
- * local-models panel.
+ * mai-11-web-memory-models — real-browser proofs for the Hindsight memory
+ * panel.
  *
  * The harness compiles the REAL feature component
  * (`KnowledgeAndModels.svelte`), the REAL feature entry
  * (`11-web-memory-models.ts`), the REAL panel host/registry and the shared
  * UI primitives into a throwaway fixture app served from virtual modules —
  * nothing hits disk and no real backend exists. The fixture API mirrors the
- * reviewed producers 1:1 (the memory surface of `11-knowledge-api` over the
- * frozen documents of `11-memory-adapter`, the local-model surface of
- * `11-model-install`, and the C02 connection surface of `06-model-api`);
- * recorded calls and pre-armed responses are the test-observed boundary
- * (the reviewed `01-web` component-browser fixture convention, not an
- * imaginary backend).
+ * reviewed memory producer 1:1 (the memory surface of `11-knowledge-api`
+ * over the frozen documents of `11-memory-adapter`); recorded calls and
+ * pre-armed responses are the test-observed boundary (the reviewed `01-web`
+ * component-browser fixture convention, not an imaginary backend).
  *
  * Covered acceptance surfaces: honest Hindsight availability
  * (status/recall/retain/reflect/export/delete over the producer's own
- * documents — an outage NEVER reads as an empty successful recall); the
- * local-model prerequisite preview (REAL measured facts, fail-closed
- * verdict) gating install/pull submits behind a satisfied preview of the
- * SAME recipe+target; watched run receipts with dedup + honest terminal
- * states; the pull IS the registration path (registered connection visible
- * with its credential REFERENCE only); the 1Password-aware credential
- * reference checker (value-free, zero network use); typed feature entry in
- * the real registry; fail-closed service bags, links and scope.
+ * documents — an outage NEVER reads as an empty successful recall) in BOTH
+ * open scopes: a server window targets its pinned server id and a global
+ * (Global / Fleet) window targets the fleet sentinel server id; the typed
+ * feature entry in the real registry; fail-closed service bags, links and
+ * scope.
  */
 
 const FIXTURE_URL = '/mai-knowledge-models-fixture/';
@@ -47,6 +42,8 @@ const CLIENT = `${FRONTEND_ROOT}src/lib/api/client.ts`;
 /** Frozen identity fixtures (opaque UUIDs per contracts.md C01 rule 1). */
 const SERVER_A = '8c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
 const SERVER_B = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+/** The fleet sentinel server id a GLOBAL memory window targets (entry contract). */
+const SENTINEL = '00000000-0000-0000-0000-000000000000';
 const APP_IDENTITY = '3f7c9a10-5b2e-4d8a-9c1f-6e4b8a2d7c50';
 const RUN_A = '7a7a7a7a-8c9d-4e8a-8a9b-4c5d6e7f8a9c';
 const WINDOW_A = '1a1a1a1a-8c9d-4e8a-8a9b-4c5d6e7f8a9c';
@@ -56,22 +53,15 @@ const WINDOW_BARE = '4d4d4d4d-8c9d-4e8a-8a9b-4c5d6e7f8a9f';
 const WINDOW_GLOBAL = '5e5e5e5e-8c9d-4e8a-8a9b-4c5d6e7f8a90';
 const WINDOW_SIBLING = '6f6f6f6f-8c9d-4e8a-8a9b-4c5d6e7f8a91';
 
-/** A value-shaped string that must NEVER be classified as a reference. */
-const FORBIDDEN_SECRET = 'sk-live-9f2b7c1a-never-typed-anywhere';
-
 /** Untruncated runtime-failure receipt: a page error is a harness defect. */
 const pageErrors: string[] = [];
 
 type Fail = { status: number; code: string; message: string };
 
-type MemoryOp = 'status' | 'recall' | 'retain' | 'reflect' | 'export' | 'delete';
-
 interface KmWindowApi {
 	calls: Array<{ op: string; payload?: unknown; args?: unknown[] }>;
 	failNext(op: string, failure: Fail | null): void;
 	armUnavailable(op: string, code: string | null): void;
-	armWrongServerPreview(): void;
-	setRunState(runId: string, state: string): void;
 	registry: {
 		kinds: string[];
 		scopeChecks: {
@@ -135,10 +125,8 @@ const APP_SOURCE = `
 	const calls = [];
 	const arms = {
 		fails: {},
-		unavailable: {},
-		wrongServerPreview: false
+		unavailable: {}
 	};
-	const watched = {};
 
 	function record(op, payload, args) {
 		calls.push({ op, payload: payload === undefined ? null : deep(payload), args: args ?? [] });
@@ -239,74 +227,7 @@ const APP_SOURCE = `
 		scope: 'server', bank: 'server-8c1d2e3f', deleted_count: null, error_type: null
 	};
 
-	// --- local-model documents (11-model-install / 06-model-api shapes) -------
-
-	function planView() {
-		return {
-			server_id: '${SERVER_A}',
-			application_id: '${APP_IDENTITY}',
-			project_name: 'mai-local-inference',
-			target_os: 'linux', target_arch: 'x86_64',
-			image: 'docker.io/ollama/ollama@sha256:2654',
-			recipe_sha256: 'a'.repeat(64),
-			compose_path: '/srv/mai/compose.yaml', compose_sha256: 'b'.repeat(64),
-			compose_text: 'services: {}',
-			directories: ['/srv/mai/models'],
-			ports: [{ host: 18114, container: 11434, protocol: 'tcp' }],
-			volumes: [{ name: 'models', container_path: '/root/.ollama', host_path: '/srv/mai/models' }],
-			credentials: [], credentials_path: null, health_probe: null,
-			prerequisites: ['docker', 'hw.arch.x86_64', 'hw.cpu.avx2', 'hw.ram.16gb', 'hw.disk.30gb'],
-			required_grants: ['docker.compose'],
-			operations: [{ op: 'verify_prerequisites', subject: 'target' }, { op: 'deploy', subject: 'compose' }],
-			limitations: ['weights are acquired by an explicit admin pull'],
-			plan_sha256: 'c'.repeat(64)
-		};
-	}
-
-	function previewView(verdict, unsatisfied, unknown, notes) {
-		return {
-			server_id: '${SERVER_A}',
-			application_id: '${APP_IDENTITY}',
-			plan: planView(),
-			facts: { 'hw.arch': 'x86_64', 'hw.ram.gb': 32 },
-			unknown: unknown,
-			measurement_notes: notes,
-			hardware_unsatisfied: unsatisfied,
-			verdict
-		};
-	}
-
-	function runView(state) {
-		return {
-			run_id: '${RUN_A}', server_id: '${SERVER_A}', parent_run_id: null, depth: 0,
-			profile_revision: 3, prompt_revision: 1, model_profile: 'local',
-			requested_grants: ['docker.compose', 'model.install'],
-			state, cancel_requested_at: null,
-			submitted_at: '2026-10-18T09:00:00Z', updated_at: '2026-10-18T09:05:00Z'
-		};
-	}
-
-	function runDetail(state, steps) {
-		return { ...runView(state), steps };
-	}
-
-	watched['${RUN_A}'] = runDetail('queued', [
-		{ seq: 1, capability_id: 'model.install', state: 'pending', receipt: null }
-	]);
-
-	const connectionRef = { name: 'local-inference-8c1d2e3f', revision: 1, schema_revision: 1, sha256: 'd'.repeat(64) };
-	const connectionViewDoc = {
-		schema_version: 1,
-		name: 'local-inference-8c1d2e3f',
-		base_url: 'http://127.0.0.1:18114/v1',
-		credential_ref: null,
-		timeout_seconds: null,
-		headers: [],
-		capabilities: { tool_calls: false, reasoning: false },
-		revision: 1, sha256: 'd'.repeat(64)
-	};
-
-	// --- the recorded fixture API (reviewed producers 1:1) ---------------------
+	// --- the recorded fixture API (reviewed producer 1:1) -----------------------
 
 	const api = {
 		async memoryStatus(serverId) {
@@ -314,7 +235,7 @@ const APP_SOURCE = `
 			throwArm('memoryStatus');
 			const unavailable = popUnavailable('memoryStatus', 'status');
 			if (unavailable) return unavailable;
-			return deep(serverId === '${SERVER_A}' ? statusOk : statusDown);
+			return deep(serverId === '${SERVER_A}' || serverId === '${SENTINEL}' ? statusOk : statusDown);
 		},
 		async recallMemory(serverId, body) {
 			record('recallMemory', body, [serverId]);
@@ -350,48 +271,10 @@ const APP_SOURCE = `
 			const unavailable = popUnavailable('deleteMemory', 'delete');
 			if (unavailable) return unavailable;
 			return deep(body.target === 'bank' ? deleteBankOk : deleteMemoriesOk);
-		},
-		async previewModelInstall(serverId, body) {
-			record('previewModelInstall', body, [serverId]);
-			throwArm('previewModelInstall');
-			if (arms.wrongServerPreview) {
-				arms.wrongServerPreview = false;
-				return deep({ ...previewView('satisfied', [], [], []), server_id: '${SERVER_B}' });
-			}
-			if (body.recipe.includes('hw.ram.8gb')) {
-				return deep(previewView('unsatisfied', ['hw.ram.16gb'], ['hw.vram.state'], ['data-root fell back to the nearest statable ancestor']));
-			}
-			return deep(previewView('satisfied', [], [], []));
-		},
-		async installModelService(serverId, applicationId, body) {
-			record('installModelService', body, [serverId, applicationId]);
-			throwArm('installModelService');
-			return deep({ run: runView('queued'), deduplicated: true });
-		},
-		async pullModelWeights(serverId, applicationId, body) {
-			record('pullModelWeights', body, [serverId, applicationId]);
-			throwArm('pullModelWeights');
-			return deep({ run: runView('queued'), deduplicated: false });
-		},
-		async readRun(runId) {
-			record('readRun', null, [runId]);
-			return deep(watched[runId] ?? runDetail('failed', []));
-		},
-		async listConnections() {
-			record('listConnections', null, []);
-			throwArm('listConnections');
-			return deep({ connections: [connectionRef] });
-		},
-		async readConnection(name) {
-			record('readConnection', null, [name]);
-			throwArm('readConnection');
-			return deep(connectionViewDoc);
 		}
 	};
 
 	const links = {
-		openApplications: (serverId) => record('openApplications', null, [serverId]),
-		openJobs: (serverId) => record('openJobs', null, [serverId]),
 		openModelSettings: () => record('openModelSettings', null, [])
 	};
 	const services = knowledgeModelsServices(api, links);
@@ -451,12 +334,6 @@ const APP_SOURCE = `
 		},
 		armUnavailable(op, code) {
 			arms.unavailable[op] = code;
-		},
-		armWrongServerPreview() {
-			arms.wrongServerPreview = true;
-		},
-		setRunState(runId, state) {
-			watched[runId] = { ...watched[runId], state };
 		},
 		registry: {
 			kinds: Array.from(registry.knownPanelKinds()).sort(),
@@ -735,6 +612,7 @@ test('mount probes honest per-server availability beside a sibling and names its
 }) => {
 	const hostA = page.getByTestId('host-a');
 	const hostB = page.getByTestId('host-b');
+	const hostGlobal = page.getByTestId('host-global');
 	await hostAMounted(page);
 
 	// The desktop holds the panel BESIDE another panel.
@@ -749,19 +627,19 @@ test('mount probes honest per-server availability beside a sibling and names its
 		'memory_disabled'
 	);
 	await expect(hostB.getByTestId('knowledge-models-root')).toBeVisible();
+	// The global host mounts the SAME panel against the fleet sentinel.
+	await expect(hostGlobal.getByTestId('memory-status-ok')).toContainText('Available');
 
 	const { calls } = await apiState(page);
-	// Every mount probe named its own window's pinned server: A (host A),
-	// B (host B) and A again (the links-less A host).
+	// Every mount probe named its own window's pinned target: A (host A),
+	// B (host B), A again (the links-less A host) and the sentinel (global).
 	const statusScopes = callsOf(calls, 'memoryStatus').map((call) => call.args?.[0]);
 	expect(statusScopes.filter((scope) => scope === SERVER_A).length).toBe(2);
 	expect(statusScopes).toContain(SERVER_B);
-	expect(statusScopes.every((scope) => scope === SERVER_A || scope === SERVER_B)).toBe(true);
-	// The connection listing is the value-free read; it is global (C02 store)
-	// and carries no server argument to misuse.
-	expect(callsOf(calls, 'listConnections').length).toBeGreaterThanOrEqual(1);
-	// The unauthenticated local endpoint is displayed honestly.
-	await expect(hostA.getByTestId('connections-empty')).toHaveCount(0);
+	expect(statusScopes).toContain(SENTINEL);
+	expect(
+		statusScopes.every((scope) => scope === SERVER_A || scope === SERVER_B || scope === SENTINEL)
+	).toBe(true);
 });
 
 test('recall paints cited provenance over the wire payload and mirrors the producer bounds', async ({
@@ -881,147 +759,27 @@ test('delete is explicit: receipts name the count, the bank needs a typed confir
 	await expect(hostA.getByTestId('delete-result').last()).toContainText('delete-bank');
 });
 
-test('preview measures real prerequisites and gates install behind a satisfied verdict of the same recipe', async ({
+test('a global-scope window runs every memory call against the fleet sentinel server id', async ({
 	page
 }) => {
-	const hostA = page.getByTestId('host-a');
+	const hostGlobal = page.getByTestId('host-global');
 	await hostAMounted(page);
 
-	// Client identity gate first: a malformed application id blocks preview.
-	await hostA.getByTestId('model-app-id-input').fill('not-a-uuid');
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1');
-	await expect(hostA.getByTestId('model-preview-run')).toBeDisabled();
-	await hostA.getByTestId('model-app-id-input').fill(APP_IDENTITY);
+	// The global window mounts the full panel: honest availability first.
+	await expect(hostGlobal.getByTestId('knowledge-models-root')).toBeVisible();
+	await expect(hostGlobal.getByTestId('memory-status-ok')).toContainText('v1.2.3');
 
-	// Unsatisfied preview: the fail-closed verdict is displayed with the
-	// unmeasurable facts (they count as NOT satisfied — no all-green).
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: hw.ram.8gb');
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-preview')).toHaveAttribute('data-verdict', 'unsatisfied');
-	await expect(hostA.getByTestId('model-preview-verdict')).toContainText('hw.ram.16gb');
-	await expect(hostA.getByTestId('model-preview-unknown')).toContainText('hw.vram.state');
-	await expect(hostA.getByTestId('model-preview-notes')).toContainText('data-root fell back');
-	// No submit while unsatisfied — and no UI-only install state (AC 2).
-	await expect(hostA.getByTestId('model-install-run')).toBeDisabled();
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-
-	// Satisfied preview of the SAME recipe+target opens the submits.
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference');
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-preview')).toHaveAttribute('data-verdict', 'satisfied');
-	await expect(hostA.getByTestId('model-preview-prereqs')).toContainText('hw.ram.16gb');
-	await expect(hostA.getByTestId('model-install-run')).toBeEnabled();
-
-	// Stale recipe: editing the recipe after the preview revokes the gate.
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference-v2');
-	await expect(hostA.getByTestId('model-install-run')).toBeDisabled();
-	await expect(hostA.getByTestId('model-install-stale')).toBeVisible();
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-	const { calls } = await apiState(page);
-	expect(callsOf(calls, 'installModelService')).toHaveLength(0);
-	expect(callsOf(calls, 'pullModelWeights')).toHaveLength(0);
-});
-
-test('install submit carries the durable intent and the watched run reports the producer state honestly', async ({
-	page
-}) => {
-	const hostA = page.getByTestId('host-a');
-	await hostAMounted(page);
-
-	await hostA.getByTestId('model-app-id-input').fill(APP_IDENTITY);
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference');
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-install-run')).toBeEnabled();
-
-	// backup_confirmed defaults to false — the operator's claim, never the UI's.
-	await hostA.getByTestId('model-install-run').click();
-	await expect(hostA.getByTestId('model-run-watch')).toBeVisible();
-	await expect(hostA.getByTestId('model-run-id')).toContainText('install run');
-	await expect(hostA.getByTestId('model-run-id')).toContainText('deduplicated');
-	await expect(hostA.getByTestId('model-run-pending')).toBeVisible();
-
-	// The poll picks up the producer's queued state, then the terminal one.
-	await expect(hostA.getByTestId('model-run-state')).toContainText('Queued');
-	await expect(hostA.getByTestId('model-run-step')).toHaveCount(1);
-	await apiCall(page, 'setRunState', [RUN_A, 'succeeded']);
-	// The poll cadence is bounded (1.5 s) but the wall clock stretches under
-	// the fully-parallel worker load; give the terminal poll real room.
-	await expect(hostA.getByTestId('model-run-state')).toContainText('Succeeded', { timeout: 20_000 });
-	await expect(hostA.getByTestId('model-run-terminal')).toContainText('producer verified');
+	// A recall from the global window carries the SENTINEL as its explicit
+	// target — never a remembered server selection.
+	await hostGlobal.getByTestId('recall-query-input').fill('nginx workers after the OOM incident');
+	await hostGlobal.getByTestId('recall-run').click();
+	await expect(hostGlobal.getByTestId('recall-result')).toBeVisible();
+	await expect(hostGlobal.getByTestId('recall-meta')).toContainText('2 hit(s)');
 
 	const { calls } = await apiState(page);
-	const installCalls = callsOf(calls, 'installModelService');
-	expect(installCalls).toHaveLength(1);
-	const payload = installCalls[0].payload as {
-		run_id: string;
-		recipe: string;
-		target_os: string;
-		target_arch: string;
-		backup_confirmed: boolean;
-	};
-	expect(payload.run_id).toMatch(/^[0-9a-f-]{36}$/);
-	expect(payload.recipe).toBe('schema_version: 1\nname: local-inference');
-	expect(payload.target_os).toBe('linux');
-	expect(payload.target_arch).toBe('x86_64');
-	expect(payload.backup_confirmed).toBe(false);
-	expect(installCalls[0].args).toEqual([SERVER_A, APP_IDENTITY]);
-});
-
-test('pull is the registration path: the terminal pull refreshes the registered connection view', async ({
-	page
-}) => {
-	const hostA = page.getByTestId('host-a');
-	await hostAMounted(page);
-
-	await hostA.getByTestId('model-app-id-input').fill(APP_IDENTITY);
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference');
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-
-	// Producer-bound client checks: model grammar, required license, endpoint.
-	await hostA.getByTestId('model-pull-model-input').fill('bad model; rm -rf');
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-	await hostA.getByTestId('model-pull-model-input').fill('qwen2.5:7b-instruct-q4_K_M');
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-	await hostA.getByTestId('model-pull-license-input').fill('apache-2.0 (weights: qwen research license)');
-	await hostA.getByTestId('model-pull-base-url-input').fill('http://127.0.0.1:18114/v1?key=leak');
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-	await hostA.getByTestId('model-pull-base-url-input').fill('http://127.0.0.1:18114/v1');
-
-	await hostA.getByTestId('model-pull-run').click();
-	await expect(hostA.getByTestId('model-run-watch')).toHaveAttribute('data-run-kind', 'pull');
-	await expect(hostA.getByTestId('model-run-id')).toContainText('pull run');
-	// The executor finishes the acquisition; the poll lands on the terminal
-	// state and registration truth follows.
-	await apiCall(page, 'setRunState', [RUN_A, 'succeeded']);
-	await expect(hostA.getByTestId('model-run-state')).toContainText('Succeeded', { timeout: 20_000 });
-
-	// The pull wrote the C02 record — the registered connection view shows
-	// the credential REFERENCE only (absent for the unauthenticated endpoint).
-	await expect(hostA.getByTestId('connection-ref-local-inference-8c1d2e3f')).toBeVisible();
-	await hostA.getByTestId('connection-open-local-inference-8c1d2e3f').click();
-	await expect(hostA.getByTestId('connection-view-name')).toContainText('local-inference-8c1d2e3f');
-	await expect(hostA.getByTestId('connection-view-url')).toContainText('http://127.0.0.1:18114/v1');
-	await expect(hostA.getByTestId('connection-view-credential-ref')).toContainText(
-		'none — unauthenticated endpoint'
-	);
-	await expect(hostA.getByTestId('connection-view-tool-calls')).toContainText('not observed');
-
-	const { calls } = await apiState(page);
-	const pullCalls = callsOf(calls, 'pullModelWeights');
-	expect(pullCalls).toHaveLength(1);
-	const payload = pullCalls[0].payload as {
-		run_id: string;
-		model: string;
-		license: string;
-		base_url: string;
-	};
-	expect(payload.run_id).toMatch(/^[0-9a-f-]{36}$/);
-	expect(payload.model).toBe('qwen2.5:7b-instruct-q4_K_M');
-	expect(payload.license).toContain('apache-2.0');
-	expect(payload.base_url).toBe('http://127.0.0.1:18114/v1');
-	// A terminal pull refreshed the registration surface (second listing).
-	expect(callsOf(calls, 'listConnections').length).toBeGreaterThanOrEqual(2);
+	const globalRecall = callsOf(calls, 'recallMemory');
+	expect(globalRecall).toHaveLength(1);
+	expect(globalRecall[0].args?.[0]).toBe(SENTINEL);
 	expect(pageErrors).toHaveLength(0);
 });
 
@@ -1034,11 +792,12 @@ test('the feature entry composes into the typed registry with scope rules, geome
 	// Registry membership: exactly the feature entry plus the benign sibling.
 	expect(registry.kinds).toEqual(['fixture-notes', 'knowledge-models']);
 
-	// Scope rules (ADR §3.2): server-scoped only; unpinned windows (the entry
-	// declares no scope_object_kinds), a global mount and foreign object kinds
-	// are refused with stable codes.
+	// Scope rules (ADR §3.2): the entry declares BOTH scopes — server and
+	// global open; unpinned windows (the entry declares no
+	// scope_object_kinds) and foreign object kinds are refused with stable
+	// codes.
 	expect(registry.scopeChecks.serverScope).toBe('ok');
-	expect(registry.scopeChecks.globalScope).toBe('scope_kind_not_allowed');
+	expect(registry.scopeChecks.globalScope).toBe('ok');
 	expect(registry.scopeChecks.pinnedObject).toBe('scope_object_kind_not_allowed');
 	expect(registry.scopeChecks.foreignObject).toBe('scope_object_kind_not_allowed');
 	expect(registry.scopeChecks.unknownKind).toBe('unknown_panel_kind');
@@ -1089,9 +848,7 @@ test('negative control: a memory outage never claims an empty successful recall'
 	await expect(hostA.getByTestId('recall-result')).toHaveCount(0);
 });
 
-test('negative control: hostile producer text renders inert and a wrong-server preview never paints', async ({
-	page
-}) => {
+test('negative control: hostile producer text renders inert', async ({ page }) => {
 	const hostA = page.getByTestId('host-a');
 	await hostAMounted(page);
 
@@ -1105,16 +862,6 @@ test('negative control: hostile producer text renders inert and a wrong-server p
 	// Text interpolation never executes: the probe never fired.
 	const xssFired = await page.evaluate(() => window.__maiXssFired === true);
 	expect(xssFired).toBe(false);
-
-	// A preview naming a DIFFERENT server is refused before painting.
-	await hostA.getByTestId('model-app-id-input').fill(APP_IDENTITY);
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference');
-	await apiCall(page, 'armWrongServerPreview');
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-preview')).toHaveCount(0);
-	await expect(hostA.getByTestId('model-preview-problem')).toContainText('different server');
-	await expect(hostA.getByTestId('model-install-run')).toBeDisabled();
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
 });
 
 test('negative control: unwired links and bags fail closed — no fake navigation, no crash', async ({
@@ -1126,66 +873,25 @@ test('negative control: unwired links and bags fail closed — no fake navigatio
 	// The links-less host renders the full panel but NO link controls.
 	await expect(hostNoSeam.getByTestId('knowledge-models-root')).toBeVisible();
 	await expect(hostNoSeam.getByTestId('memory-open-model-settings')).toHaveCount(0);
-	await expect(hostNoSeam.getByTestId('model-open-applications')).toHaveCount(0);
 
 	// A bagless mount fails closed to the safe state — no throw, no partial UI.
 	await expect(page.getByTestId('host-bare').getByTestId('panel-config-error')).toBeVisible();
-	// A global mount contradicts the entry's server scope: the REGISTRY
-	// refuses it at open (PanelHost's own safe unavailable state).
-	await expect(page.getByTestId('host-global').getByTestId('panel-unavailable')).toBeVisible();
 
 	// The sibling is unaffected by any of it (error containment).
 	await expect(page.getByTestId('host-sibling').getByTestId('sibling-panel')).toBeVisible();
 	expect(pageErrors).toHaveLength(0);
 
 	// The links host, by contrast, renders and routes the open through the
-	// seam with the pinned scope.
+	// seam.
 	const hostA = page.getByTestId('host-a');
 	await expect(hostA.getByTestId('memory-open-model-settings')).toBeVisible();
 	await hostA.getByTestId('memory-open-model-settings').click();
-	await hostA.getByTestId('model-open-applications').click();
 	const { calls } = await apiState(page);
-	const openApps = callsOf(calls, 'openApplications');
-	expect(openApps).toHaveLength(1);
-	expect(openApps[0].args?.[0]).toBe(SERVER_A);
+	const openSettings = callsOf(calls, 'openModelSettings');
+	expect(openSettings).toHaveLength(1);
 });
 
-test('negative control: the credential reference checker classifies value-free with zero network use', async ({
-	page
-}) => {
-	const hostA = page.getByTestId('host-a');
-	await hostAMounted(page);
-
-	const { calls: baseline } = await apiState(page);
-	const baselineCount = baseline.length;
-
-	// A valid 1Password reference is classified as .env-VALUE material.
-	await hostA.getByTestId('credential-ref-check-input').fill('op://MAI/prod-gateway/api-key');
-	await expect(hostA.getByTestId('credential-ref-classified')).toContainText('1Password reference');
-	await expect(hostA.getByTestId('credential-ref-classified')).toContainText('.env VALUE');
-
-	// A valid .env NAME is classified as the reference lane.
-	await hostA.getByTestId('credential-ref-check-input').fill('MAI_GATEWAY_KEY');
-	await expect(hostA.getByTestId('credential-ref-classified')).toContainText('.env reference name');
-
-	// A secret VALUE shape is never a valid reference, and the value itself
-	// is never echoed into any classification.
-	await hostA.getByTestId('credential-ref-check-input').fill(FORBIDDEN_SECRET);
-	await expect(hostA.getByTestId('credential-ref-invalid')).toBeVisible();
-	await expect(hostA.getByTestId('credential-ref-classified')).toHaveCount(0);
-	const pageText = await page.getByTestId('host-a').innerText();
-	expect(pageText).not.toContain(FORBIDDEN_SECRET);
-
-	// An op://-shaped but malformed reference is refused with the grammar.
-	await hostA.getByTestId('credential-ref-check-input').fill('op://vault/item with space');
-	await expect(hostA.getByTestId('credential-ref-invalid')).toContainText('three non-empty segments');
-
-	// Nothing typed was ever transmitted: zero new recorded calls.
-	const { calls: after } = await apiState(page);
-	expect(after.length).toBe(baselineCount);
-});
-
-test('negative control: retain, delete and preview outages stay honest at every boundary', async ({
+test('negative control: retain and delete outages stay honest at every boundary', async ({
 	page
 }) => {
 	const hostA = page.getByTestId('host-a');
@@ -1215,21 +921,4 @@ test('negative control: retain, delete and preview outages stay honest at every 
 	await expect(hostA.getByTestId('delete-problem')).toBeVisible();
 	await expect(hostA.getByTestId('delete-problem')).toHaveAttribute('data-error-code', 'validation_failed');
 	await expect(hostA.getByTestId('delete-result')).toHaveCount(0);
-
-	// Preview: an envelope failure (e.g. transport unavailable) leaves NO
-	// preview and therefore no submits — the fail-closed gate holds.
-	await hostA.getByTestId('model-app-id-input').fill(APP_IDENTITY);
-	await hostA.getByTestId('model-recipe-input').fill('schema_version: 1\nname: local-inference');
-	await apiCall(page, 'failNext', [
-		'previewModelInstall',
-		{ status: 503, code: 'unavailable', message: 'prerequisite measurement transport is unavailable' }
-	]);
-	await hostA.getByTestId('model-preview-run').click();
-	await expect(hostA.getByTestId('model-preview-problem')).toContainText('transport is unavailable');
-	await expect(hostA.getByTestId('model-preview')).toHaveCount(0);
-	await expect(hostA.getByTestId('model-install-run')).toBeDisabled();
-	await expect(hostA.getByTestId('model-pull-run')).toBeDisabled();
-	const { calls } = await apiState(page);
-	expect(callsOf(calls, 'installModelService')).toHaveLength(0);
-	expect(callsOf(calls, 'pullModelWeights')).toHaveLength(0);
 });

@@ -19,7 +19,10 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *    fresh on reopen);
  *  - changing the selected server fixture never retargets open windows;
  *  - workspace state is per-session (second browser context starts empty);
- *  - only benign fixtures: the journey performs zero API requests.
+ *  - only benign fixtures: the journey performs zero API requests (the one
+ *    deliberate exception is the live-nav proof, which sets the readable
+ *    `mai_csrf` cookie and mocks exactly the listed-profiles + memory-status
+ *    reads to compose the REAL live entries into the REAL ServerTreeNav).
  *
  * Known limits (recorded in the card evidence): minimize/maximize chrome is
  * rendered by WindowFrame but its transitions belong to 01-window-presentation
@@ -329,6 +332,87 @@ test('the fixture desktop performs no API requests', async ({ page }) => {
 
 	expect(urls.length).toBeGreaterThan(0);
 	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
+});
+
+test('live nav: Global / Fleet lists Memory only there and opens it with the global scope', async ({
+	page
+}) => {
+	// A readable `mai_csrf` cookie is the live-attach probe; the one listed
+	// profiles request is mocked, so the REAL live entries compose into the
+	// REAL ServerTreeNav on the real route.
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [
+					{
+						schema_version: 1,
+						server_id: SERVER_ALPHA_ID,
+						name: 'Server Alpha',
+						prompt_revision: 1,
+						prompt_text: 'fixture',
+						environment: 'linux_ssh',
+						ssh: {
+							host: 'alpha.example',
+							port: 22,
+							user: 'mai',
+							host_key: 'k',
+							credential_ref: 'MAI_SSH_KEY'
+						},
+						privilege: 'sudo',
+						capabilities: ['memory.recall'],
+						revision: 1,
+						sha256: 'f'.repeat(64),
+						projection: { revision: 1, stale: false }
+					}
+				]
+			})
+		})
+	);
+	// The Memory panel's mount probe answers honestly for any target.
+	await page.route('**/api/v1/servers/*/memory/status', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				status: 'ok',
+				code: null,
+				provider: 'hindsight',
+				operation: 'status',
+				api_version: 'v1.2.3',
+				error_type: null
+			})
+		})
+	);
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+
+	// Global / Fleet lists the Memory entry — and ONLY once, globally.
+	const memoryItem = page.getByTestId('open-knowledge-models');
+	await expect(memoryItem).toContainText('Open Memory — Global');
+	await expect(page.getByTestId('open-knowledge-models-' + SERVER_ALPHA_ID)).toHaveCount(0);
+	await expect(page.getByTestId('open-model-settings-' + SERVER_ALPHA_ID)).toHaveCount(0);
+
+	// The per-server Documents entry stays per-server; no Memory/Model-settings
+	// item repeats inside a server accordion (they are Global / Fleet kinds).
+	await expect(page.getByTestId('open-documents')).toContainText('Open Documents — Server Alpha');
+
+	// The global entry opens the Memory window pinned to the GLOBAL scope.
+	await memoryItem.click();
+	await expect(frame(page, 'knowledge-models')).toHaveCount(1);
+	await expect(frame(page, 'knowledge-models').locator('.mai-window-frame__title')).toHaveText(
+		'Memory — Global'
+	);
+	await expect(page.getByTestId('desktop-status')).toHaveText('Opened Memory — Global.');
+	// The mounted panel probed availability through the real client.
+	await expect(frame(page, 'knowledge-models').getByTestId('memory-status-ok')).toContainText(
+		'v1.2.3'
+	);
 });
 
 test('the bottom chat dock is always visible, interactive offline and performs no API requests', async ({

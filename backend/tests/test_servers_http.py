@@ -532,16 +532,13 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
         ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
         ("GET", "/api/v1/monitoring/notification-policy"),
-        # (11-knowledge-api: memory surface + local model install/pull.)
+        # (11-knowledge-api: memory surface.)
         ("GET", "/api/v1/servers/{server_id}/memory/status"),
         ("POST", "/api/v1/servers/{server_id}/memory/recall"),
         ("POST", "/api/v1/servers/{server_id}/memory/retain"),
         ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
         ("GET", "/api/v1/servers/{server_id}/memory/export"),
         ("POST", "/api/v1/servers/{server_id}/memory/delete"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/preview"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/install"),
-        ("POST", "/api/v1/servers/{server_id}/models/local/{application_id}/pull"),
     }
     # Every route stays under the frozen prefix; no docs listeners (G1).
     for route in api_routes:
