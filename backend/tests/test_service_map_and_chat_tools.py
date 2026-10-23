@@ -1169,18 +1169,276 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
         service_map=None,
     )
     by_id: dict[str, Any] = {d.identifier: d for d in comp.descriptors}
-    for cap_id in ("app.discover", "app.list_adopted", "app.adopt", "app.unadopt", "app.delete_map_entry"):
+    for cap_id in (
+        "app.discover",
+        "app.list_adopted",
+        "app.adopt",
+        "app.unadopt",
+        "app.delete_map_entry",
+        "app.list_catalog",
+        "app.upsert_catalog_runbook",
+        "app.delete_catalog_runbook",
+    ):
         desc = assert_agent_ready_descriptor(by_id[cap_id])
         assert len(str(desc.input_schema["description"])) >= 30
     adopt_props: Any = by_id["app.adopt"].input_schema["properties"]
     assert adopt_props["origin"]["enum"] == ["manual", "compose", "systemd_unit"]
     assert "install" in adopt_props["instructions"]["properties"]
+    assert "custom_instructions" in adopt_props
+    assert "installed" in adopt_props
     assert "machine_id" in adopt_props["upsert_categories"]["items"]["properties"]
     discover_props: Any = by_id["app.discover"].input_schema["properties"]
     assert "limit" in discover_props and "offset" in discover_props
     list_adopted_props: Any = by_id["app.list_adopted"].input_schema["properties"]
     assert "limit" in list_adopted_props and "offset" in list_adopted_props
-    assert len(INTERNAL_API_CAPABILITY_IDS) == 7
+    list_catalog_props: Any = by_id["app.list_catalog"].input_schema["properties"]
+    assert "limit" in list_catalog_props and "offset" in list_catalog_props
+    upsert_catalog_props: Any = by_id["app.upsert_catalog_runbook"].input_schema["properties"]
+    assert "install" in upsert_catalog_props["instructions"]["properties"]
+    assert len(INTERNAL_API_CAPABILITY_IDS) == 10
+
+
+async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
+    tmp_path: Path,
+) -> None:
+    """Unit test (no database required) verifying:
+    - @internal_api_tool catalog capabilities: app.upsert_catalog_runbook,
+      app.list_catalog, app.delete_catalog_runbook
+    - app.adopt inheriting category, description, and 5-slot instructions from
+      the global catalog while persisting server-specific custom_instructions
+      and installed status.
+    """
+    from unittest.mock import MagicMock
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    map_store = _store(tmp_path)
+    composition = build_internal_api_capabilities(
+        applications=MagicMock(),
+        adoption=MagicMock(),
+        docs=MagicMock(),
+        service_map=map_store,
+        data_root=tmp_path,
+    )
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    global_ctx = _context(
+        ("app.list_catalog", "app.upsert_catalog_runbook", "app.delete_catalog_runbook"),
+        server_id=GENERAL_CONSULT,
+    )
+
+    # 1. Add Forgejo to global catalog via app.upsert_catalog_runbook
+    upsert_exec = composition.executors["app.upsert_catalog_runbook"]
+    res1 = await upsert_exec(
+        _call(
+            "app.upsert_catalog_runbook",
+            {
+                "name": "Forgejo",
+                "category": "dev",
+                "description": "Self-hosted lightweight software forge.",
+                "instructions": {
+                    "install": "docker compose up -d forgejo",
+                    "update": "docker compose pull forgejo && docker compose up -d",
+                    "uninstall": "docker compose down",
+                    "backup": "forgejo dump -c /data/gitea/conf/app.ini",
+                    "verify": "curl -fsS http://127.0.0.1:3000/api/v1/version",
+                },
+            },
+            global_ctx,
+        )
+    )
+    assert res1.ok is True, res1.output
+    cat_data = json.loads(res1.output)
+    runbook_id = cat_data["runbook_id"]
+    assert cat_data["category"] == "dev"
+    assert cat_data["revision"] == 1
+
+    # 2. List catalog via app.list_catalog
+    list_exec = composition.executors["app.list_catalog"]
+    res_list = await list_exec(
+        _call(
+            "app.list_catalog",
+            {"query": "forgejo", "category": "dev", "limit": 10, "offset": 0},
+            global_ctx,
+        )
+    )
+    assert res_list.ok is True, res_list.output
+    list_data = json.loads(res_list.output)
+    assert list_data["total"] == 1
+    assert list_data["runbooks"][0]["runbook_id"] == runbook_id
+
+    # 3. Adopt Forgejo on SERVER_A with server-specific custom_instructions
+    # and installed=True (omitting category/description/instructions -> inherited)
+    server_ctx = _context(("app.adopt",), server_id=SERVER_A)
+    adopt_exec = composition.executors["app.adopt"]
+    res_adopt = await adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Forgejo",
+                "origin": "manual",
+                "installed": True,
+                "custom_instructions": "Listening on 127.0.0.1:3000 behind Caddy git.internal; repos on /mnt/nas/git.",
+            },
+            server_ctx,
+        )
+    )
+    assert res_adopt.ok is True, res_adopt.output
+    adopt_data = json.loads(res_adopt.output)
+    assert adopt_data["category"] == "dev"
+    assert adopt_data["description"] == "Self-hosted lightweight software forge."
+    assert adopt_data["instructions"]["backup"] == "forgejo dump -c /data/gitea/conf/app.ini"
+    assert adopt_data["custom_instructions"] == (
+        "Listening on 127.0.0.1:3000 behind Caddy git.internal; repos on /mnt/nas/git."
+    )
+    assert adopt_data["installed"] is True
+
+    # 4. Update server-specific custom_instructions via app.adopt without wiping catalog fields
+    res_adopt2 = await adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Forgejo",
+                "custom_instructions": "Listening on 127.0.0.1:3000; SSH port 2222; repos on /mnt/nas/git.",
+            },
+            server_ctx,
+        )
+    )
+    assert res_adopt2.ok is True, res_adopt2.output
+    adopt_data2 = json.loads(res_adopt2.output)
+    assert adopt_data2["revision"] == 2
+    assert adopt_data2["installed"] is True
+    assert adopt_data2["instructions"]["verify"] == "curl -fsS http://127.0.0.1:3000/api/v1/version"
+    assert "SSH port 2222" in adopt_data2["custom_instructions"]
+
+    # 5. Also verify origin="compose" adoption inheriting from catalog and updating
+    # custom_instructions without passing expected_revision or application_id.
+    from datetime import datetime, timezone
+    from mai.applications.adopt import AdoptedApplication, AdoptionResult
+
+    stored_records: dict[tuple[uuid.UUID, uuid.UUID], AdoptedApplication] = {}
+
+    class _FakeAdoption:
+        async def list_adopted(self, sid: uuid.UUID) -> list[AdoptedApplication]:
+            return [r for (s, _), r in stored_records.items() if s == sid]
+
+        async def read(
+            self, sid: uuid.UUID, aid: uuid.UUID
+        ) -> AdoptedApplication | None:
+            return stored_records.get((sid, aid))
+
+        async def adopt(self, *, store: Any, request: Any) -> AdoptionResult:
+            del store
+            key = (request.server_id, request.application_id)
+            prev = stored_records.get(key)
+            expected = 0 if prev is None else prev.revision
+            assert request.expected_revision == expected, (
+                f"expected_revision mismatch: got {request.expected_revision}, expected {expected}"
+            )
+            new_rev = expected + 1
+            now = datetime.now(timezone.utc)
+            rec = AdoptedApplication(
+                server_id=request.server_id,
+                application_id=request.application_id,
+                name=request.name,
+                origin=request.origin,
+                compose_project=request.compose_project,
+                working_dir=request.working_dir,
+                unit_name=request.unit_name,
+                external_working_dir=request.external_working_dir,
+                external_config_files=request.external_config_files,
+                external_environment_files=request.external_environment_files,
+                revision=new_rev,
+                schema_revision=1,
+                sha256="deadbeef" * 8,
+                adopted_at=now,
+                reconciled_at=now,
+                stale=False,
+            )
+            stored_records[key] = rec
+            return AdoptionResult(
+                intent_id=uuid.uuid4(),
+                server_id=request.server_id,
+                application_id=request.application_id,
+                op="upsert",
+                outcome="adopted" if expected == 0 else "updated",
+                revision=new_rev,
+                sha256=rec.sha256,
+            )
+
+    comp_compose = build_internal_api_capabilities(
+        applications=MagicMock(),
+        adoption=_FakeAdoption(),  # type: ignore[arg-type]
+        docs=MagicMock(),
+        service_map=map_store,
+        data_root=tmp_path,
+    )
+    compose_adopt_exec = comp_compose.executors["app.adopt"]
+    res_comp1 = await compose_adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Forgejo",
+                "origin": "compose",
+                "compose_project": "forgejo",
+                "working_dir": "/srv/forgejo",
+                "installed": True,
+                "custom_instructions": "Compose stack at /srv/forgejo; port 3000.",
+            },
+            _context(("app.adopt",), server_id=SERVER_B),
+        )
+    )
+    assert res_comp1.ok is True, res_comp1.output
+    comp1_data = json.loads(res_comp1.output)
+    assert comp1_data["origin"] == "compose"
+    assert comp1_data["category"] == "dev"
+    assert comp1_data["instructions"]["install"] == "docker compose up -d forgejo"
+    assert comp1_data["custom_instructions"] == "Compose stack at /srv/forgejo; port 3000."
+    assert comp1_data["installed"] is True
+
+    # Re-calling app.adopt on SERVER_B without expected_revision or origin updates in place
+    res_comp2 = await compose_adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Forgejo",
+                "custom_instructions": "Compose stack at /srv/forgejo; port 3000; runner enabled.",
+                "installed": True,
+            },
+            _context(("app.adopt",), server_id=SERVER_B),
+        )
+    )
+    assert res_comp2.ok is True, res_comp2.output
+    comp2_data = json.loads(res_comp2.output)
+    assert comp2_data["application_id"] == comp1_data["application_id"]
+    assert comp2_data["origin"] == "compose"
+    assert comp2_data["revision"] == 2
+    assert comp2_data["custom_instructions"] == (
+        "Compose stack at /srv/forgejo; port 3000; runner enabled."
+    )
+    assert comp2_data["instructions"]["backup"] == "forgejo dump -c /data/gitea/conf/app.ini"
+
+    # 6. Delete from global catalog via app.delete_catalog_runbook
+    del_exec = composition.executors["app.delete_catalog_runbook"]
+    res_del = await del_exec(
+        _call(
+            "app.delete_catalog_runbook",
+            {"runbook_id": runbook_id},
+            global_ctx,
+        )
+    )
+    assert res_del.ok is True, res_del.output
+    assert json.loads(res_del.output)["removed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1463,4 +1721,161 @@ async def test_agent_tool_list_adopted_pagination_counts_filtered_set(
     assert full["has_more"] is False
     partial = await _tool_list_adopted(bridge, server_a, limit=2, offset=0)
     assert partial["has_more"] is True
+
+
+async def test_catalog_tools_and_adopt_inherits_catalog_with_custom_instructions(
+    live_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    """End-to-end two-tier workflow:
+    1. Agent adds an app to the global Runbook Catalog via app.upsert_catalog_runbook
+       (works in General Consult without a server_id).
+    2. Agent lists the catalog via app.list_catalog.
+    3. Agent adopts the app on server_a via app.adopt with server-specific
+       custom_instructions and installed=True, automatically inheriting the
+       catalog's category, description, and 5-slot runbook instructions.
+    4. Agent updates custom_instructions/installed via a second app.adopt call
+       without passing expected_revision or application_id.
+    5. Deleting the catalog recipe via app.delete_catalog_runbook leaves the
+       server adoption intact.
+    """
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    del jar
+    composition = build_internal_api_capabilities(
+        applications=live_app.state.applications,
+        adoption=live_app.state.app_adoption,
+        docs=live_app.state.app_docs,
+        service_map=live_app.state.service_map,
+        session_factory=live_app.state.session_factory,
+    )
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    global_ctx = _context(
+        ("app.list_catalog", "app.upsert_catalog_runbook", "app.delete_catalog_runbook"),
+        server_id=uuid.UUID(int=0),
+    )
+
+    # 1. Upsert into global catalog from General Consult (server_id = 0).
+    upsert_exec = composition.executors["app.upsert_catalog_runbook"]
+    upsert_res = await upsert_exec(
+        _call(
+            "app.upsert_catalog_runbook",
+            {
+                "name": "Immich",
+                "category": "media",
+                "description": "Self-hosted photo and video management platform.",
+                "instructions": {
+                    "install": "docker compose up -d",
+                    "update": "docker compose pull && docker compose up -d",
+                    "uninstall": "docker compose down",
+                    "backup": "pg_dumpall > dump.sql",
+                    "verify": "curl -fsS http://127.0.0.1:2283/api/server/ping",
+                },
+            },
+            global_ctx,
+        )
+    )
+    assert upsert_res.ok is True, upsert_res.output
+    upsert_env = json.loads(upsert_res.output)
+    assert upsert_env["status"] == "ok"
+    runbook_id = upsert_env["runbook_id"]
+    assert upsert_env["category"] == "media"
+    assert upsert_env["revision"] == 1
+
+    # 2. List global catalog with query filter.
+    list_exec = composition.executors["app.list_catalog"]
+    list_res = await list_exec(
+        _call(
+            "app.list_catalog",
+            {"query": "immich", "limit": 10, "offset": 0},
+            global_ctx,
+        )
+    )
+    assert list_res.ok is True, list_res.output
+    list_env = json.loads(list_res.output)
+    assert list_env["total"] == 1
+    assert list_env["runbooks"][0]["runbook_id"] == runbook_id
+    assert list_env["runbooks"][0]["instructions"]["verify"].startswith("curl")
+
+    # 3. Adopt on server_a with compose selectors + server-specific custom_instructions
+    # while omitting category, description, and instructions (must inherit from catalog).
+    server_ctx = _context(("app.adopt", "app.list_adopted"), server_id=server_a)
+    adopt_exec = composition.executors["app.adopt"]
+    adopt_res = await adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Immich",
+                "origin": "compose",
+                "compose_project": "immich",
+                "working_dir": "/opt/immich",
+                "installed": True,
+                "custom_instructions": "Compose dir /opt/immich; bound to 127.0.0.1:2283; library at /mnt/nas/photos.",
+            },
+            server_ctx,
+        )
+    )
+    assert adopt_res.ok is True, adopt_res.output
+    adopt_env = json.loads(adopt_res.output)
+    assert adopt_env["status"] == "ok"
+    assert adopt_env["category"] == "media"
+    assert adopt_env["description"] == "Self-hosted photo and video management platform."
+    assert adopt_env["instructions"]["install"] == "docker compose up -d"
+    assert adopt_env["instructions"]["verify"] == "curl -fsS http://127.0.0.1:2283/api/server/ping"
+    assert adopt_env["custom_instructions"] == (
+        "Compose dir /opt/immich; bound to 127.0.0.1:2283; library at /mnt/nas/photos."
+    )
+    assert adopt_env["installed"] is True
+
+    # 4. Call app.adopt again to update custom_instructions without expected_revision
+    # or origin/selectors — must auto-resolve revision and preserve compose selectors + catalog instructions.
+    adopt_update = await adopt_exec(
+        _call(
+            "app.adopt",
+            {
+                "name": "Immich",
+                "custom_instructions": "Compose dir /opt/immich; upgraded to v1.120; backup target /mnt/nas/backups/immich.",
+                "installed": True,
+            },
+            server_ctx,
+        )
+    )
+    assert adopt_update.ok is True, adopt_update.output
+    update_env = json.loads(adopt_update.output)
+    assert update_env["application_id"] == adopt_env["application_id"]
+    assert update_env["origin"] == "compose"
+    assert update_env["revision"] == 2
+    assert update_env["custom_instructions"] == (
+        "Compose dir /opt/immich; upgraded to v1.120; backup target /mnt/nas/backups/immich."
+    )
+    assert update_env["instructions"]["backup"] == "pg_dumpall > dump.sql"
+
+    # 5. Delete from catalog.json; server adoption remains untouched.
+    del_exec = composition.executors["app.delete_catalog_runbook"]
+    del_res = await del_exec(
+        _call(
+            "app.delete_catalog_runbook",
+            {"runbook_id": runbook_id},
+            global_ctx,
+        )
+    )
+    assert del_res.ok is True, del_res.output
+    assert json.loads(del_res.output)["removed"] is True
+    stored_entry = live_app.state.service_map.get_entry(
+        server_a, adopt_env["application_id"]
+    )
+    assert stored_entry is not None
+    assert stored_entry.custom_instructions.startswith("Compose dir /opt/immich; upgraded")
+
 

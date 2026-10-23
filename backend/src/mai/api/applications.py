@@ -1212,6 +1212,75 @@ async def list_adopted(
     )
 
 
+def _resolve_inherited_service_map_fields(
+    map_store: ServiceMapStore,
+    server_id: uuid.UUID,
+    application_id: uuid.UUID,
+    payload: AdoptBody,
+) -> tuple[str, str, dict[str, str], str | None, bool | None]:
+    """Inherit category, description, and 5-slot runbook instructions from
+    an existing server entry or matching global Catalog Runbook when omitted
+    in ``AdoptBody``; preserve ``custom_instructions`` and ``installed``.
+    """
+    existing_entry = map_store.get_entry(server_id, application_id)
+    if existing_entry is None:
+        for candidate in map_store.list_entries(server_id):
+            if candidate.name.lower() == payload.name.strip().lower():
+                existing_entry = candidate
+                break
+    catalog_runbook = map_store.get_catalog_runbook(application_id)
+    if catalog_runbook is None:
+        for rb in map_store.list_catalog_runbooks():
+            if rb.name.lower() == payload.name.strip().lower():
+                catalog_runbook = rb
+                break
+    effective_category = (
+        payload.category
+        if payload.category
+        else (
+            existing_entry.category
+            if existing_entry is not None
+            else (
+                catalog_runbook.category
+                if catalog_runbook is not None
+                else "system"
+            )
+        )
+    )
+    effective_description = (
+        payload.description
+        if payload.description is not None
+        else (
+            existing_entry.description
+            if existing_entry is not None and existing_entry.description
+            else (
+                catalog_runbook.description
+                if catalog_runbook is not None
+                else ""
+            )
+        )
+    )
+    merged_instructions: dict[str, str] = {k: "" for k in INSTRUCTION_KEYS}
+    if catalog_runbook is not None:
+        for key, val in catalog_runbook.instructions.to_json().items():
+            if val:
+                merged_instructions[key] = val
+    if existing_entry is not None:
+        for key, val in existing_entry.instructions.to_json().items():
+            if val:
+                merged_instructions[key] = val
+    for key, val in payload.instructions.model_dump().items():
+        if val:
+            merged_instructions[key] = val
+    return (
+        effective_category,
+        effective_description,
+        merged_instructions,
+        payload.custom_instructions,
+        payload.installed,
+    )
+
+
 @router.post(
     "",
     status_code=HTTP_201_CREATED,
@@ -1316,19 +1385,28 @@ async def adopt_application(
     # The Service Map sidecar: category/description/instructions persist
     # for the adopted service (the map is the metadata catalogue over the
     # C09 truth; a store rejection here surfaces, never a silent skip).
+    (
+        eff_category,
+        eff_description,
+        eff_instructions,
+        eff_custom,
+        eff_installed,
+    ) = _resolve_inherited_service_map_fields(
+        map_store, server_id, application_id, payload
+    )
     entry = map_store.upsert_entry(
         server_id,
         name=payload.name,
-        category=payload.category or "system",
+        category=eff_category,
         origin=ApplicationOrigin(payload.origin).value,
         application_id=application_id,
         compose_project=payload.compose_project,
         working_dir=payload.working_dir,
         unit_name=payload.unit_name,
-        description=payload.description or "",
-        instructions=payload.instructions.model_dump(),
-        custom_instructions=payload.custom_instructions,
-        installed=payload.installed,
+        description=eff_description,
+        instructions=eff_instructions,
+        custom_instructions=eff_custom,
+        installed=eff_installed,
     )
     record = await adoption.read(server_id, application_id)
     assert record is not None  # the pipeline just reconciled it
@@ -1361,19 +1439,28 @@ async def _adopt_manual_entry(
     honestly (``pending``) — the committed map entry is never rolled
     back for it.
     """
+    (
+        eff_category,
+        eff_description,
+        eff_instructions,
+        eff_custom,
+        eff_installed,
+    ) = _resolve_inherited_service_map_fields(
+        map_store, server_id, application_id, payload
+    )
     entry = map_store.upsert_entry(
         server_id,
         name=payload.name,
-        category=payload.category or "system",
+        category=eff_category,
         origin="manual",
         application_id=application_id,
         compose_project=payload.compose_project,
         working_dir=payload.working_dir,
         unit_name=payload.unit_name,
-        description=payload.description or "",
-        instructions=payload.instructions.model_dump(),
-        custom_instructions=payload.custom_instructions,
-        installed=payload.installed,
+        description=eff_description,
+        instructions=eff_instructions,
+        custom_instructions=eff_custom,
+        installed=eff_installed,
     )
     return AdoptionCreated(
         intent_id=str(uuid.uuid5(application_id, "service-map:manual-adoption")),
@@ -1400,11 +1487,14 @@ def _render_manual_record(entry: ServiceMapEntry) -> str:
         f"- server_id: `{entry.server_id}`",
         f"- origin: `{entry.origin}`",
         f"- category: `{entry.category}`",
+        f"- installed: `{str(entry.installed).lower()}`",
         f"- map_revision: {entry.revision}",
         "",
     ]
     if entry.description:
         lines += ["## Description", "", entry.description, ""]
+    if entry.custom_instructions:
+        lines += ["## Server custom instructions", "", entry.custom_instructions, ""]
     runbook = entry.instructions.to_json()
     if any(runbook.values()):
         lines += ["## Runbook instructions", ""]

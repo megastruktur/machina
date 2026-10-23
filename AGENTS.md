@@ -32,6 +32,9 @@ Unbounded collection loads clutter panels, exhaust agent context windows, and ri
   - Every field on `payload_model` (including nested `BaseModel` fields and array item models) must declare `Field(description=...)` of at least 12 characters.
 - Serialized tool output envelopes must remain strictly under the 64 KiB `CapabilityDispatcher` cap (`_bound_internal_api_envelope`).
 - Whenever backend FastAPI route schemas change, regenerate `frontend/src/lib/api/schema.generated.ts` using the command documented at the top of `frontend/src/lib/api/client.ts`.
+- **Runbook Catalog vs. Adoption (`docs/architecture/runbook-catalog-and-adoption.md`):**
+  - **Global Runbook Catalog (`app.list_catalog`, `app.upsert_catalog_runbook`, `app.delete_catalog_runbook`):** Fleet-wide, server-agnostic recipes stored in `<data_root>/service_map/catalog.json` (`name`, `category`, `description`, and 5 `instructions` slots: `install`, `update`, `uninstall`, `backup`, `verify`).
+  - **Per-Server Adoption (`app.adopt`, `app.unadopt`, `app.list_adopted`, `app.discover`):** Assigns a service to a specific `server_id`, verifies/records `installed` (`bool`) and concrete selectors (`compose` / `systemd_unit` / `manual`), stores **server-specific `custom_instructions`** (host paths, ports, `.env` locations, domains, overrides), and automatically inherits `category`, `description`, and `instructions` from a matching global catalog runbook when omitted.
 
 ---
 

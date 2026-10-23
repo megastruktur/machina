@@ -79,9 +79,11 @@ BUILTIN_SKILLS: tuple[BuiltinSkillSpec, ...] = (
         manifest_yaml=(
             "schema_version: 1\n"
             "skill: app-discovery-adoption\n"
-            "title: Application Discovery & Service Map Curation\n"
-            "description: Discover running workloads, adopt services into M.A.I., and document their Service Map entries.\n"
+            "title: Runbook Catalog & Application Adoption\n"
+            "description: Two-tier workflow: add/update global Runbook Catalog recipes and adopt/verify services on target servers with server-specific custom instructions.\n"
             "requires_capabilities:\n"
+            "  - app.list_catalog\n"
+            "  - app.upsert_catalog_runbook\n"
             "  - app.discover\n"
             "  - app.list_adopted\n"
             "  - app.adopt\n"
@@ -89,11 +91,17 @@ BUILTIN_SKILLS: tuple[BuiltinSkillSpec, ...] = (
             "references: []\n"
         ),
         instructions_md=(
-            "# Application Discovery & Service Map Curation\n\n"
-            "Use this workflow when onboarding a server or auditing its running workloads:\n"
-            "1. Call `app.discover` with pagination (`limit`, `offset`) and optional `kind_filter` / `query`.\n"
-            "2. Compare discovered candidates against `app.list_adopted`.\n"
-            "3. Adopt confirmed production workloads with `app.adopt` and curate their category, description, and operational runbook via `app.upsert_map_entry`.\n"
+            "# Runbook Catalog & Application Adoption\n\n"
+            "Use the two-tier service model to separate global software recipes from per-server deployments:\n"
+            "1. **Tier 1 — Global Runbook Catalog (`app.list_catalog`, `app.upsert_catalog_runbook`, `app.delete_catalog_runbook`):**\n"
+            "   - Fleet-wide and server-agnostic (`catalog.json`).\n"
+            "   - When asked to **add an app to the catalog**, research its official docs (`web.search` / `web.read`) and call `app.upsert_catalog_runbook` with `name`, `category`, `description`, and the 5 global `instructions` slots (`install`, `update`, `uninstall`, `backup`, `verify`).\n"
+            "   - Do NOT put host-specific paths, ports, or server state in the global catalog.\n"
+            "2. **Tier 2 — Server Adoption (`app.discover`, `app.list_adopted`, `app.adopt`, `app.unadopt`):**\n"
+            "   - Assigns a service to a specific `server_id`.\n"
+            "   - Check whether the service is installed/running on the host via `app.discover` (paginated `limit`/`offset`) and/or `host.shell` / `service.http`.\n"
+            "   - Call `app.adopt` with `origin` (`compose`, `systemd_unit`, or `manual`), target selectors (`compose_project` + `working_dir`, or `unit_name`), `installed` (`true` if verified installed on the host, `false` if staged), and `custom_instructions` containing the **server-specific instructions** (host paths, ports, bind addresses, `.env` paths, reverse-proxy domains, systemd overrides, backup targets).\n"
+            "   - `app.adopt` automatically inherits `category`, `description`, and the 5 global `instructions` slots from a matching global Catalog Runbook when omitted.\n"
         ),
         references={},
     ),
@@ -122,18 +130,19 @@ BUILTIN_SKILLS: tuple[BuiltinSkillSpec, ...] = (
         manifest_yaml=(
             "schema_version: 1\n"
             "skill: web-research-runbook\n"
-            "title: External Documentation & Advisory Research\n"
-            "description: Combine local server documentation retrieval with SearXNG web search and page reading.\n"
+            "title: External Documentation & Runbook Catalog Research\n"
+            "description: Combine local server documentation retrieval with SearXNG web search and page reading to populate global Runbook Catalog recipes.\n"
             "requires_capabilities:\n"
             "  - web.search\n"
             "  - web.read\n"
             "references: []\n"
         ),
         instructions_md=(
-            "# External Documentation & Advisory Research\n\n"
-            "1. Query `web.search` with focused technical keywords (software name, version, error code, or CVE).\n"
+            "# External Documentation & Runbook Catalog Research\n\n"
+            "1. Query `web.search` with focused technical keywords (software name, version, install/upgrade guide, or CVE).\n"
             "2. Fetch authoritative documentation or release notes using `web.read`.\n"
-            "3. Cross-reference external guidance with the target server's actual configuration before recommending changes.\n"
+            "3. When adding or updating an application in the global Runbook Catalog, persist the researched `install`, `update`, `uninstall`, `backup`, and `verify` procedures via `app.upsert_catalog_runbook`.\n"
+            "4. Cross-reference external guidance with the target server's actual configuration (`custom_instructions`) before applying host modifications.\n"
         ),
         references={},
     ),

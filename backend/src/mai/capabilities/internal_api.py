@@ -92,6 +92,9 @@ APP_LIST_ADOPTED_CAPABILITY: Final = "app.list_adopted"
 APP_ADOPT_CAPABILITY: Final = "app.adopt"
 APP_UNADOPT_CAPABILITY: Final = "app.unadopt"
 APP_DELETE_MAP_ENTRY_CAPABILITY: Final = "app.delete_map_entry"
+APP_LIST_CATALOG_CAPABILITY: Final = "app.list_catalog"
+APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY: Final = "app.upsert_catalog_runbook"
+APP_DELETE_CATALOG_RUNBOOK_CAPABILITY: Final = "app.delete_catalog_runbook"
 
 #: The internal-API capability set the chat agent exposes by default across
 #: both pinned-server conversations and General Consult (the UI/agent surface
@@ -103,6 +106,9 @@ INTERNAL_API_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     APP_UNADOPT_CAPABILITY,
     UPSERT_MAP_CAPABILITY,
     APP_DELETE_MAP_ENTRY_CAPABILITY,
+    APP_LIST_CATALOG_CAPABILITY,
+    APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY,
+    APP_DELETE_CATALOG_RUNBOOK_CAPABILITY,
     CHAT_READ_CAPABILITY,
 )
 
@@ -716,6 +722,16 @@ def _bound_internal_api_envelope(
             ]
             envelope["applications_truncated"] = True
 
+    if isinstance(envelope.get("runbooks"), list):
+        while (
+            len(envelope["runbooks"]) > 1
+            and len(json.dumps(envelope, sort_keys=True).encode("utf-8")) > max_bytes
+        ):
+            envelope["runbooks"] = envelope["runbooks"][
+                : max(1, len(envelope["runbooks"]) // 2)
+            ]
+            envelope["has_more"] = True
+
     return envelope
 
 
@@ -896,42 +912,52 @@ class AppAdoptPayload(BaseModel):
         default_factory=list,
         description="Optional list of absolute environment (.env) file paths on the host.",
     )
-    expected_revision: int = Field(
-        default=0,
-        description="Optimistic concurrency revision: 0 when adopting a new service, or the current revision when updating.",
+    expected_revision: int | None = Field(
+        default=None,
+        description=(
+            "Optimistic concurrency revision: 0 when adopting a new service, "
+            "the current revision when updating, or omit to auto-resolve."
+        ),
     )
     category: str | None = Field(
         default=None,
         description=(
-            "Service Map category slug (e.g. 'system', 'ai', 'media', 'network', "
-            "'storage', 'monitoring', 'security', 'games', or a custom slug)."
+            "Service Map category slug (e.g. 'system', 'ai', 'media', 'dev', "
+            "'infrastructure', 'observability', 'agent', 'games', or a custom slug). "
+            "Omit to inherit from the global Runbook Catalog or existing entry."
         ),
     )
     description: str | None = Field(
         default=None,
-        description="Concise summary of what the service does and how it is configured on this host.",
+        description=(
+            "Concise summary of what the service does. Omit to inherit from "
+            "the global Runbook Catalog or existing entry."
+        ),
     )
     instructions: ServiceInstructionsPayload | None = Field(
         default=None,
         description=(
             "Operational runbook object with optional string keys: "
-            "'install', 'update', 'uninstall', 'backup', 'verify'."
+            "'install', 'update', 'uninstall', 'backup', 'verify'. Omit to "
+            "inherit from the global Runbook Catalog or existing entry."
         ),
     )
     custom_instructions: str | None = Field(
         default=None,
         description=(
-            "Server-specific operational notes for this host, injected into "
-            "the agent's service context alongside the global description "
-            "and runbook. Omit to preserve the stored value."
+            "Server-specific operational instructions for this host (e.g. "
+            "ports, bind addresses, config/env file paths, volume mounts, "
+            "systemd overrides, backup targets), injected into the agent's "
+            "@service context alongside the global catalog runbook. Omit to "
+            "preserve the stored value."
         ),
     )
     installed: bool | None = Field(
         default=None,
         description=(
-            "Whether the service is currently installed on this host. Omit "
-            "to preserve the stored value; false marks a runbook staged "
-            "but not installed."
+            "Whether the service is verified installed on this host (true "
+            "when confirmed present on the system; false when staged from "
+            "the catalog but not installed). Omit to preserve the stored value."
         ),
     )
     upsert_categories: list[ServiceCategoryPayload] = Field(
@@ -939,6 +965,106 @@ class AppAdoptPayload(BaseModel):
         description=(
             "Optional list of custom categories to create/update: "
             "[{'machine_id': '...', 'label': '...', 'description': '...'}]."
+        ),
+    )
+
+
+class AppListCatalogPayload(BaseModel):
+    """List global Runbook Catalog recipes (fleet-wide, server-agnostic)."""
+
+    model_config = {"extra": "forbid"}
+
+    query: str | None = Field(
+        default=None,
+        max_length=256,
+        description=(
+            "Optional case-insensitive substring filter over catalog runbook "
+            "names, categories, and descriptions."
+        ),
+    )
+    category: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional category machine_id filter (e.g. 'media', 'ai', 'dev').",
+    )
+    limit: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Maximum number of catalog runbooks to return per page (default 25, max 100).",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Zero-based pagination offset for catalog runbooks (default 0).",
+    )
+
+
+class AppUpsertCatalogRunbookPayload(BaseModel):
+    """Add or update an application recipe in the global Runbook Catalog (catalog.json)."""
+
+    model_config = {"extra": "forbid"}
+
+    runbook_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical UUID of an existing catalog runbook to update. "
+            "Omit to match by name or mint a deterministic catalog UUID5."
+        ),
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Display name of the application/service in the global Runbook "
+            "Catalog (e.g. 'Immich', 'Forgejo', 'Prometheus')."
+        ),
+    )
+    category: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Service taxonomy category machine_id ('games', 'ai', 'agent', "
+            "'system', 'dev', 'infrastructure', 'media', 'observability', or "
+            "a custom slug). Defaults to deterministic classification or 'system'."
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "General, server-agnostic description of the application, its "
+            "purpose, and architecture."
+        ),
+    )
+    instructions: ServiceInstructionsPayload | None = Field(
+        default=None,
+        description=(
+            "Global operational runbook instructions researched from official "
+            "documentation: 'install', 'update', 'uninstall', 'backup', 'verify'."
+        ),
+    )
+    upsert_categories: list[ServiceCategoryPayload] = Field(
+        default_factory=list,
+        description=(
+            "Optional custom taxonomy categories to create or update before "
+            "saving the catalog runbook."
+        ),
+    )
+
+
+class AppDeleteCatalogRunbookPayload(BaseModel):
+    """Delete an application recipe from the global Runbook Catalog (catalog.json only)."""
+
+    model_config = {"extra": "forbid"}
+
+    runbook_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "Canonical UUID of the global catalog runbook to delete (from "
+            "app.list_catalog). Per-server adopted entries are not affected."
         ),
     )
 
@@ -1046,7 +1172,13 @@ def build_internal_api_capabilities(
     )
     from mai.applications.discover import discover_server
     from mai.applications.document import record_doc_id
-    from mai.applications.service_map import ServiceMapStore, entry_digest
+    from mai.applications.service_map import (
+        INSTRUCTION_KEYS,
+        ServiceMapError,
+        ServiceMapStore,
+        classify_service,
+        entry_digest,
+    )
     from mai.contracts.server import parse_server_profile_text
     from mai.knowledge.documents import (
         DocumentNamespace,
@@ -1300,38 +1432,179 @@ def build_internal_api_capabilities(
                 "unavailable", "applications service is unavailable"
             )
         server_id = _resolve_server_id(call, payload, APP_ADOPT_CAPABILITY)
-        origin_value = payload.get("origin", "manual")
-        name = str(payload["name"])
+        name = str(payload["name"]).strip()
+        raw_call_payload = call.payload if isinstance(call.payload, Mapping) else {}
+        explicit_origin = "origin" in raw_call_payload and raw_call_payload.get("origin") is not None
+        origin_value = str(payload.get("origin") or "manual")
+
+        # Match any existing Service Map entry on this server or global
+        # Catalog Runbook so adopting a catalog service inherits its
+        # category, description, and 5-slot runbook instructions while
+        # adding server-specific custom_instructions and installed state.
+        raw_aid = payload.get("application_id")
+        parsed_aid: uuid.UUID | None = None
+        if raw_aid:
+            try:
+                parsed_aid = uuid.UUID(str(raw_aid).strip())
+            except ValueError:
+                raise InternalApiError(
+                    "invalid_request",
+                    "application_id must be a canonical UUID string",
+                ) from None
+
+        existing_entry = None
+        for candidate in service_map.list_entries(server_id):
+            if parsed_aid is not None and candidate.application_id == str(parsed_aid):
+                existing_entry = candidate
+                break
+            if parsed_aid is None and candidate.name.lower() == name.lower():
+                existing_entry = candidate
+                break
+
+        catalog_runbook = None
+        for rb in service_map.list_catalog_runbooks():
+            if parsed_aid is not None and rb.runbook_id == str(parsed_aid):
+                catalog_runbook = rb
+                break
+            if rb.name.lower() == name.lower():
+                catalog_runbook = rb
+                break
+
+        # If updating an existing server entry and origin was not explicitly
+        # changed by the caller, preserve its stored origin and selectors.
+        if not explicit_origin and existing_entry is not None:
+            origin_value = existing_entry.origin
+
+        compose_project = payload.get("compose_project")
+        if compose_project is None and existing_entry is not None and origin_value == existing_entry.origin:
+            compose_project = existing_entry.compose_project
+        working_dir = payload.get("working_dir")
+        if working_dir is None and existing_entry is not None and origin_value == existing_entry.origin:
+            working_dir = existing_entry.working_dir
+        unit_name = payload.get("unit_name")
+        if unit_name is None and existing_entry is not None and origin_value == existing_entry.origin:
+            unit_name = existing_entry.unit_name
+
+        # Resolve per-server application_id (never reuse a bare catalog
+        # runbook_id across multiple servers' compose/systemd adoptions,
+        # which would collide on cross_server_conflict).
+        existing_adopted = None
+        try:
+            for rec in await adoption.list_adopted(server_id):
+                if parsed_aid is not None and rec.application_id == parsed_aid:
+                    existing_adopted = rec
+                    break
+                if parsed_aid is None and rec.name.lower() == name.lower():
+                    existing_adopted = rec
+                    break
+        except Exception:
+            existing_adopted = None
+
         application_id: uuid.UUID
-        if payload.get("application_id"):
-            application_id = uuid.UUID(str(payload["application_id"]))
+        if parsed_aid is not None:
+            if (
+                origin_value != "manual"
+                and catalog_runbook is not None
+                and str(parsed_aid) == catalog_runbook.runbook_id
+                and existing_adopted is None
+            ):
+                application_id = uuid.uuid5(
+                    server_id, f"service-map:{name.lower()}"
+                )
+            else:
+                application_id = parsed_aid
+        elif existing_adopted is not None:
+            application_id = existing_adopted.application_id
+        elif existing_entry is not None and (
+            origin_value == "manual"
+            or catalog_runbook is None
+            or existing_entry.application_id != catalog_runbook.runbook_id
+        ):
+            application_id = uuid.UUID(existing_entry.application_id)
         else:
-            application_id = uuid.uuid4()
+            application_id = uuid.uuid5(
+                server_id, f"service-map:{name.lower()}"
+            )
+
+        # Merge inherited category, description, and 5-slot runbook instructions.
+        effective_category = (
+            str(payload["category"])
+            if payload.get("category")
+            else (
+                existing_entry.category
+                if existing_entry is not None
+                else (
+                    catalog_runbook.category
+                    if catalog_runbook is not None
+                    else classify_service(
+                        name, str(unit_name or compose_project or "")
+                    )
+                )
+            )
+        )
+        effective_description = (
+            str(payload["description"])
+            if payload.get("description") is not None
+            else (
+                existing_entry.description
+                if existing_entry is not None and existing_entry.description
+                else (
+                    catalog_runbook.description
+                    if catalog_runbook is not None
+                    else ""
+                )
+            )
+        )
+        merged_instructions: dict[str, str] = {k: "" for k in INSTRUCTION_KEYS}
+        if catalog_runbook is not None:
+            for key, val in catalog_runbook.instructions.to_json().items():
+                if val:
+                    merged_instructions[key] = val
+        if existing_entry is not None:
+            for key, val in existing_entry.instructions.to_json().items():
+                if val:
+                    merged_instructions[key] = val
+        raw_instr = raw_call_payload.get("instructions")
+        if isinstance(raw_instr, Mapping):
+            for key in INSTRUCTION_KEYS:
+                if key in raw_instr and raw_instr[key] is not None:
+                    merged_instructions[key] = str(raw_instr[key])
+        elif isinstance(payload.get("instructions"), Mapping):
+            for key, val in payload["instructions"].items():
+                if val:
+                    merged_instructions[key] = str(val)
+
+        if payload.get("upsert_categories"):
+            for category in payload["upsert_categories"]:
+                service_map.upsert_category(
+                    str(category["machine_id"]),
+                    label=str(category.get("label", category["machine_id"])),
+                    description=str(category.get("description", "")),
+                )
 
         if origin_value == "manual":
             # The chat/manual addition: persist directly in the Service Map +
             # canonical identity doc (the UI's `_adopt_manual_entry` flow).
-            if payload.get("upsert_categories"):
-                for category in payload["upsert_categories"]:
-                    service_map.upsert_category(
-                        str(category["machine_id"]),
-                        label=str(category.get("label", category["machine_id"])),
-                        description=str(category.get("description", "")),
-                    )
             entry = service_map.upsert_entry(
                 server_id,
                 name=name,
-                category=payload.get("category") or "system",
+                category=effective_category,
                 origin="manual",
                 application_id=application_id,
-                compose_project=payload.get("compose_project"),
-                working_dir=payload.get("working_dir"),
-                unit_name=payload.get("unit_name"),
-                description=payload.get("description") or "",
-                instructions=payload.get("instructions") or {},
+                compose_project=compose_project,
+                working_dir=working_dir,
+                unit_name=unit_name,
+                description=effective_description,
+                instructions=merged_instructions,
                 custom_instructions=payload.get("custom_instructions"),
                 installed=payload.get("installed"),
             )
+            if (
+                existing_entry is not None
+                and existing_entry.application_id != str(application_id)
+                and existing_entry.origin == "manual"
+            ):
+                service_map.delete_entry(server_id, existing_entry.application_id)
             doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
             if data_root is not None:
                 try:
@@ -1368,6 +1641,13 @@ def build_internal_api_capabilities(
             return {
                 "application_id": str(application_id),
                 "server_id": str(server_id),
+                "name": entry.name,
+                "origin": entry.origin,
+                "category": entry.category,
+                "description": entry.description,
+                "custom_instructions": entry.custom_instructions,
+                "installed": entry.installed,
+                "instructions": entry.instructions.to_json(),
                 "outcome": "reconciled",
                 "revision": entry.revision,
                 "sha256": entry_digest(entry),
@@ -1381,20 +1661,27 @@ def build_internal_api_capabilities(
                 "invalid_request",
                 f"origin must be one of {[o.value for o in ApplicationOrigin]}",
             ) from None
+        expected_rev = payload.get("expected_revision")
+        if expected_rev is None:
+            try:
+                live_rec = await adoption.read(server_id, application_id)
+            except Exception:
+                live_rec = None
+            expected_rev = 0 if live_rec is None else live_rec.revision
         request = AdoptionRequest(
             server_id=server_id,
             application_id=application_id,  # type: ignore[arg-type]
             name=name,
             origin=origin,
-            compose_project=payload.get("compose_project"),
-            working_dir=payload.get("working_dir"),
-            unit_name=payload.get("unit_name"),
+            compose_project=compose_project,
+            working_dir=working_dir,
+            unit_name=unit_name,
             external_working_dir=payload.get("external_working_dir"),
             external_config_files=tuple(payload.get("external_config_files", [])),
             external_environment_files=tuple(
                 payload.get("external_environment_files", [])
             ),
-            expected_revision=int(payload.get("expected_revision", 0)),
+            expected_revision=int(expected_rev),
         )
         try:
             result = await adoption.adopt(
@@ -1405,28 +1692,26 @@ def build_internal_api_capabilities(
                 "adoption_failed",
                 f"adoption refused: {type(exc).__name__}",
             ) from None
-        # Service Map + categories (the UI's adopt flow).
-        if payload.get("upsert_categories"):
-            for category in payload["upsert_categories"]:
-                service_map.upsert_category(
-                    str(category["machine_id"]),
-                    label=str(category.get("label", category["machine_id"])),
-                    description=str(category.get("description", "")),
-                )
-        service_map.upsert_entry(
+        entry = service_map.upsert_entry(
             server_id,
             application_id=result.application_id,
             name=name,
             origin=origin.value,
-            compose_project=payload.get("compose_project"),
-            working_dir=payload.get("working_dir"),
-            unit_name=payload.get("unit_name"),
-            category=str(payload.get("category", "system")),
-            description=str(payload.get("description", "")),
-            instructions=payload.get("instructions") or {},
+            compose_project=compose_project,
+            working_dir=working_dir,
+            unit_name=unit_name,
+            category=effective_category,
+            description=effective_description,
+            instructions=merged_instructions,
             custom_instructions=payload.get("custom_instructions"),
             installed=payload.get("installed"),
         )
+        if (
+            existing_entry is not None
+            and existing_entry.application_id != str(result.application_id)
+            and existing_entry.origin == "manual"
+        ):
+            service_map.delete_entry(server_id, existing_entry.application_id)
         # Canonical identity document (honest pending on doc-service gaps).
         record = await adoption.read(server_id, result.application_id)
         doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
@@ -1446,6 +1731,13 @@ def build_internal_api_capabilities(
         return {
             "application_id": str(result.application_id),
             "server_id": str(server_id),
+            "name": entry.name,
+            "origin": entry.origin,
+            "category": entry.category,
+            "description": entry.description,
+            "custom_instructions": entry.custom_instructions,
+            "installed": entry.installed,
+            "instructions": entry.instructions.to_json(),
             "outcome": result.outcome,
             "revision": result.revision,
             "sha256": result.sha256,
@@ -1549,6 +1841,210 @@ def build_internal_api_capabilities(
 
     operations.append(_app_delete_map_entry)
 
+    # -- app.list_catalog ------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=APP_LIST_CATALOG_CAPABILITY,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["service_map"],
+        environments=["controller"],
+        payload_model=AppListCatalogPayload,
+        description=(
+            "List global Runbook Catalog recipes across the fleet (server-agnostic). "
+            "Returns paginated catalog runbooks (runbook_id, name, category, "
+            "description, 5-slot instructions, revision) and taxonomy categories."
+        ),
+    )
+    async def _app_list_catalog(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        del call
+        if service_map is None:
+            raise InternalApiError(
+                "unavailable", "service map service is unavailable"
+            )
+        runbooks = list(service_map.list_catalog_runbooks())
+        category_filter = (payload.get("category") or "").strip().lower()
+        if category_filter:
+            runbooks = [
+                rb for rb in runbooks if rb.category.lower() == category_filter
+            ]
+        query = (payload.get("query") or "").strip().lower()
+        if query:
+            runbooks = [
+                rb
+                for rb in runbooks
+                if query in rb.name.lower()
+                or query in rb.category.lower()
+                or query in rb.description.lower()
+            ]
+        total = len(runbooks)
+        eff_limit = int(payload.get("limit") or 25)
+        eff_offset = max(0, int(payload.get("offset") or 0))
+        paged = runbooks[eff_offset : eff_offset + eff_limit]
+        return {
+            "runbooks": [rb.to_json() for rb in paged],
+            "categories": [
+                cat.to_json() for cat in service_map.list_categories()
+            ],
+            "total": total,
+            "limit": eff_limit,
+            "offset": eff_offset,
+            "has_more": (eff_offset + len(paged)) < total,
+        }
+
+    operations.append(_app_list_catalog)
+
+    # -- app.upsert_catalog_runbook --------------------------------------------
+
+    @internal_api_tool(
+        capability_id=APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["service_map"],
+        environments=["controller"],
+        payload_model=AppUpsertCatalogRunbookPayload,
+        description=(
+            "Add or update an application recipe in the global Runbook Catalog "
+            "(catalog.json only; server-agnostic, does not adopt onto any server). "
+            "Use after researching official documentation to store the service's "
+            "category, description, and 5 operational runbook slots (install, "
+            "update, uninstall, backup, verify)."
+        ),
+    )
+    async def _app_upsert_catalog_runbook(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        del call
+        if service_map is None:
+            raise InternalApiError(
+                "unavailable", "service map service is unavailable"
+            )
+        name = str(payload["name"]).strip()
+        raw_rid = payload.get("runbook_id")
+        parsed_rid: uuid.UUID | None = None
+        if raw_rid:
+            try:
+                parsed_rid = uuid.UUID(str(raw_rid).strip())
+            except ValueError:
+                raise InternalApiError(
+                    "invalid_request",
+                    "runbook_id must be a canonical UUID string",
+                ) from None
+
+        if payload.get("upsert_categories"):
+            for category in payload["upsert_categories"]:
+                try:
+                    service_map.upsert_category(
+                        str(category["machine_id"]),
+                        label=str(category.get("label", category["machine_id"])),
+                        description=str(category.get("description", "")),
+                    )
+                except ServiceMapError as exc:
+                    raise InternalApiError(exc.code.value, exc.detail) from None
+
+        existing = None
+        for candidate in service_map.list_catalog_runbooks():
+            if parsed_rid is not None and candidate.runbook_id == str(parsed_rid):
+                existing = candidate
+                break
+            if parsed_rid is None and candidate.name.lower() == name.lower():
+                existing = candidate
+                break
+        if parsed_rid is None and existing is not None:
+            parsed_rid = uuid.UUID(existing.runbook_id)
+
+        effective_category = (
+            str(payload["category"])
+            if payload.get("category")
+            else (
+                existing.category
+                if existing is not None
+                else classify_service(
+                    name, str(payload.get("description") or "")
+                )
+            )
+        )
+        effective_description = (
+            str(payload["description"])
+            if payload.get("description") is not None
+            else (existing.description if existing is not None else "")
+        )
+        merged_instructions: dict[str, str] = {k: "" for k in INSTRUCTION_KEYS}
+        if existing is not None:
+            for key, val in existing.instructions.to_json().items():
+                if val:
+                    merged_instructions[key] = val
+        if isinstance(payload.get("instructions"), Mapping):
+            for key, val in payload["instructions"].items():
+                if val:
+                    merged_instructions[key] = str(val)
+
+        try:
+            runbook = service_map.upsert_catalog_runbook(
+                name=name,
+                category=effective_category,
+                description=effective_description,
+                instructions=merged_instructions,
+                runbook_id=parsed_rid,
+            )
+        except ServiceMapError as exc:
+            raise InternalApiError(exc.code.value, exc.detail) from None
+
+        return {
+            "runbook": runbook.to_json(),
+            "runbook_id": runbook.runbook_id,
+            "name": runbook.name,
+            "category": runbook.category,
+            "revision": runbook.revision,
+        }
+
+    operations.append(_app_upsert_catalog_runbook)
+
+    # -- app.delete_catalog_runbook --------------------------------------------
+
+    @internal_api_tool(
+        capability_id=APP_DELETE_CATALOG_RUNBOOK_CAPABILITY,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["service_map"],
+        environments=["controller"],
+        payload_model=AppDeleteCatalogRunbookPayload,
+        description=(
+            "Delete one application recipe from the global Runbook Catalog "
+            "(catalog.json only). Per-server adopted applications and Service "
+            "Map entries are never modified or removed by this tool."
+        ),
+    )
+    async def _app_delete_catalog_runbook(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        del call
+        if service_map is None:
+            raise InternalApiError(
+                "unavailable", "service map service is unavailable"
+            )
+        try:
+            rid = uuid.UUID(str(payload["runbook_id"]).strip())
+        except ValueError:
+            raise InternalApiError(
+                "invalid_request",
+                "runbook_id must be a canonical UUID string",
+            ) from None
+        removed = service_map.delete_catalog_runbook(rid)
+        if not removed:
+            raise InternalApiError(
+                "not_found",
+                f"no global catalog runbook stored for {rid}",
+            )
+        return {
+            "runbook_id": str(rid),
+            "removed": True,
+        }
+
+    operations.append(_app_delete_catalog_runbook)
+
     # -- registration ----------------------------------------------------------
 
     registry = CapabilityRegistry()
@@ -1569,10 +2065,21 @@ def build_internal_api_capabilities(
 
 __all__ = [
     "APP_ADOPT_CAPABILITY",
+    "APP_DELETE_CATALOG_RUNBOOK_CAPABILITY",
     "APP_DELETE_MAP_ENTRY_CAPABILITY",
     "APP_DISCOVER_CAPABILITY",
     "APP_LIST_ADOPTED_CAPABILITY",
+    "APP_LIST_CATALOG_CAPABILITY",
     "APP_UNADOPT_CAPABILITY",
+    "APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY",
+    "AppAdoptPayload",
+    "AppDeleteCatalogRunbookPayload",
+    "AppDeleteMapEntryPayload",
+    "AppDiscoverPayload",
+    "AppListAdoptedPayload",
+    "AppListCatalogPayload",
+    "AppUnadoptPayload",
+    "AppUpsertCatalogRunbookPayload",
     "INTERNAL_API_CAPABILITY_IDS",
     "InternalApiComposition",
     "InternalApiError",

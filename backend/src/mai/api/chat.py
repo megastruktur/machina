@@ -249,6 +249,8 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "app.unadopt",
         "app.upsert_map_entry",
         "app.delete_map_entry",
+        "app.upsert_catalog_runbook",
+        "app.delete_catalog_runbook",
         "secret.store",
     }
 )
