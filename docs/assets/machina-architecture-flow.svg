@@ -67,7 +67,7 @@
         8 built-in + custom categories, filter pills, 5-step
       </text>
       <text x="12" y="57" fill="#ece8de" font-family="'Rajdhani', system-ui, sans-serif" font-size="13">
-        operational runbooks &amp; one-click [Chat @service]
+        operational runbooks &amp; background runbook jobs
       </text>
       <text x="12" y="73" fill="#6ee7b7" font-family="'JetBrains Mono', ui-monospace, monospace" font-size="10.5">
         games · ai · agent · system · dev · infra · media · obs

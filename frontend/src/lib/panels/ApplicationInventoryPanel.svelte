@@ -77,6 +77,10 @@
 		StandaloneDetailView,
 		SystemdUnitDetailView
 	} from '../workspace/entries/08-web-apps.js';
+	import type {
+		RunbookExecutionView,
+		RunbookView
+	} from '../workspace/entries/13-web-runbooks.js';
 
 	let { panel }: { panel: PanelContext } = $props();
 
@@ -117,6 +121,22 @@
 	const api = $derived(readApi(panel.services));
 	const lifecycle = $derived(readLifecycle(panel.services));
 	const docs = $derived(readDocs(panel.services));
+
+	/**
+	 * The optional background-execution seam: `executeRunbook` on the api
+	 * bag queues a durable agent job without touching the Chat window.
+	 * Absent ⇒ the Update/Remove/Install/Refresh links fall back to the
+	 * lifecycle openers (or fail closed when neither seam exists).
+	 */
+	function readExecute(
+		services: PanelServices
+	): NonNullable<ApplicationsApi['executeRunbook']> | null {
+		const candidate = services.api as Partial<ApplicationsApi> | undefined;
+		if (typeof candidate?.executeRunbook !== 'function') return null;
+		return candidate.executeRunbook.bind(candidate);
+	}
+
+	const execute = $derived(readExecute(panel.services));
 	/** Applications management: a global mount contradicts the entry contract. */
 	const serverScope = $derived(panel.scope.kind === 'server' ? panel.scope.server_id : null);
 	/** Optional pinned application object (registry-restricted to kind 'application'). */
@@ -137,6 +157,8 @@
 	const MAX_SELECTOR_CHARS = 512;
 	/** Bounded external path entries (adopt.py _PATH_MAX). */
 	const MAX_PATH_CHARS = 1024;
+	/** Bounded per-slot runbook instruction / custom instruction (service_map.py). */
+	const MAX_INSTRUCTION_CHARS = 8000;
 
 	const TABS = Object.freeze([
 		{ id: 'inventory', label: 'Inventory' },
@@ -388,6 +410,8 @@
 	// --- inventory (the projected adoption page; C09 rule 1) -------------------
 
 	let applications = $state<ApplicationView[]>([]);
+	/** The Available-from-catalog page section (global runbooks not installed). */
+	let availableRunbooks = $state<RunbookView[]>([]);
 	let inventoryTotal = $state(0);
 	let inventoryLoadingMore = $state(false);
 	let inventoryState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -396,6 +420,21 @@
 	const inventoryHasMore = $derived(
 		inventoryState === 'ready' && applications.length < inventoryTotal
 	);
+
+	/** Merge one page's available runbooks (deduplicated by runbook id). */
+	function mergeAvailable(page: ApplicationPage): void {
+		const seen = new Set(availableRunbooks.map((r) => r.runbook_id));
+		const appended = (page.available_runbooks ?? []).filter((r) => !seen.has(r.runbook_id));
+		availableRunbooks = [...availableRunbooks, ...appended];
+		for (const runbook of availableRunbooks) {
+			if (availableDrafts[runbook.runbook_id] === undefined) {
+				availableDrafts = {
+					...availableDrafts,
+					[runbook.runbook_id]: runbook.custom_instructions ?? ''
+				};
+			}
+		}
+	}
 
 	async function loadInventory(): Promise<void> {
 		if (api === null || serverScope === null) return;
@@ -420,6 +459,8 @@
 			}
 			applications = page.applications;
 			inventoryTotal = page.total;
+			availableRunbooks = [];
+			mergeAvailable(page);
 			// The merged taxonomy rides the page when the producer carries it;
 			// an omitted field (old fixtures) keeps the client-side built-ins.
 			pageCategories = page.categories ?? [];
@@ -461,6 +502,7 @@
 			const seen = new Set(applications.map((a) => a.application_id));
 			const appended = page.applications.filter((a) => !seen.has(a.application_id));
 			applications = [...applications, ...appended];
+			mergeAvailable(page);
 			inventoryTotal = page.applications.length === 0 ? applications.length : page.total;
 		} catch (error) {
 			if (disposed || epoch !== inventoryEpoch) return;
@@ -606,6 +648,8 @@
 	/** The pre-filled (suggested) category: selecting it is NOT an explicit change. */
 	let adoptCategoryInitial = $state('');
 	let adoptDescription = $state('');
+	/** Server-specific notes for the new service (rides the adoption). */
+	let adoptCustomInstructions = $state('');
 	let adoptInstructions = $state<Record<RunbookStep, string>>({
 		install: '',
 		update: '',
@@ -760,6 +804,7 @@
 		adoptCategory = suggestedCategory(observed);
 		adoptCategoryInitial = adoptCategory;
 		adoptDescription = '';
+		adoptCustomInstructions = '';
 		adoptInstructions = { install: '', update: '', uninstall: '', backup: '', verify: '' };
 		adoptFields = {};
 		adoptProblem = null;
@@ -864,6 +909,9 @@
 			body.category = adoptCategory;
 		}
 		if (adoptDescription.trim() !== '') body.description = adoptDescription.trim();
+		if (adoptCustomInstructions.trim() !== '') {
+			body.custom_instructions = adoptCustomInstructions.trim();
+		}
 		const steps = Object.fromEntries(
 			RUNBOOK_STEPS.map((step) => [step, adoptInstructions[step].trim()])
 		) as Record<RunbookStep, string>;
@@ -912,19 +960,77 @@
 		}
 	}
 
-	// --- lifecycle + documents seams (links, never reimplementations) ---------
+	// --- background runbook execution (the lifecycle job seam) -----------------
 
-	function openInstall(row: ApplicationView): void {
-		if (lifecycle === null || serverScope === null) return;
-		lifecycle.openInstall(serverScope, row.application_id);
+	/**
+	 * Queued background jobs by application/runbook id: the honest badge
+	 * state (`Background <action> job started`) rendered on the card that
+	 * started the job. The Chat window is NEVER opened or pre-filled.
+	 */
+	let backgroundJobs = $state<Record<string, RunbookExecutionView>>({});
+	/** Per-target background submission problems (value-free). */
+	let backgroundProblems = $state<Record<string, { code: string; message: string }>>({});
+
+	async function runBackground(
+		targetId: string,
+		action: 'install' | 'update' | 'uninstall' | 'verify',
+		customInstructions: string | null = null
+	): Promise<void> {
+		if (execute === null || serverScope === null) return;
+		const scope = serverScope;
+		try {
+			const view = await execute(scope, targetId, {
+				action,
+				custom_instructions:
+					customInstructions !== null && customInstructions.trim() !== ''
+						? customInstructions.trim()
+						: null
+			});
+			if (disposed || scope !== serverScope) return;
+			backgroundJobs = { ...backgroundJobs, [targetId]: view };
+			const problems = { ...backgroundProblems };
+			delete problems[targetId];
+			backgroundProblems = problems;
+			// The staged entry/notes may have changed server truth: refresh.
+			void loadInventory();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			backgroundProblems = {
+				...backgroundProblems,
+				[targetId]: {
+					code,
+					message: friendlyText(
+						code,
+						messageOf(error) ?? 'The background job could not be queued; nothing ran.'
+					)
+				}
+			};
+		}
 	}
 
-	function openUpdate(row: ApplicationView): void {
+	// --- lifecycle + documents seams (links, never reimplementations) ---------
+
+	/**
+	 * Update/Remove: the BACKGROUND job is the primary path (the runbook
+	 * procedure runs as an agent job; the Chat window stays untouched).
+	 * Without the execution seam the lifecycle openers remain the honest
+	 * fallback; with neither, the buttons render disabled (never a fake).
+	 */
+	function onUpdate(row: ApplicationView): void {
+		if (execute !== null) {
+			void runBackground(row.application_id, 'update');
+			return;
+		}
 		if (lifecycle === null || serverScope === null) return;
 		lifecycle.openUpdate(serverScope, row.application_id);
 	}
 
-	function openRemove(row: ApplicationView): void {
+	function onRemove(row: ApplicationView): void {
+		if (execute !== null) {
+			void runBackground(row.application_id, 'uninstall');
+			return;
+		}
 		if (lifecycle === null || serverScope === null) return;
 		lifecycle.openRemove(serverScope, row.application_id);
 	}
@@ -934,24 +1040,41 @@
 		docs.openDocument(docId);
 	}
 
-	// --- one-click chat tag (the bottom dock listens on the window) ----------
+	// --- available runbooks (the global catalog's not-installed half) ----------
 
-	/**
-	 * Tags this server + `@service` in the Bottom Chat Dock: a window-level
-	 * CustomEvent, nothing else — the dock owns the focus mechanics (the
-	 * panel never reaches into another surface's state).
-	 */
-	function chatAboutService(row: ApplicationView): void {
-		if (serverScope === null) return;
-		window.dispatchEvent(
-			new CustomEvent('mai:chat-focus-service', {
-				detail: {
-					serverId: serverScope,
-					serviceName: row.name,
-					applicationId: row.application_id,
-					category: mappedCategory(row)
-				}
-			})
+	/** Per-runbook draft of the per-server custom instructions (Edit form). */
+	let availableDrafts = $state<Record<string, string>>({});
+	/** The runbook whose per-server custom-instructions editor is open. */
+	let availableEditTarget = $state<string | null>(null);
+
+	function startAvailableEdit(runbook: RunbookView): void {
+		availableEditTarget = runbook.runbook_id;
+		if (availableDrafts[runbook.runbook_id] === undefined) {
+			availableDrafts = {
+				...availableDrafts,
+				[runbook.runbook_id]: runbook.custom_instructions ?? ''
+			};
+		}
+	}
+
+	function cancelAvailableEdit(): void {
+		availableEditTarget = null;
+	}
+
+	function saveAvailableEdit(): void {
+		// The draft is sent with (and persisted by) the next Install/Refresh
+		// execute call — the honest in-between is labeled on the form.
+		availableEditTarget = null;
+	}
+
+	function runAvailable(
+		runbook: RunbookView,
+		action: 'install' | 'verify'
+	): void {
+		void runBackground(
+			runbook.runbook_id,
+			action,
+			availableDrafts[runbook.runbook_id] ?? null
 		);
 	}
 
@@ -960,6 +1083,7 @@
 	let editTarget = $state<ApplicationView | null>(null);
 	let editCategory = $state('');
 	let editDescription = $state('');
+	let editCustomInstructions = $state('');
 	let editInstructions = $state<Record<RunbookStep, string>>({
 		install: '',
 		update: '',
@@ -974,11 +1098,23 @@
 		return { install: '', update: '', uninstall: '', backup: '', verify: '' };
 	}
 
+	/** The stored per-server custom instructions (old records → empty). */
+	function mappedCustomInstructions(row: ApplicationView): string {
+		if (
+			'custom_instructions' in row &&
+			typeof row.custom_instructions === 'string'
+		) {
+			return row.custom_instructions;
+		}
+		return '';
+	}
+
 	/** Open the inline editor pre-filled with the record's stored map metadata. */
 	function startEdit(row: ApplicationView): void {
 		editTarget = row;
 		editCategory = mappedCategory(row);
 		editDescription = mappedDescription(row);
+		editCustomInstructions = mappedCustomInstructions(row);
 		const recorded = mappedInstructions(row);
 		editInstructions = emptyInstructions();
 		if (recorded !== null) {
@@ -1030,7 +1166,10 @@
 			expected_revision: target.revision,
 			category: editCategory,
 			description: editDescription.trim(),
-			instructions: steps
+			instructions: steps,
+			// Empty string CLEARS the stored notes; the absent value would
+			// preserve them (the body is strict, so the decision is explicit).
+			custom_instructions: editCustomInstructions
 		};
 		editBusy = true;
 		editProblem = null;
@@ -1351,21 +1490,37 @@
 												<option value={entry.machine_id}>{entry.label}</option>
 											{/each}
 										</Select>
-										<Field
-											label="Description"
-											bind:value={editDescription}
-											hint="What this service is for (bounded to 2000 characters)."
-											data-testid="service-edit-description"
-										/>
+										<label class="mai-apps__field">
+											<span>Description</span>
+											<textarea
+												bind:value={editDescription}
+												rows="3"
+												maxlength={CATEGORY_DESC_MAX}
+												data-testid="service-edit-description"
+											></textarea>
+										</label>
+										<label class="mai-apps__field">
+											<span>Custom instructions (server-specific, injected into the agent's
+												@service context)</span>
+											<textarea
+												bind:value={editCustomInstructions}
+												rows="4"
+												maxlength={MAX_INSTRUCTION_CHARS}
+												data-testid="service-edit-custom-instructions"
+											></textarea>
+										</label>
 										<fieldset class="mai-apps__fieldset">
 											<legend>Runbook instructions</legend>
 											{#each RUNBOOK_STEPS as step (step)}
-												<Field
-													label={step}
-													bind:value={editInstructions[step]}
-													hint="Optional command or note for the {step} procedure."
-													data-testid="service-edit-instructions-{step}"
-												/>
+												<label class="mai-apps__field">
+													<span>{step}</span>
+													<textarea
+														bind:value={editInstructions[step]}
+														rows="3"
+														maxlength={MAX_INSTRUCTION_CHARS}
+														data-testid="service-edit-instructions-{step}"
+													></textarea>
+												</label>
 											{/each}
 										</fieldset>
 										<div class="mai-apps__actions">
@@ -1391,41 +1546,26 @@
 								<div class="mai-apps__row-actions">
 									<Button
 										variant="secondary"
-										onclick={() => chatAboutService(row)}
-										data-testid="service-chat-trigger"
-									>
-										Chat @{row.name}
-									</Button>
-									<Button
-										variant="secondary"
 										onclick={() => startEdit(row)}
 										data-testid="service-edit-start"
 									>
-										Map details…
+										✎ Edit
 									</Button>
 									<Button
 										variant="secondary"
-										onclick={() => openInstall(row)}
-										disabled={lifecycle === null}
-										data-testid="install-link"
-									>
-										Install…
-									</Button>
-									<Button
-										variant="secondary"
-										onclick={() => openUpdate(row)}
-										disabled={lifecycle === null}
+										onclick={() => onUpdate(row)}
+										disabled={execute === null && lifecycle === null}
 										data-testid="update-link"
 									>
-										Update…
+										Update
 									</Button>
 									<Button
 										variant="secondary"
-										onclick={() => openRemove(row)}
-										disabled={lifecycle === null}
+										onclick={() => onRemove(row)}
+										disabled={execute === null && lifecycle === null}
 										data-testid="remove-link"
 									>
-										Remove…
+										Remove
 									</Button>
 									{#if recordDocs[row.application_id]?.status === 'documented' &&
 										recordDocs[row.application_id]?.doc_id}
@@ -1442,6 +1582,22 @@
 										Revoke adoption…
 									</Button>
 								</div>
+								{#if backgroundJobs[row.application_id]}
+									<p class="mai-apps__note" role="status" data-testid="background-job-badge-{row.application_id}">
+										Background {backgroundJobs[row.application_id].action} job started
+										(state: {backgroundJobs[row.application_id].state}).
+									</p>
+								{/if}
+								{#if backgroundProblems[row.application_id]}
+									<div
+										class="mai-apps__state mai-apps__state--error"
+										role="alert"
+										data-testid="background-job-error-{row.application_id}"
+										data-error-code={backgroundProblems[row.application_id].code}
+									>
+										<p>{backgroundProblems[row.application_id].message}</p>
+									</div>
+								{/if}
 							</li>
 						{/each}
 					</ul>
@@ -1458,10 +1614,140 @@
 							</Button>
 						</div>
 					{/if}
-					{#if lifecycle === null}
+
+					<section
+						class="mai-apps__subsection"
+						aria-label="Available from the global Runbook Catalog"
+						data-testid="available-runbooks-section"
+					>
+						<h5>Available from Runbook Catalog</h5>
+						<p class="mai-apps__meta">
+							Global runbook recipes not installed on this server. Install queues a
+							BACKGROUND agent job — the Chat window is never opened or pre-filled.
+						</p>
+						{#if availableRunbooks.length === 0}
+							<div class="mai-apps__state" role="status" data-testid="available-runbooks-empty">
+								<p>Every catalog runbook is installed on this server (or the catalog is empty).
+									Create recipes in the global Runbook Catalog window.</p>
+							</div>
+						{:else}
+							<ul class="mai-apps__rows" data-testid="available-runbooks-list">
+								{#each availableRunbooks as runbook (runbook.runbook_id)}
+									<li
+										class="mai-apps__row"
+										data-testid="available-runbook-row"
+										data-runbook-id={runbook.runbook_id}
+									>
+										<div class="mai-apps__row-main">
+											<span class="mai-apps__label" data-testid="available-runbook-name">
+												{runbook.name}
+											</span>
+											<span
+												class="mai-apps__chip"
+												data-testid="available-runbook-category"
+												data-category={runbook.category}
+											>
+												{categoryLabel(runbook.category)}
+											</span>
+										</div>
+										{#if runbook.description}
+											<p class="mai-apps__description" data-testid="available-runbook-description">
+												{runbook.description}
+											</p>
+										{/if}
+										<details class="mai-apps__runbook" data-testid="available-runbook-instructions">
+											<summary>Operational runbook</summary>
+											<dl class="mai-apps__facts">
+												{#each RUNBOOK_STEPS as step (step)}
+													{#if runbook.instructions?.[step]}
+														<dt>{step}</dt>
+														<dd data-testid="available-runbook-step" data-step={step}>
+															{runbook.instructions[step]}
+														</dd>
+													{/if}
+												{/each}
+											</dl>
+										</details>
+										{#if availableEditTarget === runbook.runbook_id}
+											<div class="mai-apps__editor" data-testid="available-edit-form">
+												<label class="mai-apps__field">
+													<span>Custom instructions for this server (persisted with the next
+														Install/Refresh and injected into the agent's @service context)</span>
+													<textarea
+														bind:value={availableDrafts[runbook.runbook_id]}
+														rows="4"
+														maxlength={MAX_INSTRUCTION_CHARS}
+														data-testid="available-edit-custom-instructions"
+													></textarea>
+												</label>
+												<div class="mai-apps__actions">
+													<Button
+														onclick={saveAvailableEdit}
+														data-testid="available-edit-save"
+													>
+														Save draft
+													</Button>
+													<Button
+														variant="secondary"
+														onclick={cancelAvailableEdit}
+														data-testid="available-edit-cancel"
+													>
+														Cancel
+													</Button>
+												</div>
+											</div>
+										{/if}
+										<div class="mai-apps__row-actions">
+											<Button
+												variant="secondary"
+												onclick={() => runAvailable(runbook, 'install')}
+												disabled={execute === null}
+												data-testid="available-install-btn"
+											>
+												Install
+											</Button>
+											<Button
+												variant="secondary"
+												onclick={() => runAvailable(runbook, 'verify')}
+												disabled={execute === null}
+												data-testid="available-refresh-btn"
+											>
+												Refresh
+											</Button>
+											<Button
+												variant="secondary"
+												onclick={() => startAvailableEdit(runbook)}
+												data-testid="available-edit-btn"
+											>
+												✎ Edit
+											</Button>
+										</div>
+										{#if backgroundJobs[runbook.runbook_id]}
+											<p class="mai-apps__note" role="status" data-testid="available-job-badge-{runbook.runbook_id}">
+												Background {backgroundJobs[runbook.runbook_id].action} job started
+												(state: {backgroundJobs[runbook.runbook_id].state}).
+											</p>
+										{/if}
+										{#if backgroundProblems[runbook.runbook_id]}
+											<div
+												class="mai-apps__state mai-apps__state--error"
+												role="alert"
+												data-testid="available-job-error-{runbook.runbook_id}"
+												data-error-code={backgroundProblems[runbook.runbook_id].code}
+											>
+												<p>{backgroundProblems[runbook.runbook_id].message}</p>
+											</div>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</section>
+
+					{#if lifecycle === null && execute === null}
 						<p class="mai-apps__note" data-testid="lifecycle-unavailable">
-							The install/update/remove surfaces are not wired into this composition; the links
-							above stay inert instead of faking a submission.
+							Neither the runbook execution nor the lifecycle surfaces are wired into this
+							composition; the links above stay inert instead of faking a submission.
 						</p>
 					{/if}
 				{/if}
@@ -1763,22 +2049,37 @@
 								<option value={entry.machine_id}>{entry.label}</option>
 							{/each}
 						</Select>
-						<Field
-							label="Description (optional)"
-							bind:value={adoptDescription}
-							error={adoptFields.description ?? ''}
-							hint="What this service is for; bounded to 2000 characters."
-							data-testid="adopt-description-input"
-						/>
+						<label class="mai-apps__field">
+							<span>Description (optional)</span>
+							<textarea
+								bind:value={adoptDescription}
+								rows="3"
+								maxlength={CATEGORY_DESC_MAX}
+								data-testid="adopt-description-input"
+							></textarea>
+						</label>
+						<label class="mai-apps__field">
+							<span>Custom instructions (optional, server-specific — injected into the
+								agent's @service context)</span>
+							<textarea
+								bind:value={adoptCustomInstructions}
+								rows="4"
+								maxlength={MAX_INSTRUCTION_CHARS}
+								data-testid="adopt-custom-instructions"
+							></textarea>
+						</label>
 						<fieldset class="mai-apps__fieldset">
 							<legend>Runbook instructions (optional)</legend>
 							{#each RUNBOOK_STEPS as step (step)}
-								<Field
-									label={step}
-									bind:value={adoptInstructions[step]}
-									hint="Optional command or note for the {step} procedure."
-									data-testid="adopt-instructions-{step}"
-								/>
+								<label class="mai-apps__field">
+									<span>{step}</span>
+									<textarea
+										bind:value={adoptInstructions[step]}
+										rows="3"
+										maxlength={MAX_INSTRUCTION_CHARS}
+										data-testid="adopt-instructions-{step}"
+									></textarea>
+								</label>
 							{/each}
 						</fieldset>
 						{#if adoptOrigin === 'compose'}
@@ -2243,6 +2544,29 @@
 	.mai-apps__fieldset legend {
 		padding: 0 var(--space-1, 0.25rem);
 		font-weight: 600;
+		font-size: var(--mai-text-xs, 0.75rem);
+	}
+
+	.mai-apps__field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+	}
+
+	.mai-apps__field > span {
+		font-size: var(--mai-text-xs, 0.75rem);
+		color: var(--color-muted, inherit);
+	}
+
+	.mai-apps__field textarea {
+		font: inherit;
+		color: inherit;
+		background: transparent;
+		border: 1px solid var(--mai-color-border, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		padding: 0.3rem 0.5rem;
+		resize: vertical;
+		font-family: var(--mai-font-mono, monospace);
 		font-size: var(--mai-text-xs, 0.75rem);
 	}
 

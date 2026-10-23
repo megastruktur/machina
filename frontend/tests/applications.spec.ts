@@ -45,6 +45,8 @@ const APP_NEW = '22222222-2222-4222-8333-444455556666';
 const APP_BETA = '33333333-3333-4222-8333-444455556666';
 const INTENT_ID = '44444444-4444-4222-8333-444455556666';
 const RECORD_DOC_ID = '55555555-5555-4222-8333-444455556666';
+const RUNBOOK_ID = '77777777-7777-4222-8333-444455556666';
+const EXEC_RUN_ID = '88888888-8888-4222-8333-444455556666';
 const WINDOW_A = '7a7a7a7a-8c9d-4e8a-8a9b-4c5d6e7f8a9c';
 const WINDOW_B = '8b8b8b8b-8c9d-4e8a-8a9b-4c5d6e7f8a9d';
 const WINDOW_PINNED = '9c9c9c9c-9999-4222-8333-444455556666';
@@ -122,6 +124,8 @@ const APP_SOURCE = `
 	const APP_BETA = '${APP_BETA}';
 	const INTENT_ID = '${INTENT_ID}';
 	const RECORD_DOC_ID = '${RECORD_DOC_ID}';
+	const RUNBOOK_ID = '${RUNBOOK_ID}';
+	const EXEC_RUN_ID = '${EXEC_RUN_ID}';
 
 	let tick = 0;
 
@@ -173,6 +177,74 @@ const APP_SOURCE = `
 	}
 
 	seedRecords();
+
+	// --- global runbook catalog (the Available section's source) ---------------
+
+	const catalog = {};
+
+	function seedCatalog() {
+		catalog[SERVER_A] = [
+			{
+				runbook_id: RUNBOOK_ID,
+				name: 'forgejo-runner',
+				category: 'dev',
+				description: 'CI runner recipe.',
+				revision: 1,
+				updated_at: '2026-10-20T09:00:00Z',
+				custom_instructions: '',
+				instructions: {
+					install: 'docker compose -f runner.yaml up -d',
+					update: '',
+					uninstall: '',
+					backup: '',
+					verify: 'systemctl is-active forgejo-runner'
+				}
+			}
+		];
+	}
+
+	seedCatalog();
+
+	function runbookFromEntry(rec) {
+		return {
+			runbook_id: rec.application_id,
+			name: rec.name,
+			category: rec.category || 'system',
+			description: rec.description || '',
+			instructions: rec.instructions || {},
+			revision: rec.revision,
+			updated_at: rec.updated_at || rec.adopted_at || '2026-10-16T10:00:00Z',
+			custom_instructions: rec.custom_instructions || ''
+		};
+	}
+
+	/**
+	 * The deterministic Available projection: staged (installed=false)
+	 * entries first — they carry the saved per-server custom instructions —
+	 * then catalog runbooks whose name no installed entry covers.
+	 */
+	function availableFor(serverId) {
+		const scope = adopted[serverId] || {};
+		const installedNames = new Set(
+			Object.values(scope)
+				.filter((rec) => rec.installed !== false)
+				.map((rec) => rec.name.toLowerCase())
+		);
+		const seen = new Set();
+		const out = [];
+		for (const rec of Object.values(scope)) {
+			if (rec.installed === false) {
+				out.push(runbookFromEntry(rec));
+				seen.add(rec.name.toLowerCase());
+			}
+		}
+		for (const rb of catalog[serverId] || []) {
+			if (seen.has(rb.name.toLowerCase()) || installedNames.has(rb.name.toLowerCase())) continue;
+			out.push(deep(rb));
+			seen.add(rb.name.toLowerCase());
+		}
+		return out;
+	}
 
 	function managedRef(serverId, matcher) {
 		const scope = adopted[serverId] || {};
@@ -355,6 +427,7 @@ const APP_SOURCE = `
 			return {
 				server_id: serverId,
 				applications: deep(all),
+				available_runbooks: availableFor(serverId),
 				limit: (page && page.limit) || 50,
 				offset: (page && page.offset) || 0,
 				total: all.length
@@ -406,6 +479,10 @@ const APP_SOURCE = `
 				live.category = payload.category ?? live.category ?? 'system';
 				live.description = payload.description ?? live.description ?? '';
 				if (payload.instructions) live.instructions = deep(payload.instructions);
+				if (payload.custom_instructions !== undefined) {
+					live.custom_instructions = payload.custom_instructions;
+				}
+				if (payload.installed !== undefined) live.installed = payload.installed;
 				const updated = {
 					intent_id: INTENT_ID,
 					application_id: resolvedId,
@@ -437,6 +514,8 @@ const APP_SOURCE = `
 				category: payload.category ?? 'system',
 				description: payload.description ?? '',
 				instructions: payload.instructions ? deep(payload.instructions) : undefined,
+				custom_instructions: payload.custom_instructions ?? '',
+				installed: payload.installed ?? true,
 				sha256: 'c'.repeat(64)
 			});
 			adopted[serverId] = adopted[serverId] || {};
@@ -473,6 +552,17 @@ const APP_SOURCE = `
 			}
 			delete adopted[serverId][applicationId];
 			return null;
+		},
+		async executeRunbook(serverId, applicationId, payload) {
+			record('executeRunbook', deep(payload), [serverId, applicationId]);
+			throwArm('execute');
+			return {
+				run_id: EXEC_RUN_ID,
+				server_id: serverId,
+				application_id: applicationId,
+				action: payload.action,
+				state: 'queued'
+			};
 		}
 	};
 
@@ -485,6 +575,10 @@ const APP_SOURCE = `
 	function openDocument(docId) {
 		record('openDocument', null, [docId]);
 	}
+
+	// The fail-closed host's bag: NO execution seam and NO lifecycle seam —
+	// Update/Remove render disabled instead of faking a submission.
+	const { executeRunbook: _omittedExecute, ...apiNoExecute } = api;
 
 	// Fixture state (records, calls, gates, clock) lives in the page's JS
 	// realm: every Playwright test gets a fresh page and therefore a fresh
@@ -499,7 +593,7 @@ const APP_SOURCE = `
 		},
 		{ openDocument: openDocument }
 	);
-	const servicesNoSeams = applicationsServices(api, null, null);
+	const servicesNoSeams = applicationsServices(apiNoExecute, null, null);
 
 	// --- registry: the REAL feature entry + one benign sibling ----------------
 	const sibling = createRawSnippet(() => {
@@ -1141,38 +1235,44 @@ test('adoption is explicit, preserves the external deployment paths, and links t
 	// loads of BOTH hosts legitimately share the recorded-call log).
 });
 
-test('lifecycle actions are links to separate surfaces; without the seam they fail closed', async ({
+test('installed services update and remove through background jobs; without the seams they fail closed', async ({
 	page
 }) => {
 	const hostA = page.getByTestId('host-a');
 	await bothWindowsMounted(page);
+	const metricsRow = hostA.getByTestId('inventory-row').filter({ hasText: 'metrics-stack' });
 
-	// With the seam: the links call the SEPARATELY implemented openers.
-	await hostA.getByTestId('install-link').click();
-	await hostA.getByTestId('update-link').click();
-	await hostA.getByTestId('remove-link').click();
-	let { calls } = await apiState(page);
-	expect(lastCall(calls, 'openInstall').args).toEqual([SERVER_A, APP_ADOPTED]);
-	expect(lastCall(calls, 'openUpdate').args).toEqual([SERVER_A, APP_ADOPTED]);
-	expect(lastCall(calls, 'openRemove').args).toEqual([SERVER_A, APP_ADOPTED]);
-	// No lifecycle flow is reimplemented in this panel: no plan/submit-style
-	// API call exists here at all — the only API ops are the four reviewed ones.
-	const apiOps = new Set(calls.map((call) => call.op));
-	expect(apiOps.has('adopt')).toBe(false);
+	// Installed cards offer exactly Update + Remove (no Install link, no
+	// Chat trigger) — both dispatch BACKGROUND runbook jobs.
+	await expect(metricsRow.getByTestId('install-link')).toHaveCount(0);
+	await expect(metricsRow.getByTestId('service-chat-trigger')).toHaveCount(0);
+	await metricsRow.getByTestId('update-link').click();
+	await expect(
+		metricsRow.getByTestId(`background-job-badge-${APP_ADOPTED}`)
+	).toContainText('Background update job started');
+	await metricsRow.getByTestId('remove-link').click();
+	await expect(
+		metricsRow.getByTestId(`background-job-badge-${APP_ADOPTED}`)
+	).toContainText('Background uninstall job started');
 
-	// Without the seam: disabled links + a visible honest note.
+	const { calls } = await apiState(page);
+	const executes = calls.filter((call) => call.op === 'executeRunbook');
+	expect(executes).toHaveLength(2);
+	expect(executes[0].args).toEqual([SERVER_A, APP_ADOPTED]);
+	expect(executes[0].payload).toEqual({ action: 'update', custom_instructions: null });
+	expect(executes[1].payload).toEqual({ action: 'uninstall', custom_instructions: null });
+	// The Chat window is never hijacked: the panel dispatches no chat-focus
+	// event and no chat op exists in the recorded calls.
+	const ops = new Set(calls.map((call) => call.op));
+	expect(ops.has('openUpdate')).toBe(false);
+	expect(ops.has('openRemove')).toBe(false);
+
+	// Without the seams: disabled links + a visible honest note.
 	const noseam = page.getByTestId('host-noseam');
 	await expect(noseam.getByTestId('inventory-list')).toBeVisible();
-	await expect(noseam.getByTestId('install-link')).toBeDisabled();
 	await expect(noseam.getByTestId('update-link')).toBeDisabled();
 	await expect(noseam.getByTestId('remove-link')).toBeDisabled();
-	await expect(noseam.getByTestId('lifecycle-unavailable')).toContainText('not wired');
-
-	calls = (await apiState(page)).calls;
-	const seamCalls = calls.filter(
-		(call) => call.op === 'openInstall' || call.op === 'openUpdate' || call.op === 'openRemove'
-	);
-	expect(seamCalls).toHaveLength(3);
+	await expect(noseam.getByTestId('lifecycle-unavailable')).toContainText('wired into this');
 });
 
 test('revocation is revision-checked and non-destructive; a stale revision is refused honestly', async ({
@@ -1540,6 +1640,18 @@ const GAMES_MAPPED = {
 	description: ''
 };
 
+/** A staged (installed=false) server entry, projected as an Available runbook. */
+const STAGED_RUNBOOK = {
+	runbook_id: APP_NEW,
+	name: 'staged-stack',
+	category: 'media',
+	description: 'A runbook staged on this server, not yet installed.',
+	instructions: { install: 'docker compose up -d', update: '', uninstall: '', backup: '', verify: '' },
+	revision: 1,
+	updated_at: '2026-10-21T08:00:00Z',
+	custom_instructions: 'staged note from the server entry'
+};
+
 /** Release a Service Map page (with metadata) over the armed list gate. */
 async function releaseMappedPage(page: Page): Promise<void> {
 	await apiCall(page, 'armDeferredList');
@@ -1548,6 +1660,25 @@ async function releaseMappedPage(page: Page): Promise<void> {
 		{
 			server_id: SERVER_A,
 			applications: [METRICS_MAPPED, GAMES_MAPPED],
+			available_runbooks: [
+				STAGED_RUNBOOK,
+				{
+					runbook_id: RUNBOOK_ID,
+					name: 'forgejo-runner',
+					category: 'dev',
+					description: 'CI runner recipe.',
+					instructions: {
+						install: 'docker compose -f runner.yaml up -d',
+						update: '',
+						uninstall: '',
+						backup: '',
+						verify: 'systemctl is-active forgejo-runner'
+					},
+					revision: 1,
+					updated_at: '2026-10-20T09:00:00Z',
+					custom_instructions: ''
+				}
+			],
 			limit: 50,
 			offset: 0,
 			total: 2
@@ -1619,32 +1750,69 @@ test('the service map renders category chips, filter pills, descriptions and the
 	);
 });
 
-test('one-click Chat @service tags the pinned server and service on the window for the dock', async ({
+test('available runbooks install and refresh as background jobs with per-server custom instructions', async ({
 	page
 }) => {
 	const hostA = page.getByTestId('host-a');
 	await expect(hostA.getByTestId('apps-root')).toBeVisible();
 	await releaseMappedPage(page);
 
-	await page.evaluate(() => {
-		const target = window as unknown as { __chatTag?: unknown };
-		target.__chatTag = null;
-		window.addEventListener('mai:chat-focus-service', (event) => {
-			target.__chatTag = (event as CustomEvent).detail;
-		});
-	});
+	const section = hostA.getByTestId('available-runbooks-section');
+	await expect(section).toBeVisible();
 
-	const metricsRow = hostA.getByTestId('inventory-row').filter({ hasText: 'metrics-stack' });
-	await metricsRow.getByTestId('service-chat-trigger').click();
+	// Two Available cards: the staged server entry and the pure catalog
+	// runbook. The staged one is the server entry's projection.
+	const stagedRow = hostA
+		.getByTestId('available-runbook-row')
+		.filter({ hasText: 'staged-stack' });
+	const catalogRow = hostA
+		.getByTestId('available-runbook-row')
+		.filter({ hasText: 'forgejo-runner' });
+	await expect(stagedRow).toHaveCount(1);
+	await expect(catalogRow).toHaveCount(1);
+	await expect(catalogRow.getByTestId('available-install-btn')).toBeVisible();
+	await expect(catalogRow.getByTestId('available-refresh-btn')).toBeVisible();
 
-	const detail = await page.evaluate(() => {
-		return (window as unknown as { __chatTag?: unknown }).__chatTag;
+	// The staged entry's saved custom instructions pre-fill the Edit draft.
+	await stagedRow.getByTestId('available-edit-btn').click();
+	await expect(stagedRow.getByTestId('available-edit-custom-instructions')).toHaveValue(
+		'staged note from the server entry'
+	);
+	// Editing the catalog runbook's draft: sent with (and persisted by) the
+	// next Install/Refresh execute call.
+	await catalogRow.getByTestId('available-edit-btn').click();
+	await catalogRow.getByTestId('available-edit-custom-instructions').fill('runner pinned to amd64');
+	await catalogRow.getByTestId('available-edit-save').click();
+	await expect(catalogRow.getByTestId('available-edit-form')).toHaveCount(0);
+
+	// The staged card never lost its saved note: the draft still prefills
+	// (checked before the job-triggered refresh re-reads the base page).
+	await stagedRow.getByTestId('available-edit-btn').click();
+	await expect(stagedRow.getByTestId('available-edit-custom-instructions')).toHaveValue(
+		'staged note from the server entry'
+	);
+	await stagedRow.getByTestId('available-edit-cancel').click();
+
+	await catalogRow.getByTestId('available-install-btn').click();
+	await expect(
+		catalogRow.getByTestId(`available-job-badge-${RUNBOOK_ID}`)
+	).toContainText('Background install job started');
+	await catalogRow.getByTestId('available-refresh-btn').click();
+	await expect(
+		catalogRow.getByTestId(`available-job-badge-${RUNBOOK_ID}`)
+	).toContainText('Background verify job started');
+
+	const { calls } = await apiState(page);
+	const executes = calls.filter((call) => call.op === 'executeRunbook');
+	expect(executes).toHaveLength(2);
+	expect(executes[0].args).toEqual([SERVER_A, RUNBOOK_ID]);
+	expect(executes[0].payload).toEqual({
+		action: 'install',
+		custom_instructions: 'runner pinned to amd64'
 	});
-	expect(detail).toEqual({
-		serverId: SERVER_A,
-		serviceName: 'metrics-stack',
-		applicationId: APP_ADOPTED,
-		category: 'observability'
+	expect(executes[1].payload).toEqual({
+		action: 'verify',
+		custom_instructions: 'runner pinned to amd64'
 	});
 });
 
@@ -1895,13 +2063,18 @@ test('map-details editing re-adopts with the observed revision and a stale revis
 	await expect(hostA.getByTestId('service-edit-description')).toHaveValue(
 		'Metrics and alerting stack.'
 	);
+	await expect(hostA.getByTestId('service-edit-custom-instructions')).toHaveValue('');
 	await expect(hostA.getByTestId('service-edit-instructions-install')).toHaveValue(
 		'docker compose up -d'
 	);
 
-	// Change the category, the description and one runbook slot; save.
+	// Change the category, the description, the server-specific custom
+	// instructions and one runbook slot; save.
 	await hostA.getByTestId('service-edit-category').selectOption('games');
 	await hostA.getByTestId('service-edit-description').fill('Relocated to games.');
+	await hostA
+		.getByTestId('service-edit-custom-instructions')
+		.fill('This host scrapes via the tailnet address only.');
 	await hostA.getByTestId('service-edit-instructions-install').fill('make deploy');
 	await hostA.getByTestId('service-edit-save').click();
 	await expect(hostA.getByTestId('service-edit-form')).toHaveCount(0);
@@ -1922,6 +2095,7 @@ test('map-details editing re-adopts with the observed revision and a stale revis
 		expected_revision: 2,
 		category: 'games',
 		description: 'Relocated to games.',
+		custom_instructions: 'This host scrapes via the tailnet address only.',
 		instructions: {
 			install: 'make deploy',
 			update: 'docker compose pull && docker compose up -d',

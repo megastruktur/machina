@@ -388,6 +388,14 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 			})
 		})
 	);
+	// uir-u4: the Runbook Catalog window reads the global catalog route.
+	await page.route('**/api/v1/applications/catalog**', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ runbooks: [], categories: [], limit: 10, offset: 0, total: 0 })
+		})
+	);
 
 	await page.goto('/');
 	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
@@ -416,6 +424,22 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 	await expect(frame(page, 'knowledge-models').getByTestId('memory-status-ok')).toContainText(
 		'v1.2.3'
 	);
+
+	// uir-u4: the Runbook Catalog entry lives under Global / Fleet only,
+	// never inside a server accordion, and opens with the global scope.
+	const runbooksItem = page.getByTestId('open-runbooks');
+	await expect(runbooksItem).toContainText('📖');
+	await expect(runbooksItem).toContainText('Open Runbook Catalog — Global');
+	await expect(page.getByTestId('open-runbooks-' + SERVER_ALPHA_ID)).toHaveCount(0);
+	await runbooksItem.click();
+	await expect(frame(page, 'runbooks')).toHaveCount(1);
+	await expect(frame(page, 'runbooks').locator('.mai-window-frame__title')).toHaveText(
+		'Runbook Catalog — Global'
+	);
+	await expect(page.getByTestId('desktop-status')).toHaveText('Opened Runbook Catalog — Global.');
+	// The mounted panel read the catalog through the real client and renders
+	// the honest empty state for the mocked empty page.
+	await expect(frame(page, 'runbooks').getByTestId('catalog-empty')).toBeVisible();
 });
 
 test('the bottom chat dock is always visible, interactive offline and performs no API requests', async ({

@@ -67,6 +67,14 @@ import type {
 } from '../workspace/entries/07-web-docs.js';
 import type { ApplicationsPageQuery } from '../workspace/entries/08-web-apps.js';
 import type {
+	CatalogPageQuery,
+	RunbookCatalogPage,
+	RunbookExecuteBody,
+	RunbookExecutionView,
+	RunbookUpsertBody,
+	RunbookView
+} from '../workspace/entries/13-web-runbooks.js';
+import type {
 	OverviewAlertsQuery,
 	OverviewFindingsQuery,
 	OverviewPageQuery
@@ -583,6 +591,19 @@ export interface MaiApiClient {
 		applicationId: string,
 		payload: RevokeBody
 	): Promise<void>;
+	/** POST /api/v1/servers/{id}/applications/{app_id}/execute — background runbook job. */
+	executeRunbook(
+		serverId: string,
+		applicationId: string,
+		payload: RunbookExecuteBody
+	): Promise<RunbookExecutionView>;
+
+	/** GET /api/v1/applications/catalog — one bounded global catalog page. */
+	listCatalogRunbooks(page?: CatalogPageQuery): Promise<RunbookCatalogPage>;
+	/** POST /api/v1/applications/catalog — upsert one global runbook. */
+	upsertCatalogRunbook(payload: RunbookUpsertBody): Promise<RunbookView>;
+	/** DELETE /api/v1/applications/catalog/{runbook_id} — delete the recipe only. */
+	deleteCatalogRunbook(runbookId: string): Promise<void>;
 
 	/** GET /api/v1/plugins — availability + configured documents, separately. */
 	pluginCatalog(page?: PageQuery): Promise<PluginCatalogView>;
@@ -908,6 +929,33 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				'DELETE',
 				`/api/v1/servers/${encodeURIComponent(serverId)}/applications/${encodeURIComponent(applicationId)}`,
 				payload,
+				204
+			),
+		executeRunbook: (serverId, applicationId, payload) =>
+			requestJson<RunbookExecutionView>(
+				'POST',
+				`/api/v1/servers/${encodeURIComponent(serverId)}/applications/${encodeURIComponent(applicationId)}/execute`,
+				payload
+			),
+
+		// Global Runbook Catalog (uir-u4).
+		listCatalogRunbooks: (page) => {
+			const params = new URLSearchParams();
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<RunbookCatalogPage>(
+				'GET',
+				`/api/v1/applications/catalog${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		upsertCatalogRunbook: (payload) =>
+			requestJson<RunbookView>('POST', '/api/v1/applications/catalog', payload),
+		deleteCatalogRunbook: (runbookId) =>
+			requestVoid(
+				'DELETE',
+				`/api/v1/applications/catalog/${encodeURIComponent(runbookId)}`,
+				undefined,
 				204
 			),
 

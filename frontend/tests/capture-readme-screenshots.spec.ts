@@ -362,8 +362,10 @@ test('captures the categorized Service Map panel', async ({ page }) => {
 		'observability'
 	);
 	await expect(metricsRow.getByTestId('runbook-step')).toHaveCount(5);
+	// uir-u4: the Chat @service trigger is gone; the per-row entry action is
+	// the ✎ Edit map-details button (the screenshot shows the honest UI).
 	await expect(
-		rows.filter({ hasText: 'ollama-inference' }).getByTestId('service-chat-trigger')
+		rows.filter({ hasText: 'ollama-inference' }).getByTestId('service-edit-start')
 	).toBeVisible();
 
 	await page.screenshot({ path: `${ASSETS_DIR}screenshot-service-map.png`, fullPage: true });

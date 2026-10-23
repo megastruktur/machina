@@ -1362,6 +1362,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{server_id}/applications/{application_id}/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue one background runbook execution (durable agent.run intent)
+         * @description Queue the runbook procedure as ONE background agent conversation.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The route persists an explicitly provided ``custom_instructions`` on
+         *     the server's map entry first (a catalog-only target is STAGED as an
+         *     ``installed=False`` entry, so the notes survive), then records the
+         *     SAME durable intent discipline as every other submit (facade row +
+         *     digest event + submit edge, the ONE producer validating the agent-run
+         *     document) and enqueues through the ONE engine client. No SSH, no
+         *     Docker and no capability dispatch ever runs inside the request — the
+         *     agent executes the procedure behind the dispatcher/policy gates and
+         *     reports status back through ``app.adopt``. The Chat window is never
+         *     opened or pre-filled by this route.
+         */
+        post: operations["execute_runbook_api_v1_servers__server_id__applications__application_id__execute_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/applications/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the global Runbook Catalog (bounded page, C01 rule 5)
+         * @description One bounded page of the GLOBAL runbook catalog (server-agnostic).
+         *
+         *     Safe method: session layer only. The page is the merged catalog —
+         *     persisted ``catalog.json`` records shadow same-named server map
+         *     entries, and pre-catalog server services are synthesized in — in
+         *     stable name order, with the merged taxonomy for the category filter.
+         */
+        get: operations["list_catalog_api_v1_applications_catalog_get"];
+        put?: never;
+        /**
+         * Create or update one global catalog runbook
+         * @description Upsert one global runbook (catalog.json ONLY; servers untouched).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     ``runbook_id`` omitted converges on the deterministic id for the
+         *     lowercased name, so re-saving a runbook of the same name updates the
+         *     existing record (revision-bumped) instead of duplicating it.
+         */
+        post: operations["upsert_catalog_runbook_api_v1_applications_catalog_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/applications/catalog/{runbook_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete one global catalog runbook (server entries untouched)
+         * @description Remove the global recipe; per-server map entries stay untouched.
+         */
+        delete: operations["delete_catalog_runbook_api_v1_applications_catalog__runbook_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plugins": {
         parameters: {
             query?: never;
@@ -1963,6 +2049,10 @@ export interface components {
             instructions?: components["schemas"]["ServiceInstructionsBody"];
             /** Upsert Categories */
             upsert_categories?: components["schemas"]["ServiceCategoryBody"][];
+            /** Custom Instructions */
+            custom_instructions?: string | null;
+            /** Installed */
+            installed?: boolean | null;
         };
         /**
          * AdoptionCreated
@@ -2054,12 +2144,19 @@ export interface components {
          *     ``categories`` is the merged taxonomy (8 built-ins + customs) for
          *     the category picker; the applications list includes manual/standalone
          *     map entries that have no SQL adoption row (seamless chat additions).
+         *     ``available_runbooks`` is the deterministic global-catalog projection:
+         *     every catalog runbook NOT currently ``installed=True`` on this server,
+         *     plus this server's staged entries (``installed=False``), sliced by the
+         *     SAME ``limit``/``offset`` window as the applications (deterministic
+         *     name order; the full paginated list is the catalog route).
          */
         ApplicationPage: {
             /** Server Id */
             server_id: string;
             /** Applications */
             applications: components["schemas"]["ApplicationView"][];
+            /** Available Runbooks */
+            available_runbooks?: components["schemas"]["RunbookView"][];
             /** Categories */
             categories?: components["schemas"]["ServiceCategoryView"][];
             /** Limit */
@@ -2122,6 +2219,16 @@ export interface components {
              */
             description: string;
             instructions?: components["schemas"]["ServiceInstructionsView"];
+            /**
+             * Custom Instructions
+             * @default
+             */
+            custom_instructions: string;
+            /**
+             * Installed
+             * @default true
+             */
+            installed: boolean;
         };
         /**
          * ApprovalView
@@ -4213,6 +4320,117 @@ export interface components {
             submitted_at: string;
             /** Updated At */
             updated_at: string;
+        };
+        /**
+         * RunbookCatalogPage
+         * @description One bounded catalog page (C01 rule 5) with the merged taxonomy.
+         */
+        RunbookCatalogPage: {
+            /** Runbooks */
+            runbooks: components["schemas"]["RunbookView"][];
+            /** Categories */
+            categories?: components["schemas"]["ServiceCategoryView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * RunbookExecuteBody
+         * @description Background runbook execution body (strict; action is required).
+         *
+         *     ``custom_instructions`` persists the per-server notes on the server's
+         *     map entry BEFORE the agent run is enqueued, so the run's ``@service``
+         *     context carries them; ``None`` keeps the stored value.
+         */
+        RunbookExecuteBody: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "install" | "update" | "uninstall" | "verify";
+            /** Custom Instructions */
+            custom_instructions?: string | null;
+        };
+        /**
+         * RunbookExecutionView
+         * @description One queued background runbook job (identity + replayed state).
+         */
+        RunbookExecutionView: {
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             */
+            server_id: string;
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Action */
+            action: string;
+            /** State */
+            state: string;
+        };
+        /**
+         * RunbookUpsertBody
+         * @description Global catalog runbook upsert body (strict; the operator decision).
+         */
+        RunbookUpsertBody: {
+            /** Runbook Id */
+            runbook_id?: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Category
+             * @default system
+             */
+            category: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            instructions?: components["schemas"]["ServiceInstructionsBody"];
+        };
+        /**
+         * RunbookView
+         * @description One global Runbook Catalog record (the catalog half of a service).
+         *
+         *     ``custom_instructions`` carries the SERVER-SPECIFIC notes only when
+         *     the view projects a staged server entry (``installed=False``); a pure
+         *     catalog projection keeps the empty default (the catalog never owns
+         *     per-server state).
+         */
+        RunbookView: {
+            /**
+             * Runbook Id
+             * Format: uuid
+             */
+            runbook_id: string;
+            /** Name */
+            name: string;
+            /** Category */
+            category: string;
+            /** Description */
+            description: string;
+            instructions: components["schemas"]["ServiceInstructionsView"];
+            /** Revision */
+            revision: number;
+            /** Updated At */
+            updated_at: string;
+            /**
+             * Custom Instructions
+             * @default
+             */
+            custom_instructions: string;
         };
         /**
          * ScheduleCreateBody
@@ -8548,6 +8766,253 @@ export interface operations {
                 };
             };
             /** @description Jobs domain unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    execute_runbook_api_v1_servers__server_id__applications__application_id__execute_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunbookExecuteBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunbookExecutionView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No server map entry or catalog runbook for this id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Service Map or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_catalog_api_v1_applications_catalog_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunbookCatalogPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Service Map is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    upsert_catalog_runbook_api_v1_applications_catalog_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunbookUpsertBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunbookView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Service Map is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_catalog_runbook_api_v1_applications_catalog__runbook_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runbook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No catalog record for this runbook id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Service Map is unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

@@ -45,6 +45,7 @@
 	import { overviewEntry } from './entries/10-web-dashboard.js';
 	import { pluginFormsEntry } from './entries/09-web-plugin-forms.js';
 	import { pluginsEntry } from './entries/12-web-plugins.js';
+	import { runbooksEntry } from './entries/13-web-runbooks.js';
 	import { serverProfileEntry } from './entries/02-web-server.js';
 
 	/**
@@ -165,6 +166,7 @@
 			overviewEntry(),
 			pluginFormsEntry(),
 			pluginsEntry(),
+			runbooksEntry(),
 			knowledgeModelsEntry()
 		]);
 		if (!result.ok) {
@@ -276,6 +278,10 @@
 		PLUGINS_PANEL_KIND,
 		pluginsPanelServices
 	} from './entries/12-web-plugins.js';
+	import {
+		RUNBOOKS_PANEL_KIND,
+		runbookCatalogServices
+	} from './entries/13-web-runbooks.js';
 	import { SERVER_PROFILE_PANEL_KIND, serverProfileServices } from './entries/02-web-server.js';
 	import type { PanelServices } from './registry.js';
 
@@ -773,7 +779,8 @@
 		listAdopted: api.listAdoptedApplications,
 		discover: api.discoverApplications,
 		adopt: api.adoptApplication,
-		revoke: api.revokeApplication
+		revoke: api.revokeApplication,
+		executeRunbook: api.executeRunbook
 	};
 
 	const pluginsApi: PluginsApi = {
@@ -870,6 +877,8 @@
 				return asBag(pluginFormsServices(pluginsApi, skillsApi));
 			case PLUGINS_PANEL_KIND:
 				return asBag(pluginsPanelServices(api));
+			case RUNBOOKS_PANEL_KIND:
+				return asBag(runbookCatalogServices(api));
 			default:
 				return {};
 		}

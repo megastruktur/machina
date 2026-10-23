@@ -71,6 +71,7 @@ resource.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Mapping
@@ -105,8 +106,19 @@ from mai.api.jobs import (
     RunSubmitBody,
     StepBody,
     _canonical_profile,
+    _jobs_services,
+    _record_submit_intent,
+    _replayed_state,
+    _sessions,
     submit_run,
 )
+from mai.agents import run as agent_run
+from mai.agents.context import format_service_map_section
+from mai.auth.sessions import hash_token
+from mai.jobs.engine import RunIdInUseError
+from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
+
+from dbos import error as dbos_error
 from mai.applications.adopt import (
     ABSENT_REVISION,
     AdoptionError,
@@ -133,10 +145,13 @@ from mai.applications.document import (
 from mai.applications.service_map import (
     CATEGORY_MACHINE_ID_RE,
     INSTRUCTION_KEYS,
+    MAX_INSTRUCTION_CHARS as MAP_INSTRUCTION_CHARS,
     MAX_NAME_CHARS as MAP_NAME_CHARS,
+    CatalogRunbook,
     ServiceInstructions,
     ServiceMapEntry,
     ServiceMapError,
+    ServiceMapErrorCode,
     ServiceMapStore,
     classify_service,
     entry_digest,
@@ -271,6 +286,27 @@ class ApplicationView(BaseModel):
     instructions: ServiceInstructionsView = Field(
         default_factory=ServiceInstructionsView
     )
+    custom_instructions: str = ""
+    installed: bool = True
+
+
+class RunbookView(BaseModel):
+    """One global Runbook Catalog record (the catalog half of a service).
+
+    ``custom_instructions`` carries the SERVER-SPECIFIC notes only when
+    the view projects a staged server entry (``installed=False``); a pure
+    catalog projection keeps the empty default (the catalog never owns
+    per-server state).
+    """
+
+    runbook_id: uuid.UUID
+    name: str
+    category: str
+    description: str
+    instructions: ServiceInstructionsView
+    revision: int
+    updated_at: str
+    custom_instructions: str = ""
 
 
 class ApplicationPage(BaseModel):
@@ -279,10 +315,16 @@ class ApplicationPage(BaseModel):
     ``categories`` is the merged taxonomy (8 built-ins + customs) for
     the category picker; the applications list includes manual/standalone
     map entries that have no SQL adoption row (seamless chat additions).
+    ``available_runbooks`` is the deterministic global-catalog projection:
+    every catalog runbook NOT currently ``installed=True`` on this server,
+    plus this server's staged entries (``installed=False``), sliced by the
+    SAME ``limit``/``offset`` window as the applications (deterministic
+    name order; the full paginated list is the catalog route).
     """
 
     server_id: str
     applications: list[ApplicationView]
+    available_runbooks: list[RunbookView] = Field(default_factory=list)
     categories: list[ServiceCategoryView] = Field(default_factory=list)
     limit: int
     offset: int
@@ -326,6 +368,10 @@ class AdoptBody(BaseModel):
         default_factory=ServiceInstructionsBody
     )
     upsert_categories: list[ServiceCategoryBody] = Field(default_factory=list)
+    custom_instructions: str | None = Field(
+        default=None, max_length=MAP_INSTRUCTION_CHARS
+    )
+    installed: bool | None = None
 
     @field_validator("category")
     @classmethod
@@ -343,6 +389,65 @@ class RecordDocView(BaseModel):
     status: str  # "documented" | "pending"
     doc_id: str | None = None
     reason: str | None = None
+
+
+class RunbookUpsertBody(BaseModel):
+    """Global catalog runbook upsert body (strict; the operator decision)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runbook_id: str | None = None
+    name: str = Field(min_length=1, max_length=MAP_NAME_CHARS)
+    category: str = Field(default="system", min_length=1, max_length=64)
+    description: str = Field(default="", max_length=2000)
+    instructions: ServiceInstructionsBody = Field(
+        default_factory=ServiceInstructionsBody
+    )
+
+    @field_validator("category")
+    @classmethod
+    def _category_slug(cls, value: str) -> str:
+        if not CATEGORY_MACHINE_ID_RE.fullmatch(value):
+            raise ValueError(
+                f"category must match {CATEGORY_MACHINE_ID_RE.pattern}"
+            )
+        return value
+
+
+class RunbookCatalogPage(BaseModel):
+    """One bounded catalog page (C01 rule 5) with the merged taxonomy."""
+
+    runbooks: list[RunbookView]
+    categories: list[ServiceCategoryView] = Field(default_factory=list)
+    limit: int
+    offset: int
+    total: int
+
+
+class RunbookExecuteBody(BaseModel):
+    """Background runbook execution body (strict; action is required).
+
+    ``custom_instructions`` persists the per-server notes on the server's
+    map entry BEFORE the agent run is enqueued, so the run's ``@service``
+    context carries them; ``None`` keeps the stored value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["install", "update", "uninstall", "verify"]
+    custom_instructions: str | None = Field(
+        default=None, max_length=MAP_INSTRUCTION_CHARS
+    )
+
+
+class RunbookExecutionView(BaseModel):
+    """One queued background runbook job (identity + replayed state)."""
+
+    run_id: uuid.UUID
+    server_id: uuid.UUID
+    application_id: uuid.UUID
+    action: str
+    state: str
 
 
 class AdoptionCreated(BaseModel):
@@ -722,6 +827,8 @@ def _application_view(
             if entry is None
             else _instructions_view(entry.instructions)
         ),
+        custom_instructions="" if entry is None else entry.custom_instructions,
+        installed=True if entry is None else entry.installed,
     )
 
 
@@ -754,7 +861,82 @@ def _map_entry_view(entry: ServiceMapEntry) -> ApplicationView:
         category=entry.category,
         description=entry.description,
         instructions=_instructions_view(entry.instructions),
+        custom_instructions=entry.custom_instructions,
+        installed=entry.installed,
     )
+
+
+def _runbook_view(
+    runbook: CatalogRunbook, *, custom_instructions: str = ""
+) -> RunbookView:
+    """Type one catalog runbook into the wire view (pure projection)."""
+    return RunbookView(
+        runbook_id=uuid.UUID(runbook.runbook_id),
+        name=runbook.name,
+        category=runbook.category,
+        description=runbook.description,
+        instructions=_instructions_view(runbook.instructions),
+        revision=runbook.revision,
+        updated_at=runbook.updated_at,
+        custom_instructions=custom_instructions,
+    )
+
+
+def _entry_runbook_view(entry: ServiceMapEntry) -> RunbookView:
+    """The wire view of one staged (``installed=False``) server entry.
+
+    The entry's per-server ``custom_instructions`` ride the view — the
+    Available list keeps the operator's host-specific notes visible and
+    editable even though the service is not installed.
+    """
+    return _runbook_view(
+        CatalogRunbook(
+            runbook_id=entry.application_id,
+            name=entry.name,
+            category=entry.category,
+            description=entry.description,
+            instructions=entry.instructions,
+            updated_at=entry.updated_at,
+            revision=entry.revision,
+        ),
+        custom_instructions=entry.custom_instructions,
+    )
+
+
+def _available_runbooks(
+    map_store: ServiceMapStore,
+    entries: Mapping[str, ServiceMapEntry],
+    *,
+    limit: int,
+    offset: int,
+) -> list[RunbookView]:
+    """The deterministic Available-from-catalog page for one server.
+
+    Staged entries (``installed=False``) come first and shadow their
+    catalog twins (they carry the saved per-server custom instructions);
+    the remaining global catalog runbooks follow unless an installed
+    entry of the same name (case-insensitive) already covers them.
+    """
+    staged = sorted(
+        (entry for entry in entries.values() if not entry.installed),
+        key=lambda entry: (entry.name.lower(), entry.application_id),
+    )
+    installed_names = {
+        entry.name.lower() for entry in entries.values() if entry.installed
+    }
+    merged: list[RunbookView] = []
+    taken_names: set[str] = set()
+    for entry in staged:
+        merged.append(_entry_runbook_view(entry))
+        taken_names.add(entry.name.lower())
+    for runbook in map_store.list_catalog_runbooks():
+        if runbook.name.lower() in taken_names:
+            continue
+        if runbook.name.lower() in installed_names:
+            continue
+        merged.append(_runbook_view(runbook))
+        taken_names.add(runbook.name.lower())
+    return merged[offset : offset + limit]
 
 
 def _wire_ts(value: datetime) -> str:
@@ -1020,6 +1202,9 @@ async def list_adopted(
     return ApplicationPage(
         server_id=str(server_id),
         applications=page,
+        available_runbooks=_available_runbooks(
+            map_store, entries, limit=limit, offset=offset
+        ),
         categories=_categories_view(map_store),
         limit=limit,
         offset=offset,
@@ -1142,6 +1327,8 @@ async def adopt_application(
         unit_name=payload.unit_name,
         description=payload.description or "",
         instructions=payload.instructions.model_dump(),
+        custom_instructions=payload.custom_instructions,
+        installed=payload.installed,
     )
     record = await adoption.read(server_id, application_id)
     assert record is not None  # the pipeline just reconciled it
@@ -1185,6 +1372,8 @@ async def _adopt_manual_entry(
         unit_name=payload.unit_name,
         description=payload.description or "",
         instructions=payload.instructions.model_dump(),
+        custom_instructions=payload.custom_instructions,
+        installed=payload.installed,
     )
     return AdoptionCreated(
         intent_id=str(uuid.uuid5(application_id, "service-map:manual-adoption")),
@@ -1785,6 +1974,387 @@ async def remove_application(
     )
 
 
+catalog_router = APIRouter(
+    prefix="/api/v1/applications/catalog",
+    tags=["applications"],
+)
+
+
+@catalog_router.get(
+    "",
+    status_code=HTTP_200_OK,
+    response_model=RunbookCatalogPage,
+    summary="List the global Runbook Catalog (bounded page, C01 rule 5)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Query parameters failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Service Map is unavailable",
+        },
+    },
+)
+async def list_catalog(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Response:
+    """One bounded page of the GLOBAL runbook catalog (server-agnostic).
+
+    Safe method: session layer only. The page is the merged catalog —
+    persisted ``catalog.json`` records shadow same-named server map
+    entries, and pre-catalog server services are synthesized in — in
+    stable name order, with the merged taxonomy for the category filter.
+    """
+    await _require_session(request)
+    map_store = _map_store(request)
+    runbooks = map_store.list_catalog_runbooks()
+    total = len(runbooks)
+    return RunbookCatalogPage(
+        runbooks=[_runbook_view(runbook) for runbook in runbooks[offset : offset + limit]],
+        categories=_categories_view(map_store),
+        limit=limit,
+        offset=offset,
+        total=total,
+    )
+
+
+@catalog_router.post(
+    "",
+    status_code=HTTP_200_OK,
+    response_model=RunbookView,
+    summary="Create or update one global catalog runbook",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token mismatch",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Service Map is unavailable",
+        },
+    },
+)
+async def upsert_catalog_runbook(
+    request: Request, payload: RunbookUpsertBody
+) -> Response:
+    """Upsert one global runbook (catalog.json ONLY; servers untouched).
+
+    Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+    ``runbook_id`` omitted converges on the deterministic id for the
+    lowercased name, so re-saving a runbook of the same name updates the
+    existing record (revision-bumped) instead of duplicating it.
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    map_store = _map_store(request)
+    try:
+        runbook = map_store.upsert_catalog_runbook(
+            name=payload.name,
+            category=payload.category,
+            description=payload.description,
+            instructions=payload.instructions.model_dump(),
+            runbook_id=payload.runbook_id,
+        )
+    except ServiceMapError as error:
+        if error.code is ServiceMapErrorCode.NOT_FOUND:
+            return render_error_envelope(
+                request, HTTP_404_NOT_FOUND, "not_found", error.detail
+            )
+        return _validation_error(request, "body", error.detail)
+    return _runbook_view(runbook)
+
+
+@catalog_router.delete(
+    "/{runbook_id}",
+    status_code=HTTP_204_NO_CONTENT,
+    summary="Delete one global catalog runbook (server entries untouched)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token mismatch",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No catalog record for this runbook id",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Service Map is unavailable",
+        },
+    },
+)
+async def delete_catalog_runbook(
+    request: Request, runbook_id: uuid.UUID
+) -> Response:
+    """Remove the global recipe; per-server map entries stay untouched."""
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    map_store = _map_store(request)
+    try:
+        removed = map_store.delete_catalog_runbook(runbook_id)
+    except ServiceMapError as error:
+        return _validation_error(request, "runbook_id", error.detail)
+    if not removed:
+        return render_error_envelope(
+            request,
+            HTTP_404_NOT_FOUND,
+            "not_found",
+            "no catalog record is stored under this runbook id",
+        )
+    return Response(status_code=HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{application_id}/execute",
+    status_code=HTTP_201_CREATED,
+    response_model=RunbookExecutionView,
+    summary="Queue one background runbook execution (durable agent.run intent)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token mismatch",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No server map entry or catalog runbook for this id",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Service Map or jobs engine unavailable",
+        },
+    },
+)
+async def execute_runbook(
+    request: Request,
+    server_id: uuid.UUID,
+    application_id: uuid.UUID,
+    payload: RunbookExecuteBody,
+) -> Response:
+    """Queue the runbook procedure as ONE background agent conversation.
+
+    Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+    The route persists an explicitly provided ``custom_instructions`` on
+    the server's map entry first (a catalog-only target is STAGED as an
+    ``installed=False`` entry, so the notes survive), then records the
+    SAME durable intent discipline as every other submit (facade row +
+    digest event + submit edge, the ONE producer validating the agent-run
+    document) and enqueues through the ONE engine client. No SSH, no
+    Docker and no capability dispatch ever runs inside the request — the
+    agent executes the procedure behind the dispatcher/policy gates and
+    reports status back through ``app.adopt``. The Chat window is never
+    opened or pre-filled by this route.
+    """
+    _store, token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    map_store = _map_store(request)
+    lifecycle, recovery = _jobs_services(request)
+    _canonical_profile(request, server_id)
+
+    entry = map_store.get_entry(server_id, application_id)
+    runbook = map_store.get_catalog_runbook(application_id)
+    if entry is None and runbook is None:
+        return render_error_envelope(
+            request,
+            HTTP_404_NOT_FOUND,
+            "not_found",
+            "no service map entry or catalog runbook is stored under this id",
+        )
+
+    try:
+        if payload.custom_instructions is not None:
+            if entry is not None:
+                # Persist the per-server notes (revision-bumped upsert).
+                entry = map_store.upsert_entry(
+                    server_id,
+                    name=entry.name,
+                    category=entry.category,
+                    origin=entry.origin,
+                    application_id=uuid.UUID(entry.application_id),
+                    compose_project=entry.compose_project,
+                    working_dir=entry.working_dir,
+                    unit_name=entry.unit_name,
+                    description=entry.description,
+                    instructions=entry.instructions,
+                    custom_instructions=payload.custom_instructions,
+                )
+            else:
+                # Stage the catalog runbook on this server: an explicit
+                # installed=False entry carrying the operator's notes.
+                entry = map_store.upsert_entry(
+                    server_id,
+                    name=runbook.name,
+                    category=runbook.category,
+                    origin="manual",
+                    application_id=uuid.UUID(runbook.runbook_id),
+                    description=runbook.description,
+                    instructions=runbook.instructions,
+                    custom_instructions=payload.custom_instructions,
+                    installed=False,
+                )
+    except ServiceMapError as error:
+        return _validation_error(request, "custom_instructions", error.detail)
+
+    effective = entry
+    if effective is None:
+        assert runbook is not None  # resolved above
+        effective = ServiceMapEntry(
+            application_id=str(runbook.runbook_id),
+            server_id=str(server_id),
+            name=runbook.name,
+            origin="manual",
+            compose_project=None,
+            working_dir=None,
+            unit_name=None,
+            category=runbook.category,
+            description=runbook.description,
+            instructions=runbook.instructions,
+            updated_at=runbook.updated_at,
+            revision=runbook.revision,
+        )
+
+    status_rule = (
+        "set installed=true via app.adopt when install completes or verify "
+        "confirms the installation; set installed=false via app.adopt (or "
+        "app.unadopt) when uninstall finishes or verify finds the service "
+        "absent"
+    )
+    task = (
+        f"Background runbook job: execute the '{payload.action}' procedure for "
+        f"the managed service @{effective.name} on this server.\n"
+        "Follow the recorded runbook instructions and the server custom "
+        "instructions exactly; report what you changed.\n"
+        f"When the procedure finishes, update the service status via "
+        f"app.adopt: {status_rule}."
+    ) + format_service_map_section([effective])
+    if len(task) > agent_run.MAX_TASK_CHARS:
+        return render_error_envelope(
+            request,
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "validation_failed",
+            "the recorded runbook exceeds the bounded task size; nothing ran",
+        )
+
+    # Lazy import: chat owns the reviewed default-capability resolution
+    # (grant store + profile + plugins + internal API + built-ins); this
+    # route reuses it verbatim instead of re-deriving a second vocabulary.
+    from mai.api.chat import DEFAULT_ROLE, _resolve_default_capabilities
+
+    stored = _canonical_profile(request, server_id)
+    profile = parse_server_profile_text(stored.text)
+    capabilities = _resolve_default_capabilities(request, server_id, profile.capabilities)
+    # The job_runs row names the model profile the run will use: the store's
+    # CURRENT selection (the exact record the worker resolves when the run
+    # payload pins no explicit profile); "default" when the store is absent.
+    models_store = getattr(request.app.state, "models", None)
+    model_profile: str | None = None
+    if models_store is not None:
+        try:
+            model_profile = models_store.get_selection().profile
+        except Exception:
+            model_profile = None
+    run_uuid = uuid.uuid4()
+    run_id = str(run_uuid)
+    try:
+        context = ExecutionContext(
+            principal=hash_token(token),
+            server_id=server_id,
+            run_id=run_uuid,
+            parent_scope=None,
+            profile_revision=str(stored.revision),
+            prompt_revision=str(profile.prompt_revision),
+            credential_references=(),
+            allowed_capabilities=capabilities,
+            mode=PolicyMode.DELEGATED,
+        )
+    except PolicyError as exc:
+        return _validation_error(request, "context", exc.detail)
+    document: dict[str, object] = {
+        "v": agent_run.RUN_PAYLOAD_VERSION,
+        "run_id": run_id,
+        "server_id": str(server_id),
+        "context": context.to_json(),
+        "role": DEFAULT_ROLE,
+        "task": task,
+        "connection": None,
+        "profile": None,
+    }
+    payload_json = agent_run.canonical_json(document)
+    try:
+        agent_run.parse_agent_run_intent(payload_json)  # the ONE producer validates
+    except agent_run.AgentRunError as exc:
+        return _validation_error(request, "task", str(exc))
+    digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
+
+    factory = _sessions(request)
+    async with factory() as session:
+        async with session.begin():
+            created = await _record_submit_intent(
+                session,
+                run_id=run_id,
+                server_id=str(server_id),
+                profile_revision=stored.revision,
+                prompt_revision=profile.prompt_revision,
+                model_profile=model_profile if model_profile is not None else "default",
+                requested_grants=sorted(capabilities),
+                digest=digest,
+                now=datetime.now(timezone.utc),
+            )
+    del created  # a freshly minted run id cannot duplicate; enqueue decides
+    try:
+        await asyncio.to_thread(
+            recovery.client.enqueue_run, run_id, agent_run.HANDLER_NAME, payload_json
+        )
+    except RunIdInUseError:
+        return render_error_envelope(
+            request,
+            HTTP_409_CONFLICT,
+            "conflict",
+            "the generated run id is already used by another run; retry",
+        )
+    except (dbos_error.DBOSException, OSError):
+        return render_error_envelope(
+            request,
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "jobs engine is unavailable",
+        )
+    state = await _replayed_state(lifecycle, run_id)
+    return RunbookExecutionView(
+        run_id=run_uuid,
+        server_id=server_id,
+        application_id=application_id,
+        action=payload.action,
+        state=state or "queued",
+    )
+
+
 def register_applications(app: FastAPI) -> None:
     """Register the applications surface under the shared boundary (C01/C08)."""
     app.include_router(router)
+    app.include_router(catalog_router)

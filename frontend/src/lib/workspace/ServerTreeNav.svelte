@@ -62,7 +62,12 @@
 	 * repeat inside a server accordion, and a global-section open pins the
 	 * `{ kind: 'global' }` scope.
 	 */
-	const GLOBAL_KINDS: readonly string[] = ['knowledge-models', 'model-settings', 'plugins'];
+	const GLOBAL_KINDS: readonly string[] = [
+		'knowledge-models',
+		'model-settings',
+		'plugins',
+		'runbooks'
+	];
 
 	const serverScopedEntries = $derived(
 		entries.filter(
@@ -108,6 +113,7 @@
 		'capability-policy': '🛡',
 		'plugin-forms': '🧩',
 		plugins: '🔌',
+		runbooks: '📖',
 		overview: '🌐',
 		'fixture-notes': '📝',
 		'fixture-prefs': '⚙',

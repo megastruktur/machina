@@ -71,12 +71,13 @@ import os
 import secrets
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from mai.applications.service_map import INSTRUCTION_KEYS, ServiceMapEntry
 from mai.contracts.server import ServerProfile, parse_server_profile_text
 from mai.profiles.files import ProfileFileStore
 
@@ -106,6 +107,7 @@ __all__ = [
     "EvidenceReceipt",
     "ServerContextMaterials",
     "assemble",
+    "format_service_map_section",
     "load_server_context",
     "main",
 ]
@@ -742,6 +744,40 @@ def _truncated_body(
     if tail > 0:
         parts.append(evidence.text[-tail:])
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Service map enrichment (the @service chip context)
+# ---------------------------------------------------------------------------
+
+
+def format_service_map_section(entries: Iterable[ServiceMapEntry]) -> str:
+    """The structured Service Map context appended to an agent task.
+
+    Each matched entry contributes its identity, category, description,
+    the server-specific custom instructions (when the operator recorded
+    any), and the operational runbook (install/update/uninstall/backup/
+    verify) — the agent's grounded service knowledge for a tagged
+    conversation. The global catalogue knowledge and the per-server
+    custom instructions ALWAYS travel together.
+    """
+    lines = ["", "## Service map context (@service tags)", ""]
+    for entry in entries:
+        lines.append(
+            f"### {entry.name} — category `{entry.category}`, "
+            f"origin `{entry.origin}` (id {entry.application_id})"
+        )
+        if entry.description:
+            lines.append(f"Description: {entry.description}")
+        custom = getattr(entry, "custom_instructions", "")
+        if custom:
+            lines.append(f"Server custom instructions: {custom}")
+        for key in INSTRUCTION_KEYS:
+            value = getattr(entry.instructions, key)
+            if value:
+                lines.append(f"- {key}: {value}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

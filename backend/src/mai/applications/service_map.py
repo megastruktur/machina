@@ -58,6 +58,7 @@ __all__ = [
     "INSTRUCTION_KEYS",
     "MAP_ORIGINS",
     "ServiceCategory",
+    "CatalogRunbook",
     "ServiceInstructions",
     "ServiceMapEntry",
     "ServiceMapError",
@@ -331,6 +332,12 @@ class ServiceMapEntry:
     instructions: ServiceInstructions
     updated_at: str
     revision: int
+    #: Server-specific prompt instructions injected into the Agent's
+    #: ``@service`` context alongside the global description/runbook.
+    custom_instructions: str = ""
+    #: Whether the service is currently installed on the host (a catalog
+    #: runbook staged-but-not-installed carries ``False``).
+    installed: bool = True
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -346,7 +353,71 @@ class ServiceMapEntry:
             "instructions": self.instructions.to_json(),
             "updated_at": self.updated_at,
             "revision": self.revision,
+            "custom_instructions": self.custom_instructions,
+            "installed": self.installed,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogRunbook:
+    """One global Runbook Catalog record (the ``catalog.json`` shape).
+
+    A runbook is the server-agnostic half of a service: identity, taxonomy
+    category, description and the operational runbook. Per-server state
+    (installed flag, custom instructions) stays on the
+    :class:`ServiceMapEntry`; the catalog never carries it.
+    """
+
+    runbook_id: str
+    name: str
+    category: str
+    description: str
+    instructions: ServiceInstructions
+    updated_at: str
+    revision: int
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "runbook_id": self.runbook_id,
+            "name": self.name,
+            "category": self.category,
+            "description": self.description,
+            "instructions": self.instructions.to_json(),
+            "updated_at": self.updated_at,
+            "revision": self.revision,
+        }
+
+
+def _catalog_runbook_of(document: Mapping[str, object]) -> CatalogRunbook:
+    """Strictly type one persisted catalog document (malformed = surfaced)."""
+    try:
+        runbook_id = _canonical_uuid(document["runbook_id"], "runbook_id")
+        name = _validated_name(document["name"])
+        category = _validated_category_id(document["category"])
+        description = _validated_description(document["description"])
+        instructions = ServiceInstructions.of(document.get("instructions"))
+        raw_revision = document["revision"]
+        if (
+            not isinstance(raw_revision, int)
+            or isinstance(raw_revision, bool)
+            or raw_revision < 1
+        ):
+            raise ValueError("revision must be a positive integer")
+        updated_at = str(document["updated_at"])
+    except (KeyError, TypeError, ValueError, ServiceMapError) as exc:
+        raise ServiceMapError(
+            ServiceMapErrorCode.MALFORMED_RECORD,
+            f"catalog runbook record is malformed: {exc}",
+        ) from None
+    return CatalogRunbook(
+        runbook_id=runbook_id,
+        name=name,
+        category=category,
+        description=description,
+        instructions=instructions,
+        updated_at=updated_at,
+        revision=raw_revision,
+    )
 
 
 def entry_digest(entry: ServiceMapEntry) -> str:
@@ -453,6 +524,14 @@ def _entry_of(document: Mapping[str, object], *, server_id: str) -> ServiceMapEn
         ):
             raise ValueError("revision must be a positive integer")
         updated_at = str(document["updated_at"])
+        # Backward-compatible: records written before the catalog split have
+        # no custom_instructions/installed keys and read as ""/True.
+        raw_custom = document.get("custom_instructions", "")
+        if not isinstance(raw_custom, str) or len(raw_custom) > MAX_INSTRUCTION_CHARS:
+            raise ValueError("custom_instructions must be a bounded string")
+        raw_installed = document.get("installed", True)
+        if not isinstance(raw_installed, bool):
+            raise ValueError("installed must be a boolean")
     except (KeyError, TypeError, ValueError, ServiceMapError) as exc:
         raise ServiceMapError(
             ServiceMapErrorCode.MALFORMED_RECORD,
@@ -490,6 +569,8 @@ def _entry_of(document: Mapping[str, object], *, server_id: str) -> ServiceMapEn
         instructions=instructions,
         updated_at=updated_at,
         revision=raw_revision,
+        custom_instructions=raw_custom,
+        installed=raw_installed,
     )
 
 
@@ -682,19 +763,39 @@ class ServiceMapStore:
         unit_name: str | None = None,
         description: str = "",
         instructions: ServiceInstructions | Mapping[str, object] | None = None,
+        custom_instructions: str | None = None,
+        installed: bool | None = None,
     ) -> ServiceMapEntry:
         """Add or update one service entry (revision-bumped, atomic).
 
         ``application_id`` omitted mints the deterministic UUID5 from
         ``(server_id, name)`` — the same service name converges on the
         same identity across upserts. The new revision is the previously
-        stored revision + 1 (or 1 on create).
+        stored revision + 1 (or 1 on create). ``custom_instructions`` and
+        ``installed`` are the per-server overrides: ``None`` preserves the
+        previously stored value (or the ``""``/``True`` default on create),
+        so callers that do not name them never wipe server-local state.
         """
         sid = _canonical_uuid(server_id, "server_id")
         name = _validated_name(name)
         category = _validated_category_id(category)
         origin = _validated_origin(origin)
         description = _validated_description(description)
+        if custom_instructions is not None:
+            if (
+                not isinstance(custom_instructions, str)
+                or len(custom_instructions) > MAX_INSTRUCTION_CHARS
+            ):
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    "custom_instructions must be a string of at most "
+                    f"{MAX_INSTRUCTION_CHARS} chars",
+                )
+        if installed is not None and not isinstance(installed, bool):
+            raise ServiceMapError(
+                ServiceMapErrorCode.INVALID_REQUEST,
+                "installed must be a boolean",
+            )
         if isinstance(instructions, ServiceInstructions):
             parsed_instructions = instructions
         else:
@@ -741,6 +842,16 @@ class ServiceMapStore:
             instructions=parsed_instructions,
             updated_at=_wire_ts(datetime.now(timezone.utc)),
             revision=1 if previous is None else previous.revision + 1,
+            custom_instructions=(
+                custom_instructions
+                if custom_instructions is not None
+                else ("" if previous is None else previous.custom_instructions)
+            ),
+            installed=(
+                installed
+                if installed is not None
+                else (True if previous is None else previous.installed)
+            ),
         )
         document = [item.to_json() for item in entries] + [entry.to_json()]
         self._ensure_root()
@@ -770,6 +881,175 @@ class ServiceMapStore:
             self._server_path(server_id),
             json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
         )
+        return True
+
+    # -- global runbook catalog ------------------------------------------------
+
+    def _catalog_path(self) -> Path:
+        return self._root / "catalog.json"
+
+    def _read_catalog(self) -> list[CatalogRunbook]:
+        """The persisted catalog records in file order (absent file = empty)."""
+        path = self._catalog_path()
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise ServiceMapError(
+                ServiceMapErrorCode.MALFORMED_RECORD,
+                f"runbook catalog file is unreadable: {exc}",
+            ) from None
+        if not isinstance(raw, list):
+            raise ServiceMapError(
+                ServiceMapErrorCode.MALFORMED_RECORD,
+                "runbook catalog file must hold a JSON array",
+            )
+        return [
+            _catalog_runbook_of(item)
+            for item in raw
+            if isinstance(item, Mapping)
+        ]
+
+    def _write_catalog(self, runbooks: list[CatalogRunbook]) -> None:
+        self._ensure_root()
+        _atomic_write(
+            self._catalog_path(),
+            json.dumps(
+                [item.to_json() for item in runbooks], indent=2, sort_keys=True
+            ).encode("utf-8"),
+        )
+
+    def _known_server_entries(self) -> tuple[ServiceMapEntry, ...]:
+        """Every per-server entry across all servers (stable identity order).
+
+        Powers the catalog's automatic seeding: a service mapped on any
+        server before the catalog existed shows up as a catalog runbook
+        without a migration. A server file whose stem is not a UUID is
+        foreign debris and is skipped; a malformed record inside a real
+        server file surfaces (the store's fail-honest discipline).
+        """
+        servers_dir = self._root / "servers"
+        if not servers_dir.exists():
+            return ()
+        entries: list[ServiceMapEntry] = []
+        for path in sorted(servers_dir.glob("*.json")):
+            try:
+                server_id = uuid.UUID(path.stem)
+            except ValueError:
+                continue
+            if path.name != f"{server_id}.json":
+                continue
+            entries.extend(self.list_entries(server_id))
+        return tuple(sorted(entries, key=lambda e: (e.name.lower(), e.application_id)))
+
+    def list_catalog_runbooks(self) -> tuple[CatalogRunbook, ...]:
+        """The merged global catalog (stable name order).
+
+        ``catalog.json`` records come first in authority: a persisted
+        runbook shadows any server map entry of the same name (case-
+        insensitive) or id. Every remaining server map entry — services
+        that existed before the catalog — is synthesized as a runbook
+        (its entry id stands in as the runbook id), so existing services
+        are automatically in the catalog.
+        """
+        persisted = self._read_catalog()
+        taken_ids = {runbook.runbook_id for runbook in persisted}
+        taken_names = {runbook.name.lower() for runbook in persisted}
+        merged = list(persisted)
+        for entry in self._known_server_entries():
+            if entry.application_id in taken_ids:
+                continue
+            if entry.name.lower() in taken_names:
+                continue
+            merged.append(
+                CatalogRunbook(
+                    runbook_id=entry.application_id,
+                    name=entry.name,
+                    category=entry.category,
+                    description=entry.description,
+                    instructions=entry.instructions,
+                    updated_at=entry.updated_at,
+                    revision=entry.revision,
+                )
+            )
+            taken_ids.add(entry.application_id)
+            taken_names.add(entry.name.lower())
+        return tuple(
+            sorted(merged, key=lambda r: (r.name.lower(), r.runbook_id))
+        )
+
+    def get_catalog_runbook(
+        self, runbook_id: str | uuid.UUID
+    ) -> CatalogRunbook | None:
+        """One catalog runbook by identity, ``None`` when absent."""
+        wanted = _canonical_uuid(runbook_id, "runbook_id")
+        for runbook in self.list_catalog_runbooks():
+            if runbook.runbook_id == wanted:
+                return runbook
+        return None
+
+    def upsert_catalog_runbook(
+        self,
+        *,
+        name: str,
+        category: str = "system",
+        description: str = "",
+        instructions: ServiceInstructions | Mapping[str, object] | None = None,
+        runbook_id: str | uuid.UUID | None = None,
+    ) -> CatalogRunbook:
+        """Add or update one catalog runbook (revision-bumped, atomic).
+
+        ``runbook_id`` omitted mints the deterministic UUID5 from the
+        catalog namespace and the lowercased name, so re-upserting a run
+        of the same name converges on one record. Server map entries are
+        never touched from here — the catalog is the global half only.
+        """
+        name = _validated_name(name)
+        category = _validated_category_id(category)
+        description = _validated_description(description)
+        if isinstance(instructions, ServiceInstructions):
+            parsed_instructions = instructions
+        else:
+            parsed_instructions = ServiceInstructions.of(instructions)
+        rid = (
+            _canonical_uuid(runbook_id, "runbook_id")
+            if runbook_id is not None
+            else str(
+                uuid.uuid5(uuid.UUID(int=0), f"runbook-catalog:{name.strip().lower()}")
+            )
+        )
+        existing = self._read_catalog()
+        runbooks = [item for item in existing if item.runbook_id != rid]
+        previous = next((item for item in existing if item.runbook_id == rid), None)
+        runbook = CatalogRunbook(
+            runbook_id=rid,
+            name=name,
+            category=category,
+            description=description,
+            instructions=parsed_instructions,
+            updated_at=_wire_ts(datetime.now(timezone.utc)),
+            revision=1 if previous is None else previous.revision + 1,
+        )
+        runbooks.append(runbook)
+        self._write_catalog(runbooks)
+        return runbook
+
+    def delete_catalog_runbook(self, runbook_id: str | uuid.UUID) -> bool:
+        """Remove one catalog runbook (catalog.json ONLY).
+
+        Server map entries are intentionally untouched: removing the
+        global recipe never uninstalls or unmapped a service. Returns
+        ``True`` when a persisted record was removed, ``False`` when the
+        id named no catalog record (a synthesized server-entry projection
+        is not deletable from the catalog).
+        """
+        rid = _canonical_uuid(runbook_id, "runbook_id")
+        existing = self._read_catalog()
+        remaining = [item for item in existing if item.runbook_id != rid]
+        if len(remaining) == len(existing):
+            return False
+        self._write_catalog(remaining)
         return True
 
 
@@ -850,6 +1130,23 @@ def upsert_map_descriptor() -> CapabilityDescriptor:
                         "maxLength": MAX_DESCRIPTION_CHARS,
                         "description": "Free-text service description.",
                     },
+                    "custom_instructions": {
+                        "type": "string",
+                        "maxLength": MAX_INSTRUCTION_CHARS,
+                        "description": (
+                            "Server-specific operational notes injected into the "
+                            "agent's service context alongside the global description "
+                            "and runbook instructions."
+                        ),
+                    },
+                    "installed": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether the service is currently installed on this "
+                            "host; false marks a catalog runbook staged but not "
+                            "yet installed."
+                        ),
+                    },
                     "instructions": {
                         "type": "object",
                         "additionalProperties": False,
@@ -891,6 +1188,8 @@ def upsert_map_descriptor() -> CapabilityDescriptor:
                     "category": {"type": "string"},
                     "revision": {"type": "integer", "minimum": 1},
                     "updated_at": {"type": "string"},
+                    "custom_instructions": {"type": "string"},
+                    "installed": {"type": "boolean"},
                     "created": {"type": "boolean"},
                 },
             },
@@ -952,6 +1251,8 @@ class ServiceMapUpsertCapability:
             "unit_name",
             "description",
             "instructions",
+            "custom_instructions",
+            "installed",
         }
         if unknown:
             raise ServiceMapError(
@@ -974,6 +1275,8 @@ class ServiceMapUpsertCapability:
             unit_name=payload.get("unit_name"),
             description=payload.get("description", ""),
             instructions=payload.get("instructions"),
+            custom_instructions=payload.get("custom_instructions"),
+            installed=payload.get("installed"),
         )
         previous_revision = entry.revision - 1
         summary = {
@@ -985,6 +1288,8 @@ class ServiceMapUpsertCapability:
             "category": entry.category,
             "revision": entry.revision,
             "updated_at": entry.updated_at,
+            "custom_instructions": entry.custom_instructions,
+            "installed": entry.installed,
             "created": previous_revision < 1,
         }
         return ExecutorResult(

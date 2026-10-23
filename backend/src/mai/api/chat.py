@@ -111,7 +111,11 @@ from mai.agents.budgets import (
     check_fanout,
     parse_root_budget,
 )
-from mai.agents.context import MAX_EVIDENCE_ITEMS, MAX_ROLE_CHARS
+from mai.agents.context import (
+    MAX_EVIDENCE_ITEMS,
+    MAX_ROLE_CHARS,
+    format_service_map_section,
+)
 from mai.api.auth import (
     BoundaryError,
     ErrorEnvelope,
@@ -145,7 +149,6 @@ from mai.api.jobs import (
 )
 from mai.api.servers import resolve_profiles_root
 from mai.applications.service_map import (
-    INSTRUCTION_KEYS,
     MAX_MATCHED_ENTRIES,
     ServiceMapEntry,
     ServiceMapStore,
@@ -744,24 +747,13 @@ def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
 def _service_details_appendix(entries: list[ServiceMapEntry]) -> str:
     """The structured Service Map context appended to the agent task.
 
-    Each matched entry contributes its identity, category, description
-    and operational runbook (install/update/uninstall/backup/verify) —
-    the agent's grounded service knowledge for the tagged conversation.
+    Delegates to the ONE producer formatter (``mai.agents.context.
+    format_service_map_section``): identity, category, description,
+    server custom instructions and the operational runbook per matched
+    entry — the agent's grounded service knowledge for the tagged
+    conversation.
     """
-    lines = ["", "## Service map context (@service tags)", ""]
-    for entry in entries:
-        lines.append(
-            f"### {entry.name} — category `{entry.category}`, "
-            f"origin `{entry.origin}` (id {entry.application_id})"
-        )
-        if entry.description:
-            lines.append(entry.description)
-        for key in INSTRUCTION_KEYS:
-            value = getattr(entry.instructions, key)
-            if value:
-                lines.append(f"- {key}: {value}")
-        lines.append("")
-    return "\n".join(lines)
+    return format_service_map_section(entries)
 
 
 def _agent_document(

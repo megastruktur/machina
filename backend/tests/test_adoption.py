@@ -1613,3 +1613,140 @@ def test_canonical_path_helpers_accept_only_uuid_identities() -> None:
         canonical_manifest_relative_path("server", uuid.uuid4())  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         canonical_meta_relative_path(uuid.uuid4(), "app")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# uir-u4: per-server custom_instructions/installed + global Runbook Catalog
+# ---------------------------------------------------------------------------
+
+
+def test_service_map_entry_round_trips_custom_instructions_and_installed(
+    tmp_path: Path,
+) -> None:
+    from mai.applications.service_map import ServiceMapStore
+
+    store = ServiceMapStore(tmp_path / "service_map")
+    server = uuid.uuid4()
+    entry = store.upsert_entry(
+        server,
+        name="nginx",
+        custom_instructions="This host proxies through Tailscale; reload with systemctl.",
+        installed=True,
+    )
+    assert entry.custom_instructions.startswith("This host proxies")
+    assert entry.installed is True
+    reread = store.get_entry(server, uuid.UUID(entry.application_id))
+    assert reread is not None
+    assert reread.custom_instructions == entry.custom_instructions
+    assert reread.installed is True
+    # The staged (installed=False) state persists with the record.
+    staged = store.upsert_entry(
+        server,
+        name="staged-service",
+        installed=False,
+    )
+    reread_staged = store.get_entry(server, uuid.UUID(staged.application_id))
+    assert reread_staged is not None and reread_staged.installed is False
+
+
+def test_entry_without_new_fields_reads_with_backward_compatible_defaults(
+    tmp_path: Path,
+) -> None:
+    import json as _json
+
+    from mai.applications.service_map import ServiceMapStore
+
+    store = ServiceMapStore(tmp_path / "service_map")
+    server = uuid.uuid4()
+    entry = store.upsert_entry(server, name="legacy")
+    # Rewrite the record exactly as a pre-catalog store left it: no
+    # custom_instructions/installed keys at all.
+    path = store.root / "servers" / f"{server}.json"
+    document = _json.loads(path.read_text(encoding="utf-8"))
+    for record in document:
+        record.pop("custom_instructions", None)
+        record.pop("installed", None)
+    path.write_text(_json.dumps(document), encoding="utf-8")
+    reread = store.get_entry(server, uuid.UUID(entry.application_id))
+    assert reread is not None
+    assert reread.custom_instructions == ""
+    assert reread.installed is True
+
+
+def test_upsert_entry_preserves_server_local_fields_when_unnamed(
+    tmp_path: Path,
+) -> None:
+    from mai.applications.service_map import ServiceMapStore
+
+    store = ServiceMapStore(tmp_path / "service_map")
+    server = uuid.uuid4()
+    first = store.upsert_entry(
+        server,
+        name="jellyfin",
+        description="media server",
+        custom_instructions="host-specific note",
+        installed=False,
+    )
+    # A later metadata-only upsert (no custom_instructions/installed named)
+    # must never wipe the server-local state.
+    second = store.upsert_entry(
+        server,
+        name="jellyfin",
+        description="media server, updated",
+        application_id=uuid.UUID(first.application_id),
+    )
+    assert second.custom_instructions == "host-specific note"
+    assert second.installed is False
+    assert second.revision == 2
+
+
+def test_catalog_runbooks_seed_from_server_entries_and_persist(tmp_path: Path) -> None:
+    from mai.applications.service_map import ServiceMapStore
+
+    store = ServiceMapStore(tmp_path / "service_map")
+    server = uuid.uuid4()
+    entry = store.upsert_entry(server, name="pre-catalog service", category="media")
+    runbooks = store.list_catalog_runbooks()
+    assert [r.name for r in runbooks] == ["pre-catalog service"]
+    synthesized = runbooks[0]
+    assert synthesized.runbook_id == entry.application_id
+    assert synthesized.category == "media"
+
+    # A persisted catalog runbook of the same name shadows the synthesized
+    # projection (one catalog record per name) and bumps revisions on re-save.
+    created = store.upsert_catalog_runbook(
+        name="Pre-Catalog Service", category="media", description="the recipe"
+    )
+    runbooks = store.list_catalog_runbooks()
+    assert len(runbooks) == 1
+    assert runbooks[0].runbook_id == created.runbook_id
+    assert created.revision == 1
+    updated = store.upsert_catalog_runbook(
+        name="Pre-Catalog Service", description="the recipe, v2"
+    )
+    assert updated.runbook_id == created.runbook_id  # deterministic name id
+    assert updated.revision == 2
+    assert store.get_catalog_runbook(created.runbook_id) is not None
+
+    # Deleting the catalog record is catalog-scoped: the server entry stays,
+    # so the synthesized projection reappears (under the ENTRY id); the
+    # deleted persisted id is gone and deleting again is a no-op.
+    assert store.delete_catalog_runbook(created.runbook_id) is True
+    assert store.get_catalog_runbook(created.runbook_id) is None
+    assert [
+        r.runbook_id for r in store.list_catalog_runbooks()
+    ] == [entry.application_id]
+    assert store.delete_catalog_runbook(created.runbook_id) is False
+    assert store.get_entry(server, uuid.UUID(entry.application_id)) is not None
+
+
+def test_catalog_upsert_validates_and_rejects_bad_records(tmp_path: Path) -> None:
+    from mai.applications.service_map import ServiceMapError, ServiceMapStore
+
+    store = ServiceMapStore(tmp_path / "service_map")
+    with pytest.raises(ServiceMapError):
+        store.upsert_catalog_runbook(name="")
+    with pytest.raises(ServiceMapError):
+        store.upsert_catalog_runbook(name="x", category="Not A Slug")
+    with pytest.raises(ServiceMapError):
+        store.upsert_catalog_runbook(name="x", instructions={"nope": "1"})

@@ -918,6 +918,22 @@ class AppAdoptPayload(BaseModel):
             "'install', 'update', 'uninstall', 'backup', 'verify'."
         ),
     )
+    custom_instructions: str | None = Field(
+        default=None,
+        description=(
+            "Server-specific operational notes for this host, injected into "
+            "the agent's service context alongside the global description "
+            "and runbook. Omit to preserve the stored value."
+        ),
+    )
+    installed: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the service is currently installed on this host. Omit "
+            "to preserve the stored value; false marks a runbook staged "
+            "but not installed."
+        ),
+    )
     upsert_categories: list[ServiceCategoryPayload] = Field(
         default_factory=list,
         description=(
@@ -1209,6 +1225,10 @@ def build_internal_api_capabilities(
                     "adopted_at": record.adopted_at.isoformat(),
                     "category": entry.category if entry is not None else "system",
                     "description": entry.description if entry is not None else "",
+                    "custom_instructions": (
+                        entry.custom_instructions if entry is not None else ""
+                    ),
+                    "installed": entry.installed if entry is not None else True,
                 }
             )
         adopted_ids = {a["application_id"] for a in applications}
@@ -1235,6 +1255,8 @@ def build_internal_api_capabilities(
                         "adopted_at": entry.updated_at,
                         "category": entry.category,
                         "description": entry.description,
+                        "custom_instructions": entry.custom_instructions,
+                        "installed": entry.installed,
                     }
                 )
         applications.sort(key=lambda a: (a["name"], a["application_id"]))
@@ -1307,6 +1329,8 @@ def build_internal_api_capabilities(
                 unit_name=payload.get("unit_name"),
                 description=payload.get("description") or "",
                 instructions=payload.get("instructions") or {},
+                custom_instructions=payload.get("custom_instructions"),
+                installed=payload.get("installed"),
             )
             doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
             if data_root is not None:
@@ -1400,6 +1424,8 @@ def build_internal_api_capabilities(
             category=str(payload.get("category", "system")),
             description=str(payload.get("description", "")),
             instructions=payload.get("instructions") or {},
+            custom_instructions=payload.get("custom_instructions"),
+            installed=payload.get("installed"),
         )
         # Canonical identity document (honest pending on doc-service gaps).
         record = await adoption.read(server_id, result.application_id)

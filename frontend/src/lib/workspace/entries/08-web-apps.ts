@@ -33,6 +33,7 @@
  */
 
 import type { components } from '../../api/schema.generated.js';
+import type { RunbookExecutionView } from './13-web-runbooks.js';
 import type { PanelEntryInput } from '../registry.js';
 
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
@@ -178,6 +179,21 @@ export interface ApplicationsApi {
 	adopt(serverId: string, payload: AdoptBody): Promise<AdoptionCreated>;
 	/** DELETE /api/v1/servers/{id}/applications/{app_id} — non-destructive revoke. */
 	revoke(serverId: string, applicationId: string, payload: RevokeBody): Promise<void>;
+	/**
+	 * POST /api/v1/servers/{id}/applications/{app_id}/execute — queue one
+	 * BACKGROUND runbook job (install/update/uninstall/verify). The Chat
+	 * window is never opened or pre-filled; the returned view carries the
+	 * queued run's identity + replayed state. Optional: without it the
+	 * panel falls back to the lifecycle openers (or fails closed).
+	 */
+	executeRunbook?(
+		serverId: string,
+		applicationId: string,
+		payload: {
+			action: 'install' | 'update' | 'uninstall' | 'verify';
+			custom_instructions?: string | null;
+		}
+	): Promise<RunbookExecutionView>;
 }
 
 /** Typed services bag the applications panel requires from its opener. */

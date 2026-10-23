@@ -53,10 +53,12 @@ from mai.agents.context import (
     ContextEvidence,
     EvidenceKind,
     assemble,
+    format_service_map_section,
     load_server_context,
     main as context_main,
 )
 from mai.agents.model_store import ModelConfigStore
+from mai.applications.service_map import ServiceInstructions, ServiceMapEntry
 from mai.contracts.server import SCHEMA_VERSION
 from mai.profiles.files import FileStoreErrorCode, ProfileFileError, ProfileFileStore
 
@@ -1028,3 +1030,74 @@ def test_cli_half_explicit_pair_is_usage_error(
             ]
         )
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# uir-u4: the @service Service Map section carries custom instructions
+# ---------------------------------------------------------------------------
+
+
+def _map_entry(**overrides: object) -> ServiceMapEntry:
+    values: dict[str, object] = {
+        "application_id": str(uuid.uuid4()),
+        "server_id": str(SERVER_A),
+        "name": "jellyfin",
+        "origin": "compose",
+        "compose_project": "media",
+        "working_dir": "/srv/media",
+        "unit_name": None,
+        "category": "media",
+        "description": "Media server for the fleet.",
+        "instructions": ServiceInstructions(
+            install="docker compose up -d",
+            verify="systemctl is-active jellyfin",
+        ),
+        "updated_at": "2026-10-20T10:00:00Z",
+        "revision": 1,
+    }
+    values.update(overrides)
+    return ServiceMapEntry(**values)  # type: ignore[arg-type]
+
+
+def test_service_map_section_lists_description_runbook_and_custom_instructions() -> None:
+    entry = _map_entry(custom_instructions="This host mounts media at /mnt/raid.")
+    section = format_service_map_section([entry])
+    assert "## Service map context (@service tags)" in section
+    assert "### jellyfin" in section
+    assert "Description: Media server for the fleet." in section
+    # The server-specific instructions sit right after the global description.
+    assert (
+        "Description: Media server for the fleet.\n"
+        "Server custom instructions: This host mounts media at /mnt/raid."
+    ) in section
+    assert "- install: docker compose up -d" in section
+    assert "- verify: systemctl is-active jellyfin" in section
+
+
+def test_service_map_section_omits_empty_custom_instructions() -> None:
+    section = format_service_map_section([_map_entry()])
+    assert "Server custom instructions" not in section
+    assert "Description: Media server for the fleet." in section
+
+
+def test_service_map_section_tolerates_entries_without_the_field() -> None:
+    # Duck-typed tolerance: getattr(entry, "custom_instructions", "") never
+    # crashes on objects that predate the field.
+    entry = _map_entry()
+    stripped = ServiceMapEntry(
+        application_id=entry.application_id,
+        server_id=entry.server_id,
+        name=entry.name,
+        origin=entry.origin,
+        compose_project=entry.compose_project,
+        working_dir=entry.working_dir,
+        unit_name=entry.unit_name,
+        category=entry.category,
+        description=entry.description,
+        instructions=entry.instructions,
+        updated_at=entry.updated_at,
+        revision=entry.revision,
+    )
+    assert format_service_map_section([stripped]).count(
+        "Server custom instructions"
+    ) == 0

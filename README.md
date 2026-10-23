@@ -20,7 +20,8 @@ Every action follows an explicit loop:
 ## Key Capabilities
 
 - **Always-Visible Bottom Chat Dock:** The console's conversation surface is a dock pinned under the workspace — never a window to lose. Draft context is explicit: a pinned **Server Chip** (following the launcher selection) plus `@service` service chips from an autocomplete over the server's mapped services; both lock immutably the moment a conversation starts, and the **floating history selector** restores past conversations with their recorded scope (`chat.read_session`).
-- **Categorized Server Service Map:** Every adopted application renders as one map row with category chips (8 built-ins — `games`, `ai`, `agent`, `system`, `dev`, `infrastructure`, `media`, `observability` — plus operator-minted custom categories), client-side filter pills, one-click **Chat @service** tagging into the dock, and a five-slot operational runbook (install, update, uninstall, backup, verify) recorded through `app.upsert_map_entry`.
+- **Categorized Server Service Map:** Every adopted application renders as one map row with category chips (8 built-ins — `games`, `ai`, `agent`, `system`, `dev`, `infrastructure`, `media`, `observability` — plus operator-minted custom categories), client-side filter pills, per-server **custom instructions** injected into the agent's `@service` context, and a five-slot operational runbook (install, update, uninstall, backup, verify) recorded through `app.upsert_map_entry`. **Update** and **Remove** queue background runbook jobs — the agent executes the procedure under policy while the Chat window stays untouched.
+- **Global Runbook Catalog:** A `Global / Fleet` window over the server-agnostic runbook recipes (`/api/v1/applications/catalog`): paginated, searchable, category-filtered, with create/edit/delete. Every server's Applications window lists catalog runbooks that are not installed as **Available** cards with **Install** / **Refresh** (verify) actions and per-server custom-instruction drafts.
 - **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Plugin Forms, Overview Dashboard, and Memory & Local Models.
 - **Supervised SSH Execution & Policy Gates:** Key-only OpenSSH supervision with pinned host-key fingerprints, explicit capability grants (`none`, `narrow`, `broad`), one-use approval tokens for mutating operations, and secret-redacted command receipts.
 - **Durable Job Engine & Scheduling:** PostgreSQL-backed (`dbos`) workflows with lease fencing, crash recovery without blind re-execution of dangerous host steps, and cron/interval scheduling.
@@ -42,9 +43,9 @@ Operational surfaces live in draggable, resizable windows; the chat dock stays p
 
 ### Server Service Map — every adopted application, categorized
 
-![Machina Server Service Map: category chips, filter pills, operational runbooks and Chat @service buttons](docs/assets/screenshot-service-map.png)
+![Machina Server Service Map: category chips, filter pills, operational runbooks and background runbook actions](docs/assets/screenshot-service-map.png)
 
-The Application Inventory panel doubles as the Server Service Map: adopt a discovered stack, categorize it (built-in taxonomy or mint a custom category), describe it, and record its five-slot runbook. Every row then offers one-click **Chat @service** — the conversation opens in the dock pre-scoped to that server and service.
+The Application Inventory panel doubles as the Server Service Map: adopt a discovered stack, categorize it (built-in taxonomy or mint a custom category), describe it, and record its five-slot runbook plus server-specific **Custom instructions** — all multi-line, all injected into the agent's `@service` context. Every installed row offers **✎ Edit**, background **Update**/**Remove** runbook jobs (the conversation never opens), and an **Available from Runbook Catalog** section below lists every global recipe not yet installed, with **Install**, **Refresh** (verify), and per-server instruction drafts.
 
 ### Machina Login Sanctuary
 
