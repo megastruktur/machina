@@ -724,8 +724,10 @@
 
 	.mai-catalog__toolbar {
 		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-2, 0.5rem);
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-3, 0.75rem);
+		flex-wrap: wrap;
 	}
 
 	.mai-catalog__filterbar {

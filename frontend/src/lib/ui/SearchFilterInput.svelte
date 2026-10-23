@@ -89,8 +89,8 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
-		min-width: 14rem;
-		flex: 1 1 16rem;
+		flex: 1 1 auto;
+		min-width: min(14rem, 100%);
 	}
 
 	.mai-search-filter__label {
