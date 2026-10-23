@@ -129,6 +129,7 @@ export type ChallengeOutcomeView = components['schemas']['ChallengeOutcomeView']
 export type ChatCancelBody = components['schemas']['ChatCancelBody'];
 export type ChatCreated = components['schemas']['ChatCreated'];
 export type ChatPage = components['schemas']['ChatPage'];
+export type ChatRenameBody = components['schemas']['ChatRenameBody'];
 export type ChatSubmitBody = components['schemas']['ChatSubmitBody'];
 export type ConversationView = components['schemas']['ConversationView'];
 export type DecisionBody = components['schemas']['DecisionBody'];
@@ -527,6 +528,8 @@ export interface MaiApiClient {
 	listConversations(serverId?: string | null, page?: PageQuery): Promise<ChatPage>;
 	/** GET /api/v1/chat/runs/{run_id} — replayed conversation record. */
 	readConversation(runId: string): Promise<ConversationView>;
+	/** PATCH /api/v1/chat/runs/{run_id} — rename a conversation. */
+	renameConversation(runId: string, payload: ChatRenameBody): Promise<ConversationView>;
 	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
 	cancelConversation(runId: string, payload: ChatCancelBody): Promise<CancelView>;
 
@@ -821,6 +824,12 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 		},
 		readConversation: (runId) =>
 			requestJson<ConversationView>('GET', `/api/v1/chat/runs/${encodeURIComponent(runId)}`),
+		renameConversation: (runId, payload) =>
+			requestJson<ConversationView>(
+				'PATCH',
+				`/api/v1/chat/runs/${encodeURIComponent(runId)}`,
+				payload
+			),
 		cancelConversation: (runId, payload) =>
 			requestJson<CancelView>(
 				'POST',

@@ -216,6 +216,7 @@ _FEATURE_SURFACE = frozenset(
         # lazy-loaded single tool step.)
         ("GET", "/api/v1/chat/runs"),
         ("GET", "/api/v1/chat/runs/{run_id}"),
+        ("PATCH", "/api/v1/chat/runs/{run_id}"),
         ("GET", "/api/v1/chat/runs/{run_id}/events"),
         ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
         ("POST", "/api/v1/chat/messages"),
@@ -255,6 +256,10 @@ _FEATURE_SURFACE = frozenset(
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/install"),
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/update"),
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/remove"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/execute"),
+        ("GET", "/api/v1/applications/catalog"),
+        ("POST", "/api/v1/applications/catalog"),
+        ("DELETE", "/api/v1/applications/catalog/{runbook_id}"),
         # (09-plugins-api: plugin configs/bindings/discovery + skills.)
         ("GET", "/api/v1/plugins"),
         ("GET", "/api/v1/plugins/{plugin}/config"),
@@ -473,6 +478,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/servers/{server_id}/applications/{application_id}/install",
         "/api/v1/servers/{server_id}/applications/{application_id}/update",
         "/api/v1/servers/{server_id}/applications/{application_id}/remove",
+        "/api/v1/servers/{server_id}/applications/{application_id}/execute",
+        "/api/v1/applications/catalog",
+        "/api/v1/applications/catalog/{runbook_id}",
         # (09-plugins-api: plugin configs/bindings/discovery + skills.)
         "/api/v1/plugins",
         "/api/v1/plugins/{plugin}/config",

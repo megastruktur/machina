@@ -589,6 +589,16 @@ test('drawer Chat History limits to 10 chats, scrolls internally, and loads more
 	await loadMore.click();
 	await expect(drawerSection.getByTestId('drawer-history-item')).toHaveCount(12);
 	await expect(drawerSection.getByTestId('drawer-history-load-more')).toHaveCount(0);
+
+	// Rename the top chat session directly in the left drawer.
+	await drawerSection.getByTestId('drawer-history-rename').first().click({ force: true });
+	const renameInput = drawerSection.getByTestId('drawer-history-rename-input');
+	await expect(renameInput).toBeVisible();
+	await renameInput.fill('Production Incident Investigation');
+	await drawerSection.getByTestId('drawer-history-rename-save').click();
+	await expect(drawerSection.getByTestId('drawer-history-item').first()).toContainText(
+		'Production Incident Investigation'
+	);
 });
 
 test('opened windows stack ABOVE the bottom chat dock and unauthorized live session redirects to /login', async ({

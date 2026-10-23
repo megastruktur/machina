@@ -471,6 +471,7 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/chat/messages"),
         ("GET", "/api/v1/chat/runs"),
         ("GET", "/api/v1/chat/runs/{run_id}"),
+        ("PATCH", "/api/v1/chat/runs/{run_id}"),
         ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
         ("GET", "/api/v1/chat/runs/{run_id}/events"),
         # (mai-wire-desktop/chat: the lazy-loaded single tool step read.)
@@ -510,6 +511,10 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/install"),
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/update"),
         ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/remove"),
+        ("POST", "/api/v1/servers/{server_id}/applications/{application_id}/execute"),
+        ("GET", "/api/v1/applications/catalog"),
+        ("POST", "/api/v1/applications/catalog"),
+        ("DELETE", "/api/v1/applications/catalog/{runbook_id}"),
         # (09-plugins-api: plugin configs/bindings/discovery + skills.)
         ("GET", "/api/v1/plugins"),
         ("GET", "/api/v1/plugins/{plugin}/config"),
@@ -520,6 +525,7 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("PUT", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
         ("DELETE", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
         ("POST", "/api/v1/plugins/{plugin}/discovery"),
+        ("POST", "/api/v1/plugins/{plugin}/probe"),
         ("GET", "/api/v1/skills"),
         ("GET", "/api/v1/skills/{skill}"),
         # (10-monitor-api: observations/findings/notifications + policy.)
@@ -539,6 +545,7 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
         ("GET", "/api/v1/servers/{server_id}/memory/export"),
         ("POST", "/api/v1/servers/{server_id}/memory/delete"),
+        ("GET", "/api/v1/servers/{server_id}/terminal/info"),
     }
     # Every route stays under the frozen prefix; no docs listeners (G1).
     for route in api_routes:

@@ -570,6 +570,7 @@
 		submitMessage: api.submitMessage,
 		listConversations: api.listConversations,
 		readConversation: api.readConversation,
+		renameConversation: api.renameConversation,
 		cancelConversation: api.cancelConversation,
 		streamConversationEvents: browserChatEventStream,
 		readRun: api.readRun,
@@ -674,6 +675,19 @@
 				if (row === undefined) {
 					throw new ApiError(404, 'not_found', 'no run stored for this run id');
 				}
+				return structuredClone(row);
+			},
+			async renameConversation(runId, payload) {
+				const row = conversations.get(runId);
+				if (row === undefined) {
+					throw new ApiError(404, 'not_found', 'no run stored for this run id');
+				}
+				const trimmed = payload.title.trim();
+				if (trimmed === '') {
+					throw new ApiError(422, 'validation_failed', 'title must not be blank');
+				}
+				row.title = trimmed;
+				row.updated_at = stamp();
 				return structuredClone(row);
 			},
 			async cancelConversation(runId) {
@@ -1072,6 +1086,7 @@
 			}}
 			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
 			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
+			onrenameconversation={(runId, title) => dockChatPanel?.triggerRenameRun(runId, title)}
 		/>
 
 		<ServerTreeNav

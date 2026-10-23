@@ -1823,6 +1823,24 @@
 	export function triggerLoadMoreHistory(): void {
 		void loadMoreHistory();
 	}
+
+	export async function triggerRenameRun(runId: string, title: string): Promise<void> {
+		const trimmed = title.trim();
+		if (!trimmed) return;
+		let updated: ConversationView | null = null;
+		if (typeof api?.renameConversation === 'function') {
+			updated = await api.renameConversation(runId, { title: trimmed });
+		}
+		historyRows = historyRows.map((row) =>
+			row.run_id === runId ? (updated ?? { ...row, title: trimmed }) : row
+		);
+		if (conversation !== null && conversation.run_id === runId) {
+			conversation = updated ?? { ...conversation, title: trimmed };
+		}
+		if (refreshed !== null && refreshed.run_id === runId) {
+			refreshed = updated ?? { ...refreshed, title: trimmed };
+		}
+	}
 </script>
 
 <div
@@ -1870,7 +1888,7 @@
 							<button type="button" class="mai-chat__history-item" data-testid="chat-history-item" onclick={() => selectHistoryRow(row)}>
 							<div class="mai-chat__row-main">
 								<span class="mai-chat__row-id" data-testid="history-row-id">
-									{shortId(row.run_id)}
+									{row.title && row.title.trim() !== '' ? row.title.trim() : shortId(row.run_id)}
 								</span>
 								<span
 									class="mai-chat__badge"

@@ -63,7 +63,10 @@ export type ChatPage = Omit<components['schemas']['ChatPage'], 'conversations'> 
 /** Generated wire shape: one conversation plus recorded references and children. */
 export type ConversationView = components['schemas']['ConversationView'] & {
 	session_run_id?: string | null;
+	title?: string | null;
 };
+/** Generated wire shape: rename body for a conversation. */
+export type ChatRenameBody = components['schemas']['ChatRenameBody'];
 /** Generated wire shape: explicit tree cancellation body (guard rule 4). */
 export type ChatCancelBody = components['schemas']['ChatCancelBody'];
 /** Generated wire shape: KNOWN engine outcome or an honest pending. */
@@ -108,6 +111,8 @@ export interface ChatApi {
 	listConversations(serverId: string, page?: PageQuery): Promise<ChatPage>;
 	/** GET /api/v1/chat/runs/{run_id} — replayed state + recorded references. */
 	readConversation(runId: string): Promise<ConversationView>;
+	/** PATCH /api/v1/chat/runs/{run_id} — durable user-defined conversation title. */
+	renameConversation?(runId: string, payload: ChatRenameBody): Promise<ConversationView>;
 	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
 	cancelConversation(runId: string, payload: ChatCancelBody): Promise<CancelView>;
 	/**

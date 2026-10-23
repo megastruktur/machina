@@ -979,6 +979,18 @@ class TestArtifactsRootResolution:
 
 
 class TestSubmitBodyShape:
+    def test_rename_body_bounds_and_extra_forbid(self) -> None:
+        from pydantic import ValidationError
+
+        parsed = chat_surface.ChatRenameBody(title="My Production Audit")
+        assert parsed.title == "My Production Audit"
+        with pytest.raises(ValidationError):
+            chat_surface.ChatRenameBody(title="")
+        with pytest.raises(ValidationError):
+            chat_surface.ChatRenameBody(title="x" * 121)
+        with pytest.raises(ValidationError):
+            chat_surface.ChatRenameBody(title="ok", extra_field="bad")  # type: ignore[call-arg]
+
     def test_unknown_fields_are_rejected(self) -> None:
         from pydantic import ValidationError
 
@@ -2151,3 +2163,62 @@ async def test_session_continuation_and_steering_keep_single_history_entry(
     listed_ids = [row["run_id"] for row in listed.json()["conversations"]]
     assert str(followup_id) in listed_ids
     assert str(first_id) not in listed_ids
+
+
+async def test_rename_conversation_persists_and_carries_across_followup(
+    chat_app, jar, server_a
+) -> None:
+    """PATCH /api/v1/chat/runs/{run_id} stores a durable title on the run
+    and carries it forward when a terminal session is continued."""
+    run_id = uuid.uuid4()
+    created = await submit_chat(
+        chat_app, jar, run_id, server_a, message="initial turn to rename"
+    )
+    assert created.status == 201, created.body
+    assert created.json()["conversation"].get("title") is None
+
+    renamed = await call_app(
+        chat_app,
+        "PATCH",
+        f"/api/v1/chat/runs/{run_id}",
+        json_body={"title": "  Production Nginx Audit  "},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert renamed.status == 200, renamed.body
+    assert renamed.json()["title"] == "Production Nginx Audit"
+
+    # Read and list reflect the new title.
+    read_back = await call_app(
+        chat_app, "GET", f"/api/v1/chat/runs/{run_id}", cookies=jar
+    )
+    assert read_back.status == 200
+    assert read_back.json()["title"] == "Production Nginx Audit"
+
+    # Cancel and continue the session; the follow-up run inherits the title.
+    await call_app(
+        chat_app,
+        "POST",
+        f"/api/v1/chat/runs/{run_id}/cancel",
+        json_body={},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    followup_id = uuid.uuid4()
+    followup = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/messages",
+        json_body={
+            "run_id": str(followup_id),
+            "server_id": str(server_a),
+            "session_run_id": str(run_id),
+            "message": "continue the renamed session",
+            "profile": "fast",
+            "allowed_capabilities": [READ_CAP],
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert followup.status == 201, followup.body
+    assert followup.json()["conversation"]["title"] == "Production Nginx Audit"

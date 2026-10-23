@@ -30,6 +30,8 @@
 		onrefreshhistory?: () => void;
 		/** Load the next page of conversations. */
 		onloadmorehistory?: () => void;
+		/** Rename a specific conversation in history. */
+		onrenameconversation?: (runId: string, title: string) => Promise<void> | void;
 	};
 
 	let {
@@ -41,10 +43,14 @@
 		onnewchat,
 		onselectconversation,
 		onrefreshhistory,
-		onloadmorehistory
+		onloadmorehistory,
+		onrenameconversation
 	}: Props = $props();
 
 	let historyExpanded = $state(true);
+	let editingRunId = $state<string | null>(null);
+	let editingTitle = $state('');
+	let renameBusy = $state(false);
 
 	const historyBadge = $derived(
 		totalConversations !== undefined && totalConversations > conversations.length
@@ -57,11 +63,49 @@
 	}
 
 	function formatConversationLabel(row: ConversationView): string {
+		if (typeof row.title === 'string' && row.title.trim() !== '') {
+			return row.title.trim();
+		}
 		const tags =
 			row.service_tags && row.service_tags.length > 0
 				? row.service_tags.map((t) => `@${t}`).join(' ')
 				: `Run ${shortId(row.run_id)}`;
 		return tags;
+	}
+
+	function startRename(row: ConversationView, event: MouseEvent): void {
+		event.stopPropagation();
+		editingRunId = row.run_id;
+		editingTitle = formatConversationLabel(row);
+	}
+
+	function cancelRename(): void {
+		if (renameBusy) return;
+		editingRunId = null;
+		editingTitle = '';
+	}
+
+	async function commitRename(runId: string): Promise<void> {
+		const trimmed = editingTitle.trim();
+		if (!trimmed || renameBusy) return;
+		renameBusy = true;
+		try {
+			await onrenameconversation?.(runId, trimmed);
+			editingRunId = null;
+			editingTitle = '';
+		} finally {
+			renameBusy = false;
+		}
+	}
+
+	function handleRenameKeydown(runId: string, event: KeyboardEvent): void {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void commitRename(runId);
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			cancelRename();
+		}
 	}
 </script>
 
@@ -94,14 +138,65 @@
 		{:else}
 			<div class="mai-chat-drawer__list" data-testid="drawer-history-list">
 				{#each conversations as row (row.run_id)}
-					<NavItem
-						icon="💬"
-						label={formatConversationLabel(row)}
-						meta={row.state ?? ''}
-						active={activeRunId === row.run_id}
-						data-testid="drawer-history-item"
-						onclick={() => onselectconversation(row.run_id)}
-					/>
+					{#if editingRunId === row.run_id}
+						<div class="mai-chat-drawer__edit-row" data-testid="drawer-history-edit-row">
+							<input
+								type="text"
+								class="mai-chat-drawer__edit-input"
+								bind:value={editingTitle}
+								maxlength={120}
+								disabled={renameBusy}
+								aria-label="Chat title"
+								data-testid="drawer-history-rename-input"
+								onkeydown={(e) => handleRenameKeydown(row.run_id, e)}
+							/>
+							<button
+								type="button"
+								class="mai-chat-drawer__icon-btn"
+								disabled={renameBusy || editingTitle.trim() === ''}
+								aria-label="Save chat title"
+								title="Save"
+								data-testid="drawer-history-rename-save"
+								onclick={() => void commitRename(row.run_id)}
+							>
+								✓
+							</button>
+							<button
+								type="button"
+								class="mai-chat-drawer__icon-btn"
+								disabled={renameBusy}
+								aria-label="Cancel rename"
+								title="Cancel"
+								data-testid="drawer-history-rename-cancel"
+								onclick={cancelRename}
+							>
+								✕
+							</button>
+						</div>
+					{:else}
+						<div class="mai-chat-drawer__item-row">
+							<NavItem
+								icon="💬"
+								label={formatConversationLabel(row)}
+								meta={row.state ?? ''}
+								active={activeRunId === row.run_id}
+								data-testid="drawer-history-item"
+								onclick={() => onselectconversation(row.run_id)}
+							/>
+							{#if onrenameconversation}
+								<button
+									type="button"
+									class="mai-chat-drawer__rename-btn"
+									aria-label="Rename chat {formatConversationLabel(row)}"
+									title="Rename chat"
+									data-testid="drawer-history-rename"
+									onclick={(e) => startRename(row, e)}
+								>
+									✎
+								</button>
+							{/if}
+						</div>
+					{/if}
 				{/each}
 			</div>
 			{#if hasMoreConversations}
@@ -142,6 +237,78 @@
 		overflow-y: auto;
 		overscroll-behavior: contain;
 		scrollbar-gutter: stable;
+	}
+
+	.mai-chat-drawer__item-row {
+		position: relative;
+		display: flex;
+		align-items: center;
+		gap: 2px;
+	}
+
+	.mai-chat-drawer__item-row :global(.mai-nav-item) {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+
+	.mai-chat-drawer__rename-btn,
+	.mai-chat-drawer__icon-btn {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 1.5rem;
+		height: 1.5rem;
+		padding: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-muted);
+		background: transparent;
+		border: var(--mai-border-width) solid transparent;
+		border-radius: var(--mai-radius-sm);
+		cursor: pointer;
+		transition:
+			color var(--mai-motion-fast) ease,
+			background-color var(--mai-motion-fast) ease,
+			border-color var(--mai-motion-fast) ease,
+			opacity var(--mai-motion-fast) ease;
+	}
+
+	.mai-chat-drawer__rename-btn {
+		opacity: 0;
+	}
+
+	.mai-chat-drawer__item-row:hover .mai-chat-drawer__rename-btn,
+	.mai-chat-drawer__item-row:focus-within .mai-chat-drawer__rename-btn {
+		opacity: 1;
+	}
+
+	.mai-chat-drawer__rename-btn:hover:not(:disabled),
+	.mai-chat-drawer__icon-btn:hover:not(:disabled) {
+		color: var(--mai-color-text);
+		background: var(--mai-color-surface-raised);
+		border-color: var(--mai-color-border);
+	}
+
+	.mai-chat-drawer__edit-row {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 2px var(--mai-space-1);
+		background: var(--mai-color-surface-raised);
+		border: var(--mai-border-width) solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+	}
+
+	.mai-chat-drawer__edit-input {
+		flex: 1 1 auto;
+		min-width: 0;
+		padding: 2px var(--mai-space-1);
+		font-family: var(--mai-font-sans);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text);
+		background: var(--mai-color-bg);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
 	}
 
 	.mai-chat-drawer__more {

@@ -576,7 +576,11 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Rename a conversation (durable user-defined title)
+         * @description Persist a user-defined conversation title on the run's event stream.
+         */
+        patch: operations["rename_conversation_api_v1_chat_runs__run_id__patch"];
         trace?: never;
     };
     "/api/v1/chat/runs/{run_id}/cancel": {
@@ -2502,6 +2506,14 @@ export interface components {
             cancel_children: boolean;
         };
         /**
+         * ChatRenameBody
+         * @description Rename body: durable user-defined conversation title.
+         */
+        ChatRenameBody: {
+            /** Title */
+            title: string;
+        };
+        /**
          * ChatCreated
          * @description Submit outcome: the conversation view plus the dedup verdict.
          */
@@ -2723,6 +2735,8 @@ export interface components {
             service_tags?: string[];
             /** Session Run Id */
             session_run_id?: string | null;
+            /** Title */
+            title?: string | null;
         };
         /**
          * DecisionBody
@@ -6428,6 +6442,77 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_conversation_api_v1_chat_runs__run_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatRenameBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run stored for this run id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persisted run state requires recovery */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

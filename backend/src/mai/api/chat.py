@@ -186,6 +186,8 @@ __all__ = ["register_chat", "resolve_artifacts_root"]
 #: the administrator asked for, plus the value-free attachment handles.
 CHAT_SUBMITTED_EVENT_TYPE: Final[str] = "chat.submitted"
 CHAT_STEERED_EVENT_TYPE: Final[str] = "chat.steered"
+CHAT_RENAMED_EVENT_TYPE: Final[str] = "chat.renamed"
+MAX_CHAT_TITLE_CHARS: Final[int] = 120
 
 #: The General Consult sentinel server id (``uuid.UUID(int=0)``): the
 #: conversation has NO target host (no server selected in the UI). Chat
@@ -399,6 +401,14 @@ class ChatCancelBody(BaseModel):
     cancel_children: bool = True
 
 
+class ChatRenameBody(BaseModel):
+    """Rename body: durable user-defined conversation title."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=MAX_CHAT_TITLE_CHARS)
+
+
 class AttachmentView(BaseModel):
     """One recorded attachment reference (identity + integrity handles)."""
 
@@ -413,12 +423,14 @@ class ConversationView(RunView):
 
     ``service_tags`` are the immutable ``@service`` chips recorded at
     submission (read back from the run's ``chat.submitted`` record).
+    ``title`` is the user-assigned conversation name when renamed.
     """
 
     attachments: list[AttachmentView] = Field(default_factory=list)
     children: list[RunView] = Field(default_factory=list)
     service_tags: list[str] = Field(default_factory=list)
     session_run_id: str | None = Field(default=None)
+    title: str | None = Field(default=None)
 
 
 class ChatCreated(BaseModel):
@@ -816,6 +828,7 @@ async def _record_chat_submission(
     service_tags: list[str],
     now: datetime,
     session_run_id: str | None = None,
+    title: str | None = None,
 ) -> None:
     """Append the ``chat.submitted`` submission record (one transaction).
 
@@ -850,6 +863,8 @@ async def _record_chat_submission(
     }
     if session_run_id is not None:
         data["session_run_id"] = session_run_id
+    if title is not None:
+        data["title"] = title
     await session.execute(
         text(
             """
@@ -867,6 +882,114 @@ async def _record_chat_submission(
             "data": json.dumps(data),
         },
     )
+
+
+async def _record_chat_renamed(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    title: str,
+    now: datetime,
+) -> None:
+    """Append a ``chat.renamed`` event and touch ``job_runs.updated_at``."""
+    seq = (
+        await session.execute(
+            text("SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :r"),
+            {"r": uuid.UUID(run_id)},
+        )
+    ).scalar_one()
+    await session.execute(
+        text(
+            """
+            INSERT INTO job_events (event_id, run_id, seq, ts, type, v, data)
+            VALUES (:event_id, :run_id, :seq, :ts, :type, :v, :data)
+            """
+        ),
+        {
+            "event_id": uuid.uuid4(),
+            "run_id": uuid.UUID(run_id),
+            "seq": seq,
+            "ts": now,
+            "type": CHAT_RENAMED_EVENT_TYPE,
+            "v": EVENT_PAYLOAD_VERSION,
+            "data": json.dumps({"title": title}),
+        },
+    )
+    await session.execute(
+        text("UPDATE job_runs SET updated_at = :now WHERE run_id = :r"),
+        {"now": now, "r": uuid.UUID(run_id)},
+    )
+
+
+async def _resolve_chat_title(
+    session: AsyncSession,
+    run_id: str,
+    submission_data: Mapping[str, object] | None = None,
+) -> str | None:
+    """Resolve the latest user-defined conversation title across session turns."""
+    current_id: str | None = run_id
+    current_sub: Mapping[str, object] | None = submission_data
+    seen: set[str] = set()
+    for _ in range(16):
+        if not current_id or current_id in seen:
+            break
+        seen.add(current_id)
+        try:
+            run_uuid = uuid.UUID(current_id)
+        except ValueError:
+            break
+        rename_row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT data FROM job_events WHERE run_id = :r "
+                        f"AND type = '{CHAT_RENAMED_EVENT_TYPE}' ORDER BY seq "
+                        "DESC LIMIT 1"
+                    ),
+                    {"r": run_uuid},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if rename_row is not None and isinstance(rename_row["data"], Mapping):
+            raw_title = rename_row["data"].get("title")
+            if isinstance(raw_title, str) and raw_title.strip():
+                return raw_title.strip()
+        if current_sub is None:
+            sub_row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT data FROM job_events WHERE run_id = :r "
+                            f"AND type = '{CHAT_SUBMITTED_EVENT_TYPE}' ORDER BY seq "
+                            "DESC LIMIT 1"
+                        ),
+                        {"r": run_uuid},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            current_sub = (
+                sub_row["data"]
+                if sub_row is not None and isinstance(sub_row["data"], Mapping)
+                else None
+            )
+        if isinstance(current_sub, Mapping):
+            sub_title = current_sub.get("title")
+            if isinstance(sub_title, str) and sub_title.strip():
+                return sub_title.strip()
+            next_session = current_sub.get("session_run_id")
+            current_id = (
+                next_session
+                if isinstance(next_session, str) and next_session
+                else None
+            )
+            current_sub = None
+        else:
+            break
+    return None
 
 
 async def _record_chat_steered(
@@ -1000,29 +1123,34 @@ async def _conversation_view(
             .mappings()
             .first()
         )
+        submission_data = (
+            submission_event["data"]
+            if submission_event is not None
+            and isinstance(submission_event["data"], Mapping)
+            else None
+        )
+        title = await _resolve_chat_title(session, identity, submission_data)
     child_states = await _child_states(factory, children_rows)
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
     session_run_id: str | None = None
-    if submission_event is not None:
-        data = submission_event["data"]
-        if isinstance(data, Mapping):
-            for item in data.get("attachments") or []:
-                if isinstance(item, Mapping):
-                    attachments.append(
-                        AttachmentView(
-                            server_id=str(item["server_id"]),
-                            op_id=str(item["op_id"]),
-                            sha256=str(item["sha256"]),
-                            bytes=int(item["bytes"]),  # type: ignore[arg-type]
-                        )
+    if submission_data is not None:
+        for item in submission_data.get("attachments") or []:
+            if isinstance(item, Mapping):
+                attachments.append(
+                    AttachmentView(
+                        server_id=str(item["server_id"]),
+                        op_id=str(item["op_id"]),
+                        sha256=str(item["sha256"]),
+                        bytes=int(item["bytes"]),  # type: ignore[arg-type]
                     )
-            raw_tags = data.get("service_tags") or []
-            if isinstance(raw_tags, list):
-                service_tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
-            raw_session_run = data.get("session_run_id")
-            if isinstance(raw_session_run, str) and raw_session_run:
-                session_run_id = raw_session_run
+                )
+        raw_tags = submission_data.get("service_tags") or []
+        if isinstance(raw_tags, list):
+            service_tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
+        raw_session_run = submission_data.get("session_run_id")
+        if isinstance(raw_session_run, str) and raw_session_run:
+            session_run_id = raw_session_run
     return ConversationView(
         **_run_view(row, state).model_dump(),
         attachments=attachments,
@@ -1032,6 +1160,7 @@ async def _conversation_view(
         ],
         service_tags=service_tags,
         session_run_id=session_run_id,
+        title=title,
     )
 
 
@@ -1332,6 +1461,11 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                 root_budget=root_budget,
             )
             if created:
+                inherited_title = (
+                    await _resolve_chat_title(session, session_run_id)
+                    if session_run_id is not None and session_run_id != run_id
+                    else None
+                )
                 await _record_chat_submission(
                     session,
                     run_id=run_id,
@@ -1342,6 +1476,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                     service_tags=list(payload.service_tags),
                     now=now,
                     session_run_id=session_run_id,
+                    title=inherited_title,
                 )
     if not created:
         # Duplicate submit: same key must carry the SAME submission
@@ -1556,6 +1691,71 @@ async def read_conversation(request: Request, run_id: uuid.UUID) -> Response:
     identity = str(run_id)
     factory = _sessions(request)
     async with factory() as session:
+        row = await _load_run_row(session, identity)
+    if row is None:
+        return _not_found_run(request)
+    state = await _replayed_state(lifecycle, identity)
+    return await _conversation_view(factory, row, state)
+
+
+@router.patch(
+    "/runs/{run_id}",
+    status_code=HTTP_200_OK,
+    response_model=ConversationView,
+    summary="Rename a conversation (durable user-defined title)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No run stored for this run id",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Persisted run state requires recovery",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+    },
+)
+async def rename_conversation(
+    request: Request, run_id: uuid.UUID, payload: ChatRenameBody
+) -> ConversationView | Response:
+    """Persist a user-defined conversation title on the run's event stream."""
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    lifecycle, _recovery = _jobs_services(request)
+    title = payload.title.strip()
+    if not title:
+        return _validation_error(request, "title", "must not be blank")
+    identity = str(run_id)
+    factory = _sessions(request)
+    now = datetime.now(timezone.utc)
+    async with factory() as session:
+        async with session.begin():
+            locked = (
+                await session.execute(
+                    text("SELECT run_id FROM job_runs WHERE run_id = :r FOR UPDATE"),
+                    {"r": run_id},
+                )
+            ).scalar()
+            if locked is None:
+                return _not_found_run(request)
+            await _record_chat_renamed(
+                session,
+                run_id=identity,
+                title=title,
+                now=now,
+            )
         row = await _load_run_row(session, identity)
     if row is None:
         return _not_found_run(request)
