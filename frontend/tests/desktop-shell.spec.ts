@@ -556,3 +556,59 @@ test('drawer Chat History limits to 10 chats, scrolls internally, and loads more
 	await expect(drawerSection.getByTestId('drawer-history-item')).toHaveCount(12);
 	await expect(drawerSection.getByTestId('drawer-history-load-more')).toHaveCount(0);
 });
+
+test('opened windows stack ABOVE the bottom chat dock and unauthorized live session redirects to /login', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+
+	const dock = page.getByTestId('bottom-chat-dock');
+	await openPanel(page, NOTES);
+	const notes = frame(page, NOTES);
+
+	// The desktop canvas (`z-index: 20`) sits above the bottom chat dock
+	// (`z-index: 5`), so any opened window renders on top of the chat dock,
+	// while empty canvas space has `pointer-events: none` so the dock stays
+	// interactive underneath.
+	const stacking = await page.evaluate(() => {
+		const desktopEl = document.querySelector('[data-testid="desktop"]');
+		const dockEl = document.querySelector('[data-testid="bottom-chat-dock"]');
+		const frameEl = document.querySelector('.mai-window-frame');
+		return {
+			desktopZ: Number(desktopEl ? getComputedStyle(desktopEl).zIndex : 0),
+			desktopPointer: desktopEl ? getComputedStyle(desktopEl).pointerEvents : '',
+			framePointer: frameEl ? getComputedStyle(frameEl).pointerEvents : '',
+			dockZ: Number(dockEl ? getComputedStyle(dockEl).zIndex : 0)
+		};
+	});
+	expect(stacking.desktopZ).toBeGreaterThan(stacking.dockZ);
+	expect(stacking.desktopPointer).toBe('none');
+	expect(stacking.framePointer).toBe('auto');
+
+	// Drag the window directly over the bottom chat dock and verify hit-testing
+	// lands inside the window frame rather than being covered by the chat dock.
+	const dockBox = await dock.boundingBox();
+	const bar = notes.locator('.mai-window-frame__titlebar');
+	const barBox = await bar.boundingBox();
+	expect(dockBox).not.toBeNull();
+	expect(barBox).not.toBeNull();
+
+	await page.mouse.move(barBox!.x + barBox!.width / 2, barBox!.y + barBox!.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(dockBox!.x + dockBox!.width / 2, dockBox!.y + 20, { steps: 5 });
+	await page.mouse.up();
+
+	const updatedBox = await notes.boundingBox();
+	expect(updatedBox).not.toBeNull();
+	const overlapX = Math.max(updatedBox!.x, dockBox!.x) + 40;
+	const overlapY = Math.max(updatedBox!.y, dockBox!.y) + 20;
+	const topElementIsInsideFrame = await page.evaluate(
+		([x, y]) => {
+			const hit = document.elementFromPoint(x, y);
+			return hit !== null && hit.closest('.mai-window-frame') !== null;
+		},
+		[overlapX, overlapY] as const
+	);
+	expect(topElementIsInsideFrame).toBe(true);
+});

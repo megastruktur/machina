@@ -212,6 +212,7 @@
 	 *    state layer runs release hooks and nothing here can touch any
 	 *    backend (NT6; contracts.md C08 rule 5, C11).
 	 */
+	import { goto } from '$app/navigation';
 	import { createWorkspaceState } from './state.js';
 	import { createPresentationController } from './presentation.js';
 	import { createLayoutPersistence, type RestoredLayoutReport } from './layout.js';
@@ -464,7 +465,21 @@
 			.some((pair) => pair.trim().startsWith(`${CSRF_COOKIE}=`));
 	}
 
-	/** Load the enrolled servers; a 401 demotes the shell to fixture mode. */
+	/**
+	 * Offline fixture harnesses run against `vite preview` on `127.0.0.1:4173` /
+	 * `localhost:4173` with no backend. Any other host/port (or when a
+	 * `mai_csrf` cookie is already present) is a live deployment and must
+	 * authenticate against the API and redirect to `/login` when unauthorized.
+	 */
+	function isOfflineFixtureHost(): boolean {
+		if (typeof window === 'undefined') return true;
+		return (
+			(window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') &&
+			window.location.port === '4173'
+		);
+	}
+
+	/** Load the enrolled servers; a 401 redirects to `/login` on live hosts. */
 	async function connectLive(): Promise<void> {
 		try {
 			const { servers } = await api.listProfiles();
@@ -475,25 +490,31 @@
 		} catch (error) {
 			live = false;
 			liveServers = [];
-			if (error instanceof ApiError && error.code === 'unauthenticated') {
+			if (error instanceof ApiError && (error.status === 401 || error.code === 'unauthenticated')) {
 				status = 'Live session required — sign in to open the live desktop.';
+				if (!isOfflineFixtureHost()) {
+					await goto('/login', { replaceState: true });
+				}
 			} else {
 				status = `Live servers unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
 			}
 		}
 	}
 
-	/** Sign out: clear the session, return to the fixture desktop. */
+	/** Sign out: clear the session, redirect to `/login` on live hosts. */
 	async function signOut(): Promise<void> {
 		try {
 			await api.logout();
 		} catch {
-			// An already-expired session still ends in fixture mode below.
+			// An already-expired session still ends in signed-out state below.
 		}
 		live = false;
 		liveServers = [];
 		selectedServerId = FIXTURE_SERVERS[0].id;
 		status = 'Signed out — fixture desktop.';
+		if (!isOfflineFixtureHost()) {
+			await goto('/login', { replaceState: true });
+		}
 	}
 
 	/** Enroll one server through the reviewed create route, then refresh. */
@@ -1013,12 +1034,15 @@
 	$effect(() => responsive.start());
 
 	/**
-	 * Live attach (browser only): load the enrolled servers ONLY when the
-	 * readable `mai_csrf` cookie proves a logged-in browser — a fixture-only
-	 * browser (no backend, Playwright) performs zero API requests.
+	 * Live attach (browser only): on live hosts (or whenever a `mai_csrf`
+	 * cookie is present), probe `/api/v1/servers` — a 401 redirects to
+	 * `/login`. Offline fixture harnesses (`127.0.0.1:4173` without cookie)
+	 * stay in fixture mode and perform zero API requests.
 	 */
 	$effect(() => {
-		if (hasSessionCookie()) void connectLive();
+		if (hasSessionCookie() || !isOfflineFixtureHost()) {
+			void connectLive();
+		}
 	});
 </script>
 
@@ -1348,9 +1372,15 @@
 	}
 
 	/* Transparent spatial line-grid canvas: no solid/overlay fill; only
-	   floating windows, the SideDrawer, and the Chat Dock render solid. */
+	   floating windows, the SideDrawer, and the Chat Dock render solid.
+	   `z-index: 20` places the window canvas ABOVE the bottom chat dock
+	   (`z-index: 5`) so opened windows always render on top of the chat dock,
+	   while `pointer-events: none` on the empty canvas lets clicks on empty
+	   space pass through to the chat dock underneath. */
 	.mai-desktop-shell__desktop {
 		position: relative;
+		z-index: 20;
+		pointer-events: none;
 		flex: 1 1 0%;
 		min-height: 360px;
 		background: transparent;
@@ -1358,15 +1388,22 @@
 		box-shadow: none;
 	}
 
+	.mai-desktop-shell__desktop > :global(.mai-window-frame) {
+		pointer-events: auto;
+	}
+
 	/* Odyssey-Style Floating Center-Bottom Chat Pill: floats above the bottom
-	   of the spatial canvas without pushing the document height. */
+	   of the spatial canvas without pushing the document height. Kept at a
+	   lower stacking level (`z-index: 5`) than `.mai-desktop-shell__desktop`
+	   (`z-index: 20`) so opened workspace windows always stack in front of
+	   the chat dock instead of being hidden behind it. */
 	.mai-desktop-shell__dock {
 		position: absolute;
 		bottom: var(--mai-space-2);
 		left: calc(100% - var(--mai-space-3) - min(860px, calc(100% - 2 * var(--mai-space-4))));
 		transform: none;
 		width: min(860px, calc(100% - 2 * var(--mai-space-4)));
-		z-index: 30;
+		z-index: 5;
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1);
