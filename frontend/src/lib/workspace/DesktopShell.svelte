@@ -1416,6 +1416,15 @@
 		box-shadow: var(--mai-shadow-float);
 	}
 
+	/* Minimized spotlight pill: collapsed, the dock shrinks from the wide
+	   composer slab to a content-sized floating pill on the same anchor. */
+	.mai-desktop-shell__dock--collapsed {
+		width: auto;
+		max-width: min(560px, calc(100% - 2 * var(--mai-space-4)));
+		border-radius: 999px;
+		padding: 6px 14px;
+	}
+
 	.mai-desktop-shell__dock-body {
 		overflow: visible;
 	}

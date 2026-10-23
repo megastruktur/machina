@@ -217,6 +217,7 @@
 	/** Typing `@<token>` in the message input opens the autocomplete. */
 	function handleComposeInput(event: Event): void {
 		const el = event.currentTarget as HTMLTextAreaElement;
+		autoGrowComposer();
 		const upto = el.value.slice(0, el.selectionStart ?? el.value.length);
 		const match = /(?:^|[\s])@([^\s@]*)$/.exec(upto);
 		if (match !== null && !chatContextLocked && !generalConsultMode) {
@@ -292,6 +293,9 @@
 	const MAX_RENDERED_EVENTS = 500;
 	/** The frozen default role this panel submits (chat.py DEFAULT_ROLE). */
 	const SUBMIT_ROLE = 'administrator';
+	/** Auto-growing composer cap (7.5rem): a compact pill that never eats the dock. */
+	const COMPOSER_MAX_HEIGHT_PX = 120;
+
 
 	/** Run lifecycle states after which nothing new can be learned (C05 rule 2). */
 	const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(['succeeded', 'failed', 'cancelled']);
@@ -323,6 +327,15 @@
 
 	function shortHash(hash: unknown): string {
 		return typeof hash === 'string' && hash !== '' ? hash.slice(0, 12) : '—';
+	}
+
+	/** Concise `HH:MM` clock for bubble headers; the full value rides `title`. */
+	function formatShortTime(iso: string): string {
+		const parsed = Date.parse(iso);
+		if (Number.isNaN(parsed)) return iso;
+		const stamp = new Date(parsed);
+		const pad = (value: number) => String(value).padStart(2, '0');
+		return `${pad(stamp.getHours())}:${pad(stamp.getMinutes())}`;
 	}
 
 	function codeOf(error: unknown): string | null {
@@ -390,6 +403,12 @@
 	let composeBusy = $state(false);
 	let composeProblem = $state<{ code: string; message: string } | null>(null);
 	let composeFields = $state<Record<string, string>>({});
+
+	/** On-demand attachments drawer: collapsed to a 1px sr-only shell until used. */
+	let attachmentsOpen = $state(false);
+	const attachmentsRevealed = $derived(
+		attachmentsOpen || composeAttachments.trim() !== '' || Boolean(composeFields.attachments)
+	);
 
 	/** Local pre-flight: only the checks with a user-fixable answer here. */
 	function composeFieldErrors(): Record<string, string> {
@@ -1573,6 +1592,23 @@
 		}
 	}
 
+	/** Compact auto-grow: one row tall, capped at 7.5rem, reset when cleared. */
+	function autoGrowComposer(): void {
+		const el = dockComposerEl;
+		if (el === null) return;
+		if (el.value === '') {
+			el.style.height = '';
+			return;
+		}
+		el.style.height = 'auto';
+		el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT_PX)}px`;
+	}
+
+	/* Programmatic clears (submit, New Chat) fire no input event: reset here. */
+	$effect(() => {
+		if (composeMessage === '') dockComposerEl?.style.setProperty('height', '');
+	});
+
 	async function streamLoop(id: string, controller: AbortController): Promise<void> {
 		if (api === null) return;
 		let passCount = 0;
@@ -1916,6 +1952,7 @@
 								<Select
 									id="{uid}-server"
 									label="Target server"
+									hideLabel
 									inlineLabel
 									pill
 									compact
@@ -1977,13 +2014,24 @@
 				     collapse button, plus sr-only / standalone New Chat & History controls. -->
 				<div class="mai-chat__header-right">
 					{#if isDocked}
-						{#if jobInProgress}
+						{#if dockCollapsed && jobInProgress}
 							<span class="mai-chat__badge mai-chat__badge--active" data-testid="chat-header-working">
 								WORKING · {elapsedSeconds}s
 							</span>
 						{/if}
 					{:else}
 						<h3 class="mai-chat__title">Conversation</h3>
+					{/if}
+					{#if isDocked && dockCollapsed}
+						<Button
+							size="sm"
+							pill
+							variant="secondary"
+							tabindex={2}
+							onclick={() => (dockCollapsed = false)}
+						>
+							Ask M.A.I.…
+						</Button>
 					{/if}
 					{#if isDocked}
 						<Button
@@ -1993,9 +2041,10 @@
 							tabindex={2}
 							onclick={() => (dockCollapsed = !dockCollapsed)}
 							aria-expanded={!dockCollapsed}
+							aria-label={dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
 							data-testid="bottom-chat-dock-toggle"
 						>
-							{dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
+							{dockCollapsed ? '▴ Expand' : '▾'}
 						</Button>
 					{/if}
 					<div class="mai-chat__header-actions" class:mai-sr-only={isDocked}>
@@ -2074,7 +2123,9 @@
 						<div class="mai-chat__bubble mai-chat__bubble--user" data-testid="prior-turn-user">
 							<div class="mai-chat__bubble-header">
 								<span class="mai-chat__bubble-author">You</span>
-								<span class="mai-chat__bubble-time">{turn.submittedAt}</span>
+								<span class="mai-chat__bubble-time" title={turn.submittedAt}>
+									{formatShortTime(turn.submittedAt)}
+								</span>
 							</div>
 							<div class="mai-chat__bubble-body">
 								{turn.userMessage}
@@ -2083,7 +2134,8 @@
 
 						<div class="mai-chat__bubble mai-chat__bubble--assistant" data-testid="prior-turn-assistant">
 							<div class="mai-chat__bubble-header">
-								<span class="mai-chat__bubble-author">⚙ M.A.I. ({turn.modelLabel})</span>
+								<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
+								<span class="mai-chat__bubble-model">{turn.modelLabel}</span>
 							</div>
 							<div class="mai-chat__bubble-body">
 								{#if turn.thinkingSteps.length > 0}
@@ -2116,24 +2168,20 @@
 												}}
 											>
 												<summary class="mai-chat__tool-card-summary">
-													<div class="mai-chat__tool-card-head">
-														<span class="mai-chat__tool-card-title">
-															▸ ⚙ TOOL CALL // {tc.capabilityId}
-														</span>
-														<span
-															class="mai-chat__badge"
-															class:mai-chat__badge--ok={tc.status === 'succeeded'}
-															class:mai-chat__badge--danger={tc.status === 'failed'}
-														>
-															{tc.status.toUpperCase()}
-														</span>
-													</div>
-													<div class="mai-chat__tool-card-meta">
-														<span>seq #{tc.stepSeq}</span>
+													<span class="mai-chat__tool-card-title">
+														▸ ⚙ {tc.capabilityId}
+														<span class="mai-chat__tool-card-seq">#{tc.stepSeq}</span>
 														{#if tc.reason !== ''}
-															<span>· outcome: {tc.reason}</span>
+															<span class="mai-chat__tool-card-reason">· {tc.reason}</span>
 														{/if}
-													</div>
+													</span>
+													<span
+														class="mai-chat__badge"
+														class:mai-chat__badge--ok={tc.status === 'succeeded'}
+														class:mai-chat__badge--danger={tc.status === 'failed'}
+													>
+														{tc.status.toUpperCase()}
+													</span>
 												</summary>
 												<div class="mai-chat__tool-card-body">
 													{#if stepDetail?.loading}
@@ -2168,7 +2216,9 @@
 					<div class="mai-chat__bubble mai-chat__bubble--user">
 						<div class="mai-chat__bubble-header">
 							<span class="mai-chat__bubble-author">You</span>
-							<span class="mai-chat__bubble-time">{display.submitted_at}</span>
+							<span class="mai-chat__bubble-time" title={display.submitted_at}>
+								{formatShortTime(display.submitted_at)}
+							</span>
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="conversation-message">
 							{messageText}
@@ -2177,14 +2227,15 @@
 
 					<div class="mai-chat__bubble mai-chat__bubble--assistant">
 						<div class="mai-chat__bubble-header">
-							<span class="mai-chat__bubble-author">⚙ M.A.I. ({resolvedModel ?? display.model_profile})</span>
+							<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
+							<span class="mai-chat__bubble-model">{resolvedModel ?? display.model_profile}</span>
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
 							{#if thinkingSteps.length > 0 || !rootTerminal}
 								<details
 									class="mai-chat__thinking-details"
 									data-testid="assistant-thinking-block"
-									open={!rootTerminal || latestAssistantReply === ''}
+									open={!rootTerminal && streamedReply === ''}
 								>
 									<summary class="mai-chat__thinking-summary">
 										{#if !rootTerminal}
@@ -2228,27 +2279,23 @@
 												}
 											}}
 										>
-											<summary class="mai-chat__tool-card-summary">
-												<div class="mai-chat__tool-card-head">
-													<span class="mai-chat__tool-card-title">
-														▸ <span class:mai-chat__cog-spin={tc.status === 'running' || tc.status === 'requested'} aria-hidden="true">⚙</span> TOOL CALL // {tc.capabilityId}
-													</span>
-													<span
-														class="mai-chat__badge"
-														class:mai-chat__badge--active={tc.status === 'running' || tc.status === 'requested'}
-														class:mai-chat__badge--ok={tc.status === 'succeeded'}
-														class:mai-chat__badge--danger={tc.status === 'failed'}
-													>
-														{tc.status.toUpperCase()}
-													</span>
-												</div>
-												<div class="mai-chat__tool-card-meta">
-													<span>seq #{tc.stepSeq}</span>
-													{#if tc.reason !== ''}
-														<span>· outcome: {tc.reason}</span>
-													{/if}
-												</div>
-											</summary>
+										<summary class="mai-chat__tool-card-summary">
+											<span class="mai-chat__tool-card-title">
+												▸ <span class:mai-chat__cog-spin={tc.status === 'running' || tc.status === 'requested'} aria-hidden="true">⚙</span> {tc.capabilityId}
+												<span class="mai-chat__tool-card-seq">#{tc.stepSeq}</span>
+												{#if tc.reason !== ''}
+													<span class="mai-chat__tool-card-reason">· {tc.reason}</span>
+												{/if}
+											</span>
+											<span
+												class="mai-chat__badge"
+												class:mai-chat__badge--active={tc.status === 'running' || tc.status === 'requested'}
+												class:mai-chat__badge--ok={tc.status === 'succeeded'}
+												class:mai-chat__badge--danger={tc.status === 'failed'}
+											>
+												{tc.status.toUpperCase()}
+											</span>
+										</summary>
 											<div class="mai-chat__tool-card-body">
 												{#if stepDetail?.loading}
 													<div class="mai-chat__tool-card-loading">Loading params &amp; response…</div>
@@ -2277,7 +2324,7 @@
 										<span class="mai-chat__stream-cursor" aria-hidden="true">▍</span>
 									{/if}
 								</div>
-							{:else if jobInProgress}
+						{:else if jobInProgress && thinkingSteps.length === 0 && visibleToolCalls.length === 0 && streamedReply === ''}
 								<div
 									class="mai-chat__work-indicator"
 									role="status"
@@ -2496,54 +2543,72 @@
 
 		<section class="mai-chat__section mai-chat__section--compose" aria-label="Compose" data-testid="chat-compose">
 			<div class="mai-chat__form">
-				<div class="mai-chat__composer-top">
-					<ModelProfileSelect
-						compact={isDocked}
-						bind:value={composeProfile}
-						error={composeFields.profile ?? ''}
-						testId="compose-profile"
-						live={profilesLive}
-					/>
-					<Field
+				<div class="mai-chat__composer-box">
+					<label class="mai-chat__label mai-chat__label--sr" for="{uid}-message">Message</label>
+					<textarea
+						id="{uid}-message"
+						class="mai-chat__textarea"
+						tabindex={isDocked ? 1 : undefined}
+						bind:this={dockComposerEl}
+						placeholder="Ask M.A.I. or type @service to pin context…"
+						bind:value={composeMessage}
+						oninput={handleComposeInput}
+						onkeydown={onComposerKeydown}
+						rows={1}
+						data-testid="compose-message"
+					></textarea>
+					<!-- On-demand attachments: the field stays in the DOM as a 1px
+					     sr-only shell when collapsed so `.fill()`/focus reveal it. -->
+					<div
 						class="mai-chat__composer-attachments"
-						label="Attachments"
-						compact
-						bind:value={composeAttachments}
-						data-testid="compose-attachments"
-						error={composeFields.attachments ?? ''}
-						hint="Op ids of stored artifacts of this server (comma-separated); references only."
-					/>
-					<Button
-						pill
-						size="sm"
-						variant={readOnlyMode ? 'primary' : 'secondary'}
-						aria-pressed={readOnlyMode}
-						onclick={() => (readOnlyMode = !readOnlyMode)}
-						data-testid="compose-read-only-toggle"
+						class:mai-chat__composer-attachments--collapsed={!attachmentsRevealed}
 					>
-						{readOnlyMode ? 'Read-only ON' : 'Read-only'}
-					</Button>
-				</div>
-				<div class="mai-chat__composer-bar">
-					<div class="mai-chat__composer-input-wrap">
-						<label class="mai-chat__label mai-chat__label--sr" for="{uid}-message">Message</label>
-						<textarea
-							id="{uid}-message"
-							class="mai-chat__textarea"
-							tabindex={isDocked ? 1 : undefined}
-							bind:this={dockComposerEl}
-							placeholder="Ask M.A.I. or type @service to pin context…"
-							bind:value={composeMessage}
-							oninput={handleComposeInput}
-							onkeydown={onComposerKeydown}
-							rows={3}
-							data-testid="compose-message"
-						></textarea>
+						<Field
+							label="Attachments"
+							compact
+							bind:value={composeAttachments}
+							data-testid="compose-attachments"
+							error={composeFields.attachments ?? ''}
+							hint=""
+							oninput={() => (attachmentsOpen = true)}
+							onfocus={() => (attachmentsOpen = true)}
+						/>
 					</div>
+					<div class="mai-chat__composer-toolbar">
+						<div class="mai-chat__composer-tools">
+							<ModelProfileSelect
+								compact
+								bind:value={composeProfile}
+								error={composeFields.profile ?? ''}
+								testId="compose-profile"
+								live={profilesLive}
+							/>
+							<Button
+								pill
+								size="sm"
+								variant={readOnlyMode ? 'primary' : 'secondary'}
+								aria-pressed={readOnlyMode}
+								onclick={() => (readOnlyMode = !readOnlyMode)}
+								data-testid="compose-read-only-toggle"
+							>
+								{readOnlyMode ? 'Read-only ON' : 'Read-only'}
+							</Button>
+							<Button
+								pill
+								size="sm"
+								variant={attachmentsOpen ? 'primary' : 'secondary'}
+								aria-pressed={attachmentsOpen}
+								onclick={() => (attachmentsOpen = !attachmentsOpen)}
+							>
+								📎 Attach
+							</Button>
+						</div>
 						<div class="mai-chat__actions">
 							<Button
 								pill
-								variant="danger"
+								size="sm"
+								variant={canStopRun ? 'danger' : 'ghost'}
+								class={canStopRun ? 'mai-chat__stop' : 'mai-chat__stop mai-chat__stop--idle'}
 								disabled={!canStopRun}
 								loading={stoppingRun}
 								onclick={stopActiveConversation}
@@ -2555,6 +2620,7 @@
 								{jobInProgress ? 'Steer' : 'Send'}
 							</Button>
 						</div>
+					</div>
 				</div>
 				{#if composeFields.message}
 					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
@@ -2607,11 +2673,14 @@
 		overflow: hidden;
 		/* Bound the whole workspace, never individual message length. Auto-height
 		   windows still measure this intrinsic body and own their outer cap. */
-		height: min(40rem, calc(100dvh - 10rem));
+		height: min(32rem, calc(100dvh - 10rem));
 	}
 
 	.mai-chat--dock-collapsed { height: auto; }
 	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle) { height: auto; }
+	/* Minimized spotlight pill: the collapsed bar keeps only the pinned
+	 * context chip, the live WORKING badge and the expand controls. */
+	.mai-chat--dock-collapsed .mai-chat__compose-context { display: none; }
 
 	.mai-chat__body[hidden] {
 		display: none;
@@ -2647,12 +2716,19 @@
 		padding: 0;
 	}
 
-	.mai-chat__conversation-status { grid-area: 1 / 1; }
+	.mai-chat__conversation-status {
+		grid-area: 1 / 1;
+		min-height: 28px;
+		align-items: center;
+	}
 	.mai-chat__inline-alerts { grid-area: 2 / 1 / auto / -1; }
 	.mai-chat__inline-alerts:empty { display: none; }
 	.mai-chat__section--conversation > .mai-chat__conversation-scroll { grid-area: 3 / 1 / auto / -1; }
 	.mai-chat__section--conversation > :global(.mai-details) { display: contents; }
-	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) { grid-area: 1 / 2; }
+	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) {
+		grid-area: 1 / 2;
+		min-height: 28px;
+	}
 	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) {
 		position: absolute;
 		top: 0;
@@ -2722,10 +2798,10 @@
 		display: flex;
 		flex-direction: column;
 		flex: 0 0 auto;
-		gap: var(--mai-space-2);
+		gap: var(--mai-space-1);
 		width: 100%;
 		min-width: 0;
-		padding: var(--mai-space-2) 0;
+		padding: var(--mai-space-1) 0;
 		border: 0;
 		background: transparent;
 		box-shadow: none;
@@ -2734,11 +2810,8 @@
 	.mai-chat__bubble-header {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
 		flex-wrap: wrap;
 		gap: var(--mai-space-2);
-		padding-bottom: var(--mai-space-1);
-		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 	}
 
 	.mai-chat__bubble-author {
@@ -2756,6 +2829,16 @@
 		color: var(--mai-color-text-subtle);
 	}
 
+	.mai-chat__bubble-model {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-muted);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: 999px;
+		padding: 0 var(--mai-space-2);
+		overflow-wrap: anywhere;
+	}
+
 	.mai-chat__bubble-body {
 		display: flex;
 		flex-direction: column;
@@ -2764,6 +2847,21 @@
 		line-height: 1.55;
 		color: var(--mai-color-text);
 		overflow-wrap: anywhere;
+	}
+
+	/* User turns: the OUTER bubble stays full width (geometry invariant); the
+	 * header and body align right and the body becomes a brass-tinted pill. */
+	.mai-chat__bubble--user .mai-chat__bubble-header,
+	.mai-chat__bubble--user .mai-chat__bubble-body {
+		align-self: flex-end;
+		max-width: min(88%, 42rem);
+	}
+
+	.mai-chat__bubble--user .mai-chat__bubble-body {
+		padding: var(--mai-space-2) var(--mai-space-3);
+		border-radius: var(--mai-radius-lg) var(--mai-radius-lg) var(--mai-radius-sm) var(--mai-radius-lg);
+		background: color-mix(in srgb, var(--mai-color-brass) 12%, var(--mai-color-surface-raised));
+		border: 1px solid color-mix(in srgb, var(--mai-color-brass) 28%, transparent);
 	}
 
 	.mai-chat__thinking-details {
@@ -2788,6 +2886,10 @@
 		letter-spacing: 0.04em;
 		color: var(--mai-color-text-muted);
 		user-select: none;
+		padding: 1px var(--mai-space-2);
+		min-height: 24px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--mai-color-brass) 5%, transparent);
 	}
 
 	.mai-chat__thinking-quote {
@@ -2826,16 +2928,20 @@
 	.mai-chat__tool-calls {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: 4px;
+	}
+
+	/* Thinking trace and tool chips form one tight activity group (4px). */
+	.mai-chat__thinking-details + .mai-chat__tool-calls {
+		margin-top: calc(4px - var(--mai-space-2));
 	}
 
 	.mai-chat__tool-card {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: var(--mai-space-1) var(--mai-space-2);
+		padding: 0;
 		border: 0;
-		border-bottom: var(--mai-border-width) solid var(--mai-color-border);
 		background: transparent;
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-xs);
@@ -2845,9 +2951,15 @@
 		cursor: pointer;
 		list-style: none;
 		display: flex;
-		flex-direction: column;
-		gap: 2px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+		padding: 3px 8px;
+		border-radius: var(--mai-radius-sm);
+		background: color-mix(in srgb, var(--mai-color-brass) 6%, transparent);
 		user-select: none;
+		min-width: 0;
 	}
 
 	.mai-chat__tool-card-summary::-webkit-details-marker {
@@ -2897,24 +3009,28 @@
 		font-style: italic;
 	}
 
-	.mai-chat__tool-card-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--mai-space-2);
-	}
-
 	.mai-chat__tool-card-title {
+		display: inline-flex;
+		align-items: baseline;
+		gap: var(--mai-space-1);
+		flex: 1 1 auto;
+		min-width: 0;
 		color: var(--mai-color-brass);
 		font-weight: var(--mai-weight-semibold);
 		letter-spacing: 0.04em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
-	.mai-chat__tool-card-meta {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--mai-space-2);
+	.mai-chat__tool-card-summary .mai-chat__badge {
+		flex: 0 0 auto;
+	}
+
+	.mai-chat__tool-card-seq,
+	.mai-chat__tool-card-reason {
 		color: var(--mai-color-text-muted);
+		font-weight: var(--mai-weight-medium);
 	}
 
 	.mai-chat__reply-markdown {
@@ -2978,19 +3094,57 @@
 		user-select: none;
 	}
 
-	.mai-chat__composer-bar {
-		display: flex;
-		flex-direction: row;
-		align-items: flex-end;
-		gap: var(--mai-space-2);
-	}
-
-	.mai-chat__composer-input-wrap {
-		flex: 1 1 auto;
-		min-width: 0;
+	/* Unified single-box composer surface: textarea + on-demand attachments +
+	 * toolbar live in one cohesive bordered pill container. */
+	.mai-chat__composer-box {
+		position: relative;
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
+		gap: var(--mai-space-2);
+		min-width: 0;
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-lg);
+		background: var(--mai-color-surface-sunken, rgba(0, 0, 0, 0.2));
+		padding: var(--mai-space-2);
+	}
+
+	.mai-chat__composer-toolbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+		flex-wrap: wrap;
+		min-width: 0;
+	}
+
+	.mai-chat__composer-tools {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		flex-wrap: wrap;
+		min-width: 0;
+	}
+
+	/* On-demand attachments: collapsed to a 1px sr-only shell (the input stays
+	 * fillable/focusable and reveals itself on first use), full row when open. */
+	.mai-chat__composer-attachments {
+		min-width: 0;
+	}
+
+	.mai-chat__composer-attachments--collapsed {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+
+	/* Rides the Button class prop (out of this template's static scope). */
+	:global(.mai-chat__stop--idle) {
+		opacity: 0.45;
 	}
 
 	.mai-chat__header-context {
@@ -3023,21 +3177,6 @@
 		border: 0;
 	}
 
-	/* Composer header bar: model profile + draft attachments + read-only
-	 * toggle, always visible and compact. */
-	.mai-chat__composer-top {
-		display: flex;
-		align-items: end;
-		justify-content: space-between;
-		gap: var(--mai-space-2, 0.5rem);
-		flex-wrap: wrap;
-		min-width: 0;
-	}
-
-	.mai-chat__composer-top > :global(.mai-field) {
-		flex: 1 1 10rem;
-		min-width: 0;
-	}
 
 	/* Floating history selector & @service autocomplete: open ABOVE the dock when docked. */
 	.mai-chat--docked .mai-chat__history-popover,
@@ -3065,11 +3204,6 @@
 		justify-content: space-between;
 		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
-	}
-
-	.mai-chat__header-actions {
-		display: inline-flex;
-		gap: var(--mai-space-2, 0.5rem);
 	}
 
 	/* Floating history selector: anchored to the header row, above the page.
@@ -3196,15 +3330,22 @@
 	.mai-chat__textarea {
 		width: 100%;
 		resize: none;
-		height: 4.5rem;
-		min-height: 3.5rem;
+		height: auto;
+		min-height: 2.25rem;
+		max-height: 7.5rem;
 		box-sizing: border-box;
-		padding: var(--space-2, 0.5rem);
-		border: 1px solid var(--border-strong, currentColor);
-		border-radius: var(--radius-sm, 4px);
-		background: var(--surface-raised, transparent);
+		padding: var(--mai-space-1) var(--mai-space-2);
+		border: 0;
+		border-radius: var(--mai-radius-sm, 4px);
+		background: transparent;
 		color: inherit;
 		font: inherit;
+		overflow-y: auto;
+	}
+
+	.mai-chat__textarea:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: calc(-1 * var(--mai-focus-ring-width));
 	}
 
 	.mai-chat__actions {
@@ -3470,21 +3611,17 @@
 	.mai-chat__header-right { flex-wrap: wrap; min-width: 0; }
 	.mai-chat__context-controls, .mai-chat__compose-context, .mai-chat__chips { min-width: 0; max-width: 100%; }
 	.mai-chat__context-controls :global(.mai-select), .mai-chat__context-controls :global(select) { min-width: 0; max-width: 100%; }
-	.mai-chat__tool-card-head { flex-wrap: wrap; }
 	.mai-chat__inline-alerts { max-height: 18dvh; overflow: auto; }
 	.mai-chat__reply-markdown, .mai-chat__bubble-body { min-width: 0; }
 	@container (max-width: 440px) {
-		/* The composer stays ONE compact wrapped row-group: profile, draft
-		 * attachments and the read-only toggle share rows; stacking them
-		 * vertically would starve the conversation area on small viewports. */
-		.mai-chat__composer-top { align-items: end; }
-		.mai-chat__composer-top > :global(.mai-model-profile-select) { flex: 1 1 8rem; }
-		.mai-chat__composer-top > :global(.mai-field) { flex: 1 1 8rem; }
-		.mai-chat__composer-bar { flex-direction: column; align-items: stretch; }
+		/* The composer toolbar wraps inside the single composer box; actions
+		 * stay right-aligned and the conversation keeps the taller share. */
+		.mai-chat__composer-toolbar { align-items: stretch; flex-direction: column; }
+		.mai-chat__composer-tools { flex-wrap: wrap; }
 		.mai-chat__actions { justify-content: flex-end; }
 		.mai-chat__header-right { gap: var(--mai-space-1); }
 		.mai-chat__title { display: none; }
-		.mai-chat__body { height: calc(100dvh - 14rem); }
+		.mai-chat__body { height: calc(100dvh - 12rem); }
 	}
 	.mai-chat__history-item {
 		display: flex; width: 100%; min-width: 0; align-items: center;

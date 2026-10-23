@@ -147,6 +147,7 @@
 		id="{uid}-select"
 		label="Model profile"
 		inlineLabel={compact}
+		hideLabel={compact}
 		pill={compact}
 		{compact}
 		bind:value
