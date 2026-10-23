@@ -265,6 +265,9 @@ _FEATURE_SURFACE = frozenset(
         ("PUT", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
         ("DELETE", "/api/v1/plugins/{plugin}/bindings/{server_id}"),
         ("POST", "/api/v1/plugins/{plugin}/discovery"),
+        # (s3-plugins-api remediation: the probe route shipped without
+        # extending this pin; transcribed from mai.api.plugins.)
+        ("POST", "/api/v1/plugins/{plugin}/probe"),
         ("GET", "/api/v1/skills"),
         ("GET", "/api/v1/skills/{skill}"),
         # (10-monitor-api: observations/findings/notifications + policy.)
@@ -284,6 +287,9 @@ _FEATURE_SURFACE = frozenset(
         ("POST", "/api/v1/servers/{server_id}/memory/reflect"),
         ("GET", "/api/v1/servers/{server_id}/memory/export"),
         ("POST", "/api/v1/servers/{server_id}/memory/delete"),
+        # (uir u2-terminal: terminal attach info; the sibling WebSocket route
+        # is not an APIRoute and stays outside this HTTP pin.)
+        ("GET", "/api/v1/servers/{server_id}/terminal/info"),
         # (mai-wire-desktop: the launcher's server list route.)
         ("GET", "/api/v1/servers"),
     }
@@ -474,6 +480,9 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/plugins/{plugin}/bindings",
         "/api/v1/plugins/{plugin}/bindings/{server_id}",
         "/api/v1/plugins/{plugin}/discovery",
+        # (s3-plugins-api remediation: the probe path shipped without
+        # extending this pin.)
+        "/api/v1/plugins/{plugin}/probe",
         "/api/v1/skills",
         "/api/v1/skills/{skill}",
         # (10-monitor-api: observations/findings/notifications + policy.)
@@ -493,6 +502,8 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/servers/{server_id}/memory/reflect",
         "/api/v1/servers/{server_id}/memory/export",
         "/api/v1/servers/{server_id}/memory/delete",
+        # (uir u2-terminal: terminal attach info view.)
+        "/api/v1/servers/{server_id}/terminal/info",
     }
     assert set(schema["paths"][HEALTH_PATH]) == {"get"}
     assert "200" in schema["paths"][HEALTH_PATH]["get"]["responses"]

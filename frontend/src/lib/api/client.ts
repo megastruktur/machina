@@ -168,6 +168,7 @@ export type ScheduleUpdateBody = components['schemas']['ScheduleUpdateBody'];
 export type ScheduleView = components['schemas']['ScheduleView'];
 export type SkillCatalogView = components['schemas']['SkillCatalogView'];
 export type SkillPackageView = components['schemas']['SkillPackageView'];
+export type TerminalSessionInfoView = components['schemas']['TerminalSessionInfoView'];
 export type MemoryDeleteBody = components['schemas']['MemoryDeleteBody'];
 export type MemoryRecallBody = components['schemas']['MemoryRecallBody'];
 export type MemoryReflectBody = components['schemas']['MemoryReflectBody'];
@@ -496,6 +497,8 @@ export interface MaiApiClient {
 	listRuns(serverId: string, page?: PageQuery): Promise<RunPage>;
 	/** POST /api/v1/password-challenges — spends one decision, one secret. */
 	submitChallenge(payload: ChallengeBody): Promise<ChallengeOutcomeView>;
+	/** GET /api/v1/servers/{server_id}/terminal/info — terminal attach view. */
+	terminalInfo(serverId: string): Promise<TerminalSessionInfoView>;
 	/** GET /api/v1/schedules?server_id=… — optional but EXPLICIT scope. */
 	listSchedules(serverId: string | null, page?: PageQuery): Promise<SchedulePage>;
 	/** POST /api/v1/schedules — durable configuration; target bound here. */
@@ -756,6 +759,11 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			),
 		submitChallenge: (payload) =>
 			requestJson<ChallengeOutcomeView>('POST', '/api/v1/password-challenges', payload),
+		terminalInfo: (serverId) =>
+			requestJson<TerminalSessionInfoView>(
+				'GET',
+				`/api/v1/servers/${encodeURIComponent(serverId)}/terminal/info`
+			),
 		listSchedules: (serverId, page) => {
 			const params = new URLSearchParams();
 			if (serverId !== null) params.set('server_id', serverId);

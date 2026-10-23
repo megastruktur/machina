@@ -1840,6 +1840,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{server_id}/terminal/info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Terminal attach information
+         * @description Return the pinned SSH target and the WebSocket path to attach to.
+         *
+         *     Safe method: session layer only (mirrors ``GET /api/v1/servers/{id}``).
+         */
+        get: operations["terminal_info_api_v1_servers__server_id__terminal_info_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -4509,6 +4531,43 @@ export interface components {
             sub_state: string | null;
             /** Description */
             description: string | null;
+        };
+        /**
+         * TerminalSessionInfoView
+         * @description Wire view for opening a terminal against one pinned target.
+         */
+        TerminalSessionInfoView: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Pinned server identity (opaque UUID).
+             */
+            server_id: string;
+            /**
+             * Host
+             * @description SSH target host from the stored profile.
+             */
+            host: string;
+            /**
+             * Port
+             * @description SSH target port from the stored profile.
+             */
+            port: number;
+            /**
+             * User
+             * @description SSH login user from the stored profile.
+             */
+            user: string;
+            /**
+             * Ws Path
+             * @description Authenticated WebSocket path that carries the terminal stream.
+             */
+            ws_path: string;
+            /**
+             * Tmux Session
+             * @description tmux session name the remote command attaches to.
+             */
+            tmux_session: string;
         };
         /**
          * UpdateSubmitBody
@@ -9761,6 +9820,64 @@ export interface operations {
                 };
             };
             /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    terminal_info_api_v1_servers__server_id__terminal_info_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TerminalSessionInfoView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No canonical profile stored for this server id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Canonical profile service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

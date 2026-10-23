@@ -95,6 +95,7 @@ from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
+from mai.api.terminal import register_terminal
 from mai.memory.hindsight import (
     HindsightProvider,
     MemoryAdapterError,
@@ -563,6 +564,11 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # routing-policy view — all over the 0007 schema; no collection or
     # delivery effect ever runs in a route.
     register_monitoring(app)
+    # The interactive terminal surface (u2-terminal): session+origin
+    # authenticated WebSocket attaching one system-OpenSSH PTY (``ssh -tt``,
+    # remote tmux/login shell) plus its session-authenticated info view. No
+    # third-party SSH library — the pinned transport is mai.execution.ssh.
+    register_terminal(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202

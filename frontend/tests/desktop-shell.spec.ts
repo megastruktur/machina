@@ -402,6 +402,9 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 	// item repeats inside a server accordion (they are Global / Fleet kinds).
 	await expect(page.getByTestId('open-documents')).toContainText('Open Documents — Server Alpha');
 
+	// uir u2-terminal: the Execution panel presents as Terminal in the nav.
+	await expect(page.getByTestId('open-execution')).toContainText('Open Terminal — Server Alpha');
+
 	// The global entry opens the Memory window pinned to the GLOBAL scope.
 	await memoryItem.click();
 	await expect(frame(page, 'knowledge-models')).toHaveCount(1);

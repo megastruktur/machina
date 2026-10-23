@@ -101,7 +101,7 @@
 		applications: '◈',
 		'server-profile': '🖥',
 		jobs: '⏱',
-		execution: '⚡',
+		execution: '⌨',
 		docs: '📄',
 		'knowledge-models': '🧠',
 		'model-settings': '⚙',
