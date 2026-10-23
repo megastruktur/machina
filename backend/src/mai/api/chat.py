@@ -121,6 +121,7 @@ from mai.api.auth import (
 )
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.plugins.config import PluginConfigStore, parse_plugin_config_text
+from mai.policy.config import GrantConfigStore
 from mai.api.jobs import (
     CANCEL_OUTCOME_BUDGET_SECONDS,
     DEFAULT_PAGE_LIMIT,
@@ -214,6 +215,58 @@ MAX_ATTACHMENTS_TOTAL_BYTES: Final[int] = 8 * 1024 * 1024
 ARTIFACTS_ROOT_VAR: Final[str] = "MAI_ARTIFACTS_ROOT"
 ARTIFACTS_DEFAULT_DIRNAME: Final[str] = "artifacts"
 
+#: Server-profile capability slugs → the concrete capability ids they
+#: enable (C03 rule 3 vocabulary). The worker's grant bootstrap makes
+#: exactly the same mapping, so an auto-resolved chat context never
+#: requests a capability the dispatcher would refuse.
+SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
+    "host_shell": "host.shell",
+    "host.shell": "host.shell",
+    "journald_logs": "host.logs",
+    "host.logs": "host.logs",
+}
+
+#: Built-in controller-side defaults of the auto-resolved chat grant
+#: set (alongside ``INTERNAL_API_CAPABILITY_IDS``): document retrieval,
+#: web research, the HTTP service probe and the host journal reader.
+BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
+    "docs.retrieve",
+    "web.search",
+    "web.read",
+    "service.http",
+    "host.logs",
+)
+
+#: Capabilities a read-only conversation strips even without a
+#: registry descriptor: raw shell and every internal-API mutation.
+READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
+    {
+        "host.shell",
+        "app.adopt",
+        "app.unadopt",
+        "app.upsert_map_entry",
+        "app.delete_map_entry",
+        "secret.store",
+    }
+)
+
+#: Read-only fallback pair: both are read-class internal capabilities,
+#: so the read-only context is ALWAYS a valid non-empty tuple even when
+#: the resolved set carried nothing else readable.
+READ_ONLY_FALLBACK_CAPABILITIES: Final[tuple[str, ...]] = (
+    "chat.read_session",
+    "docs.retrieve",
+)
+
+#: The strict non-mutation instruction appended to a read-only
+#: conversation's task (exact frozen wording).
+READ_ONLY_INSTRUCTION: Final[str] = (
+    "\n\n[READ-ONLY MODE: Write and mutate capabilities are disabled. "
+    "Do NOT modify, create, delete, install, update, restart, or change "
+    "any system state, files, configurations, or services. Only read, "
+    "inspect, and answer questions.]"
+)
+
 
 def resolve_artifacts_root(env: Mapping[str, str] | None = None) -> str:
     """The controller-side evidence artifacts root for this process.
@@ -290,12 +343,17 @@ class ChatSubmitBody(BaseModel):
     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
     rule 5). ``profile`` names the model profile selection explicitly
     (C06 rule 1); ``connection`` stays optional (the model store's
-    stored pairing when omitted). ``capabilities`` is the conversation's
-    explicit parent grant request — omitted means NO capability, never a
-    default grant; delegation children are clamped to its intersection.
-    ``root_budget`` is the optional aggregate delegation budget (C05
-    rule 7): frozen on the run row, narrowed against the delegation
-    gates, and enforced by the root ledger across the whole tree.
+    stored pairing when omitted). ``allowed_capabilities`` is the
+    conversation's explicit parent grant request — omitted or empty
+    means the agent runs with EVERY capability granted for the target
+    server (grant store, server-profile capabilities, enabled plugin
+    bindings and the built-in defaults) under the default ``delegated``
+    mode; delegation children are clamped to its intersection.
+    ``read_only`` strips every non-read capability and pins a strict
+    non-mutation instruction onto the agent task. ``root_budget`` is
+    the optional aggregate delegation budget (C05 rule 7): frozen on
+    the run row, narrowed against the delegation gates, and enforced
+    by the root ledger across the whole tree.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -307,9 +365,10 @@ class ChatSubmitBody(BaseModel):
     connection: str | None = Field(default=None, max_length=200)
     role: str = Field(default=DEFAULT_ROLE, min_length=1, max_length=MAX_ROLE_CHARS)
     rounds: int | None = Field(default=None, ge=1, le=agent_run.MAX_MAX_ROUNDS)
-    mode: PolicyMode = PolicyMode.ASK
+    mode: PolicyMode = Field(default=PolicyMode.DELEGATED)
     credential_references: list[str] = Field(default_factory=list)
-    capabilities: list[str] = Field(default_factory=list)
+    allowed_capabilities: list[str] | None = Field(default=None, max_length=64)
+    read_only: bool = Field(default=False)
     children: list[ChildBody] = Field(
         default_factory=list, max_length=agent_delegate.MAX_CHILDREN_PER_RUN
     )
@@ -522,6 +581,122 @@ def _dedup_preserving_order(values: list[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _plugin_capability_ids(
+    plugin_store: object, server_id: uuid.UUID
+) -> list[str]:
+    """Capability ids of every ENABLED plugin binding for this target.
+
+    Both per-server bindings and the global sentinel binding
+    (``00000000-0000-0000-0000-000000000000``) count. Any unusable
+    plugin store or record degrades to fewer capabilities — the
+    submission itself is never blocked by plugin configuration.
+    """
+    capabilities: list[str] = []
+    if not isinstance(plugin_store, PluginConfigStore):
+        return capabilities
+    try:
+        for plugin_name in plugin_store.list_plugins():
+            try:
+                stored_doc = plugin_store.read_config(plugin_name)
+                doc = parse_plugin_config_text(stored_doc.text)
+            except Exception:
+                continue
+            if not doc.enabled:
+                continue
+            try:
+                for binding in plugin_store.list_bindings(plugin_name):
+                    if binding.server_id in (server_id, uuid.UUID(int=0)):
+                        capabilities.extend(binding.capabilities)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return capabilities
+
+
+def _server_profile_capability_ids(
+    profile_capabilities: tuple[str, ...],
+) -> list[str]:
+    """Concrete capability ids enabled by one server profile.
+
+    The worker's grant bootstrap grants both the raw slug and its
+    underscore-normalized form plus the explicit ``host_shell`` /
+    ``journald_logs`` mappings; this surface resolves exactly the same
+    set so auto-resolved chats never exceed the dispatcher's grants.
+    """
+    resolved: list[str] = []
+    for slug in profile_capabilities:
+        resolved.append(slug)
+        resolved.append(slug.replace("_", "."))
+        mapped = SERVER_PROFILE_CAPABILITY_MAP.get(slug)
+        if mapped is not None:
+            resolved.append(mapped)
+    return resolved
+
+
+def _resolve_default_capabilities(
+    request: Request,
+    server_id: uuid.UUID,
+    profile_capabilities: tuple[str, ...],
+) -> list[str]:
+    """Every capability granted for the target when the submit omits its
+    own ``allowed_capabilities`` (auto-capabilities by default).
+
+    Sources, unioned and deduplicated: the grant configuration store
+    (entries naming this server), the canonical server profile's
+    capabilities, enabled plugin bindings (per-server + global), the
+    internal-API surface and the built-in controller-side defaults.
+    An unusable source degrades to fewer capabilities — never an error.
+    """
+    resolved: list[str] = []
+    grants_store = getattr(request.app.state, "grants", None)
+    if isinstance(grants_store, GrantConfigStore):
+        try:
+            for capability_id, servers in grants_store.read().grants.items():
+                if server_id in servers:
+                    resolved.append(capability_id)
+        except Exception:
+            pass
+    resolved.extend(_server_profile_capability_ids(profile_capabilities))
+    resolved.extend(
+        _plugin_capability_ids(
+            getattr(request.app.state, "plugins", None), server_id
+        )
+    )
+    resolved.extend(INTERNAL_API_CAPABILITY_IDS)
+    resolved.extend(BUILTIN_CHAT_CAPABILITIES)
+    return list(_dedup_preserving_order(resolved))
+
+
+def _read_only_capabilities(
+    request: Request, capabilities: list[str]
+) -> list[str]:
+    """Strip every non-read capability for a read-only conversation.
+
+    The static mutation vocabulary is always excluded; registry-known
+    descriptors with ``effect_class != "read"`` are excluded too (an
+    absent registry excludes nothing extra). ``chat.read_session`` /
+    ``docs.retrieve`` are ensured last so the ``ExecutionContext``
+    always carries a valid, non-empty read-only capability tuple.
+    """
+    excluded = set(READ_ONLY_EXCLUDED_CAPABILITIES)
+    registry = getattr(request.app.state, "registry", None)
+    if registry is not None:
+        try:
+            for descriptor in registry.list_capabilities():
+                if descriptor.effect_class != "read":
+                    excluded.add(descriptor.identifier)
+        except Exception:
+            pass
+    filtered = [
+        capability_id
+        for capability_id in capabilities
+        if capability_id not in excluded
+    ]
+    filtered.extend(READ_ONLY_FALLBACK_CAPABILITIES)
+    return list(_dedup_preserving_order(filtered))
+
+
 def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
     """The canonical whole-submission document (the dedup digest input).
 
@@ -539,7 +714,8 @@ def _submission_document(body: ChatSubmitBody) -> dict[str, object]:
         "rounds": body.rounds,
         "mode": body.mode.value,
         "credential_references": list(body.credential_references),
-        "capabilities": list(body.capabilities),
+        "allowed_capabilities": list(body.allowed_capabilities or []),
+        "read_only": body.read_only,
         "children": [
             {
                 "task": child.task,
@@ -601,9 +777,17 @@ def _agent_document(
     task text with the tagged services' map metadata + runbook. The
     appendix is bounded to the producer's task limit: entries drop from
     the tail until the enriched task fits (the tags stay recorded on the
-    submission either way).
+    submission either way). A read-only conversation pins the frozen
+    non-mutation instruction onto the task; the message tail yields —
+    minimally — so the enriched task still fits the producer's bound.
     """
-    task = body.message
+    read_only_suffix = READ_ONLY_INSTRUCTION if body.read_only else ""
+    task = body.message + read_only_suffix
+    if len(task) > agent_run.MAX_TASK_CHARS:
+        task = (
+            body.message[: agent_run.MAX_TASK_CHARS - len(read_only_suffix)]
+            + read_only_suffix
+        )
     if service_details:
         entries = list(service_details[:MAX_MATCHED_ENTRIES])
         while entries:
@@ -944,9 +1128,11 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
             )
         profile_revision = 1
         prompt_revision = 1
+        profile_capability_ids: tuple[str, ...] = ()
     else:
         stored = _canonical_profile(request, server_uuid)
         profile = parse_server_profile_text(stored.text)
+        profile_capability_ids = profile.capabilities
         profile_revision = stored.revision
         prompt_revision = profile.prompt_revision
 
@@ -957,39 +1143,29 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     except AttachmentRejected as exc:
         return _validation_error(request, exc.field, exc.detail)
 
-    capabilities = _dedup_preserving_order(payload.capabilities)
-    # Always expose the internal-API tool surface (app.discover, app.list_adopted,
-    # app.adopt, app.unadopt, app.upsert_map_entry, app.delete_map_entry,
-    # chat.read_session) and controller-side web research tools (web.search,
-    # web.read) alongside any host-scoped capabilities so the chat agent can
-    # operate Machina services and consult external docs in both pinned-server
-    # and General Consult chats.
-    plugin_caps: list[str] = []
-    plugin_store = getattr(request.app.state, "plugins", None)
-    if isinstance(plugin_store, PluginConfigStore):
-        try:
-            for plugin_name in plugin_store.list_plugins():
-                try:
-                    stored_doc = plugin_store.read_config(plugin_name)
-                    doc = parse_plugin_config_text(stored_doc.text)
-                except Exception:
-                    continue
-                if not doc.enabled:
-                    continue
-                try:
-                    for b in plugin_store.list_bindings(plugin_name):
-                        if b.server_id in (server_uuid, uuid.UUID(int=0)):
-                            plugin_caps.extend(b.capabilities)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    capabilities = _dedup_preserving_order(
-        list(capabilities)
-        + list(INTERNAL_API_CAPABILITY_IDS)
-        + ["web.search", "web.read"]
-        + plugin_caps
-    )
+    if payload.allowed_capabilities:
+        # Explicit request: the submitted list rides exactly as asked,
+        # unioned with the internal-API tool surface (app.discover,
+        # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
+        # app.delete_map_entry, chat.read_session) and controller-side web
+        # research tools (web.search, web.read) plus enabled plugin
+        # bindings, so the chat agent can always operate Machina services
+        # and consult external docs.
+        capabilities = _dedup_preserving_order(
+            list(payload.allowed_capabilities)
+            + list(INTERNAL_API_CAPABILITY_IDS)
+            + ["web.search", "web.read"]
+            + _plugin_capability_ids(
+                getattr(request.app.state, "plugins", None), server_uuid
+            )
+        )
+    else:
+        # Auto-capabilities by default: everything granted for the target.
+        capabilities = _resolve_default_capabilities(
+            request, server_uuid, profile_capability_ids
+        )
+    if payload.read_only:
+        capabilities = _read_only_capabilities(request, capabilities)
     # Scoped per-plugin credentials (C4/H2/M7): plugin credential_refs
     # deliberately stay OUT of the chat context's credential_references.
     # A native plugin's secrets resolve on demand in the worker's

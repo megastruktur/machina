@@ -5,6 +5,14 @@
 	 * Replaces the free-form text input for Model profile in ChatPanel with a
 	 * clean `<Select>` dropdown while preserving a synced visually-hidden input
 	 * for existing automated `.fill()` assertions.
+	 *
+	 * Live mode exposes ONLY the actually configured model profiles: it reads
+	 * `GET /api/v1/models/profiles` (the stored profiles) plus
+	 * `GET /api/v1/models/selection` (the stored default) — the real wire
+	 * vocabulary — and never merges the static fixture list into a live
+	 * result. The stored default selection is auto-selected when the current
+	 * value is empty or not a configured profile. A failed live read falls
+	 * back to the static `options` (offline/fixture harnesses).
 	 */
 	import { onMount } from 'svelte';
 	import Select from './Select.svelte';
@@ -23,7 +31,7 @@
 		/** Test id for automated test bindings (`compose-profile`). */
 		testId?: string;
 		/**
-		 * Fetch live profiles from `/api/v1/models` on mount.
+		 * Fetch the configured profiles + default selection on mount.
 		 * Defaults to `false` — enable explicitly in the live Chat panel so
 		 * offline fixture harnesses (desktop-shell / chat.spec) never fire a
 		 * real network request.
@@ -43,39 +51,64 @@
 	}: Props = $props();
 
 	let liveProfiles = $state<string[]>([]);
+	let liveReady = $state(false);
 
 	onMount(() => {
 		if (!live) return;
 		let cancelled = false;
 		void (async () => {
 			try {
-				const res = await fetch('/api/v1/models', {
-					method: 'GET',
-					credentials: 'same-origin',
-					headers: { accept: 'application/json' }
-				});
-				if (!res.ok || cancelled) return;
-				const body = (await res.json()) as {
-					profiles?: Array<{ name?: unknown }>;
-					selection?: { profile?: unknown } | null;
-				};
+				const [profilesRes, selectionRes] = await Promise.all([
+					fetch('/api/v1/models/profiles', {
+						method: 'GET',
+						credentials: 'same-origin',
+						headers: { accept: 'application/json' }
+					}),
+					fetch('/api/v1/models/selection', {
+						method: 'GET',
+						credentials: 'same-origin',
+						headers: { accept: 'application/json' }
+					})
+				]);
 				if (cancelled) return;
-				const names: string[] = [];
-				if (
-					body.selection &&
-					typeof body.selection.profile === 'string' &&
-					body.selection.profile.trim() !== ''
-				) {
-					names.push(body.selection.profile.trim());
+				if (!profilesRes.ok) return;
+				const profilesBody = (await profilesRes.json()) as {
+					profiles?: Array<{ name?: unknown }>;
+				};
+				// The stored default (404 when none is stored) auto-selects.
+				let defaultProfile = '';
+				if (selectionRes.ok) {
+					const selectionBody = (await selectionRes.json()) as {
+						profile?: unknown;
+					};
+					if (typeof selectionBody.profile === 'string') {
+						defaultProfile = selectionBody.profile.trim();
+					}
 				}
-				if (Array.isArray(body.profiles)) {
-					for (const item of body.profiles) {
-						if (typeof item?.name === 'string' && item.name.trim() !== '') {
-							names.push(item.name.trim());
+				const names: string[] = [];
+				const seen = new Set<string>();
+				if (
+					defaultProfile !== '' &&
+					Array.isArray(profilesBody.profiles) &&
+					profilesBody.profiles.some(
+						(item) => typeof item?.name === 'string' && item.name.trim() === defaultProfile
+					)
+				) {
+					names.push(defaultProfile);
+					seen.add(defaultProfile);
+				}
+				if (Array.isArray(profilesBody.profiles)) {
+					for (const item of profilesBody.profiles) {
+						const name = typeof item?.name === 'string' ? item.name.trim() : '';
+						if (name !== '' && !seen.has(name)) {
+							names.push(name);
+							seen.add(name);
 						}
 					}
 				}
+				if (names.length === 0) return;
 				liveProfiles = names;
+				liveReady = true;
 			} catch {
 				// Offline or fixture harness — fall back to static options silently.
 			}
@@ -85,10 +118,21 @@
 		};
 	});
 
+	/** Live reads own the option list completely; static options never merge in. */
 	const mergedOptions = $derived.by(() => {
-		const set = new Set<string>([...liveProfiles, ...options]);
+		if (liveReady && liveProfiles.length > 0) return liveProfiles;
+		const set = new Set<string>(options);
 		if (value && value.trim() !== '') set.add(value);
 		return [...set];
+	});
+
+	// Auto-select the configured default (or the first real profile) when the
+	// current value is empty or not a configured profile.
+	$effect(() => {
+		if (!liveReady || liveProfiles.length === 0) return;
+		if (value === '' || !liveProfiles.includes(value)) {
+			value = liveProfiles[0];
+		}
 	});
 </script>
 

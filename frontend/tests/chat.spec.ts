@@ -125,6 +125,9 @@ declare global {
 		/** Set by a test init script: the boot scenario (chat-spec-owned name). */
 		__maiChatScenario?: Scenario;
 		__maiChatFramed?: boolean;
+		/** Set by a test init script: mount the bag as a LIVE slice (the
+		 * ModelProfileSelect may fetch the configured profiles). */
+		__maiChatLive?: boolean;
 		/** Set ONLY by hostile-content execution (its presence is the failure). */
 		__maiPwned?: number;
 	}
@@ -306,8 +309,11 @@ const APP_SOURCE = `
 				policy_revision: 7,
 				status: 'pending',
 				created_by: 'fixture-admin',
-				created_at: '2026-10-16T09:01:30Z',
-				expires_at: '2026-10-16T10:01:30Z',
+				created_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+				// One hour ahead of the real clock: a hardcoded date goes stale
+				// and the panel correctly refuses a decision on an expired
+				// approval (the honest-expiry behavior this fixture must not trip).
+				expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
 				consumed_by: null,
 				consumed_at: null
 			};
@@ -352,7 +358,7 @@ const APP_SOURCE = `
 				bytes: 1234
 			}));
 			const conversation = runRow(runId, serverId, 'running', {
-				requested_grants: payload.capabilities ?? [],
+				requested_grants: payload.allowed_capabilities ?? [],
 				children: rows,
 				attachments,
 				// The producer records the submitted @service chips on the run
@@ -468,8 +474,11 @@ const APP_SOURCE = `
 	// The bag carries the optional draft-context extras (server options for
 	// the picker, mapped services for the @service autocomplete) alongside
 	// the required api slice — the composed desktop passes the same shape.
+	// 'live' mirrors DesktopShell: only a live session's slice marks the
+	// panel free to fetch the configured model profiles.
 	const services = {
 		...chatServices(api),
+		live: window.__maiChatLive === true,
 		serverOptions: [
 			{ id: SERVER_A, label: 'Server Alpha' },
 			{ id: SERVER_B, label: 'Server Beta' }
@@ -925,16 +934,10 @@ async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
 	return page;
 }
 
-async function openOptions(scope: Locator): Promise<void> {
-	const toggle = scope.getByTestId('chat-advanced-toggle');
-	if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
-}
-
 /** Fill the MAIN compose form and submit; waits for the recorded call. */
 async function submitFromHost(page: Page, host: string, message: string): Promise<void> {
 	const scope = page.getByTestId(host);
 	await scope.getByTestId('compose-message').fill(message);
-	await openOptions(scope);
 	await scope.getByTestId('compose-profile').fill('fixture-fast');
 	await scope.getByTestId('chat-submit').click();
 	await expect
@@ -960,15 +963,15 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	await expect(main.getByTestId('history-empty')).toBeVisible();
 	await main.getByTestId('chat-history-toggle').click();
 
-	// Compose in MAIN: message, explicit profile, capability request (with a
-	// duplicate to prove dedup), TWO child tasks, one attachment reference.
+	// Compose in MAIN: message, explicit profile, read-only OFF (default),
+	// one attachment reference. Capabilities and children are NOT sent:
+	// the backend auto-resolves the granted capability set, and the manual
+	// spawn form is gone.
 	await main.getByTestId('compose-message').fill('Review the fixture deployment end to end.');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
-	await main.getByTestId('compose-capabilities').fill('fixture.read, fixture.exec, fixture.read');
-	await main.getByTestId('compose-child-task').fill('child aspect-alpha review');
-	await main.getByTestId('child-add').click();
-	await main.getByTestId('compose-child-task').nth(1).fill('child aspect-beta review');
+	await main.getByTestId('compose-read-only-toggle').click();
+	await expect(main.getByTestId('compose-read-only-toggle')).toHaveAttribute('aria-pressed', 'true');
+	await main.getByTestId('compose-read-only-toggle').click();
 	await main.getByTestId('compose-attachments').fill(OP_ID);
 	await main.getByTestId('chat-submit').click();
 
@@ -982,12 +985,10 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	expect(body.message).toBe('Review the fixture deployment end to end.');
 	expect(body.profile).toBe('fixture-fast');
 	expect(body.role).toBe('administrator');
-	expect(body.mode).toBe('ask');
-	expect(body.capabilities).toEqual(['fixture.read', 'fixture.exec']);
-	expect(body.children).toEqual([
-		{ task: 'child aspect-alpha review' },
-		{ task: 'child aspect-beta review' }
-	]);
+	expect(body.mode).toBe('delegated');
+	expect(body.read_only).toBe(false);
+	expect(body.allowed_capabilities).toBeUndefined();
+	expect(body.children).toBeUndefined();
 	expect(body.attachments).toEqual([{ server_id: SERVER_A, op_id: OP_ID }]);
 
 	// The recorded conversation renders: pinned target, opener message,
@@ -1012,12 +1013,13 @@ test('submit pins the window scope; the recorded conversation renders transcript
 		const list = window.__maiChatApi!.submissions;
 		return list[list.length - 1];
 	});
+	expect(submission.childIds).toEqual([]);
 	await queueStreamPair({
 		frames: [
 			frame(1, 'chat.submitted', {
 				submission_sha256: PAYLOAD_SHA,
-				handler: 'agent.delegate',
-				children: 2,
+				handler: 'agent.run',
+				children: 0,
 				attachments: [{ server_id: SERVER_A, op_id: OP_ID, sha256: ATTACHMENT_SHA, bytes: 1234 }]
 			}),
 			frame(2, 'agent.started', {
@@ -1038,11 +1040,7 @@ test('submit pins the window scope; the recorded conversation renders transcript
 				budget: { context_limit_tokens: 8192, used_chars: 900 },
 				evidence_items: 1
 			}),
-			frame(4, 'agent.delegation_planned', {
-				children: submission.childIds,
-				depth: 1
-			}),
-			frame(5, 'agent.model_round', {
+			frame(4, 'agent.model_round', {
 				round: 1,
 				status: 'tool_calls',
 				tool_calls: [{ seq: 1, capability_id: 'fixture.exec', payload_hash: PAYLOAD_SHA }]
@@ -1053,8 +1051,8 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	// The transcript is a collapsed details accordion — expand it before
 	// reading the recorded events.
 	await main.getByTestId('conversation-transcript').locator('summary').click();
-	// The planned event (seq 4) carries no transcript entry of its own — it
-	// links this window's child-task labels to the value-free child ids.
+	// No child tasks were submitted: the planned event never arrives and the
+	// transcript carries exactly the recorded run facts.
 	await expect(transcript.getByTestId('transcript-entry')).toHaveCount(4);
 	await expect(transcript.getByTestId('transcript-label')).toContainText([
 		'Model bound',
@@ -1067,17 +1065,15 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	// The requested capability renders as the row KEY of the round entry.
 	await expect(transcript.getByText('fixture.exec')).toBeVisible();
 
-	// The composed (not re-implemented) tree shows both children with the
-	// labels this window authored, linked through the planned event order.
+	// The composed (not re-implemented) tree shows the honest empty state:
+	// no child runs exist for this childless submission.
 	const tree = main.getByTestId('conversation-children');
 	await expect(tree).toBeVisible();
-	await expect(tree.getByText('child aspect-alpha review')).toBeVisible();
-	await expect(tree.getByText('child aspect-beta review')).toBeVisible();
+	await expect(tree.getByTestId('children-none')).toContainText('No child runs recorded');
 
 	// The SECOND window pins ITS OWN scope: its submit carries SERVER_B and a
 	// different idempotency key — no hidden global current-server target.
 	await second.getByTestId('compose-message').fill('Second window task');
-	await openOptions(second);
 	await second.getByTestId('compose-profile').fill('fixture-fast');
 	await second.getByTestId('chat-submit').click();
 	await expect
@@ -1354,7 +1350,9 @@ test('Details defaults closed and preserves draft, transcript, scope and subscri
 	await expect(main.getByTestId('conversation-children')).toBeVisible();
 	await main.getByTestId('conversation-transcript').locator('summary').click();
 	await expect(main.getByTestId('transcript-list')).toBeVisible();
-	await main.getByTestId('chat-details-trigger').click();
+	// The expanded panel covers the trigger (its ✕ is the close affordance);
+	// reopening rides the trigger again once the panel is out of the way.
+	await main.getByTestId('chat-details-close').click();
 	await main.getByTestId('chat-details-trigger').click();
 	await expect(main.getByTestId('transcript-list')).toBeVisible();
 	await expect(main.getByTestId('compose-message')).toHaveValue('Unsent next question');
@@ -1388,7 +1386,7 @@ for (const state of ['succeeded', 'failed', 'cancelled']) {
 		await main.getByTestId('conversation-refresh').click();
 		await expect(main.getByTestId('approval-decide')).toHaveCount(0);
 		await expect(main.getByTestId('approval-id')).toHaveText(APPROVAL_ID);
-		await main.getByTestId('chat-details-trigger').click();
+		await main.getByTestId('chat-details-close').click();
 		await expect(main.getByTestId('approval-section')).toBeHidden();
 		await expect(main.getByTestId('approval-warning')).toHaveCount(0);
 		expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
@@ -1483,7 +1481,7 @@ test('stream and refresh failures remain visible with Details closed', async ({ 
 	await page.evaluate(() => window.__maiChatApi!.failNextRead({ status: 503, code: 'unavailable', message: 'Fixture refresh unavailable' }));
 	await main.getByTestId('conversation-refresh').click();
 	await expect(main.locator('.mai-chat__inline-alerts [data-testid="refresh-problem"]')).toContainText('Fixture refresh unavailable');
-	await main.getByTestId('chat-details-trigger').click();
+	await main.getByTestId('chat-details-close').click();
 	await expect(main.locator('.mai-chat__inline-alerts [data-testid="refresh-problem"]')).toBeVisible();
 	await expect(main.locator('p[data-testid="stream-status"]')).toBeHidden();
 });
@@ -1601,9 +1599,9 @@ test('compose validation stays local; a finished conversation replays without in
 	await expect(main.getByText('A message is required.')).toBeVisible();
 	expect((await callsOf(page, 'submitMessage')).length).toBe(0);
 
-	// A malformed attachment reference is a local error too (no request).
+	// A malformed attachment reference is a local error too (no request);
+	// the inline field error renders beside the composer attachments input.
 	await main.getByTestId('compose-message').fill('Hostile attachments are refused locally.');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('compose-attachments').fill('not-a-uuid');
 	await main.getByTestId('chat-submit').click();
@@ -1705,7 +1703,6 @@ test('draft Server Chip: remove → General Consult, re-pick, @service chips; ev
 	// Submit: server_id carries the picked server and the body records the
 	// remaining `@service` chip.
 	await main.getByTestId('compose-message').fill('Consult the pinned services.');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
@@ -1720,7 +1717,7 @@ test('draft Server Chip: remove → General Consult, re-pick, @service chips; ev
 	// Immutable once started: chips lock, remove/pick controls leave the DOM.
 	await expect(main.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
 	await expect(main.getByTestId('chat-service-chip')).toHaveAttribute('data-locked', 'true');
-	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(main.getByTestId('chat-context-locked')).toHaveCount(0);
 	await expect(main.getByTestId('chat-server-chip-remove')).toHaveCount(0);
 	await expect(main.getByTestId('chat-service-chip-remove')).toHaveCount(0);
 	await expect(main.getByTestId('chat-server-picker')).toHaveCount(0);
@@ -1747,7 +1744,6 @@ test('General Consult submit rides the sentinel server id and restores as the co
 	await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
 
 	await main.getByTestId('compose-message').fill('Cross-server consult question.');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect
@@ -1761,7 +1757,7 @@ test('General Consult submit rides the sentinel server id and restores as the co
 	// and it is locked.
 	await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
 	await expect(main.getByTestId('chat-server-chip')).toHaveCount(0);
-	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(main.getByTestId('chat-context-locked')).toHaveCount(0);
 
 	// New Chat restores the default Server Chip.
 	await main.getByTestId('chat-new-session').click();
@@ -1797,7 +1793,7 @@ test('the floating chat history selector restores the transcript and the locked 
 	await expect(main.getByTestId('chat-server-chip')).toContainText('Server Alpha');
 	await expect(main.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
 	await expect(main.getByTestId('chat-service-chip')).toHaveCount(2);
-	await expect(main.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(main.getByTestId('chat-context-locked')).toHaveCount(0);
 	await expect(main.getByTestId('compose-profile')).toHaveValue('fixture-fast');
 	await expect(main.getByTestId('chat-server-chip-remove')).toHaveCount(0);
 	await expect(main.getByTestId('chat-service-chip-remove')).toHaveCount(0);
@@ -1833,7 +1829,6 @@ test('the mai:chat-focus-service window event pre-populates a new draft and neve
 
 	// Start the chat; the recorded conversation locks to its scope.
 	await main.getByTestId('compose-message').fill('Seam-started conversation.');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('fixture-fast');
 	await main.getByTestId('chat-submit').click();
 	await expect
@@ -1873,12 +1868,11 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 640 
 		// Isolate a single standalone host, without overriding any ChatPanel style.
 		await page.addStyleTag({ content: 'body { margin: 0; } #app > section:not([data-testid="host-main"]) { display:none; }' });
 		const main = page.getByTestId('host-main');
-		await expect(main.getByTestId('chat-advanced-toggle')).toHaveAttribute('aria-expanded', 'false');
-		await expect(main.getByTestId('compose-profile')).toBeHidden();
+		await expect(main.getByTestId('compose-profile')).toBeVisible();
+		await expect(main.getByTestId('compose-read-only-toggle')).toBeVisible();
 		await expect(main.getByTestId('chat-history')).toHaveCount(0);
 		const longText = 'LongWord'.repeat(100) + '\n' + 'Full width paragraph. '.repeat(150);
 		await submitFromHost(page, 'host-main', longText);
-		await main.getByTestId('chat-advanced-toggle').click();
 		await queueStreamPair({ frames: [
 			frame(1, 'agent.started', { model: 'fixture-model', profile: 'fixture-fast' }),
 			frame(2, 'agent.model_round', { round: 1, status: 'tool_calls', tool_calls: [{seq: 1, capability_id: 'fixture.read', payload_hash: PAYLOAD_SHA}] }),
@@ -1924,13 +1918,15 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 640 
 			expect(result.composer.bottom).toBeCloseTo(result.body.bottom, 0);
 		}
 		await geometry();
+		// The read-only toggle is part of the always-visible composer bar; it
+		// is exercised while the details sheet is CLOSED (the open sheet
+		// overlays the composer and its ✕ is the close affordance).
+		await main.getByTestId('compose-read-only-toggle').click();
+		await geometry();
+		await main.getByTestId('compose-read-only-toggle').click();
 		await main.getByTestId('chat-details-trigger').click();
 		await main.getByTestId('conversation-transcript').locator('summary').click();
 		await geometry();
-		await openOptions(main);
-		await geometry();
-		await main.getByTestId('compose-capabilities').fill('fixture.read');
-		await main.getByTestId('chat-advanced-toggle').click();
 		await main.getByTestId('conversation-refresh').focus();
 		await page.keyboard.press('Escape');
 		await expect(main.getByTestId('chat-details-trigger')).toBeFocused();
@@ -1957,26 +1953,67 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 640 
 		await main.getByTestId('chat-details-trigger').click();
 		await expect(main.getByTestId('approval-hash')).toHaveText(PAYLOAD_SHA);
 		await expect(main.getByTestId('approval-server')).toHaveText(SERVER_A);
-		await openOptions(main);
 		const send = await main.getByTestId('chat-submit').boundingBox();
 		expect(send!.y + send!.height).toBeLessThanOrEqual(viewport.height);
 		expect(await callsOf(page, 'decideApproval')).toHaveLength(0);
 	});
 }
 
-test('closed Options validation remains actionable without submitting', async ({page}) => {
+test('profile validation stays inline and blocks submission without a request', async ({page}) => {
 	await openFixture(page, 'compose');
 	const main = page.getByTestId('host-main');
-	await openOptions(main);
 	await main.getByTestId('compose-profile').fill('');
-	await main.getByTestId('chat-advanced-toggle').click();
 	await main.getByTestId('compose-message').fill('Message without a required profile');
 	await main.getByTestId('chat-submit').click();
-	await expect(main.getByTestId('compose-options-error')).toBeVisible();
-	await main.getByTestId('compose-options-error').getByRole('button', {name:'Options'}).click();
+	await expect(main.getByText('A model profile is required.')).toBeVisible();
 	await expect(main.getByTestId('compose-profile')).toBeVisible();
 	await expect(main.getByTestId('compose-message')).toHaveValue('Message without a required profile');
 	expect(await callsOf(page, 'submitMessage')).toEqual([]);
+});
+
+test('live model profiles expose ONLY the configured profiles and auto-select the stored default', async ({
+	page
+}) => {
+	// The real wire reads: GET /api/v1/models/profiles + /models/selection.
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [
+					{ name: 'alpha-live', revision: 2 },
+					{ name: 'beta-live', revision: 1 }
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ connection: 'alpha', profile: 'beta-live' })
+		})
+	);
+	await page.addInitScript((value) => {
+		window.__maiChatLive = value;
+	}, true);
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+
+	// The stored default selection auto-selects (never the fake 'default').
+	await expect(main.getByTestId('compose-profile')).toHaveValue('beta-live');
+
+	// The dropdown lists ONLY the configured profiles — no merged static
+	// fixture vocabulary ('default', 'fast', 'reasoning', 'fixture-fast').
+	const options = main
+		.getByTestId('compose-profile-select')
+		.locator('option');
+	await expect(options).toHaveText(['Select profile…', 'beta-live', 'alpha-live']);
+
+	// An unknown current value re-points at the stored default (the submit
+	// body would never carry a profile the backend does not store).
+	await main.getByTestId('compose-profile').fill('fixture-fast');
+	await expect(main.getByTestId('compose-profile')).toHaveValue('beta-live');
 });
 
 test('chat history limits initial page to 10 conversations and loads more on demand', async ({

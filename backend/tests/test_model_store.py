@@ -550,6 +550,11 @@ def test_bind_defaults_to_selection_and_accepts_explicit_names(
 def test_bind_rejects_invalid_explicit_pair(tmp_path: Path) -> None:
     store = ModelConfigStore(tmp_path / "data-root")
     _write_pair(store)
+    store.write_connection(
+        OTHER_CONNECTION_NAME,
+        _connection_text(OTHER_CONNECTION_NAME),
+        expected_revision=0,
+    )
     store.write_profile(
         OTHER_PROFILE_NAME,
         _profile_text(OTHER_PROFILE_NAME, OTHER_CONNECTION_NAME),
@@ -560,6 +565,53 @@ def test_bind_rejects_invalid_explicit_pair(tmp_path: Path) -> None:
     assert excinfo.value.fields["connection"] == (
         ModelConfigErrorCode.INVALID_SELECTION.value
     )
+
+
+def test_bind_resolves_paired_connection_for_a_profile_alone(
+    tmp_path: Path,
+) -> None:
+    """`bind(profile=…)` without a connection resolves the profile's OWN
+    paired connection — never the stored selection's (a chat profile
+    selection binds cleanly without naming the connection)."""
+    store = ModelConfigStore(tmp_path / "data-root")
+    _write_pair(store)
+    store.write_connection(
+        OTHER_CONNECTION_NAME,
+        _connection_text(OTHER_CONNECTION_NAME),
+        expected_revision=0,
+    )
+    store.write_profile(
+        OTHER_PROFILE_NAME,
+        _profile_text(OTHER_PROFILE_NAME, OTHER_CONNECTION_NAME),
+        expected_revision=0,
+    )
+    # The stored selection names the OTHER pair: a profile-only bind must
+    # still resolve the profile's own stored pairing.
+    store.set_selection(
+        OTHER_CONNECTION_NAME, OTHER_PROFILE_NAME, expected_revision=0
+    )
+    binding = store.bind(profile=PROFILE_NAME)
+    assert binding.connection.name == CONNECTION_NAME
+    assert binding.profile.name == PROFILE_NAME
+    other = store.bind(profile=OTHER_PROFILE_NAME)
+    assert other.connection.name == OTHER_CONNECTION_NAME
+    assert other.profile.name == OTHER_PROFILE_NAME
+
+
+def test_bind_profile_alone_still_rejects_pairing_drift(tmp_path: Path) -> None:
+    """A stored profile whose pairing drifted from its stored connection
+    document is a classified rejection, never a silent retarget."""
+    store = ModelConfigStore(tmp_path / "data-root")
+    _write_pair(store)
+    # Edit the profile to name a connection that is not stored at all.
+    store.write_profile(
+        PROFILE_NAME,
+        _profile_text(PROFILE_NAME, OTHER_CONNECTION_NAME),
+        expected_revision=1,
+    )
+    with pytest.raises(ModelStoreError) as excinfo:
+        store.bind(profile=PROFILE_NAME)
+    assert _codes_of(excinfo.value) is ModelStoreErrorCode.NOT_FOUND
 
 
 def test_binding_retains_profile_revision_across_edit(tmp_path: Path) -> None:

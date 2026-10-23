@@ -62,6 +62,7 @@ from mai.agents.budgets import (
 )
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.logs import write_evidence_artifact
 from mai.contracts.jobs import RunState, parse_job_event
 
@@ -355,7 +356,12 @@ def _mutation_headers(jar: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-async def create_profile(app: FastAPI, jar: dict[str, str], name: str) -> uuid.UUID:
+async def create_profile(
+    app: FastAPI,
+    jar: dict[str, str],
+    name: str,
+    capabilities: list[str] | None = None,
+) -> uuid.UUID:
     """Create one canonical server profile through the real HTTP surface.
 
     The identity is MINTED server-side (C01 rule 1: opaque identities are
@@ -377,7 +383,7 @@ async def create_profile(app: FastAPI, jar: dict[str, str], name: str) -> uuid.U
                 "credential_ref": "MAI_SSH_KEY_FIXTURE",
             },
             "privilege": "none",
-            "capabilities": [],
+            "capabilities": capabilities if capabilities is not None else [],
         },
         headers=_mutation_headers(jar),
         cookies=jar,
@@ -589,10 +595,14 @@ def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         conn.execute(
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
+            "job_schedules, job_events, job_steps, notification_alerts, "
+            "observation_findings, server_observations, job_runs, approvals, "
+            "application_projection, application_projection_journal, "
+            "knowledge_doc_chunks, knowledge_documents, "
             "profile_projection_journal, profile_projection, admin_sessions, "
             "admin_credential, alembic_version"
         )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -884,7 +894,7 @@ async def submit_chat(
     *,
     message: str = "investigate the fixture service",
     profile: str = "fast",
-    capabilities: list[str] | None = None,
+    allowed_capabilities: list[str] | None = None,
     children: list[dict] | None = None,
     attachments: list[dict] | None = None,
     **extra: Any,
@@ -895,8 +905,8 @@ async def submit_chat(
         "message": message,
         "profile": profile,
     }
-    if capabilities is not None:
-        body["capabilities"] = capabilities
+    if allowed_capabilities is not None:
+        body["allowed_capabilities"] = allowed_capabilities
     if children is not None:
         body["children"] = children
     if attachments is not None:
@@ -1069,7 +1079,7 @@ async def test_submit_creates_durable_agent_job_with_recorded_references(
         jar,
         run_id,
         server_a,
-        capabilities=[READ_CAP],
+        allowed_capabilities=[READ_CAP],
         attachments=[{"server_id": str(server_a), "op_id": str(op_id)}],
     )
     assert response.status == 201, response.body
@@ -1080,7 +1090,16 @@ async def test_submit_creates_durable_agent_job_with_recorded_references(
     assert view["server_id"] == str(server_a)
     assert view["depth"] == 0
     assert view["model_profile"] == "fast"
-    assert view["requested_grants"] == [READ_CAP]
+    # An explicit request rides with the internal-API tool surface and the
+    # web research tools (the documented explicit-path union).
+    assert view["requested_grants"] == sorted(
+        {
+            READ_CAP,
+            *INTERNAL_API_CAPABILITY_IDS,
+            "web.search",
+            "web.read",
+        }
+    )
     assert view["attachments"] == [
         {
             "server_id": str(server_a),
@@ -1120,6 +1139,212 @@ async def test_submit_creates_durable_agent_job_with_recorded_references(
     # The durable intent is a valid agent-run payload (the ONE producer
     # accepted it at submit; the digest record covers the whole submission).
     assert submitted.data["submission_sha256"]
+
+
+async def test_submit_auto_resolves_default_capabilities(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """Omitted ``allowed_capabilities`` runs EVERY capability granted for
+    the target: grant-store entries, server-profile capabilities (the
+    worker's ``host_shell`` → ``host.shell`` mapping), enabled plugin
+    bindings and the built-in defaults — under the delegated mode."""
+    created = await submit_chat(chat_app, jar, uuid.uuid4(), server_a)
+    assert created.status == 201, created.body
+    view = created.json()["conversation"]
+    # No grant config stored, empty profile capabilities, no plugins:
+    # the built-in surface alone (fixture scope: server_a has no grants).
+    assert view["requested_grants"] == sorted(
+        {*INTERNAL_API_CAPABILITY_IDS, *chat_surface.BUILTIN_CHAT_CAPABILITIES}
+    )
+
+    # The SAME omitted request on General Consult resolves the same
+    # controller-side defaults without any host profile.
+    consult = await submit_chat(
+        chat_app, jar, uuid.uuid4(), uuid.UUID(int=0)
+    )
+    assert consult.status == 201, consult.body
+    assert consult.json()["conversation"]["requested_grants"] == (
+        view["requested_grants"]
+    )
+
+    # Server-profile capabilities join through the exact mapping the
+    # worker's grant bootstrap applies (raw slug + normalized + specials).
+    host_server = await create_profile(
+        chat_app, jar, "fixture-host", capabilities=["host_shell", "fixture.read"]
+    )
+    hosted = await submit_chat(chat_app, jar, uuid.uuid4(), host_server)
+    assert hosted.status == 201, hosted.body
+    hosted_grants = set(hosted.json()["conversation"]["requested_grants"])
+    assert {"host_shell", "host.shell", "fixture.read"} <= hosted_grants
+
+    # The durable row carries the auto-resolved grant set.
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT requested_grants FROM job_runs WHERE run_id = %s",
+            (uuid.UUID(hosted.json()["conversation"]["run_id"]),),
+        ).fetchone()
+    assert row is not None
+    assert set(row["requested_grants"]) == hosted_grants
+
+
+async def test_submit_auto_resolution_includes_grant_store_entries(
+    chat_app, jar, server_a
+) -> None:
+    """Grant-store entries scoped to the target join the auto-resolved
+    set; entries scoped to another server do not."""
+    chat_app.state.grants.write(
+        {
+            "policy": {"revision": 1, "denied_capabilities": []},
+            "grants": [
+                {
+                    "capability_id": "fixture.granted",
+                    "server_ids": [str(server_a)],
+                },
+                {
+                    "capability_id": "fixture.elsewhere",
+                    "server_ids": [str(SERVER_B)],
+                },
+            ],
+        },
+        expected_revision=0,
+    )
+    created = await submit_chat(chat_app, jar, uuid.uuid4(), server_a)
+    assert created.status == 201, created.body
+    grants = set(created.json()["conversation"]["requested_grants"])
+    assert "fixture.granted" in grants
+    assert "fixture.elsewhere" not in grants
+
+
+async def test_submit_read_only_strips_mutation_capabilities(
+    chat_app, jar, server_a
+) -> None:
+    """``read_only=True`` strips the non-read vocabulary and pins the
+    read fallbacks; the flag participates in the whole-submission
+    digest (a flipped flag for the same key is a DIFFERENT submission)."""
+    run_id = uuid.uuid4()
+    created = await submit_chat(
+        chat_app,
+        jar,
+        run_id,
+        server_a,
+        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        read_only=True,
+    )
+    assert created.status == 201, created.body
+    grants = set(created.json()["conversation"]["requested_grants"])
+    # The static mutation vocabulary is stripped even without a registry.
+    assert "host.shell" not in grants
+    assert "app.adopt" not in grants
+    assert "app.unadopt" not in grants
+    assert "app.upsert_map_entry" not in grants
+    assert "app.delete_map_entry" not in grants
+    assert "secret.store" not in grants
+    # Read capabilities (explicit and internal) survive; the read
+    # fallbacks are always ensured so the context tuple is non-empty.
+    assert READ_CAP in grants
+    assert PRIV_CAP in grants  # no registry on the API process: unseen
+    assert {"chat.read_session", "docs.retrieve"} <= grants
+
+    # Identical read-only resubmission attaches; flipping the flag is a
+    # new submission (409 for the same idempotency key).
+    duplicate = await submit_chat(
+        chat_app,
+        jar,
+        run_id,
+        server_a,
+        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        read_only=True,
+    )
+    assert duplicate.status == 200, duplicate.body
+    assert duplicate.json()["deduplicated"] is True
+    writable = await submit_chat(
+        chat_app,
+        jar,
+        run_id,
+        server_a,
+        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        read_only=False,
+    )
+    assert writable.status == 409
+    assert _error(writable)["code"] == "conflict"
+
+
+async def test_submit_read_only_filters_registry_effect_classes(
+    chat_app, jar, server_a
+) -> None:
+    """Registry descriptors with ``effect_class != "read"`` are stripped
+    from a read-only conversation's resolved set."""
+    from types import SimpleNamespace
+
+    chat_app.state.registry = SimpleNamespace(
+        list_capabilities=lambda: (
+            SimpleNamespace(identifier=READ_CAP, effect_class="read"),
+            SimpleNamespace(identifier=PRIV_CAP, effect_class="privileged"),
+        )
+    )
+    try:
+        created = await submit_chat(
+            chat_app,
+            jar,
+            uuid.uuid4(),
+            server_a,
+            allowed_capabilities=[READ_CAP, PRIV_CAP],
+            read_only=True,
+        )
+        assert created.status == 201, created.body
+        grants = set(created.json()["conversation"]["requested_grants"])
+        assert READ_CAP in grants
+        assert PRIV_CAP not in grants
+        assert {"chat.read_session", "docs.retrieve"} <= grants
+    finally:
+        chat_app.state.registry = None
+
+
+def test_read_only_instruction_is_pinned_onto_the_task() -> None:
+    """The read-only suffix is the frozen wording, appended to the task
+    and bounded to the producer's task limit."""
+    from pydantic import ValidationError
+
+    body = chat_surface.ChatSubmitBody(
+        run_id=str(uuid.uuid4()),
+        message="inspect the service",
+        profile="fast",
+        read_only=True,
+    )
+    context = chat_surface.ExecutionContext(
+        principal="principal",
+        server_id=uuid.UUID(body.server_id),
+        run_id=uuid.UUID(body.run_id),
+        parent_scope=None,
+        profile_revision="1",
+        prompt_revision="1",
+        credential_references=(),
+        allowed_capabilities=("chat.read_session",),
+        mode=chat_surface.PolicyMode.DELEGATED,
+    )
+    document = chat_surface._agent_document(body, body.run_id, body.server_id, context)
+    assert document["task"].startswith("inspect the service")
+    assert document["task"].endswith(chat_surface.READ_ONLY_INSTRUCTION)
+
+    # A message at the producer's cap yields its tail so the enriched
+    # task still fits (never a validation rejection).
+    huge = chat_surface.ChatSubmitBody(
+        run_id=str(uuid.uuid4()),
+        message="x" * chat_surface.agent_run.MAX_TASK_CHARS,
+        profile="fast",
+        read_only=True,
+    )
+    with pytest.raises(ValidationError):
+        chat_surface.ChatSubmitBody(
+            run_id=str(uuid.uuid4()),
+            message="x" * (chat_surface.agent_run.MAX_TASK_CHARS + 1),
+            profile="fast",
+        )
+    huge_document = chat_surface._agent_document(
+        huge, huge.run_id, huge.server_id, context
+    )
+    assert len(huge_document["task"]) <= chat_surface.agent_run.MAX_TASK_CHARS
+    assert huge_document["task"].endswith(chat_surface.READ_ONLY_INSTRUCTION)
 
 
 async def test_duplicate_submit_attaches_and_conflicting_submit_rejects(
@@ -1517,7 +1742,7 @@ async def test_live_conversation_executes_streams_and_reconnects(
         run_id,
         server_a,
         message="check the fixture service with aspect-alpha focus",
-        capabilities=[READ_CAP],
+        allowed_capabilities=[READ_CAP],
         attachments=[{"server_id": str(server_a), "op_id": str(op_id)}],
     )
     assert created.status == 201, created.body
@@ -1638,7 +1863,7 @@ async def test_live_delegation_tree_parent_and_child_events(
         run_id,
         server_a,
         message="coordinate the fixture review",
-        capabilities=[READ_CAP],
+        allowed_capabilities=[READ_CAP],
         children=[
             {"task": "child aspect-alpha review", "capabilities": [READ_CAP]},
             {"task": "child aspect-beta review", "capabilities": [READ_CAP]},
@@ -1755,7 +1980,7 @@ async def test_live_budgeted_delegation_enforces_the_root_budget(
         run_id,
         server_a,
         message="coordinate the budgeted fixture review",
-        capabilities=[READ_CAP],
+        allowed_capabilities=[READ_CAP],
         children=[
             {"task": "child aspect-alpha review", "capabilities": [READ_CAP]},
             {"task": "child aspect-beta review", "capabilities": [READ_CAP]},
@@ -1815,7 +2040,7 @@ async def test_cancel_records_request_and_stops_the_conversation(
     conversation that never started lands cancelled deterministically)."""
     run_id = uuid.uuid4()
     created = await submit_chat(
-        chat_app, jar, run_id, server_a, capabilities=[READ_CAP]
+        chat_app, jar, run_id, server_a, allowed_capabilities=[READ_CAP]
     )
     assert created.status == 201, created.body
 
@@ -1872,7 +2097,7 @@ async def test_session_continuation_and_steering_keep_single_history_entry(
             "session_run_id": str(first_id),
             "message": "steer the active session",
             "profile": "fast",
-            "capabilities": [READ_CAP],
+            "allowed_capabilities": [READ_CAP],
         },
         headers=_mutation_headers(jar),
         cookies=jar,
@@ -1906,7 +2131,7 @@ async def test_session_continuation_and_steering_keep_single_history_entry(
             "session_run_id": str(first_id),
             "message": "follow up after terminal",
             "profile": "fast",
-            "capabilities": [READ_CAP],
+            "allowed_capabilities": [READ_CAP],
         },
         headers=_mutation_headers(jar),
         cookies=jar,

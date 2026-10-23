@@ -2424,12 +2424,17 @@ export interface components {
          *     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
          *     rule 5). ``profile`` names the model profile selection explicitly
          *     (C06 rule 1); ``connection`` stays optional (the model store's
-         *     stored pairing when omitted). ``capabilities`` is the conversation's
-         *     explicit parent grant request — omitted means NO capability, never a
-         *     default grant; delegation children are clamped to its intersection.
-         *     ``root_budget`` is the optional aggregate delegation budget (C05
-         *     rule 7): frozen on the run row, narrowed against the delegation
-         *     gates, and enforced by the root ledger across the whole tree.
+         *     stored pairing when omitted). ``allowed_capabilities`` is the
+         *     conversation's explicit parent grant request — omitted or empty
+         *     means the agent runs with EVERY capability granted for the target
+         *     server (grant store, server-profile capabilities, enabled plugin
+         *     bindings and the built-in defaults) under the default ``delegated``
+         *     mode; delegation children are clamped to its intersection.
+         *     ``read_only`` strips every non-read capability and pins a strict
+         *     non-mutation instruction onto the agent task. ``root_budget`` is
+         *     the optional aggregate delegation budget (C05 rule 7): frozen on
+         *     the run row, narrowed against the delegation gates, and enforced
+         *     by the root ledger across the whole tree.
          */
         ChatSubmitBody: {
             /** Run Id */
@@ -2452,12 +2457,17 @@ export interface components {
             role: string;
             /** Rounds */
             rounds?: number | null;
-            /** @default ask */
+            /** @default delegated */
             mode: components["schemas"]["PolicyMode"];
             /** Credential References */
             credential_references?: string[];
-            /** Capabilities */
-            capabilities?: string[];
+            /** Allowed Capabilities */
+            allowed_capabilities?: string[] | null;
+            /**
+             * Read Only
+             * @default false
+             */
+            read_only: boolean;
             /** Children */
             children?: components["schemas"]["ChildBody"][];
             root_budget?: components["schemas"]["RootBudgetBody"] | null;

@@ -657,7 +657,8 @@
 				message,
 				profile: attachProfile.trim(),
 				role: 'administrator',
-				mode: 'ask'
+				mode: 'ask',
+				read_only: false
 			});
 			if (disposed) return;
 			attachDoneRunId = created.conversation.run_id;

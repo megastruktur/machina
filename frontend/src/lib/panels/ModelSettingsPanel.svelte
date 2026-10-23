@@ -1200,11 +1200,15 @@
 			{/if}
 		</section>
 
-		<!-- ===================== Selection ===================== -->
-		<section class="mai-model-settings__section" aria-label="Selection" data-testid="selection-section">
+		<!-- ===================== Default model ===================== -->
+		<section
+			class="mai-model-settings__section"
+			aria-label="Default model"
+			data-testid="selection-section"
+		>
 			<header class="mai-model-settings__section-header">
 				<span class="mai-model-settings__section-icon"><Pin size={16} aria-hidden="true" /></span>
-				<h3 class="mai-model-settings__heading">Selection</h3>
+				<h3 class="mai-model-settings__heading">Default model</h3>
 			</header>
 			<p class="mai-model-settings__hint">
 				The default (connection, profile) pair. Changing it never retargets a running conversation:

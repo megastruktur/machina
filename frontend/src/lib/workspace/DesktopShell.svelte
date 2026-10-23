@@ -608,7 +608,7 @@
 		return {
 			async submitMessage(payload) {
 				const base = rowOf(payload.run_id, payload.server_id, payload.profile);
-				base.requested_grants = [...(payload.capabilities ?? [])];
+				base.requested_grants = [...(payload.allowed_capabilities ?? [])];
 				base.children = (payload.children ?? []).map((child, index) => ({
 					...rowOf(
 						`${payload.run_id}-child-${String(index + 1)}`,

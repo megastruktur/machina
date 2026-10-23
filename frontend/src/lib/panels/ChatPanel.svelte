@@ -290,11 +290,8 @@
 	const REFRESH_DEBOUNCE_MS = 150;
 	/** Rendered-transcript cap: a long replay cannot grow the DOM without bound. */
 	const MAX_RENDERED_EVENTS = 500;
-	/** Explicit children per submission (delegate.MAX_CHILDREN_PER_RUN). */
-	const MAX_CHILDREN = 8;
-	/** The frozen default role/mode this panel submits (chat.py DEFAULT_*). */
+	/** The frozen default role this panel submits (chat.py DEFAULT_ROLE). */
 	const SUBMIT_ROLE = 'administrator';
-	const SUBMIT_MODE = 'ask' as const;
 
 	/** Run lifecycle states after which nothing new can be learned (C05 rule 2). */
 	const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(['succeeded', 'failed', 'cancelled']);
@@ -388,27 +385,11 @@
 
 	let composeMessage = $state('');
 	let composeProfile = $state('default');
-	let composeModeOverride = $state<'ask' | 'delegated' | null>(null);
-	const composeMode = $derived<'ask' | 'delegated'>(
-		composeModeOverride ?? (profilesLive ? 'delegated' : SUBMIT_MODE)
-	);
-	let composeCapabilities = $state('');
-	let composeChildren = $state<string[]>(['']);
+	let readOnlyMode = $state(false);
 	let composeAttachments = $state('');
 	let composeBusy = $state(false);
 	let composeProblem = $state<{ code: string; message: string } | null>(null);
 	let composeFields = $state<Record<string, string>>({});
-
-	const childSlots = $derived(composeChildren.length);
-
-	function addChildSlot(): void {
-		if (composeChildren.length >= MAX_CHILDREN) return;
-		composeChildren = [...composeChildren, ''];
-	}
-
-	function removeChildSlot(index: number): void {
-		composeChildren = composeChildren.filter((_, i) => i !== index);
-	}
 
 	/** Local pre-flight: only the checks with a user-fixable answer here. */
 	function composeFieldErrors(): Record<string, string> {
@@ -428,40 +409,6 @@
 		const serverId = generalConsultMode
 			? GLOBAL_CONSULT_SERVER_ID
 			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
-		const tasks = composeChildren.map((task) => task.trim()).filter((task) => task !== '');
-		const explicitCaps = parseNameList(composeCapabilities);
-		const effectiveCaps =
-			explicitCaps.length > 0
-				? explicitCaps
-				: profilesLive && serverId !== GLOBAL_CONSULT_SERVER_ID
-					? [
-							'host.logs',
-							'host.shell',
-							'service.http',
-							'docs.retrieve',
-							'web.search',
-							'web.read',
-							'app.discover',
-							'app.list_adopted',
-							'app.adopt',
-							'app.unadopt',
-							'app.upsert_map_entry',
-							'app.delete_map_entry',
-							'chat.read_session'
-						]
-					: profilesLive
-						? [
-								'web.search',
-								'web.read',
-								'app.discover',
-								'app.list_adopted',
-								'app.adopt',
-								'app.unadopt',
-								'app.upsert_map_entry',
-								'app.delete_map_entry',
-								'chat.read_session'
-							]
-						: [];
 		const userPrompt = composeMessage.trim();
 		let fullMessage = userPrompt;
 		if (display !== null && !jobInProgress) {
@@ -491,9 +438,12 @@
 			message: fullMessage,
 			profile: composeProfile.trim(),
 			role: SUBMIT_ROLE,
-			mode: composeMode,
-			capabilities: effectiveCaps,
-			children: tasks.map((task) => ({ task })),
+			// Auto-capabilities: the backend resolves every capability granted
+			// for the target when `allowed_capabilities` is omitted; the
+			// delegated mode runs them autonomously. Read-only strips the
+			// mutation surface server-side (the instruction block rides too).
+			mode: 'delegated',
+			read_only: readOnlyMode,
 			attachments: parseNameList(composeAttachments).map((opId) => ({
 				server_id: serverId,
 				op_id: opId
@@ -516,7 +466,6 @@
 		if (Object.keys(composeFields).length > 0) return;
 		const rawUserPrompt = composeMessage.trim();
 		const body = buildSubmitBody(crypto.randomUUID());
-		const childTasks = body.children ?? [];
 		composeBusy = true;
 		try {
 			const created = await api.submitMessage(body);
@@ -550,12 +499,10 @@
 			} else {
 				authoredLabels.clear();
 			}
-			// This window authored the submission: the message and the ordered
-			// child tasks are the labels the tree may render (child ids arrive
-			// value-free on the planned event, in body order — plan_children).
+			// This window authored the submission: the message is the root
+			// label the tree may render.
 			authoredLabels.set(created.conversation.run_id, rawUserPrompt);
 			saveStoredAuthored(authoredLabels);
-			pendingChildTasks = childTasks.map((child) => child.task);
 			if (steeredInPlace && display !== null) {
 				taskLabels = { ...taskLabels, [display.run_id]: rawUserPrompt };
 				stopStreamReveal();
@@ -568,7 +515,6 @@
 				openConversation(created.conversation, isFollowUp);
 			}
 			composeMessage = '';
-			composeChildren = [''];
 			composeAttachments = '';
 			void loadHistory();
 		} catch (error) {
@@ -824,7 +770,6 @@
 	let authoredLabels = $state(loadStoredAuthored());
 	let storedTurnsByRun = $state(loadStoredTurns());
 	let supersededRunIds = $state(loadStoredSuperseded());
-	let pendingChildTasks = $state<string[]>([]);
 	let taskLabels = $state<Record<string, string>>({});
 
 	function openConversation(view: ConversationView, keepPriorTurns = false): void {
@@ -861,8 +806,8 @@
 	/**
 	 * `+ New Chat`: drop the open conversation, release its stream and reset
 	 * the composer to a fresh UNLOCKED draft — the default Server Chip back
-	 * on the pinned scope, no `@service` tags, no profile/capability/child
-	 * residue, history untouched.
+	 * on the pinned scope, no `@service` tags, no profile/read-only residue,
+	 * history untouched.
 	 */
 	function newChat(): void {
 		finishStream();
@@ -881,10 +826,8 @@
 		detailsOpen = false;
 		composeMessage = '';
 		composeProfile = 'default';
-		composeModeOverride = null;
-		composeChildren = [''];
+		readOnlyMode = false;
 		composeAttachments = '';
-		composeCapabilities = '';
 		composeFields = {};
 		composeProblem = null;
 		draftServerOverride = undefined;
@@ -1401,16 +1344,9 @@
 				break;
 			}
 			case 'agent.delegation_planned': {
-				// The planned child ids are in submitted-body order (frozen by
-				// plan_children) — the ONE truthful link to this window's labels.
-				if (pendingChildTasks.length > 0) {
-					const ids = asStringArray(recordOf(data)?.children);
-					const next = { ...taskLabels };
-					const bound = Math.min(ids.length, pendingChildTasks.length);
-					for (let index = 0; index < bound; index += 1) next[ids[index]] = pendingChildTasks[index];
-					taskLabels = next;
-					pendingChildTasks = [];
-				}
+				// The manual child-task form is gone: this panel no longer
+				// submits children, so there are no opener-authored labels
+				// to bind (a history-opened conversation renders ids only).
 				break;
 			}
 			default:
@@ -1798,33 +1734,11 @@
 		return 'Initializing cogitator & assembling server context…';
 	});
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
-	let advancedOpen = $state(false);
 	let detailsOpen = $state(false);
 	let stoppingRun = $state(false);
 	const canStopRun = $derived(
 		api !== null && display !== null && jobInProgress && !cancelRequested && !stoppingRun
 	);
-
-	function toggleOptionsDrawer(): void {
-		const next = !advancedOpen;
-		advancedOpen = next;
-		if (next) detailsOpen = false;
-	}
-
-	function handleOptionsKeydown(e: KeyboardEvent): void {
-		if (e.key === 'Escape' && advancedOpen) {
-			e.stopPropagation();
-			advancedOpen = false;
-			const btn = document.getElementById(`${uid}-options-trigger`);
-			btn?.focus();
-		}
-	}
-
-	$effect(() => {
-		if (detailsOpen) {
-			advancedOpen = false;
-		}
-	});
 
 	async function stopActiveConversation(): Promise<void> {
 		if (api === null || display === null || !jobInProgress || cancelRequested || stoppingRun) return;
@@ -1994,11 +1908,6 @@
 								@{tag}
 							</Chip>
 						{/each}
-						{#if chatContextLocked}
-							<span class="mai-chat__lock" data-testid="chat-context-locked">
-								🔒 Server &amp; @service context locked for this session
-							</span>
-						{/if}
 					</div>
 
 					{#if !chatContextLocked}
@@ -2064,13 +1973,10 @@
 					{/if}
 				</div>
 
-				<!-- Right side of the header: Noosphere title + Options toggle + dock collapse button (when docked)
-				     plus sr-only / standalone New Chat & History controls. -->
+				<!-- Right side of the header: working badge (when docked) and the dock
+				     collapse button, plus sr-only / standalone New Chat & History controls. -->
 				<div class="mai-chat__header-right">
 					{#if isDocked}
-						<span class="mai-chat__noosphere-title" data-testid="chat-noosphere-title">
-							<span class:mai-chat__cog-spin={jobInProgress} aria-hidden="true">⚙</span> Noosphere
-						</span>
 						{#if jobInProgress}
 							<span class="mai-chat__badge mai-chat__badge--active" data-testid="chat-header-working">
 								WORKING · {elapsedSeconds}s
@@ -2079,18 +1985,6 @@
 					{:else}
 						<h3 class="mai-chat__title">Conversation</h3>
 					{/if}
-					<Button
-						id="{uid}-options-trigger"
-						size="sm"
-						pill
-						variant="secondary"
-						onclick={toggleOptionsDrawer}
-						aria-expanded={advancedOpen}
-						aria-controls="{uid}-options"
-						data-testid="chat-advanced-toggle"
-					>
-						{advancedOpen ? 'Hide options' : 'Options'}
-					</Button>
 					{#if isDocked}
 						<Button
 							size="sm"
@@ -2589,7 +2483,12 @@
 
 				<div class="mai-chat__children" data-testid="conversation-children">
 					<h5>Delegated children</h5>
-					<DelegationTree conversation={display} api={api} taskLabels={taskLabels} />
+					<DelegationTree
+						conversation={display}
+						api={api}
+						taskLabels={taskLabels}
+						showCancel={false}
+					/>
 				</div>
 				</DetailsDisclosure>
 			{/if}
@@ -2597,6 +2496,34 @@
 
 		<section class="mai-chat__section mai-chat__section--compose" aria-label="Compose" data-testid="chat-compose">
 			<div class="mai-chat__form">
+				<div class="mai-chat__composer-top">
+					<ModelProfileSelect
+						compact={isDocked}
+						bind:value={composeProfile}
+						error={composeFields.profile ?? ''}
+						testId="compose-profile"
+						live={profilesLive}
+					/>
+					<Field
+						class="mai-chat__composer-attachments"
+						label="Attachments"
+						compact
+						bind:value={composeAttachments}
+						data-testid="compose-attachments"
+						error={composeFields.attachments ?? ''}
+						hint="Op ids of stored artifacts of this server (comma-separated); references only."
+					/>
+					<Button
+						pill
+						size="sm"
+						variant={readOnlyMode ? 'primary' : 'secondary'}
+						aria-pressed={readOnlyMode}
+						onclick={() => (readOnlyMode = !readOnlyMode)}
+						data-testid="compose-read-only-toggle"
+					>
+						{readOnlyMode ? 'Read-only ON' : 'Read-only'}
+					</Button>
+				</div>
 				<div class="mai-chat__composer-bar">
 					<div class="mai-chat__composer-input-wrap">
 						<label class="mai-chat__label mai-chat__label--sr" for="{uid}-message">Message</label>
@@ -2632,104 +2559,6 @@
 				{#if composeFields.message}
 					<p class="mai-chat__field-error" role="alert">{composeFields.message}</p>
 				{/if}
-				{#if !advancedOpen && Object.keys(composeFields).some((field) => field !== 'message')}
-					<p class="mai-chat__field-error" role="alert" data-testid="compose-options-error">
-						Review the highlighted Options before sending.
-						<Button variant="ghost" size="sm" onclick={toggleOptionsDrawer}>Options</Button>
-					</p>
-				{/if}
-				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div
-					class="mai-chat__advanced"
-					role="region"
-					aria-label="Options"
-					hidden={!advancedOpen}
-					id="{uid}-options"
-					onkeydown={handleOptionsKeydown}
-				>
-					<div class="mai-chat__drawer-head">
-						<span class="mai-chat__drawer-title">⚙ Composer Options</span>
-						<Button
-							size="sm"
-							variant="ghost"
-							onclick={() => (advancedOpen = false)}
-							aria-label="Close options"
-							data-testid="chat-options-close"
-						>
-							✕
-						</Button>
-					</div>
-					<div class="mai-chat__composer-profile">
-						<ModelProfileSelect
-							compact={isDocked}
-							bind:value={composeProfile}
-							error={composeFields.profile ?? ''}
-							testId="compose-profile"
-							live={profilesLive}
-						/>
-					</div>
-					<div class="mai-chat__composer-mode">
-						<Select
-							label="Execution mode"
-							value={composeMode}
-							onchange={(e) => {
-								const val = (e.currentTarget as HTMLSelectElement).value;
-								if (val === 'ask' || val === 'delegated') composeModeOverride = val;
-							}}
-							compact={isDocked}
-							data-testid="compose-mode"
-						>
-							<option value="delegated">Delegated — run granted capabilities autonomously</option>
-							<option value="ask">Ask — require approval before privileged/mutate actions</option>
-						</Select>
-					</div>
-					<Field
-						label="Capabilities"
-						bind:value={composeCapabilities}
-						data-testid="compose-capabilities"
-						error={composeFields.capabilities ?? ''}
-						hint="Comma-separated grant request; empty uses default capabilities in live mode."
-					/>
-					<fieldset class="mai-chat__children">
-						<legend class="mai-chat__label">Child tasks (optional, runs on this server)</legend>
-						{#each composeChildren as _, index (index)}
-							<div class="mai-chat__child" data-testid="compose-child">
-								<Field
-									label="Child {index + 1} task"
-									bind:value={composeChildren[index]}
-									data-testid="compose-child-task"
-								/>
-								<Button
-									variant="secondary"
-									onclick={() => removeChildSlot(index)}
-									disabled={childSlots <= 1}
-									data-testid="child-remove"
-								>
-									Remove
-								</Button>
-							</div>
-						{/each}
-						<Button
-							variant="secondary"
-							onclick={addChildSlot}
-							disabled={childSlots >= MAX_CHILDREN}
-							data-testid="child-add"
-						>
-							Add child task
-						</Button>
-						{#if composeFields.children}
-							<p class="mai-chat__field-error" role="alert">{composeFields.children}</p>
-						{/if}
-					</fieldset>
-					<Field
-						label="Context attachments"
-						bind:value={composeAttachments}
-						data-testid="compose-attachments"
-						error={composeFields.attachments ?? ''}
-						hint="Op ids of stored artifacts of this server (comma-separated); references only."
-					/>
-				</div>
 				{#if composeProblem !== null}
 					<div
 						class="mai-chat__state mai-chat__state--error"
@@ -2782,7 +2611,7 @@
 	}
 
 	.mai-chat--dock-collapsed { height: auto; }
-	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle):not(:has(.mai-chat__advanced:not([hidden]))) { height: auto; }
+	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle) { height: auto; }
 
 	.mai-chat__body[hidden] {
 		display: none;
@@ -3180,16 +3009,6 @@
 		flex: 0 0 auto;
 	}
 
-	.mai-chat__noosphere-title {
-		font-family: var(--mai-font-display);
-		font-size: var(--mai-text-xs);
-		font-weight: var(--mai-weight-semibold);
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--mai-color-brass);
-		white-space: nowrap;
-	}
-
 	.mai-chat__label--sr,
 	.mai-sr-only {
 		position: absolute;
@@ -3204,32 +3023,20 @@
 		border: 0;
 	}
 
-	.mai-chat__advanced {
-		position: absolute;
-		top: 0;
-		right: 0;
-		bottom: 0;
-		width: min(26rem, 92%);
-		max-height: none;
-		z-index: 25;
+	/* Composer header bar: model profile + draft attachments + read-only
+	 * toggle, always visible and compact. */
+	.mai-chat__composer-top {
 		display: flex;
-		flex-direction: column;
-		gap: var(--mai-space-2);
-		overflow-x: hidden;
-		overflow-y: auto;
-		overscroll-behavior: contain;
-		box-sizing: border-box;
-		background: var(--mai-surface-glass-raised, var(--mai-color-surface-raised));
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass);
-		border-radius: var(--mai-radius-md);
-		box-shadow: var(--mai-shadow-float);
-		padding: var(--mai-space-3);
-		animation: mai-chat-slide-from-right var(--mai-motion-base, 180ms) ease-out;
+		align-items: end;
+		justify-content: space-between;
+		gap: var(--mai-space-2, 0.5rem);
+		flex-wrap: wrap;
+		min-width: 0;
 	}
 
-	.mai-chat__advanced[hidden] {
-		display: none;
+	.mai-chat__composer-top > :global(.mai-field) {
+		flex: 1 1 10rem;
+		min-width: 0;
 	}
 
 	/* Floating history selector & @service autocomplete: open ABOVE the dock when docked. */
@@ -3265,12 +3072,14 @@
 		gap: var(--mai-space-2, 0.5rem);
 	}
 
-	/* Floating history selector: anchored to the header row, above the page. */
+	/* Floating history selector: anchored to the header row, above the page.
+	 * Stacks ABOVE the details sheet (z-index 25): both are transient, but
+	 * the popover must stay clickable while the sheet is open. */
 	.mai-chat__history-popover {
 		position: absolute;
 		top: 100%;
 		right: 0;
-		z-index: 20;
+		z-index: 30;
 		width: min(24rem, 100%);
 		max-height: 18rem;
 		overflow: auto;
@@ -3288,11 +3097,6 @@
 		flex-wrap: wrap;
 	}
 
-	.mai-chat__lock {
-		font-size: var(--mai-text-xs, 0.75rem);
-		color: var(--color-warning, inherit);
-	}
-
 	.mai-chat__compose-context {
 		position: relative;
 		display: flex;
@@ -3307,12 +3111,13 @@
 		flex-wrap: wrap;
 	}
 
-	/* `@service` autocomplete: opens under the composer controls. */
+	/* `@service` autocomplete: opens under the composer controls; stacks
+	 * above the details sheet (z-index 25) like the history popover. */
 	.mai-chat__service-autocomplete {
 		position: absolute;
 		top: 100%;
 		left: 0;
-		z-index: 20;
+		z-index: 30;
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-1, 0.25rem);
@@ -3400,26 +3205,6 @@
 		background: var(--surface-raised, transparent);
 		color: inherit;
 		font: inherit;
-	}
-
-	.mai-chat__children {
-		border: 1px solid var(--border-subtle, transparent);
-		border-radius: var(--radius-sm, 4px);
-		padding: var(--space-2, 0.5rem);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-2, 0.5rem);
-		margin: 0;
-	}
-
-	.mai-chat__child {
-		display: flex;
-		align-items: end;
-		gap: var(--space-2, 0.5rem);
-	}
-
-	.mai-chat__child > :global(.mai-field) {
-		flex: 1;
 	}
 
 	.mai-chat__actions {
@@ -3685,15 +3470,20 @@
 	.mai-chat__header-right { flex-wrap: wrap; min-width: 0; }
 	.mai-chat__context-controls, .mai-chat__compose-context, .mai-chat__chips { min-width: 0; max-width: 100%; }
 	.mai-chat__context-controls :global(.mai-select), .mai-chat__context-controls :global(select) { min-width: 0; max-width: 100%; }
-	.mai-chat__child, .mai-chat__children, .mai-chat__child > :global(.mai-field) { min-width: 0; }
 	.mai-chat__tool-card-head { flex-wrap: wrap; }
 	.mai-chat__inline-alerts { max-height: 18dvh; overflow: auto; }
 	.mai-chat__reply-markdown, .mai-chat__bubble-body { min-width: 0; }
 	@container (max-width: 440px) {
+		/* The composer stays ONE compact wrapped row-group: profile, draft
+		 * attachments and the read-only toggle share rows; stacking them
+		 * vertically would starve the conversation area on small viewports. */
+		.mai-chat__composer-top { align-items: end; }
+		.mai-chat__composer-top > :global(.mai-model-profile-select) { flex: 1 1 8rem; }
+		.mai-chat__composer-top > :global(.mai-field) { flex: 1 1 8rem; }
 		.mai-chat__composer-bar { flex-direction: column; align-items: stretch; }
 		.mai-chat__actions { justify-content: flex-end; }
 		.mai-chat__header-right { gap: var(--mai-space-1); }
-		.mai-chat__title, .mai-chat__noosphere-title { display: none; }
+		.mai-chat__title { display: none; }
 		.mai-chat__body { height: calc(100dvh - 14rem); }
 	}
 	.mai-chat__history-item {

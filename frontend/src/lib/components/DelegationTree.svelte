@@ -106,7 +106,8 @@
 	let {
 		conversation,
 		api,
-		taskLabels
+		taskLabels,
+		showCancel = true
 	}: {
 		/** The replayed root conversation row the opener already holds. */
 		conversation: ConversationView;
@@ -114,6 +115,13 @@
 		api: unknown;
 		/** Opener-authored task labels keyed by run id (never fetched, never invented). */
 		taskLabels?: Readonly<Record<string, string>>;
+		/**
+		 * Render the "Stop this conversation" section. Default `true` — the
+		 * standalone tree keeps its explicit cancel control; the Chat panel's
+		 * embedded instance passes `false` (the conversation panel owns the
+		 * one composer Stop control and adds no second one).
+		 */
+		showCancel?: boolean;
 	} = $props();
 
 	// --- explicit inputs (fail closed when incomplete) -----------------------
@@ -759,46 +767,57 @@
 			{/if}
 		</section>
 
-		<section class="mai-delg__section" aria-label="Cancel conversation" data-testid="cancel-section">
-			<h4 class="mai-delg__heading">Stop this conversation</h4>
-			{#if cancellable}
-				<div class="mai-delg__actions">
-					<Button variant="danger" loading={cancelling} onclick={cancelConversation} data-testid="cancel-conversation">
-						Cancel conversation and children
-					</Button>
-				</div>
-			{:else}
-				<p class="mai-delg__muted" data-testid="cancel-unavailable">
-					{#if displayRoot.state === null}
-						The run state is not recorded yet; there is nothing to cancel here.
-					{:else}
-						This conversation already reached a terminal state; nothing left to cancel.
-					{/if}
-				</p>
-			{/if}
-			{#if cancelStatus !== null}
-				<p
-					class="mai-delg__note"
-					role="status"
-					data-testid="cancel-status"
-					data-outcome={cancelStatus.outcome ?? 'pending'}
-				>
-					{cancelStatus.outcome === null
-						? 'Cancellation requested — not yet verified.'
-						: `Cancelled (verified).`}
-				</p>
-			{/if}
-			{#if cancelProblem !== null}
-				<div
-					class="mai-delg__banner mai-delg__banner--error"
-					role="alert"
-					data-testid="cancel-error"
-					data-error-code={cancelProblem.code}
-				>
-					<p>{cancelProblem.message}</p>
-				</div>
-			{/if}
-		</section>
+		{#if showCancel}
+			<section
+				class="mai-delg__section"
+				aria-label="Cancel conversation"
+				data-testid="cancel-section"
+			>
+				<h4 class="mai-delg__heading">Stop this conversation</h4>
+				{#if cancellable}
+					<div class="mai-delg__actions">
+						<Button
+							variant="danger"
+							loading={cancelling}
+							onclick={cancelConversation}
+							data-testid="cancel-conversation"
+						>
+							Cancel conversation and children
+						</Button>
+					</div>
+				{:else}
+					<p class="mai-delg__muted" data-testid="cancel-unavailable">
+						{#if displayRoot.state === null}
+							The run state is not recorded yet; there is nothing to cancel here.
+						{:else}
+							This conversation already reached a terminal state; nothing left to cancel.
+						{/if}
+					</p>
+				{/if}
+				{#if cancelStatus !== null}
+					<p
+						class="mai-delg__note"
+						role="status"
+						data-testid="cancel-status"
+						data-outcome={cancelStatus.outcome ?? 'pending'}
+					>
+						{cancelStatus.outcome === null
+							? 'Cancellation requested — not yet verified.'
+							: `Cancelled (verified).`}
+					</p>
+				{/if}
+				{#if cancelProblem !== null}
+					<div
+						class="mai-delg__banner mai-delg__banner--error"
+						role="alert"
+						data-testid="cancel-error"
+						data-error-code={cancelProblem.code}
+					>
+						<p>{cancelProblem.message}</p>
+					</div>
+				{/if}
+			</section>
+		{/if}
 	{/if}
 </div>
 

@@ -438,14 +438,13 @@ test('the bottom chat dock is always visible, interactive offline and performs n
 
 	// Offline compose round trip through the in-memory slice: the recorded
 	// conversation renders and the context locks — all without any request.
-	// `Options` expands the progressive-disclosure composer drawer first.
-	await dock.getByTestId('chat-advanced-toggle').click();
+	// The model profile + read-only toggle live directly in the composer bar.
 	await dock.getByTestId('compose-message').fill('Dock fixture message');
 	await dock.getByTestId('compose-profile').fill('fixture-fast');
 	await dock.getByTestId('chat-submit').click();
 	await expect(dock.getByTestId('conversation-state')).toHaveText('Running');
 	await expect(dock.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
-	await expect(dock.getByTestId('chat-context-locked')).toBeVisible();
+	await expect(dock.getByTestId('chat-context-locked')).toHaveCount(0);
 	await expect(dock.getByTestId('chat-server-chip-remove')).toHaveCount(0);
 
 	// `New Chat` returns to an unlocked draft with the default chip.
@@ -472,22 +471,18 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 		// Existing user-controlled shell navigation, not a geometry override.
 		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
 		const dock = page.getByTestId('bottom-chat-dock');
-		await expect(dock.getByTestId('compose-profile')).toBeHidden();
-		await expect(dock.getByTestId('chat-advanced-toggle')).toHaveAttribute('aria-expanded', 'false');
-		await dock.getByTestId('chat-advanced-toggle').click();
+		await expect(dock.getByTestId('compose-profile')).toBeVisible();
+		await expect(dock.getByTestId('compose-read-only-toggle')).toBeVisible();
 		await dock.getByTestId('compose-profile').fill('fixture-fast');
 		await dock.getByTestId('compose-message').fill('Long fixture token '.repeat(150));
 		await dock.getByTestId('chat-submit').click();
-		await dock.getByTestId('chat-advanced-toggle').click();
-		await expect(dock.getByTestId('chat-details-trigger')).toHaveAttribute('aria-expanded', 'false');
+		await expect(dock.getByTestId('conversation-state')).toHaveText('Running');
 		await dock.getByTestId('compose-message').fill('Preserve this dock draft');
-		for (const state of ['closed', 'details', 'both', 'restored']) {
+		for (const state of ['details', 'closed']) {
+			// Open rides the trigger; the expanded panel covers it, so close
+			// rides the panel's own ✕ affordance.
 			if (state === 'details') await dock.getByTestId('chat-details-trigger').click();
-			if (state === 'both') await dock.getByTestId('chat-advanced-toggle').click();
-			if (state === 'restored') {
-				await dock.getByTestId('chat-advanced-toggle').click();
-				await dock.getByTestId('chat-details-trigger').click();
-			}
+			else await dock.getByTestId('chat-details-close').click();
 			for (const id of ['compose-message', 'chat-submit', 'chat-details-trigger']) {
 				const box = await dock.getByTestId(id).boundingBox();
 				expect(box, `${state}: ${id}`).not.toBeNull();
