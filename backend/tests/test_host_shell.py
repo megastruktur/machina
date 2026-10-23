@@ -39,7 +39,6 @@ import json
 import os
 import shlex
 import socket
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -487,6 +486,32 @@ def _report(
     )
 
 
+class _FakeClock:
+    """Deterministic monotonic clock for the executor's settle loop.
+
+    The settle budget is wall-clock by design (it must cover the
+    requested command timeout), so a real clock makes the budget tests
+    either slow or unsatisfiable. Swapping the module's ``time`` for
+    this one keeps the loop arithmetic honest — the deadline math is
+    the real one — while the test itself stays instant.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.slept = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept += seconds
+        self.now += seconds
+
+    @property
+    def elapsed(self) -> float:
+        return self.slept
+
+
 class _Harness:
     """A capability wired to a scratch namespace and a scripted lane."""
 
@@ -719,6 +744,14 @@ class TestTransportComposition:
     def test_settle_budget_returns_last_proven_state(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """A non-terminal report burns the settle window, then reports
+        the last proven state — never a hang and never a success.
+
+        The settle window covers the requested command timeout
+        (``min(MAX_SETTLE_SECONDS, max(settle_seconds, timeout + 5))``),
+        so the budget is asserted against a deterministic clock rather
+        than wall-clock time.
+        """
         harness = _Harness(monkeypatch, tmp_path)
         harness.capability = HostShellCapability(
             profiles=lambda server_id: harness.profile,
@@ -727,10 +760,16 @@ class TestTransportComposition:
             intents_dir=str(tmp_path / "intents"),
             settle_seconds=0.05,
         )
+        clock = _FakeClock()
+        monkeypatch.setattr(host_shell_module, "time", clock)
         harness.lane.script = [_report(status=CommandStatus.RUNNING)]
-        started = time.monotonic()
-        result = asyncio.run(harness.run())
-        assert time.monotonic() - started < 5.0  # bounded, not a hang
+        timeout = 1.0
+        result = asyncio.run(
+            harness.run(payload={"command": "sleep 2", "timeout": timeout})
+        )
+        expected_settle = min(MAX_SETTLE_SECONDS, max(0.05, timeout + 5.0))
+        # the settle window covers the requested timeout, and only that
+        assert clock.elapsed == pytest.approx(expected_settle, abs=0.05)
         assert result.ok is False
         document = json.loads(result.output)
         assert document["status"] == "running"
@@ -740,6 +779,8 @@ class TestTransportComposition:
     def test_unknown_status_reports_notes_never_success(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """``outcome_unknown`` is non-terminal: it keeps the settle loop
+        polling, then surfaces as notes — never as a success."""
         harness = _Harness(monkeypatch, tmp_path)
         harness.capability = HostShellCapability(
             profiles=lambda server_id: harness.profile,
@@ -748,13 +789,20 @@ class TestTransportComposition:
             intents_dir=str(tmp_path / "intents"),
             settle_seconds=0.05,
         )
+        clock = _FakeClock()
+        monkeypatch.setattr(host_shell_module, "time", clock)
         harness.lane.script = [
             _report(
                 status=CommandStatus.OUTCOME_UNKNOWN,
                 notes=("receipt_missing: an effect can precede its receipt",),
             )
         ]
-        result = asyncio.run(harness.run())
+        timeout = 1.0
+        result = asyncio.run(
+            harness.run(payload={"command": "sleep 2", "timeout": timeout})
+        )
+        expected_settle = min(MAX_SETTLE_SECONDS, max(0.05, timeout + 5.0))
+        assert clock.elapsed == pytest.approx(expected_settle, abs=0.05)
         assert result.ok is False
         document = json.loads(result.output)
         assert document["status"] == "outcome_unknown"
