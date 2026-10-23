@@ -14,7 +14,6 @@
 	 * value is empty or not a configured profile. A failed live read falls
 	 * back to the static `options` (offline/fixture harnesses).
 	 */
-	import { onMount } from 'svelte';
 	import Select from './Select.svelte';
 
 	const DEFAULT_PROFILES = ['default', 'fast', 'reasoning', 'fixture-fast'] as const;
@@ -31,10 +30,10 @@
 		/** Test id for automated test bindings (`compose-profile`). */
 		testId?: string;
 		/**
-		 * Fetch the configured profiles + default selection on mount.
-		 * Defaults to `false` — enable explicitly in the live Chat panel so
-		 * offline fixture harnesses (desktop-shell / chat.spec) never fire a
-		 * real network request.
+		 * Fetch the configured profiles + default selection when `live` is true.
+		 * Reactive: transitions from `false` → `true` (such as when `DesktopShell`
+		 * finishes `connectLive()`) immediately trigger the fetch and replace
+		 * the static options with the real configured profiles.
 		 */
 		live?: boolean;
 	};
@@ -53,8 +52,12 @@
 	let liveProfiles = $state<string[]>([]);
 	let liveReady = $state(false);
 
-	onMount(() => {
-		if (!live) return;
+	$effect(() => {
+		if (!live) {
+			liveProfiles = [];
+			liveReady = false;
+			return;
+		}
 		let cancelled = false;
 		void (async () => {
 			try {
@@ -106,7 +109,6 @@
 						}
 					}
 				}
-				if (names.length === 0) return;
 				liveProfiles = names;
 				liveReady = true;
 			} catch {
@@ -120,7 +122,7 @@
 
 	/** Live reads own the option list completely; static options never merge in. */
 	const mergedOptions = $derived.by(() => {
-		if (liveReady && liveProfiles.length > 0) return liveProfiles;
+		if (live || liveReady) return liveProfiles;
 		const set = new Set<string>(options);
 		if (value && value.trim() !== '') set.add(value);
 		return [...set];
@@ -129,7 +131,11 @@
 	// Auto-select the configured default (or the first real profile) when the
 	// current value is empty or not a configured profile.
 	$effect(() => {
-		if (!liveReady || liveProfiles.length === 0) return;
+		if (!liveReady) return;
+		if (liveProfiles.length === 0) {
+			value = '';
+			return;
+		}
 		if (value === '' || !liveProfiles.includes(value)) {
 			value = liveProfiles[0];
 		}

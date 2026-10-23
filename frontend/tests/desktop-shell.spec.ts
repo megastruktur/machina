@@ -396,9 +396,43 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 			body: JSON.stringify({ runbooks: [], categories: [], limit: 10, offset: 0, total: 0 })
 		})
 	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [
+					{
+						schema_version: 1,
+						name: 'glm53flash',
+						connection: 'litellm',
+						model: 'z-ai-coding/glm-5.3-flash'
+					}
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				schema_version: 1,
+				connection: 'litellm',
+				profile: 'glm53flash'
+			})
+		})
+	);
 
 	await page.goto('/');
 	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+
+	// The bottom chat dock's ModelProfileSelect reacts to `live` becoming true
+	// after `connectLive()` and replaces the static fixture options with ONLY
+	// the configured profile (`glm53flash`).
+	const dockSelect = page.getByTestId('bottom-chat-dock').getByTestId('compose-profile-select');
+	await expect(dockSelect.locator('option')).toHaveText(['Select profile…', 'glm53flash']);
+	await expect(dockSelect).toHaveValue('glm53flash');
 
 	// Global / Fleet lists the Memory entry — and ONLY once, globally.
 	const memoryItem = page.getByTestId('open-knowledge-models');
