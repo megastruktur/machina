@@ -120,6 +120,12 @@ from pydantic_ai.tools import (
     DeferredToolResults,
     Tool,
 )
+from pydantic_ai_harness import (
+    ClampOversizedMessages,
+    ClearToolResults,
+    SummarizingCompaction,
+    TieredCompaction,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -330,8 +336,24 @@ MAX_TASK_CHARS: Final[int] = 1024 * 1024
 MAX_ROLE_LEN: Final[int] = MAX_ROLE_CHARS
 
 #: Checkpointed conversation-history bound (C06 rule 3: explicit bound,
-#: honest failure — never a silent truncation of run state).
+#: honest failure — never a silent truncation of run state). This fires
+#: only as the LAST resort: the TieredCompaction capability below runs
+#: first inside every model request, so a history that still exceeds
+#: this bound after compaction is an honest structural failure.
 MAX_HISTORY_BYTES: Final[int] = 2 * 1024 * 1024
+
+#: Conversation-compaction budget (fraction of the model's context
+#: window) the TieredCompaction escalation drives toward: cheap tiers
+#: run first; the LLM summarizer only when they cannot reclaim enough.
+COMPACTION_TARGET_FRACTION: Final[float] = 0.8
+#: Per-part clamp ceiling (tokens) — the first, zero-LLM tier.
+COMPACTION_CLAMP_MAX_PART_TOKENS: Final[int] = 50_000
+#: How many most-recent tool-call/tool-return pairs keep their results
+#: when the second, zero-LLM tier blanks older ones (pairing always kept).
+COMPACTION_KEEP_TOOL_PAIRS: Final[int] = 3
+#: Tail messages the summarizing tier preserves verbatim (it summarizes
+#: everything older, with the run's own model).
+COMPACTION_SUMMARY_KEEP_MESSAGES: Final[int] = 20
 
 #: Reconciliation wait budgets (mirroring the steps module's shape; the
 #: agent run parks on the same durable ``recv`` seam).
@@ -767,6 +789,52 @@ def _deferring_tool(tool: Tool) -> Tool:
     )
 
 
+def _compaction_capability(context_limit: int | None) -> TieredCompaction[None]:
+    """The per-run conversation-compaction capability (harness Tiered).
+
+    Cheap-to-expensive escalation under one budget — ``target_fraction``
+    of the model's context window: clamp any single oversized part,
+    blank older tool results (the most recent ``keep_pairs`` pairs stay;
+    call/return pairing is never broken), then LLM-summarize the oldest
+    history with the run's own model (the tier's model inherits the
+    request's). The processor runs INSIDE the model request
+    (``before_model_request``), so the compacted history is exactly what
+    ``result.all_messages()`` returns — the round's existing
+    ``history_json`` checkpoint carries it; no separate durable step.
+
+    Machina's system prompt — the leading :class:`SystemPromptPart` of
+    the checkpointed seed — survives by construction: the harness
+    extracts leading system parts and re-emits them verbatim ahead of
+    any summary message; the zero-LLM tiers keep every message. The
+    bound profile's declared ``context_limit`` overrides window
+    resolution (an OpenAI-compatible gateway's model id is not in any
+    registry); ``None`` falls back to the harness's conservative
+    default window.
+    """
+    return TieredCompaction(
+        tiers=[
+            # Zero-LLM first: one oversized part clamped head+tail.
+            ClampOversizedMessages(
+                max_part_tokens=COMPACTION_CLAMP_MAX_PART_TOKENS
+            ),
+            # Zero-LLM second: older tool results blanked in place.
+            # The tier's own trigger is bypassed inside TieredCompaction
+            # (the orchestrator drives it) — ``max_tokens=1`` is the
+            # documented "any valid value" placeholder.
+            ClearToolResults(
+                max_tokens=1, keep_pairs=COMPACTION_KEEP_TOOL_PAIRS
+            ),
+            # The expensive last tier: summarize everything older than
+            # the kept tail with the run's model.
+            SummarizingCompaction(
+                max_messages=1,
+                keep_messages=COMPACTION_SUMMARY_KEEP_MESSAGES,
+            ),
+        ],
+        target_fraction=COMPACTION_TARGET_FRACTION,
+        context_window=context_limit,
+    )
+
 # ---------------------------------------------------------------------------
 # composition
 # ---------------------------------------------------------------------------
@@ -1172,6 +1240,9 @@ class AgentRunExecutor:
             model=resolved_model,
             tools=[_deferring_tool(tool) for tool in bridge.tools],
             output_type=[str, DeferredToolRequests],
+            capabilities=[
+                _compaction_capability(binding.profile.context_limit)
+            ],
         )
         history = ModelMessagesTypeAdapter.validate_json(history_json.encode("utf-8"))
         deferred = (
