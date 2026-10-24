@@ -25,7 +25,14 @@ model-facing tools and the deterministic steps path share. The module owns:
   profile are pinned by :func:`~mai.agents.context.load_server_context` and
   the bounded model payload assembled by :func:`~mai.agents.context.assemble`
   (C06 rules 2–3); a safe summary event (budget report, revision pins, no
-  content) lands in the shared per-run stream.
+  content) lands in the shared per-run stream. The conversation
+  ``message_history`` seed is ONE checkpointed step
+  (:meth:`AgentRunExecutor.abuild_conversation_seed`): continued runs load
+  the prior role-preserving turns from the canonical conversation store as
+  native PydanticAI messages (06-context-continuity — never synthetic
+  wrappers, never authority elevation); the canonical assistant reply is
+  recorded through the idempotent producer step
+  (:meth:`AgentRunExecutor.arecord_assistant_reply`).
 - **The durable conversation loop** — each model round is ONE checkpointed
   ``DBOS.step`` that ends either in the assistant's final text or in a
   deferred tool-request list; each requested tool call is ONE exactly-once
@@ -129,6 +136,8 @@ from pydantic_ai_harness import (
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.agents import conversation_context
+from mai.agents import conversation_store
 from mai.agents.context import (
     MAX_ROLE_CHARS,
     ContextError,
@@ -168,6 +177,10 @@ from mai.capabilities.dispatch import (
     EFFECT_UNKNOWN,
     CapabilityDispatcher,
     canonical_payload_hash,
+)
+from mai.contracts.conversations import (
+    ConversationContractError,
+    SteerAction,
 )
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
@@ -380,6 +393,16 @@ RECONCILE_WAIT_DEADLINE_REASON: Final[str] = "reconcile_wait_deadline"
 
 #: Durable DBOS topic for mid-run user steering messages.
 STEER_TOPIC: Final[str] = "mai.chat.steer"
+
+#: Bounded page of pending conversation-steering rows consumed per safe
+#: boundary (AGENTS.md mandatory-pagination invariant; deterministic
+#: ordering, leftover rows stay pending for the next boundary).
+STEERING_POLL_PAGE_LIMIT: Final[int] = 50
+
+#: Stable ``agent.completed`` event key carrying a deterministic
+#: boundary stop (``pause``/``cancel`` steering); absent on runs that
+#: end normally so existing event shapes stay byte-identical.
+STOPPED_BY_EVENT_KEY: Final[str] = "stopped_by"
 ROUND_BUDGET_REASON: Final[str] = "round_budget_exhausted"
 HISTORY_BUDGET_REASON: Final[str] = "history_budget_exhausted"
 TOOL_BUDGET_REASON: Final[str] = "tool_call_budget_exhausted"
@@ -393,6 +416,7 @@ CRASH_RECOVERY_RESULT_REASON: Final[str] = "crash_recovery"
 #: coherent for the UI.
 AGENT_STARTED_EVENT_TYPE: Final[str] = "agent.started"
 AGENT_CONTEXT_EVENT_TYPE: Final[str] = "agent.context_assembled"
+AGENT_HISTORY_EVENT_TYPE: Final[str] = "agent.conversation_history"
 AGENT_ROUND_EVENT_TYPE: Final[str] = "agent.model_round"
 AGENT_RECONCILING_EVENT_TYPE: Final[str] = "agent.awaiting_reconciliation"
 AGENT_COMPLETED_EVENT_TYPE: Final[str] = "agent.completed"
@@ -1373,6 +1397,222 @@ class AgentRunExecutor:
             "user_message": assembled.user_message,
         }
 
+    # -- conversation seed + producer boundary (06-context-continuity) -----
+
+    async def abuild_conversation_seed(
+        self, intent: AgentRunIntent, assembled: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Build the bounded native multi-turn ``message_history`` seed.
+
+        When the run links to a canonical conversation (05-turn-submit's
+        ``conversation_runs`` attachment), the seed carries the prior
+        role-preserving turns as native ``ModelRequest(UserPromptPart)`` /
+        ``ModelResponse(TextPart)`` messages (never synthetic wrappers,
+        never authority elevation — see
+        :mod:`mai.agents.conversation_context`). A legacy run without a
+        link keeps the plain system+user seed AND the legacy event stream
+        shape (no ``conversation_history`` event). The value-free
+        assembly report lands once in the run stream for linked
+        conversations (counts and completeness markers only, never
+        content).
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        system_prompt = str(assembled["system_prompt"])
+        user_message = str(assembled["user_message"])
+        if conversation_id is None:
+            seed_json = initial_history_json(system_prompt, user_message)
+            report: dict[str, object] = {
+                "conversation_linked": False,
+                "conversation_id": None,
+                "history_completeness": "unavailable",
+            }
+            # No canonical conversation: the legacy event stream shape is
+            # preserved EXACTLY (standalone agent.run runs — no prior
+            # turns and no legacy history were loaded — emit no
+            # conversation_history event).
+        else:
+            seed = await conversation_context.abuild_conversation_seed(
+                self._sessions,
+                conversation_id=str(conversation_id),
+                server_id=intent.context.server_id,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                run_id=intent.run_id,
+            )
+            seed_json = seed.history_json
+            report = {
+                "conversation_linked": seed.report.conversation_linked,
+                "conversation_id": seed.report.conversation_id,
+                "history_completeness": seed.report.history_completeness,
+                "missing_from_sequence": seed.report.missing_from_sequence,
+                "missing_to_sequence": seed.report.missing_to_sequence,
+                "prior_turns_total": seed.report.prior_turns_total,
+                "turns_included_verbatim": seed.report.turns_included_verbatim,
+                "turns_compacted": seed.report.turns_compacted,
+                "excerpts_elided": seed.report.excerpts_elided,
+                "non_chat_rows_skipped": seed.report.non_chat_rows_skipped,
+                "current_turn_rows_excluded": (
+                    seed.report.current_turn_rows_excluded
+                ),
+                "legacy_proven_submissions": (
+                    seed.report.legacy_proven_submissions
+                ),
+                "seed_messages": seed.report.seed_messages,
+                "seed_bytes": seed.report.seed_bytes,
+                "budget_bytes": seed.report.budget_bytes,
+            }
+            await self._emit_once(
+                intent.run_id, AGENT_HISTORY_EVENT_TYPE, dict(report)
+            )
+        return {"history_json": seed_json, "report": report}
+
+    async def arecord_assistant_reply(
+        self, intent: AgentRunIntent, output: str
+    ) -> dict[str, object]:
+        """Record ONE canonical assistant reply for this run (producer).
+
+        Trusted producer boundary: idempotent per ``run_id`` (the safe
+        ``agent-run:<run_id>`` ``content_ref`` marker is checked before
+        the append, so replays/restarts never duplicate the row), C2
+        projected content, provenance ``system`` (platform model
+        producer per the frozen role/source matrix). Legacy runs without
+        a conversation link and blank final outputs record nothing —
+        honestly, never fabricated.
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return {"recorded": False, "reason": "no_conversation_link"}
+        row = await conversation_context.arecord_assistant_reply(
+            self._sessions,
+            conversation_id=str(conversation_id),
+            server_id=intent.context.server_id,
+            run_id=intent.run_id,
+            content=output,
+        )
+        if row is None:
+            return {"recorded": False, "reason": "empty_output"}
+        return {
+            "recorded": True,
+            "message_id": str(row.message_id),
+            "sequence": row.sequence,
+        }
+
+    # -- durable conversation steering queue (07-steering) ------------------
+
+    async def apoll_steering(self, intent: AgentRunIntent) -> dict[str, object]:
+        """Read the conversation's PENDING steering rows (checkpointed read).
+
+        One bounded deterministic page (``ORDER BY created_at,
+        steering_id LIMIT`` :data:`STEERING_POLL_PAGE_LIMIT`) of
+        unconsumed rows for the linked conversation; scope fails closed
+        (C8) and legacy runs without a conversation link poll nothing.
+        READ-ONLY by contract: the checkpointed poll output is the
+        durable claim a recovered workflow re-derives its decisions
+        from — the idempotent applied-marking is the SEPARATE ack step,
+        so a crash can never lose an already-polled control (the
+        checkpoint replays the same rows).
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return {"conversation_linked": False, "pending": []}
+        try:
+            await conversation_store.aget_conversation(
+                self._sessions, conversation_id, server_id=intent.context.server_id
+            )
+        except ConversationContractError:
+            return {"conversation_linked": False, "pending": []}
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT steering_id, action, content
+                        FROM conversation_steering
+                        WHERE conversation_id = :cid AND delivery_status = 'pending'
+                        ORDER BY created_at, steering_id
+                        LIMIT :l
+                        """
+                    ),
+                    {"cid": conversation_id, "l": STEERING_POLL_PAGE_LIMIT},
+                )
+            ).mappings().all()
+        pending = [
+            {
+                "steering_id": str(row["steering_id"]),
+                "action": str(row["action"]),
+                "content": row["content"],
+            }
+            for row in rows
+        ]
+        return {"conversation_linked": True, "pending": pending}
+
+    async def aack_steering(
+        self, intent: AgentRunIntent, claimed: list[dict[str, object]]
+    ) -> dict[str, object]:
+        """Mark the processed prefix of pending controls applied (ack).
+
+        Idempotent (``aapply_steering`` replays onto the same durable
+        row): a crash before the ack step's own checkpoint replays onto
+        already-applied rows, never a second consumption. Rows are
+        acknowledged in the claimed order, so a stop control ends the
+        prefix — controls behind it stay pending for the next runner.
+        """
+        if not claimed:
+            return {"acked": []}
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return {"acked": []}
+        acked: list[str] = []
+        for item in claimed:
+            row = await conversation_store.aapply_steering(
+                self._sessions,
+                conversation_id=conversation_id,
+                server_id=intent.context.server_id,
+                steering_id=uuid.UUID(str(item["steering_id"])),
+            )
+            acked.append(str(row.steering_id))
+        return {"acked": acked}
+
+    async def arelease_conversation_lease(
+        self, intent: AgentRunIntent
+    ) -> dict[str, object]:
+        """Release the conversation writer lease at a terminal state (§1).
+
+        The ``conversation_runs`` link attached pre-enqueue (05) IS the
+        lease; a terminal run must never keep follow-up turns stuck
+        behind a stale ``active_run_id``. Idempotent
+        (``arelease_run``): the boolean reports the POST-CALL state
+        (``lease_free``), so a replayed release observes the same free
+        lease. Legacy runs without a link release nothing. Best-effort
+        on the failure/cancel paths: the submit-side terminal-lease
+        recheck (chat seam) stays the durable backstop, so a
+        pathological release failure never rewrites an honest run
+        outcome.
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return {"conversation_linked": False, "lease_free": False}
+        try:
+            await conversation_store.arelease_run(
+                self._sessions,
+                conversation_id=conversation_id,
+                server_id=intent.context.server_id,
+                run_id=uuid.UUID(intent.run_id),
+            )
+        except (ConversationContractError, ValueError):
+            return {"conversation_linked": True, "lease_free": False}
+        return {"conversation_linked": True, "lease_free": True}
+
     # -- one conversation round (checkpointed) ------------------------------
 
     async def amodel_round(
@@ -1926,7 +2166,12 @@ class AgentRunExecutor:
     async def afinish_run(
         self, intent: AgentRunIntent, summary: Mapping[str, object]
     ) -> str:
-        """Record ``running → succeeded``; emit the safe summary event."""
+        """Record ``running → succeeded``; emit the safe summary event.
+
+        Terminal state ⇒ the conversation writer lease is released
+        (§1): a completed run must never keep follow-up turns stuck
+        behind a stale ``active_run_id``.
+        """
         current = await self._steps.lifecycle.current_state(intent.run_id)
         if current is RunState.RUNNING:
             await self._steps.lifecycle.record_transition(
@@ -1934,15 +2179,19 @@ class AgentRunExecutor:
             )
             current = RunState.SUCCEEDED
         assert current is not None
-        await self._emit_once(
-            intent.run_id,
-            AGENT_COMPLETED_EVENT_TYPE,
-            {
-                "rounds": summary.get("rounds"),
-                "tool_calls": summary.get("tool_calls"),
-                "output_chars": summary.get("output_chars"),
-            },
-        )
+        completed_data: dict[str, object] = {
+            "rounds": summary.get("rounds"),
+            "tool_calls": summary.get("tool_calls"),
+            "output_chars": summary.get("output_chars"),
+        }
+        stopped_by = summary.get(STOPPED_BY_EVENT_KEY)
+        if stopped_by is not None:
+            # Deterministic boundary stop (pause/cancel steering): the
+            # event carries the honest disposition; runs that end
+            # normally keep the existing event shape byte-identical.
+            completed_data[STOPPED_BY_EVENT_KEY] = stopped_by
+        await self._emit_once(intent.run_id, AGENT_COMPLETED_EVENT_TYPE, completed_data)
+        await self.arelease_conversation_lease(intent)
         return current.value
 
     # -- idempotent-by-observation event emission ---------------------------
@@ -2062,6 +2311,65 @@ def _agent_context_assembled(payload_json: str, pins_json: str) -> dict[str, obj
     intent = parse_agent_run_intent(payload_json)
     executor = _resolve_agent_run()
     return executor.run(executor.aassemble_context(intent, json.loads(pins_json)))
+
+
+@DBOS.step(name="agents.conversation_seed")
+def _agent_conversation_seed(
+    payload_json: str, assembled_json: str
+) -> dict[str, object]:
+    """Build the conversation ``message_history`` seed (checkpointed).
+
+    The seed (prior native turns + the new user request) and its
+    value-free assembly report are ONE durable step result: a recovered
+    run replays the recorded seed instead of re-reading a transcript
+    that only ever grows (deterministic across restarts, C2/C4).
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(
+        executor.abuild_conversation_seed(intent, json.loads(assembled_json))
+    )
+
+
+@DBOS.step(name="agents.assistant_recorded")
+def _agent_assistant_recorded(payload_json: str, output: str) -> dict[str, object]:
+    """Record the canonical assistant reply (checkpointed producer).
+
+    Idempotent per ``run_id``: the step checkpoint plus the safe
+    ``content_ref`` marker make replays/restarts never duplicate the
+    transcript row (C4/C7 producer honesty).
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(executor.arecord_assistant_reply(intent, output))
+
+
+@DBOS.step(name="agents.steering_polled")
+def _agent_steering_poll(payload_json: str) -> dict[str, object]:
+    """Poll the durable steering queue at a safe boundary (read-only).
+
+    The CHECKPOINTED poll output is the durable claim: a recovered
+    workflow re-derives its boundary decisions from this checkpoint,
+    never from live queue state (which the idempotent ack mutates).
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(executor.apoll_steering(intent))
+
+
+@DBOS.step(name="agents.steering_acked")
+def _agent_steering_ack(payload_json: str, claimed_json: str) -> dict[str, object]:
+    """Mark the processed steering prefix applied (checkpointed ack).
+
+    Idempotent: replay after a crash re-acks already-applied rows
+    unchanged, so a duplicate signal or a step replay never re-applies
+    an already-consumed control (C4/C5).
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(
+        executor.aack_steering(intent, json.loads(claimed_json))
+    )
 
 
 @DBOS.step(name="agents.model_round")
@@ -2199,7 +2507,14 @@ def _utcnow() -> datetime:
 
 
 def _drain_steering_messages() -> list[str]:
-    """Drain any mid-run user steering messages queued on ``STEER_TOPIC``."""
+    """Drain any mid-run user steering messages queued on ``STEER_TOPIC``.
+
+    Legacy channel only (runs before the canonical conversation seam).
+    Deterministic controls (``action: pause|cancel``) are NEVER model
+    input: they ride the durable conversation-steering queue and are
+    consumed at safe boundaries, so a control payload is filtered out
+    of the text drain even if it is signaled here.
+    """
     messages: list[str] = []
     while True:
         try:
@@ -2209,12 +2524,98 @@ def _drain_steering_messages() -> list[str]:
         if raw is None:
             break
         if isinstance(raw, Mapping):
+            action = raw.get("action")
+            if action is not None and action != SteerAction.STEER.value:
+                continue
             text = raw.get("message")
             if isinstance(text, str) and text.strip():
                 messages.append(text.strip())
         elif isinstance(raw, str) and raw.strip():
             messages.append(raw.strip())
     return messages
+
+
+def _decide_steering_boundary(
+    claimed: list[dict[str, object]],
+) -> tuple[list[str], str | None, list[dict[str, object]]]:
+    """The deterministic boundary decision over one claimed page (pure).
+
+    Returns ``(steer_texts, stop_action, ack_prefix)``. Natural-language
+    steering is collected for the NEXT model round (``UserPromptPart``
+    injection via ``steered_json``). A pause/cancel ALWAYS wins its
+    boundary and ends the run: natural-language rows claimed at the
+    same boundary stay PENDING (outside the ack prefix) so the next
+    runner interprets them — nothing is dropped, nothing is applied
+    twice (C4/C5). Because the caller derives the decision from the
+    checkpointed poll, a recovered run re-derives the identical stop (a
+    replay can never resume effects past a consumed stop control).
+    """
+    texts: list[str] = []
+    for item in claimed:
+        action = str(item.get("action"))
+        if action in (SteerAction.PAUSE.value, SteerAction.CANCEL.value):
+            # Deterministic control: ack ONLY the stop row; natural-
+            # language rows stay pending for the next runner, so their
+            # interpretation is never lost.
+            return [], str(action), [dict(item)]
+        if action == SteerAction.STEER.value:
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                texts.append(content.strip())
+    return texts, None, [dict(item) for item in claimed]
+
+
+def _claim_steering_boundary(
+    payload_json: str,
+) -> tuple[list[str], str | None]:
+    """One safe-boundary steering consumption (durable, exactly once).
+
+    Checkpointed poll (the durable claim) → :func:`_decide_steering_boundary`
+    → checkpointed idempotent ack of the decided prefix.
+    """
+    polled = _agent_steering_poll(payload_json)
+    claimed = [dict(item) for item in polled.get("pending") or []]
+    if not claimed:
+        return [], None
+    texts, stop, ack_prefix = _decide_steering_boundary(claimed)
+    _agent_steering_ack(payload_json, canonical_json(ack_prefix))
+    return texts, stop
+
+
+def _steering_stop_result_text(reason: str) -> str:
+    """Honest tool result for a deferred call a boundary never dispatched.
+
+    A batch interrupted at a safe boundary leaves the not-yet-executed
+    calls with an explicit ``not_executed`` document (wire honesty, C08
+    rule 6): no effect occurred, never an invented outcome.
+    """
+    return canonical_json(
+        {
+            "status": "not_executed",
+            "reason": reason,
+            "detail": (
+                "the batch was interrupted at a safe steering boundary "
+                "before this call was dispatched; no effect occurred"
+            ),
+        }
+    )
+
+
+def _release_lease_quietly(intent: AgentRunIntent) -> None:
+    """Best-effort conversation lease release on failure/cancel paths.
+
+    Mirrors :func:`_record_quietly`: plain (non-checkpointed) idempotent
+    calls, so a terminal run still frees the writer lease even when the
+    workflow is unwinding through an exception.
+    """
+    try:
+        executor = _resolve_agent_run()
+    except AgentRunError:
+        return
+    try:
+        executor.run(executor.arelease_conversation_lease(intent))
+    except Exception:
+        pass
 
 
 def run_agent_conversation(payload_json: str) -> dict[str, object]:
@@ -2234,17 +2635,29 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         pins = _agent_model_bound(payload_json)
         pins_json = canonical_json(pins)
         assembled = _agent_context_assembled(payload_json, pins_json)
-        history_json = initial_history_json(
-            str(assembled["system_prompt"]), str(assembled["user_message"])
+        seed = _agent_conversation_seed(
+            payload_json, canonical_json(assembled)
         )
+        history_json = str(seed["history_json"])
         deferred_json: str | None = None
         pending_steered: list[str] = []
+        stopped_by: str | None = None
+        round_record: dict[str, object] = {}
         rounds = 0
         tool_records: list[dict[str, object]] = []
         output_chars = 0
         while True:
+            # Safe boundary BEFORE every model round: the durable
+            # steering queue is consumed exactly once here, and a
+            # deterministic pause/cancel stops the attempt without a
+            # further model call or effect (C4/C5).
             if rounds > 0:
                 pending_steered.extend(_drain_steering_messages())
+            boundary_texts, stop = _claim_steering_boundary(payload_json)
+            pending_steered.extend(boundary_texts)
+            if stop is not None:
+                stopped_by = stop
+                break
             steered_json = (
                 canonical_json(pending_steered) if pending_steered else None
             )
@@ -2261,9 +2674,17 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             if str(round_record["status"]) == "final":
                 output_chars = int(str(round_record["output_chars"]))
                 late_steered = _drain_steering_messages()
-                if not late_steered:
+                boundary_texts, stop = _claim_steering_boundary(payload_json)
+                if stop is not None:
+                    # The attempt ends at the boundary; late
+                    # natural-language steering stays queued for the
+                    # next runner (never dropped, never re-applied).
+                    stopped_by = stop
+                    break
+                if not late_steered and not boundary_texts:
                     break
                 pending_steered.extend(late_steered)
+                pending_steered.extend(boundary_texts)
                 deferred_json = None
                 rounds += 1
                 if rounds >= intent.max_rounds:
@@ -2278,7 +2699,20 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             if existing_rows + len(calls) > AGENT_TOOL_MAX_PER_RUN:
                 raise AgentStageError(TOOL_BUDGET_REASON)
             results: dict[str, str] = {}
+            steering_interrupt = False
             for call in calls:
+                # Safe boundary BEFORE EACH NEW tool effect (C5/C6):
+                # steering or a deterministic stop gates the next
+                # command; the already-settled calls keep their
+                # honest recorded outcomes either way.
+                boundary_texts, stop = _claim_steering_boundary(payload_json)
+                if stop is not None:
+                    stopped_by = stop
+                    break
+                if boundary_texts:
+                    pending_steered.extend(boundary_texts)
+                    steering_interrupt = True
+                    break
                 call_json = canonical_json(call)
                 outcome = _agent_tool_execute(payload_json, call_json)
                 if str(outcome["state"]) == StepState.OUTCOME_UNKNOWN.value:
@@ -2291,28 +2725,58 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                         "reason": outcome.get("reason"),
                     }
                 )
+            if stopped_by is not None:
+                break
+            if steering_interrupt:
+                # The model must SEE the steering before any further
+                # effect: the not-yet-dispatched deferred calls carry
+                # explicit not_executed documents (wire honesty —
+                # nothing ran, nothing invented) and the next round
+                # re-decides under the injected UserPromptPart.
+                for call in calls:
+                    call_id = str(call["tool_call_id"])
+                    if call_id not in results:
+                        results[call_id] = _steering_stop_result_text(
+                            "steering_pending"
+                        )
+                deferred_json = canonical_json({"calls": results})
+                rounds += 1
+                if rounds >= intent.max_rounds:
+                    raise AgentStageError(ROUND_BUDGET_REASON)
+                continue
             deferred_json = canonical_json({"calls": results})
             rounds += 1
             if rounds >= intent.max_rounds:
                 raise AgentStageError(ROUND_BUDGET_REASON)
+        recorded = _agent_assistant_recorded(
+            payload_json, str(round_record.get("output") or "")
+        )
         summary = {
-            "rounds": rounds + 1,
+            "rounds": rounds + 1 if round_record else 0,
             "tool_calls": tool_records,
             "output_chars": output_chars,
+            "assistant_recorded": bool(recorded.get("recorded")),
+            "assistant_message_id": recorded.get("message_id"),
         }
+        if stopped_by is not None:
+            summary[STOPPED_BY_EVENT_KEY] = stopped_by
         _agent_run_finished(payload_json, canonical_json(summary))
         return {"run_id": intent.run_id, "state": "succeeded", **summary}
     except AgentStageError as stage:
         _agent_run_failed(payload_json, stage.reason)
+        _release_lease_quietly(intent)
         raise AgentRunFailed(stage.reason) from None
     except StepsError:
         _record_quietly(intent, "fail")
+        _release_lease_quietly(intent)
         raise
     except dbos_error.DBOSWorkflowCancelledError:
         _record_quietly(intent, "cancel")
+        _release_lease_quietly(intent)
         raise
     except AgentRunError:
         _record_quietly(intent, "fail")
+        _release_lease_quietly(intent)
         raise
     except Exception:
         # An unexpected failure (a defect, not a classified stage): the
@@ -2320,6 +2784,7 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         # translation so both sides agree, then let the original
         # exception surface as-is (never swallowed, never classified).
         _record_quietly(intent, "fail")
+        _release_lease_quietly(intent)
         raise
 
 

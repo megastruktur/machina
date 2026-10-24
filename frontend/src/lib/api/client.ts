@@ -184,6 +184,40 @@ export type MemoryReflectBody = components['schemas']['MemoryReflectBody'];
 export type MemoryRetainBody = components['schemas']['MemoryRetainBody'];
 
 /**
+ * Canonical conversation surface (§3; 09-client-continuity). Types come
+ * verbatim from the generated schema (`operations`/`components`); these
+ * aliases only give the methods and their consumers stable names. The
+ * list/detail/messages/events reads are the scoped paginated page family
+ * (C01 rule 2: explicit `server_id`, never a hidden selection).
+ */
+export type CanonicalConversationSummary = components['schemas']['ConversationSummary'];
+export type CanonicalConversationPage = components['schemas']['ConversationListPage'];
+export type CanonicalConversationDetail = components['schemas']['ConversationDetailView'];
+export type CanonicalTranscriptMessage = components['schemas']['TranscriptMessage'];
+export type CanonicalTranscriptPage = components['schemas']['ConversationTranscriptPage'];
+export type CanonicalConversationEvent = components['schemas']['ConversationEvent'];
+export type CanonicalEventsPage = components['schemas']['ConversationEventsPage'];
+export type CanonicalConversationTurn = components['schemas']['ConversationTurnSubmitRequest'];
+export type CanonicalTurnSubmitted = components['schemas']['ConversationTurnSubmitResponse'];
+export type TurnDisposition = components['schemas']['TurnDisposition'];
+export type ConversationSteerRequest = components['schemas']['ConversationSteerRequest'];
+export type ConversationSteerView = components['schemas']['ChatSteerView'];
+
+/**
+ * Query of the canonical events page: the `afterSeq` replay cursor (the
+ * conversation-local monotonic sequence; only strictly newer events are
+ * returned) plus the bounded page size. There is no `offset` on this route —
+ * the cursor IS the resume position, so the filtered set is always served
+ * from its start and reconnect dedup is by construction.
+ */
+export interface ConversationEventsQuery {
+	/** Replay cursor: return only events strictly newer than this sequence. */
+	afterSeq?: number;
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+}
+
+/**
  * Liveness/readiness bodies. `app.py` returns plain dicts via JSONResponse,
  * so the OpenAPI declarations are `unknown`; these narrow types document the
  * actual observed bodies (backend/src/mai/api/app.py `liveness`/`readiness`).
@@ -533,6 +567,63 @@ export interface MaiApiClient {
 	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
 	cancelConversation(runId: string, payload: ChatCancelBody): Promise<CancelView>;
 
+	// Canonical conversation surface (§3; 09-client-continuity). Every method
+	// takes its explicit `server_id`; collection reads take `page?: PageQuery`
+	// (the events page takes its `afterSeq` cursor instead of an offset).
+	/**
+	 * GET /api/v1/chat/conversations?server_id=… — one bounded page of safe
+	 * canonical conversation metadata (deterministic `updated_at DESC,
+	 * conversation_id`; no transcript content ever rides a list page).
+	 */
+	listCanonicalConversations(
+		serverId: string,
+		page?: PageQuery
+	): Promise<CanonicalConversationPage>;
+	/** GET /api/v1/chat/conversations/{id}?server_id=… — safe header + gap honesty. */
+	getConversation(conversationId: string, serverId: string): Promise<CanonicalConversationDetail>;
+	/**
+	 * GET /api/v1/chat/conversations/{id}/messages?server_id=… — role-preserving
+	 * sanitized transcript page ordered `(sequence, message_id)`, same-filter total.
+	 */
+	listConversationMessages(
+		conversationId: string,
+		serverId: string,
+		page?: PageQuery
+	): Promise<CanonicalTranscriptPage>;
+	/**
+	 * GET /api/v1/chat/conversations/{id}/events?server_id=&after_seq=&limit= —
+	 * bounded cursor-exclusive metadata events plus the current-state block.
+	 */
+	listConversationEvents(
+		conversationId: string,
+		serverId: string,
+		query?: ConversationEventsQuery
+	): Promise<CanonicalEventsPage>;
+	/**
+	 * POST /api/v1/chat/conversations — create a conversation and admit its
+	 * first turn (idempotent on `client_request_id`: 201 created, 200
+	 * deduplicated; the body's `disposition` is the honest verdict).
+	 */
+	createConversation(payload: CanonicalConversationTurn): Promise<CanonicalTurnSubmitted>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/messages — one follow-up turn onto
+	 * an existing conversation (201 created / 200 deduplicated / 202
+	 * queued_followup while another run holds the writer lease).
+	 */
+	submitConversationMessage(
+		conversationId: string,
+		payload: CanonicalConversationTurn
+	): Promise<CanonicalTurnSubmitted>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/steer — one deterministic
+	 * steering/control request onto the active run (201 created, 200
+	 * deduplicated on retransmission).
+	 */
+	steerConversation(
+		conversationId: string,
+		payload: ConversationSteerRequest
+	): Promise<ConversationSteerView>;
+
 	/** GET /api/v1/models/connections — value-free references. */
 	listConnections(): Promise<ModelConnectionList>;
 	/** GET /api/v1/models/connections/{name} — credential reference only. */
@@ -834,6 +925,49 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<CancelView>(
 				'POST',
 				`/api/v1/chat/runs/${encodeURIComponent(runId)}/cancel`,
+				payload
+			),
+
+		// Canonical conversation surface (§3; 09-client-continuity). Same
+		// transport as every other method: C01 envelope errors through
+		// `ApiError`, session cookies + CSRF double-submit on mutations.
+		listCanonicalConversations: (serverId, page) =>
+			requestJson<CanonicalConversationPage>(
+				'GET',
+				`/api/v1/chat/conversations?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		getConversation: (conversationId, serverId) =>
+			requestJson<CanonicalConversationDetail>(
+				'GET',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}?server_id=${encodeURIComponent(serverId)}`
+			),
+		listConversationMessages: (conversationId, serverId, page) =>
+			requestJson<CanonicalTranscriptPage>(
+				'GET',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		listConversationEvents: (conversationId, serverId, query) => {
+			const params = new URLSearchParams();
+			params.set('server_id', serverId);
+			if (query?.afterSeq !== undefined) params.set('after_seq', String(query.afterSeq));
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			return requestJson<CanonicalEventsPage>(
+				'GET',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/events?${params.toString()}`
+			);
+		},
+		createConversation: (payload) =>
+			requestJson<CanonicalTurnSubmitted>('POST', '/api/v1/chat/conversations', payload),
+		submitConversationMessage: (conversationId, payload) =>
+			requestJson<CanonicalTurnSubmitted>(
+				'POST',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
+				payload
+			),
+		steerConversation: (conversationId, payload) =>
+			requestJson<ConversationSteerView>(
+				'POST',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/steer`,
 				payload
 			),
 

@@ -594,7 +594,9 @@ def _drop_app_tables(url: str) -> None:
     """Reset the fixture database to pre-bootstrap state (engine schema too)."""
     with psycopg.connect(url) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
+            "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
+            "conversation_messages, conversations, "
+            "job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, notification_alerts, "
             "observation_findings, server_observations, job_runs, approvals, "
             "application_projection, application_projection_journal, "
@@ -704,6 +706,10 @@ async def _truncate(url: str) -> None:
                 "profile_projection",
                 "admin_sessions",
                 "admin_credential",
+                "conversation_steering",
+                "conversation_runs",
+                "conversation_messages",
+                "conversations",
             ):
                 # ``job_resource_locks`` is engine/service-owned (like the
                 # dbos schema): absent until its first real use, so the
@@ -2222,3 +2228,539 @@ async def test_rename_conversation_persists_and_carries_across_followup(
     )
     assert followup.status == 201, followup.body
     assert followup.json()["conversation"]["title"] == "Production Nginx Audit"
+
+
+# ---------------------------------------------------------------------------
+# modern canonical turn submission (05-turn-submit; C1/C4/C6/C8 regressions)
+# ---------------------------------------------------------------------------
+
+
+async def submit_turn(
+    app: FastAPI,
+    jar: dict[str, str],
+    client_request_id: uuid.UUID,
+    server: uuid.UUID,
+    *,
+    message: str = "investigate the fixture service",
+    profile: str | None = "fast",
+    conversation_id: uuid.UUID | None = None,
+    **extra: Any,
+) -> HttpResponse:
+    """One modern §3 submit (create or follow-up) through the real ASGI app."""
+    body: dict[str, Any] = {
+        "server_id": str(server),
+        "client_request_id": str(client_request_id),
+        "message": message,
+    }
+    if profile is not None:
+        body["profile"] = profile
+    body.update(extra)
+    path = (
+        "/api/v1/chat/conversations"
+        if conversation_id is None
+        else f"/api/v1/chat/conversations/{conversation_id}/messages"
+    )
+    return await call_app(
+        app,
+        "POST",
+        path,
+        json_body=body,
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+
+
+def _conversation_rows(url: str, conversation_id: uuid.UUID) -> list[dict]:
+    """The canonical transcript rows of one conversation (assertion aid)."""
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT message_id, conversation_id, seq, role, source_kind, content, "
+            "redacted, content_fingerprint, client_request_id "
+            "FROM conversation_messages WHERE conversation_id = %s ORDER BY seq",
+            (conversation_id,),
+        ).fetchall()
+
+
+def _conversation_links(url: str, conversation_id: uuid.UUID) -> list[dict]:
+    """The conversation's run links (assertion aid)."""
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT run_id, released_at FROM conversation_runs "
+            "WHERE conversation_id = %s ORDER BY created_at, run_id",
+            (conversation_id,),
+        ).fetchall()
+
+
+def _conversation_row(url: str, conversation_id: uuid.UUID) -> dict | None:
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        return conn.execute(
+            "SELECT conversation_id, server_id, active_run_id, active_task_id, "
+            "history_completeness FROM conversations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+
+
+async def test_modern_create_admits_first_turn_atomically(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C1/AC1: the first turn records the canonical conversation, the user
+    message row and the enqueue-intent ownership with ONE identity (the
+    client_request_id), then durably enqueues through the real engine."""
+    crid = uuid.uuid4()
+    created = await submit_turn(
+        chat_app,
+        jar,
+        crid,
+        server_a,
+        message="Plan only; do not change files",
+    )
+    assert created.status == 201, created.body
+    body = created.json()
+    assert body["conversation_id"] == str(crid)
+    assert body["run_id"] == str(crid)
+    assert body["task_id"] is None
+    assert body["revision"] == 1
+    assert body["disposition"] == "created"
+    message_id = uuid.UUID(body["message_id"])
+
+    conversation = _conversation_row(bootstrapped_url, crid)
+    assert conversation is not None
+    assert conversation["server_id"] == server_a
+    assert conversation["history_completeness"] == "complete"
+    assert conversation["active_run_id"] == crid
+    assert conversation["active_task_id"] is None
+
+    rows = _conversation_rows(bootstrapped_url, crid)
+    assert len(rows) == 1
+    stored = rows[0]
+    assert stored["message_id"] == message_id
+    assert stored["seq"] == 1
+    assert stored["role"] == "user"
+    assert stored["source_kind"] == "api"
+    assert stored["content"] == "Plan only; do not change files"
+    assert stored["redacted"] is False
+    assert stored["client_request_id"] == crid
+
+    links = _conversation_links(bootstrapped_url, crid)
+    assert [(link["run_id"], link["released_at"] is None) for link in links] == [
+        (crid, True)
+    ]
+
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        run = conn.execute(
+            "SELECT model_profile, server_id FROM job_runs WHERE run_id = %s",
+            (crid,),
+        ).fetchone()
+    assert run is not None
+    assert run["model_profile"] == "fast"
+    assert run["server_id"] == server_a
+
+    events = await read_events_direct(bootstrapped_url, crid)
+    types = [event.type for event in events]
+    assert "run.submitted" in types and "chat.submitted" in types
+    submitted = next(e for e in events if e.type == "chat.submitted")
+    assert submitted.data["conversation_id"] == str(crid)
+    assert submitted.data["message_id"] == str(message_id)
+    assert submitted.data["handler"] == "agent.run"
+    # The engine enqueue followed the commit: the engine HOLDS the run.
+    assert await _current_state(bootstrapped_url, crid) == "queued"
+
+
+async def test_modern_create_pins_missing_profile_from_selection(
+    chat_app, jar, server_a, bootstrapped_url, tmp_path
+) -> None:
+    """An omitted profile pins the controller's stored model selection at
+    submit time; with no selection stored the seam fails closed (503)."""
+    missing = await submit_turn(
+        chat_app, jar, uuid.uuid4(), server_a, profile=None
+    )
+    assert missing.status == 503, missing.body
+    assert _error(missing)["code"] == "unavailable"
+    assert _conversation_row(bootstrapped_url, uuid.uuid4()) is None
+
+    # Store a real selection under the app's data root (the same confined
+    # store the lifespan built), then the omitted profile resolves to it.
+    from mai.agents.models import SCHEMA_VERSION as MODEL_SCHEMA_VERSION
+    from mai.agents.model_store import ModelConfigStore
+
+    store = ModelConfigStore(tmp_path / "data-root")
+    connection = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "name": "gateway",
+        "base_url": "http://127.0.0.1:9/v1",
+        "timeout_seconds": 5,
+        "capabilities": {"tool_calls": True},
+    }
+    store.write_connection(
+        "gateway", json.dumps(connection) + "\n", expected_revision=0
+    )
+    profile = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "name": "selected",
+        "connection": "gateway",
+        "model": "fixture-model",
+        "max_tokens": 256,
+    }
+    store.write_profile("selected", json.dumps(profile) + "\n", expected_revision=0)
+    store.set_selection("gateway", "selected", expected_revision=0)
+
+    crid = uuid.uuid4()
+    created = await submit_turn(
+        chat_app, jar, crid, server_a, message="ask with the selected model",
+        profile=None,
+    )
+    assert created.status == 201, created.body
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT model_profile FROM job_runs WHERE run_id = %s", (crid,)
+        ).fetchone()
+    assert row is not None and row["model_profile"] == "selected"
+
+
+async def test_modern_retry_deduplicates_and_conflict_fails_closed(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C4/AC1: an identical retransmission under the same
+    client_request_id attaches to the SAME message and run (200
+    deduplicated, no second row); any changed payload under the same key
+    fails closed with the stable client_request_conflict."""
+    crid = uuid.uuid4()
+    first = await submit_turn(chat_app, jar, crid, server_a, message="original ask")
+    assert first.status == 201, first.body
+    original_message_id = first.json()["message_id"]
+
+    retry = await submit_turn(chat_app, jar, crid, server_a, message="original ask")
+    assert retry.status == 200, retry.body
+    assert retry.json()["disposition"] == "deduplicated"
+    assert retry.json()["run_id"] == str(crid)
+    assert retry.json()["message_id"] == original_message_id
+
+    conflicting = await submit_turn(
+        chat_app, jar, crid, server_a, message="a different ask entirely"
+    )
+    assert conflicting.status == 409, conflicting.body
+    assert _error(conflicting)["code"] == "client_request_conflict"
+
+    changed_profile = await submit_turn(
+        chat_app, jar, crid, server_a, message="original ask", profile="other"
+    )
+    assert changed_profile.status == 409, changed_profile.body
+    assert _error(changed_profile)["code"] == "client_request_conflict"
+
+    # Exactly ONE message row and ONE run survived every attempt.
+    rows = _conversation_rows(bootstrapped_url, crid)
+    assert len(rows) == 1 and rows[0]["content"] == "original ask"
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_runs WHERE run_id = %s", (crid,)
+        ).fetchone()
+    assert runs is not None and runs["n"] == 1
+    assert await _current_state(bootstrapped_url, crid) == "queued"
+
+
+async def test_modern_followup_reuses_conversation_and_records_only_new_text(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C1/AC2: a finished follow-up reuses the canonical conversation_id,
+    records ONLY the actual new user text (no browser-stitched history)
+    and chains the legacy session_run_id so the history stays ONE entry."""
+    crid = uuid.uuid4()
+    created = await submit_turn(
+        chat_app,
+        jar,
+        crid,
+        server_a,
+        message="Plan only; do not change files",
+    )
+    assert created.status == 201, created.body
+
+    # Finish the first run (writer lease released on the next admission).
+    cancel = await call_app(
+        chat_app,
+        "POST",
+        f"/api/v1/chat/runs/{crid}/cancel",
+        json_body={},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert cancel.status == 200, cancel.body
+
+    followup_id = uuid.uuid4()
+    followup = await submit_turn(
+        chat_app,
+        jar,
+        followup_id,
+        server_a,
+        message="continue",
+        conversation_id=crid,
+    )
+    assert followup.status == 201, followup.body
+    body = followup.json()
+    assert body["conversation_id"] == str(crid)
+    assert body["run_id"] == str(followup_id)
+    assert body["disposition"] == "created"
+
+    rows = _conversation_rows(bootstrapped_url, crid)
+    assert [row["content"] for row in rows] == [
+        "Plan only; do not change files",
+        "continue",
+    ]
+    assert [row["seq"] for row in rows] == [1, 2]
+    assert rows[1]["client_request_id"] == followup_id
+
+    # The follow-up run chains to the conversation's first run for the
+    # legacy surface: one entry, the follow-up listed, the root superseded.
+    events = await read_events_direct(bootstrapped_url, followup_id)
+    submitted = next(e for e in events if e.type == "chat.submitted")
+    assert submitted.data["session_run_id"] == str(crid)
+    assert submitted.data["conversation_id"] == str(crid)
+    listed = await call_app(
+        chat_app,
+        "GET",
+        f"/api/v1/chat/runs?server_id={server_a}",
+        cookies=jar,
+    )
+    assert listed.status == 200
+    listed_ids = [row["run_id"] for row in listed.json()["conversations"]]
+    assert str(followup_id) in listed_ids
+    assert str(crid) not in listed_ids
+
+
+async def test_modern_cross_server_fails_closed(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C8/AC2: every modern submission against another server's
+    conversation identity fails closed with the scope-blind
+    conversation_not_found and zero identity leakage."""
+    server_b = await create_profile(chat_app, jar, "fixture-b")
+    crid = uuid.uuid4()
+    created = await submit_turn(chat_app, jar, crid, server_a, message="mine")
+    assert created.status == 201, created.body
+
+    foreign = await submit_turn(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_b,
+        message="stolen continuation",
+        conversation_id=crid,
+    )
+    assert foreign.status == 404, foreign.body
+    error = _error(foreign)
+    assert error["code"] == "conversation_not_found"
+    assert str(server_a) not in json.dumps(error)
+
+    # The create route: an idempotency key already bound to another
+    # server's conversation scope is a scope-blind 404 as well.
+    stolen = await submit_turn(chat_app, jar, crid, server_b, message="stolen create")
+    assert stolen.status == 404, stolen.body
+    assert _error(stolen)["code"] == "conversation_not_found"
+
+    # Nothing was written for the rejected attempts.
+    assert len(_conversation_rows(bootstrapped_url, crid)) == 1
+    assert [link["run_id"] for link in _conversation_links(bootstrapped_url, crid)] == [
+        crid
+    ]
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        foreign_runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_runs WHERE server_id = %s",
+            (server_b,),
+        ).fetchone()
+    assert foreign_runs is not None and foreign_runs["n"] == 0
+
+
+async def test_modern_concurrent_submissions_serialize(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """C6/AC1: concurrent submissions against one conversation serialize
+    deterministically — the first turn wins the writer lease, the second
+    is honestly queued (202) against the active writer; identical
+    concurrent retransmissions collapse onto one row."""
+    crid = uuid.uuid4()
+    created = await submit_turn(chat_app, jar, crid, server_a, message="first turn")
+    assert created.status == 201, created.body
+
+    # Finish the first run so its writer lease is stale bookkeeping: the
+    # winner of the race below reconciles it away and takes the lease.
+    cancel = await call_app(
+        chat_app,
+        "POST",
+        f"/api/v1/chat/runs/{crid}/cancel",
+        json_body={},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert cancel.status == 200, cancel.body
+
+    second_id, third_id = uuid.uuid4(), uuid.uuid4()
+    both = await asyncio.gather(
+        submit_turn(
+            chat_app, jar, second_id, server_a,
+            message="second turn", conversation_id=crid,
+        ),
+        submit_turn(
+            chat_app, jar, third_id, server_a,
+            message="third turn", conversation_id=crid,
+        ),
+    )
+    statuses = sorted(response.status for response in both)
+    assert statuses == [201, 202]
+    winner = next(r for r in both if r.status == 201)
+    queued = next(r for r in both if r.status == 202)
+    assert queued.json()["disposition"] == "queued_followup"
+    assert queued.json()["run_id"] is None
+    assert queued.json()["conversation_id"] == str(crid)
+    winner_id = uuid.UUID(winner.json()["run_id"])
+    assert winner_id in (second_id, third_id)
+
+    # Ordered turns, exactly one new run, no duplicate active runs.
+    rows = _conversation_rows(bootstrapped_url, crid)
+    assert [row["seq"] for row in rows] == [1, 2, 3]
+    assert len({row["client_request_id"] for row in rows}) == 3
+    links = _conversation_links(bootstrapped_url, crid)
+    assert sorted(str(link["run_id"]) for link in links) == sorted(
+        [str(crid), str(winner_id)]
+    )
+    conversation = _conversation_row(bootstrapped_url, crid)
+    assert conversation is not None
+    assert conversation["active_run_id"] == winner_id
+
+    # Concurrent IDENTICAL creates collapse onto one conversation/row/run.
+    twin = uuid.uuid4()
+    pair = await asyncio.gather(
+        submit_turn(chat_app, jar, twin, server_a, message="twin turn"),
+        submit_turn(chat_app, jar, twin, server_a, message="twin turn"),
+    )
+    assert sorted(response.status for response in pair) == [200, 201]
+    assert len({response.json()["message_id"] for response in pair}) == 1
+    assert len(_conversation_rows(bootstrapped_url, twin)) == 1
+
+
+async def test_modern_followup_under_live_lease_queues(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """A message follow-up while a run holds the writer lease is admitted,
+    recorded in order and honestly reported queued (202) — no competing
+    executor starts (steering is the 07 seam)."""
+    crid = uuid.uuid4()
+    created = await submit_turn(chat_app, jar, crid, server_a, message="holds lease")
+    assert created.status == 201, created.body
+
+    followup_id = uuid.uuid4()
+    queued = await submit_turn(
+        chat_app,
+        jar,
+        followup_id,
+        server_a,
+        message="arrives mid-run",
+        conversation_id=crid,
+    )
+    assert queued.status == 202, queued.body
+    body = queued.json()
+    assert body["disposition"] == "queued_followup"
+    assert body["run_id"] is None
+    assert body["conversation_id"] == str(crid)
+
+    # The turn is durably recorded (ordered), but no run attached.
+    rows = _conversation_rows(bootstrapped_url, crid)
+    assert [row["content"] for row in rows] == ["holds lease", "arrives mid-run"]
+    assert [link["run_id"] for link in _conversation_links(bootstrapped_url, crid)] == [
+        crid
+    ]
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_runs WHERE run_id = %s", (followup_id,)
+        ).fetchone()
+    assert runs is not None and runs["n"] == 0
+
+
+async def test_modern_new_task_conflicts_under_live_lease(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """§1 one-writer lease: an exclusive new episode cannot start while a
+    run holds the conversation lease (structured conversation_busy)."""
+    crid = uuid.uuid4()
+    created = await submit_turn(chat_app, jar, crid, server_a, message="hold the lease")
+    assert created.status == 201, created.body
+
+    rejected = await submit_turn(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        message="switch goal mid-flight",
+        conversation_id=crid,
+        task_action="new_task",
+    )
+    assert rejected.status == 409, rejected.body
+    assert _error(rejected)["code"] == "conversation_busy"
+    assert len(_conversation_rows(bootstrapped_url, crid)) == 1
+
+
+async def test_modern_expected_revision_cas_fails_closed(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """A stale expected_revision is a structured 409 BEFORE any store
+    write; the initial revision pins admit the turn."""
+    crid = uuid.uuid4()
+    stale = await submit_turn(
+        chat_app, jar, crid, server_a, message="stale pin", expected_revision=2
+    )
+    assert stale.status == 409, stale.body
+    assert _error(stale)["code"] == "revision_conflict"
+    assert _conversation_row(bootstrapped_url, crid) is None
+
+    pinned = await submit_turn(
+        chat_app, jar, crid, server_a, message="current pin", expected_revision=1
+    )
+    assert pinned.status == 201, pinned.body
+    assert pinned.json()["revision"] == 1
+
+
+async def test_modern_submit_boundary_session_origin_csrf(
+    chat_app, jar, server_a
+) -> None:
+    """The modern seam sits behind the same session → origin → CSRF
+    boundary as the legacy route (ADR §5 order), before any effect."""
+    unauthenticated = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/conversations",
+        json_body={
+            "server_id": str(server_a),
+            "client_request_id": str(uuid.uuid4()),
+            "message": "no session",
+            "profile": "fast",
+        },
+    )
+    assert unauthenticated.status == 401
+
+    evil = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/conversations",
+        json_body={
+            "server_id": str(server_a),
+            "client_request_id": str(uuid.uuid4()),
+            "message": "evil origin",
+            "profile": "fast",
+        },
+        headers={"origin": EVIL_ORIGIN},
+        cookies=jar,
+    )
+    assert evil.status == 403
+
+    no_csrf = await call_app(
+        chat_app,
+        "POST",
+        "/api/v1/chat/conversations",
+        json_body={
+            "server_id": str(server_a),
+            "client_request_id": str(uuid.uuid4()),
+            "message": "missing csrf",
+            "profile": "fast",
+        },
+        headers={"origin": ORIGIN},
+        cookies=jar,
+    )
+    assert no_csrf.status == 403

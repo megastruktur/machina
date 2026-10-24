@@ -86,7 +86,7 @@ const FIXTURE_CANARY = 'MAI-FIXTURE-CANARY-context-body-NEVER-DISPLAY';
 const HOSTILE_TOOL_TEXT = '<img src=x onerror="window.__maiPwned=1">MAI-FIXTURE-HOSTILE-TOOL-TEXT';
 const HOSTILE_FAILURE = '<script>window.__maiPwned=2</script>fixture_denial';
 
-type Scenario = 'compose' | 'replay' | 'history' | 'approval' | 'approval-absent';
+type Scenario = 'compose' | 'replay' | 'history' | 'approval' | 'approval-absent' | 'canonical';
 
 type Fail = { status: number; code: string; message: string };
 
@@ -111,6 +111,21 @@ interface ChatWindowApi {
 	toggleMain(on: boolean): void;
 	toggleSecond(on: boolean): void;
 	seedConversations(serverId: string, count: number): void;
+	/** Canonical fixture controls (scenario 'canonical'): arm the task
+	 * revision the panel must pin with `expected_revision` (C6). */
+	armRevision(next: number): void;
+	/** Arm the writer-lease busy path: follow-ups return `queued_followup`. */
+	armBusy(on: boolean): void;
+	/** Append an assistant transcript row (the trusted producer's reply). */
+	appendAssistant(conversationId: string, content: string): void;
+	/** Mark the conversation's active run succeeded and release its lease. */
+	completeRun(runId: string): void;
+	/** Most recent test-authored canonical conversation id (or null). */
+	lastCanonicalId(): string | null;
+	/** Cross-server probe: returns ONLY the structured code (C8). */
+	probeCrossServer(): Promise<{ code: string }>;
+	/** Extra metadata-only canonical rows for list pagination. */
+	seedCanonicalConversations(count: number): void;
 	registry: {
 		kinds: string[];
 		checkScope(kind: string, scope: unknown): { ok: true } | { ok: false; code: string };
@@ -130,6 +145,10 @@ declare global {
 		__maiChatLive?: boolean;
 		/** Set ONLY by hostile-content execution (its presence is the failure). */
 		__maiPwned?: number;
+		/** Set by a test init script: the in-page canonical conversation
+		 * store mounts (scenario 'canonical' — the §3 surface is exercised
+		 * with the panel's canonical-first behavior). */
+		__maiChatCanonical?: boolean;
 	}
 }
 
@@ -320,12 +339,396 @@ const APP_SOURCE = `
 		}
 	}
 
+	// --- in-page canonical conversation store (§3; task 10 fixture) ----------
+	// Present only when the init script sets __maiChatCanonical: legacy
+	// scenarios keep the exact legacy-only bag, so the panel's fallback
+	// stays the behavior under test there (graceful degradation).
+
+	const CANON_CONV = 'dd444444-1111-4222-8333-444455556666';
+	const CANON_GAP = 'dd555555-1111-4222-8333-444455556666';
+	const canonical = window.__maiChatCanonical === true;
+	const canonicalStore = {};
+	let canonicalRevision = 1;
+	let canonicalBusy = false;
+	const canonicalSteers = {};
+	let canonicalPauseCount = 0;
+	let canonicalCounter = 0;
+
+	function msgId() {
+		canonicalCounter += 1;
+		return 'e1000000-0000-4000-8000-' + String(canonicalCounter).padStart(12, '0');
+	}
+
+	function canonRow(conversationId, serverId, title, completeness, gaps) {
+		return {
+			conversation_id: conversationId,
+			server_id: serverId,
+			title,
+			created_at: '2026-10-16T08:00:00Z',
+			updated_at: '2026-10-16T08:30:00Z',
+			message_count: 0,
+			active_task_id: null,
+			active_run_id: null,
+			history_completeness: completeness,
+			missing_range: null,
+			legacy_gaps: gaps,
+			messages: [],
+			events: [],
+			latestSeq: 0
+		};
+	}
+
+	function canonAppend(row, role, content, extras) {
+		row.latestSeq += 1;
+		const message = Object.assign(
+			{
+				conversation_id: row.conversation_id,
+				message_id: msgId(),
+				sequence: row.messages.length + 1,
+				role,
+				source_kind: role === 'user' ? 'api' : 'system',
+				created_at:
+					'2026-10-16T08:' + String(10 + row.messages.length).padStart(2, '0') + ':00Z',
+				content,
+				redacted: false,
+				content_ref: null
+			},
+			extras ?? {}
+		);
+		row.messages.push(message);
+		row.message_count = row.messages.length;
+		row.events.push({
+			seq: row.latestSeq,
+			kind: 'transcript.appended',
+			message_id: message.message_id,
+			role,
+			source_kind: message.source_kind,
+			redacted: message.redacted,
+			has_content_ref: message.content_ref !== null,
+			created_at: message.created_at
+		});
+		row.updated_at = message.created_at;
+		return message;
+	}
+
+	function canonActiveRun(row) {
+		return row.active_run_id !== null &&
+			conversations[row.active_run_id] !== undefined &&
+			!['succeeded', 'failed', 'cancelled'].includes(conversations[row.active_run_id].state)
+			? row.active_run_id
+			: null;
+	}
+
+	if (canonical) {
+		const restored = canonRow(CANON_CONV, SERVER_A, 'Restore me', 'complete', []);
+		for (let i = 1; i <= 7; i++) {
+			canonAppend(restored, 'user', 'Restore question ' + i);
+			canonAppend(restored, 'assistant', 'Restore answer ' + i + ' — recorded server-side.');
+		}
+		canonicalStore[CANON_CONV] = restored;
+		const gappy = canonRow(CANON_GAP, SERVER_A, 'Partial legacy import', 'partial', [
+			{
+				kind: 'missing_range',
+				from_sequence: 2,
+				to_sequence: 5,
+				count: null,
+				description:
+					'Sequences 2–5 predate the canonical store; browser-reconstructed bodies are unrecoverable.'
+			}
+		]);
+		canonAppend(gappy, 'user', 'Legacy-era question');
+		canonAppend(gappy, 'assistant', 'Legacy-era answer');
+		canonicalStore[CANON_GAP] = gappy;
+	}
+
+	const canonicalApi = {
+		async listCanonicalConversations(serverId, page) {
+			calls.push({
+				op: 'listCanonicalConversations',
+				serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const rows = Object.values(canonicalStore)
+				.filter((row) => row.server_id === serverId)
+				.sort(
+					(a, b) =>
+						b.updated_at.localeCompare(a.updated_at) ||
+						a.conversation_id.localeCompare(b.conversation_id)
+				);
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const sliced = rows.slice(offset, offset + limit);
+			return {
+				limit,
+				offset,
+				total: rows.length,
+				has_more: offset + sliced.length < rows.length,
+				items: sliced.map((row) => ({
+					conversation_id: row.conversation_id,
+					server_id: row.server_id,
+					title: row.title,
+					created_at: row.created_at,
+					updated_at: row.updated_at,
+					message_count: row.message_count,
+					active_task_id: row.active_task_id,
+					active_run_id: row.active_run_id
+				}))
+			};
+		},
+		async getConversation(conversationId, serverId) {
+			calls.push({ op: 'getConversation', runId: conversationId, serverId });
+			const row = canonicalStore[String(conversationId)];
+			// C8: the scope-blind 404 — never an existence or content leak.
+			if (!row || row.server_id !== serverId) {
+				throw new ApiError(404, 'not_found', 'no conversation in the requesting server scope');
+			}
+			return {
+				conversation_id: row.conversation_id,
+				server_id: row.server_id,
+				title: row.title,
+				created_at: row.created_at,
+				updated_at: row.updated_at,
+				message_count: row.message_count,
+				active_task_id: row.active_task_id,
+				active_run_id: row.active_run_id,
+				history_completeness: row.history_completeness,
+				missing_range: null,
+				legacy_gaps: JSON.parse(JSON.stringify(row.legacy_gaps))
+			};
+		},
+		async listConversationMessages(conversationId, serverId, page) {
+			calls.push({
+				op: 'listConversationMessages',
+				runId: conversationId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const row = canonicalStore[String(conversationId)];
+			if (!row || row.server_id !== serverId) {
+				throw new ApiError(404, 'not_found', 'no conversation in the requesting server scope');
+			}
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const ordered = [...row.messages].sort(
+				(a, b) => a.sequence - b.sequence || a.message_id.localeCompare(b.message_id)
+			);
+			const sliced = ordered.slice(offset, offset + limit);
+			return {
+				limit,
+				offset,
+				total: ordered.length,
+				has_more: offset + sliced.length < ordered.length,
+				conversation_id: row.conversation_id,
+				history_completeness: row.history_completeness,
+				items: JSON.parse(JSON.stringify(sliced))
+			};
+		},
+		async listConversationEvents(conversationId, serverId, query) {
+			calls.push({
+				op: 'listConversationEvents',
+				runId: conversationId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(query ?? {}))
+			});
+			const row = canonicalStore[String(conversationId)];
+			if (!row || row.server_id !== serverId) {
+				throw new ApiError(404, 'not_found', 'no conversation in the requesting server scope');
+			}
+			const after = query?.afterSeq ?? 0;
+			const limit = query?.limit ?? 50;
+			const newer = row.events.filter((one) => one.seq > after);
+			const sliced = newer.slice(0, limit);
+			return {
+				conversation_id: row.conversation_id,
+				limit,
+				offset: 0,
+				total: newer.length,
+				has_more: newer.length > sliced.length,
+				after_seq: after,
+				events: JSON.parse(JSON.stringify(sliced)),
+				current: {
+					latest_seq: row.latestSeq,
+					history_completeness: row.history_completeness,
+					active_run_id: row.active_run_id,
+					active_task_id: row.active_task_id,
+					pending_steering: canonicalPauseCount
+				}
+			};
+		},
+		async createConversation(payload) {
+			const wire = JSON.parse(JSON.stringify(payload));
+			calls.push({ op: 'createConversation', payload: wire });
+			if (!UUID_RE.test(String(payload.client_request_id))) {
+				throw new ApiError(422, 'validation_failed', 'client_request_id must be a canonical UUID string');
+			}
+			if (
+				payload.server_id !== SERVER_A &&
+				payload.server_id !== SERVER_B &&
+				payload.server_id !== GLOBAL_CONSULT
+			) {
+				throw new ApiError(404, 'not_found', 'no canonical profile for the target server');
+			}
+			if (typeof payload.message !== 'string' || payload.message.length === 0) {
+				throw new ApiError(422, 'validation_failed', 'message failed validation', '', {
+					message: 'min_length'
+				});
+			}
+			if (payload.expected_revision != null && payload.expected_revision !== canonicalRevision) {
+				throw new ApiError(409, 'revision_conflict', 'expected task revision does not match the current revision', '', {
+					expected_revision: 'revision_conflict'
+				});
+			}
+			const id = String(payload.client_request_id);
+			if (canonicalStore[id] !== undefined) {
+				const first = canonicalStore[id].messages[0];
+				if (first.content !== payload.message) {
+					throw new ApiError(409, 'client_request_conflict', 'idempotency key is already used by a different submission');
+				}
+				return {
+					conversation_id: id,
+					message_id: first.message_id,
+					task_id: null,
+					run_id: id,
+					revision: canonicalRevision,
+					disposition: 'deduplicated'
+				};
+			}
+			const row = canonRow(id, payload.server_id, null, 'complete', []);
+			const message = canonAppend(row, 'user', payload.message);
+			canonicalStore[id] = row;
+			// The durable run: the facade row the run read and the SSE route serve.
+			conversations[id] = runRow(id, payload.server_id, 'running', { requested_grants: [] });
+			row.active_run_id = id;
+			return {
+				conversation_id: id,
+				message_id: message.message_id,
+				task_id: null,
+				run_id: id,
+				revision: canonicalRevision,
+				disposition: 'created'
+			};
+		},
+		async submitConversationMessage(conversationId, payload) {
+			const wire = JSON.parse(JSON.stringify(payload));
+			calls.push({ op: 'submitConversationMessage', runId: conversationId, payload: wire });
+			const row = canonicalStore[String(conversationId)];
+			if (!row || row.server_id !== payload.server_id) {
+				throw new ApiError(404, 'not_found', 'no conversation in the requesting server scope');
+			}
+			if (row.history_completeness !== 'complete') {
+				// §4 gate: gap confirmation comes BEFORE any mutation (C7).
+				throw new ApiError(
+					409,
+					'history_reconstruction_incomplete',
+					'history reconstruction is ' +
+						row.history_completeness +
+						'; explicit user scope confirmation is required before new mutations',
+					'',
+					{ history_completeness: 'history_reconstruction_incomplete' }
+				);
+			}
+			if (payload.expected_revision != null && payload.expected_revision !== canonicalRevision) {
+				throw new ApiError(409, 'revision_conflict', 'expected task revision does not match the current revision', '', {
+					expected_revision: 'revision_conflict'
+				});
+			}
+			const prior = row.messages.find((one) => one.client_request_id === payload.client_request_id);
+			if (prior !== undefined) {
+				if (prior.content !== payload.message) {
+					throw new ApiError(409, 'client_request_conflict', 'idempotency key is already used by a different submission');
+				}
+				return {
+					conversation_id: row.conversation_id,
+					message_id: prior.message_id,
+					task_id: null,
+					run_id: null,
+					revision: canonicalRevision,
+					disposition: 'deduplicated'
+				};
+			}
+			const message = canonAppend(row, 'user', payload.message, {
+				client_request_id: payload.client_request_id
+			});
+			const lease = canonActiveRun(row);
+			if (canonicalBusy && lease !== null) {
+				// Durable delivery identity: the lease-holding run consumes the
+				// turn at its next safe boundary (202 semantics; no second executor).
+				canonicalPauseCount += 1;
+				return {
+					conversation_id: row.conversation_id,
+					message_id: message.message_id,
+					task_id: null,
+					run_id: null,
+					revision: canonicalRevision,
+					disposition: 'queued_followup'
+				};
+			}
+			const runId = String(payload.client_request_id);
+			conversations[runId] = runRow(runId, payload.server_id, 'running', {});
+			row.active_run_id = runId;
+			return {
+				conversation_id: row.conversation_id,
+				message_id: message.message_id,
+				task_id: null,
+				run_id: runId,
+				revision: canonicalRevision,
+				disposition: 'created'
+			};
+		},
+		async steerConversation(conversationId, payload) {
+			const wire = JSON.parse(JSON.stringify(payload));
+			calls.push({ op: 'steerConversation', runId: conversationId, payload: wire });
+			const row = canonicalStore[String(conversationId)];
+			if (!row || row.server_id !== payload.server_id) {
+				throw new ApiError(404, 'not_found', 'no conversation in the requesting server scope');
+			}
+			const active = canonActiveRun(row);
+			if (active === null) {
+				throw new ApiError(409, 'no_active_run', "no active run holds this conversation's writer lease", '', {
+					conversation_id: 'no_active_run'
+				});
+			}
+			const key = String(payload.client_request_id);
+			if (canonicalSteers[key] === true) {
+				return {
+					conversation_id: row.conversation_id,
+					steering_id: key,
+					run_id: active,
+					action: payload.action,
+					client_request_id: key,
+					disposition: 'deduplicated',
+					delivery_status: 'pending'
+				};
+			}
+			canonicalSteers[key] = true;
+			if (payload.action === 'cancel') {
+				conversations[active].cancel_requested_at = '2026-10-16T09:05:00Z';
+				conversations[active].state = 'cancelled';
+				row.active_run_id = null;
+			} else if (payload.action === 'pause') {
+				canonicalPauseCount += 1;
+			}
+			return {
+				conversation_id: row.conversation_id,
+				steering_id: key,
+				run_id: active,
+				action: payload.action,
+				client_request_id: key,
+				disposition: 'created',
+				delivery_status: 'pending'
+			};
+		}
+	};
+
 	let approvalReadFailure = null;
 	let failNextRead = null;
 	let decideFailure = null;
 	let cancelOutcome = null;
 
 	const api = {
+		// The canonical slice rides ONLY when the scenario mounted the
+		// canonical store: the legacy bag stays byte-identical otherwise.
+		...(canonical ? canonicalApi : {}),
 		async submitMessage(payload) {
 			const wire = JSON.parse(JSON.stringify(payload));
 			calls.push({ op: 'submitMessage', payload: wire });
@@ -596,6 +999,59 @@ const APP_SOURCE = `
 					children: [],
 					attachments: []
 				});
+			}
+		},
+		armRevision(next) {
+			canonicalRevision = next;
+		},
+		armBusy(on) {
+			canonicalBusy = on;
+		},
+		appendAssistant(conversationId, content) {
+			const row = canonicalStore[String(conversationId)];
+			if (!row) throw new Error('no such canonical conversation');
+			canonAppend(row, 'assistant', content);
+		},
+		completeRun(runId) {
+			const run = conversations[String(runId)];
+			if (run === undefined) throw new Error('no such fixture run');
+			run.state = 'succeeded';
+			const row = canonicalStore[String(runId)];
+			if (row !== undefined && row.active_run_id === String(runId)) row.active_run_id = null;
+		},
+		lastCanonicalId() {
+			const ids = Object.keys(canonicalStore).filter(
+				(id) => id !== CANON_CONV && id !== CANON_GAP
+			);
+			return ids.length === 0 ? null : ids[ids.length - 1];
+		},
+		async probeCrossServer() {
+			// Drives the REAL harness getConversation across scopes; returns
+			// ONLY the structured code — never conversation content (C8).
+			try {
+				await canonicalApi.getConversation(CANON_CONV, SERVER_B);
+				return { code: 'leaked' };
+			} catch (error) {
+				return {
+					code:
+						error !== null && typeof error === 'object' && 'code' in error
+							? String(error.code)
+							: 'unknown'
+				};
+			}
+		},
+		seedCanonicalConversations(count) {
+			for (let i = 1; i <= count; i++) {
+				const id = 'cc000000-0000-4000-8000-' + String(i).padStart(12, '0');
+				const row = canonRow(
+					id,
+					SERVER_A,
+					'Paged conversation ' + i,
+					'complete',
+					[]
+				);
+				row.updated_at = '2026-10-16T07:' + String(59 - i).padStart(2, '0') + ':00Z';
+				canonicalStore[id] = row;
 			}
 		},
 		registry: {
@@ -925,9 +1381,13 @@ test.beforeEach(async ({ page }) => {
 
 async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
 	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
-	await page.addInitScript((value) => {
-		window.__maiChatScenario = value;
-	}, scenario);
+	await page.addInitScript(
+		(value) => {
+			window.__maiChatScenario = value;
+			window.__maiChatCanonical = value === 'canonical';
+		},
+		scenario
+	);
 	await page.goto(FIXTURE_URL);
 	await expect(page.getByTestId('host-main').getByTestId('chat-root')).toBeVisible();
 	await expect(page.getByTestId('host-second').getByTestId('chat-root')).toBeVisible();
@@ -2044,4 +2504,244 @@ test('chat history limits initial page to 10 conversations and loads more on dem
 		'Showing 14 of 14 recorded conversations.'
 	);
 	await expect(main.getByTestId('history-load-more')).toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Canonical conversation continuity (§3; task 10) — the in-page canonical
+// store scenario. The panel runs its canonical-first behavior: raw-message
+// submits (C1/C6), server-truth restore + bounded transcript paging (C2),
+// the deterministic control plane (C5), gap honesty (C7) and scope
+// isolation (C8). Legacy scenarios above keep the legacy-only bag and prove
+// the graceful fallback.
+// ---------------------------------------------------------------------------
+
+test.describe('canonical conversation continuity (in-page canonical store)', () => {
+	test('C1/C6: submits carry ONLY the raw message; a stale revision fails closed with nothing applied', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await main.getByTestId('compose-message').fill('Plan only; do not change files');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		const creates = await callsOf(page, 'createConversation');
+		expect(creates).toHaveLength(1);
+		const body = creates[0].payload as Record<string, unknown>;
+		// The wire carries ONLY the actual user text — never a stitched
+		// "## Prior conversation turns" wrapper (C1/C6).
+		expect(body.message).toBe('Plan only; do not change files');
+		expect(body.server_id).toBe(SERVER_A);
+		expect(body.profile).toBe('fixture-fast');
+		expect(UUID_RE.test(String(body.client_request_id))).toBe(true);
+		expect(body.task_action).toBe('continue');
+
+		// The admitted turn is durable server-side: the transcript row is
+		// the server's copy, rendered verbatim.
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Plan only; do not change files'
+		);
+
+		// The trusted producer appends the reply; the run finishes and the
+		// terminal hand-over pulls the produced rows into the transcript.
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		expect(conversationId).not.toBeNull();
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'done');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText('done');
+		await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+
+		// A follow-up rides the conversation id + revision pin, raw text only.
+		await main.getByTestId('compose-message').fill('continue');
+		await main.getByTestId('chat-submit').click();
+		const follows = await callsOf(page, 'submitConversationMessage');
+		expect(follows).toHaveLength(1);
+		expect(follows[0].runId).toBe(conversationId);
+		const followBody = follows[0].payload as Record<string, unknown>;
+		expect(followBody.message).toBe('continue');
+		expect(followBody.expected_revision).toBe(1);
+		expect(followBody.task_action).toBe('continue');
+		expect(followBody.server_id).toBe(SERVER_A);
+
+		// C6: another writer moves the revision; the stale pin fails closed
+		// with a structured conflict, the draft survives and nothing applied.
+		await page.evaluate(() => window.__maiChatApi!.armRevision(2));
+		await main.getByTestId('compose-message').fill('Stale follow-up');
+		await main.getByTestId('chat-submit').click();
+		const conflict = main.getByTestId('compose-error');
+		await expect(conflict).toBeVisible();
+		await expect(conflict).toHaveAttribute('data-error-code', 'revision_conflict');
+		await expect(conflict).toContainText('NOT applied');
+		await expect(main.getByTestId('compose-message')).toHaveValue('Stale follow-up');
+		const userRows = await main.getByTestId('canonical-user-message').allTextContents();
+		expect(userRows.filter((text) => text.includes('Stale follow-up'))).toHaveLength(0);
+	});
+
+	test('C2: history selection restores the server transcript with bounded paging and no local cache', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await main.getByTestId('chat-history-toggle').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(2);
+		await main.getByTestId('chat-history-item').first().click();
+
+		// Restored strictly from the server reads (getConversation +
+		// listConversationMessages) — the newest bounded window first.
+		await expect(main.getByTestId('conversation-state')).toBeVisible();
+		await expect(main.getByTestId('transcript-window-meta')).toHaveText(
+			'Showing 10 of 14 recorded messages.'
+		);
+		await expect(main.getByTestId('canonical-user-message')).toHaveCount(5);
+		await expect(main.getByTestId('canonical-assistant-message')).toHaveCount(5);
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Restore question 7'
+		);
+		await expect(main.getByTestId('transcript-load-earlier')).toContainText(
+			'Load earlier messages (10 of 14)'
+		);
+
+		// Bounded scroll container (AGENTS §1): the transcript scrolls, it
+		// never grows the page.
+		await expect(main.locator('.mai-chat__conversation-scroll')).toHaveCSS(
+			'overflow-y',
+			'auto'
+		);
+
+		// Load earlier: deduplicated prepend until the window covers all.
+		await main.getByTestId('transcript-load-earlier').click();
+		await expect(main.getByTestId('transcript-window-meta')).toHaveText(
+			'Showing 14 of 14 recorded messages.'
+		);
+		await expect(main.getByTestId('canonical-user-message')).toHaveCount(7);
+		await expect(main.getByTestId('canonical-assistant-message')).toHaveCount(7);
+		await expect(main.getByTestId('transcript-load-earlier')).toHaveCount(0);
+		await expect(main.getByTestId('canonical-user-message').first()).toContainText(
+			'Restore question 1'
+		);
+
+		// No browser cache: the canonical restore writes NOTHING into web
+		// storage — a fresh session re-reads the same server truth.
+		const storage = await page.evaluate(() => ({
+			authored: window.localStorage.getItem('mai.chat.authored.v1'),
+			turns: window.localStorage.getItem('mai.chat.prior_turns.v1'),
+			superseded: window.localStorage.getItem('mai.chat.superseded.v1')
+		}));
+		expect(storage).toEqual({ authored: null, turns: null, superseded: null });
+		const reads = await callsOf(page, 'listConversationMessages');
+		expect(reads.length).toBeGreaterThanOrEqual(2);
+	});
+
+	test('C5: steering, pause and cancel ride the deterministic control plane with honest queued states', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await main.getByTestId('compose-message').fill('Long inspection task');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Long inspection task'
+		);
+
+		// Active lease: the follow-up is admitted, persisted, and honestly
+		// reported queued_followup (202 semantics — no second executor).
+		await page.evaluate(() => window.__maiChatApi!.armBusy(true));
+		await main.getByTestId('compose-message').fill('Steer towards the nginx unit logs');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('turn-queued-note')).toBeVisible();
+		await expect(main.getByTestId('turn-queued-note')).toContainText(
+			'queued behind the active run'
+		);
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Steer towards the nginx unit logs'
+		);
+
+		// Pause: a deterministic control row with honest pending delivery.
+		await main.getByTestId('chat-pause').click();
+		await expect(main.getByTestId('control-note')).toContainText('Pause recorded');
+		const steers = await callsOf(page, 'steerConversation');
+		expect(steers).toHaveLength(1);
+		expect(steers[0].payload).toMatchObject({ action: 'pause' });
+		await expect(main.getByTestId('pending-steering-note')).toContainText(
+			'Pending steering rows: 1'
+		);
+
+		// Cancel through the same control plane; the recorded run state is
+		// rendered as the verified truth.
+		await main.getByTestId('chat-stop').click();
+		await expect(main.getByTestId('control-note')).toContainText('Cancellation recorded');
+		await expect(main.getByTestId('conversation-state')).toHaveText('Cancelled (verified)');
+		const cancels = await callsOf(page, 'steerConversation');
+		expect(cancels).toHaveLength(2);
+		expect(cancels[1].payload).toMatchObject({ action: 'cancel' });
+	});
+
+	test('C7: partial legacy history renders the gap banner and refuses mutations honestly', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('chat-history-item').nth(1).click();
+		const banner = main.getByTestId('legacy-gaps-banner');
+		await expect(banner).toBeVisible();
+		await expect(banner).toContainText('partial');
+		await expect(main.getByTestId('legacy-gap')).toContainText('Sequences 2–5');
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Legacy-era question'
+		);
+
+		await main.getByTestId('compose-message').fill('Mutate despite the gap');
+		await main.getByTestId('chat-submit').click();
+		const refusal = main.getByTestId('compose-error');
+		await expect(refusal).toBeVisible();
+		await expect(refusal).toHaveAttribute('data-error-code', 'history_reconstruction_incomplete');
+		await expect(refusal).toContainText('scope confirmation');
+		// Nothing was applied: the transcript still holds only the two rows.
+		await expect(main.getByTestId('canonical-user-message')).toHaveCount(1);
+		await expect(main.getByTestId('canonical-assistant-message')).toHaveCount(1);
+	});
+
+	test('C8: canonical scope isolation — other servers never render and cross-scope probes fail closed', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const second = page.getByTestId('host-second');
+
+		// SERVER_B's panel sees none of SERVER_A's conversations.
+		await second.getByTestId('chat-history-toggle').click();
+		await expect(second.getByTestId('history-empty')).toBeVisible();
+		await expect(second.getByTestId('history-row')).toHaveCount(0);
+
+		// A direct cross-scope read returns ONLY the structured code.
+		const probe = await page.evaluate(() => window.__maiChatApi!.probeCrossServer());
+		expect(probe.code).toBe('not_found');
+	});
+
+	test('canonical history list pages with Load more inside a bounded container', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await page.evaluate(() => window.__maiChatApi!.seedCanonicalConversations(11));
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(10);
+		await expect(main.getByTestId('history-total')).toHaveText(
+			'Showing 10 of 13 recorded conversations.'
+		);
+		await main.getByTestId('history-load-more').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(13);
+		await expect(main.getByTestId('history-total')).toHaveText(
+			'Showing 13 of 13 recorded conversations.'
+		);
+		await expect(main.getByTestId('history-load-more')).toHaveCount(0);
+	});
 });

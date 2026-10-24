@@ -69,6 +69,7 @@ from mai.api.auth import (
     resolve_trusted_proxies,
 )
 from mai.api.chat import register_chat
+from mai.api.conversations import register_conversations
 from mai.api.documents import (
     EMBEDDINGS_BASE_URL_VAR,
     EMBEDDINGS_CREDENTIAL_REF_VAR,
@@ -517,6 +518,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # delegation facade — HTTP persists intent only; model rounds, tool
     # calls and child workflows run in the worker.
     register_chat(app)
+    # The canonical conversation history surface (act_CONTRACTS §3/§4):
+    # bounded, explicitly server-scoped reads over the app-owned
+    # conversation store — the paginated list/detail/transcript pages and
+    # the cursor-deduplicated metadata event page, with honest legacy-gap
+    # labels (partial/unavailable) instead of invented turns. Read-only:
+    # writes stay on the reviewed chat submit/steer seam.
+    register_conversations(app)
     # The model configuration/selection/probe surface (C03 rule 6/C06
     # rule 1): connection/profile/selection records over the confined
     # atomic store — credential references only, never resolved material

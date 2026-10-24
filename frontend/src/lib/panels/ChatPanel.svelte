@@ -75,6 +75,7 @@
 	import DetailsDisclosure from '../ui/DetailsDisclosure.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
+	import type { components } from '../api/schema.generated.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import {
 		GLOBAL_CONSULT_SERVER_ID,
@@ -86,9 +87,16 @@
 		type ChatServiceOption,
 		type ChatServices,
 		type ChatSubmitBody,
+		type CanonicalConversationDetail,
+		type CanonicalConversationPage,
+		type CanonicalConversationSummary,
+		type CanonicalTranscriptMessage,
+		type CanonicalTranscriptPage,
+		type CanonicalTurnSubmitted,
 		type ConversationView,
 		type DecisionBody,
-		type RunDetail
+		type RunDetail,
+		type TurnDisposition
 	} from '../workspace/entries/06-web-chat.js';
 
 	export type ChatHistoryMeta = {
@@ -273,8 +281,12 @@
 		dockComposerEl?.scrollIntoView({ block: 'nearest' });
 	}
 
-	function selectHistoryRow(row: ConversationView): void {
+	function selectHistoryRow(row: ChatHistoryRow): void {
 		historyOpen = false;
+		if (row.canonical === true && canonicalApi !== null) {
+			void openCanonicalConversation(row);
+			return;
+		}
 		openConversation(row);
 	}
 
@@ -428,29 +440,10 @@
 		const serverId = generalConsultMode
 			? GLOBAL_CONSULT_SERVER_ID
 			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
-		const userPrompt = composeMessage.trim();
-		let fullMessage = userPrompt;
-		if (display !== null && !jobInProgress) {
-			const turnsToSummarize: Array<{ user: string; assistant: string }> = [
-				...priorTurns.map((t) => ({ user: t.userMessage, assistant: t.reply })),
-				{ user: messageText, assistant: latestAssistantReply || streamedReply }
-			];
-			const historyLines: string[] = ['## Prior conversation turns in this session', ''];
-			for (let idx = 0; idx < turnsToSummarize.length; idx++) {
-				const turn = turnsToSummarize[idx];
-				historyLines.push(`### Turn ${idx + 1} — User`);
-				historyLines.push(turn.user);
-				if (turn.assistant.trim() !== '') {
-					historyLines.push('', `### Turn ${idx + 1} — Assistant`, turn.assistant.trim());
-				}
-				historyLines.push('');
-			}
-			historyLines.push('## Follow-up request', '', userPrompt);
-			const candidate = historyLines.join('\n');
-			if (candidate.length <= 15000) {
-				fullMessage = candidate;
-			}
-		}
+		// The browser NEVER stitches prior turns into the prompt (C1/C6):
+		// the legacy seam carries ONLY the actual new user text, and the
+		// canonical conversation surface assembles history server-side.
+		const fullMessage = composeMessage.trim();
 		const body: ChatSubmitBody = {
 			run_id: runId,
 			server_id: serverId,
@@ -484,6 +477,10 @@
 		composeProblem = null;
 		if (Object.keys(composeFields).length > 0) return;
 		const rawUserPrompt = composeMessage.trim();
+		if (canonicalApi !== null) {
+			await submitCanonicalTurn(rawUserPrompt);
+			return;
+		}
 		const body = buildSubmitBody(crypto.randomUUID());
 		composeBusy = true;
 		try {
@@ -558,9 +555,530 @@
 		}
 	}
 
+	// --- canonical conversation surface (§3; 09-client-continuity; task 10) ----
+
+	/**
+	 * Honest legacy-history vocabulary (generated schema, §4): `complete`
+	 * needs no banner; `partial`/`unavailable` render the gap banner and
+	 * the backend blocks new mutations until scope confirmation — the UI
+	 * never fabricates turns to fill a gap (C7).
+	 */
+	type HistoryCompleteness = components['schemas']['HistoryCompleteness'];
+	type LegacyGap = components['schemas']['LegacyHistoryGap'];
+
+	/**
+	 * History-row union: legacy run rows unchanged, canonical conversation
+	 * rows pinning `run_id` to the conversation id (the stable list
+	 * identity the drawer seam selects by) plus canonical-only display
+	 * fields. Legacy consumers keep reading the ConversationView part.
+	 */
+	type ChatHistoryRow = ConversationView & {
+		conversation_id?: string;
+		message_count?: number;
+		canonical?: boolean;
+	};
+
+	/** The optional canonical slice, present only when EVERY method exists. */
+	type CanonicalChatApi = ChatApi &
+		Required<
+			Pick<
+				ChatApi,
+				| 'createConversation'
+				| 'submitConversationMessage'
+				| 'steerConversation'
+				| 'listCanonicalConversations'
+				| 'getConversation'
+				| 'listConversationMessages'
+				| 'listConversationEvents'
+			>
+		>;
+
+	const canonicalApi = $derived.by<CanonicalChatApi | null>(() => {
+		if (api === null) return null;
+		for (
+			const name of [
+				'createConversation',
+				'submitConversationMessage',
+				'steerConversation',
+				'listCanonicalConversations',
+				'getConversation',
+				'listConversationMessages',
+				'listConversationEvents'
+			] as const
+		) {
+			if (typeof api[name] !== 'function') return null;
+		}
+		return api as CanonicalChatApi;
+	});
+
+	// Canonical conversation state (single-writer instance locals; no
+	// module-level singletons, ADR §5 rule 4).
+	let canonicalId = $state<string | null>(null);
+	let canonicalDetail = $state<CanonicalConversationDetail | null>(null);
+	let canonicalMessages = $state<CanonicalTranscriptMessage[]>([]);
+	let canonicalTotal = $state(0);
+	/** Slice start of the loaded transcript window (ascending sequences). */
+	let canonicalOffset = $state(0);
+	let canonicalHasMore = $state(false);
+	let canonicalLoadingMore = $state(false);
+	let canonicalBusy = $state(false);
+	let canonicalProblem = $state<{ code: string; message: string } | null>(null);
+	let canonicalCompleteness = $state<HistoryCompleteness>('complete');
+	let canonicalGaps = $state<LegacyGap[]>([]);
+	/** The replay cursor: strictly newer events only (dedup by construction). */
+	let canonicalLatestSeq = $state(0);
+	let canonicalPendingSteering = $state(0);
+	let lastRevision = $state<number | null>(null);
+	let lastDisposition = $state<TurnDisposition | null>(null);
+	let controlBusy = $state(false);
+	let controlNote = $state<string | null>(null);
+
+	const canonicalMode = $derived(canonicalId !== null);
+
+	/**
+	 * Honest status text for a canonical conversation: the lease-holding
+	 * run's recorded state when bound, otherwise the restore/queued truth —
+	 * never a fabricated success (C08 rule 6).
+	 */
+	const canonicalStateText = $derived.by(() => {
+		if (display !== null) return runStateText(display.state);
+		if (canonicalBusy) return 'Restoring conversation…';
+		if (lastDisposition === 'queued_followup') return 'Follow-up queued';
+		return 'Conversation';
+	});
+
+	function resetCanonicalView(): void {
+		canonicalId = null;
+		canonicalDetail = null;
+		canonicalMessages = [];
+		canonicalTotal = 0;
+		canonicalOffset = 0;
+		canonicalHasMore = false;
+		canonicalLoadingMore = false;
+		canonicalProblem = null;
+		canonicalCompleteness = 'complete';
+		canonicalGaps = [];
+		canonicalLatestSeq = 0;
+		canonicalPendingSteering = 0;
+		lastRevision = null;
+		lastDisposition = null;
+		controlBusy = false;
+		controlNote = null;
+	}
+
+	/** Canonical row → the drawer-compatible history row (identity pinned). */
+	function canonicalHistoryRow(row: CanonicalConversationSummary): ChatHistoryRow {
+		return {
+			run_id: row.conversation_id,
+			server_id: row.server_id,
+			parent_run_id: null,
+			depth: 0,
+			profile_revision: 0,
+			prompt_revision: 0,
+			model_profile: '',
+			requested_grants: [],
+			state: null,
+			cancel_requested_at: null,
+			submitted_at: row.created_at,
+			updated_at: row.updated_at,
+			title: row.title ?? null,
+			conversation_id: row.conversation_id,
+			message_count: row.message_count,
+			canonical: true
+		};
+	}
+
+	/**
+	 * Structured turn/control failures keep their honest, specific text:
+	 * the user learns exactly what was NOT applied (C6/C7 wire honesty).
+	 */
+	function canonicalTurnErrorText(code: string, fallback: string): string {
+		if (code === 'revision_conflict')
+			return 'This conversation changed elsewhere; your message was NOT applied. Reopen the conversation and try again.';
+		if (code === 'client_request_conflict')
+			return 'That idempotency key already carried a different message; nothing was duplicated or overwritten.';
+		if (code === 'conversation_busy')
+			return 'Another run holds this conversation; steering, pause or cancel are accepted while it executes.';
+		if (code === 'history_reconstruction_incomplete')
+			return 'Earlier history is incomplete; explicit scope confirmation is required before new mutations. The message was not applied.';
+		if (code === 'no_active_run')
+			return 'No active run holds this conversation; there is nothing to steer.';
+		return friendlyText(code, fallback);
+	}
+
+	/**
+	 * Bounded history page of the PINNED server from the canonical store
+	 * (C01 rules 2/5): safe metadata only — no transcript content ever
+	 * rides a list page.
+	 */
+	async function loadCanonicalHistory(loadMore: boolean): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const scope = serverScope;
+		if (canonicalRef === null || scope === null) return;
+		if (loadMore) {
+			if (historyState.status !== 'ready' || historyLoadingMore || !historyHasMore) return;
+		}
+		historyState = { status: 'loading' };
+		if (!loadMore) {
+			historyRows = [];
+			historyLoadingMore = false;
+		}
+		historyProblem = null;
+		try {
+			const page: CanonicalConversationPage = await canonicalRef.listCanonicalConversations(
+				scope,
+				{ limit: PAGE_LIMIT, offset: loadMore ? historyOffset : 0 }
+			);
+			if (disposed || scope !== serverScope) return;
+			const mapped = (page.items ?? []).map(canonicalHistoryRow);
+			if (loadMore) {
+				const seen = new Set(historyRows.map((row) => row.run_id));
+				historyRows = [...historyRows, ...mapped.filter((row) => !seen.has(row.run_id))];
+			} else {
+				historyRows = mapped;
+			}
+			historyOffset = page.offset + (page.items ?? []).length;
+			historyRawTotal = page.total;
+			historyTotal = page.total;
+			historyState = { status: 'ready' };
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			if (!loadMore) {
+				historyRows = [];
+				historyTotal = 0;
+				historyOffset = 0;
+				historyRawTotal = 0;
+				historyState = { status: 'error' };
+			}
+			historyProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ??
+						(loadMore
+							? 'Additional conversations could not be loaded.'
+							: 'The conversation list could not be read.')
+				)
+			};
+		}
+	}
+
+	/**
+	 * Apply one transcript page as the visible window (ascending order).
+	 * The window is the bounded LAST page on restore; the server truth
+	 * replaces everything local, so no optimistic residue survives.
+	 */
+	function applyCanonicalPage(page: CanonicalTranscriptPage, start: number): void {
+		canonicalMessages = page.items ?? [];
+		canonicalTotal = page.total;
+		canonicalOffset = start;
+		canonicalHasMore = start > 0;
+		canonicalCompleteness = page.history_completeness;
+		queueMicrotask(scrollToConversationBottom);
+	}
+
+	/** Restore the bounded transcript window (latest PAGE_LIMIT rows). */
+	async function loadCanonicalMessages(): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const id = canonicalId;
+		const scope = serverScope;
+		if (canonicalRef === null || id === null || scope === null) return;
+		const head = await canonicalRef.listConversationMessages(id, scope, {
+			limit: PAGE_LIMIT,
+			offset: 0
+		});
+		if (disposed || canonicalId !== id) return;
+		const start = Math.max(0, head.total - PAGE_LIMIT);
+		if (start === 0) {
+			applyCanonicalPage(head, 0);
+			return;
+		}
+		const tail = await canonicalRef.listConversationMessages(id, scope, {
+			limit: PAGE_LIMIT,
+			offset: start
+		});
+		if (disposed || canonicalId !== id) return;
+		applyCanonicalPage(tail, start);
+	}
+
+	/** `Load earlier`: prepend the preceding deduplicated page. */
+	async function loadEarlierCanonicalMessages(): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const id = canonicalId;
+		const scope = serverScope;
+		if (canonicalRef === null || id === null || scope === null) return;
+		if (canonicalLoadingMore || !canonicalHasMore) return;
+		canonicalLoadingMore = true;
+		canonicalProblem = null;
+		try {
+			const start = Math.max(0, canonicalOffset - PAGE_LIMIT);
+			const page = await canonicalRef.listConversationMessages(id, scope, {
+				limit: canonicalOffset - start,
+				offset: start
+			});
+			if (disposed || canonicalId !== id) return;
+			const seen = new Set(canonicalMessages.map((one) => one.message_id));
+			const earlier = (page.items ?? []).filter((one) => !seen.has(one.message_id));
+			canonicalMessages = [...earlier, ...canonicalMessages];
+			canonicalOffset = start;
+			canonicalTotal = page.total;
+			canonicalCompleteness = page.history_completeness;
+			canonicalHasMore = start > 0;
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			canonicalProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ?? 'Earlier messages could not be loaded.'
+				)
+			};
+		} finally {
+			if (!disposed) canonicalLoadingMore = false;
+		}
+	}
+
+	/**
+	 * Cursor catch-up (C2/C5/C8 honesty): read the bounded event page
+	 * strictly after the last seen conversation sequence. `current` is the
+	 * honest state block — completeness, lease-holding run, pending
+	 * steering count — and new appends trigger a tail re-read so the
+	 * transcript stays one server truth. A newly bound lease starts its
+	 * stream; every read carries the pinned server scope.
+	 */
+	async function refreshCanonicalTail(): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const id = canonicalId;
+		const scope = serverScope;
+		if (canonicalRef === null || id === null || scope === null) return;
+		try {
+			const page = await canonicalRef.listConversationEvents(id, scope, {
+				afterSeq: canonicalLatestSeq,
+				limit: 50
+			});
+			if (disposed || canonicalId !== id) return;
+			canonicalLatestSeq = page.current.latest_seq;
+			canonicalCompleteness = page.current.history_completeness;
+			canonicalPendingSteering = page.current.pending_steering;
+			// A bound run's facade state moves independently of its stream
+			// (lease released, run finished): the debounced refresh keeps the
+			// recorded badge honest without waiting for stream frames.
+			if (conversation !== null) scheduleRefresh();
+			if (canonicalDetail !== null) {
+				canonicalDetail = {
+					...canonicalDetail,
+					history_completeness: page.current.history_completeness,
+					active_run_id: page.current.active_run_id
+				};
+			}
+			if ((page.events ?? []).length > 0 || canonicalMessages.length === 0) {
+				await loadCanonicalMessages();
+				if (disposed || canonicalId !== id) return;
+			}
+			// Bind the live fold to the lease-holding run (a real chat run:
+			// the run facade and the SSE route both serve it).
+			const activeRun = page.current.active_run_id;
+			if (
+				activeRun !== null &&
+				activeRun !== '' &&
+				(conversation === null || conversation.run_id !== activeRun)
+			) {
+				try {
+					const view = await api?.readConversation(activeRun);
+					if (disposed || canonicalId !== id) return;
+					if (view !== undefined && conversation?.run_id !== activeRun) {
+						conversation = view;
+						refreshed = view;
+						startStream();
+					}
+				} catch {
+					// The run row read failing must not kill the transcript
+					// view; the structured problem stays on the next poll.
+				}
+			}
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			refreshProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ?? 'The conversation state could not be refreshed.'
+				)
+			};
+		}
+	}
+
+	/**
+	 * The canonical submit (§3; C1/C6): ONLY the raw user message rides the
+	 * wire — never a stitched history wrapper. Identity is the client-minted
+	 * idempotency key; continuation is the conversation id; `expected_revision`
+	 * pins the task revision so a stale writer fails closed (409), and an
+	 * active lease surfaces `queued_followup` instead of a second executor.
+	 */
+	async function submitCanonicalTurn(rawUserPrompt: string): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const scope = serverScope;
+		const openId = canonicalId;
+		if (canonicalRef === null || scope === null) return;
+		const clientRequestId = crypto.randomUUID();
+		const serverId = generalConsultMode
+			? GLOBAL_CONSULT_SERVER_ID
+			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
+		composeBusy = true;
+		try {
+			const submitted: CanonicalTurnSubmitted =
+				openId === null
+					? await canonicalRef.createConversation({
+							server_id: serverId,
+							client_request_id: clientRequestId,
+							message: rawUserPrompt,
+							profile: composeProfile.trim(),
+							requested_phase: readOnlyMode ? 'plan' : null,
+							task_action: 'continue'
+						})
+					: await canonicalRef.submitConversationMessage(openId, {
+							server_id: scope,
+							client_request_id: clientRequestId,
+							message: rawUserPrompt,
+							expected_revision: lastRevision,
+							requested_phase: readOnlyMode ? 'plan' : null,
+							task_action: 'continue'
+						});
+			if (disposed) return;
+			canonicalId = submitted.conversation_id;
+			lastRevision = submitted.revision;
+			lastDisposition = submitted.disposition;
+			composeMessage = '';
+			// The admitted turn is durable before the response: refresh the
+			// tail immediately, then the history list (message_count moved).
+			await refreshCanonicalTail();
+			if (!disposed) void loadHistory();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			composeProblem = {
+				code,
+				message: canonicalTurnErrorText(
+					code,
+					messageOf(error) ?? 'The turn could not be recorded.'
+				)
+			};
+			if (error !== null && typeof error === 'object' && 'fields' in error) {
+				const fields = (error as { fields: unknown }).fields;
+				if (typeof fields === 'object' && fields !== null) {
+					const next: Record<string, string> = {};
+					for (const [key, value] of Object.entries(fields as Record<string, unknown>)) {
+						if (typeof value === 'string') next[key] = value;
+					}
+					composeFields = next;
+				}
+			}
+		} finally {
+			if (!disposed) composeBusy = false;
+		}
+	}
+
+	/**
+	 * Deterministic control rows (§3; C5): steer/pause/cancel are recorded
+	 * durably before the caller learns anything and consumed at the run's
+	 * next safe effect boundary — never retroactive; in-flight effects are
+	 * not claimed stopped until their receipts say so.
+	 */
+	async function recordControl(action: 'steer' | 'pause' | 'cancel'): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const id = canonicalId;
+		const scope = serverScope;
+		if (canonicalRef === null || id === null || scope === null || controlBusy) return;
+		controlBusy = true;
+		controlNote = null;
+		try {
+			const view = await canonicalRef.steerConversation(id, {
+				conversation_id: id,
+				server_id: scope,
+				action,
+				message: null,
+				client_request_id: crypto.randomUUID()
+			});
+			if (disposed) return;
+			controlNote =
+				view.disposition === 'deduplicated'
+					? `The ${view.action} control was already recorded (deduplicated); the run consumes it at its next safe boundary.`
+					: `${view.action === 'steer' ? 'Steering' : view.action === 'pause' ? 'Pause' : 'Cancellation'} recorded — the run consumes it at its next safe boundary; in-flight effects are not claimed stopped until their receipts say so.`;
+			scheduleRefresh();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			controlNote = canonicalTurnErrorText(
+				code,
+				messageOf(error) ?? 'The control could not be recorded.'
+			);
+		} finally {
+			if (!disposed) controlBusy = false;
+		}
+	}
+
+	/** Restore one canonical conversation from a history row (no local cache). */
+	async function openCanonicalConversation(row: ChatHistoryRow): Promise<void> {
+		const canonicalRef = canonicalApi;
+		const scope = serverScope;
+		if (canonicalRef === null || scope === null) return;
+		const conversationId = row.conversation_id ?? row.run_id;
+		finishStream();
+		historyOpen = false;
+		// A canonical restore shares NO state with the legacy fold.
+		priorTurns = [];
+		conversation = null;
+		refreshed = null;
+		needsApproval = false;
+		approvalBinding = null;
+		approval = null;
+		approvalProblem = null;
+		approvalBusy = false;
+		decisionStatus = null;
+		resetFold();
+		detailsOpen = false;
+		resetCanonicalView();
+		canonicalId = conversationId;
+		canonicalBusy = true;
+		try {
+			const detail = await canonicalRef.getConversation(conversationId, scope);
+			if (disposed || canonicalId !== conversationId) return;
+			canonicalDetail = detail;
+			canonicalCompleteness = detail.history_completeness;
+			canonicalGaps = detail.legacy_gaps ?? [];
+			// The recorded scope locks the context exactly like the legacy
+			// restore: an open conversation never retargets (C01 rule 2).
+			draftServerOverride =
+				detail.server_id === GLOBAL_CONSULT_SERVER_ID ? null : detail.server_id;
+			selectedServiceTags = [];
+			composeProfile = 'default';
+			await loadCanonicalMessages();
+			if (disposed || canonicalId !== conversationId) return;
+			// A live writer lease resumes its stream; otherwise the bounded
+			// events read settles the honest state block.
+			await refreshCanonicalTail();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			canonicalProblem = {
+				code,
+				message: friendlyText(
+					code,
+					messageOf(error) ?? 'The conversation could not be restored.'
+				)
+			};
+			resetCanonicalView();
+		} finally {
+			if (!disposed) canonicalBusy = false;
+		}
+	}
+
 	// --- history (bounded page of the pinned server; C01 rules 5 and 7) ------
 
-	let historyRows = $state<ConversationView[]>([]);
+	let historyRows = $state<ChatHistoryRow[]>([]);
 	let historyTotal = $state(0);
 	let historyOffset = $state(0);
 	let historyRawTotal = $state(0);
@@ -575,6 +1093,10 @@
 
 	async function loadHistory(): Promise<void> {
 		if (api === null || serverScope === null) return;
+		if (canonicalApi !== null) {
+			await loadCanonicalHistory(false);
+			return;
+		}
 		const scope = serverScope;
 		historyState = { status: 'loading' };
 		historyLoadingMore = false;
@@ -617,6 +1139,10 @@
 			historyLoadingMore ||
 			!historyHasMore
 		) {
+			return;
+		}
+		if (canonicalApi !== null) {
+			await loadCanonicalHistory(true);
 			return;
 		}
 		const scope = serverScope;
@@ -795,6 +1321,8 @@
 		if (!keepPriorTurns) {
 			priorTurns = storedTurnsByRun.get(view.run_id) ?? [];
 		}
+		// A legacy open replaces any canonical view entirely.
+		resetCanonicalView();
 		conversation = view;
 		refreshed = null;
 		taskLabels = Object.fromEntries(authoredLabels);
@@ -835,6 +1363,7 @@
 		refreshed = null;
 		runDetail = null;
 		taskLabels = {};
+		resetCanonicalView();
 		needsApproval = false;
 		approvalBinding = null;
 		approval = null;
@@ -1778,6 +2307,17 @@
 
 	async function stopActiveConversation(): Promise<void> {
 		if (api === null || display === null || !jobInProgress || cancelRequested || stoppingRun) return;
+		if (canonicalMode) {
+			// The canonical control plane: a deterministic cancel row recorded
+			// durably (steerConversation), never the legacy tree-cancel body.
+			stoppingRun = true;
+			try {
+				await recordControl('cancel');
+			} finally {
+				if (!disposed) stoppingRun = false;
+			}
+			return;
+		}
 		stoppingRun = true;
 		try {
 			await api.cancelConversation(display.run_id, { cancel_children: true });
@@ -1804,8 +2344,48 @@
 	});
 
 	$effect(() => {
-		onactivechange?.(activeRunId || null);
+		// The §3 turn body carries no @service tags and no attachments: a
+		// panel running the canonical surface never shows those draft
+		// controls, so any residue would only mislead — cleared on sight
+		// (wire honesty, C08 rule 6).
+		if (canonicalApi !== null) {
+			selectedServiceTags = [];
+			composeAttachments = '';
+			attachmentsOpen = false;
+		}
 	});
+
+	$effect(() => {
+		// The drawer's active marker: the canonical conversation identity
+		// when one is open (history rows pin run_id to it), else the run id.
+		onactivechange?.(canonicalId ?? (activeRunId || null));
+	});
+
+	/** Bounded canonical catch-up cadence while a conversation is open. */
+	const CANONICAL_POLL_MS = 2000;
+
+	$effect(() => {
+		if (canonicalApi === null || canonicalId === null) return;
+		const timer = setInterval(() => {
+			if (disposed) return;
+			void refreshCanonicalTail();
+		}, CANONICAL_POLL_MS);
+		return () => clearInterval(timer);
+	});
+
+	$effect(() => {
+		// Canonical terminal hand-over: the assistant reply becomes a
+		// transcript row (server truth), so the live fold releases its text
+		// and one catch-up read pulls the produced rows in — no duplicated
+		// reply, no invented text (C08 rule 6).
+		if (!canonicalMode || !rootTerminal) return;
+		stopStreamReveal();
+		streamedReply = '';
+		thinkingSteps = [];
+		visibleToolCalls = [];
+		void refreshCanonicalTail();
+	});
+
 
 	export function triggerNewChat(): void {
 		newChat();
@@ -1897,10 +2477,16 @@
 									class:mai-chat__badge--neutral={row.state === 'cancelled'}
 									data-testid="history-row-state"
 								>
-									{runStateText(row.state)}
+									{row.canonical === true
+										? `${row.message_count ?? 0} messages`
+										: runStateText(row.state)}
 								</span>
-								<span class="mai-chat__meta">{row.model_profile}</span>
-								<span class="mai-chat__meta">{row.submitted_at}</span>
+								{#if row.canonical === true}
+									<span class="mai-chat__meta">{formatShortTime(row.updated_at)}</span>
+								{:else}
+									<span class="mai-chat__meta">{row.model_profile}</span>
+									<span class="mai-chat__meta">{row.submitted_at}</span>
+								{/if}
 								<span class="mai-chat__badge">{row.server_id === GLOBAL_CONSULT_SERVER_ID ? 'General Consult' : serverLabelFor(row.server_id)}</span>
 								{#each row.service_tags ?? [] as tag (tag)}<span class="mai-chat__badge">@{tag}</span>{/each}
 							</div>
@@ -1992,7 +2578,7 @@
 										<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
 									{/if}
 								</Select>
-								{#if !generalConsultMode}
+								{#if !generalConsultMode && canonicalApi === null}
 									<Button
 										size="sm"
 										pill
@@ -2004,7 +2590,7 @@
 									</Button>
 								{/if}
 							</div>
-							{#if servicePickerOpen && !generalConsultMode}
+							{#if servicePickerOpen && !generalConsultMode && canonicalApi === null}
 								<div class="mai-chat__service-autocomplete" data-testid="chat-service-autocomplete">
 									{#each serviceSuggestions as service (service.name)}
 										<button
@@ -2106,37 +2692,159 @@
 			aria-label="Open conversation"
 			data-testid="chat-conversation"
 		>
-			{#if display === null}
+			{#if display === null && !canonicalMode}
 				<div class="mai-chat__state" role="status" data-testid="chat-none">
 					<p>No conversation is open. Send a message or open one from the list.</p>
 				</div>
 			{:else}
 				<p class="mai-chat__line mai-chat__conversation-status">
-					<span
-						class="mai-chat__badge"
-						class:mai-chat__badge--active={jobInProgress}
-						class:mai-chat__badge--ok={display.state === 'succeeded'}
-						class:mai-chat__badge--danger={display.state === 'failed'}
-						class:mai-chat__badge--neutral={display.state === 'cancelled'}
-						data-testid="conversation-state"
-					>
-						{runStateText(display.state)}
-					</span>
-					{#if jobInProgress}
-						<span class="mai-chat__live-status" data-testid="conversation-live-progress" role="status">
-							<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
-							<span class="mai-chat__live-status-text">{activeStepText}</span>
-							<span class="mai-chat__live-status-timer">{elapsedSeconds}s</span>
+					{#if canonicalMode}
+						<span
+							class="mai-chat__badge"
+							class:mai-chat__badge--active={jobInProgress}
+							class:mai-chat__badge--ok={display?.state === 'succeeded'}
+							class:mai-chat__badge--danger={display?.state === 'failed'}
+							class:mai-chat__badge--neutral={display?.state === 'cancelled'}
+							data-testid="conversation-state"
+						>
+							{canonicalStateText}
 						</span>
-					{/if}
-					{#if cancelRequested && !rootTerminal}
-						<span class="mai-chat__note" data-testid="conversation-cancel-note">
-							Cancellation requested
-						</span>
+						{#if canonicalPendingSteering > 0}
+							<span class="mai-chat__note" data-testid="pending-steering-note" role="status">
+								Pending steering rows: {canonicalPendingSteering}
+							</span>
+						{/if}
+						{#if lastDisposition === 'queued_followup'}
+							<span class="mai-chat__note" data-testid="turn-queued-note" role="status">
+								Follow-up recorded — queued behind the active run; the run consumes it
+								at its next safe boundary.
+							</span>
+						{/if}
+						{#if controlNote !== null}
+							<span class="mai-chat__note" data-testid="control-note" role="status">
+								{controlNote}
+							</span>
+						{/if}
+					{:else}
+						{#if display !== null}
+							<span
+								class="mai-chat__badge"
+								class:mai-chat__badge--active={jobInProgress}
+								class:mai-chat__badge--ok={display.state === 'succeeded'}
+								class:mai-chat__badge--danger={display.state === 'failed'}
+								class:mai-chat__badge--neutral={display.state === 'cancelled'}
+								data-testid="conversation-state"
+							>
+								{runStateText(display.state)}
+							</span>
+							{#if jobInProgress}
+								<span class="mai-chat__live-status" data-testid="conversation-live-progress" role="status">
+									<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
+									<span class="mai-chat__live-status-text">{activeStepText}</span>
+									<span class="mai-chat__live-status-timer">{elapsedSeconds}s</span>
+								</span>
+							{/if}
+							{#if cancelRequested && !rootTerminal}
+								<span class="mai-chat__note" data-testid="conversation-cancel-note">
+									Cancellation requested
+								</span>
+							{/if}
+						{/if}
 					{/if}
 				</p>
 
+				{#if canonicalMode && canonicalCompleteness !== 'complete'}
+					<div
+						class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
+						role="alert"
+						data-testid="legacy-gaps-banner"
+					>
+						<span>
+							Recorded history is {canonicalCompleteness}: earlier messages may be
+							missing, and new mutations require explicit scope confirmation
+							(§4 — nothing is reconstructed or invented).
+						</span>
+						{#each canonicalGaps as gap, gapIndex (gapIndex)}
+							<span class="mai-chat__gap" data-testid="legacy-gap">{gap.description}</span>
+						{/each}
+					</div>
+				{/if}
+
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
+					{#if canonicalMode}
+						{#if canonicalBusy}
+							<div class="mai-chat__state" role="status" data-testid="canonical-restoring">
+								<p>Restoring the recorded conversation…</p>
+							</div>
+						{:else if canonicalProblem !== null}
+							<div
+								class="mai-chat__state mai-chat__state--error"
+								role="alert"
+								data-testid="canonical-problem"
+								data-error-code={canonicalProblem.code}
+							>
+								<p>{canonicalProblem.message}</p>
+							</div>
+						{:else}
+							{#if canonicalHasMore}
+								<div class="mai-chat__history-more">
+									<Button
+										size="sm"
+										variant="secondary"
+										loading={canonicalLoadingMore}
+										onclick={loadEarlierCanonicalMessages}
+										data-testid="transcript-load-earlier"
+									>
+										Load earlier messages ({canonicalMessages.length} of {canonicalTotal})
+									</Button>
+								</div>
+							{/if}
+							{#each canonicalMessages as message (message.message_id)}
+								{#if message.role === 'user'}
+									<div class="mai-chat__bubble mai-chat__bubble--user" data-testid="canonical-user-message">
+										<div class="mai-chat__bubble-header">
+											<span class="mai-chat__bubble-author">You</span>
+											<span class="mai-chat__bubble-time" title={message.created_at}>
+												{formatShortTime(message.created_at)}
+											</span>
+										</div>
+										<div class="mai-chat__bubble-body">{message.content}</div>
+									</div>
+								{:else if message.role === 'assistant'}
+									<div class="mai-chat__bubble mai-chat__bubble--assistant" data-testid="canonical-assistant-message">
+										<div class="mai-chat__bubble-header">
+											<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
+										</div>
+										<div class="mai-chat__bubble-body">
+											{#if message.content !== ''}
+												<div class="mai-chat__reply-markdown">
+													<MarkdownRenderer content={message.content} />
+												</div>
+											{:else if message.content_ref !== null && message.content_ref !== ''}
+												<p class="mai-chat__meta">
+													Recorded behind a safe content reference:
+													{message.content_ref}{message.redacted ? ' (redacted)' : ''}
+												</p>
+											{:else}
+												<p class="mai-chat__meta">No inline content recorded for this message.</p>
+											{/if}
+										</div>
+									</div>
+								{:else}
+									<p class="mai-chat__meta" data-testid="canonical-other-message">
+										[{message.role}]{message.content !== ''
+											? ` ${message.content}`
+											: message.content_ref !== null && message.content_ref !== ''
+												? ` ${message.content_ref}`
+												: ' (no inline content)'}
+									</p>
+								{/if}
+							{/each}
+							<p class="mai-chat__meta" data-testid="transcript-window-meta">
+								Showing {canonicalMessages.length} of {canonicalTotal} recorded messages.
+							</p>
+						{/if}
+					{:else}
 					{#each priorTurns as turn (turn.runId)}
 						<div class="mai-chat__bubble mai-chat__bubble--user" data-testid="prior-turn-user">
 							<div class="mai-chat__bubble-header">
@@ -2231,22 +2939,28 @@
 						</div>
 					{/each}
 
-					<div class="mai-chat__bubble mai-chat__bubble--user">
-						<div class="mai-chat__bubble-header">
-							<span class="mai-chat__bubble-author">You</span>
-							<span class="mai-chat__bubble-time" title={display.submitted_at}>
-								{formatShortTime(display.submitted_at)}
-							</span>
+					{#if display !== null}
+						<div class="mai-chat__bubble mai-chat__bubble--user">
+							<div class="mai-chat__bubble-header">
+								<span class="mai-chat__bubble-author">You</span>
+								<span class="mai-chat__bubble-time" title={display.submitted_at}>
+									{formatShortTime(display.submitted_at)}
+								</span>
+							</div>
+							<div class="mai-chat__bubble-body" data-testid="conversation-message">
+								{messageText}
+							</div>
 						</div>
-						<div class="mai-chat__bubble-body" data-testid="conversation-message">
-							{messageText}
-						</div>
-					</div>
+					{/if}
+					{/if}
 
+					{#if !canonicalMode || jobInProgress}
 					<div class="mai-chat__bubble mai-chat__bubble--assistant">
 						<div class="mai-chat__bubble-header">
 							<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
-							<span class="mai-chat__bubble-model">{resolvedModel ?? display.model_profile}</span>
+							{#if display !== null}
+								<span class="mai-chat__bubble-model">{resolvedModel ?? display.model_profile}</span>
+							{/if}
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
 							{#if thinkingSteps.length > 0 || !rootTerminal}
@@ -2365,6 +3079,7 @@
 							{/if}
 						</div>
 					</div>
+					{/if}
 
 				</div>
 
@@ -2408,13 +3123,17 @@
 						</Button>
 					</div>
 					<div class="mai-chat__section-head">
+						{#if display !== null}
 						<span class="mai-chat__meta" data-testid="conversation-id">{shortId(display.run_id)}</span>
 						<Button variant="secondary" onclick={loadConversation} data-testid="conversation-refresh">Refresh</Button>
+						{/if}
 					</div>
 					<p class="mai-chat__meta" data-testid="chat-scope">Server {shortId(serverScope ?? '')} · Pinned scope</p>
+					{#if display !== null}
 					<p class="mai-chat__meta" data-testid="conversation-target">
 						Server {shortId(display.server_id)} · profile {display.model_profile} · grants {grantsText}
 					</p>
+					{/if}
 					{#if cancelRequested && rootTerminal}
 						<p class="mai-chat__meta" data-testid="conversation-cancel-note">Cancellation requested</p>
 					{/if}
@@ -2503,7 +3222,7 @@
 								exists for this run yet.
 							</p>
 						{/if}
-						{#if approvalBinding !== null && approval !== null}
+						{#if approvalBinding !== null && approval !== null && display !== null}
 							<dl class="mai-chat__entry-rows" data-testid="approval-binding">
 								<dt>approval_id</dt>
 								<dd data-testid="approval-id">{approval.approval_id}</dd>
@@ -2546,15 +3265,17 @@
 					</div>
 				{/if}
 
-				<div class="mai-chat__children" data-testid="conversation-children">
-					<h5>Delegated children</h5>
-					<DelegationTree
-						conversation={display}
-						api={api}
-						taskLabels={taskLabels}
-						showCancel={false}
-					/>
-				</div>
+				{#if display !== null}
+					<div class="mai-chat__children" data-testid="conversation-children">
+						<h5>Delegated children</h5>
+						<DelegationTree
+							conversation={display}
+							api={api}
+							taskLabels={taskLabels}
+							showCancel={false}
+						/>
+					</div>
+				{/if}
 				</DetailsDisclosure>
 			{/if}
 		</section>
@@ -2611,17 +3332,32 @@
 							>
 								{readOnlyMode ? 'Read-only ON' : 'Read-only'}
 							</Button>
-							<Button
-								pill
-								size="sm"
-								variant={attachmentsOpen ? 'primary' : 'secondary'}
-								aria-pressed={attachmentsOpen}
-								onclick={() => (attachmentsOpen = !attachmentsOpen)}
-							>
-								📎 Attach
-							</Button>
+							{#if canonicalApi === null}
+								<Button
+									pill
+									size="sm"
+									variant={attachmentsOpen ? 'primary' : 'secondary'}
+									aria-pressed={attachmentsOpen}
+									onclick={() => (attachmentsOpen = !attachmentsOpen)}
+								>
+									📎 Attach
+								</Button>
+							{/if}
 						</div>
 						<div class="mai-chat__actions">
+							{#if canonicalMode && jobInProgress}
+								<Button
+									pill
+									size="sm"
+									variant="secondary"
+									disabled={controlBusy}
+									loading={controlBusy}
+									onclick={() => recordControl('pause')}
+									data-testid="chat-pause"
+								>
+									Pause
+								</Button>
+							{/if}
 							<Button
 								pill
 								size="sm"

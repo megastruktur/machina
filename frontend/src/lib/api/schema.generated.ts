@@ -526,6 +526,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped page of canonical conversations
+         * @description One bounded page of safe conversation metadata (§3 ``GET`` list).
+         *
+         *     The page is exactly the requested server's scope; ordering and the
+         *     same-filter total are the storage owner's deterministic contract
+         *     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
+         *     transcript content ever rides a list page.
+         */
+        get: operations["list_canonical_conversations_api_v1_chat_conversations_get"];
+        put?: never;
+        /**
+         * Create a conversation and submit its first turn (canonical seam)
+         * @description Create one conversation and atomically admit its first turn (§3).
+         *
+         *     The modern seam: ``client_request_id`` IS the new conversation's
+         *     identity and the first run's idempotency key, so a retry after any
+         *     crash or network timeout recovers the exact conversation, message
+         *     and run triple — deduplicated (``200``), never a second row (C4).
+         *     The canonical user message and the durable enqueue intent commit
+         *     through the conversation store's serialized admission window (C6);
+         *     the engine enqueue follows the commit (re-armable gap, never a half
+         *     intent).
+         */
+        post: operations["create_conversation_api_v1_chat_conversations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded role-preserving transcript page (deterministic order)
+         * @description The sanitized transcript page (§3 ``GET`` messages; C2).
+         *
+         *     Ordered ``(seq, message_id)`` with the same-filter ``total``; the
+         *     page carries the conversation's honest history-completeness marker.
+         *     A fresh session restores the true server transcript — no browser
+         *     cache dependency, no placeholder rows, no fabricated turns.
+         */
+        get: operations["list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get"];
+        put?: never;
+        /**
+         * Submit one follow-up turn onto a conversation (canonical seam)
+         * @description Append one user turn to an existing conversation (§3).
+         *
+         *     The turn records ONLY the actual new user text — the canonical
+         *     transcript is assembled server-side at execution time, never
+         *     browser-stitched (C1). A finished follow-up starts a new durable run
+         *     bound to the SAME canonical conversation; a turn arriving while
+         *     another run holds the writer lease is admitted, recorded and
+         *     honestly reported ``queued_followup`` (``202``, no competing
+         *     executor). Retrying the SAME ``client_request_id`` deduplicates
+         *     against the original turn (C4); a conflicting payload under the same
+         *     key fails closed (``409 client_request_conflict``).
+         */
+        post: operations["submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/steer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit one deterministic steering/control request onto an active run
+         * @description Record one active-run steering/control request (§3; C5).
+         *
+         *     DURABLE FIRST: the ``conversation_steering`` row commits before the
+         *     caller is told anything and before any delivery, so a crash between
+         *     the append and the run's consumption recovers through the run's own
+         *     safe-boundary poll — and a retransmitted ``client_request_id``
+         *     deduplicates onto the SAME row, never a second control (C4). Pause
+         *     and cancel are deterministic: they are recorded without any intake
+         *     model call and consumed at the run's next safe effect boundary;
+         *     in-flight effects are never claimed killed without their receipt.
+         */
+        post: operations["steer_conversation_api_v1_chat_conversations__conversation_id__steer_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chat/runs": {
         parameters: {
             query?: never;
@@ -657,6 +763,60 @@ export interface paths {
          *     ``agent.delegation_planned`` event (value-free references).
          */
         get: operations["stream_conversation_events_api_v1_chat_runs__run_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One conversation's safe header with honest legacy-gap metadata
+         * @description The safe singleton header (§3 ``GET`` one) with §4 gap honesty.
+         *
+         *     A ``partial``/``unavailable`` conversation labels its gaps explicitly
+         *     (missing range + bounded proven-but-unrecoverable submission count);
+         *     a complete conversation carries no gap metadata and pays no extra
+         *     query. Nothing about another scope's identity can appear in any
+         *     rejection (C8).
+         */
+        get: operations["read_canonical_conversation_api_v1_chat_conversations__conversation_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded cursor-exclusive metadata event page (resumable)
+         * @description Bounded resumable metadata events (§3 ``GET`` events; C2).
+         *
+         *     The cursor is the conversation-local monotonic message sequence.
+         *     Frames are strictly cursor-exclusive and ascending, so a reconnect
+         *     with the last seen ``after_seq`` deduplicates by construction —
+         *     without gaps and without duplicates. Events carry content
+         *     IDENTITIES only (never transcript text, C05); the envelope's
+         *     current-state block carries the bounded lease/steering/revision
+         *     truth for honest catch-up rendering.
+         */
+        get: operations["list_canonical_events_api_v1_chat_conversations__conversation_id__events_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2506,14 +2666,6 @@ export interface components {
             cancel_children: boolean;
         };
         /**
-         * ChatRenameBody
-         * @description Rename body: durable user-defined conversation title.
-         */
-        ChatRenameBody: {
-            /** Title */
-            title: string;
-        };
-        /**
          * ChatCreated
          * @description Submit outcome: the conversation view plus the dedup verdict.
          */
@@ -2535,6 +2687,59 @@ export interface components {
             offset: number;
             /** Total */
             total: number;
+        };
+        /**
+         * ChatRenameBody
+         * @description Rename body: durable user-defined conversation title.
+         */
+        ChatRenameBody: {
+            /** Title */
+            title: string;
+        };
+        /**
+         * ChatSteerView
+         * @description Steer/control outcome (§3): the durable control row's identity.
+         *
+         *     ``delivery_status`` is always ``pending`` at response time: the row
+         *     is durable BEFORE the caller is told anything, and it is consumed
+         *     by the lease-holding run at its next safe effect boundary — the
+         *     UI displays pending/applied distinctly and never fabricates an
+         *     instant state.
+         */
+        ChatSteerView: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Target conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Steering Id
+             * Format: uuid
+             * @description Durable steering/control row identity
+             */
+            steering_id: string;
+            /**
+             * Run Id
+             * @description Lease-holding run the control addresses, when one exists
+             */
+            run_id: string | null;
+            /** @description steer, pause or cancel */
+            action: components["schemas"]["SteerAction"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Idempotency key deduplicating repeated control submissions
+             */
+            client_request_id: string;
+            /** @description created or deduplicated (same-key retransmission) */
+            disposition: components["schemas"]["TurnDisposition"];
+            /**
+             * Delivery Status
+             * @description Always pending at response time; the active run consumes the control at a safe effect boundary
+             * @constant
+             */
+            delivery_status: "pending";
         };
         /**
          * ChatSubmitBody
@@ -2696,11 +2901,451 @@ export interface components {
             compose_service: string | null;
         };
         /**
+         * ConversationCurrentView
+         * @description Current-state catch-up block on every events page (§3).
+         *
+         *     Bounded scalar state (identities + counts only), so a reconnecting
+         *     consumer renders the lease/steering truth without fabricating a
+         *     timeline entry for state that has no monotonic cursor.
+         */
+        ConversationCurrentView: {
+            /**
+             * Latest Seq
+             * @description Newest allocated transcript sequence (0 when empty)
+             */
+            latest_seq: number;
+            /** @description Honest history marker for this conversation (§4) */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /**
+             * Active Run Id
+             * @description Current lease-holding durable run, when one exists
+             */
+            active_run_id: string | null;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id: string | null;
+            /**
+             * Pending Steering
+             * @description Bounded count of not-yet-applied durable control rows
+             */
+            pending_steering: number;
+        };
+        /**
+         * ConversationDetailView
+         * @description Safe singleton header plus explicit legacy-gap metadata (§3/§4).
+         *
+         *     ``legacy_gaps`` is empty exactly when ``history_completeness`` is
+         *     ``complete``; otherwise it names every gap the store proved.
+         */
+        ConversationDetailView: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Opaque stable conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this conversation
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description User-assigned conversation title, when set
+             */
+            title?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description RFC3339 UTC last-activity timestamp
+             */
+            updated_at: string;
+            /**
+             * Message Count
+             * @description Persisted message count
+             */
+            message_count: number;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id?: string | null;
+            /**
+             * Active Run Id
+             * @description Current durable run, when one is attached (§1)
+             */
+            active_run_id?: string | null;
+            /** @description complete, partial or unavailable; never fabricated (§4) */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /** @description Missing transcript range when completeness is not complete */
+            missing_range?: components["schemas"]["MessageRange"] | null;
+            /**
+             * Legacy Gaps
+             * @description Honest legacy-gap metadata (§4); empty when complete
+             */
+            legacy_gaps?: components["schemas"]["LegacyHistoryGap"][];
+        };
+        /**
+         * ConversationEvent
+         * @description One metadata-only transcript event (§3 ``GET`` events).
+         *
+         *     The ``seq`` IS the dedup cursor: conversation-local, monotonic,
+         *     gap-free (allocated under the conversation's write lock), so a
+         *     reconnect with the last seen sequence replays strictly newer events
+         *     without gaps or duplicates (C2). No content field exists to leak.
+         */
+        ConversationEvent: {
+            /**
+             * Seq
+             * @description Conversation-local monotonic sequence (the dedup cursor)
+             */
+            seq: number;
+            /**
+             * Kind
+             * @description The event kind (one canonical transcript append)
+             * @constant
+             */
+            kind: "transcript.appended";
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Opaque stable message identity
+             */
+            message_id: string;
+            /**
+             * Role
+             * @description Trusted producer-assigned role (vocabulary mirror)
+             */
+            role: string;
+            /**
+             * Source Kind
+             * @description Origin of the message (vocabulary mirror)
+             */
+            source_kind: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted
+             */
+            redacted: boolean;
+            /**
+             * Has Content Ref
+             * @description True when content lives behind the safe content_ref
+             */
+            has_content_ref: boolean;
+            /**
+             * Created At
+             * @description RFC3339 UTC event timestamp
+             */
+            created_at: string;
+        };
+        /**
+         * ConversationEventsPage
+         * @description One bounded, cursor-exclusive events page (§3 ``GET`` events).
+         *
+         *     The cursor filters the set (``seq > after_seq``); ``total`` is the
+         *     pre-slice count under that identical predicate and the slice serves
+         *     the filtered set from its start, so ``has_more`` follows the
+         *     canonical derivation. The page is deterministic and replayable: the
+         *     same cursor always returns the same slice (C2 reconnect dedup).
+         */
+        ConversationEventsPage: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Items skipped within the cursor-filtered set; the cursor (after_seq) is the resume position, so the filtered set is served from its start
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * After Seq
+             * @description The replay cursor: only strictly newer events are returned
+             */
+            after_seq: number;
+            /**
+             * Events
+             * @description Metadata events in strictly ascending seq order
+             */
+            events?: components["schemas"]["ConversationEvent"][];
+            /** @description Current-state catch-up block (identities and counts) */
+            current: components["schemas"]["ConversationCurrentView"];
+        };
+        /**
+         * ConversationListPage
+         * @description One bounded, explicitly server-scoped list page (§3 ``GET`` list).
+         *
+         *     Safe metadata only: rows never carry transcript content, so the page
+         *     stays safe for generic list surfaces (C01 rule 5; AGENTS.md §1).
+         */
+        ConversationListPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Conversation rows in deterministic updated_at order
+             */
+            items?: components["schemas"]["ConversationSummary"][];
+        };
+        /**
+         * ConversationSteerRequest
+         * @description Deterministic control request (§3): pause/cancel carry no planner
+         *     input; natural-language steering is interpreted at the next safe
+         *     boundary and displayed as pending until applied.
+         */
+        ConversationSteerRequest: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Target conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /** @description steer, pause or cancel */
+            action: components["schemas"]["SteerAction"];
+            /**
+             * Message
+             * @description Natural-language steering text; forbidden on pause/cancel
+             */
+            message?: string | null;
+            /**
+             * Client Request Id
+             * @description Idempotency key for repeated control submissions
+             */
+            client_request_id?: string | null;
+            /**
+             * Expected Revision
+             * @description Expected task revision for CAS on steering, when relevant
+             */
+            expected_revision?: number | null;
+        };
+        /**
+         * ConversationSummary
+         * @description Safe metadata row of one conversation (§3 ``GET`` list page item).
+         *
+         *     No transcript content: summaries stay safe for generic list surfaces.
+         */
+        ConversationSummary: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Opaque stable conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this conversation
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description User-assigned conversation title, when set
+             */
+            title?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description RFC3339 UTC last-activity timestamp
+             */
+            updated_at: string;
+            /**
+             * Message Count
+             * @description Persisted message count
+             */
+            message_count: number;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id?: string | null;
+            /**
+             * Active Run Id
+             * @description Current durable run, when one is attached (§1)
+             */
+            active_run_id?: string | null;
+        };
+        /**
+         * ConversationTranscriptPage
+         * @description One role-preserving sanitized message page (§3), ordered by
+         *     ``(sequence, message_id)`` with the same-filter ``total``.
+         */
+        ConversationTranscriptPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * @description History-completeness marker for the loaded range
+             * @default complete
+             */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /**
+             * Items
+             * @description Message rows in deterministic sequence order
+             */
+            items?: components["schemas"]["TranscriptMessage"][];
+        };
+        /**
+         * ConversationTurnSubmitRequest
+         * @description One accepted user turn (§3 ``POST`` shape): idempotency key, explicit
+         *     server scope, optional CAS revision and explicit task action.
+         */
+        ConversationTurnSubmitRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description UI-authored idempotency key deduplicating retransmission
+             */
+            client_request_id: string;
+            /**
+             * Message
+             * @description Safe user message text (raw-secret exclusion happens upstream)
+             */
+            message: string;
+            /**
+             * Profile
+             * @description Model profile reference for the next allowed call
+             */
+            profile?: string | null;
+            /** @description Advisory requested phase; never permission (§5) */
+            requested_phase?: components["schemas"]["Phase"] | null;
+            /**
+             * Expected Revision
+             * @description Expected task revision for CAS; stale writes conflict
+             */
+            expected_revision?: number | null;
+            /**
+             * Task Action
+             * @description Explicit episode action: continue or start a new task (§1)
+             */
+            task_action?: ("continue" | "new_task") | null;
+        };
+        /**
+         * ConversationTurnSubmitResponse
+         * @description Persisted turn identity plus run disposition (§3; brief AC 2).
+         */
+        ConversationTurnSubmitResponse: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Persisted message identity
+             */
+            message_id: string;
+            /**
+             * Task Id
+             * @description Task episode bound to the turn, when one exists
+             */
+            task_id: string | null;
+            /**
+             * Run Id
+             * @description Durable run bound to the turn, when one started
+             */
+            run_id: string | null;
+            /**
+             * Revision
+             * @description Current task revision after the turn was admitted
+             */
+            revision: number;
+            /** @description created, deduplicated or queued_followup */
+            disposition: components["schemas"]["TurnDisposition"];
+        };
+        /**
          * ConversationView
          * @description One conversation: the run view plus its recorded references.
          *
          *     ``service_tags`` are the immutable ``@service`` chips recorded at
          *     submission (read back from the run's ``chat.submitted`` record).
+         *     ``title`` is the user-assigned conversation name when renamed.
          */
         ConversationView: {
             /** Run Id */
@@ -3115,6 +3760,13 @@ export interface components {
             start_period_seconds: number;
         };
         /**
+         * HistoryCompleteness
+         * @description History-completeness marker (§3/§4): ``partial|unavailable`` must be
+         *     shown, never papered over with fabricated turns.
+         * @enum {string}
+         */
+        HistoryCompleteness: "complete" | "partial" | "unavailable";
+        /**
          * InstalledPluginView
          * @description One installed native plugin's rich catalog view (plugins window).
          *
@@ -3159,6 +3811,41 @@ export interface components {
             truncated: boolean;
             /** Malformed Lines */
             malformed_lines: number;
+        };
+        /**
+         * LegacyHistoryGap
+         * @description One honestly-labelled legacy gap (§4; scenario C7).
+         *
+         *     Gap metadata is derived ONLY from proved app-owned records; a gap is
+         *     shown, never papered over with a fabricated turn or a placeholder.
+         */
+        LegacyHistoryGap: {
+            /**
+             * Kind
+             * @description Which gap this row labels: a missing transcript sequence range, or proven submissions with no recoverable row
+             * @enum {string}
+             */
+            kind: "missing_range" | "unrecoverable_submissions";
+            /**
+             * From Sequence
+             * @description First missing transcript sequence (missing_range only)
+             */
+            from_sequence?: number | null;
+            /**
+             * To Sequence
+             * @description Last missing transcript sequence, inclusive (missing_range only)
+             */
+            to_sequence?: number | null;
+            /**
+             * Count
+             * @description Bounded count of the labelled records (unrecoverable_submissions only)
+             */
+            count?: number | null;
+            /**
+             * Description
+             * @description Value-free human-readable gap explanation
+             */
+            description: string;
         };
         /**
          * LifecycleSubmitBody
@@ -3284,6 +3971,35 @@ export interface components {
             /** Document Id */
             document_id?: string | null;
         };
+        /**
+         * MessageRange
+         * @description A missing transcript range shown when history is not complete (§4).
+         */
+        MessageRange: {
+            /**
+             * From Sequence
+             * @description First missing sequence
+             */
+            from_sequence: number;
+            /**
+             * To Sequence
+             * @description Last missing sequence (inclusive)
+             */
+            to_sequence: number;
+        };
+        /**
+         * MessageRole
+         * @description Frozen message roles (§1). Intake payloads cannot forge a role:
+         *     assistant/tool rows are created only through trusted producer paths.
+         * @enum {string}
+         */
+        MessageRole: "user" | "assistant" | "tool" | "system";
+        /**
+         * MessageSourceKind
+         * @description Where a message came from (§1 source kind; §4 legacy material).
+         * @enum {string}
+         */
+        MessageSourceKind: "browser" | "api" | "legacy_import" | "system";
         /**
          * ModelCapabilitiesBody
          * @description Optional endpoint capabilities the connection declares (C06 rule 1).
@@ -3651,6 +4367,12 @@ export interface components {
             /** Password */
             password: string;
         };
+        /**
+         * Phase
+         * @description Application task phases (act_CONTRACTS §5/§6): advisory, never permission.
+         * @enum {string}
+         */
+        Phase: "plan" | "inspect" | "act";
         /**
          * PlanBody
          * @description Plan preview body (strict): identity + recipe document + target.
@@ -4719,6 +5441,14 @@ export interface components {
             container: components["schemas"]["ContainerView"];
         };
         /**
+         * SteerAction
+         * @description Deterministic control actions (§3): pause/cancel never wait for a
+         *     planner; natural-language steering is interpreted at the next safe
+         *     boundary.
+         * @enum {string}
+         */
+        SteerAction: "steer" | "pause" | "cancel";
+        /**
          * StepBody
          * @description One ordered capability step of a run intent (C05 rule 3).
          *
@@ -4811,6 +5541,66 @@ export interface components {
              */
             tmux_session: string;
         };
+        /**
+         * TranscriptMessage
+         * @description One role-preserving sanitized transcript row (§1/§3).
+         *
+         *     Content may be carried as a safe ``content_ref`` instead of raw text
+         *     (C05 privacy resolution); ``redacted`` marks deliberately redacted rows,
+         *     for which no textual-fidelity claim is made.
+         */
+        TranscriptMessage: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Opaque stable message identity
+             */
+            message_id: string;
+            /**
+             * Sequence
+             * @description Conversation-local monotonic sequence number
+             */
+            sequence: number;
+            /** @description Trusted producer-assigned role */
+            role: components["schemas"]["MessageRole"];
+            /** @description Origin of the message */
+            source_kind: components["schemas"]["MessageSourceKind"];
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC message timestamp
+             */
+            created_at: string;
+            /**
+             * Content
+             * @description Sanitized message text when carried inline
+             * @default
+             */
+            content: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted (no fidelity claim)
+             * @default false
+             */
+            redacted: boolean;
+            /**
+             * Content Ref
+             * @description Safe out-of-band content reference instead of raw text
+             */
+            content_ref?: string | null;
+        };
+        /**
+         * TurnDisposition
+         * @description Run disposition of an accepted turn submit (§3; brief: 201/200/202).
+         * @enum {string}
+         */
+        TurnDisposition: "created" | "deduplicated" | "queued_followup";
         /**
          * UpdateSubmitBody
          * @description Update submit: adds the CURRENT recipe baseline assertion.
@@ -6346,6 +7136,332 @@ export interface operations {
             };
         };
     };
+    list_canonical_conversations_api_v1_chat_conversations_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationListPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_conversation_api_v1_chat_conversations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The submitted idempotency key is already bound to another server's conversation scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Idempotency key retransmitted with changed content, or another writer holds the conversation lease */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Model configuration or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTranscriptPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Idempotency key retransmitted with changed content, another writer holds the conversation lease, a stale task revision was pinned, or history reconstruction is incomplete */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Model configuration or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    steer_conversation_api_v1_chat_conversations__conversation_id__steer_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationSteerRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSteerView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No active run holds the conversation lease, or the idempotency key was retransmitted (deduplicated, 200) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation (steer requires a message; pause/cancel carry none) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     list_conversations_api_v1_chat_runs_get: {
         parameters: {
             query?: {
@@ -6692,6 +7808,113 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_canonical_conversation_api_v1_chat_conversations__conversation_id__get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationDetailView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_canonical_events_api_v1_chat_conversations__conversation_id__events_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                /** @description Replay cursor: return only strictly newer events */
+                after_seq?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationEventsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
