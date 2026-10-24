@@ -74,6 +74,8 @@
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 	import DetailsDisclosure from '../ui/DetailsDisclosure.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
+	import TaskEvidence from './chat/TaskEvidence.svelte';
+	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -363,6 +365,84 @@
 	function recordOf(value: unknown): Record<string, unknown> | null {
 		if (typeof value !== 'object' || value === null) return null;
 		return value as Record<string, unknown>;
+	}
+
+	/** Frozen outcome vocabulary (`mai.contracts.tasks.TaskOutcome`). */
+	const TASK_OUTCOME_VALUES: ReadonlySet<string> = new Set([
+		'in_progress',
+		'partially_verified',
+		'verified',
+		'needs_input',
+		'failed',
+		'cancelled'
+	]);
+	/** Frozen per-criterion verification vocabulary (`VerificationStatus`). */
+	const CRITERION_STATE_VALUES: ReadonlySet<string> = new Set(['passed', 'failed', 'unavailable']);
+
+	/**
+	 * Fail-closed narrow of the additive `task_outcome` run-summary document
+	 * (`OutcomeObservation.document()`): identifiers and frozen-vocabulary
+	 * states only. Any drift — unknown outcome word, non-array/incomplete
+	 * criterion states, counts that disagree with the explicit states — is a
+	 * rejection (`null`), never a guessed block (C08 rule 6).
+	 */
+	function readTaskOutcome(data: unknown): TaskOutcomeDocument | null {
+		const document = recordOf(recordOf(data)?.['task_outcome']);
+		if (document === null) return null;
+		const rawOutcome = document['outcome'];
+		const outcome =
+			typeof rawOutcome === 'string' && TASK_OUTCOME_VALUES.has(rawOutcome) ? rawOutcome : null;
+		const criteria = recordOf(document['criteria']);
+		if (criteria === null) return null;
+		const boundedCount = (value: unknown): number | null =>
+			typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+		const total = boundedCount(criteria['total']);
+		const supported = boundedCount(criteria['supported']);
+		const failed = boundedCount(criteria['failed']);
+		const unavailable = boundedCount(criteria['unavailable']);
+		if (total === null || supported === null || failed === null || unavailable === null) return null;
+		if (supported + failed + unavailable !== total) return null;
+		const rawStates = document['criterion_states'];
+		if (!Array.isArray(rawStates) || rawStates.length !== total) return null;
+		const criterionStates: TaskOutcomeCriterion[] = [];
+		const seen = new Set<string>();
+		for (const entry of rawStates) {
+			const one = recordOf(entry);
+			const id = one?.['criterion_id'];
+			const state = one?.['state'];
+			if (typeof id !== 'string' || id === '') return null;
+			if (typeof state !== 'string' || !CRITERION_STATE_VALUES.has(state)) return null;
+			if (seen.has(id)) return null;
+			seen.add(id);
+			criterionStates.push({ criterion_id: id, state });
+		}
+		const rawRejectionFields = document['rejection_fields'];
+		let rejectionFields: Record<string, string> | undefined;
+		if (rawRejectionFields !== undefined) {
+			if (recordOf(rawRejectionFields) === null) return null;
+			rejectionFields = {};
+			for (const [field, code] of Object.entries(rawRejectionFields as Record<string, unknown>)) {
+				if (typeof code !== 'string') return null;
+				rejectionFields[field] = code;
+			}
+		}
+		return {
+			task_id: typeof document['task_id'] === 'string' ? (document['task_id'] as string) : null,
+			outcome,
+			verified: document['verified'] === true,
+			recorded: document['recorded'] === true,
+			criteria: { total, supported, failed, unavailable },
+			criterion_states: criterionStates,
+			proposal: typeof document['proposal'] === 'string' ? (document['proposal'] as string) : 'none',
+			disposition:
+				typeof document['disposition'] === 'string' ? (document['disposition'] as string) : undefined,
+			revision: boundedCount(document['revision']) ?? undefined,
+			rejection_code:
+				typeof document['rejection_code'] === 'string'
+					? (document['rejection_code'] as string)
+					: undefined,
+			rejection_fields: rejectionFields
+		};
 	}
 
 	function asStringArray(value: unknown): string[] {
@@ -663,6 +743,10 @@
 		lastRevision = null;
 		lastDisposition = null;
 		controlBusy = false;
+		// The outcome block belongs to exactly one conversation: a switch
+		// clears it (the fold re-derives from the replayed run record, or the
+		// block stays honestly absent — never a stale verdict).
+		taskOutcome = null;
 		controlNote = null;
 	}
 
@@ -1042,6 +1126,9 @@
 		detailsOpen = false;
 		resetCanonicalView();
 		canonicalId = conversationId;
+		// Reopen continuity: the conversation's last server-delivered outcome
+		// document (a lease-holding run re-folds it from the SSE replay).
+		taskOutcome = taskOutcomeByConversation.get(conversationId) ?? null;
 		canonicalBusy = true;
 		try {
 			const detail = await canonicalRef.getConversation(conversationId, scope);
@@ -1323,6 +1410,9 @@
 		}
 		// A legacy open replaces any canonical view entirely.
 		resetCanonicalView();
+		// Reopen continuity: the conversation's last server-delivered outcome
+		// document (the SSE replay re-folds it when the run record replays).
+		taskOutcome = taskOutcomeByConversation.get(view.run_id) ?? null;
 		conversation = view;
 		refreshed = null;
 		taskLabels = Object.fromEntries(authoredLabels);
@@ -1868,6 +1958,18 @@
 						{ k: 'output_chars', v: rowOf(data, 'output_chars') }
 					]
 				});
+				// 21-outcome-ui: the run summary's additive `task_outcome`
+				// document (absent for taskless runs). Fail-closed narrow —
+				// the outcome block is driven by THIS document, never by the
+				// run's technical success state (E1).
+				const outcomeDocument = readTaskOutcome(data);
+				if (outcomeDocument !== null) {
+					taskOutcome = outcomeDocument;
+					taskOutcomeByConversation.set(event.run_id, outcomeDocument);
+					if (canonicalId !== null) {
+						taskOutcomeByConversation.set(canonicalId, outcomeDocument);
+					}
+				}
 				break;
 			}
 			case 'agent.failed': {
@@ -1964,6 +2066,21 @@
 
 	let needsApproval = $state(false);
 	let runDetail = $state<RunDetail | null>(null);
+	/**
+	 * The value-free task outcome document (act `21-outcome-ui`), folded from
+	 * the run summary's additive `task_outcome` key (`TASK_OUTCOME_SUMMARY_KEY`,
+	 * `mai.agents.task_completion`) as projected onto the run's event stream.
+	 * `null` = absent or malformed ⇒ NO outcome block — never an invented
+	 * verdict, and never the run's technical success state (C08 rule 6; E1).
+	 */
+	let taskOutcome = $state<TaskOutcomeDocument | null>(null);
+	/**
+	 * Presentation continuity for the outcome block: the SERVER-DELIVERED
+	 * documents (folded from the run summary) keyed by conversation identity.
+	 * Instance-scoped memory only — never web storage, never invented: a
+	 * conversation whose document was never delivered renders no block.
+	 */
+	const taskOutcomeByConversation = new Map<string, TaskOutcomeDocument>();
 	let approvalBinding = $state<ApprovalBinding | null>(null);
 	let approval = $state<ApprovalView | null>(null);
 	let approvalProblem = $state<{ code: string; message: string } | null>(null);
@@ -2752,6 +2869,10 @@
 						{/if}
 					{/if}
 				</p>
+
+				{#if taskOutcome !== null}
+					<TaskEvidence document={taskOutcome} />
+				{/if}
 
 				{#if canonicalMode && canonicalCompleteness !== 'complete'}
 					<div

@@ -138,6 +138,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents import conversation_context
 from mai.agents import conversation_store
+from mai.agents import task_completion
 from mai.agents import task_store
 from mai.agents.intake import IntakeRejection, arun_intake_turn
 from mai.agents.context import (
@@ -2646,6 +2647,28 @@ class AgentRunExecutor:
 
     # -- endings -------------------------------------------------------------
 
+    async def afinalize_task_outcome(
+        self, intent: AgentRunIntent
+    ) -> dict[str, object] | None:
+        """The additive domain-outcome observation at the final seam (§9).
+
+        Read-only derivation over the task bound to THIS run's link:
+        the observation document reports every criterion explicitly and
+        records NOTHING — a finished attempt never closes, verifies or
+        advances an episode by itself. ``verified`` can only ever mirror
+        a previously validated evidence-backed verdict (act
+        ``20-completion``); the technical ``RunState`` machine is
+        untouched (this runs after the workflow loop, before the
+        terminal translation, additively). ``None`` = unbound or
+        out-of-scope run: taskless runs keep every legacy surface
+        byte-identical.
+        """
+        return await task_completion.aobserve_task_outcome(
+            self._sessions,
+            server_id=uuid.UUID(intent.server_id),
+            run_id=intent.run_id,
+        )
+
     async def afinish_run(
         self, intent: AgentRunIntent, summary: Mapping[str, object]
     ) -> str:
@@ -2667,6 +2690,16 @@ class AgentRunExecutor:
             "tool_calls": summary.get("tool_calls"),
             "output_chars": summary.get("output_chars"),
         }
+        # Additive (21b): project the value-free task-outcome document into
+        # the emitted event so the real path delivers it (R-21 wire gap).
+        # Absent for taskless runs (the document is None) -> the key is
+        # omitted and every legacy surface stays byte-identical; a
+        # non-mapping or empty value is never emitted as-is.
+        outcome_document = summary.get(task_completion.TASK_OUTCOME_SUMMARY_KEY)
+        if isinstance(outcome_document, Mapping) and outcome_document:
+            completed_data[task_completion.TASK_OUTCOME_SUMMARY_KEY] = dict(
+                outcome_document
+            )
         stopped_by = summary.get(STOPPED_BY_EVENT_KEY)
         if stopped_by is not None:
             # Deterministic boundary stop (pause/cancel steering): the
@@ -2961,6 +2994,26 @@ def _agent_run_finished(payload_json: str, summary_json: str) -> str:
     return executor.run(executor.afinish_run(intent, json.loads(summary_json)))
 
 
+@DBOS.step(name="agents.task_outcome_finalized")
+def _agent_task_outcome_finalized(payload_json: str) -> str:
+    """The additive evidence-backed task-outcome observation (20-completion).
+
+    Checkpointed read-only derivation over the task bound to this run's
+    link (§9): the returned document rides the run summary additively —
+    a taskless run yields ``"null"`` and every legacy surface stays
+    byte-identical. A completed ATTEMPT is never a verified task: the
+    observation records nothing, so without an evidence-backed criterion
+    proposal the episode stays open and resumable (E1/P3). The step is
+    strict (failures propagate to the engine's classified recovery): an
+    observation error must never be silently hidden behind a missing
+    key, and the replay re-reads the same deterministic state.
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    document = executor.run(executor.afinalize_task_outcome(intent))
+    return canonical_json(document) if document is not None else "null"
+
+
 @DBOS.step(name="agents.run_failed")
 def _agent_run_failed(payload_json: str, reason: str) -> str:
     """Record the run ``failed`` + the classified reason event."""
@@ -3203,6 +3256,12 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                 "assistant_message_id": recorded.get("message_id"),
                 "intake": _intake_summary_document(intake),
             }
+            # 20-completion: the additive evidence-backed task-outcome
+            # observation (absent for taskless runs — legacy shape
+            # byte-identical; never closes or verifies an episode).
+            outcome_json = _agent_task_outcome_finalized(payload_json)
+            if outcome_json != "null":
+                summary["task_outcome"] = json.loads(outcome_json)
             if stopped_by is not None:
                 summary[STOPPED_BY_EVENT_KEY] = stopped_by
             _agent_run_finished(payload_json, canonical_json(summary))
@@ -3323,6 +3382,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             # The task/phase binding this run executed under (AC 1/2),
             # value-free and observable next to the conversation outcome.
             summary["intake"] = _intake_summary_document(intake)
+        # 20-completion: the additive evidence-backed task-outcome
+        # observation (absent for taskless runs — legacy shape
+        # byte-identical; a finished attempt never closes or verifies
+        # an episode by itself, E1/P3).
+        outcome_json = _agent_task_outcome_finalized(payload_json)
+        if outcome_json != "null":
+            summary["task_outcome"] = json.loads(outcome_json)
         if stopped_by is not None:
             summary[STOPPED_BY_EVENT_KEY] = stopped_by
         _agent_run_finished(payload_json, canonical_json(summary))

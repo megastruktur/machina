@@ -50,14 +50,26 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import FunctionModel
 
+from mai.agents.output_safety import REDACTED, project_text
 from mai.agents.tools import (
     BridgeError,
     BridgeErrorCode,
     CapabilityToolBridge,
+    TOOL_RESULT_PROJECTION_SCHEMA_VERSION,
     TOOL_RESULT_SCHEMA_VERSION,
     ToolResult,
     ToolStatus,
+    project_tool_result,
     tool_name_for,
+)
+from mai.capabilities.dispatch import (
+    REDACTED as DISPATCH_REDACTED,
+)
+from mai.contracts.tasks import (
+    RESULT_DATA_VALUE_MAX_CHARS,
+    DomainOutcome,
+    EffectCertainty,
+    ExecutionStatus,
 )
 from mai.capabilities.dispatch import (
     CapabilityCall,
@@ -241,9 +253,7 @@ class _Recorder:
 
     async def __call__(self, call: CapabilityCall) -> ExecutorResult:
         self.calls.append(call)
-        count = (
-            int(self.counter.read_text()) if self.counter.exists() else 0
-        ) + 1
+        count = (int(self.counter.read_text()) if self.counter.exists() else 0) + 1
         self.counter.write_text(str(count))
         return ExecutorResult(ok=self._ok, output=self._output)
 
@@ -281,9 +291,7 @@ def _dispatcher(
 
 def _unused_approvals() -> ApprovalStore:
     """A real store over a lazily-connecting engine (never dialed)."""
-    _, sessions = create_app_engine(
-        "postgresql://unused:unused@127.0.0.1:1/unused"
-    )
+    _, sessions = create_app_engine("postgresql://unused:unused@127.0.0.1:1/unused")
     return ApprovalStore(sessions)
 
 
@@ -334,9 +342,7 @@ def migrated_url() -> str:
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP SCHEMA public CASCADE; CREATE SCHEMA public"
-            )
+            conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
             conn.commit()
         command.upgrade(_alembic_config(), "head")
     finally:
@@ -470,9 +476,7 @@ def test_enabled_but_unregistered_is_not_exposed(fxt_dir: Path) -> None:
         _context(allowed=(READ_CAPABILITY, UNREGISTERED_CAPABILITY)),
     )
     assert bridge.enabled_capabilities == (READ_CAPABILITY,)
-    assert [tool.name for tool in bridge.tools] == [
-        tool_name_for(READ_CAPABILITY)
-    ]
+    assert [tool.name for tool in bridge.tools] == [tool_name_for(READ_CAPABILITY)]
 
 
 # ---------------------------------------------------------------------------
@@ -578,17 +582,13 @@ async def test_non_canonical_payload_rejected_before_state(
 ) -> None:
     recorder = _Recorder(counter)
     identifier = "free.form"
-    registry = _registry_with(
-        _fixture_descriptor(identifier, "read", input_schema={})
-    )
+    registry = _registry_with(_fixture_descriptor(identifier, "read", input_schema={}))
     bridge = _bridge(
         registry,
         _dispatcher(registry, _unused_approvals(), executor=recorder),
         _context(allowed=(identifier,)),
     )
-    result = _result_of(
-        await _tool_of(bridge, identifier).function(**{"x": object()})
-    )
+    result = _result_of(await _tool_of(bridge, identifier).function(**{"x": object()}))
     assert result["status"] == ToolStatus.DENIED.value
     assert result["error"]["code"] == "invalid_request"
     assert result["payload_hash"] == "non_canonical"
@@ -677,9 +677,7 @@ async def test_granted_read_executes_and_maps_outcome(
         _context(allowed=(READ_CAPABILITY,), references=(SECRET_NAME,)),
     )
     payload = {"source": "journal", "service": "mai-api"}
-    result = _result_of(
-        await _tool_of(bridge, READ_CAPABILITY).function(**payload)
-    )
+    result = _result_of(await _tool_of(bridge, READ_CAPABILITY).function(**payload))
     assert result["status"] == ToolStatus.EXECUTED.value
     assert result["allowed"] is True
     assert result["effect"] == "executed"
@@ -695,9 +693,7 @@ async def test_granted_read_executes_and_maps_outcome(
 
 
 @pytest.mark.anyio
-async def test_denied_scope_denies_without_effect(
-    fxt_dir: Path, counter: Path
-) -> None:
+async def test_denied_scope_denies_without_effect(fxt_dir: Path, counter: Path) -> None:
     recorder = _Recorder(counter)
     registry = _real_registry()
     bridge = _bridge(
@@ -754,7 +750,9 @@ async def test_infrastructure_failure_returns_structured_denial(
     bridge = _bridge(
         registry,
         _dispatcher(
-            registry, _unused_approvals(), executor=_Recorder(counter),
+            registry,
+            _unused_approvals(),
+            executor=_Recorder(counter),
             grants=_broken_grants,
         ),
         _context(allowed=(READ_CAPABILITY,)),
@@ -814,12 +812,7 @@ async def test_approval_store_outage_never_raises_from_tool(
     assert not counter.exists()
 
 
-def test_tool_result_json_shape_is_frozen_and_value_free(
-    fxt_dir: Path,
-) -> None:
-    registry = _real_registry()
-    bridge = _bridge(registry, _dispatcher(registry, _unused_approvals()))
-    tool = _tool_of(bridge, READ_CAPABILITY)
+def test_tool_result_json_shape_is_frozen_and_value_free() -> None:
     # The rejected document pins the frozen key order/shape.
     document = json.loads(
         ToolResult.rejected(
@@ -848,8 +841,14 @@ def test_tool_result_json_shape_is_frozen_and_value_free(
         "executor_ok",
         "output",
         "error",
+        "projection",
     ]
     assert document["schema_version"] == TOOL_RESULT_SCHEMA_VERSION
+    # The projection block is versioned on its own clock (act 19).
+    assert (
+        document["projection"]["schema_version"]
+        == TOOL_RESULT_PROJECTION_SCHEMA_VERSION
+    )
     assert SECRET_VALUE not in json.dumps(document)
 
 
@@ -884,9 +883,7 @@ async def test_deferred_approval_persists_binding_and_resumes_once(
     bridge = _bridge(
         registry,
         _dispatcher(registry, store, executor=recorder),
-        _context(
-            allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK
-        ),
+        _context(allowed=(PRIVILEGED_CAPABILITY,), mode=PolicyMode.ASK),
     )
     payload = {"command": "systemctl status mai"}
     # 1. The model-facing call defers: nothing ran, binding recorded.
@@ -1043,9 +1040,7 @@ async def test_mismatched_resume_never_consumes_the_decision(
 # ---------------------------------------------------------------------------
 
 
-def _scripted_agent(
-    bridge: CapabilityToolBridge, script: list[ModelResponse]
-) -> Agent:
+def _scripted_agent(bridge: CapabilityToolBridge, script: list[ModelResponse]) -> Agent:
     step = {"index": 0}
 
     async def model_fn(messages: list[ModelMessage], info) -> ModelResponse:
@@ -1053,7 +1048,9 @@ def _scripted_agent(
         step["index"] += 1
         return response
 
-    return Agent(model=FunctionModel(model_fn), instructions="probe", tools=list(bridge.tools))
+    return Agent(
+        model=FunctionModel(model_fn), instructions="probe", tools=list(bridge.tools)
+    )
 
 
 @pytest.mark.anyio
@@ -1224,3 +1221,596 @@ async def test_agent_run_defers_privileged_call_for_approval(
     assert document["policy_revision"] == 7
     assert recorder.calls == []
     assert not counter.exists()
+
+
+# ---------------------------------------------------------------------------
+# act 19-tool-results: compact model-facing projection (E3/S1/AC1/AC2)
+# ---------------------------------------------------------------------------
+
+
+def _tool_result(
+    *,
+    status: ToolStatus = ToolStatus.EXECUTED,
+    output_text: str | None = None,
+    executor_ok: bool | None = True,
+    reason: str = "allowed",
+    effect: str = "executed",
+    error_code: str | None = None,
+    error_detail: str | None = None,
+) -> ToolResult:
+    """One directly-constructed result with exactly the run-layer kwargs.
+
+    Mirrors ``mai.agents.run._result_document``: the run layer builds
+    :class:`ToolResult` from outcome fields without passing any
+    projection input, so the projection must derive everything from
+    these twenty fields alone (versioned/adapted compatibility, AC2).
+    """
+    return ToolResult(
+        schema_version=TOOL_RESULT_SCHEMA_VERSION,
+        capability_id="fixture.cap",
+        server_id=SERVER_A,
+        run_id=RUN_1,
+        status=status,
+        allowed=status is ToolStatus.EXECUTED,
+        reason=reason,
+        effect=effect,
+        payload_hash="0" * 64,
+        policy_revision=7,
+        effect_class="read",
+        approval_id=None,
+        approval_spent=False,
+        approval_code=None,
+        executor_ok=None if status is ToolStatus.UNKNOWN_EFFECT else executor_ok,
+        output_text=output_text,
+        output_truncated=None if output_text is None else False,
+        output_omitted_bytes=None if output_text is None else 0,
+        error_code=error_code,
+        error_detail=error_detail,
+    )
+
+
+def _projection_of(result: ToolResult) -> dict[str, object]:
+    projected = project_tool_result(result)
+    assert projected["schema_version"] == TOOL_RESULT_PROJECTION_SCHEMA_VERSION
+    return projected
+
+
+def test_shell_wrapper_exit_zero_stays_unknown_and_uncertain() -> None:
+    """E3: a wrapper exit code alone is never domain evidence."""
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "succeeded",
+                "exit_code": 0,
+                "stdout": "all checks look fine",
+                "stderr": "",
+            }
+        )
+    )
+    projection = _projection_of(result)
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+    assert "unproven" in str(projection["retry_hint"])
+
+
+def test_exit_zero_with_failed_subcheck_is_failure_never_certain() -> None:
+    """E3/AC1: exit 0 + a failed subcheck stays failure/uncertain — the
+    failed subcheck is never promoted to certain success."""
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "succeeded",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "subchecks": [
+                    {"name": "unit_active", "passed": True},
+                    {"name": "healthz_200", "passed": False},
+                ],
+            }
+        )
+    )
+    projection = _projection_of(result)
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.FAILURE.value
+    assert projection["effect_certainty"] != EffectCertainty.CERTAIN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+    subchecks = projection["subchecks"]
+    assert isinstance(subchecks, list) and len(subchecks) == 2
+    assert {"name": "healthz_200", "passed": False} in subchecks
+    assert "failure" in str(projection["retry_hint"])
+
+
+def test_structured_ok_envelope_proves_certain_success() -> None:
+    """Structured tools report their semantic outcome explicitly; a
+    proven execution plus an explicit ``ok`` envelope is the one
+    ``certain``-success combination."""
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "ok",
+                "items": ["a", "b"],
+                "limit": 10,
+                "offset": 0,
+                "total": 2,
+                "has_more": False,
+            }
+        )
+    )
+    projection = _projection_of(result)
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.SUCCESS.value
+    assert projection["effect_certainty"] == EffectCertainty.CERTAIN.value
+
+
+def test_refused_envelope_is_failed_execution_and_uncertain_failure() -> None:
+    """A structured refusal is explicit negative evidence: the technical
+    execution failed, the domain outcome is failure — and per AC1 the
+    certainty stays ``uncertain`` (only positive success evidence is
+    ever ``certain``)."""
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "refused",
+                "code": "vault_not_allowed",
+                "message": "credential refused by policy",
+                "capability_id": "fixture.cap",
+            }
+        ),
+        executor_ok=False,
+    )
+    projection = _projection_of(result)
+    assert projection["execution_status"] == ExecutionStatus.FAILED.value
+    assert projection["domain_outcome"] == DomainOutcome.FAILURE.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+    assert projection["error_code"] == "vault_not_allowed"
+    assert projection["error_detail"] == "credential refused by policy"
+
+
+def test_unknown_effect_claims_nothing() -> None:
+    """S2 honesty at the projection layer: an unproven effect stays
+    ``outcome_unknown``/``unknown``/``unknown`` — no termination claim,
+    no invented outcome."""
+    projection = _projection_of(_tool_result(status=ToolStatus.UNKNOWN_EFFECT))
+    assert projection["execution_status"] == ExecutionStatus.OUTCOME_UNKNOWN.value
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNKNOWN.value
+    assert "reconcile" in str(projection["retry_hint"])
+
+
+def test_denial_reports_error_code_and_never_a_domain_claim() -> None:
+    """A pre-dispatch rejection carries its stable code; nothing ran, so
+    no domain outcome and no effect evidence exist."""
+    result = _tool_result(
+        status=ToolStatus.DENIED,
+        effect="not_attempted",
+        reason="payload_schema_mismatch",
+        error_code="payload_schema_mismatch",
+        error_detail="$.command: required property is missing",
+        executor_ok=None,
+    )
+    projection = _projection_of(result)
+    assert projection["execution_status"] == ExecutionStatus.FAILED.value
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNKNOWN.value
+    assert projection["error_code"] == "payload_schema_mismatch"
+
+
+def test_approval_required_is_outcome_unknown_with_approval_hint() -> None:
+    """The approval deferral (bridge status or the run layer's parked
+    ``approval_required_but_absent`` row) is honest: no effect ran, the
+    outcome is unknown, the hint names the approval path."""
+    for result in (
+        _tool_result(status=ToolStatus.APPROVAL_REQUIRED, effect="not_attempted"),
+        _tool_result(
+            status=ToolStatus.DENIED,
+            effect="not_attempted",
+            reason="approval_required_but_absent",
+        ),
+    ):
+        projection = _projection_of(result)
+        assert projection["execution_status"] == ExecutionStatus.OUTCOME_UNKNOWN.value
+        assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+        assert projection["effect_certainty"] == EffectCertainty.UNKNOWN.value
+        assert "approval" in str(projection["retry_hint"])
+
+
+def test_malformed_subchecks_fail_closed_over_ok_status() -> None:
+    """Broken structured evidence never falls through to the weaker
+    envelope rule: a present-but-malformed (or empty) ``subchecks``
+    section keeps the outcome ``unknown`` even beside ``status: ok``."""
+    for output in (
+        json.dumps({"status": "ok", "subchecks": "all good"}),
+        json.dumps({"status": "ok", "subchecks": []}),
+        json.dumps({"status": "ok", "subchecks": [{"name": "x", "passed": "yes"}]}),
+        json.dumps({"status": "ok", "subchecks": [{"name": 1, "passed": True}]}),
+    ):
+        projection = _projection_of(_tool_result(output_text=output))
+        assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+        assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+
+
+def test_invalid_domain_outcome_marker_fails_closed() -> None:
+    projection = _projection_of(
+        _tool_result(
+            output_text=json.dumps({"status": "ok", "domain_outcome": "excellent"})
+        )
+    )
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+
+
+def test_explicit_failure_marker_wins_over_ok_envelope() -> None:
+    """Negative evidence pins the outcome: an explicit ``failure`` marker
+    is never promoted away by the envelope's ``ok``."""
+    projection = _projection_of(
+        _tool_result(
+            output_text=json.dumps({"status": "ok", "domain_outcome": "failure"})
+        )
+    )
+    assert projection["domain_outcome"] == DomainOutcome.FAILURE.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+
+
+def test_non_json_output_has_no_semantic_evidence() -> None:
+    """Arbitrary text (no regex oracle, §9): execution layer facts only."""
+    projection = _projection_of(
+        _tool_result(output_text="service restarted successfully\n")
+    )
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+
+
+def test_projection_is_deterministic() -> None:
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "ok",
+                "subchecks": [{"name": "a", "passed": True}],
+                "evidence_refs": [{"kind": "run_event", "evidence_id": str(RUN_1)}],
+            }
+        )
+    )
+    assert project_tool_result(result) == project_tool_result(result)
+
+
+def test_projection_pagination_slices_and_totals() -> None:
+    """Every extracted collection is a bounded page with honest
+    metadata: sliced totals and ``has_more`` — truncation is never
+    hidden success (wire honesty C08 rule 6)."""
+    subchecks = [{"name": f"check_{i:02d}", "passed": i % 3 != 0} for i in range(20)]
+    evidence = [{"kind": "observation", "evidence_id": str(RUN_1)} for _ in range(18)]
+    result_data = {f"metric_{i:02d}": str(i) for i in range(12)}
+    projection = _projection_of(
+        _tool_result(
+            output_text=json.dumps(
+                {
+                    "status": "ok",
+                    "subchecks": subchecks,
+                    "evidence_refs": evidence,
+                    "result_data": result_data,
+                }
+            )
+        )
+    )
+    pagination = projection["pagination"]
+    assert isinstance(pagination, dict)
+    assert pagination["subchecks"] == {
+        "limit": 16,
+        "offset": 0,
+        "total": 20,
+        "has_more": True,
+    }
+    assert pagination["evidence_refs"] == {
+        "limit": 16,
+        "offset": 0,
+        "total": 18,
+        "has_more": True,
+    }
+    assert pagination["result_data"] == {
+        "limit": 8,
+        "offset": 0,
+        "total": 12,
+        "has_more": True,
+    }
+    assert len(projection["subchecks"]) == 16
+    assert len(projection["evidence_refs"]) == 16
+    assert len(projection["result_data"]) == 8
+
+
+def test_projection_result_data_bounds_and_drops_secret_keys() -> None:
+    """Safe bounded result data (§9): values capped, credential-shaped
+    keys never carried — and dropped keys stay visible in the total."""
+    long_value = "x" * (RESULT_DATA_VALUE_MAX_CHARS + 500)
+    projection = _projection_of(
+        _tool_result(
+            output_text=json.dumps(
+                {
+                    "status": "ok",
+                    "result_data": {
+                        "password": "must-not-ride",
+                        "API_KEY": "also-not",
+                        "ok_metric": long_value,
+                    },
+                }
+            )
+        )
+    )
+    result_data = projection["result_data"]
+    assert isinstance(result_data, dict)
+    assert "password" not in result_data and "API_KEY" not in result_data
+    assert result_data["ok_metric"] == "x" * RESULT_DATA_VALUE_MAX_CHARS
+    pagination = projection["pagination"]
+    assert isinstance(pagination, dict)
+    assert pagination["result_data"]["total"] == 3
+    assert "must-not-ride" not in json.dumps(projection)
+
+
+def test_projection_evidence_refs_survive_with_kinds() -> None:
+    """Evidence refs survive the projection (no silent drops): object
+    entries normalize to contract shape, bare string ids are carried,
+    and the pagination total counts every entry."""
+    projection = _projection_of(
+        _tool_result(
+            output_text=json.dumps(
+                {
+                    "status": "ok",
+                    "evidence_refs": [
+                        {
+                            "kind": "run_event",
+                            "evidence_id": str(RUN_1),
+                            "note": "dispatcher receipt",
+                        },
+                        str(SERVER_A),
+                        {"evidence_id": "partial"},
+                        42,
+                    ],
+                }
+            )
+        )
+    )
+    refs = projection["evidence_refs"]
+    assert isinstance(refs, list)
+    assert refs[0] == {
+        "kind": "run_event",
+        "evidence_id": str(RUN_1),
+        "note": "dispatcher receipt",
+    }
+    assert refs[1] == {"evidence_id": str(SERVER_A)}
+    assert refs[2] == {"evidence_id": "partial"}
+    assert len(refs) == 3  # the non-string/non-mapping entry cannot be shaped
+    pagination = projection["pagination"]
+    assert isinstance(pagination, dict)
+    assert pagination["evidence_refs"]["total"] == 4
+
+
+def test_version_one_callers_stay_compatible() -> None:
+    """AC2: the envelope change is additive and versioned — every
+    version-1 key keeps its position, and the legacy 20-kwarg
+    construction (the run layer's exact call shape) serializes with the
+    projection appended."""
+    result = _tool_result()
+    document = json.loads(result.to_json_str())
+    version_one_keys = [
+        "schema_version",
+        "capability_id",
+        "server_id",
+        "run_id",
+        "status",
+        "allowed",
+        "reason",
+        "effect",
+        "payload_hash",
+        "policy_revision",
+        "effect_class",
+        "approval_id",
+        "approval_spent",
+        "approval_code",
+        "executor_ok",
+        "output",
+        "error",
+    ]
+    assert list(document)[: len(version_one_keys)] == version_one_keys
+    assert list(document)[-1] == "projection"
+    assert document["schema_version"] == TOOL_RESULT_SCHEMA_VERSION
+
+
+def test_projection_extracted_fields_stay_pattern_clean() -> None:
+    """Defense-in-depth (S1): extracted projection fields run through the
+    output-safety pattern layer even when only the dispatcher's
+    value-redaction ran (the bridge's direct model-facing path)."""
+    token = "sk-" + "Z" * 30
+    result = _tool_result(
+        output_text=json.dumps(
+            {
+                "status": "ok",
+                "result_data": {"last_error": f"auth failed for {token}"},
+                "subchecks": [{"name": f"probe {token}", "passed": True}],
+            }
+        )
+    )
+    projected = json.dumps(_projection_of(result))
+    assert token not in projected
+    assert REDACTED in projected
+
+
+# ===========================================================================
+# S1: redaction guarantees retained through the real dispatcher + run seam
+# ===========================================================================
+
+
+def test_redaction_canaries_never_reach_the_model_envelope(fxt_dir: Path) -> None:
+    """The production composition — dispatcher value-redaction → run-seam
+    ``project_text`` → :class:`ToolResult` → projection — leaves no
+    canary in any form (raw, JSON-escaped, JSON-encoded inner payload)
+    anywhere in the serialized envelope.
+
+    The base64-pickled canary documents the recorded boundary: no layer
+    decodes opaque encoded blobs (unpickling untrusted bytes is an RCE
+    vector), so the assertion pins what the layers DO guarantee — the
+    extracted projection copy is capped, and every decodable form is
+    gone (see report.md, limitations)."""
+    import base64
+    import pickle
+
+    resolved = "fxt-resolved-secret-19a86c"
+    escaped = json.dumps(resolved, ensure_ascii=True)[1:-1]
+    inner = json.dumps({"password": "fxt-inner-secret-44b2"})
+    pickled = base64.b64encode(
+        pickle.dumps({"password": "fxt-pickled-secret-77c3"})
+    ).decode("ascii")
+    token = "sk-" + "Q" * 30
+    raw_output = json.dumps(
+        {
+            "status": "ok",
+            "note": f"leak attempt {resolved} and {escaped}",
+            "encoded": inner,
+            "checkpoint": pickled,
+            "token": token,
+            "result_data": {
+                "echo": resolved,
+                "blob": pickled,
+                "token_echo": token,
+            },
+        }
+    )
+    # The exact run-seam composition (run.py `_result_document` feeds the
+    # projection `project_text(output, resolved_values)`).
+    safe_output = project_text(raw_output, [resolved])
+    result = _tool_result(output_text=safe_output)
+    envelope = result.to_json_str()
+
+    assert resolved not in envelope
+    assert escaped not in envelope
+    assert "fxt-inner-secret-44b2" not in envelope
+    assert token not in envelope
+    assert REDACTED in envelope
+    # Every decodable secret form is gone from the projection block too.
+    projection_text = json.dumps(json.loads(envelope)["projection"])
+    assert resolved not in projection_text
+    assert "fxt-inner-secret-44b2" not in projection_text
+    # The opaque base64-pickled blob cannot ride an extracted field whole:
+    # extracted copies are capped at the §9 value bound.
+    projected = json.loads(envelope)["projection"]
+    blob_copy = projected["result_data"].get("blob")
+    assert blob_copy is not None
+    assert len(blob_copy) <= RESULT_DATA_VALUE_MAX_CHARS
+
+
+@pytest.mark.anyio
+async def test_bridge_structured_output_projects_domain_success(
+    fxt_dir: Path, counter: Path
+) -> None:
+    """Full chain through the real bridge + dispatcher: a structured
+    ``ok`` envelope projects success/certain end-to-end."""
+    registry = _real_registry()
+    executor = _Recorder(
+        counter,
+        output=json.dumps(
+            {
+                "status": "ok",
+                "items": ["one"],
+                "limit": 10,
+                "offset": 0,
+                "total": 1,
+                "has_more": False,
+            }
+        ),
+    )
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, _unused_approvals(), executor=executor),
+        _context(allowed=(READ_CAPABILITY,)),
+    )
+    document = _result_of(
+        await _tool_of(bridge, READ_CAPABILITY).function(
+            **{"source": "journal", "service": "mai-api"}
+        )
+    )
+    assert document["status"] == ToolStatus.EXECUTED.value
+    projection = document["projection"]
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.SUCCESS.value
+    assert projection["effect_certainty"] == EffectCertainty.CERTAIN.value
+    assert counter.exists()
+
+
+@pytest.mark.anyio
+async def test_bridge_shell_exit_zero_projects_unknown_domain(
+    fxt_dir: Path, counter: Path
+) -> None:
+    """E3 through the real chain: the wrapper executed and exited zero,
+    and the projection honestly reports an unproven domain outcome."""
+    registry = _real_registry()
+    executor = _Recorder(
+        counter,
+        output=json.dumps(
+            {
+                "status": "succeeded",
+                "exit_code": 0,
+                "stdout": "done",
+                "stderr": "",
+            }
+        ),
+    )
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, _unused_approvals(), executor=executor),
+        _context(allowed=(READ_CAPABILITY,)),
+    )
+    document = _result_of(
+        await _tool_of(bridge, READ_CAPABILITY).function(
+            **{"source": "journal", "service": "mai-api"}
+        )
+    )
+    projection = document["projection"]
+    assert projection["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert projection["domain_outcome"] == DomainOutcome.UNKNOWN.value
+    assert projection["effect_certainty"] == EffectCertainty.UNCERTAIN.value
+
+
+@pytest.mark.anyio
+async def test_bridge_canary_output_projects_without_leaks(
+    fxt_dir: Path, counter: Path
+) -> None:
+    """S1 through the real chain: the dispatcher's value-redaction layer
+    scrubs executor-declared secret material before the projection ever
+    runs; no canary and no raw payload material appears anywhere in the
+    model-facing envelope, and the payload is present as its hash only."""
+    registry = _real_registry()
+
+    class _Leaky:
+        async def __call__(self, call: CapabilityCall) -> ExecutorResult:
+            assert call.payload == {"source": "journal", "service": "mai-api"}
+            output = json.dumps(
+                {
+                    "status": "ok",
+                    "echo": REFERENCE_PAYLOAD["command"],
+                    "leak": SECRET_VALUE,
+                    "result_data": {"echo": SECRET_VALUE},
+                }
+            )
+            return ExecutorResult(ok=True, output=output, redact_values=(SECRET_VALUE,))
+
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, _unused_approvals(), executor=_Leaky()),
+        _context(allowed=(READ_CAPABILITY,)),
+    )
+    document = _result_of(
+        await _tool_of(bridge, READ_CAPABILITY).function(
+            **{"source": "journal", "service": "mai-api"}
+        )
+    )
+    envelope = json.dumps(document)
+    assert SECRET_VALUE not in envelope
+    assert DISPATCH_REDACTED in envelope
+    assert document["payload_hash"] == canonical_payload_hash(
+        {"source": "journal", "service": "mai-api"}
+    )
+    projection = document["projection"]
+    assert projection["result_data"]["echo"] == DISPATCH_REDACTED
+    assert projection["domain_outcome"] == DomainOutcome.SUCCESS.value
+    assert projection["effect_certainty"] == EffectCertainty.CERTAIN.value
