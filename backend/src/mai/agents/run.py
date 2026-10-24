@@ -138,6 +138,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents import conversation_context
 from mai.agents import conversation_store
+from mai.agents import task_store
+from mai.agents.intake import IntakeRejection, arun_intake_turn
 from mai.agents.context import (
     MAX_ROLE_CHARS,
     ContextError,
@@ -188,6 +190,12 @@ from mai.contracts.jobs import (
     RunState,
     StepState,
 )
+from mai.contracts.tasks import (
+    Phase,
+    PhaseAction,
+    TaskContractError,
+    validate_phase,
+)
 from mai.credentials.env import EnvFileError, EnvResolver
 from mai.execution.commands import CommandRequest, CommandStatus
 from mai.jobs import engine as _engine
@@ -216,6 +224,8 @@ __all__ = [
     "DEFAULT_RECONCILE_WAIT_SECONDS",
     "DEFAULT_WAIT_POLL_SECONDS",
     "HANDLER_NAME",
+    "AGENT_INTAKE_EVENT_TYPE",
+    "INTAKE_NO_EXECUTOR_KINDS",
     "MAX_HISTORY_BYTES",
     "MAX_MAX_ROUNDS",
     "MAX_RECONCILE_WAIT_SECONDS",
@@ -417,10 +427,28 @@ CRASH_RECOVERY_RESULT_REASON: Final[str] = "crash_recovery"
 AGENT_STARTED_EVENT_TYPE: Final[str] = "agent.started"
 AGENT_CONTEXT_EVENT_TYPE: Final[str] = "agent.context_assembled"
 AGENT_HISTORY_EVENT_TYPE: Final[str] = "agent.conversation_history"
+AGENT_INTAKE_EVENT_TYPE: Final[str] = "agent.intake_interpreted"
 AGENT_ROUND_EVENT_TYPE: Final[str] = "agent.model_round"
 AGENT_RECONCILING_EVENT_TYPE: Final[str] = "agent.awaiting_reconciliation"
 AGENT_COMPLETED_EVENT_TYPE: Final[str] = "agent.completed"
 AGENT_FAILED_EVENT_TYPE: Final[str] = "agent.failed"
+
+#: Classified stage reason when the structured intake fails closed (P4):
+#: the run records ``failed`` with ZERO model rounds and ZERO tool
+#: effects — invalid intake can never enable execution (AC 1).
+INTAKE_REJECTED_REASON: Final[str] = "intake_rejected"
+
+#: Stable denial reason for a phase-gated tool effect (§6 phase gate):
+#: a task-bound run executes steps only in ``act`` and reads only in
+#: ``inspect``/``act`` — the ratified ``validate_phase`` vocabulary.
+PHASE_NOT_ALLOWED_REASON: Final[str] = "phase_not_allowed"
+
+#: Intake variants that finish the accepted turn WITHOUT launching the
+#: executor loop (P1: no second action-model call for a plain answer;
+#: ``clarify``/``blocked`` produce no task machinery and no effects).
+INTAKE_NO_EXECUTOR_KINDS: Final[frozenset[str]] = frozenset(
+    {"answer", "clarify", "blocked"}
+)
 
 
 class AgentRunErrorCode(StrEnum):
@@ -661,6 +689,123 @@ def initial_history_json(system_prompt: str, user_message: str) -> str:
         ModelRequest(parts=[UserPromptPart(content=user_message)]),
     ]
     return ModelMessagesTypeAdapter.dump_json(seed).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# structured intake (13-intake-runner): pure projections
+# ---------------------------------------------------------------------------
+
+
+def _intake_output_text(turn: object) -> str:
+    """The bounded user-facing text of a NO-EXECUTOR intake variant.
+
+    ``answer`` carries its own text; ``clarify`` renders the bounded open
+    questions; ``blocked`` states the safe reason. Deterministic and
+    structurally bounded (the contract caps every input field) — never a
+    fabricated completion, never an invented effect claim.
+    """
+    kind = str(getattr(turn, "turn_kind", ""))
+    if kind == "answer":
+        return str(getattr(turn, "answer_text", "")).strip()
+    understanding = str(getattr(turn, "understanding", "")).strip()
+    if kind == "clarify":
+        questions = getattr(turn, "open_questions", ()) or ()
+        lines = [understanding or "The turn needs your input before it can proceed."]
+        for question in questions:
+            proposal_id = str(getattr(question, "proposal_id", "")).strip()
+            body = str(getattr(question, "question", "")).strip()
+            label = f"{proposal_id}: " if proposal_id else ""
+            lines.append(f"- {label}{body}")
+        return "\n".join(lines)
+    if kind == "blocked":
+        reason = str(getattr(turn, "reason", "")).strip()
+        return f"{understanding}\nBlocked: {reason}".strip()
+    return understanding  # pragma: no cover - caller gates the variant
+
+
+def _intake_summary_document(intake: Mapping[str, object]) -> dict[str, object]:
+    """The value-free intake projection for the run summary (C05 rule 4).
+
+    Counts, dispositions and identities only — never snapshot content,
+    model prose or repair feedback (those stay in the checkpointed step
+    document and the bounded event fields, both non-content by contract).
+    """
+    usage = (
+        intake.get("planner_usage")
+        if isinstance(intake.get("planner_usage"), Mapping)
+        else {}
+    )
+    return {
+        "interpreted": bool(intake.get("interpreted")),
+        "turn_kind": intake.get("turn_kind"),
+        "applied": bool(intake.get("applied")),
+        "task_id": intake.get("task_id"),
+        "disposition": intake.get("disposition"),
+        "planner_model_calls": usage.get("model_calls"),
+        "planner_repaired": usage.get("repaired"),
+    }
+
+
+def _task_context_block(header: Mapping[str, object]) -> str:
+    """The deterministic bounded task-state block for the seed's system
+    prompt (the task/phase binding of AC 2).
+
+    Riding the LEADING ``SystemPromptPart`` is deliberate: the pinned
+    compaction stack re-emits leading system parts verbatim ahead of any
+    summary, so task id, phase, completed steps and constraints survive
+    steering rounds AND compaction events (AC 2) — they cannot be
+    silently summarized away mid-run. Every collection is the store's
+    bounded page with the omission STATED, never hidden; constraint
+    statements ride verbatim within that page bound (critical constraints
+    are never truncated here).
+    """
+    lines = [
+        "",
+        "# Active task episode (validated by structured intake)",
+        (
+            f"task_id: {header.get('task_id')} "
+            f"(revision {header.get('revision')}, "
+            f"phase {header.get('requested_phase')})"
+        ),
+    ]
+    objective = str(header.get("summary") or header.get("title") or "").strip()
+    if objective:
+        lines.append(f"objective: {objective}")
+    steps = header.get("steps") if isinstance(header.get("steps"), list) else []
+    if steps:
+        lines.append("# Plan steps (step_id | status | verification | title)")
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            lines.append(
+                f"- {step.get('step_id')} | {step.get('status')} | "
+                f"{step.get('verification')} | {step.get('title')}"
+            )
+    if header.get("steps_omitted"):
+        lines.append(f"(plan shows the first {len(steps)} steps; more exist)")
+    constraints = (
+        header.get("constraints")
+        if isinstance(header.get("constraints"), list)
+        else []
+    )
+    if constraints:
+        lines.append("# Active constraints (these MUST hold; origin anchors the source)")
+        for constraint in constraints:
+            if not isinstance(constraint, Mapping):
+                continue
+            lines.append(
+                f"- [{constraint.get('origin')}] {constraint.get('statement')}"
+            )
+    if header.get("constraints_omitted"):
+        lines.append(
+            f"(constraints show the first {len(constraints)}; more exist)"
+        )
+    lines.append(
+        "Work toward the plan under these constraints. The phase above "
+        "gates target effects at every tool boundary (plan: none, "
+        "inspect: read-only, act: granted capabilities)."
+    )
+    return "\n".join(lines)
 
 
 def _result_document(
@@ -1501,6 +1646,317 @@ class AgentRunExecutor:
             "sequence": row.sequence,
         }
 
+    # -- structured intake checkpoint + task binding (13-intake-runner) ----
+
+    async def asource_message_of_turn(
+        self, intent: AgentRunIntent
+    ) -> uuid.UUID | None:
+        """The accepted user turn THIS run interprets, when one exists.
+
+        The canonical submit seam (05) persists the user message with
+        ``client_request_id == run_id`` INSIDE the admission window and
+        attaches the run BEFORE enqueue, so a started worker always
+        observes it. A linked run without that row (defensive) or a
+        legacy run without a link returns ``None`` — no intake, honest
+        reason, never a guessed source message.
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return None
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT message_id FROM conversation_messages "
+                        "WHERE conversation_id = :cid "
+                        "AND client_request_id = :rid "
+                        "AND role = 'user' "
+                        "ORDER BY seq, message_id LIMIT 1"
+                    ),
+                    {"cid": conversation_id, "rid": uuid.UUID(intent.run_id)},
+                )
+            ).first()
+        return None if row is None else uuid.UUID(str(row[0]))
+
+    async def ainterpret_intake_turn(
+        self, intent: AgentRunIntent, pins: Mapping[str, object]
+    ) -> dict[str, object]:
+        """ONE checkpointed tool-free interpretation of the accepted turn.
+
+        C4 idempotency is layered: the DBOS step checkpoint replays the
+        SAME accepted result without re-running the intake model, and the
+        intake seam's stable per-turn key deduplicates onto the SAME task
+        in the store (a replayed turn can never create a second task).
+        Usage accounting is honest and replay-invariant: the bounded
+        planner record rides the checkpointed document and the value-free
+        ``agent.intake_interpreted`` event. An unrepairable rejection
+        (P4) raises :class:`AgentStageError` (``intake_rejected``) after
+        emitting the value-free rejection fields — the run has ZERO
+        rounds and ZERO tool effects.
+
+        Legacy runs without a conversation link return
+        ``{"interpreted": False}`` and keep today's behavior unchanged.
+        """
+        conversation_id = await conversation_context.aconversation_for_run(
+            self._sessions, run_id=intent.run_id
+        )
+        if conversation_id is None:
+            return {"interpreted": False, "reason": "no_conversation_link"}
+        source_message_id = await self.asource_message_of_turn(intent)
+        if source_message_id is None:
+            return {"interpreted": False, "reason": "source_message_not_found"}
+
+        binding = _binding_from_pins(pins)
+        selection = binding.selection()
+        active_resolver: Any = (
+            self._resolver() if callable(self._resolver) else self._resolver
+        )
+        try:
+            if self._model_builder is not None:
+                resolved = self._model_builder(
+                    selection=selection, resolver=active_resolver
+                )
+            else:
+                resolved = build_model(selection, resolver=active_resolver)
+        except (ModelConfigError, EnvFileError) as error:
+            code = getattr(error, "code", None)
+            code_value = getattr(code, "value", str(code))
+            raise AgentStageError(
+                f"model_credential_{code_value or 'failed'}",
+                error_type=type(error).__name__,
+            ) from None
+        planner_model = (
+            resolved.model if isinstance(resolved, ResolvedModel) else resolved
+        )
+
+        try:
+            outcome = await arun_intake_turn(
+                planner_model,
+                self._sessions,
+                server_id=uuid.UUID(intent.server_id),
+                conversation_id=conversation_id,
+                source_message_id=source_message_id,
+            )
+        except IntakeRejection as exc:
+            await self._emit_once(
+                intent.run_id,
+                AGENT_INTAKE_EVENT_TYPE,
+                {
+                    "interpreted": False,
+                    "rejected": True,
+                    "fields": dict(exc.fields),
+                    "model_calls": exc.model_calls,
+                    "attempts": exc.attempts,
+                    "repaired": exc.repaired,
+                },
+            )
+            raise AgentStageError(
+                INTAKE_REJECTED_REASON, error_type="IntakeRejection"
+            ) from None
+        except TaskContractError as exc:
+            # Defensive belt: the seam converts store rejections into the
+            # bounded repair loop itself; a rejection escaping here is
+            # still fail-closed with value-free fields.
+            await self._emit_once(
+                intent.run_id,
+                AGENT_INTAKE_EVENT_TYPE,
+                {
+                    "interpreted": False,
+                    "rejected": True,
+                    "fields": dict(exc.fields),
+                    "model_calls": 0,
+                    "attempts": 0,
+                    "repaired": False,
+                },
+            )
+            raise AgentStageError(
+                INTAKE_REJECTED_REASON, error_type="TaskContractError"
+            ) from None
+
+        turn = outcome.turn
+        record = outcome.record
+        turn_kind = str(turn.turn_kind)
+        requested_phase = (
+            str(turn.requested_phase.value)
+            if getattr(turn, "requested_phase", None) is not None
+            else None
+        )
+        task_header: dict[str, object] | None = None
+        if outcome.applied and outcome.task_id is not None:
+            # Bind the validated episode to THIS run's link row (§1: the
+            # run contributes to the task; the idempotent update makes a
+            # replayed bind observe the same row).
+            await self._abind_run_task(intent, conversation_id, outcome.task_id)
+            task_header = await self._atask_header(
+                outcome.task_id, server_id=uuid.UUID(intent.server_id)
+            )
+        await self._emit_once(
+            intent.run_id,
+            AGENT_INTAKE_EVENT_TYPE,
+            {
+                "interpreted": True,
+                "rejected": False,
+                "turn_kind": turn_kind,
+                "applied": outcome.applied,
+                "task_id": str(outcome.task_id) if outcome.task_id else None,
+                "revision": outcome.revision,
+                "disposition": outcome.disposition,
+                "requested_phase": requested_phase,
+                "planner_model_calls": record.model_calls,
+                "planner_attempts": record.attempts,
+                "planner_repaired": record.repaired,
+                "planner_function_tools": record.function_tools,
+            },
+        )
+        output_text = (
+            _intake_output_text(turn)
+            if turn_kind in INTAKE_NO_EXECUTOR_KINDS
+            else None
+        )
+        return {
+            "interpreted": True,
+            "conversation_id": str(conversation_id),
+            "source_message_id": str(source_message_id),
+            "turn_kind": turn_kind,
+            "applied": outcome.applied,
+            "task_id": str(outcome.task_id) if outcome.task_id else None,
+            "revision": outcome.revision,
+            "disposition": outcome.disposition,
+            "requested_phase": requested_phase,
+            "planner_usage": {
+                "model_calls": record.model_calls,
+                "attempts": record.attempts,
+                "repaired": record.repaired,
+                "function_tools": record.function_tools,
+            },
+            "task_header": task_header,
+            "output_text": output_text,
+        }
+
+    async def _abind_run_task(
+        self,
+        intent: AgentRunIntent,
+        conversation_id: uuid.UUID,
+        task_id: uuid.UUID,
+    ) -> None:
+        """Attach the intake-validated task to THIS run's link (idempotent).
+
+        The link row exists (attached pre-enqueue) with a NULL task id;
+        the intake result names the episode this run contributes to.
+        ONE transaction under the conversation row lock with the scope
+        re-check (C8 belt); a replayed bind updates the same row to the
+        same value, never a second link.
+        """
+        async with self._sessions() as session, session.begin():
+            locked = (
+                await session.execute(
+                    text(
+                        "SELECT server_id FROM conversations "
+                        "WHERE conversation_id = :cid FOR UPDATE"
+                    ),
+                    {"cid": conversation_id},
+                )
+            ).scalar()
+            if locked is None:
+                raise AgentStageError(
+                    INTAKE_REJECTED_REASON, error_type="ConversationMissing"
+                )
+            if str(locked) != str(intent.context.server_id):
+                # A scope-mismatched link is unreachable through the
+                # scope-checked probe above; fail closed regardless.
+                raise AgentStageError(
+                    INTAKE_REJECTED_REASON, error_type="ConversationScopeMismatch"
+                )
+            await session.execute(
+                text(
+                    "UPDATE conversation_runs SET task_id = :task "
+                    "WHERE conversation_id = :cid AND run_id = :rid"
+                ),
+                {
+                    "task": task_id,
+                    "cid": conversation_id,
+                    "rid": uuid.UUID(intent.run_id),
+                },
+            )
+
+    async def _atask_header(
+        self, task_id: uuid.UUID, *, server_id: uuid.UUID
+    ) -> dict[str, object] | None:
+        """The bounded task-state header bound to execution (AC 1/2).
+
+        Same page bounds as the intake snapshot (store defaults, omission
+        stated). ``None`` = the task vanished between apply and read
+        (unreachable under the writer lease; honestly unbound rather
+        than fabricated).
+        """
+        try:
+            task = await task_store.aget_task(
+                self._sessions, task_id, server_id=server_id
+            )
+        except TaskContractError:
+            return None
+        steps_page = await task_store.alist_steps(
+            self._sessions, task_id, server_id=server_id
+        )
+        constraints_page = await task_store.alist_constraints(
+            self._sessions, task_id, server_id=server_id
+        )
+        return {
+            "task_id": str(task.task_id),
+            "revision": task.revision,
+            "requested_phase": task.requested_phase.value,
+            "title": task.title,
+            "summary": task.summary,
+            "steps": [
+                {
+                    "step_id": row.step_id,
+                    "status": row.status.value,
+                    "verification": row.verification.value,
+                    "title": row.title,
+                }
+                for row in steps_page.items
+            ],
+            "steps_omitted": steps_page.has_more,
+            "constraints": [
+                {
+                    "constraint_id": row.constraint_id,
+                    "origin": row.origin.value,
+                    "statement": row.statement,
+                }
+                for row in constraints_page.items
+            ],
+            "constraints_omitted": constraints_page.has_more,
+        }
+
+    async def abound_task_phase(self, intent: AgentRunIntent) -> Phase | None:
+        """The phase of the task THIS run is bound to, when any.
+
+        Read at the effect boundary (not intake-time): a phase correction
+        recorded between rounds applies at the NEXT tool boundary. No
+        link, a link without a task, or a task without a phase →
+        ``None`` (the legacy unbound behavior — the gate is inert).
+        """
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT t.requested_phase FROM conversation_runs r "
+                        "JOIN agent_tasks t ON t.task_id = r.task_id "
+                        "WHERE r.run_id = :rid "
+                        "ORDER BY r.created_at DESC, r.run_id LIMIT 1"
+                    ),
+                    {"rid": uuid.UUID(intent.run_id)},
+                )
+            ).first()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return Phase(str(row[0]))
+        except ValueError:
+            return None  # unknown value: fail closed at the caller
+
     # -- durable conversation steering queue (07-steering) ------------------
 
     async def apoll_steering(self, intent: AgentRunIntent) -> dict[str, object]:
@@ -1907,6 +2363,33 @@ class AgentRunExecutor:
                 detail=None,
                 payload_hash=payload_hash if isinstance(payload_hash, str) else None,
             )
+
+        # Phase gate (§6; task-phase-gate resource): a task-bound run
+        # executes target effects only in ``act`` and reads only in
+        # ``inspect``/``act`` — the ratified ``validate_phase`` mapping.
+        # The denial lands BEFORE the fence marker: no effect was even
+        # planned, and the honest failed row tells the model why.
+        phase = await self.abound_task_phase(intent)
+        if phase is not None:
+            descriptor = self._bridge_of(intent).descriptor_for(str(capability_id))
+            effect_class = str(getattr(descriptor, "effect_class", "") or "")
+            action = (
+                PhaseAction.COLLECT_EVIDENCE
+                if effect_class == "read"
+                else PhaseAction.EXECUTE_STEPS
+            )
+            try:
+                validate_phase(phase, action)
+            except TaskContractError:
+                return await self._persist_denial(
+                    intent,
+                    call,
+                    row_capability,
+                    pending=True,
+                    reason=PHASE_NOT_ALLOWED_REASON,
+                    detail=f"{action.value}_in_{phase.value}",
+                    payload_hash=payload_hash,
+                )
 
         await self._steps.amark_running(intent.run_id, seq, row_capability)
         try:
@@ -2331,6 +2814,28 @@ def _agent_conversation_seed(
     )
 
 
+@DBOS.step(name="agents.intake_interpreted")
+def _agent_intake_interpreted(
+    payload_json: str, pins_json: str
+) -> dict[str, object]:
+    """ONE checkpointed tool-free intake interpretation (13-intake-runner).
+
+    The step result IS the C4 replay anchor: a recovered/replayed
+    workflow re-reads the SAME accepted interpretation (same turn kind,
+    same task binding, same planner usage) without a second model call,
+    and the store's stable per-turn key keeps a replay from creating a
+    second task even if the checkpoint were lost. An unrepairable
+    rejection raises the classified ``intake_rejected`` stage failure
+    after emitting the value-free fields (P4: no effects on invalid
+    intake).
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(
+        executor.ainterpret_intake_turn(intent, json.loads(pins_json))
+    )
+
+
 @DBOS.step(name="agents.assistant_recorded")
 def _agent_assistant_recorded(payload_json: str, output: str) -> dict[str, object]:
     """Record the canonical assistant reply (checkpointed producer).
@@ -2634,7 +3139,30 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         _agent_run_started(payload_json)
         pins = _agent_model_bound(payload_json)
         pins_json = canonical_json(pins)
+        # 13-intake-runner: ONE checkpointed tool-free interpretation of
+        # the accepted turn BEFORE any executor work (C4 anchor; planner
+        # usage accounted; P4 rejection fails the run with zero effects).
+        intake = _agent_intake_interpreted(payload_json, pins_json)
         assembled = _agent_context_assembled(payload_json, pins_json)
+        intake_header = (
+            intake.get("task_header")
+            if isinstance(intake.get("task_header"), Mapping)
+            else None
+        )
+        if intake.get("interpreted") and intake_header is not None:
+            # Task/phase binding (AC 1/2): the validated header rides the
+            # LEADING system part of the seed, so task id, phase, steps
+            # and constraints survive steering and compaction by
+            # construction. The context step's own checkpoint is
+            # untouched (06 seam undisturbed); the seed step receives
+            # the deterministic workflow-computed payload.
+            assembled = {
+                **assembled,
+                "system_prompt": (
+                    str(assembled["system_prompt"])
+                    + _task_context_block(intake_header)
+                ),
+            }
         seed = _agent_conversation_seed(
             payload_json, canonical_json(assembled)
         )
@@ -2646,6 +3174,39 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         rounds = 0
         tool_records: list[dict[str, object]] = []
         output_chars = 0
+        # 13-intake-runner: the plain-answer variants END the accepted
+        # turn here (P1: no second action-model call, no executor, no
+        # effects). A deterministic stop control still wins its boundary;
+        # claimed natural-language steering is never dropped — the run
+        # falls through into the executor loop under it, and the intake
+        # answer is superseded by the steered continuation.
+        intake_kind = (
+            str(intake["turn_kind"]) if intake.get("interpreted") else None
+        )
+        intake_answered = False
+        if intake_kind in INTAKE_NO_EXECUTOR_KINDS:
+            boundary_texts, stop = _claim_steering_boundary(payload_json)
+            if stop is not None:
+                stopped_by = stop
+            elif not boundary_texts:
+                intake_answered = True
+            else:
+                pending_steered.extend(boundary_texts)
+        if intake_answered:
+            answer_text = str(intake.get("output_text") or "")
+            recorded = _agent_assistant_recorded(payload_json, answer_text)
+            summary = {
+                "rounds": 0,
+                "tool_calls": tool_records,
+                "output_chars": len(answer_text),
+                "assistant_recorded": bool(recorded.get("recorded")),
+                "assistant_message_id": recorded.get("message_id"),
+                "intake": _intake_summary_document(intake),
+            }
+            if stopped_by is not None:
+                summary[STOPPED_BY_EVENT_KEY] = stopped_by
+            _agent_run_finished(payload_json, canonical_json(summary))
+            return {"run_id": intent.run_id, "state": "succeeded", **summary}
         while True:
             # Safe boundary BEFORE every model round: the durable
             # steering queue is consumed exactly once here, and a
@@ -2758,6 +3319,10 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             "assistant_recorded": bool(recorded.get("recorded")),
             "assistant_message_id": recorded.get("message_id"),
         }
+        if intake.get("interpreted"):
+            # The task/phase binding this run executed under (AC 1/2),
+            # value-free and observable next to the conversation outcome.
+            summary["intake"] = _intake_summary_document(intake)
         if stopped_by is not None:
             summary[STOPPED_BY_EVENT_KEY] = stopped_by
         _agent_run_finished(payload_json, canonical_json(summary))
