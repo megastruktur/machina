@@ -149,6 +149,12 @@ from mai.agents.model_store import (
     ModelConfigStore,
     ModelStoreError,
 )
+from mai.agents.output_safety import (
+    REDACTED,
+    project_document,
+    project_text,
+    redact_values,
+)
 from mai.agents.tools import (
     TOOL_RESULT_SCHEMA_VERSION,
     BridgeError,
@@ -159,12 +165,16 @@ from mai.agents.tools import (
 )
 from mai.capabilities.dispatch import (
     EFFECT_NOT_ATTEMPTED,
-    REDACTED,
+    EFFECT_UNKNOWN,
     CapabilityDispatcher,
-    _secret_output_forms,
     canonical_payload_hash,
 )
-from mai.contracts.jobs import TERMINAL_STEP_STATES, RunState, StepState
+from mai.contracts.jobs import (
+    EVENT_PAYLOAD_VERSION,
+    TERMINAL_STEP_STATES,
+    RunState,
+    StepState,
+)
 from mai.credentials.env import EnvFileError, EnvResolver
 from mai.execution.commands import CommandRequest, CommandStatus
 from mai.jobs import engine as _engine
@@ -173,10 +183,12 @@ from mai.jobs.resource_locks import ResourceLockService
 from mai.jobs.steps import (
     EXECUTION_TIMEOUT_REASON,
     RESUME_TOPIC,
+    STEP_COMPLETED_EVENT_TYPE,
     WAIT_FOR_APPROVAL,
     StepExecutor,
     StepIntent,
     StepsError,
+    StepsErrorCode,
     _translate_outcome,
 )
 from mai.plugins.registry import CapabilityRegistry
@@ -262,10 +274,10 @@ def _scrub_secret_text(text: str, secrets: list[str]) -> str:
     Raw and JSON-escaped forms both scrub: receipts embed
     JSON-serialized strings (double-encoded payloads, echoed tool
     output), where only the escaped form of the secret appears (C2).
+    The value-form producer is shared with the dispatcher's own output
+    boundary via :mod:`mai.agents.output_safety`.
     """
-    for value in _secret_output_forms(secrets):
-        text = text.replace(value, REDACTED)
-    return text
+    return redact_values(text, secrets)
 
 
 def _scrub_secret_document(value: object, secrets: list[str]) -> object:
@@ -712,6 +724,37 @@ def _receipt_result_document(
     )
 
 
+def _timeout_result_document(
+    intent: AgentRunIntent,
+    receipt: Mapping[str, object],
+) -> str:
+    """The honest ToolResult at the reconciliation deadline (value-free).
+
+    The wait budget expired while the effect's outcome was still
+    unknown: ``status=unknown_effect`` + ``reason=execution_timeout_exceeded``.
+    Never a claim of confirmed termination (no termination receipt
+    exists) and never a retry instruction: ``allowed`` is false,
+    ``executor_ok`` stays unknown and the settled step row is terminal —
+    the runtime never re-dispatches it. (Recorded boundary: agent-path
+    calls carry no mutation-lock lease; the resource-lock fence is the
+    declared-steps surface.)
+    """
+    hash_value = receipt.get("payload_hash")
+    return _result_document(
+        intent=intent,
+        capability_id=str(receipt.get("capability_id") or "unknown"),
+        status=ToolStatus.UNKNOWN_EFFECT,
+        reason=EXECUTION_TIMEOUT_REASON,
+        payload_hash=str(hash_value) if isinstance(hash_value, str) else None,
+        effect=str(receipt.get("effect") or EFFECT_UNKNOWN),
+        policy_revision=(
+            int(receipt["policy_revision"])  # type: ignore[arg-type]
+            if isinstance(receipt.get("policy_revision"), int)
+            else None
+        ),
+    )
+
+
 def _parse_deferred_results(document: Mapping[str, object]) -> DeferredToolResults:
     """Rebuild the deferred-result map from its checkpointed document."""
     calls_value = document.get("calls")
@@ -834,6 +877,54 @@ def _compaction_capability(context_limit: int | None) -> TieredCompaction[None]:
         target_fraction=COMPACTION_TARGET_FRACTION,
         context_window=context_limit,
     )
+
+# ---------------------------------------------------------------------------
+# the shared whole-stream event producer (agent-side seam)
+# ---------------------------------------------------------------------------
+
+
+async def _astep_completed_event(
+    session: AsyncSession, run_id: str, data: Mapping[str, object]
+) -> int:
+    """Append one ``step.completed`` event at the next whole-stream cursor.
+
+    The shared producer contract (C05 rule 4, the lifecycle's allocation):
+    the CALLER holds the ``job_runs`` row lock in its own transaction, the
+    cursor is ``MAX(seq) + 1`` and the row lands with the frozen envelope
+    columns (``event_id``/``ts``/``type``/``v``/``data``) — the storage
+    ``UNIQUE (run_id, seq)`` is the backstop. Failure raises: a lost event
+    is never swallowed as a recorded success.
+    """
+    next_seq = (
+        await session.execute(
+            text(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events "
+                "WHERE run_id = :r"
+            ),
+            {"r": uuid.UUID(run_id)},
+        )
+    ).scalar_one()
+    await session.execute(
+        text(
+            """
+            INSERT INTO job_events
+                (event_id, run_id, seq, ts, type, v, data)
+            VALUES
+                (:event_id, :run_id, :seq, :ts, :type, :v, :data)
+            """
+        ),
+        {
+            "event_id": uuid.uuid4(),
+            "run_id": uuid.UUID(run_id),
+            "seq": next_seq,
+            "ts": datetime.now(timezone.utc),
+            "type": STEP_COMPLETED_EVENT_TYPE,
+            "v": EVENT_PAYLOAD_VERSION,
+            "data": json.dumps(dict(data)),
+        },
+    )
+    return next_seq
+
 
 # ---------------------------------------------------------------------------
 # composition
@@ -1004,45 +1095,148 @@ class AgentRunExecutor:
             receipt_patch["stderr"] = report.stderr
         if report.exit_code is not None:
             receipt_patch["exit_code"] = report.exit_code
-        try:
-            async with self._sessions() as session:
-                async with session.begin():
-                    updated = await session.execute(
-                        text(
-                            "UPDATE job_steps SET state = :target, receipt = :receipt "
-                            "WHERE run_id = :run AND seq = :seq AND state = :expected "
-                            "RETURNING step_id"
-                        ),
-                        {
-                            "target": step_state.value,
-                            "receipt": json.dumps(receipt_patch),
-                            "run": uuid.UUID(run_id),
-                            "seq": seq,
-                            "expected": StepState.OUTCOME_UNKNOWN.value,
-                        },
-                    )
-                    if updated.scalar() is None:
-                        return False
+        async with self._sessions() as session:
+            async with session.begin():
+                locked = (
                     await session.execute(
                         text(
-                            "INSERT INTO job_events (run_id, seq, kind, payload) "
-                            "VALUES (:run, (SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :run), :kind, :payload)"
+                            "SELECT run_id FROM job_runs WHERE run_id = :r FOR UPDATE"
                         ),
-                        {
-                            "run": uuid.UUID(run_id),
-                            "kind": "step.completed",
-                            "payload": json.dumps(
-                                {
-                                    "capability_id": str(row.get("capability_id", "unknown")),
-                                    "reason": reason,
-                                    "op_id": op_id_value,
-                                }
-                            ),
-                        },
+                        {"r": uuid.UUID(run_id)},
                     )
-        except Exception:
-            return False
+                ).scalar()
+                if locked is None:
+                    raise StepsError(
+                        StepsErrorCode.RUN_NOT_FOUND,
+                        "no job_runs row for this run_id",
+                    )
+                updated = await session.execute(
+                    text(
+                        "UPDATE job_steps SET state = :target, receipt = :receipt "
+                        "WHERE run_id = :run AND seq = :seq AND state = :expected "
+                        "RETURNING step_id"
+                    ),
+                    {
+                        "target": step_state.value,
+                        "receipt": json.dumps(receipt_patch),
+                        "run": uuid.UUID(run_id),
+                        "seq": seq,
+                        "expected": StepState.OUTCOME_UNKNOWN.value,
+                    },
+                )
+                step_id = updated.scalar()
+                if step_id is None:
+                    return False
+                await _astep_completed_event(
+                    session,
+                    run_id,
+                    {
+                        "step_id": str(step_id),
+                        "seq": seq,
+                        "capability_id": str(row.get("capability_id", "unknown")),
+                        "reason": reason,
+                        "op_id": op_id_value,
+                    },
+                )
         return True
+
+    async def aexpire_unknown_step(self, run_id: str, seq: int) -> dict[str, object]:
+        """Expire one ``outcome_unknown`` step at the reconciliation deadline.
+
+        ONE transaction, the reviewed machinery's way: the ``job_runs``
+        row lock, the guarded ``outcome_unknown → failed`` transition with
+        the timeout receipt (single-owner; a lost guard means a
+        reconciler resolution landed concurrently — its durable truth is
+        returned instead of the timeout) and the schema-valid
+        ``step.completed`` timeout event at the next whole-stream cursor.
+
+        The receipt keeps the attempt's own ``effect``/op identity and
+        records ``reason=execution_timeout_exceeded`` +
+        ``resolution=timeout``: a WAIT-BUDGET expiry — never a claim that
+        the effect was terminated (no termination receipt exists here)
+        and never a re-execution authorization. Any persistence failure
+        raises (checkpointed step ⇒ the run fails loudly; a lost event is
+        never swallowed as a recorded success).
+        """
+        async with self._sessions() as session:
+            async with session.begin():
+                locked = (
+                    await session.execute(
+                        text(
+                            "SELECT run_id FROM job_runs WHERE run_id = :r FOR UPDATE"
+                        ),
+                        {"r": uuid.UUID(run_id)},
+                    )
+                ).scalar()
+                if locked is None:
+                    raise StepsError(
+                        StepsErrorCode.RUN_NOT_FOUND,
+                        "no job_runs row for this run_id",
+                    )
+                row = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT step_id, capability_id, state, receipt "
+                                "FROM job_steps WHERE run_id = :r AND seq = :s "
+                                "FOR UPDATE"
+                            ),
+                            {"r": uuid.UUID(run_id), "s": seq},
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if row is None:
+                    raise StepsError(
+                        StepsErrorCode.STEP_STATE_GUARD,
+                        "no job_steps row for this seq",
+                    )
+                state = str(row["state"])
+                if state != StepState.OUTCOME_UNKNOWN.value:
+                    receipt: dict[str, object] = (
+                        dict(row["receipt"])
+                        if isinstance(row["receipt"], Mapping)
+                        else {}
+                    )
+                    return {"state": state, "receipt": receipt}
+                receipt = (
+                    dict(row["receipt"])
+                    if isinstance(row["receipt"], Mapping)
+                    else {}
+                )
+                receipt["reason"] = EXECUTION_TIMEOUT_REASON
+                receipt["resolution"] = "timeout"
+                updated = await session.execute(
+                    text(
+                        "UPDATE job_steps SET state = :target, receipt = :receipt "
+                        "WHERE run_id = :run AND seq = :seq AND state = :expected "
+                        "RETURNING step_id"
+                    ),
+                    {
+                        "target": StepState.FAILED.value,
+                        "receipt": json.dumps(receipt),
+                        "run": uuid.UUID(run_id),
+                        "seq": seq,
+                        "expected": StepState.OUTCOME_UNKNOWN.value,
+                    },
+                )
+                step_id = updated.scalar()
+                if step_id is None:
+                    raise StepsError(
+                        StepsErrorCode.STEP_STATE_GUARD,
+                        "step row is not in the expected pre-transition state",
+                    )
+                event_data: dict[str, object] = {
+                    "step_id": str(step_id),
+                    "seq": seq,
+                    "capability_id": str(row["capability_id"]),
+                    "reason": EXECUTION_TIMEOUT_REASON,
+                }
+                if isinstance(receipt.get("op_id"), str) and receipt["op_id"]:
+                    event_data["op_id"] = receipt["op_id"]
+                await _astep_completed_event(session, run_id, event_data)
+        return {"state": StepState.FAILED.value, "receipt": receipt}
 
     # -- run-state observation (delegated to the reviewed machinery) ------
 
@@ -1541,28 +1735,21 @@ class AgentRunExecutor:
                         receipt["approval_id"] = str(created_approval.approval_id)
                 except Exception:
                     pass
+        # The shared output-safety projection (C2 / S1): redact resolved
+        # values AND secret-shaped tokens BEFORE any size bound, traverse
+        # nested / JSON-encoded payloads, bound the receipt copy last.
+        resolved_values = _resolved_credential_values(
+            self._steps, outcome.credential_references
+        )
         if outcome.output is not None and outcome.output.text:
-            resolved_values = _resolved_credential_values(
-                self._steps, outcome.credential_references
+            receipt["response"] = project_document(
+                outcome.output.text, resolved_values
             )
-            try:
-                parsed_output = json.loads(outcome.output.text)
-                receipt["response"] = (
-                    _scrub_secret_document(parsed_output, resolved_values)
-                    if len(outcome.output.text) <= 32768
-                    else outcome.output.text[:32768] + "… [truncated]"
-                )
-            except Exception:
-                receipt["response"] = _scrub_secret_text(
-                    outcome.output.text[:32768], resolved_values
-                )
         if isinstance(payload, Mapping):
             receipt["params"] = _scrubbed_step_params(
                 str(capability_id),
                 dict(payload),
-                _resolved_credential_values(
-                    self._steps, outcome.credential_references
-                ),
+                resolved_values,
             )
         step_state = StepState(state_value)
         await self._steps.apersist_outcome(
@@ -1582,7 +1769,11 @@ class AgentRunExecutor:
             payload_hash=outcome.payload_hash,
             effect=outcome.effect,
             policy_revision=outcome.policy_revision,
-            output_text=None if outcome.output is None else outcome.output.text,
+            output_text=(
+                None
+                if outcome.output is None
+                else project_text(outcome.output.text, resolved_values)
+            ),
             output_truncated=(
                 None if outcome.output is None else outcome.output.truncated
             ),
@@ -1932,6 +2123,23 @@ def _agent_wait_resumed(payload_json: str, from_state: str) -> str:
     return executor.run(executor.await_wait_resumed(intent, from_state))
 
 
+@DBOS.step(name="agents.reconcile_expired")
+def _agent_reconcile_expired(payload_json: str, call_json: str) -> str:
+    """Expire one unknown-effect step at the deadline (checkpointed).
+
+    ONE checkpointed step ⇒ the guarded transition + the timeout event
+    commit at most once per attempt (a recovered attempt replays the
+    checkpoint instead of re-appending). Persistence failures propagate:
+    the run fails loudly instead of claiming a recorded event.
+    """
+    intent = parse_agent_run_intent(payload_json)
+    call = json.loads(call_json)
+    executor = _resolve_agent_run()
+    return canonical_json(
+        executor.run(executor.aexpire_unknown_step(intent.run_id, int(call["seq"])))
+    )
+
+
 @DBOS.step(name="agents.run_finished")
 def _agent_run_finished(payload_json: str, summary_json: str) -> str:
     """Record ``running → succeeded`` after the conversation (observe)."""
@@ -2156,58 +2364,35 @@ def _settle_unknown(
         remaining = (deadline - _utcnow()).total_seconds()
         if remaining <= 0:
             _agent_wait_resumed(payload_json, RunState.RECONCILING.value)
-            executor = _resolve_agent_run()
-            receipt = row["receipt"] if row and isinstance(row["receipt"], Mapping) else {}
-            receipt_patch = dict(receipt)
-            receipt_patch["reason"] = EXECUTION_TIMEOUT_REASON
-            receipt_patch["resolution"] = "timeout"
-            async def _persist_timeout() -> None:
-                async with executor._sessions() as session:
-                    async with session.begin():
-                        await session.execute(
-                            text(
-                                "UPDATE job_steps SET state = :target, receipt = :receipt "
-                                "WHERE run_id = :run AND seq = :seq AND state = :expected"
-                            ),
-                            {
-                                "target": StepState.FAILED.value,
-                                "receipt": json.dumps(receipt_patch),
-                                "run": uuid.UUID(intent.run_id),
-                                "seq": int(call["seq"]),
-                                "expected": StepState.OUTCOME_UNKNOWN.value,
-                            },
-                        )
-                        await session.execute(
-                            text(
-                                "INSERT INTO job_events (run_id, seq, kind, payload) "
-                                "VALUES (:run, (SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :run), :kind, :payload)"
-                            ),
-                            {
-                                "run": uuid.UUID(intent.run_id),
-                                "kind": "step.completed",
-                                "payload": json.dumps(
-                                    {
-                                        "capability_id": str(call.get("capability_id", "unknown")),
-                                        "reason": EXECUTION_TIMEOUT_REASON,
-                                        "op_id": receipt.get("op_id"),
-                                    }
-                                ),
-                            },
-                        )
-            try:
-                executor.run(_persist_timeout())
-            except Exception:
-                pass
+            settled = json.loads(_agent_reconcile_expired(payload_json, call_json))
+            row_state = str(settled.get("state"))
+            receipt = (
+                settled["receipt"]
+                if isinstance(settled.get("receipt"), Mapping)
+                else {}
+            )
+            if row_state != StepState.FAILED.value:
+                # A reconciler resolution landed before the expiry could:
+                # the durable truth decides, exactly like a mid-wait
+                # resolution (never the timeout, never a re-dispatch).
+                if row_state == StepState.CANCELLED.value:
+                    _record_quietly(intent, "cancel")
+                    raise AgentRunFailed("step_cancelled")
+                return {
+                    "seq": int(call["seq"]),
+                    "state": row_state,
+                    "reason": receipt.get("reason"),
+                    "op_id": receipt.get("op_id"),
+                    "result_text": _receipt_result_document(
+                        intent, row_state, receipt, resolved=True
+                    ),
+                }
             return {
                 "seq": int(call["seq"]),
                 "state": StepState.FAILED.value,
                 "reason": EXECUTION_TIMEOUT_REASON,
                 "op_id": receipt.get("op_id"),
-                "result_text": (
-                    "The command exceeded the maximum reconciliation window "
-                    "and was terminated. Break the task into smaller chunks "
-                    "or optimize the command."
-                ),
+                "result_text": _timeout_result_document(intent, receipt),
             }
         DBOS.recv(
             topic=RESUME_TOPIC,

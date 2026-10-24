@@ -278,6 +278,41 @@ class TestDurableSeams:
         assert history[1].parts[0].content == "TASK"  # type: ignore[attr-defined]
 
 
+class TestTimeoutResultDocument:
+    """The deadline ToolResult: honest unknown-effect, never termination."""
+
+    def test_timeout_document_is_honest_unknown_effect(self) -> None:
+        run_id = str(uuid.uuid4())
+        intent = agent_run.parse_agent_run_intent(_canonical(_intent_document(run_id)))
+        receipt: dict[str, object] = {
+            "v": 1,
+            "op_id": "op-1",
+            "capability_id": "fixture.read",
+            "allowed": True,
+            "reason": "status_unresolved",
+            "effect": "executed",
+            "payload_hash": "deadbeef",
+        }
+        document = json.loads(agent_run._timeout_result_document(intent, receipt))
+        assert document["status"] == "unknown_effect"
+        assert document["reason"] == "execution_timeout_exceeded"
+        assert document["allowed"] is False
+        assert document["executor_ok"] is None
+        assert document["effect"] == "executed"
+        assert document["payload_hash"] == "deadbeef"
+        assert document["capability_id"] == "fixture.read"
+        assert document["run_id"] == run_id
+
+    def test_timeout_document_defaults_to_unknown_effect_class(self) -> None:
+        run_id = str(uuid.uuid4())
+        intent = agent_run.parse_agent_run_intent(_canonical(_intent_document(run_id)))
+        document = json.loads(agent_run._timeout_result_document(intent, {}))
+        assert document["status"] == "unknown_effect"
+        assert document["effect"] == "unknown"
+        assert document["payload_hash"] == "non_canonical"
+        assert document["capability_id"] == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # composition wiring (no database dialed)
 # ---------------------------------------------------------------------------
@@ -2134,14 +2169,27 @@ class TestDurableAgentRuns:
         assert row is not None and row["state"] == "succeeded"
         assert _run(_run_states(factory, run_id)) == ("queued", "running", "succeeded")
 
-    def test_reconcile_deadline_expiry_fails_run_honestly(
+    def test_reconcile_deadline_expiry_records_honest_timeout(
         self, agent_url, factory, insert_run, scenario, composition
     ) -> None:
-        """AC2: an unresolved uncertain effect never becomes a success."""
+        """AC (03-recovery): the deadline expiry stays honest end-to-end.
+
+        When the reconciliation wait budget expires on an unresolved
+        uncertain effect, the checkpointed expiry step closes the step
+        ``outcome_unknown → failed`` ATOMICALLY with the schema-valid
+        ``step.completed`` timeout event (real PostgreSQL accepts the
+        frozen envelope — no ``kind``/``payload`` columns, no swallow),
+        the receipt records ``execution_timeout_exceeded`` +
+        ``resolution=timeout`` (a wait-budget expiry, never a termination
+        claim — no fabricated host verdict), the model receives the
+        honest ``unknown_effect`` ToolResult, and the effect is never
+        re-dispatched (the conversation resumes from the checkpoint; the
+        run finishes without a second attempt).
+        """
         composition()
         _write_policy_files(scenario, grants=[{READ_CAP: True}])
         _behavior(scenario, {READ_CAP: "unknown_status"})
-        _script(scenario, [_tool_call_entry(), {"text": "unreachable"}])
+        _script(scenario, [_tool_call_entry(), {"text": "done"}])
         run_id = str(uuid.uuid4())
         document = _intent_document(
             run_id,
@@ -2156,28 +2204,69 @@ class TestDurableAgentRuns:
             worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
             _run(_enqueue_run(client, insert_run, run_id, document))
             _wait_until(
-                lambda: (_terminal_engine_state(client, run_id) or "") == "failed",
+                lambda: (_terminal_engine_state(client, run_id) or "")
+                in {"succeeded", "failed", "error"},
                 RUN_TIMEOUT,
-                "deadline failure",
+                "run completion after the deadline expiry",
             )
         finally:
             if worker is not None:
                 _stop(worker)
             client.close()
 
+        # The conversation CONTINUES past the honest timeout (the model
+        # is told the truth and finishes); the engine lands terminal.
+        assert (_terminal_engine_state(client, run_id) or "") == "succeeded"
+        # The step closed with the timeout receipt — never fabricated
+        # host truth (no exit_code/response), never a success claim.
         row = _read_step_row(agent_url, run_id, 1)
-        assert row is not None and row["state"] == "outcome_unknown"
+        assert row is not None and row["state"] == "failed"
+        receipt = row["receipt"]
+        assert receipt["reason"] == "execution_timeout_exceeded"
+        # A WAIT-BUDGET expiry — the only resolution marker is
+        # ``timeout``; no host verdict was fabricated by the expiry
+        # (the attempt's own recorded exit_code stays the attempt's).
+        assert receipt["resolution"] == "timeout"
+        assert receipt["exit_code"] is None
+        # The persisted timeout event: schema-valid frozen envelope
+        # (parse_job_event validates type/v/data exactly once, with the
+        # guarded closure's identity), and the whole stream keeps its
+        # monotonic per-run cursor with no gaps or duplicates.
         events = _read_events(agent_url, run_id)
+        assert [event.seq for event in events] == list(
+            range(1, len(events) + 1)
+        )
+        timeouts = [
+            event
+            for event in events
+            if event.type == "step.completed"
+            and event.data.get("reason") == "execution_timeout_exceeded"
+        ]
+        assert len(timeouts) == 1
+        assert timeouts[0].v == 1
+        assert timeouts[0].data["capability_id"] == READ_CAP
+        assert timeouts[0].data["seq"] == 1
+        assert isinstance(timeouts[0].data["step_id"], str)
+        # The park/resume narrative stays exactly once.
         awaiting = [
             event for event in events if event.type == "agent.awaiting_reconciliation"
         ]
         assert len(awaiting) == 1
         deadline = datetime.fromisoformat(awaiting[0].data["deadline"])
         assert deadline.tzinfo is not None
+        # Honest model-facing outcome + exactly-once effect: the fake
+        # model journaled the UNKNOWN_EFFECT ToolResult (never an
+        # unparsable prose claim of termination), and the uncertain
+        # effect ran exactly once — never re-dispatched after expiry.
+        lines = _journal_lines(scenario)
+        assert "tool_return:unknown_effect" in lines
+        assert "tool_return:unparsable" not in lines
+        assert _journal_count(scenario, "begin:fixture.read:m1") == 1
+        assert _journal_count(scenario, "effect:fixture.read:m1") == 1
         assert _run(_run_states(factory, run_id)) == (
             "queued",
             "running",
             "reconciling",
             "running",
-            "failed",
+            "succeeded",
         )

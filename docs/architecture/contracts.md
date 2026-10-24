@@ -539,3 +539,45 @@ documentation-only per test policy. Author checks: input read receipts, cross-re
 integrity, scenario-coverage completeness, crash-window/cross-server/approval tabletop
 (`01`–`03` files in the evidence directory). Independent acceptance happens at the P00
 phase gate.
+
+## Addendum — conversation and task continuity (act campaign, 2026-10-24)
+
+Narrow, explicitly approved addendum (campaign `agent-continuity`,
+card `01-contracts`); C01–C11 above remain unchanged and binding, and nothing
+here alters grants, approval checks or the frozen DBOS run lifecycle.
+
+1. **Identity resolution.** `conversation_id` (stable UUID per chat, server-
+   and principal-pinned, independent of its last run), `message_id` (UUID +
+   conversation-local monotonic sequence), `task_id` (stable goal-episode
+   UUID, V1 one active task per conversation) and `revision` (optimistic CAS
+   token for task/plan changes) join the C01 identity set. `run_id` stays
+   exactly the C05 durable engine attempt: DBOS checkpoints own model/tool
+   history; app-owned tables own user-visible domain state. One writer lease
+   per conversation; stale writes surface the structured conflict codes,
+   never last-writer-wins.
+2. **C05 task-body privacy.** Raw-secret exclusion happens before persistence
+   or model forwarding (credential references only, C03 rule 6). Durable
+   conversation/task bodies are bounded, sanitized, provenance-carrying and
+   may be stored out-of-band behind safe `content_ref`s with explicit
+   redaction markers (no textual-fidelity claim for redacted content).
+   Run-scoped telemetry keeps only content IDs/revisions/safe references;
+   transcript content is never copied into generic job/event payloads.
+   Retention/deletion follows the existing authorized data policy; no claim
+   that deleting a chat erases engine audit or backups.
+3. **Structured intake authority boundary.** The checkpointed
+   `TurnInterpretation` intake union (`answer | clarify | plan |
+   continue_task | new_task | blocked`) contains NO writable `approved`,
+   `grants`, `execute_now` or `bypass_approval` fields and no credential
+   values — `extra="forbid"` rejects them at every nesting level. Phase
+   (`plan|inspect|act`) remains advisory; execution stays subject to existing
+   grants and the C03 approval checks. Model-origin proposals can never
+   supersede USER-origin constraints.
+4. **Ownership.** The vocabulary below lives in
+   `backend/src/mai/contracts/conversations.py` and
+   `backend/src/mai/contracts/tasks.py` with the full resolution (submission
+   dispositions, steering/pause/cancel, completion verdicts, pagination
+   50/200, legacy `history_completeness` handling and the stable error-code
+   registry) documented in
+   `docs/architecture/agent-task-continuity.md`. Route writes stay with the
+   named producer cards (05/07/08); migrations with 04/11; no sibling
+   redefines these names (act_CONTRACTS §11).
