@@ -29,9 +29,41 @@
  */
 
 import type { components } from '../../api/schema.generated.js';
-import type { SubscribeEventsOptions } from '../../api/client.js';
+import type {
+	CanonicalConversationDetail,
+	CanonicalConversationPage,
+	CanonicalConversationTurn,
+	CanonicalEventsPage,
+	CanonicalTurnSubmitted,
+	CanonicalTranscriptPage,
+	ConversationEventsQuery,
+	ConversationSteerRequest,
+	ConversationSteerView,
+	SubscribeEventsOptions
+} from '../../api/client.js';
 import { subscribeEvents } from '../../api/client.js';
 import type { PanelEntryInput } from '../registry.js';
+
+/**
+ * Canonical conversation wire shapes (§3; 09-client-continuity) — the exact
+ * generated-schema types the client transports, re-exported here so the
+ * panel-facing service vocabulary stays single-sourced.
+ */
+export type {
+	CanonicalConversationDetail,
+	CanonicalConversationPage,
+	CanonicalConversationSummary,
+	CanonicalConversationTurn,
+	CanonicalConversationEvent,
+	CanonicalEventsPage,
+	CanonicalTranscriptMessage,
+	CanonicalTranscriptPage,
+	CanonicalTurnSubmitted,
+	ConversationEventsQuery,
+	ConversationSteerRequest,
+	ConversationSteerView,
+	TurnDisposition
+} from '../../api/client.js';
 
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
 export const CHAT_PANEL_KIND = 'chat';
@@ -115,6 +147,65 @@ export interface ChatApi {
 	renameConversation?(runId: string, payload: ChatRenameBody): Promise<ConversationView>;
 	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
 	cancelConversation(runId: string, payload: ChatCancelBody): Promise<CancelView>;
+
+	// --- Canonical conversation surface (§3; 09-client-continuity) -----------
+	// Optional slice: the real composed client provides every method; the
+	// offline in-memory dock fixture (and any pre-canon host) omits them and
+	// the panel fails closed on absence, exactly like `renameConversation?`.
+	// Every collection read is explicitly server-scoped and bounded (C01
+	// rules 2/5; AGENTS.md §1); submission idempotency keys are client-minted.
+	/**
+	 * GET /api/v1/chat/conversations?server_id=… — bounded page of safe
+	 * canonical metadata; no transcript content ever rides a list page.
+	 */
+	listCanonicalConversations?(
+		serverId: string,
+		page?: PageQuery
+	): Promise<CanonicalConversationPage>;
+	/** GET /api/v1/chat/conversations/{id}?server_id=… — header + gap honesty. */
+	getConversation?(conversationId: string, serverId: string): Promise<CanonicalConversationDetail>;
+	/**
+	 * GET /api/v1/chat/conversations/{id}/messages?server_id=… — role-preserving
+	 * sanitized transcript page ordered `(sequence, message_id)`, same-filter total.
+	 */
+	listConversationMessages?(
+		conversationId: string,
+		serverId: string,
+		page?: PageQuery
+	): Promise<CanonicalTranscriptPage>;
+	/**
+	 * GET /api/v1/chat/conversations/{id}/events?server_id=&after_seq=&limit= —
+	 * cursor-exclusive metadata events; `afterSeq` is the dedup cursor, so a
+	 * reconnect replays strictly newer events without gaps or duplicates.
+	 */
+	listConversationEvents?(
+		conversationId: string,
+		serverId: string,
+		query?: ConversationEventsQuery
+	): Promise<CanonicalEventsPage>;
+	/**
+	 * POST /api/v1/chat/conversations — create + first turn (idempotent on
+	 * `client_request_id`: 201 created / 200 deduplicated; 202 queued_followup
+	 * arrives only on the follow-up route).
+	 */
+	createConversation?(payload: CanonicalConversationTurn): Promise<CanonicalTurnSubmitted>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/messages — one follow-up turn
+	 * (201 created / 200 deduplicated / 202 queued_followup under an active
+	 * writer lease; stale `expected_revision` fails closed with a structured 409).
+	 */
+	submitConversationMessage?(
+		conversationId: string,
+		payload: CanonicalConversationTurn
+	): Promise<CanonicalTurnSubmitted>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/steer — deterministic steering/
+	 * control row, recorded durably before the caller is told anything.
+	 */
+	steerConversation?(
+		conversationId: string,
+		payload: ConversationSteerRequest
+	): Promise<ConversationSteerView>;
 	/**
 	 * GET /api/v1/chat/runs/{run_id}/events — authenticated, origin-checked
 	 * SSE subscription with `Last-Event-ID` replay (C08 rule 7). Resolves

@@ -46,7 +46,8 @@ export const DOCS_PANEL_KIND = 'documents';
 /** Generated wire shape: one canonical collection (`docs`/`runbooks`). */
 export type DocNamespace = components['schemas']['DocumentNamespace'];
 /** Generated wire shape: one C07 rule 5 verification vocabulary value. */
-export type VerificationStatus = components['schemas']['VerificationStatus'];
+export type VerificationStatus =
+    components['schemas']['mai__knowledge__documents__VerificationStatus'];
 /** Generated wire shape: one scope's reindex-reconcile request. */
 export type ReconcileBody = components['schemas']['ReconcileBody'];
 /** Generated wire shape: one revision-checked full-content edit. */

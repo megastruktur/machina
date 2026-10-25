@@ -3,7 +3,14 @@
 Card ``06-tool-bridge`` against contracts.md **C06 rule 4** ("the
 agent-to-tool bridge passes the ``ExecutionContext`` through the same
 dispatcher used by deterministic UI/job calls"; "PydanticAI deferred
-tools are not an authorization boundary") and **C03 rules 2–7**.
+tools are not an authorization boundary") and **C03 rules 2–7**;
+card ``19-tool-results`` adds the compact model-facing projection
+(:func:`project_tool_result`) that separates the three layers a tool
+answer must not conflate — wrapper execution (:class:`~mai.contracts.
+tasks.ExecutionStatus`), domain outcome (:class:`~mai.contracts.tasks.
+DomainOutcome`) and effect certainty (:class:`~mai.contracts.tasks.
+EffectCertainty`) — while every collection it carries stays paginated
+and every string stays inside the dispatcher's redaction boundary.
 
 What this module is
 -------------------
@@ -79,6 +86,7 @@ from typing import Any
 
 from pydantic_ai.tools import Tool
 
+from mai.agents.output_safety import bound_text, redact_text
 from mai.capabilities.dispatch import (
     EFFECT_EXECUTED,
     EFFECT_UNKNOWN,
@@ -86,6 +94,16 @@ from mai.capabilities.dispatch import (
     DispatchError,
     DispatchOutcome,
     canonical_payload_hash,
+)
+from mai.contracts.tasks import (
+    MAX_EVIDENCE_REFS,
+    RESULT_DATA_MAX_ENTRIES,
+    RESULT_DATA_VALUE_MAX_CHARS,
+    SECRET_DATA_KEYS,
+    DomainOutcome,
+    EffectCertainty,
+    EvidenceKind,
+    ExecutionStatus,
 )
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
@@ -95,14 +113,52 @@ __all__ = [
     "BridgeErrorCode",
     "CapabilityToolBridge",
     "MAX_TOOL_NAME_CHARS",
+    "TOOL_RESULT_PROJECTION_SCHEMA_VERSION",
     "TOOL_RESULT_SCHEMA_VERSION",
     "ToolResult",
     "ToolStatus",
+    "project_tool_result",
     "tool_name_for",
 ]
 
 #: Version of the frozen :class:`ToolResult` JSON document shape.
-TOOL_RESULT_SCHEMA_VERSION = 1
+#:
+#: ``2`` — act ``19-tool-results``: the document gained one additive key,
+#: ``projection`` (the compact execution/domain/certainty block built by
+#: :func:`project_tool_result`). Every version-1 key keeps its position,
+#: name, type and semantics, so version-1 consumers stay compatible; the
+#: bump marks the extension, it does not rename or re-order anything.
+TOOL_RESULT_SCHEMA_VERSION = 2
+
+#: Version of the frozen :class:`ToolResult` ``projection`` block shape
+#: (act ``19-tool-results``). The projection is versioned independently so
+#: the envelope and the projection can evolve on their own clocks.
+TOOL_RESULT_PROJECTION_SCHEMA_VERSION = 1
+
+#: The approval-deferral reason the dispatcher reports when a privileged
+#: call arrives without its approval decision (mirrored verbatim from the
+#: C03 dispatch vocabulary; the run layer parks the attempt on it).
+_APPROVAL_REQUIRED_REASON = "approval_required_but_absent"
+
+#: Bounded projection slices (act_CONTRACTS §9 "safe bounded result data"
+#: + the mandatory-pagination invariant). Subchecks have no central bound
+#: of their own; the projection caps them at the evidence-ref bound.
+_MAX_SUBCHECKS = MAX_EVIDENCE_REFS
+_SUBCHECK_NAME_MAX_CHARS = 128
+_ERROR_CODE_MAX_CHARS = 64
+_ERROR_DETAIL_MAX_CHARS = 200
+_RETRY_HINT_MAX_CHARS = 200
+_RESULT_KEY_MAX_CHARS = 64
+_EVIDENCE_ID_MAX_CHARS = 64
+_EVIDENCE_NOTE_MAX_CHARS = 200
+
+#: Internal-API envelope statuses that carry semantic meaning (the
+#: ``{"status": "ok"}`` / ``{"status": "refused"|"unavailable", "code"}``
+#: convention every internal-API executor wraps its result in). A shell
+#: wrapper envelope NEVER reaches this branch — see
+#: :func:`_domain_evidence`.
+_OK_ENVELOPE_STATUS = "ok"
+_FAILURE_ENVELOPE_STATUSES = frozenset({"refused", "unavailable"})
 
 #: OpenAI-compatible function-name bound: ``^[A-Za-z0-9_-]{1,64}$``. The
 #: descriptor slug charset (``[a-z0-9._-]``) is not wire-safe (dots), so
@@ -204,6 +260,15 @@ class ToolResult:
     material (capability, target, run, payload hash, policy revision)
     for the jobs facade to persist a ``waiting_approval`` deferral and
     for the resume path to bind the human decision (C03 rule 4).
+
+    The serialized document (:meth:`to_json_str`) carries every
+    version-1 key unchanged plus one additive ``projection`` key: the
+    compact execution/domain/certainty block built by
+    :func:`project_tool_result` (act ``19-tool-results``; act_CONTRACTS
+    §9). The derivation reads only the fields already on the result, so
+    every construction path — the bridge's ``from_outcome``, pre-dispatch
+    ``rejected`` and the run layer's direct replay documents — projects
+    identically and deterministically.
     """
 
     schema_version: int
@@ -334,6 +399,7 @@ class ToolResult:
                 "error": None
                 if self.error_code is None
                 else {"code": self.error_code, "detail": self.error_detail},
+                "projection": project_tool_result(self),
             },
             ensure_ascii=True,
             allow_nan=False,
@@ -344,6 +410,429 @@ class ToolResult:
             f"<ToolResult {self.capability_id} {self.status.value} "
             f"reason={self.reason}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# Compact model-facing projection (act 19-tool-results; act_CONTRACTS §9)
+# ---------------------------------------------------------------------------
+
+
+def _safe_slice(text: str, limit: int) -> str:
+    """Redact, then bound, one extracted projection string.
+
+    Extracted fields are substrings of the dispatcher-redacted output,
+    so this is defense-in-depth (the model-facing bridge path runs only
+    the dispatcher's value-redaction; the pattern layer here also covers
+    that path). The order is the output-safety invariant: redaction
+    FIRST, the explicit bound AFTER — a cut can never split or expose a
+    secret redaction already replaced.
+    """
+    return bound_text(redact_text(text), limit)
+
+
+def _parsed_output_document(result: ToolResult) -> dict[str, object] | None:
+    """The executor envelope, when the bounded output parses as a JSON
+    object.
+
+    The dispatcher redacted and bounded the text before this module ever
+    saw it (C03 rule 6, C06 rule 3), so every string inside the parsed
+    document is already redaction-safe. Non-JSON output (arbitrary shell
+    text, prose) yields ``None`` — there is no structured evidence to
+    read, and none is invented.
+    """
+    text = result.output_text
+    if not text or len(text) > 262144:
+        return None
+    stripped = text.lstrip()
+    if stripped[:1] != "{":
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _is_shell_envelope(document: Mapping[str, object]) -> bool:
+    """Whether the envelope is a command-wrapper receipt (host.shell and
+    siblings: ``exit_code``/``stdout`` present).
+
+    A wrapper's own ``status``/``exit_code`` prove only that the command
+    ran — never what it semantically did (E3: "wrapper exits zero" is not
+    domain evidence). Explicit structured domain markers (``subchecks``,
+    ``domain_outcome``) still win over this rule; the wrapper ``status``
+    key alone never does.
+    """
+    return "exit_code" in document or "stdout" in document
+
+
+def _subcheck_page(
+    document: Mapping[str, object],
+) -> tuple[list[dict[str, object]], int, bool, bool]:
+    """Validate the subcheck section; return the bounded slice.
+
+    ``(page, total, well_formed, any_failed)``. A subcheck entry MUST be
+    an object with a non-empty string ``name`` and a boolean ``passed`` —
+    any other shape anywhere in the section makes the whole section
+    untrustworthy (``well_formed=False``), and untrustworthy structured
+    evidence must never fall through to a weaker promotion rule. The
+    slice is deterministic: declaration order, first
+    :data:`_MAX_SUBCHECKS` well-formed entries; ``any_failed`` is
+    evaluated over the FULL section, not just the slice.
+    """
+    raw = document.get("subchecks")
+    if raw is None:
+        return [], 0, True, False
+    if not isinstance(raw, list):
+        return [], 0, False, False
+    page: list[dict[str, object]] = []
+    any_failed = False
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            return [], len(raw), False, False
+        name = entry.get("name")
+        passed = entry.get("passed")
+        if not isinstance(name, str) or not name.strip():
+            return [], len(raw), False, False
+        if not isinstance(passed, bool):
+            return [], len(raw), False, False
+        if passed is False:
+            any_failed = True
+        if len(page) < _MAX_SUBCHECKS:
+            page.append(
+                {"name": _safe_slice(name, _SUBCHECK_NAME_MAX_CHARS), "passed": passed}
+            )
+    return page, len(raw), True, any_failed
+
+
+def _page_meta(total: int, limit: int) -> dict[str, object]:
+    """Pagination metadata for one sliced collection (mandatory
+    pagination invariant): the pre-slice total rides beside the slice."""
+    return {
+        "limit": limit,
+        "offset": 0,
+        "total": total,
+        "has_more": total > limit,
+    }
+
+
+def _domain_evidence(
+    document: Mapping[str, object] | None,
+) -> tuple[DomainOutcome, bool]:
+    """Derive ``(domain_outcome, fail_closed)`` from the executor envelope.
+
+    Deterministic precedence, documented so consumers can audit it:
+
+    1. Explicit structured domain markers win: ``subchecks`` (structured
+       tools report meaningful subchecks explicitly, §9) and a
+       ``domain_outcome`` marker in the frozen vocabulary. Any explicit
+       negative evidence (a failed subcheck, an explicit failure) pins
+       the outcome to ``failure`` — a wrapper exit code can never promote
+       it away.
+       A ``subchecks``/``domain_outcome`` key that is PRESENT but
+       malformed (wrong shape, out-of-vocabulary value) is fail-closed:
+       the outcome stays ``unknown`` even if a weaker rule (envelope
+       ``status``) would have said ``ok`` — broken evidence never
+       promotes.
+    2. A shell wrapper envelope (``exit_code``/``stdout`` keys) has NO
+       semantic evidence: ``unknown``, whatever its ``status`` claims.
+    3. Otherwise the internal-API envelope convention decides:
+       ``status == "ok"`` → ``success``; ``"refused"``/``"unavailable"``
+       → ``failure``; anything else → ``unknown``.
+    4. No parseable envelope at all → ``unknown`` (arbitrary shell work,
+       plain text — no regex oracle is built here, §9).
+    """
+    if document is None:
+        return DomainOutcome.UNKNOWN, False
+    negative = False
+    positive = False
+    fail_closed = False
+
+    _page, total, well_formed, any_failed = _subcheck_page(document)
+    if "subchecks" in document:
+        if not well_formed or total == 0:
+            fail_closed = True
+        elif any_failed:
+            negative = True
+        else:
+            positive = True
+
+    marker = document.get("domain_outcome")
+    if marker is not None:
+        try:
+            outcome = DomainOutcome(marker)
+        except ValueError:
+            fail_closed = True
+        else:
+            if outcome is DomainOutcome.FAILURE:
+                negative = True
+            elif outcome is DomainOutcome.SUCCESS:
+                positive = True
+
+    if fail_closed:
+        return DomainOutcome.UNKNOWN, True
+    if negative:
+        return DomainOutcome.FAILURE, False
+    if positive:
+        return DomainOutcome.SUCCESS, False
+    if _is_shell_envelope(document):
+        return DomainOutcome.UNKNOWN, False
+    status = document.get("status")
+    if status == _OK_ENVELOPE_STATUS:
+        return DomainOutcome.SUCCESS, False
+    if isinstance(status, str) and status in _FAILURE_ENVELOPE_STATUSES:
+        return DomainOutcome.FAILURE, False
+    return DomainOutcome.UNKNOWN, False
+
+
+def _execution_status(result: ToolResult) -> ExecutionStatus:
+    """The technical wrapper execution status (§9 ``execution_status``).
+
+    Separate layer from the domain outcome: the dispatcher's honest
+    lifecycle maps onto the frozen C04 subset. A denied/approval-required
+    attempt closed without running (nothing to verify); an executed call
+    with ``executor_ok=False`` is a technical failure (the executor
+    answered, negatively); an unproven effect stays ``outcome_unknown``.
+    ``cancelled`` is unreachable from the bridge vocabulary (no
+    cancellation concept exists at this seam) and is therefore never
+    claimed.
+    """
+    if result.status is ToolStatus.EXECUTED:
+        if result.executor_ok is False:
+            return ExecutionStatus.FAILED
+        return ExecutionStatus.SUCCEEDED
+    if result.status is ToolStatus.UNKNOWN_EFFECT:
+        return ExecutionStatus.OUTCOME_UNKNOWN
+    if (
+        result.status is ToolStatus.APPROVAL_REQUIRED
+        or result.reason == _APPROVAL_REQUIRED_REASON
+    ):
+        return ExecutionStatus.OUTCOME_UNKNOWN
+    return ExecutionStatus.FAILED
+
+
+def _effect_certainty(
+    result: ToolResult, domain: DomainOutcome, fail_closed: bool
+) -> EffectCertainty:
+    """How certain the effect evidence is (§9 ``effect_certainty``).
+
+    ``certain`` is reserved for one combination: the effect is proven
+    executed AND explicit consistent structured evidence reports success.
+    Everything else degrades honestly — negative evidence (a failed
+    subcheck, a refused envelope) keeps ``uncertain`` so downstream
+    reconciliation re-checks instead of trusting the projection (AC1:
+    a failed subcheck is never promoted to certain success), and any
+    unproven effect (denied, approval-pending, unknown) keeps ``unknown``
+    — no effect evidence exists at all.
+    """
+    if result.status is not ToolStatus.EXECUTED:
+        return EffectCertainty.UNKNOWN
+    if fail_closed:
+        return EffectCertainty.UNCERTAIN
+    if domain is DomainOutcome.SUCCESS:
+        return EffectCertainty.CERTAIN
+    return EffectCertainty.UNCERTAIN
+
+
+def _retry_hint(
+    result: ToolResult, execution: ExecutionStatus, domain: DomainOutcome
+) -> str:
+    """Fixed, value-free advice (§9: advice only; policy decides)."""
+    if (
+        result.status is ToolStatus.APPROVAL_REQUIRED
+        or result.reason == _APPROVAL_REQUIRED_REASON
+    ):
+        return (
+            "No effect ran; obtain an explicit approval decision and "
+            "resume once through the durable approval path."
+        )
+    if result.status is ToolStatus.UNKNOWN_EFFECT:
+        return (
+            "Neither success nor failure is proven; reconcile the unknown "
+            "effect before any retry."
+        )
+    if result.status is ToolStatus.DENIED:
+        return (
+            "Do not retry identically; reconcile the stable reason and "
+            "error code first."
+        )
+    if execution is ExecutionStatus.FAILED or domain is DomainOutcome.FAILURE:
+        return (
+            "The structured result reports failure; inspect error_code and "
+            "result_data before any retry."
+        )
+    if domain is DomainOutcome.UNKNOWN:
+        return (
+            "The effect ran but the domain outcome is unproven; verify with "
+            "a structured check before treating it as done."
+        )
+    return "Success is proven by the structured result; no retry needed."
+
+
+def _error_code(
+    result: ToolResult, document: Mapping[str, object] | None
+) -> str | None:
+    """The stable machine-readable error code, when one exists.
+
+    Bridge/dispatcher rejections carry it on the result; executor
+    envelopes carry it as the structured ``code`` field. Never an
+    exception message, never payload material.
+    """
+    if result.error_code is not None:
+        return _safe_slice(result.error_code, _ERROR_CODE_MAX_CHARS)
+    if document is not None:
+        code = document.get("code")
+        if isinstance(code, str) and code:
+            return _safe_slice(code, _ERROR_CODE_MAX_CHARS)
+    return None
+
+
+def _error_detail(
+    result: ToolResult, document: Mapping[str, object] | None
+) -> str | None:
+    """The bounded safe error detail: a stable bridge/violation string or
+    the executor envelope's ``message`` — both value-free by contract,
+    both substrings of already-redacted text."""
+    if result.error_detail is not None:
+        return _safe_slice(result.error_detail, _ERROR_DETAIL_MAX_CHARS)
+    if document is not None:
+        for field in ("message", "detail"):
+            value = document.get(field)
+            if isinstance(value, str) and value:
+                return _safe_slice(value, _ERROR_DETAIL_MAX_CHARS)
+    return None
+
+
+def _evidence_ref_page(
+    document: Mapping[str, object] | None,
+) -> tuple[list[dict[str, object]], int]:
+    """The bounded evidence-reference slice plus its pre-slice total.
+
+    Evidence refs survive the projection (no silent drops): every entry
+    is carried in contract shape — ``{kind, evidence_id, note?}`` for
+    object entries, ``{evidence_id}`` for bare string ids — and the
+    pagination metadata reports the full pre-slice total, so a sliced
+    page is visible as sliced, never as the whole truth.
+    """
+    if document is None:
+        return [], 0
+    raw = document.get("evidence_refs")
+    if raw is None:
+        return [], 0
+    if not isinstance(raw, list):
+        return [], 0
+    page: list[dict[str, object]] = []
+    for entry in raw[:MAX_EVIDENCE_REFS]:
+        if isinstance(entry, str):
+            if entry.strip():
+                page.append({"evidence_id": _safe_slice(entry, _EVIDENCE_ID_MAX_CHARS)})
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        evidence_id = entry.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            continue
+        ref: dict[str, object] = {
+            "evidence_id": _safe_slice(evidence_id, _EVIDENCE_ID_MAX_CHARS)
+        }
+        kind = entry.get("kind")
+        if isinstance(kind, str) and kind in {item.value for item in EvidenceKind}:
+            ref["kind"] = kind
+        note = entry.get("note")
+        if isinstance(note, str) and note.strip():
+            ref["note"] = _safe_slice(note, _EVIDENCE_NOTE_MAX_CHARS)
+        page.append(ref)
+    return page, len(raw)
+
+
+def _result_data_page(
+    document: Mapping[str, object] | None,
+) -> tuple[dict[str, str], int]:
+    """The bounded safe result-data slice plus its pre-slice total.
+
+    Credential-shaped keys are never carried (the S1 boundary — same
+    discipline as the completion verdict); every value is a bounded
+    substring of already-redacted output. Dropped keys stay visible in
+    the pagination total.
+    """
+    if document is None:
+        return {}, 0
+    raw = document.get("result_data")
+    if raw is None:
+        return {}, 0
+    if not isinstance(raw, Mapping):
+        return {}, 0
+    page: dict[str, str] = {}
+    for key, value in list(raw.items())[:RESULT_DATA_MAX_ENTRIES]:
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if key.lower() in SECRET_DATA_KEYS:
+            continue
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, (bool, int, float)) or value is None:
+            text = json.dumps(value)
+        else:
+            text = json.dumps(value, sort_keys=True, default=str)
+        page[_safe_slice(key, _RESULT_KEY_MAX_CHARS)] = _safe_slice(
+            text, RESULT_DATA_VALUE_MAX_CHARS
+        )
+    return page, len(raw)
+
+
+def project_tool_result(result: ToolResult) -> dict[str, object]:
+    """The compact model-facing projection of one tool result (§9).
+
+    Separates the three layers the model must not conflate:
+
+    - ``execution_status`` — the technical wrapper execution (frozen C04
+      subset via :class:`~mai.contracts.tasks.ExecutionStatus`);
+    - ``domain_outcome`` — what the operation semantically did
+      (:class:`~mai.contracts.tasks.DomainOutcome`); ``unknown`` is the
+      honest answer for arbitrary shell work — a wrapper exit code alone
+      NEVER produces ``success`` (E3);
+    - ``effect_certainty`` — how certain the effect evidence is
+      (:class:`~mai.contracts.tasks.EffectCertainty`); ``certain`` only
+      for a proven execution with explicit consistent structured success
+      evidence (AC1: a failed subcheck or an unknown semantic outcome is
+      never promoted to certain success).
+
+    Plus the surviving decision material: stable ``error_code``, fixed
+    value-free ``retry_hint`` advice, evidence references, subchecks and
+    bounded ``result_data`` — every extracted collection paginated
+    (``limit``/``offset``/``total``/``has_more``) so a slice is never
+    mistaken for the whole set. All strings originate in the
+    dispatcher-redacted output or in frozen vocabularies, so the
+    projection cannot leak what redaction removed.
+
+    Pure and deterministic: the same :class:`ToolResult` always projects
+    to the same document, on the live tool path and on replay alike.
+    """
+    document = _parsed_output_document(result)
+    domain, fail_closed = _domain_evidence(document)
+    execution = _execution_status(result)
+    subchecks, subchecks_total, _, _ = _subcheck_page(document or {})
+    evidence_refs, evidence_total = _evidence_ref_page(document)
+    result_data, result_data_total = _result_data_page(document)
+    return {
+        "schema_version": TOOL_RESULT_PROJECTION_SCHEMA_VERSION,
+        "execution_status": execution.value,
+        "domain_outcome": domain.value,
+        "effect_certainty": _effect_certainty(result, domain, fail_closed).value,
+        "error_code": _error_code(result, document),
+        "error_detail": _error_detail(result, document),
+        "retry_hint": _safe_slice(
+            _retry_hint(result, execution, domain), _RETRY_HINT_MAX_CHARS
+        ),
+        "evidence_refs": evidence_refs,
+        "subchecks": subchecks,
+        "result_data": result_data,
+        "pagination": {
+            "subchecks": _page_meta(subchecks_total, _MAX_SUBCHECKS),
+            "evidence_refs": _page_meta(evidence_total, MAX_EVIDENCE_REFS),
+            "result_data": _page_meta(result_data_total, RESULT_DATA_MAX_ENTRIES),
+        },
+    }
 
 
 def tool_name_for(capability_id: str) -> str:
@@ -650,17 +1139,12 @@ def _validate_payload(
     if not isinstance(schema, Mapping):
         return f"{path}: schema must be a JSON object"
     for keyword in schema:
-        if (
-            keyword not in _SUPPORTED_KEYWORDS
-            and keyword not in _ANNOTATION_KEYWORDS
-        ):
+        if keyword not in _SUPPORTED_KEYWORDS and keyword not in _ANNOTATION_KEYWORDS:
             return f"{path}: schema uses unsupported keyword {keyword!r}"
 
     expected_type = schema.get("type")
     if expected_type is not None:
-        names = (
-            expected_type if isinstance(expected_type, list) else [expected_type]
-        )
+        names = expected_type if isinstance(expected_type, list) else [expected_type]
         if not names or any(name not in _JSON_TYPES for name in names):
             return f"{path}: schema declares an unsupported type"
         if not any(_check_type(value, name) for name in names):
@@ -735,8 +1219,16 @@ def _validate_array(
     min_items = schema.get("minItems")
     max_items = schema.get("maxItems")
     for name, bound, comparison in (
-        ("minItems", min_items, len(value) < min_items if min_items is not None else False),
-        ("maxItems", max_items, len(value) > max_items if max_items is not None else False),
+        (
+            "minItems",
+            min_items,
+            len(value) < min_items if min_items is not None else False,
+        ),
+        (
+            "maxItems",
+            max_items,
+            len(value) > max_items if max_items is not None else False,
+        ),
     ):
         if bound is not None and (
             not isinstance(bound, int) or isinstance(bound, bool)

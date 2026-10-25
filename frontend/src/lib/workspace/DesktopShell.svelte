@@ -576,6 +576,16 @@
 		readRun: api.readRun,
 		readApproval: api.readApproval,
 		decideApproval: api.decideApproval,
+		// Canonical conversation surface (§3; 09-client-continuity, wired by
+		// 10-chat-continuity-ui): the panel prefers these for submit, restore,
+		// steering and gap honesty; a bag without them degrades to legacy.
+		listCanonicalConversations: api.listCanonicalConversations,
+		getConversation: api.getConversation,
+		listConversationMessages: api.listConversationMessages,
+		listConversationEvents: api.listConversationEvents,
+		createConversation: api.createConversation,
+		submitConversationMessage: api.submitConversationMessage,
+		steerConversation: api.steerConversation,
 		/** Live-transport marker read by ChatPanel.profilesLive (not on the wire). */
 		listProfiles: async () => []
 	};

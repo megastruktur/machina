@@ -80,13 +80,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Final
+from typing import Annotated, Final, Literal
 
 from dbos import error as dbos_error
 from fastapi import APIRouter, FastAPI, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.status import (
     HTTP_200_OK,
@@ -102,6 +103,15 @@ from starlette.status import (
 
 from mai.agents import delegate as agent_delegate
 from mai.agents import run as agent_run
+from mai.agents.conversation_store import (
+    aactive_run,
+    aattach_run,
+    acreate_conversation,
+    aenqueue_steering,
+    aget_conversation,
+    arelease_run,
+    asubmit_turn,
+)
 from mai.agents.budgets import (
     BUDGET_PAYLOAD_VERSION,
     MAX_ACTIVE_RUNS,
@@ -116,6 +126,7 @@ from mai.agents.context import (
     MAX_ROLE_CHARS,
     format_service_map_section,
 )
+from mai.agents.model_store import ModelStoreError
 from mai.api.auth import (
     BoundaryError,
     ErrorEnvelope,
@@ -124,6 +135,11 @@ from mai.api.auth import (
     _require_session,
 )
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
+from mai.capabilities.task_state import (
+    TASK_PROPOSE_UPDATE_CAPABILITY,
+    TASK_STATE_CAPABILITY_IDS,
+    TASK_UPDATE_ITEM_CAPABILITY,
+)
 from mai.plugins.config import PluginConfigStore, parse_plugin_config_text
 from mai.policy.config import GrantConfigStore
 from mai.api.jobs import (
@@ -154,6 +170,18 @@ from mai.applications.service_map import (
     ServiceMapStore,
 )
 from mai.auth.sessions import hash_token
+from mai.contracts.conversations import (
+    ConversationContractError,
+    ConversationErrorCode,
+    ConversationSteerRequest,
+    ConversationTurnSubmitRequest,
+    ConversationTurnSubmitResponse,
+    MessageSourceKind,
+    SteerAction,
+    TurnDisposition,
+    assert_history_available,
+    assert_writer_admission,
+)
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
     JobEvent,
@@ -161,6 +189,7 @@ from mai.contracts.jobs import (
     parse_job_event,
 )
 from mai.contracts.server import parse_server_profile_text
+from mai.contracts.tasks import TaskErrorCode
 from mai.jobs.engine import EngineError, RunIdInUseError, validate_run_id
 from mai.jobs.lifecycle import (
     RunLifecycleError,
@@ -187,6 +216,11 @@ __all__ = ["register_chat", "resolve_artifacts_root"]
 CHAT_SUBMITTED_EVENT_TYPE: Final[str] = "chat.submitted"
 CHAT_STEERED_EVENT_TYPE: Final[str] = "chat.steered"
 CHAT_RENAMED_EVENT_TYPE: Final[str] = "chat.renamed"
+#: Structured rejection when steering targets a conversation whose writer
+#: lease is free (nothing is executing). Kept local to this seam: the
+#: frozen ``ConversationErrorCode`` vocabulary has no fitting member and
+#: the contracts module is outside this card's allowlist.
+NO_ACTIVE_RUN_CODE: Final[str] = "no_active_run"
 MAX_CHAT_TITLE_CHARS: Final[int] = 120
 
 #: The General Consult sentinel server id (``uuid.UUID(int=0)``): the
@@ -199,6 +233,13 @@ GLOBAL_CONSULT_SERVER_ID: Final[str] = "00000000-0000-0000-0000-000000000000"
 #: The default conversation role (single-administrator product; C06
 #: rule 2's role line). Overridable per submit within the frozen bounds.
 DEFAULT_ROLE: Final[str] = "administrator"
+
+#: The implicit task revision while NO task episode exists yet (the
+#: ``agent_tasks`` rows are migration 0009's, owned by ``11-task-store``).
+#: Every turn response reports this revision; an ``expected_revision``
+#: CAS pin must be ``None`` or exactly this value until task episodes
+#: land — anything else fails closed with the stable ``revision_conflict``.
+INITIAL_TASK_REVISION: Final[int] = 1
 
 #: One immutable ``@service`` chip: a Service Map lookup key (matched
 #: case-insensitively against application_id/name/unit_name/
@@ -233,17 +274,21 @@ SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
 
 #: Built-in controller-side defaults of the auto-resolved chat grant
 #: set (alongside ``INTERNAL_API_CAPABILITY_IDS``): document retrieval,
-#: web research, the HTTP service probe and the host journal reader.
+#: web research, the HTTP service probe, the host journal reader and the
+#: task-state agent tools (run-identity scoped: the model can only see
+#: and update the task bound to its own conversation — §7).
 BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "docs.retrieve",
     "web.search",
     "web.read",
     "service.http",
     "host.logs",
+    *TASK_STATE_CAPABILITY_IDS,
 )
 
 #: Capabilities a read-only conversation strips even without a
-#: registry descriptor: raw shell and every internal-API mutation.
+#: registry descriptor: raw shell and every internal-API mutation plus
+#: the task mutation lane (``task.read`` is read-class and survives).
 READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
     {
         "host.shell",
@@ -254,6 +299,8 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "app.upsert_catalog_runbook",
         "app.delete_catalog_runbook",
         "secret.store",
+        TASK_PROPOSE_UPDATE_CAPABILITY,
+        TASK_UPDATE_ITEM_CAPABILITY,
     }
 )
 
@@ -438,6 +485,36 @@ class ChatCreated(BaseModel):
 
     conversation: ConversationView
     deduplicated: bool
+
+
+class ChatSteerView(BaseModel):
+    """Steer/control outcome (§3): the durable control row's identity.
+
+    ``delivery_status`` is always ``pending`` at response time: the row
+    is durable BEFORE the caller is told anything, and it is consumed
+    by the lease-holding run at its next safe effect boundary — the
+    UI displays pending/applied distinctly and never fabricates an
+    instant state.
+    """
+
+    conversation_id: uuid.UUID = Field(description="Target conversation identity")
+    steering_id: uuid.UUID = Field(
+        description="Durable steering/control row identity",
+    )
+    run_id: uuid.UUID | None = Field(
+        description="Lease-holding run the control addresses, when one exists",
+    )
+    action: SteerAction = Field(description="steer, pause or cancel")
+    client_request_id: uuid.UUID = Field(
+        description="Idempotency key deduplicating repeated control submissions",
+    )
+    disposition: TurnDisposition = Field(
+        description="created or deduplicated (same-key retransmission)",
+    )
+    delivery_status: Literal["pending"] = Field(
+        description="Always pending at response time; the active run "
+        "consumes the control at a safe effect boundary",
+    )
 
 
 class ChatPage(BaseModel):
@@ -829,6 +906,10 @@ async def _record_chat_submission(
     now: datetime,
     session_run_id: str | None = None,
     title: str | None = None,
+    conversation_id: uuid.UUID | None = None,
+    message_id: uuid.UUID | None = None,
+    requested_phase: str | None = None,
+    task_action: str | None = None,
 ) -> None:
     """Append the ``chat.submitted`` submission record (one transaction).
 
@@ -838,7 +919,11 @@ async def _record_chat_submission(
     whole-stream discipline (``MAX(seq)+1``; the storage
     ``UNIQUE (run_id, seq)`` is the backstop). ``service_tags`` (the
     immutable ``@service`` chips) are recorded on the event; readers
-    tolerate an absent key (submissions predating the field).
+    tolerate an absent key (submissions predating the field). The
+    canonical-turn seam records its identity binding alongside
+    (``conversation_id``/``message_id``) plus the advisory episode
+    fields (``requested_phase``/``task_action``) — provenance metadata
+    for the downstream intake/steering slices, never permission.
     """
     seq = (
         await session.execute(
@@ -865,6 +950,14 @@ async def _record_chat_submission(
         data["session_run_id"] = session_run_id
     if title is not None:
         data["title"] = title
+    if conversation_id is not None:
+        data["conversation_id"] = str(conversation_id)
+    if message_id is not None:
+        data["message_id"] = str(message_id)
+    if requested_phase is not None:
+        data["requested_phase"] = requested_phase
+    if task_action is not None:
+        data["task_action"] = task_action
     await session.execute(
         text(
             """
@@ -1029,6 +1122,514 @@ async def _record_chat_steered(
             "v": EVENT_PAYLOAD_VERSION,
             "data": json.dumps(data),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Modern canonical turn submission (act_CONTRACTS §3; 05-turn-submit)
+# ---------------------------------------------------------------------------
+
+
+def _conversation_lock_key(conversation_id: uuid.UUID) -> int:
+    """The per-conversation submit serialization key (C6).
+
+    A transaction-scoped Postgres advisory lock keyed by the
+    conversation's UUID serializes the whole admission window
+    (create-when-missing / dedup / writer-lease admission / intent /
+    run attachment) across concurrent submitters and processes. Distinct
+    conversations map to distinct bigint keys; the astronomically
+    unlikely birthday collision would only add spurious serialization,
+    never incorrectness.
+    """
+    return conversation_id.int & ((1 << 63) - 1)
+
+
+def _resolve_submit_profile(request: Request, profile: str | None) -> str:
+    """The run's pinned model profile name (C06 rule 1).
+
+    An explicit ``profile`` rides exactly as asked; an omitted one pins
+    the controller's stored model selection AT SUBMIT TIME, so the run
+    row and the durable intent record exactly which configuration the
+    turn admitted (an administrator edit can never move a bound run).
+    A missing store or stored selection fails closed (``503``), never a
+    guessed profile name.
+    """
+    if profile is not None:
+        return profile
+    store = getattr(request.app.state, "models", None)
+    if store is None:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "model configuration service is unavailable",
+        )
+    try:
+        return store.get_selection().profile
+    except ModelStoreError:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "no model selection stored",
+        ) from None
+
+
+def _modern_turn_document(
+    *,
+    run_id: str,
+    server_id: str,
+    context: ExecutionContext,
+    profile: str,
+    task: str,
+) -> dict[str, object]:
+    """The frozen agent-run intent document for one canonical turn.
+
+    The ONE producer's shape with the modern seam's fixed vocabulary:
+    the default role, no connection override, no delegation children and
+    no attachment enrichment are expressible here — the modern submit
+    admits exactly the §3 body. ``task`` is the PROJECTED transcript
+    content (C2 ordering: raw-secret exclusion precedes persistence and
+    model forwarding), so the durable intent can never carry a secret
+    the store itself refused.
+    """
+    return {
+        "v": agent_run.RUN_PAYLOAD_VERSION,
+        "run_id": run_id,
+        "server_id": server_id,
+        "context": context.to_json(),
+        "role": DEFAULT_ROLE,
+        "task": task,
+        "connection": None,
+        "profile": profile,
+    }
+
+
+def _modern_submission_document(
+    *,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    content_fingerprint: str,
+    profile: str,
+    requested_phase: str | None,
+    task_action: str | None,
+) -> dict[str, object]:
+    """The modern whole-submission digest input (the dedup identity).
+
+    Covers everything the turn asked for: the canonical conversation and
+    message identities, the PROJECTED content fingerprint, the pinned
+    profile and the advisory episode fields. A retransmission under the
+    same ``client_request_id`` must carry all of them identically (C4);
+    any difference fails closed as ``client_request_conflict``.
+    """
+    return {
+        "v": 1,
+        "conversation_id": str(conversation_id),
+        "message_id": str(message_id),
+        "content_fingerprint": content_fingerprint,
+        "profile": profile,
+        "requested_phase": requested_phase,
+        "task_action": task_action,
+    }
+
+
+def _not_found_conversation(request: Request) -> Response:
+    """The scope-blind 404 (C8): existence of another server's conversation
+    never leaks through the error channel."""
+    return _error(
+        request,
+        HTTP_404_NOT_FOUND,
+        ConversationErrorCode.CONVERSATION_NOT_FOUND.value,
+        "no conversation in the requesting server scope",
+    )
+
+
+def _conversation_contract_error(
+    request: Request, exc: ConversationContractError
+) -> Response:
+    """Map the store's closed rejections onto the C01 envelope.
+
+    The stable codes ride verbatim (``conversation_not_found`` → 404;
+    the 409 vocabulary ``client_request_conflict`` /
+    ``conversation_busy`` / ``history_reconstruction_incomplete``);
+    every message is value-free by contract, so nothing about another
+    scope's identities can leak through the error channel (C8).
+    """
+    fields = exc.fields
+    codes = set(fields.values())
+    if ConversationErrorCode.CONVERSATION_NOT_FOUND.value in codes:
+        return _error(
+            request,
+            HTTP_404_NOT_FOUND,
+            ConversationErrorCode.CONVERSATION_NOT_FOUND.value,
+            "no conversation in the requesting server scope",
+            fields=fields,
+        )
+    if ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value in codes:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value,
+            "idempotency key retransmitted with changed content",
+            fields=fields,
+        )
+    if ConversationErrorCode.CONVERSATION_BUSY.value in codes:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            ConversationErrorCode.CONVERSATION_BUSY.value,
+            "another writer holds the conversation lease",
+            fields=fields,
+        )
+    if ConversationErrorCode.HISTORY_RECONSTRUCTION_INCOMPLETE.value in codes:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            ConversationErrorCode.HISTORY_RECONSTRUCTION_INCOMPLETE.value,
+            "history reconstruction is incomplete; explicit user scope "
+            "confirmation is required before new mutations",
+            fields=fields,
+        )
+    return _conflict(request, "conversation contract rejected")
+
+
+def _turn_response(response: ConversationTurnSubmitResponse) -> Response:
+    """One admitted turn at its disposition's honest status (201/200/202)."""
+    return Response(
+        status_code=response.http_status,
+        content=response.model_dump_json(),
+        media_type="application/json",
+    )
+
+
+async def _submit_canonical_turn(
+    request: Request,
+    payload: ConversationTurnSubmitRequest,
+    *,
+    conversation_id: uuid.UUID | None,
+) -> Response:
+    """Admit one user turn through the canonical conversation store (§3).
+
+    ONE admission window per conversation, serialized by the advisory
+    lock: create-when-missing, scope/completeness gates, the canonical
+    message insert (dedup on ``(conversation_id, client_request_id)``),
+    the one-writer lease admission, the durable enqueue intent
+    (``job_runs`` row + ``run.submitted`` + ``chat.submitted``, the
+    shared submit-intent writer) and the idempotent run attachment. The
+    engine enqueue FOLLOWS the commit exactly like the legacy seam: a
+    crash leaves a re-armable gap (the retry re-anchors and re-enqueues
+    idempotently), never a half-recorded turn (C4). The model-facing
+    task text is the PROJECTED store content, never the raw payload.
+
+    ``conversation_id is None`` (the create route) derives the new
+    conversation's identity from ``client_request_id`` — the idempotency
+    key therefore names at most ONE conversation, and a retry after any
+    crash recovers the exact conversation/message/run triple without a
+    second row of any kind. Follow-up runs record
+    ``session_run_id=<conversation_id>`` so the legacy surface keeps
+    collapsing the conversation into ONE history entry (C1
+    compatibility): the first run of a conversation shares its id.
+    """
+    _store, token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    lifecycle, recovery = _jobs_services(request)
+
+    client_request_id = payload.client_request_id
+    target = client_request_id if conversation_id is None else conversation_id
+    server_uuid = payload.server_id
+    server_id = str(server_uuid)
+    general_consult = server_uuid == uuid.UUID(int=0)
+    if general_consult:
+        # General Consult has no target host: no canonical-profile
+        # binding (revisions pin to 1), exactly like the legacy seam.
+        profile_revision = 1
+        prompt_revision = 1
+        profile_capability_ids: tuple[str, ...] = ()
+    else:
+        stored = _canonical_profile(request, server_uuid)
+        profile = parse_server_profile_text(stored.text)
+        profile_capability_ids = profile.capabilities
+        profile_revision = stored.revision
+        prompt_revision = profile.prompt_revision
+    # The §3 body expresses no explicit grant list, no children and no
+    # attachments: the turn runs with EVERY capability granted for the
+    # target (the documented auto-resolution) and no delegation.
+    capabilities = _resolve_default_capabilities(
+        request, server_uuid, profile_capability_ids
+    )
+    # Fails closed before ANY store write when the model configuration
+    # cannot pin a profile (503, never a guessed profile name).
+    model_profile = _resolve_submit_profile(request, payload.profile)
+    # CAS gate BEFORE any store write: today's implicit task revision is
+    # the initial one (task episodes arrive with migration 0009); a pin
+    # against anything else is a stale request, structured 409, never
+    # last-writer-wins (§1).
+    if (
+        payload.expected_revision is not None
+        and payload.expected_revision != INITIAL_TASK_REVISION
+    ):
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            TaskErrorCode.REVISION_CONFLICT.value,
+            "expected task revision does not match the current revision",
+            fields={"expected_revision": TaskErrorCode.REVISION_CONFLICT.value},
+        )
+    try:
+        context = ExecutionContext(
+            principal=hash_token(token),
+            server_id=server_uuid,
+            run_id=client_request_id,
+            parent_scope=None,
+            profile_revision=str(profile_revision),
+            prompt_revision=str(prompt_revision),
+            credential_references=(),
+            allowed_capabilities=capabilities,
+            mode=PolicyMode.DELEGATED,
+        )
+    except PolicyError as exc:
+        return _validation_error(request, "context", exc.detail)
+
+    factory = _sessions(request)
+    now = datetime.now(timezone.utc)
+    requested_phase = (
+        payload.requested_phase.value if payload.requested_phase is not None else None
+    )
+    try:
+        async with factory() as guard, guard.begin():
+            # C6: the WHOLE admission window below serializes per
+            # conversation (create / dedup / lease admission / intent /
+            # attach) across concurrent submitters and processes.
+            await guard.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _conversation_lock_key(target)},
+            )
+            if conversation_id is None:
+                try:
+                    await aget_conversation(factory, target, server_id=server_uuid)
+                except ConversationContractError:
+                    try:
+                        await acreate_conversation(
+                            factory, server_id=server_uuid, conversation_id=target
+                        )
+                    except IntegrityError:
+                        # The client-chosen id is bound to ANOTHER server's
+                        # scope: the scope-blind 404, never a leak (C8).
+                        return _not_found_conversation(request)
+            conversation = await aget_conversation(
+                factory, target, server_id=server_uuid
+            )
+            assert_history_available(
+                conversation.history_completeness, user_confirmed=False
+            )
+            active = await aactive_run(factory, target, server_id=server_uuid)
+            if (
+                active is not None
+                and active.run_id != client_request_id
+                and await _replayed_state(lifecycle, str(active.run_id))
+                in (
+                    RunState.SUCCEEDED.value,
+                    RunState.FAILED.value,
+                    RunState.CANCELLED.value,
+                )
+            ):
+                # The lease-holding run is TERMINAL: the conversation's
+                # writer lease is stale bookkeeping, so it releases here —
+                # a finished conversation can continue (C1). A run that
+                # merely sits queued/reconciling keeps holding the lease.
+                await arelease_run(
+                    factory,
+                    conversation_id=target,
+                    server_id=server_uuid,
+                    run_id=active.run_id,
+                )
+                active = None
+            lease_holder = (
+                None
+                if active is None or active.run_id == client_request_id
+                else active.run_id
+            )
+            # One writer/executor lease at a time (§1): an exclusive new
+            # episode cannot start under a live lease — rejected BEFORE any
+            # store write. A retry of the lease-holding turn itself bypasses
+            # the gate and re-arms below (C4).
+            assert_writer_admission(
+                lease_holder, follow_up=payload.task_action != "new_task"
+            )
+            turn = await asubmit_turn(
+                factory,
+                conversation_id=target,
+                server_id=server_uuid,
+                client_request_id=client_request_id,
+                message=payload.message,
+                source_kind=MessageSourceKind.API,
+            )
+            if lease_holder is not None:
+                # Active-run delivery (07-steering): the canonical
+                # message row is durable (asubmit_turn committed); the
+                # steering row is the durable DELIVERY identity the
+                # lease-holding run consumes exactly once at its next
+                # safe effect boundary — appended BEFORE the caller is
+                # told anything, so a crash between append and
+                # consumption recovers through the run's own poll
+                # (C4/C5). Same idempotency key as the message: a
+                # retransmitted submit replays onto the SAME row.
+                await aenqueue_steering(
+                    factory,
+                    conversation_id=target,
+                    server_id=server_uuid,
+                    action=SteerAction.STEER,
+                    client_request_id=client_request_id,
+                    content=turn.message.content,
+                    run_id=lease_holder,
+                )
+                return _turn_response(
+                    ConversationTurnSubmitResponse(
+                        conversation_id=target,
+                        message_id=turn.message.message_id,
+                        task_id=conversation.active_task_id,
+                        run_id=None,
+                        revision=INITIAL_TASK_REVISION,
+                        disposition=TurnDisposition.QUEUED_FOLLOWUP,
+                    )
+                )
+            engine_document = _modern_turn_document(
+                run_id=str(client_request_id),
+                server_id=server_id,
+                context=context,
+                profile=model_profile,
+                task=turn.message.content,
+            )
+            try:
+                agent_run.parse_agent_run_intent(_canonical(engine_document))
+            except agent_run.AgentRunError as exc:
+                return _validation_error(request, "message", exc.detail)
+            payload_json = _canonical(engine_document)
+            engine_digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
+            submission_digest = hashlib.sha256(
+                _canonical(
+                    _modern_submission_document(
+                        conversation_id=target,
+                        message_id=turn.message.message_id,
+                        content_fingerprint=turn.message.content_fingerprint,
+                        profile=model_profile,
+                        requested_phase=requested_phase,
+                        task_action=payload.task_action,
+                    )
+                ).encode("ascii")
+            ).hexdigest()
+            created = await _record_submit_intent(
+                guard,
+                run_id=str(client_request_id),
+                server_id=server_id,
+                profile_revision=profile_revision,
+                prompt_revision=prompt_revision,
+                model_profile=model_profile,
+                requested_grants=sorted(capabilities),
+                digest=engine_digest,
+                now=now,
+            )
+            if created:
+                # Legacy-surface compatibility (C1): follow-up runs chain
+                # to the conversation's FIRST run (which shares the
+                # conversation id) so Chat History shows one entry.
+                await _record_chat_submission(
+                    guard,
+                    run_id=str(client_request_id),
+                    digest=submission_digest,
+                    handler=agent_run.HANDLER_NAME,
+                    attachments=[],
+                    child_count=0,
+                    service_tags=[],
+                    now=now,
+                    session_run_id=(
+                        str(target) if target != client_request_id else None
+                    ),
+                    conversation_id=target,
+                    message_id=turn.message.message_id,
+                    requested_phase=requested_phase,
+                    task_action=payload.task_action,
+                )
+            # The writer-lease hand-over commits INSIDE the serialized
+            # window: a concurrent submitter can never observe the gap
+            # between intent and lease (two active runs are unreachable).
+            await aattach_run(
+                factory,
+                conversation_id=target,
+                server_id=server_uuid,
+                run_id=client_request_id,
+            )
+    except ConversationContractError as exc:
+        return _conversation_contract_error(request, exc)
+    if not created:
+        # Duplicate submit: same key must carry the SAME turn (C4).
+        events = await lifecycle.event_stream(str(client_request_id))
+        recorded = next(
+            (e for e in events if e.type == CHAT_SUBMITTED_EVENT_TYPE), None
+        )
+        recorded_digest = (
+            recorded.data.get("submission_sha256")
+            if recorded is not None and isinstance(recorded.data, Mapping)
+            else None
+        )
+        if recorded_digest != submission_digest:
+            return _error(
+                request,
+                HTTP_409_CONFLICT,
+                ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value,
+                "idempotency key is already used by a different submission",
+                fields={
+                    "client_request_id": (
+                        ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value
+                    )
+                },
+            )
+        # Crash-gap healing: a committed facade row without its submit
+        # edge re-anchors idempotently (the intent-level resume).
+        if await lifecycle.current_state(str(client_request_id)) is None:
+            await lifecycle.record_transition(
+                str(client_request_id), RunState.QUEUED
+            )
+    try:
+        await asyncio.to_thread(
+            recovery.client.enqueue_run,
+            str(client_request_id),
+            agent_run.HANDLER_NAME,
+            payload_json,
+        )
+    except RunIdInUseError:
+        if created:
+            # Unreachable in order (the row precedes every enqueue), but a
+            # lost race must surface structured, never as a 500 (C05 r5).
+            return _error(
+                request,
+                HTTP_409_CONFLICT,
+                ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value,
+                "idempotency key is already used by a different submission",
+                fields={
+                    "client_request_id": (
+                        ConversationErrorCode.CLIENT_REQUEST_CONFLICT.value
+                    )
+                },
+            )
+    except (dbos_error.DBOSException, OSError):
+        return _error(
+            request,
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "jobs engine is unavailable",
+        )
+    disposition = (
+        TurnDisposition.CREATED if created else TurnDisposition.DEDUPLICATED
+    )
+    return _turn_response(
+        ConversationTurnSubmitResponse(
+            conversation_id=target,
+            message_id=turn.message.message_id,
+            task_id=conversation.active_task_id,
+            run_id=client_request_id,
+            revision=INITIAL_TASK_REVISION,
+            disposition=disposition,
+        )
     )
 
 
@@ -1528,6 +2129,219 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
     return Response(
         status_code=HTTP_200_OK,
         content=created_view.model_dump_json(),
+        media_type="application/json",
+    )
+
+
+@router.post(
+    "/conversations",
+    status_code=HTTP_201_CREATED,
+    response_model=ConversationTurnSubmitResponse,
+    summary="Create a conversation and submit its first turn (canonical seam)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "The submitted idempotency key is already bound to "
+            "another server's conversation scope",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Idempotency key retransmitted with changed content, "
+            "or another writer holds the conversation lease",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Model configuration or jobs engine unavailable",
+        },
+    },
+)
+async def create_conversation(
+    request: Request, payload: ConversationTurnSubmitRequest
+) -> Response:
+    """Create one conversation and atomically admit its first turn (§3).
+
+    The modern seam: ``client_request_id`` IS the new conversation's
+    identity and the first run's idempotency key, so a retry after any
+    crash or network timeout recovers the exact conversation, message
+    and run triple — deduplicated (``200``), never a second row (C4).
+    The canonical user message and the durable enqueue intent commit
+    through the conversation store's serialized admission window (C6);
+    the engine enqueue follows the commit (re-armable gap, never a half
+    intent).
+    """
+    return await _submit_canonical_turn(request, payload, conversation_id=None)
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages",
+    status_code=HTTP_201_CREATED,
+    response_model=ConversationTurnSubmitResponse,
+    summary="Submit one follow-up turn onto a conversation (canonical seam)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No conversation in the requesting server scope "
+            "(cross-server references fail closed, C8)",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Idempotency key retransmitted with changed content, "
+            "another writer holds the conversation lease, a stale task "
+            "revision was pinned, or history reconstruction is incomplete",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Model configuration or jobs engine unavailable",
+        },
+    },
+)
+async def submit_conversation_message(
+    request: Request, conversation_id: uuid.UUID, payload: ConversationTurnSubmitRequest
+) -> Response:
+    """Append one user turn to an existing conversation (§3).
+
+    The turn records ONLY the actual new user text — the canonical
+    transcript is assembled server-side at execution time, never
+    browser-stitched (C1). A finished follow-up starts a new durable run
+    bound to the SAME canonical conversation; a turn arriving while
+    another run holds the writer lease is admitted, recorded and
+    honestly reported ``queued_followup`` (``202``, no competing
+    executor). Retrying the SAME ``client_request_id`` deduplicates
+    against the original turn (C4); a conflicting payload under the same
+    key fails closed (``409 client_request_conflict``).
+    """
+    return await _submit_canonical_turn(
+        request, payload, conversation_id=conversation_id
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/steer",
+    status_code=HTTP_201_CREATED,
+    response_model=ChatSteerView,
+    summary="Submit one deterministic steering/control request onto an active run",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No conversation in the requesting server scope "
+            "(cross-server references fail closed, C8)",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "No active run holds the conversation lease, or the "
+            "idempotency key was retransmitted (deduplicated, 200)",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation (steer requires a "
+            "message; pause/cancel carry none)",
+        },
+    },
+)
+async def steer_conversation(
+    request: Request, conversation_id: uuid.UUID, payload: ConversationSteerRequest
+) -> Response:
+    """Record one active-run steering/control request (§3; C5).
+
+    DURABLE FIRST: the ``conversation_steering`` row commits before the
+    caller is told anything and before any delivery, so a crash between
+    the append and the run's consumption recovers through the run's own
+    safe-boundary poll — and a retransmitted ``client_request_id``
+    deduplicates onto the SAME row, never a second control (C4). Pause
+    and cancel are deterministic: they are recorded without any intake
+    model call and consumed at the run's next safe effect boundary;
+    in-flight effects are never claimed killed without their receipt.
+    """
+    _store, token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    if payload.conversation_id != conversation_id:
+        return _validation_error(
+            request,
+            "conversation_id",
+            "body conversation id does not match the target path",
+        )
+    client_request_id = (
+        payload.client_request_id
+        if payload.client_request_id is not None
+        else uuid.uuid4()
+    )
+    factory = _sessions(request)
+    try:
+        conversation = await aget_conversation(
+            factory, conversation_id, server_id=payload.server_id
+        )
+    except ConversationContractError as exc:
+        return _conversation_contract_error(request, exc)
+    active = await aactive_run(factory, conversation_id, server_id=payload.server_id)
+    if active is None:
+        # Nothing is executing: there is no run to steer. Structured and
+        # value-free — never a guessed acceptance, never a 500 (C05 r5).
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            NO_ACTIVE_RUN_CODE,
+            "no active run holds this conversation's writer lease",
+            fields={"conversation_id": NO_ACTIVE_RUN_CODE},
+        )
+    try:
+        row, disposition = await aenqueue_steering(
+            factory,
+            conversation_id=conversation_id,
+            server_id=payload.server_id,
+            action=payload.action,
+            client_request_id=client_request_id,
+            content=payload.message,
+            run_id=active.run_id,
+        )
+    except ConversationContractError as exc:
+        return _conversation_contract_error(request, exc)
+    view = ChatSteerView(
+        conversation_id=conversation.conversation_id,
+        steering_id=row.steering_id,
+        run_id=active.run_id,
+        action=payload.action,
+        client_request_id=client_request_id,
+        disposition=disposition,
+        delivery_status="pending",
+    )
+    return Response(
+        status_code=HTTP_201_CREATED
+        if disposition is TurnDisposition.CREATED
+        else HTTP_200_OK,
+        content=view.model_dump_json(),
         media_type="application/json",
     )
 

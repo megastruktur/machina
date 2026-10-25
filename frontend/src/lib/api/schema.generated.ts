@@ -526,6 +526,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped page of canonical conversations
+         * @description One bounded page of safe conversation metadata (§3 ``GET`` list).
+         *
+         *     The page is exactly the requested server's scope; ordering and the
+         *     same-filter total are the storage owner's deterministic contract
+         *     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
+         *     transcript content ever rides a list page.
+         */
+        get: operations["list_canonical_conversations_api_v1_chat_conversations_get"];
+        put?: never;
+        /**
+         * Create a conversation and submit its first turn (canonical seam)
+         * @description Create one conversation and atomically admit its first turn (§3).
+         *
+         *     The modern seam: ``client_request_id`` IS the new conversation's
+         *     identity and the first run's idempotency key, so a retry after any
+         *     crash or network timeout recovers the exact conversation, message
+         *     and run triple — deduplicated (``200``), never a second row (C4).
+         *     The canonical user message and the durable enqueue intent commit
+         *     through the conversation store's serialized admission window (C6);
+         *     the engine enqueue follows the commit (re-armable gap, never a half
+         *     intent).
+         */
+        post: operations["create_conversation_api_v1_chat_conversations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded role-preserving transcript page (deterministic order)
+         * @description The sanitized transcript page (§3 ``GET`` messages; C2).
+         *
+         *     Ordered ``(seq, message_id)`` with the same-filter ``total``; the
+         *     page carries the conversation's honest history-completeness marker.
+         *     A fresh session restores the true server transcript — no browser
+         *     cache dependency, no placeholder rows, no fabricated turns.
+         */
+        get: operations["list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get"];
+        put?: never;
+        /**
+         * Submit one follow-up turn onto a conversation (canonical seam)
+         * @description Append one user turn to an existing conversation (§3).
+         *
+         *     The turn records ONLY the actual new user text — the canonical
+         *     transcript is assembled server-side at execution time, never
+         *     browser-stitched (C1). A finished follow-up starts a new durable run
+         *     bound to the SAME canonical conversation; a turn arriving while
+         *     another run holds the writer lease is admitted, recorded and
+         *     honestly reported ``queued_followup`` (``202``, no competing
+         *     executor). Retrying the SAME ``client_request_id`` deduplicates
+         *     against the original turn (C4); a conflicting payload under the same
+         *     key fails closed (``409 client_request_conflict``).
+         */
+        post: operations["submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/steer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit one deterministic steering/control request onto an active run
+         * @description Record one active-run steering/control request (§3; C5).
+         *
+         *     DURABLE FIRST: the ``conversation_steering`` row commits before the
+         *     caller is told anything and before any delivery, so a crash between
+         *     the append and the run's consumption recovers through the run's own
+         *     safe-boundary poll — and a retransmitted ``client_request_id``
+         *     deduplicates onto the SAME row, never a second control (C4). Pause
+         *     and cancel are deterministic: they are recorded without any intake
+         *     model call and consumed at the run's next safe effect boundary;
+         *     in-flight effects are never claimed killed without their receipt.
+         */
+        post: operations["steer_conversation_api_v1_chat_conversations__conversation_id__steer_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chat/runs": {
         parameters: {
             query?: never;
@@ -659,6 +765,229 @@ export interface paths {
         get: operations["stream_conversation_events_api_v1_chat_runs__run_id__events_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One conversation's safe header with honest legacy-gap metadata
+         * @description The safe singleton header (§3 ``GET`` one) with §4 gap honesty.
+         *
+         *     A ``partial``/``unavailable`` conversation labels its gaps explicitly
+         *     (missing range + bounded proven-but-unrecoverable submission count);
+         *     a complete conversation carries no gap metadata and pays no extra
+         *     query. Nothing about another scope's identity can appear in any
+         *     rejection (C8).
+         */
+        get: operations["read_canonical_conversation_api_v1_chat_conversations__conversation_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded cursor-exclusive metadata event page (resumable)
+         * @description Bounded resumable metadata events (§3 ``GET`` events; C2).
+         *
+         *     The cursor is the conversation-local monotonic message sequence.
+         *     Frames are strictly cursor-exclusive and ascending, so a reconnect
+         *     with the last seen ``after_seq`` deduplicates by construction —
+         *     without gaps and without duplicates. Events carry content
+         *     IDENTITIES only (never transcript text, C05); the envelope's
+         *     current-state block carries the bounded lease/steering/revision
+         *     truth for honest catch-up rendering.
+         */
+        get: operations["list_canonical_events_api_v1_chat_conversations__conversation_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/task": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The conversation's ONE active task header (§8; no unbounded arrays)
+         * @description The compact §8 header view for the conversation's active episode.
+         *
+         *     Resolution goes through the conversation row's ``active_task_id`` —
+         *     the ONE task pointer §1 defines — so a completed episode's history
+         *     never masquerades as the current task. Absent conversation, foreign
+         *     scope and absent episode all collapse into the SAME scope-blind 404:
+         *     existence never leaks (C8).
+         */
+        get: operations["read_conversation_task_api_v1_chat_conversations__conversation_id__task_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped plan-step page (§8; AGENTS.md §1)
+         * @description The deterministic plan-step page, ordered ``(position, step_id)``.
+         *
+         *     ``total`` is the ``COUNT(*)`` under the identical filter predicate;
+         *     superseded rows stay recorded and are served only when explicitly
+         *     requested (P3). Cross-server access is the scope-blind 404 (C8).
+         */
+        get: operations["list_task_steps_api_v1_chat_tasks__task_id__items_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/constraints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped constraint page (§8; AGENTS.md §1)
+         * @description The deterministic constraint page, ordered ``(position, id)``.
+         *
+         *     The §1/§6 safety boundary is read like every other collection:
+         *     bounded, deterministic, never silently truncated — every row carries
+         *     its ``origin`` (user requirement vs model inference) and its source
+         *     message anchors.
+         */
+        get: operations["list_task_constraints_api_v1_chat_tasks__task_id__constraints_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped evidence-registry page (§8/§9)
+         * @description The deterministic evidence-registry page, ordered ``(created_at, id)``.
+         *
+         *     Provenance IDENTITIES only (kind + referenced record ID + safe note):
+         *     the route never re-fetches or inlines the referenced source content.
+         */
+        get: operations["list_task_evidence_api_v1_chat_tasks__task_id__evidence_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded revision-ledger page (§8 audit; P5 shared truth)
+         * @description The append-only revision ledger, newest revision first (§8).
+         *
+         *     The SAME ledger the agent tools write, so a reconnecting UI (P5)
+         *     re-derives the shared server revision and the pending/applied
+         *     distinction from one authoritative history — never from browser
+         *     state.
+         */
+        get: operations["list_task_revisions_api_v1_chat_tasks__task_id__revisions_get"];
+        put?: never;
+        /**
+         * One authenticated user correction/proposal under CAS + idempotency (§8)
+         * @description The user correction route (§8): ONE shared revision service call.
+         *
+         *     Always ``author="user"`` — a user correction is never authored as the
+         *     model — and always SOURCE-LINKED: the frozen patch model requires the
+         *     user message being corrected, and the store existence-checks it
+         *     against the task's conversation (P4) before recording the revision.
+         *     A stale tab's ``base_revision`` is the structured
+         *     ``409 revision_conflict`` — never last-writer-wins (C6); a
+         *     retransmitted ``idempotency_key`` replays onto the SAME revision (C4,
+         *     ``200 deduplicated``). Plan review never touches the phase, the
+         *     status or any approval (§6).
+         */
+        post: operations["submit_task_correction_api_v1_chat_tasks__task_id__revisions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * One explicit user decision: phase selection or pause/cancel (§8)
+         * @description The user decision route (§8): DISTINCT from plan review and from
+         *     operation approval.
+         *
+         *     The route performs metadata-only header updates through the ONE
+         *     store's CAS seam: phase selection is advisory (never permission) and
+         *     pause/cancel follow the frozen outcome transitions (a cancelled
+         *     episode closes and releases the conversation's active-task pointer).
+         *     It NEVER applies a plan delta, NEVER authorizes a pending operation
+         *     and NEVER terminates one — effect authorization stays on the C03
+         *     approvals surface, unchanged (§6: metadata decisions cannot change
+         *     grants). A stale ``expected_revision`` (the named revision the user
+         *     reviewed) is the structured ``409 revision_conflict`` (C6); a
+         *     retransmitted ``client_request_id`` replays (``200 deduplicated``).
+         */
+        post: operations["submit_task_decision_api_v1_chat_tasks__task_id__decisions_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2004,6 +2333,12 @@ export interface components {
             alert: components["schemas"]["AlertView"];
         };
         /**
+         * ActionRisk
+         * @description Declared risk/action class of a step (§5 "risk/action class").
+         * @enum {string}
+         */
+        ActionRisk: "read_only" | "mutating" | "irreversible";
+        /**
          * AdoptBody
          * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
          *
@@ -2506,14 +2841,6 @@ export interface components {
             cancel_children: boolean;
         };
         /**
-         * ChatRenameBody
-         * @description Rename body: durable user-defined conversation title.
-         */
-        ChatRenameBody: {
-            /** Title */
-            title: string;
-        };
-        /**
          * ChatCreated
          * @description Submit outcome: the conversation view plus the dedup verdict.
          */
@@ -2535,6 +2862,59 @@ export interface components {
             offset: number;
             /** Total */
             total: number;
+        };
+        /**
+         * ChatRenameBody
+         * @description Rename body: durable user-defined conversation title.
+         */
+        ChatRenameBody: {
+            /** Title */
+            title: string;
+        };
+        /**
+         * ChatSteerView
+         * @description Steer/control outcome (§3): the durable control row's identity.
+         *
+         *     ``delivery_status`` is always ``pending`` at response time: the row
+         *     is durable BEFORE the caller is told anything, and it is consumed
+         *     by the lease-holding run at its next safe effect boundary — the
+         *     UI displays pending/applied distinctly and never fabricates an
+         *     instant state.
+         */
+        ChatSteerView: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Target conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Steering Id
+             * Format: uuid
+             * @description Durable steering/control row identity
+             */
+            steering_id: string;
+            /**
+             * Run Id
+             * @description Lease-holding run the control addresses, when one exists
+             */
+            run_id: string | null;
+            /** @description steer, pause or cancel */
+            action: components["schemas"]["SteerAction"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Idempotency key deduplicating repeated control submissions
+             */
+            client_request_id: string;
+            /** @description created or deduplicated (same-key retransmission) */
+            disposition: components["schemas"]["TurnDisposition"];
+            /**
+             * Delivery Status
+             * @description Always pending at response time; the active run consumes the control at a safe effect boundary
+             * @constant
+             */
+            delivery_status: "pending";
         };
         /**
          * ChatSubmitBody
@@ -2674,6 +3054,56 @@ export interface components {
             bindings: components["schemas"]["BindingView"][];
         };
         /**
+         * ConstraintOrigin
+         * @description Source anchor distinguishing user requirements from model inferences
+         *     (act_CONTRACTS §5 ``constraints_proposed``).
+         * @enum {string}
+         */
+        ConstraintOrigin: "user" | "model";
+        /**
+         * ConstraintProposal
+         * @description One proposed constraint with source anchors (§5 ``constraints_proposed``).
+         *
+         *     ``origin`` distinguishes user requirements from model inferences: a
+         *     model-generated update can never remove/supersede a USER-origin constraint
+         *     (§6) — that needs an explicit user correction through the revision API.
+         */
+        ConstraintProposal: {
+            /**
+             * Constraint Id
+             * @description Stable slug of the proposed constraint
+             */
+            constraint_id: string;
+            /**
+             * Category
+             * @description Constraint category slug, e.g. safety or scope
+             */
+            category: string;
+            /**
+             * Statement
+             * @description Safe constraint statement; no secret material
+             */
+            statement: string;
+            /** @description Whether the user stated this or the model inferred it */
+            origin: components["schemas"]["ConstraintOrigin"];
+            /**
+             * Source Message Refs
+             * @description User messages this constraint is anchored to
+             */
+            source_message_refs?: string[];
+            /**
+             * Suggested
+             * @description Whether to add a new constraint or supersede an existing one
+             * @enum {string}
+             */
+            suggested: "add" | "supersede";
+            /**
+             * Supersedes Constraint Id
+             * @description Existing constraint ID replaced by a supersede proposal
+             */
+            supersedes_constraint_id?: string | null;
+        };
+        /**
          * ContainerView
          * @description One observed container (the discovery safe view: no env/mounts).
          */
@@ -2696,11 +3126,451 @@ export interface components {
             compose_service: string | null;
         };
         /**
+         * ConversationCurrentView
+         * @description Current-state catch-up block on every events page (§3).
+         *
+         *     Bounded scalar state (identities + counts only), so a reconnecting
+         *     consumer renders the lease/steering truth without fabricating a
+         *     timeline entry for state that has no monotonic cursor.
+         */
+        ConversationCurrentView: {
+            /**
+             * Latest Seq
+             * @description Newest allocated transcript sequence (0 when empty)
+             */
+            latest_seq: number;
+            /** @description Honest history marker for this conversation (§4) */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /**
+             * Active Run Id
+             * @description Current lease-holding durable run, when one exists
+             */
+            active_run_id: string | null;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id: string | null;
+            /**
+             * Pending Steering
+             * @description Bounded count of not-yet-applied durable control rows
+             */
+            pending_steering: number;
+        };
+        /**
+         * ConversationDetailView
+         * @description Safe singleton header plus explicit legacy-gap metadata (§3/§4).
+         *
+         *     ``legacy_gaps`` is empty exactly when ``history_completeness`` is
+         *     ``complete``; otherwise it names every gap the store proved.
+         */
+        ConversationDetailView: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Opaque stable conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this conversation
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description User-assigned conversation title, when set
+             */
+            title?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description RFC3339 UTC last-activity timestamp
+             */
+            updated_at: string;
+            /**
+             * Message Count
+             * @description Persisted message count
+             */
+            message_count: number;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id?: string | null;
+            /**
+             * Active Run Id
+             * @description Current durable run, when one is attached (§1)
+             */
+            active_run_id?: string | null;
+            /** @description complete, partial or unavailable; never fabricated (§4) */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /** @description Missing transcript range when completeness is not complete */
+            missing_range?: components["schemas"]["MessageRange"] | null;
+            /**
+             * Legacy Gaps
+             * @description Honest legacy-gap metadata (§4); empty when complete
+             */
+            legacy_gaps?: components["schemas"]["LegacyHistoryGap"][];
+        };
+        /**
+         * ConversationEvent
+         * @description One metadata-only transcript event (§3 ``GET`` events).
+         *
+         *     The ``seq`` IS the dedup cursor: conversation-local, monotonic,
+         *     gap-free (allocated under the conversation's write lock), so a
+         *     reconnect with the last seen sequence replays strictly newer events
+         *     without gaps or duplicates (C2). No content field exists to leak.
+         */
+        ConversationEvent: {
+            /**
+             * Seq
+             * @description Conversation-local monotonic sequence (the dedup cursor)
+             */
+            seq: number;
+            /**
+             * Kind
+             * @description The event kind (one canonical transcript append)
+             * @constant
+             */
+            kind: "transcript.appended";
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Opaque stable message identity
+             */
+            message_id: string;
+            /**
+             * Role
+             * @description Trusted producer-assigned role (vocabulary mirror)
+             */
+            role: string;
+            /**
+             * Source Kind
+             * @description Origin of the message (vocabulary mirror)
+             */
+            source_kind: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted
+             */
+            redacted: boolean;
+            /**
+             * Has Content Ref
+             * @description True when content lives behind the safe content_ref
+             */
+            has_content_ref: boolean;
+            /**
+             * Created At
+             * @description RFC3339 UTC event timestamp
+             */
+            created_at: string;
+        };
+        /**
+         * ConversationEventsPage
+         * @description One bounded, cursor-exclusive events page (§3 ``GET`` events).
+         *
+         *     The cursor filters the set (``seq > after_seq``); ``total`` is the
+         *     pre-slice count under that identical predicate and the slice serves
+         *     the filtered set from its start, so ``has_more`` follows the
+         *     canonical derivation. The page is deterministic and replayable: the
+         *     same cursor always returns the same slice (C2 reconnect dedup).
+         */
+        ConversationEventsPage: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Items skipped within the cursor-filtered set; the cursor (after_seq) is the resume position, so the filtered set is served from its start
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * After Seq
+             * @description The replay cursor: only strictly newer events are returned
+             */
+            after_seq: number;
+            /**
+             * Events
+             * @description Metadata events in strictly ascending seq order
+             */
+            events?: components["schemas"]["ConversationEvent"][];
+            /** @description Current-state catch-up block (identities and counts) */
+            current: components["schemas"]["ConversationCurrentView"];
+        };
+        /**
+         * ConversationListPage
+         * @description One bounded, explicitly server-scoped list page (§3 ``GET`` list).
+         *
+         *     Safe metadata only: rows never carry transcript content, so the page
+         *     stays safe for generic list surfaces (C01 rule 5; AGENTS.md §1).
+         */
+        ConversationListPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Conversation rows in deterministic updated_at order
+             */
+            items?: components["schemas"]["ConversationSummary"][];
+        };
+        /**
+         * ConversationSteerRequest
+         * @description Deterministic control request (§3): pause/cancel carry no planner
+         *     input; natural-language steering is interpreted at the next safe
+         *     boundary and displayed as pending until applied.
+         */
+        ConversationSteerRequest: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Target conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /** @description steer, pause or cancel */
+            action: components["schemas"]["SteerAction"];
+            /**
+             * Message
+             * @description Natural-language steering text; forbidden on pause/cancel
+             */
+            message?: string | null;
+            /**
+             * Client Request Id
+             * @description Idempotency key for repeated control submissions
+             */
+            client_request_id?: string | null;
+            /**
+             * Expected Revision
+             * @description Expected task revision for CAS on steering, when relevant
+             */
+            expected_revision?: number | null;
+        };
+        /**
+         * ConversationSummary
+         * @description Safe metadata row of one conversation (§3 ``GET`` list page item).
+         *
+         *     No transcript content: summaries stay safe for generic list surfaces.
+         */
+        ConversationSummary: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Opaque stable conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this conversation
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description User-assigned conversation title, when set
+             */
+            title?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description RFC3339 UTC last-activity timestamp
+             */
+            updated_at: string;
+            /**
+             * Message Count
+             * @description Persisted message count
+             */
+            message_count: number;
+            /**
+             * Active Task Id
+             * @description Current active task episode, when one exists (§1)
+             */
+            active_task_id?: string | null;
+            /**
+             * Active Run Id
+             * @description Current durable run, when one is attached (§1)
+             */
+            active_run_id?: string | null;
+        };
+        /**
+         * ConversationTranscriptPage
+         * @description One role-preserving sanitized message page (§3), ordered by
+         *     ``(sequence, message_id)`` with the same-filter ``total``.
+         */
+        ConversationTranscriptPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * @description History-completeness marker for the loaded range
+             * @default complete
+             */
+            history_completeness: components["schemas"]["HistoryCompleteness"];
+            /**
+             * Items
+             * @description Message rows in deterministic sequence order
+             */
+            items?: components["schemas"]["TranscriptMessage"][];
+        };
+        /**
+         * ConversationTurnSubmitRequest
+         * @description One accepted user turn (§3 ``POST`` shape): idempotency key, explicit
+         *     server scope, optional CAS revision and explicit task action.
+         */
+        ConversationTurnSubmitRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description UI-authored idempotency key deduplicating retransmission
+             */
+            client_request_id: string;
+            /**
+             * Message
+             * @description Safe user message text (raw-secret exclusion happens upstream)
+             */
+            message: string;
+            /**
+             * Profile
+             * @description Model profile reference for the next allowed call
+             */
+            profile?: string | null;
+            /** @description Advisory requested phase; never permission (§5) */
+            requested_phase?: components["schemas"]["Phase"] | null;
+            /**
+             * Expected Revision
+             * @description Expected task revision for CAS; stale writes conflict
+             */
+            expected_revision?: number | null;
+            /**
+             * Task Action
+             * @description Explicit episode action: continue or start a new task (§1)
+             */
+            task_action?: ("continue" | "new_task") | null;
+        };
+        /**
+         * ConversationTurnSubmitResponse
+         * @description Persisted turn identity plus run disposition (§3; brief AC 2).
+         */
+        ConversationTurnSubmitResponse: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Persisted message identity
+             */
+            message_id: string;
+            /**
+             * Task Id
+             * @description Task episode bound to the turn, when one exists
+             */
+            task_id: string | null;
+            /**
+             * Run Id
+             * @description Durable run bound to the turn, when one started
+             */
+            run_id: string | null;
+            /**
+             * Revision
+             * @description Current task revision after the turn was admitted
+             */
+            revision: number;
+            /** @description created, deduplicated or queued_followup */
+            disposition: components["schemas"]["TurnDisposition"];
+        };
+        /**
          * ConversationView
          * @description One conversation: the run view plus its recorded references.
          *
          *     ``service_tags`` are the immutable ``@service`` chips recorded at
          *     submission (read back from the run's ``chat.submitted`` record).
+         *     ``title`` is the user-assigned conversation name when renamed.
          */
         ConversationView: {
             /** Run Id */
@@ -2810,7 +3680,7 @@ export interface components {
             /** Origin Revision */
             origin_revision?: string | null;
             /** @default unverified */
-            verification: components["schemas"]["VerificationStatus"];
+            verification: components["schemas"]["mai__knowledge__documents__VerificationStatus"];
         };
         /**
          * DocumentDeleteBody
@@ -2908,6 +3778,35 @@ export interface components {
             evaluated: number;
             /** Outcomes */
             outcomes: components["schemas"]["EvaluateOutcomeView"][];
+        };
+        /**
+         * EvidenceKind
+         * @description What kind of sourced record an evidence reference points at (§5 facts;
+         *     §9 evidence validator checks provenance, task/target and observation type).
+         * @enum {string}
+         */
+        EvidenceKind: "message" | "observation" | "run_event" | "artifact" | "document";
+        /**
+         * EvidenceRef
+         * @description One sourced evidence reference (§5 facts; §9 evidence binding).
+         *
+         *     ``evidence_id`` points at an existing sourced record in the task/conversation
+         *     scope; existence is checked by the runtime store, never assumed here.
+         */
+        EvidenceRef: {
+            /** @description Kind of sourced record referenced */
+            kind: components["schemas"]["EvidenceKind"];
+            /**
+             * Evidence Id
+             * Format: uuid
+             * @description Opaque UUID of the referenced record
+             */
+            evidence_id: string;
+            /**
+             * Note
+             * @description Short safe annotation for UI display
+             */
+            note?: string | null;
         };
         /**
          * ExecutionEnvironment
@@ -3115,6 +4014,13 @@ export interface components {
             start_period_seconds: number;
         };
         /**
+         * HistoryCompleteness
+         * @description History-completeness marker (§3/§4): ``partial|unavailable`` must be
+         *     shown, never papered over with fabricated turns.
+         * @enum {string}
+         */
+        HistoryCompleteness: "complete" | "partial" | "unavailable";
+        /**
          * InstalledPluginView
          * @description One installed native plugin's rich catalog view (plugins window).
          *
@@ -3159,6 +4065,41 @@ export interface components {
             truncated: boolean;
             /** Malformed Lines */
             malformed_lines: number;
+        };
+        /**
+         * LegacyHistoryGap
+         * @description One honestly-labelled legacy gap (§4; scenario C7).
+         *
+         *     Gap metadata is derived ONLY from proved app-owned records; a gap is
+         *     shown, never papered over with a fabricated turn or a placeholder.
+         */
+        LegacyHistoryGap: {
+            /**
+             * Kind
+             * @description Which gap this row labels: a missing transcript sequence range, or proven submissions with no recoverable row
+             * @enum {string}
+             */
+            kind: "missing_range" | "unrecoverable_submissions";
+            /**
+             * From Sequence
+             * @description First missing transcript sequence (missing_range only)
+             */
+            from_sequence?: number | null;
+            /**
+             * To Sequence
+             * @description Last missing transcript sequence, inclusive (missing_range only)
+             */
+            to_sequence?: number | null;
+            /**
+             * Count
+             * @description Bounded count of the labelled records (unrecoverable_submissions only)
+             */
+            count?: number | null;
+            /**
+             * Description
+             * @description Value-free human-readable gap explanation
+             */
+            description: string;
         };
         /**
          * LifecycleSubmitBody
@@ -3284,6 +4225,35 @@ export interface components {
             /** Document Id */
             document_id?: string | null;
         };
+        /**
+         * MessageRange
+         * @description A missing transcript range shown when history is not complete (§4).
+         */
+        MessageRange: {
+            /**
+             * From Sequence
+             * @description First missing sequence
+             */
+            from_sequence: number;
+            /**
+             * To Sequence
+             * @description Last missing sequence (inclusive)
+             */
+            to_sequence: number;
+        };
+        /**
+         * MessageRole
+         * @description Frozen message roles (§1). Intake payloads cannot forge a role:
+         *     assistant/tool rows are created only through trusted producer paths.
+         * @enum {string}
+         */
+        MessageRole: "user" | "assistant" | "tool" | "system";
+        /**
+         * MessageSourceKind
+         * @description Where a message came from (§1 source kind; §4 legacy material).
+         * @enum {string}
+         */
+        MessageSourceKind: "browser" | "api" | "legacy_import" | "system";
         /**
          * ModelCapabilitiesBody
          * @description Optional endpoint capabilities the connection declares (C06 rule 1).
@@ -3651,6 +4621,18 @@ export interface components {
             /** Password */
             password: string;
         };
+        /**
+         * PatchOp
+         * @description Bounded patch operation kinds (§5 "add/update/supersede operations").
+         * @enum {string}
+         */
+        PatchOp: "add" | "update" | "supersede";
+        /**
+         * Phase
+         * @description Application task phases (act_CONTRACTS §5/§6): advisory, never permission.
+         * @enum {string}
+         */
+        Phase: "plan" | "inspect" | "act";
         /**
          * PlanBody
          * @description Plan preview body (strict): identity + recipe document + target.
@@ -4719,6 +5701,14 @@ export interface components {
             container: components["schemas"]["ContainerView"];
         };
         /**
+         * SteerAction
+         * @description Deterministic control actions (§3): pause/cancel never wait for a
+         *     planner; natural-language steering is interpreted at the next safe
+         *     boundary.
+         * @enum {string}
+         */
+        SteerAction: "steer" | "pause" | "cancel";
+        /**
          * StepBody
          * @description One ordered capability step of a run intent (C05 rule 3).
          *
@@ -4737,6 +5727,12 @@ export interface components {
             /** Resource */
             resource?: string | null;
         };
+        /**
+         * StepStatus
+         * @description Frozen todo statuses (act_CONTRACTS §7; additions need reconciliation).
+         * @enum {string}
+         */
+        StepStatus: "pending" | "in_progress" | "blocked" | "executed" | "skipped";
         /**
          * StepView
          * @description One durable step row (intent + safe receipt; C04 rule 4).
@@ -4775,6 +5771,717 @@ export interface components {
             description: string | null;
         };
         /**
+         * TaskConstraintView
+         * @description One constraint row with its source anchors (§5/§6).
+         *
+         *     ``origin`` distinguishes user requirements from model inferences —
+         *     the authority fact that keeps a model correction from ever erasing a
+         *     user prohibition (P4).
+         */
+        TaskConstraintView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Constraint Id
+             * @description Stable slug of the constraint
+             */
+            constraint_id: string;
+            /**
+             * Category
+             * @description Constraint category slug, e.g. safety
+             */
+            category: string;
+            /**
+             * Statement
+             * @description Safe constraint statement; no secret material
+             */
+            statement: string;
+            /** @description Whether the user stated this or the model inferred it */
+            origin: components["schemas"]["ConstraintOrigin"];
+            /**
+             * Source Message Refs
+             * @description User messages this constraint is anchored to
+             */
+            source_message_refs: string[];
+            /**
+             * Position
+             * @description Deterministic list position
+             */
+            position: number;
+            /**
+             * Superseded At
+             * @description RFC3339 UTC supersede timestamp for recorded history, else null
+             */
+            superseded_at: string | null;
+            /**
+             * Superseded By
+             * @description Constraint ID that replaced this row, else null (P3 history)
+             */
+            superseded_by: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
+        };
+        /**
+         * TaskConstraintsPage
+         * @description One bounded constraint page (§8 ``GET constraints``; AGENTS.md §1).
+         */
+        TaskConstraintsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Constraint rows in deterministic (position, id) order
+             */
+            items?: components["schemas"]["TaskConstraintView"][];
+        };
+        /**
+         * TaskCorrectionBody
+         * @description One authenticated user correction/proposal (§8 ``POST revisions``).
+         *
+         *     The body embeds the FROZEN ratified patch model — the exact same
+         *     validated delta the model tools submit — so CAS (``base_revision``),
+         *     idempotency (``idempotency_key``) and the mandatory source message
+         *     (``source_message_id``) are contract-owned, not re-implemented here.
+         *     The route always stores ``author="user"``.
+         */
+        TaskCorrectionBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
+             */
+            server_id: string;
+            /** @description The bounded plan delta (user correction/proposal) with CAS base_revision, idempotency key and source message reference */
+            patch: components["schemas"]["TaskPlanPatch"];
+            /**
+             * Constraint Proposals
+             * @description Bounded constraint add/supersede proposals anchored to user messages
+             */
+            constraint_proposals?: components["schemas"]["ConstraintProposal"][];
+        };
+        /**
+         * TaskCounts
+         * @description List counts for the compact task view (§8: no unbounded arrays).
+         */
+        TaskCounts: {
+            /**
+             * Steps Total
+             * @description Total plan steps on the task
+             */
+            steps_total: number;
+            /**
+             * Steps Executed
+             * @description Steps in executed status
+             */
+            steps_executed: number;
+            /**
+             * Constraints Total
+             * @description Active constraints on the task
+             */
+            constraints_total: number;
+            /**
+             * Evidence Total
+             * @description Evidence records on the task
+             */
+            evidence_total: number;
+            /**
+             * Criteria Total
+             * @description Acceptance criteria on the task
+             */
+            criteria_total: number;
+            /**
+             * Criteria Verified
+             * @description Criteria currently passed
+             */
+            criteria_verified: number;
+        };
+        /**
+         * TaskDecisionBody
+         * @description One explicit user decision (§8 ``POST decisions``).
+         *
+         *     Phase selection is ADVISORY (never permission, §6) and pause/cancel
+         *     move only the domain outcome layer through its frozen transition map.
+         *     A decision NEVER applies a plan delta (that is the revisions route)
+         *     and NEVER authorizes or terminates a pending operation (that is the
+         *     C03 approvals surface; §6: metadata decisions cannot change grants).
+         */
+        TaskDecisionBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
+             */
+            server_id: string;
+            /**
+             * Expected Revision
+             * @description The named revision this decision reviewed; a stale value is the structured 409 revision_conflict (C6)
+             */
+            expected_revision: number;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Caller key so retransmitted decisions deduplicate (§1)
+             */
+            client_request_id: string;
+            /** @description The user's chosen next phase (plan|inspect|act); advisory only, never permission (§6) */
+            requested_phase?: components["schemas"]["Phase"] | null;
+            /**
+             * Task Action
+             * @description Explicit deterministic control: pause parks the open episode as needs_input, cancel closes it (terminal)
+             */
+            task_action?: ("pause" | "cancel") | null;
+        };
+        /**
+         * TaskEvidencePage
+         * @description One bounded evidence page (§8 ``GET evidence``; AGENTS.md §1).
+         */
+        TaskEvidencePage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Evidence rows in deterministic (created_at, id) order
+             */
+            items?: components["schemas"]["TaskEvidenceView"][];
+        };
+        /**
+         * TaskEvidenceView
+         * @description One evidence-registry row (§9 provenance identities only).
+         *
+         *     The registry stores WHICH sourced record backs the task (kind + ID +
+         *     optional safe note), never a copy of the referenced content.
+         */
+        TaskEvidenceView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Evidence Id
+             * Format: uuid
+             * @description Opaque UUID of the referenced record
+             */
+            evidence_id: string;
+            /** @description Kind of sourced record referenced */
+            kind: components["schemas"]["EvidenceKind"];
+            /**
+             * Note
+             * @description Short safe annotation for UI display, when recorded
+             */
+            note: string | null;
+            /**
+             * Origin Step Id
+             * @description Step that first registered this evidence, when known
+             */
+            origin_step_id: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC registration timestamp
+             */
+            created_at: string;
+        };
+        /**
+         * TaskMutationOutcome
+         * @description The shared outcome of one accepted/replayed task mutation (§1).
+         *
+         *     The fresh header view (revision, phase, status, counts), the
+         *     append-only revision row this mutation produced (source-linked,
+         *     authority-recorded) and the honest idempotency disposition
+         *     (``created`` | ``deduplicated``).
+         */
+        TaskMutationOutcome: {
+            /** @description The fresh compact header view after the mutation (§8) */
+            task: components["schemas"]["TaskView"];
+            /** @description The revision-ledger row this mutation produced/replayed */
+            revision: components["schemas"]["TaskRevisionView"];
+            /**
+             * Disposition
+             * @description created for a first application, deduplicated for an idempotent replay (C4)
+             * @enum {string}
+             */
+            disposition: "created" | "deduplicated";
+        };
+        /**
+         * TaskOutcome
+         * @description Application task outcome (act_CONTRACTS §9); technical RunState frozen
+         *     at C05 rule 2 is untouched — this is the domain layer above it.
+         * @enum {string}
+         */
+        TaskOutcome: "in_progress" | "needs_input" | "partially_verified" | "verified" | "failed" | "cancelled";
+        /**
+         * TaskPlanPatch
+         * @description Bounded plan delta (§5 ``todo_patch``, §7 ``task.propose_update``).
+         *
+         *     A patch is a DELTA against the current task at ``base_revision`` — never
+         *     whole-list replacement — and stays strictly under the 16 KiB serialized
+         *     budget so it can never blow the capability dispatcher envelope.
+         */
+        TaskPlanPatch: {
+            /**
+             * Schema Version
+             * @description Patch schema version; consumers fail closed on drift
+             * @default 1
+             */
+            schema_version: number;
+            /**
+             * Source Message Id
+             * Format: uuid
+             * @description User message this interpretation/patch was produced from
+             */
+            source_message_id: string;
+            /**
+             * Base Revision
+             * @description Expected task revision for compare-and-swap (§1)
+             */
+            base_revision: number;
+            /**
+             * Idempotency Key
+             * Format: uuid
+             * @description Caller key so retransmitted patches deduplicate (§1)
+             */
+            idempotency_key: string;
+            /**
+             * Title
+             * @description Proposed task header title (≤ 240 chars)
+             */
+            title?: string | null;
+            /**
+             * Summary
+             * @description Proposed task summary (≤ 1000 chars)
+             */
+            summary?: string | null;
+            /**
+             * Rationale
+             * @description Why this delta is proposed (≤ 1000 chars)
+             */
+            rationale?: string | null;
+            /**
+             * Operations
+             * @description Bounded add/update/supersede operations (max 12)
+             */
+            operations?: components["schemas"]["TaskStepOperation"][];
+        };
+        /**
+         * TaskPlanStep
+         * @description One stable plan item (§7): bounded, dependency-linked, evidence-bound.
+         *
+         *     ``executed`` without evidence references is invalid (P4): "done" is only
+         *     rendered from agreed checks, never from a model-ticked boolean.
+         */
+        TaskPlanStep: {
+            /**
+             * Step Id
+             * @description Stable item ID that survives replanning deltas
+             */
+            step_id: string;
+            /**
+             * Title
+             * @description Short step title safe for browser display
+             */
+            title: string;
+            /**
+             * @description Frozen todo status of this step
+             * @default pending
+             */
+            status: components["schemas"]["StepStatus"];
+            /**
+             * @description Separate verification state bound to evidence
+             * @default not_checked
+             */
+            verification: components["schemas"]["mai__contracts__tasks__VerificationStatus"];
+            /**
+             * Evidence Refs
+             * @description Sourced evidence supporting executed/verified state
+             */
+            evidence_refs?: components["schemas"]["EvidenceRef"][];
+            /**
+             * Depends On
+             * @description Stable step IDs this step depends on; no cycles
+             */
+            depends_on?: string[];
+            /**
+             * @description Declared risk/action class of the step
+             * @default read_only
+             */
+            risk: components["schemas"]["ActionRisk"];
+            /**
+             * Prerequisite Unresolved
+             * @description True when a required prerequisite is still missing
+             * @default false
+             */
+            prerequisite_unresolved: boolean;
+            /**
+             * Expected Check
+             * @description The check that will decide this step is done
+             */
+            expected_check?: string | null;
+            /**
+             * Skip Reason
+             * @description Required reason when status is skipped
+             */
+            skip_reason?: string | null;
+        };
+        /**
+         * TaskRevisionView
+         * @description One append-only revision-log row (§8 audit; P5 shared truth).
+         *
+         *     ``author`` is the stored authority fact (``user`` for every correction
+         *     this surface accepts — never the model) and ``source_message_id`` is
+         *     the user message the revision was produced from, so a disputed
+         *     interpretation always explains itself through its origin (§8 UI
+         *     contract).
+         */
+        TaskRevisionView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Revision
+             * @description The optimistic revision token (§1)
+             */
+            revision: number;
+            /**
+             * Kind
+             * @description Frozen revision kind (create|plan_patch|item_update|metadata|completion)
+             */
+            kind: string;
+            /**
+             * Author
+             * @description Stored authority: user, model or system (§6)
+             */
+            author: string;
+            /**
+             * Source Message Id
+             * @description User message this revision was produced from, when linked
+             */
+            source_message_id: string | null;
+            /**
+             * Item Id
+             * @description Stable item ID for item-scoped revisions, else null
+             */
+            item_id: string | null;
+            /**
+             * Payload
+             * @description Bounded revision summary (operation/constraint identities)
+             */
+            payload: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Applied At
+             * @description RFC3339 UTC application timestamp
+             */
+            applied_at: string;
+        };
+        /**
+         * TaskRevisionsPage
+         * @description One bounded revision-ledger page (§8; AGENTS.md §1), newest first.
+         */
+        TaskRevisionsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Revision rows in deterministic revision-descending order
+             */
+            items?: components["schemas"]["TaskRevisionView"][];
+        };
+        /**
+         * TaskStepOperation
+         * @description One bounded patch operation against a single step (§5 delta semantics).
+         */
+        TaskStepOperation: {
+            /** @description Patch operation kind: add, update or supersede */
+            op: components["schemas"]["PatchOp"];
+            /** @description The step payload the operation applies */
+            step: components["schemas"]["TaskPlanStep"];
+            /**
+             * Position
+             * @description Requested list position for ordering-sensitive updates
+             */
+            position?: number | null;
+            /**
+             * Supersedes Step Id
+             * @description Existing step ID replaced by a supersede operation
+             */
+            supersedes_step_id?: string | null;
+        };
+        /**
+         * TaskStepView
+         * @description One plan item (§7 vocabulary mirror of the storage row).
+         *
+         *     ``executed``/``skipped`` stay visible with their evidence references
+         *     and skip reasons — "done" is rendered from agreed checks, never a
+         *     ticked boolean (§7); superseded rows stay RECORDED (P3).
+         */
+        TaskStepView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Step Id
+             * @description Stable item ID that survives replanning
+             */
+            step_id: string;
+            /**
+             * Title
+             * @description Short step title safe for browser display
+             */
+            title: string;
+            /** @description Frozen todo status of this step */
+            status: components["schemas"]["StepStatus"];
+            /** @description Separate verification state bound to evidence */
+            verification: components["schemas"]["VerificationStatus-Output"];
+            /**
+             * Position
+             * @description Deterministic list position
+             */
+            position: number;
+            /** @description Declared risk/action class of the step */
+            risk: components["schemas"]["ActionRisk"];
+            /**
+             * Prerequisite Unresolved
+             * @description True when a required prerequisite is still missing
+             */
+            prerequisite_unresolved: boolean;
+            /**
+             * Expected Check
+             * @description The check that will decide this step is done, when declared
+             */
+            expected_check: string | null;
+            /**
+             * Skip Reason
+             * @description Recorded reason when the step is skipped, otherwise null
+             */
+            skip_reason: string | null;
+            /**
+             * Result Summary
+             * @description Safe bounded result summary, when one was recorded
+             */
+            result_summary: string | null;
+            /**
+             * Evidence Refs
+             * @description Sourced evidence supporting executed/verified state
+             */
+            evidence_refs: components["schemas"]["EvidenceRef"][];
+            /**
+             * Depends On
+             * @description Stable step IDs this step depends on (no cycles)
+             */
+            depends_on: string[];
+            /**
+             * Superseded At
+             * @description RFC3339 UTC supersede timestamp for recorded history, else null
+             */
+            superseded_at: string | null;
+            /**
+             * Superseded By
+             * @description Step ID that replaced this row, else null (P3 history)
+             */
+            superseded_by: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
+        };
+        /**
+         * TaskStepsPage
+         * @description One bounded plan-step page (§8 ``GET items``; AGENTS.md §1).
+         */
+        TaskStepsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Step rows in deterministic (position, step_id) order
+             */
+            items?: components["schemas"]["TaskStepView"][];
+        };
+        /**
+         * TaskView
+         * @description Compact task header view (§8 ``GET task`` shape): revision, phase,
+         *     status and counts only — item/constraint/evidence collections are fetched
+         *     as explicitly paginated pages, never embedded here.
+         */
+        TaskView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Opaque stable task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this task (§1)
+             */
+            server_id: string;
+            /**
+             * Revision
+             * @description Current optimistic revision token
+             */
+            revision: number;
+            /**
+             * Title
+             * @description Task header title (≤ 240 chars)
+             */
+            title: string;
+            /**
+             * Summary
+             * @description Task summary (≤ 1000 chars)
+             */
+            summary?: string | null;
+            /** @description Advisory phase; never permission */
+            requested_phase: components["schemas"]["Phase"];
+            /** @description Domain outcome layer above RunState */
+            status: components["schemas"]["TaskOutcome"];
+            /**
+             * Active Step Id
+             * @description Step currently being worked on, if any
+             */
+            active_step_id?: string | null;
+            /** @description List counts for bounded rendering */
+            counts: components["schemas"]["TaskCounts"];
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
+        };
+        /**
          * TerminalSessionInfoView
          * @description Wire view for opening a terminal against one pinned target.
          */
@@ -4811,6 +6518,66 @@ export interface components {
              */
             tmux_session: string;
         };
+        /**
+         * TranscriptMessage
+         * @description One role-preserving sanitized transcript row (§1/§3).
+         *
+         *     Content may be carried as a safe ``content_ref`` instead of raw text
+         *     (C05 privacy resolution); ``redacted`` marks deliberately redacted rows,
+         *     for which no textual-fidelity claim is made.
+         */
+        TranscriptMessage: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Message Id
+             * Format: uuid
+             * @description Opaque stable message identity
+             */
+            message_id: string;
+            /**
+             * Sequence
+             * @description Conversation-local monotonic sequence number
+             */
+            sequence: number;
+            /** @description Trusted producer-assigned role */
+            role: components["schemas"]["MessageRole"];
+            /** @description Origin of the message */
+            source_kind: components["schemas"]["MessageSourceKind"];
+            /**
+             * Created At
+             * Format: date-time
+             * @description RFC3339 UTC message timestamp
+             */
+            created_at: string;
+            /**
+             * Content
+             * @description Sanitized message text when carried inline
+             * @default
+             */
+            content: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted (no fidelity claim)
+             * @default false
+             */
+            redacted: boolean;
+            /**
+             * Content Ref
+             * @description Safe out-of-band content reference instead of raw text
+             */
+            content_ref?: string | null;
+        };
+        /**
+         * TurnDisposition
+         * @description Run disposition of an accepted turn submit (§3; brief: 201/200/202).
+         * @enum {string}
+         */
+        TurnDisposition: "created" | "deduplicated" | "queued_followup";
         /**
          * UpdateSubmitBody
          * @description Update submit: adds the CURRENT recipe baseline assertion.
@@ -4851,10 +6618,22 @@ export interface components {
         };
         /**
          * VerificationStatus
+         * @description Verification is separate from execution and bound to evidence (§7).
+         * @enum {string}
+         */
+        "VerificationStatus-Output": "not_checked" | "passed" | "failed" | "unavailable";
+        /**
+         * VerificationStatus
+         * @description Verification is separate from execution and bound to evidence (§7).
+         * @enum {string}
+         */
+        mai__contracts__tasks__VerificationStatus: "not_checked" | "passed" | "failed" | "unavailable";
+        /**
+         * VerificationStatus
          * @description C07 rule 5 boundary: outcomes are separated from hypotheses.
          * @enum {string}
          */
-        VerificationStatus: "unverified" | "verified" | "hypothesis";
+        mai__knowledge__documents__VerificationStatus: "unverified" | "verified" | "hypothesis";
     };
     responses: never;
     parameters: never;
@@ -6346,6 +8125,332 @@ export interface operations {
             };
         };
     };
+    list_canonical_conversations_api_v1_chat_conversations_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationListPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_conversation_api_v1_chat_conversations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The submitted idempotency key is already bound to another server's conversation scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Idempotency key retransmitted with changed content, or another writer holds the conversation lease */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Model configuration or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTranscriptPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Idempotency key retransmitted with changed content, another writer holds the conversation lease, a stale task revision was pinned, or history reconstruction is incomplete */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Model configuration or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    steer_conversation_api_v1_chat_conversations__conversation_id__steer_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationSteerRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSteerView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No active run holds the conversation lease, or the idempotency key was retransmitted (deduplicated, 200) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation (steer requires a message; pause/cancel carry none) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     list_conversations_api_v1_chat_runs_get: {
         parameters: {
             query?: {
@@ -6686,6 +8791,527 @@ export interface operations {
                 };
             };
             /** @description Last-Event-ID cursor is not a non-negative integer */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_canonical_conversation_api_v1_chat_conversations__conversation_id__get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationDetailView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_canonical_events_api_v1_chat_conversations__conversation_id__events_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
+                server_id: string;
+                /** @description Replay cursor: return only strictly newer events */
+                after_seq?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationEventsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_conversation_task_api_v1_chat_conversations__conversation_id__task_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_steps_api_v1_chat_tasks__task_id__items_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                /** @description Include superseded rows (recorded P3 history) in the page */
+                include_superseded?: boolean;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_constraints_api_v1_chat_tasks__task_id__constraints_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                /** @description Include superseded rows (recorded P3 history) in the page */
+                include_superseded?: boolean;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskConstraintsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_evidence_api_v1_chat_tasks__task_id__evidence_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskEvidencePage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_revisions_api_v1_chat_tasks__task_id__revisions_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRevisionsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_task_correction_api_v1_chat_tasks__task_id__revisions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskCorrectionBody"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of an already-applied correction (C4) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale base revision (C6) or contract rejection */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The proposed patch is contract-invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    submit_task_decision_api_v1_chat_tasks__task_id__decisions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskDecisionBody"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of an already-applied decision (C4) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale named revision (C6) or frozen-transition rejection */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The decision is contract-invalid */
             422: {
                 headers: {
                     [name: string]: unknown;

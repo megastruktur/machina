@@ -69,6 +69,7 @@ from mai.api.auth import (
     resolve_trusted_proxies,
 )
 from mai.api.chat import register_chat
+from mai.api.conversations import register_conversations
 from mai.api.documents import (
     EMBEDDINGS_BASE_URL_VAR,
     EMBEDDINGS_CREDENTIAL_REF_VAR,
@@ -95,6 +96,7 @@ from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
+from mai.api.tasks import register_tasks
 from mai.api.terminal import register_terminal
 from mai.memory.hindsight import (
     HindsightProvider,
@@ -103,8 +105,10 @@ from mai.memory.hindsight import (
 )
 from mai.capabilities.internal_api import (
     INTERNAL_API_CAPABILITY_IDS,
+    InternalApiComposition,
     build_internal_api_capabilities,
 )
+from mai.capabilities.task_state import build_task_state_capabilities
 from mai.applications.adopt import (
     ApplicationAdoption,
     ApplicationManifestStore,
@@ -355,6 +359,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             data_root=resolve_profiles_root(app.state.env),
             env_resolver=lambda: app.state.credentials,
         )
+        # Task-state tools (act 14-task-tools, act_CONTRACTS §7): the
+        # bounded read/proposal/item-update surface over the ONE task
+        # service, registered through the SAME composition seam so every
+        # consumer of ``app.state.internal_api`` sees one
+        # descriptor→executor surface. Descriptors are validated
+        # fail-closed at composition time; a missing database composition
+        # (``session_factory=None``) yields executors that answer
+        # unavailable.
+        _task_state = build_task_state_capabilities(
+            session_factory=app.state.session_factory,
+        )
+        app.state.internal_api = InternalApiComposition(
+            descriptors=(
+                *app.state.internal_api.descriptors,
+                *_task_state.descriptors,
+            ),
+            executors={
+                **app.state.internal_api.executors,
+                **_task_state.executors,
+            },
+        )
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
         # atomic store over the same explicitly configured data root (the
         # store appends its own ``models/`` namespace). Credential material
@@ -517,6 +542,23 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # delegation facade — HTTP persists intent only; model rounds, tool
     # calls and child workflows run in the worker.
     register_chat(app)
+    # The canonical conversation history surface (act_CONTRACTS §3/§4):
+    # bounded, explicitly server-scoped reads over the app-owned
+    # conversation store — the paginated list/detail/transcript pages and
+    # the cursor-deduplicated metadata event page, with honest legacy-gap
+    # labels (partial/unavailable) instead of invented turns. Read-only:
+    # writes stay on the reviewed chat submit/steer seam.
+    register_conversations(app)
+    # The task read/correction/decision surface (act_CONTRACTS §6/§8): the
+    # compact header view for the conversation's ONE active episode, the
+    # explicitly server-scoped paginated items/constraints/evidence/
+    # revisions pages, the authenticated user correction route (ONE shared
+    # revision service call: CAS + idempotency + source-linked,
+    # author=user) and the distinct decision route (advisory phase
+    # selection, pause/cancel) — operation approvals stay on the C03
+    # approvals surface; metadata decisions never authorize or terminate
+    # target operations.
+    register_tasks(app)
     # The model configuration/selection/probe surface (C03 rule 6/C06
     # rule 1): connection/profile/selection records over the confined
     # atomic store — credential references only, never resolved material
