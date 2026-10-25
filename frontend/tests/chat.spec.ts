@@ -500,6 +500,7 @@ const APP_SOURCE = `
 		},
 		async getConversation(conversationId, serverId) {
 			calls.push({ op: 'getConversation', runId: conversationId, serverId });
+			consumeReadFailure();
 			const row = canonicalStore[String(conversationId)];
 			// C8: the scope-blind 404 — never an existence or content leak.
 			if (!row || row.server_id !== serverId) {
@@ -3440,5 +3441,186 @@ test.describe('dock task services mount (24b D-2)', () => {
 		]) {
 			expect(await callsOf(page, op), op).toHaveLength(0);
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 24c D-3 — terminal canonical reopen VISIBILITY. V6-retest proved the live
+// defect: a completed canonical conversation (active_run_id NULL) restores
+// with the legacy fold null (`display = refreshed ?? conversation` stays
+// null), the section got `mai-chat__section--idle`, and the docked rule
+// `.mai-chat--docked .mai-chat__section--idle { display:none }` hid the
+// ENTIRE conversation — transcript, Understanding and Plan. These focused
+// cases drive the EXISTING canonical restore seam (history rows) at 360×640
+// and pin the state condition directly: an open canonical identity must
+// never carry the idle class. The DOCKED visibility proof (computed
+// display:none red-before/green-after) lives in the composed DesktopShell
+// suite, which mounts the real bottom dock. The blank-draft idle behavior
+// must stay exactly as it is.
+// ---------------------------------------------------------------------------
+
+test.describe('terminal canonical reopen visibility (24c D-3)', () => {
+	test.use({ viewport: { width: 360, height: 640 } });
+
+	test('a completed canonical conversation (active_run_id null) reopens with transcript, Understanding and Plan visible', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical', { tasks: true });
+		// Pocket-viewport convention (chat layout tests): isolate the main
+		// host so sibling sections cannot intercept the compose interaction.
+		await page.addStyleTag({
+			content: 'body { margin: 0; } #app > section:not([data-testid="host-main"]) { display:none; }'
+		});
+		const main = page.getByTestId('host-main');
+
+		// Finish a conversation: submit, the producer appends the reply and
+		// releases the writer lease — server truth: active_run_id NULL after.
+		// (Canonical submits ride createConversation — never submitMessage.)
+		await main.getByTestId('compose-message').fill('Terminal question about the plan');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(
+			main
+				.getByTestId('canonical-user-message')
+				.filter({ hasText: 'Terminal question about the plan' })
+		).toBeVisible();
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		expect(conversationId).not.toBeNull();
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'Terminal recorded answer');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+
+		// New Chat: the intentional blank-draft idle state stays untouched —
+		// the repair must never fake an open conversation here.
+		await main.getByTestId('chat-new-session').click();
+		await expect(main.getByTestId('chat-conversation')).toHaveClass(/mai-chat__section--idle/);
+		await expect(main.getByTestId('chat-none')).toBeVisible();
+		await expect(main.getByTestId('task-understanding')).toHaveCount(0);
+
+		// Reopen the COMPLETED conversation from drawer-style history rows.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await main
+			.getByTestId('chat-history-item')
+			.filter({ hasText: String(conversationId).slice(0, 8) })
+			.click();
+
+		// An open canonical identity must NOT be idle: real transcript, real
+		// §8 data, nonzero box — not a hidden section, not a fabricated run.
+		await expect(main.getByTestId('chat-conversation')).toBeVisible();
+		await expect(main.getByTestId('chat-conversation')).not.toHaveClass(
+			/mai-chat__section--idle/
+		);
+		const box = await main.getByTestId('chat-conversation').boundingBox();
+		expect(box, 'completed reopen conversation box').not.toBeNull();
+		expect(box!.height).toBeGreaterThan(0);
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Terminal question about the plan'
+		);
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText(
+			'Terminal recorded answer'
+		);
+		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('task-understanding-scope-title')).toHaveText(
+			'Fixture plan-only task'
+		);
+		await expect(main.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
+		await expect(main.getByTestId('task-understanding-step-row')).toHaveCount(2);
+		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('task-plan-evidence-empty')).toBeVisible();
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+	});
+
+	test('a plain canonical conversation without a task reopens with visible messages and no task fabrication', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// The recorded Global consult (the V6 9ce236c1 shape: plain, no task).
+		await page.evaluate(
+			([sentinel, rowId]) =>
+				window.__maiChatApi!.seedCanonicalRow(sentinel, rowId, 'Plain recorded consult'),
+			[GLOBAL_CONSULT_SERVER_ID, GLOBAL_CONV]
+		);
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('chat-history-item')).toHaveCount(1);
+		await main.getByTestId('chat-history-item').first().click();
+
+		await expect(main.getByTestId('chat-conversation')).toBeVisible();
+		await expect(main.getByTestId('chat-conversation')).not.toHaveClass(
+			/mai-chat__section--idle/
+		);
+		const box = await main.getByTestId('chat-conversation').boundingBox();
+		expect(box, 'plain reopen conversation box').not.toBeNull();
+		expect(box!.height).toBeGreaterThan(0);
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Seeded question — Plain recorded consult'
+		);
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText(
+			'Seeded recorded answer — Plain recorded consult'
+		);
+		// No task slice bound: both §8 blocks fail closed honestly and zero
+		// task requests leave the page — absence, never fabrication. (The
+		// unbound note's own visibility at this viewport belongs to the 24b
+		// suite; here the §8 state honesty rides the section data-state and
+		// its recorded note text.)
+		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'unbound');
+		await expect(main.getByTestId('task-understanding')).toContainText(
+			'No task services are bound; nothing is fetched or fabricated.'
+		);
+		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'unbound');
+		await expect(main.getByTestId('task-plan')).toContainText(
+			'No task services are bound; nothing is fetched or fabricated.'
+		);
+		for (const op of [
+			'getConversationTask',
+			'listTaskSteps',
+			'listTaskConstraints',
+			'listTaskEvidence',
+			'listTaskRevisions'
+		]) {
+			expect(await callsOf(page, op), op).toHaveLength(0);
+		}
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+	});
+
+	test('a fail-closed restore 404 renders its error visibly instead of collapsing silently', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// Arm the producer failure the restore must surface: the detail read
+		// answers with the scope-blind 404 (C8 preserved, C05 honesty kept).
+		await page.evaluate(() =>
+			window.__maiChatApi!.failNextRead({
+				status: 404,
+				code: 'not_found',
+				message: 'no conversation in the requesting server scope'
+			})
+		);
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('chat-history-item').filter({ hasText: 'Restore me' }).click();
+
+		// The structured error must be VISIBLE: pre-repair the restore catch
+		// wiped the problem state and collapsed to the blank draft — a silent
+		// failure. With the open canonical identity the alert stays mounted.
+		await expect(main.getByTestId('canonical-problem')).toBeVisible();
+		await expect(main.getByTestId('canonical-problem')).toHaveAttribute(
+			'data-error-code',
+			'not_found'
+		);
+		await expect(main.getByTestId('canonical-problem')).toContainText(
+			'no conversation in the requesting server scope'
+		);
+		await expect(main.getByTestId('chat-conversation')).toBeVisible();
+		await expect(main.getByTestId('chat-conversation')).not.toHaveClass(
+			/mai-chat__section--idle/
+		);
 	});
 });

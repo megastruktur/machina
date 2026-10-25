@@ -1219,6 +1219,10 @@
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
+			// 24c D-3: the identity stays OPEN with the structured problem —
+			// exactly the messages-load failure path. Wiping it here collapsed
+			// the dock to the blank draft and silently hid the fail-closed
+			// restore error (wrong scope → 404) from the user.
 			canonicalProblem = {
 				code,
 				message: friendlyText(
@@ -1226,7 +1230,6 @@
 					messageOf(error) ?? 'The conversation could not be restored.'
 				)
 			};
-			resetCanonicalView();
 		} finally {
 			if (!disposed) canonicalBusy = false;
 		}
@@ -2897,9 +2900,14 @@
 		</header>
 
 		<div class="mai-chat__body" hidden={isDocked && dockCollapsed} data-testid="chat-root">
+		<!-- 24c D-3: idle means "no conversation open at all". An open or
+		     restoring canonical identity (canonicalId nonempty) is NOT idle
+		     even while the legacy fold is null (completed conversation,
+		     active_run_id null) — the docked idle-collapse rule must never
+		     hide a reopened transcript, Understanding or Plan. -->
 		<section
 			class="mai-chat__section mai-chat__section--conversation"
-			class:mai-chat__section--idle={display === null}
+			class:mai-chat__section--idle={display === null && !canonicalMode}
 			aria-label="Open conversation"
 			data-testid="chat-conversation"
 		>

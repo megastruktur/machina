@@ -1350,6 +1350,69 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		expect(one.status, one.path).toBeLessThan(400);
 	}
 
+	// --- 24c D-3: the COMPLETED reopen at 360×640 ----------------------------
+	// Server truth after a run goes terminal: active_run_id is NULL (the V6
+	// production shape for the completed plan-only conversations). Reopening
+	// the completed conversation from the drawer history must leave the
+	// conversation section, transcript, Understanding and Plan ACTUALLY
+	// visible — the docked idle-collapse rule must not hide them. The blank
+	// draft before the reopen must keep its intentional idle collapse.
+	epoch = 3;
+	conversations.get(CREATED_ID)!.activeRunId = null;
+	conversations.get(CREATED_ID)!.updatedAt = '2026-10-25T15:30:00Z';
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	await dock.getByTestId('chat-server-chip-remove').click();
+	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+	// The blank draft keeps the idle/compact collapse: no fake expansion, no
+	// spurious task content without an open conversation.
+	await expect(dock.getByTestId('chat-conversation')).toHaveClass(/mai-chat__section--idle/);
+	await expect(dock.getByTestId('chat-conversation')).not.toBeVisible();
+	await expect(dock.getByTestId('task-understanding')).toHaveCount(0);
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await expect(
+		drawer.getByTestId('drawer-history-item').filter({ hasText: CREATED_ID.slice(0, 8) })
+	).toHaveCount(1);
+	await drawer
+		.getByTestId('drawer-history-item')
+		.filter({ hasText: CREATED_ID.slice(0, 8) })
+		.click();
+	// THE 24c defect: the reopened section is visible with real content —
+	// not display:none behind `.mai-chat--docked .mai-chat__section--idle`.
+	await expect(dock.getByTestId('chat-conversation')).toBeVisible();
+	await expect(dock.getByTestId('chat-conversation')).not.toHaveClass(/mai-chat__section--idle/);
+	const conversationBox = await dock.getByTestId('chat-conversation').boundingBox();
+	expect(conversationBox, 'terminal reopen conversation box').not.toBeNull();
+	expect(conversationBox!.height).toBeGreaterThan(0);
+	await expect(
+		dock.getByTestId('canonical-user-message').filter({ hasText: 'Global consult from composed dock' })
+	).toBeVisible();
+	// Honest status: with no bound run the badge states the neutral truth —
+	// never a fabricated terminal state (C08 rule 6).
+	await expect(dock.getByTestId('conversation-state')).toHaveText('Conversation');
+	await expect(dock.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-understanding-scope-title')).toHaveText(
+		'Decommission the legacy cron job'
+	);
+	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
+	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+	// The terminal epoch obeys the same scope rule: post-unpin every canonical
+	// read rides the sentinel and nothing 404s.
+	const terminal = canonicalRequests.filter((one) => one.epoch === 3);
+	expect(terminal.length, 'epoch 3 recorded').toBeGreaterThan(0);
+	const terminalSentinel = terminal.findIndex((one) => one.serverId === GLOBAL_SENTINEL);
+	expect(terminalSentinel, 'epoch 3 sentinel seen').toBeGreaterThan(-1);
+	for (const [index, one] of terminal.entries()) {
+		if (index < terminalSentinel) {
+			expect(one.serverId, `epoch 3 pre-unpin ${one.path}`).toBe(LIVE_SERVER_ID);
+		} else {
+			expect(one.serverId, `epoch 3 post-unpin ${one.path}`).toBe(GLOBAL_SENTINEL);
+		}
+		expect(one.status, one.path).toBeLessThan(400);
+	}
+
 	// --- the §8 task-read audit ----------------------------------------------
 	// Pre-repair the dock's services bag carried NO task methods: both blocks
 	// rendered "unbound" and these requests never left the page. Every task
