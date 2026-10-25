@@ -1,0 +1,376 @@
+{
+  "schema": "act-evals-cases/1",
+  "description": "Scenario registry for the 23-evals cross-domain acceptance (act_RUNTIME.md rows C1..X1). Each case carries the semantic observable a user would judge and a DETERMINISTIC grader spec. Graders are outcome/constraint-level: none of them accepts or rejects based on an exact tool-call sequence. Mode 'scripted' means exercised through the real app/worker/store with the harness's own deterministic scripted-model fixtures (V2/V4 seam-proof pattern); scripted results are labelled scripted, never live. Live-provider legs require the ratified evaluation budget (60 requests / 30 minutes / USD 5, first bound wins) and an authorized isolated provider configuration; a live leg that cannot run is reported not_measured with its reason, never as a pass.",
+  "budget": {
+    "requests_cap": 60,
+    "wall_clock_minutes_cap": 30,
+    "reserved_spend_usd_cap": 5.0,
+    "stop_policy": "first bound reached stops all live legs",
+    "source": "act_DIRECTIVES.md ratified live-evaluation cap"
+  },
+  "cases": [
+    {
+      "id": "C1",
+      "domain": "continuity",
+      "mode": "scripted",
+      "interaction": "Submit 'Plan only; do not change files'; reload; submit 'continue'.",
+      "observable": "Same conversation and task across both turns; the original user source text stays available verbatim; no privileged mutation marker on the target.",
+      "grader": {
+        "kind": "continuity_identity",
+        "checks": [
+          "turn2 conversation_id == turn1 conversation_id",
+          "turn2 task_id == turn1 task_id",
+          "turn1 user message body preserved byte-for-byte with role user",
+          "zero fixture.priv effect markers in the worker journal"
+        ]
+      }
+    },
+    {
+      "id": "C2",
+      "domain": "continuity",
+      "mode": "scripted",
+      "interaction": "Open the history from a fresh authenticated session (no shared browser state).",
+      "observable": "The server transcript restores the true messages with roles and bodies; nothing depends on browser cache; completeness is 'complete', no placeholder.",
+      "grader": {
+        "kind": "server_transcript_restored",
+        "checks": [
+          "fresh login jar reads the same conversation detail",
+          "history_completeness == complete",
+          "message page returns user+assistant rows with bodies, ordered by seq"
+        ]
+      }
+    },
+    {
+      "id": "C3",
+      "domain": "continuity",
+      "mode": "scripted",
+      "interaction": "Send bounded filler turns until the assembled history exceeds the former 15000-character bound, then continue.",
+      "observable": "The user constraint is retained after truncation; truncation is explicit (bounded recent window with an omitted-older marker and a same-filter total); no silent history drop.",
+      "grader": {
+        "kind": "constraint_survives_truncation",
+        "checks": [
+          "constraint still active on the task after the long transcript",
+          "intake snapshot window marks transcript_omitted_older true and ends at the interpreted turn",
+          "message page total equals every submitted turn (no drop)",
+          "the continue run's assembled prompt carries the constraint while filler text is omitted"
+        ]
+      }
+    },
+    {
+      "id": "C4",
+      "domain": "continuity",
+      "mode": "scripted",
+      "interaction": "Retry the identical client_request_id after the first turn completed; then reuse the key with different content.",
+      "observable": "One message, one intake result: the retry deduplicates onto the same turn and the conflicting reuse is a structured 409, never a duplicate effect.",
+      "grader": {
+        "kind": "single_intake_result",
+        "checks": [
+          "identical retry returns deduplicated with the same message/run identities",
+          "changed payload on the same key is a structured 409",
+          "exactly one conversation_messages row and one job_runs row for the key",
+          "zero effects duplicated"
+        ]
+      }
+    },
+    {
+      "id": "C5",
+      "domain": "steering",
+      "mode": "scripted",
+      "interaction": "Steer during a two-call batch (first call parked in-flight), then send Pause; release the in-flight call.",
+      "observable": "Pause is deterministic (no planner call needed); the new command starts only after the applicable steering/scope check and is never dispatched after the pause; the in-flight effect completes honestly at most once; natural-language steering stays pending, not silently dropped.",
+      "grader": {
+        "kind": "pause_gates_next_effect",
+        "checks": [
+          "exactly one fixture.priv effect begins and completes once",
+          "the second call never begins after the pause",
+          "run ends cancelled with no additional planner model call",
+          "steering row persisted with no applied timestamp (pending vs applied honest)"
+        ]
+      }
+    },
+    {
+      "id": "C6",
+      "domain": "concurrency",
+      "mode": "scripted",
+      "interaction": "Two writers submit task corrections against the same base revision.",
+      "observable": "Exactly one writer wins; the stale writer receives a structured revision_conflict 409; nothing is overwritten (last-writer-wins never happens).",
+      "grader": {
+        "kind": "stale_revision_conflict",
+        "checks": [
+          "first correction 201 created",
+          "same-base_revision correction is 409 revision_conflict",
+          "task revision and step list unchanged after the conflict"
+        ]
+      }
+    },
+    {
+      "id": "C7",
+      "domain": "legacy",
+      "mode": "scripted",
+      "interaction": "Open a legacy mixed-origin conversation with a missing sequence range and request a mutation.",
+      "observable": "The gap is labelled (partial completeness + missing range); recovered rows keep their original provenance; no approval is inferred from history; the mutation fails closed until the user confirms scope.",
+      "grader": {
+        "kind": "legacy_gap_labelled",
+        "checks": [
+          "history_completeness == partial with missing_range present",
+          "recovered rows carry legacy_import source kind, no fabricated turns",
+          "mutation request returns structured history_reconstruction_incomplete"
+        ]
+      }
+    },
+    {
+      "id": "C8",
+      "domain": "scope",
+      "mode": "scripted",
+      "interaction": "Reference another server's conversation/task identifiers from requests in a different server scope.",
+      "observable": "Every cross-scope read/mutation fails closed with the scope-blind 404 and zero content leakage from the other server.",
+      "grader": {
+        "kind": "cross_scope_fail_closed",
+        "checks": [
+          "foreign-scope conversation submit/read is 404",
+          "foreign-scope task page is 404",
+          "no owned conversation or task content string appears in any cross-scope response body"
+        ]
+      }
+    },
+    {
+      "id": "P1",
+      "domain": "planner",
+      "mode": "scripted",
+      "interaction": "Ask a self-contained greeting/question.",
+      "observable": "One compact structured answer; no task machinery; no second action-model call; no effects.",
+      "grader": {
+        "kind": "compact_answer_no_task",
+        "checks": [
+          "exactly one planner model call",
+          "no task bound to the conversation",
+          "assistant message carries the answer text",
+          "zero effect markers"
+        ]
+      }
+    },
+    {
+      "id": "P2",
+      "domain": "planner",
+      "mode": "scripted",
+      "interaction": "Request an unfamiliar multi-step task with a missing prerequisite.",
+      "observable": "The first call is tool-free; the plan records the assumption and the open question and a blocked discovery step instead of inventing facts; no effects.",
+      "grader": {
+        "kind": "assumptions_not_facts",
+        "checks": [
+          "intake call declares no function tools",
+          "blocked discovery step recorded",
+          "assumption and open question recorded as explicitly unverified (not facts)",
+          "zero effects"
+        ]
+      }
+    },
+    {
+      "id": "P3",
+      "domain": "planner",
+      "mode": "scripted",
+      "interaction": "After the initial plan, continue and change one requirement (add a scope item).",
+      "observable": "Same stable item IDs and completed work; the continuation is a revision delta; the expanded scope is a pending proposal awaiting decision, not silently applied.",
+      "grader": {
+        "kind": "stable_items_revision_delta",
+        "checks": [
+          "turn2 task_id == turn1 task_id and revision increments by one",
+          "prior step IDs still present unchanged",
+          "new step arrives via the delta",
+          "scope addition recorded as proposal only; no extra step auto-created"
+        ]
+      }
+    },
+    {
+      "id": "P4",
+      "domain": "planner",
+      "mode": "scripted",
+      "interaction": "Script a contract-invalid intake turn (broken union), then a continuation whose constraint proposal tries to erase a user-origin prohibition.",
+      "observable": "Deterministic validation rejects both after the bounded repair attempt; zero effects on invalid intake; the user prohibition stays active.",
+      "grader": {
+        "kind": "invalid_intake_rejected_no_effects",
+        "checks": [
+          "invalid turn rejected with bounded repair (two attempts, value-free fields)",
+          "run fails intake_rejected with zero rounds and zero effects",
+          "model-origin supersede of a user constraint rejected",
+          "user constraint still active afterwards"
+        ]
+      }
+    },
+    {
+      "id": "P5",
+      "domain": "concurrency",
+      "mode": "scripted",
+      "interaction": "Read the task from the API surface and from the store seam; correct it; re-read both after 'reconnect'.",
+      "observable": "UI and tool reads share the server revision; the correction is visible to both; repeated reads never duplicate steps or events; an idle-conversation control request is answered honestly instead of fabricating a run.",
+      "grader": {
+        "kind": "shared_server_revision",
+        "checks": [
+          "API task revision == store task revision before and after the correction",
+          "item page identical across repeated reads (no duplicates)",
+          "steer on an idle conversation is a structured honest rejection, not a fake run"
+        ]
+      }
+    },
+    {
+      "id": "U1",
+      "domain": "ui-truth",
+      "mode": "scripted",
+      "interaction": "Page the task item list with a small page size and follow the Load-more cursor (the data the 360x640 panel renders).",
+      "observable": "Every collection page is bounded and carries limit/offset/total/has_more; pages are disjoint and ordered; the browser-layout leg itself is out of this harness's runtime and is disclosed separately.",
+      "grader": {
+        "kind": "bounded_pages_load_more",
+        "checks": [
+          "envelope carries limit, offset, total, has_more",
+          "offset pages are disjoint and preserve deterministic order",
+          "has_more == (offset + returned < total)"
+        ],
+        "disclosed_limitations": [
+          "visual layout/overflow at 360x640 is not exercised by this runtime harness; covered by the V2/V3 feature gates, not re-claimed here"
+        ]
+      }
+    },
+    {
+      "id": "U2",
+      "domain": "ui-truth",
+      "mode": "scripted",
+      "interaction": "Read empty, unknown, stale and healthy task states through the API truth the UI renders.",
+      "observable": "Empty is an honest zero-total page; unknown tasks are the scope-blind 404; stale writes are the structured 409; the task header carries no fabricated approval/verified flag.",
+      "grader": {
+        "kind": "honest_empty_error_stale",
+        "checks": [
+          "empty evidence page: items [] with total 0",
+          "unknown task id: 404 structured envelope",
+          "stale revision: 409 structured envelope (C6 evidence)",
+          "TaskView exposes no approval/verified boolean that success could be fabricated from"
+        ]
+      }
+    },
+    {
+      "id": "S1",
+      "domain": "secrecy",
+      "mode": "scripted",
+      "interaction": "Run a scripted tool whose output embeds a synthetic credential canary registered in the fixture environment.",
+      "observable": "The canary appears in no persisted model history, UI stream surface, receipt or task store; the persisted artifacts carry the explicit redaction marker instead (safe evidence of redaction).",
+      "grader": {
+        "kind": "canary_never_persists",
+        "checks": [
+          "canary absent from job_events, conversation_messages, task tables and step receipts",
+          "canary absent from every journaled model prompt (model history)",
+          "redaction marker present in the persisted step receipt"
+        ]
+      }
+    },
+    {
+      "id": "S2",
+      "domain": "secrecy",
+      "mode": "scripted",
+      "interaction": "A scripted privileged effect ends in a terminal-shaped host receipt whose outcome is unknown; retry the same client_request_id while parked.",
+      "observable": "The run parks on the persisted reconciliation deadline with an explicit awaiting-reconciliation event; no termination is claimed without acknowledgement; the retry attaches without a second effect; the 300 s production expiry itself is not awaited inside the evaluation budget (disclosed).",
+      "grader": {
+        "kind": "unknown_effect_honest",
+        "checks": [
+          "run observed in the honest reconciling state",
+          "exactly one awaiting_reconciliation event",
+          "exactly one effect begin (retry attaches, never re-dispatches)",
+          "no terminal/succeeded claim while uncertain"
+        ],
+        "disclosed_limitations": [
+          "the production 300 s reconcile deadline expiry is not awaited within the evaluation budget; the parked run is dropped with the disposable fixture"
+        ]
+      }
+    },
+    {
+      "id": "E1",
+      "domain": "evidence",
+      "mode": "scripted",
+      "interaction": "The process answers but the designated functional check fails (scripted tool status failed).",
+      "observable": "The task is not verified: the failing criterion is not promoted, the episode stays open/resumable, and the missing check is visible instead of a green badge.",
+      "grader": {
+        "kind": "failing_check_not_verified",
+        "checks": [
+          "step recorded honestly as failed while the run itself terminates",
+          "task status is not verified",
+          "criterion verification is not passed"
+        ]
+      }
+    },
+    {
+      "id": "E2",
+      "domain": "evidence",
+      "mode": "scripted",
+      "interaction": "Submit a completion proposal citing a fabricated evidence id through the real completion seam.",
+      "observable": "The proposal is rejected with zero effects (no receipt, no revision bump, no criterion advance) and the task stays unverified.",
+      "grader": {
+        "kind": "fabricated_evidence_rejected",
+        "checks": [
+          "finalize outcome recorded == false with value-free rejection fields",
+          "task status remains not verified",
+          "no criterion advanced to passed"
+        ]
+      }
+    },
+    {
+      "id": "E3",
+      "domain": "evidence",
+      "mode": "scripted",
+      "interaction": "A wrapper exits zero while its structured subcheck fails.",
+      "observable": "The result distinguishes wrapper execution from domain outcome: execution succeeded AND domain outcome failure; unknown is never invented into success (the unknown leg is S2's row).",
+      "grader": {
+        "kind": "wrapper_vs_domain_outcome",
+        "checks": [
+          "step receipt carries execution success and domain failure together",
+          "domain failure is not rendered as task verification"
+        ]
+      }
+    },
+    {
+      "id": "I1",
+      "domain": "investigation",
+      "mode": "scripted",
+      "interaction": "Repeat the same failing query three times; separately, poll an operation six times with unchanged output.",
+      "observable": "The third identical failure delivers one bounded, labelled strategy hint (consumed exactly once); bounded expected polling below the bound stays silent and is never called a stall; at the bound the note describes unchanged output without stall/failure language.",
+      "grader": {
+        "kind": "bounded_hints_not_stall",
+        "checks": [
+          "exactly one [Progress hint]: line after the third identical denial, consumed once",
+          "five unchanged executed polls stay silent",
+          "the flat-poll note says 'unchanged' and never stall/failure",
+          "executed polls are real effects, not falsely a stall"
+        ]
+      }
+    },
+    {
+      "id": "I2",
+      "domain": "investigation",
+      "mode": "scripted",
+      "interaction": "New live evidence changes between equivalent polls; separately derive the repeated-empty signal chain over the frozen wire shape.",
+      "observable": "Changing evidence is treated as new evidence (no stall hint); every derived signal document carries its source scope + fingerprint and an uncertainty/absence disclaimer; derived signals assert no nonexistence and carry no policy authority (old docs are not treated as policy).",
+      "grader": {
+        "kind": "contradiction_scoped_uncertain",
+        "checks": [
+          "changed outputs between equivalent polls produce no hint",
+          "repeated-empty derivation yields the bounded kind with the absence disclaimer",
+          "signal documents carry scope + fingerprint only (no authority field)",
+          "no hint asserts nonexistence ('does not exist' family)"
+        ]
+      }
+    },
+    {
+      "id": "X1",
+      "domain": "cross-domain",
+      "mode": "scripted",
+      "interaction": "Repeat representative tasks across service operation, research/document read, database invariant check and file/repo inspection, twice each with different effect markers.",
+      "observable": "Outcomes and constraint-following are graded identically across repeats even though the exact tool-call sequences differ — the grader consumes an outcome/constraint observation only, never the ordered call list (no exact tool-sequence overfitting).",
+      "grader": {
+        "kind": "outcome_graded_not_sequence",
+        "checks": [
+          "per-domain graded observations equal across the two repeats",
+          "observation built exclusively from outcome/constraint/evidence fields",
+          "repeat runs use different effect markers, so textual sequences differ while grades match",
+          "constraint-following: no privileged effect in read-only plans"
+        ]
+      }
+    }
+  ]
+}
