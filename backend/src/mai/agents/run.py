@@ -139,6 +139,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mai.agents import conversation_context
 from mai.agents import conversation_store
 from mai.agents import task_completion
+from mai.agents import task_progress
 from mai.agents import task_store
 from mai.agents.intake import IntakeRejection, arun_intake_turn
 from mai.agents.context import (
@@ -694,6 +695,42 @@ def initial_history_json(system_prompt: str, user_message: str) -> str:
         ModelRequest(parts=[UserPromptPart(content=user_message)]),
     ]
     return ModelMessagesTypeAdapter.dump_json(seed).decode("utf-8")
+
+
+def _progress_note_text(progress_hint_json: str | None) -> str | None:
+    """The bounded rendered progress hint of one round (22-progress).
+
+    Fail-closed both ways: an absent/``null``/malformed document renders
+    NO note (the default keeps every legacy round byte-identical), and
+    the rendered sentence is the derivation's own bounded text — value-
+    free advisory guidance, never a tool result and never an effect.
+    """
+    if not progress_hint_json or progress_hint_json == "null":
+        return None
+    try:
+        document = json.loads(progress_hint_json)
+    except ValueError:
+        return None
+    hint = task_progress.render_hint_text(document)
+    return f"[Progress hint]: {hint}" if hint else None
+
+
+def compose_round_prompt(
+    steered_prompt: str | None, progress_note: str | None
+) -> str | None:
+    """The next model round's prompt text (22-progress composition).
+
+    User steering keeps its reviewed ``[User steering message]`` framing
+    and authority; the runtime hint follows AFTER it, explicitly labeled
+    ``[Progress hint]`` so it can never be mistaken for user input. Both
+    absent → ``None`` (the legacy prompt argument for a plain deferred-
+    result round, byte-identical).
+    """
+    if progress_note is None:
+        return steered_prompt
+    if steered_prompt is None:
+        return progress_note
+    return f"{steered_prompt}\n\n{progress_note}"
 
 
 # ---------------------------------------------------------------------------
@@ -2171,6 +2208,7 @@ class AgentRunExecutor:
         deferred_json: str | None,
         round_index: int,
         steered_json: str | None = None,
+        progress_hint_json: str | None = None,
     ) -> dict[str, object]:
         """One durable model round (see module docstring).
 
@@ -2178,6 +2216,10 @@ class AgentRunExecutor:
         final text or the deferred tool-request list with each call's
         deterministic step sequence. Classified failures raise
         :class:`AgentStageError` (bind/credential/provider classes).
+        ``progress_hint_json`` (22-progress) is the checkpointed bounded
+        no-progress derivation's document (or ``None``/``"null"``); it
+        renders as a labeled advisory round prefix after any user
+        steering and changes no tool effect anywhere.
         """
         binding = _binding_from_pins(pins)
         selection = binding.selection()
@@ -2245,9 +2287,12 @@ class AgentRunExecutor:
                     steered_prompt = "\n\n".join(
                         f"[User steering message]: {msg}" for msg in cleaned
                     )
+        prompt_text = compose_round_prompt(
+            steered_prompt, _progress_note_text(progress_hint_json)
+        )
         try:
             result = await agent.run(
-                steered_prompt,
+                prompt_text,
                 message_history=history,
                 deferred_tool_results=deferred,
             )
@@ -3009,6 +3054,7 @@ def _agent_model_round(
     deferred_json: str | None,
     round_index: int,
     steered_json: str | None = None,
+    progress_hint_json: str | None = None,
 ) -> dict[str, object]:
     """One durable conversation round (checkpointed)."""
     intent = parse_agent_run_intent(payload_json)
@@ -3021,6 +3067,7 @@ def _agent_model_round(
             deferred_json,
             round_index,
             steered_json,
+            progress_hint_json,
         )
     )
 
@@ -3047,6 +3094,30 @@ def _agent_task_header_refreshed(
     intent = parse_agent_run_intent(payload_json)
     executor = _resolve_agent_run()
     return executor.run(executor.arefresh_task_header(intent))
+
+
+@DBOS.step(name="agents.progress_hint_checked")
+def _agent_progress_hint(
+    payload_json: str,
+    history_json: str,
+    round_results_json: str,
+) -> str:
+    """One checkpointed bounded no-progress derivation (22-progress).
+
+    A PURE function of THIS run's own conversation artifacts — the
+    checkpointed history (prior rounds' frozen ``ToolResult`` documents)
+    plus the current round's result map — so a recovered workflow replays
+    the recorded derivation deterministically instead of re-deriving from
+    process-local state (C4). Read-only and advisory: the returned
+    bounded document (``"null"`` when silent) steers the NEXT round via
+    ``amodel_round`` and never changes any tool effect, any receipt, or
+    the durable lifecycle. Task-local by construction (no store, no
+    cross-task memory); it stores no chain-of-thought (only counts,
+    short digests/fingerprints, capability ids — see ``task_progress``).
+    """
+    parse_agent_run_intent(payload_json)
+    document = task_progress.progress_hint_document(history_json, round_results_json)
+    return canonical_json(document) if document is not None else "null"
 
 
 @DBOS.step(name="agents.read_step")
@@ -3334,6 +3405,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         rounds = 0
         tool_records: list[dict[str, object]] = []
         output_chars = 0
+        # 22-progress: the bounded no-progress hint derived AFTER a tool
+        # round rides the NEXT model round (consumed once, then reset —
+        # a steering continuation of a final round never re-receives a
+        # stale hint). ``None`` keeps every legacy round byte-identical.
+        progress_hint_json: str | None = None
+        progress_hint_emissions = 0
+        progress_hint_last: dict[str, object] | None = None
         # 13-intake-runner: the plain-answer variants END the accepted
         # turn here (P1: no second action-model call, no executor, no
         # effects). A deterministic stop control still wins its boundary;
@@ -3396,7 +3474,9 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                 deferred_json,
                 rounds,
                 steered_json,
+                progress_hint_json,
             )
+            progress_hint_json = None
             history_json = str(round_record["history_json"])
             if str(round_record["status"]) == "final":
                 output_chars = int(str(round_record["output_chars"]))
@@ -3475,6 +3555,26 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                     history_json,
                     _agent_task_header_refreshed(payload_json),
                 )
+            if results:
+                # 22-progress: ONE checkpointed bounded no-progress
+                # derivation over THIS run's own artifacts (history +
+                # the round's real outcomes; the steering branch's
+                # not_executed wire notes are appended only below, so
+                # they are never observations). Advisory only: the
+                # document, when not "null", renders as the labeled
+                # ``[Progress hint]`` prefix of the NEXT round — it
+                # changes no effect, no receipt, no lifecycle state.
+                hint_json = _agent_progress_hint(
+                    payload_json,
+                    history_json,
+                    canonical_json({"calls": results}),
+                )
+                if hint_json != "null":
+                    progress_hint_json = hint_json
+                    progress_hint_emissions += 1
+                    document = json.loads(hint_json)
+                    if isinstance(document, dict):
+                        progress_hint_last = document
             if steering_interrupt:
                 # The model must SEE the steering before any further
                 # effect: the not-yet-dispatched deferred calls carry
@@ -3510,6 +3610,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             # The task/phase binding this run executed under (AC 1/2),
             # value-free and observable next to the conversation outcome.
             summary["intake"] = _intake_summary_document(intake)
+        if progress_hint_emissions:
+            # 22-progress: additive observability of the bounded
+            # no-progress hints this attempt emitted (count + the LAST
+            # document). Absent for hint-free runs — legacy shape
+            # byte-identical; advisory data, never a lifecycle change.
+            summary["progress_hints"] = progress_hint_emissions
+            summary["progress_hint"] = progress_hint_last
         # 20-completion: the additive evidence-backed task-outcome
         # observation (absent for taskless runs — legacy shape
         # byte-identical; a finished attempt never closes or verifies
