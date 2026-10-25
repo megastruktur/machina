@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 
 /**
  * 01-desktop-shell — real-browser proofs for the composed desktop shell on
@@ -655,4 +655,453 @@ test('opened windows stack ABOVE the bottom chat dock and unauthorized live sess
 		[overlapX, overlapY] as const
 	);
 	expect(topElementIsInsideFrame).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// 24a D-1 — the COMPOSED live dock journey V6 proved broken: real shell +
+// real ChatPanel + real browser client routes over mocked HTTP. The dock
+// boots pinned to ONE real server; removing the chip must re-scope the
+// whole canonical surface (history list, create, event tail, messages,
+// restore) to the Global sentinel — the drawer must show the created
+// conversation and a restore/reload must never 404 or ride the old server.
+// ---------------------------------------------------------------------------
+
+const LIVE_SERVER_ID = 'af130194-930d-45da-a47c-0aa22bb14d46';
+const GLOBAL_SENTINEL = '00000000-0000-0000-0000-000000000000';
+const PRE_GLOBAL_ID = '9ce236c1-a253-48b9-9eaa-350016223e2f';
+const CREATED_ID = '4ea2eca6-d7f0-415d-a131-ce0d1742f51a';
+const CREATED_RUN = '10bc17bc-6211-4a8a-b48e-b490d9b5284b';
+const CSRF_COOKIE = 'mai_csrf';
+
+interface MockMessage {
+	message_id: string;
+	sequence: number;
+	role: 'user' | 'assistant';
+	content: string;
+	created_at: string;
+}
+
+interface MockConversation {
+	serverId: string;
+	createdAt: string;
+	updatedAt: string;
+	activeRunId: string | null;
+	messages: MockMessage[];
+}
+
+/** Build one canonical request record for the scope audit. */
+interface CanonicalRequest {
+	path: string;
+	method: string;
+	serverId: string | null;
+	status: number;
+	/** Shell epoch: 0 = first boot, 1 = after the reload (a fresh draft). */
+	epoch: number;
+}
+
+test('live dock Global journey (24a D-1): unpin → Global history → submit → drawer shows it → restore/reload stays on the sentinel', async ({
+	page,
+	context
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+
+	// The readable CSRF cookie is the honest live-attach probe (auth ADR §5).
+	await context.addCookies([
+		{ name: CSRF_COOKIE, value: 'playwright-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+
+	// --- the canonical store the routes serve --------------------------------
+	const now = '2026-10-25T15:13:16Z';
+	const conversations = new Map<string, MockConversation>();
+	const addMessages = (id: string, messages: MockMessage[]): void => {
+		const row = conversations.get(id);
+		if (row) {
+			row.messages = messages;
+			row.updatedAt = messages[messages.length - 1]?.created_at ?? row.updatedAt;
+		}
+	};
+	conversations.set(PRE_GLOBAL_ID, {
+		serverId: GLOBAL_SENTINEL,
+		createdAt: '2026-10-25T15:00:00Z',
+		updatedAt: '2026-10-25T15:05:00Z',
+		activeRunId: null,
+		messages: [
+			{
+				message_id: 'aa000000-0000-4000-8000-000000000001',
+				sequence: 1,
+				role: 'user',
+				content: 'Pre-existing consult question.',
+				created_at: '2026-10-25T15:00:10Z'
+			},
+			{
+				message_id: 'aa000000-0000-4000-8000-000000000002',
+				sequence: 2,
+				role: 'assistant',
+				content: 'Pre-existing consult answer.',
+				created_at: '2026-10-25T15:05:00Z'
+			}
+		]
+	});
+	conversations.set(CREATED_ID, {
+		serverId: GLOBAL_SENTINEL,
+		createdAt: now,
+		updatedAt: now,
+		activeRunId: null,
+		messages: []
+	});
+
+	const canonicalRequests: CanonicalRequest[] = [];
+	const createdBodies: Array<Record<string, unknown>> = [];
+	// Shell epoch: the reload boots a FRESH panel whose pinned-scope draft
+	// correctly lists the real server again before the test unpins it — the
+	// audit runs per epoch (the "read scope follows the CURRENT draft" rule
+	// applies within one shell life, never across reloads).
+	let epoch = 0;
+	const jsonHeaders = { 'content-type': 'application/json' };
+	const fulfillJson = (route: Route, status: number, body: unknown) =>
+		route.fulfill({ status, headers: jsonHeaders, body: JSON.stringify(body) });
+	const summaryOf = (id: string): Record<string, unknown> => {
+		const row = conversations.get(id)!;
+		return {
+			conversation_id: id,
+			server_id: row.serverId,
+			title: null,
+			created_at: row.createdAt,
+			updated_at: row.updatedAt,
+			message_count: row.messages.length,
+			active_task_id: null,
+			active_run_id: row.activeRunId
+		};
+	};
+	const detailOf = (id: string): Record<string, unknown> => ({
+		...summaryOf(id),
+		history_completeness: 'complete',
+		missing_range: null,
+		legacy_gaps: []
+	});
+	const notFound = (
+		route: Route,
+		request: { serverId: string | null; path: string; method: string }
+	) => {
+		canonicalRequests.push({ ...request, status: 404, epoch });
+		return fulfillJson(route, 404, {
+			detail: { code: 'not_found', message: 'no conversation in the requesting server scope' }
+		});
+	};
+
+	// ONE dispatcher for the whole canonical surface: list/create/detail/
+	// messages/events, each scope-checked exactly like the backend (C8).
+	await page.route('**/api/v1/chat/conversations**', async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		const serverId = url.searchParams.get('server_id');
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const record = (status: number, overrideServerId?: string | null): CanonicalRequest => {
+			const entry = {
+				path: url.pathname + url.search,
+				method: request.method(),
+				serverId: overrideServerId !== undefined ? overrideServerId : serverId,
+				status,
+				epoch
+			};
+			canonicalRequests.push(entry);
+			return entry;
+		};
+		// POST /api/v1/chat/conversations — create + first turn.
+		if (request.method() === 'POST' && parts.length === 4) {
+			const body = request.postDataJSON() as Record<string, unknown>;
+			createdBodies.push(body);
+			record(201, typeof body.server_id === 'string' ? body.server_id : null);
+			addMessages(CREATED_ID, [
+				{
+					message_id: 'bb000000-0000-4000-8000-000000000001',
+					sequence: 1,
+					role: 'user',
+					content: String(body.message),
+					created_at: now
+				},
+				{
+					message_id: 'bb000000-0000-4000-8000-000000000002',
+					sequence: 2,
+					role: 'assistant',
+					content: 'Recorded dock reply.',
+					created_at: now
+				}
+			]);
+			const created = conversations.get(CREATED_ID)!;
+			created.activeRunId = CREATED_RUN;
+			return fulfillJson(route, 201, {
+				conversation_id: CREATED_ID,
+				message_id: 'bb000000-0000-4000-8000-000000000001',
+				task_id: null,
+				run_id: CREATED_RUN,
+				revision: 1,
+				disposition: 'created'
+			});
+		}
+		const conversationId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : null;
+		const tail = parts[5] ?? null;
+		if (conversationId === null) {
+			// GET /api/v1/chat/conversations?server_id=… — bounded page.
+			record(200);
+			const items = [...conversations.entries()]
+				.filter(([, row]) => row.serverId === serverId)
+				.sort(([, a], [, b]) => b.updatedAt.localeCompare(a.updatedAt))
+				.map(([id]) => summaryOf(id));
+			return fulfillJson(route, 200, {
+				limit: Number(url.searchParams.get('limit') ?? 10),
+				offset: Number(url.searchParams.get('offset') ?? 0),
+				total: items.length,
+				has_more: false,
+				items
+			});
+		}
+		const row = conversations.get(conversationId);
+		if (row === undefined || row.serverId !== serverId)
+			return notFound(route, { serverId, path: url.pathname, method: request.method() });
+		if (tail === 'messages') {
+			record(200);
+			return fulfillJson(route, 200, {
+				limit: Number(url.searchParams.get('limit') ?? 10),
+				offset: Number(url.searchParams.get('offset') ?? 0),
+				total: row.messages.length,
+				has_more: false,
+				conversation_id: conversationId,
+				history_completeness: 'complete',
+				items: row.messages
+			});
+		}
+		if (tail === 'events') {
+			record(200);
+			const afterSeq = Number(url.searchParams.get('after_seq') ?? 0);
+			const events = row.messages
+				.filter((message) => message.sequence > afterSeq)
+				.map((message) => ({
+					seq: message.sequence,
+					kind: 'transcript.appended',
+					message_id: message.message_id,
+					role: message.role,
+					source_kind: message.role === 'user' ? 'api' : 'system',
+					redacted: false,
+					has_content_ref: false,
+					created_at: message.created_at
+				}));
+			return fulfillJson(route, 200, {
+				conversation_id: conversationId,
+				limit: 50,
+				offset: 0,
+				total: events.length,
+				has_more: false,
+				after_seq: afterSeq,
+				events,
+				current: {
+					latest_seq: row.messages.length,
+					history_completeness: 'complete',
+					active_run_id: row.activeRunId,
+					active_task_id: null,
+					pending_steering: 0
+				}
+			});
+		}
+		// GET /api/v1/chat/conversations/{id} — header + gap honesty.
+		record(200);
+		return fulfillJson(route, 200, detailOf(conversationId));
+	});
+
+	// The lease-holding run facade + its SSE route (the producer pair).
+	await page.route('**/api/v1/chat/runs/**', async (route) => {
+		const url = new URL(route.request().url());
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const runId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : '';
+		if (runId === '') {
+			return route.fulfill({
+				status: 404,
+				headers: jsonHeaders,
+				body: JSON.stringify({ detail: { code: 'not_found', message: 'no run id' } })
+			});
+		}
+		if (parts[5] === 'events') {
+			// Bounded SSE stream: closes immediately with no frames — the
+			// subscription lifecycle is exercised, nothing rides it here.
+			return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+		}
+		const row = [...conversations.values()].find((one) => one.activeRunId === runId);
+		if (row === undefined) {
+			return route.fulfill({
+				status: 404,
+				headers: jsonHeaders,
+				body: JSON.stringify({ detail: { code: 'not_found', message: 'no such run' } })
+			});
+		}
+		return route.fulfill({
+			status: 200,
+			headers: jsonHeaders,
+			body: JSON.stringify({
+				run_id: runId,
+				server_id: row.serverId,
+				parent_run_id: null,
+				depth: 0,
+				profile_revision: 1,
+				prompt_revision: 1,
+				model_profile: 'glm53flash',
+				requested_grants: [],
+				state: 'running',
+				cancel_requested_at: null,
+				submitted_at: row.createdAt,
+				updated_at: row.updatedAt
+			})
+		});
+	});
+
+	// Live attach: one real server profile + the model profile the dock's
+	// live select renders.
+	await page.route('**/api/v1/servers', (route) =>
+		fulfillJson(route, 200, {
+			servers: [
+				{
+					schema_version: 1,
+					server_id: LIVE_SERVER_ID,
+					name: 'megaserver',
+					prompt_revision: 1,
+					prompt_text: 'fixture',
+					environment: 'linux_ssh',
+					ssh: {
+						host: 'megaserver',
+						port: 22,
+						user: 'mai',
+						host_key: '',
+						credential_ref: 'fixture-credential'
+					},
+					privilege: 'sudo',
+					capabilities: [],
+					revision: 1,
+					sha256: 'ab'.repeat(32),
+					projection: { revision: 1, stale: false }
+				}
+			]
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		fulfillJson(route, 200, {
+			profiles: [
+				{
+					schema_version: 1,
+					name: 'glm53flash',
+					connection: 'litellm',
+					model: 'z-ai-coding/glm-5.3-flash'
+				}
+			]
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		fulfillJson(route, 200, { schema_version: 1, connection: 'litellm', profile: 'glm53flash' })
+	);
+
+	const dock = page.getByTestId('bottom-chat-dock');
+	const drawer = page.getByTestId('drawer-chat-section');
+
+	// Boot pinned to the REAL server (the V6 starting state).
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	await expect(dock.getByTestId('chat-server-chip')).toContainText('megaserver');
+	// The pinned-scope drawer: no LIVE conversations recorded.
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await expect(drawer.getByTestId('drawer-history-empty')).toBeVisible();
+	const pinnedLists = canonicalRequests.filter((one) => one.method === 'GET');
+	expect(pinnedLists.length).toBeGreaterThanOrEqual(1);
+	for (const one of pinnedLists) expect(one.serverId).toBe(LIVE_SERVER_ID);
+
+	// --- the V6 defect trigger: unpin the chip ------------------------------
+	await dock.getByTestId('chat-server-chip-remove').click();
+	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+
+	// Drawer refresh after the unpin: the history list now rides the
+	// sentinel and shows the PRE-EXISTING Global conversation.
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await expect(
+		drawer.getByTestId('drawer-history-item').filter({ hasText: PRE_GLOBAL_ID.slice(0, 8) })
+	).toHaveCount(1);
+
+	// Submit a NEW conversation from the dock: the create body names the
+	// Global sentinel — never the previously selected server.
+	await dock.getByTestId('compose-message').fill('Global consult from composed dock');
+	await dock.getByTestId('chat-submit').click();
+	await expect(
+		dock.getByTestId('canonical-user-message').filter({ hasText: 'Global consult from composed dock' })
+	).toHaveCount(1);
+	await expect(dock.getByTestId('canonical-assistant-message')).toContainText(
+		'Recorded dock reply.'
+	);
+	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+	expect(createdBodies).toHaveLength(1);
+	expect(createdBodies[0].server_id).toBe(GLOBAL_SENTINEL);
+	expect(createdBodies[0].message).toBe('Global consult from composed dock');
+
+	// The created conversation appears in the drawer history next to the
+	// pre-existing one (V6 saw "Chat History 0" forever).
+	await expect(
+		drawer.getByTestId('drawer-history-item').filter({ hasText: CREATED_ID.slice(0, 8) })
+	).toHaveCount(1);
+
+	// --- restore: open the created conversation from the drawer -------------
+	await drawer
+		.getByTestId('drawer-history-item')
+		.filter({ hasText: CREATED_ID.slice(0, 8) })
+		.click();
+	await expect(dock.getByTestId('canonical-user-message').filter({ hasText: 'Global consult from composed dock' })).toBeVisible();
+	await expect(dock.getByTestId('canonical-assistant-message')).toContainText('Recorded dock reply.');
+	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+
+	// --- reload: a fresh shell restores the same Global conversation --------
+	epoch = 1;
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	await dock.getByTestId('chat-server-chip-remove').click();
+	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await expect(
+		drawer.getByTestId('drawer-history-item').filter({ hasText: CREATED_ID.slice(0, 8) })
+	).toHaveCount(1);
+	await drawer
+		.getByTestId('drawer-history-item')
+		.filter({ hasText: CREATED_ID.slice(0, 8) })
+		.click();
+	await expect(
+		dock.getByTestId('canonical-user-message').filter({ hasText: 'Global consult from composed dock' })
+	).toHaveCount(1);
+	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+
+	// --- the scope audit -----------------------------------------------------
+	// 1. The create rode the sentinel (asserted above). 2. Within each shell
+	// epoch, NO canonical request regressed to the previously selected server
+	// once the first sentinel-scoped request happened — a fresh reload boot
+	// correctly re-lists the pinned draft scope until the test unpins again —
+	// and 3. nothing 404'd (a scope-blind events poll 404ing forever was the
+	// V6 defect).
+	for (const auditEpoch of [0, 1]) {
+		const requests = canonicalRequests.filter((one) => one.epoch === auditEpoch);
+		expect(requests.length, `epoch ${auditEpoch} recorded`).toBeGreaterThan(0);
+		const firstSentinelIndex = requests.findIndex((one) => one.serverId === GLOBAL_SENTINEL);
+		expect(firstSentinelIndex, `epoch ${auditEpoch} sentinel seen`).toBeGreaterThan(-1);
+		for (const [index, one] of requests.entries()) {
+			if (index < firstSentinelIndex) {
+				expect(one.serverId, `epoch ${auditEpoch} pre-unpin ${one.path}`).toBe(LIVE_SERVER_ID);
+			} else {
+				expect(one.serverId, `epoch ${auditEpoch} post-unpin ${one.path}`).toBe(GLOBAL_SENTINEL);
+			}
+			expect(one.status, one.path).toBeLessThan(400);
+		}
+	}
+	// The event tail actually polled the created conversation — on the sentinel.
+	const eventReads = canonicalRequests.filter(
+		(one) => one.path.includes(`/${CREATED_ID}/events`) && one.method === 'GET'
+	);
+	expect(eventReads.length).toBeGreaterThanOrEqual(1);
+	for (const one of eventReads) {
+		expect(one.serverId).toBe(GLOBAL_SENTINEL);
+		expect(one.status).toBe(200);
+	}
 });

@@ -721,6 +721,14 @@
 	// Canonical conversation state (single-writer instance locals; no
 	// module-level singletons, ADR §5 rule 4).
 	let canonicalId = $state<string | null>(null);
+	/**
+	 * The explicit scope a canonical conversation was opened under: the
+	 * draft target at create time, or the history row's recorded `server_id`
+	 * at restore time. It rules every canonical read until the server's own
+	 * `canonicalDetail.server_id` lands and keeps ruling it if that read is
+	 * still in flight (24a D-1: the draft scope, never the stale panel pin).
+	 */
+	let canonicalActiveScope = $state<string | null>(null);
 	let canonicalDetail = $state<CanonicalConversationDetail | null>(null);
 	let canonicalMessages = $state<CanonicalTranscriptMessage[]>([]);
 	let canonicalTotal = $state(0);
@@ -769,6 +777,7 @@
 
 	function resetCanonicalView(): void {
 		canonicalId = null;
+		canonicalActiveScope = null;
 		canonicalDetail = null;
 		canonicalMessages = [];
 		canonicalTotal = 0;
@@ -837,7 +846,10 @@
 	 */
 	async function loadCanonicalHistory(loadMore: boolean): Promise<void> {
 		const canonicalRef = canonicalApi;
-		const scope = serverScope;
+		// The one canonical scope: Global while the draft is unpinned, the
+		// pinned server while no override is set, the recorded scope while a
+		// conversation is open (24a D-1).
+		const scope = canonicalScope;
 		if (canonicalRef === null || scope === null) return;
 		if (loadMore) {
 			if (historyState.status !== 'ready' || historyLoadingMore || !historyHasMore) return;
@@ -853,7 +865,10 @@
 				scope,
 				{ limit: PAGE_LIMIT, offset: loadMore ? historyOffset : 0 }
 			);
-			if (disposed || scope !== serverScope) return;
+			// Scope guard: a slow response scoped to a PREVIOUS draft/open
+			// conversation is discarded — it can never overwrite another
+			// scope's page (no cross-server leakage).
+			if (disposed || scope !== canonicalScope) return;
 			const mapped = (page.items ?? []).map(canonicalHistoryRow);
 			if (loadMore) {
 				const seen = new Set(historyRows.map((row) => row.run_id));
@@ -906,13 +921,13 @@
 	async function loadCanonicalMessages(): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const id = canonicalId;
-		const scope = serverScope;
+		const scope = canonicalScope;
 		if (canonicalRef === null || id === null || scope === null) return;
 		const head = await canonicalRef.listConversationMessages(id, scope, {
 			limit: PAGE_LIMIT,
 			offset: 0
 		});
-		if (disposed || canonicalId !== id) return;
+		if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 		const start = Math.max(0, head.total - PAGE_LIMIT);
 		if (start === 0) {
 			applyCanonicalPage(head, 0);
@@ -922,7 +937,7 @@
 			limit: PAGE_LIMIT,
 			offset: start
 		});
-		if (disposed || canonicalId !== id) return;
+		if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 		applyCanonicalPage(tail, start);
 	}
 
@@ -930,7 +945,7 @@
 	async function loadEarlierCanonicalMessages(): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const id = canonicalId;
-		const scope = serverScope;
+		const scope = canonicalScope;
 		if (canonicalRef === null || id === null || scope === null) return;
 		if (canonicalLoadingMore || !canonicalHasMore) return;
 		canonicalLoadingMore = true;
@@ -941,7 +956,7 @@
 				limit: canonicalOffset - start,
 				offset: start
 			});
-			if (disposed || canonicalId !== id) return;
+			if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 			const seen = new Set(canonicalMessages.map((one) => one.message_id));
 			const earlier = (page.items ?? []).filter((one) => !seen.has(one.message_id));
 			canonicalMessages = [...earlier, ...canonicalMessages];
@@ -975,14 +990,14 @@
 	async function refreshCanonicalTail(): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const id = canonicalId;
-		const scope = serverScope;
+		const scope = canonicalScope;
 		if (canonicalRef === null || id === null || scope === null) return;
 		try {
 			const page = await canonicalRef.listConversationEvents(id, scope, {
 				afterSeq: canonicalLatestSeq,
 				limit: 50
 			});
-			if (disposed || canonicalId !== id) return;
+			if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 			canonicalLatestSeq = page.current.latest_seq;
 			canonicalCompleteness = page.current.history_completeness;
 			canonicalPendingSteering = page.current.pending_steering;
@@ -999,7 +1014,7 @@
 			}
 			if ((page.events ?? []).length > 0 || canonicalMessages.length === 0) {
 				await loadCanonicalMessages();
-				if (disposed || canonicalId !== id) return;
+				if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 			}
 			// Bind the live fold to the lease-holding run (a real chat run:
 			// the run facade and the SSE route both serve it).
@@ -1011,7 +1026,7 @@
 			) {
 				try {
 					const view = await api?.readConversation(activeRun);
-					if (disposed || canonicalId !== id) return;
+					if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 					if (view !== undefined && conversation?.run_id !== activeRun) {
 						conversation = view;
 						refreshed = view;
@@ -1044,13 +1059,15 @@
 	 */
 	async function submitCanonicalTurn(rawUserPrompt: string): Promise<void> {
 		const canonicalRef = canonicalApi;
-		const scope = serverScope;
 		const openId = canonicalId;
-		if (canonicalRef === null || scope === null) return;
+		if (canonicalRef === null || canonicalScope === null) return;
 		const clientRequestId = crypto.randomUUID();
-		const serverId = generalConsultMode
-			? GLOBAL_CONSULT_SERVER_ID
-			: (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID);
+		// A NEW conversation targets the explicit DRAFT choice (the sentinel
+		// when the server chip was removed); a FOLLOW-UP targets the open
+		// conversation's RECORDED scope (`canonicalScope`) — a draft change
+		// never retargets an open conversation (C01 rule 2, 24a D-1).
+		const serverId =
+			openId === null ? (effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID) : canonicalScope;
 		composeBusy = true;
 		try {
 			const submitted: CanonicalTurnSubmitted =
@@ -1064,7 +1081,7 @@
 							task_action: 'continue'
 						})
 					: await canonicalRef.submitConversationMessage(openId, {
-							server_id: scope,
+							server_id: serverId,
 							client_request_id: clientRequestId,
 							message: rawUserPrompt,
 							expected_revision: lastRevision,
@@ -1073,6 +1090,10 @@
 						});
 			if (disposed) return;
 			canonicalId = submitted.conversation_id;
+			// Pin the read scope to the target the request actually named
+			// BEFORE the first tail/messages/history refresh fires: a Global
+			// create polls Global, never the previous panel pin.
+			canonicalActiveScope = serverId;
 			lastRevision = submitted.revision;
 			lastDisposition = submitted.disposition;
 			composeMessage = '';
@@ -1114,7 +1135,7 @@
 	async function recordControl(action: 'steer' | 'pause' | 'cancel'): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const id = canonicalId;
-		const scope = serverScope;
+		const scope = canonicalScope;
 		if (canonicalRef === null || id === null || scope === null || controlBusy) return;
 		controlBusy = true;
 		controlNote = null;
@@ -1147,9 +1168,13 @@
 	/** Restore one canonical conversation from a history row (no local cache). */
 	async function openCanonicalConversation(row: ChatHistoryRow): Promise<void> {
 		const canonicalRef = canonicalApi;
-		const scope = serverScope;
-		if (canonicalRef === null || scope === null) return;
+		if (canonicalRef === null) return;
 		const conversationId = row.conversation_id ?? row.run_id;
+		// 24a D-1: the restore targets the ROW's RECORDED server (the Global
+		// sentinel for consult conversations) — never the panel pin, which
+		// would 404 a scope-blind read before the recorded scope is known.
+		const rowScope = row.server_id;
+		if (conversationId === '' || rowScope === '') return;
 		finishStream();
 		historyOpen = false;
 		// A canonical restore shares NO state with the legacy fold.
@@ -1166,12 +1191,15 @@
 		detailsOpen = false;
 		resetCanonicalView();
 		canonicalId = conversationId;
+		// The row's recorded scope rules the detail read and every read
+		// after it until (and after) the server's own detail lands.
+		canonicalActiveScope = rowScope;
 		// Reopen continuity: the conversation's last server-delivered outcome
 		// document (a lease-holding run re-folds it from the SSE replay).
 		taskOutcome = taskOutcomeByConversation.get(conversationId) ?? null;
 		canonicalBusy = true;
 		try {
-			const detail = await canonicalRef.getConversation(conversationId, scope);
+			const detail = await canonicalRef.getConversation(conversationId, rowScope);
 			if (disposed || canonicalId !== conversationId) return;
 			canonicalDetail = detail;
 			canonicalCompleteness = detail.history_completeness;
@@ -1341,10 +1369,10 @@
 	 * context is the ONLY context; the remove/pick controls leave the DOM and
 	 * the chips render `data-locked="true"` until `New Chat` resets the draft.
 	 */
-	const chatContextLocked = $derived(display !== null);
+	const chatContextLocked = $derived(display !== null || canonicalMode);
 	const effectiveServerId = $derived(
 		chatContextLocked
-			? (display?.server_id ?? null)
+			? (canonicalDetail?.server_id ?? display?.server_id ?? null)
 			: draftServerOverride === undefined
 				? serverScope
 				: draftServerOverride
@@ -1352,6 +1380,31 @@
 	const generalConsultMode = $derived(
 		effectiveServerId === null || effectiveServerId === GLOBAL_CONSULT_SERVER_ID
 	);
+	/**
+	 * THE one canonical scope (24a D-1 repair). Every canonical call —
+	 * history list/load-more, detail, transcript pages, event tail, steering
+	 * controls and the follow-up turn's `server_id` — reads THIS value, so
+	 * the read scope can never drift from the target the conversation
+	 * actually belongs to. Derivation, in priority order:
+	 *
+	 *  1. OPEN conversation (recorded truth): `canonicalDetail.server_id`.
+	 *     An opened conversation never retargets (C01 rule 2), and reads
+	 *     stay on the server the backend recorded — not on the panel pin
+	 *     and not on a draft chip.
+	 *  2. CREATED here, detail read still in flight: the scope the create
+	 *     request itself named (`canonicalActiveScope`) — for a Global draft
+	 *     that is the sentinel, so the first tail/events/messages reads
+	 *     already hit Global instead of the previous panel pin.
+	 *  3. FRESH DRAFT: the explicit draft choice — the draft override when
+	 *     set (`null` ⇒ Global sentinel, id ⇒ that server), else the pinned
+	 *     panel scope. Removing the server chip therefore re-scopes the
+	 *     history list to Global and a later submit to the same target.
+	 */
+	const canonicalScope = $derived.by<string | null>(() => {
+		if (canonicalDetail !== null) return canonicalDetail.server_id;
+		if (canonicalId !== null) return canonicalActiveScope;
+		return effectiveServerId ?? GLOBAL_CONSULT_SERVER_ID;
+	});
 	const rootTerminal = $derived(
 		display !== null && display.state !== null && TERMINAL_RUN_STATES.has(display.state)
 	);
@@ -2922,7 +2975,7 @@
 					<TaskPlan
 						services={taskServicesBag}
 						conversationId={canonicalId}
-						serverId={serverScope}
+						serverId={canonicalScope}
 						sourceMessageId={lastCanonicalUserMessageId}
 					/>
 				{/if}
@@ -3302,7 +3355,11 @@
 						<Button variant="secondary" onclick={loadConversation} data-testid="conversation-refresh">Refresh</Button>
 						{/if}
 					</div>
-					<p class="mai-chat__meta" data-testid="chat-scope">Server {shortId(serverScope ?? '')} · Pinned scope</p>
+					<p class="mai-chat__meta" data-testid="chat-scope">
+						{canonicalScope === GLOBAL_CONSULT_SERVER_ID
+							? 'General Consult · global scope'
+							: `Server ${shortId(canonicalScope ?? '')} · Pinned scope`}
+					</p>
 					{#if display !== null}
 					<p class="mai-chat__meta" data-testid="conversation-target">
 						Server {shortId(display.server_id)} · profile {display.model_profile} · grants {grantsText}

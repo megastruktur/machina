@@ -64,6 +64,8 @@ const ROOT = 'aa111111-1111-4222-8333-444455556666';
 const CHILD_A = 'bb222222-1111-4222-8333-444455556666';
 const CHILD_B = 'cc333333-1111-4222-8333-444455556666';
 const HISTORY_RUN = 'ee555555-1111-4222-8333-444455556666';
+/** A recorded GLOBAL (General Consult) canonical conversation (24a D-1). */
+const GLOBAL_CONV = 'dd666666-1111-4222-8333-444455556666';
 const APPROVAL_ID = 'f1000000-1111-4222-8333-444455556666';
 const OP_ID = 'ef000000-0000-4000-8000-000000000009';
 const ATTACHMENT_SHA = 'cd'.repeat(32);
@@ -126,6 +128,12 @@ interface ChatWindowApi {
 	probeCrossServer(): Promise<{ code: string }>;
 	/** Extra metadata-only canonical rows for list pagination. */
 	seedCanonicalConversations(count: number): void;
+	/** Seed one complete canonical row on ANY recorded scope (24a: the
+	 * Global-sentinel draft/restore journeys). */
+	seedCanonicalRow(serverId: string, conversationId: string, title: string): void;
+	/** One-shot: the NEXT canonical list resolves only after this delay
+	 * (stale-response scope-guard proof, 24a D-1 rule 4). */
+	armSlowList(delayMs: number): void;
 	registry: {
 		kinds: string[];
 		checkScope(kind: string, scope: unknown): { ok: true } | { ok: false; code: string };
@@ -353,6 +361,8 @@ const APP_SOURCE = `
 	const canonicalSteers = {};
 	let canonicalPauseCount = 0;
 	let canonicalCounter = 0;
+	/** One-shot: the next canonical LIST resolves only after this delay. */
+	let slowListDelay = 0;
 
 	function msgId() {
 		canonicalCounter += 1;
@@ -448,6 +458,13 @@ const APP_SOURCE = `
 				serverId,
 				payload: JSON.parse(JSON.stringify(page ?? {}))
 			});
+			if (slowListDelay > 0) {
+				const delay = slowListDelay;
+				slowListDelay = 0;
+				const resolvers = Promise.withResolvers();
+				setTimeout(resolvers.resolve, delay);
+				await resolvers.promise;
+			}
 			const rows = Object.values(canonicalStore)
 				.filter((row) => row.server_id === serverId)
 				.sort(
@@ -1053,6 +1070,15 @@ const APP_SOURCE = `
 				row.updated_at = '2026-10-16T07:' + String(59 - i).padStart(2, '0') + ':00Z';
 				canonicalStore[id] = row;
 			}
+		},
+		seedCanonicalRow(serverId, conversationId, title) {
+			const row = canonRow(String(conversationId), String(serverId), String(title), 'complete', []);
+			canonAppend(row, 'user', 'Seeded question — ' + title);
+			canonAppend(row, 'assistant', 'Seeded recorded answer — ' + title);
+			canonicalStore[String(conversationId)] = row;
+		},
+		armSlowList(delayMs) {
+			slowListDelay = Number(delayMs);
 		},
 		registry: {
 			kinds: Array.from(registry.knownPanelKinds()).sort(),
@@ -2743,5 +2769,241 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 			'Showing 13 of 13 recorded conversations.'
 		);
 		await expect(main.getByTestId('history-load-more')).toHaveCount(0);
+	});
+
+	// --- 24a D-1: the canonical read scope follows the draft/recorded target -
+
+	test('D-1: unpinned draft retargets EVERY canonical read to the Global sentinel — list, create, tail, messages, control — and the consult lands in history', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// One pre-existing Global conversation the pinned scope must NOT see.
+		await page.evaluate(
+			([sentinel, conversationId]) =>
+				window.__maiChatApi!.seedCanonicalRow(sentinel, conversationId, 'Pre-existing consult'),
+			[GLOBAL_CONSULT_SERVER_ID, GLOBAL_CONV]
+		);
+		// The calls log is SHARED with host-second (pinned to SERVER_B):
+		// baseline it so the audit below covers only THIS host's reads.
+		const listsBefore = (await callsOf(page, 'listCanonicalConversations')).length;
+
+		// Remove the server chip → Global draft.
+		await main.getByTestId('chat-server-chip-remove').click();
+		await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
+
+		// History refresh rides the sentinel: the pinned server's recorded
+		// rows (Restore me / Partial legacy import) are invisible; only the
+		// Global row renders.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(1);
+		await expect(main.getByTestId('history-row').first()).toContainText('Pre-existing consult');
+		const lists = await callsOf(page, 'listCanonicalConversations');
+		expect(lists.length).toBeGreaterThan(listsBefore);
+		for (const call of lists.slice(listsBefore)) {
+			expect(call.serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		}
+
+		// Submit: the create names the sentinel — never the panel pin.
+		await main.getByTestId('compose-message').fill('Cross-server consult question.');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Cross-server consult question.'
+		);
+		const creates = await callsOf(page, 'createConversation');
+		expect(creates).toHaveLength(1);
+		expect((creates[0].payload as Record<string, unknown>).server_id).toBe(
+			GLOBAL_CONSULT_SERVER_ID
+		);
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		expect(conversationId).not.toBeNull();
+
+		// While the run holds the lease, steering rides the sentinel too.
+		await main.getByTestId('chat-pause').click();
+		await expect(main.getByTestId('control-note')).toContainText('Pause recorded');
+		const steers = await callsOf(page, 'steerConversation');
+		expect(steers).toHaveLength(1);
+		expect((steers[0].payload as Record<string, unknown>).server_id).toBe(
+			GLOBAL_CONSULT_SERVER_ID
+		);
+
+		// Producer appends the reply and releases the lease; the terminal
+		// hand-over pulls it in — every tail/message read on the sentinel,
+		// no scope-blind 404 anywhere.
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'consult answer');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		await expect(main.getByTestId('canonical-assistant-message').last()).toContainText(
+			'consult answer'
+		);
+		await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+		for (const call of await callsOf(page, 'listConversationEvents')) {
+			expect(call.serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		}
+		for (const call of await callsOf(page, 'listConversationMessages')) {
+			expect(call.serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		}
+
+		// The post-submit history refresh is ALSO Global-scoped: the created
+		// consult appears next to the pre-existing one (V6 saw "Chat History 0").
+		await expect(main.getByTestId('history-row')).toHaveCount(2);
+		await expect(main.getByTestId('history-row')).toContainText([
+			'Pre-existing consult',
+			String(conversationId).slice(0, 8)
+		]);
+	});
+
+	test('D-1: a Global history row restores and reopens on its RECORDED sentinel scope', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+		await page.evaluate(
+			([sentinel, conversationId]) =>
+				window.__maiChatApi!.seedCanonicalRow(sentinel, conversationId, 'Recorded consult'),
+			[GLOBAL_CONSULT_SERVER_ID, GLOBAL_CONV]
+		);
+
+		// Default draft (pinned server): the Global row is invisible.
+		await main.getByTestId('chat-history-toggle').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(2);
+
+		// Unpin → the Global row appears → restore it.
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(1);
+		await main.getByTestId('chat-history-item').first().click();
+
+		// The restore read the ROW's recorded sentinel — not the previous
+		// panel pin (the pre-fix behavior 404'd this exact read).
+		const gets = await callsOf(page, 'getConversation');
+		expect(gets).toHaveLength(1);
+		expect(gets[0].runId).toBe(GLOBAL_CONV);
+		expect(gets[0].serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'Seeded question — Recorded consult'
+		);
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText(
+			'Seeded recorded answer — Recorded consult'
+		);
+		await expect(main.getByTestId('chat-general-consult-badge')).toBeVisible();
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+		for (const call of await callsOf(page, 'listConversationMessages')) {
+			expect(call.serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		}
+
+		// Reopen: New Chat resets the draft to the panel scope; unpin again
+		// and restore the same row — server truth, role-preserving, no
+		// duplicated rows.
+		await main.getByTestId('chat-new-session').click();
+		await expect(main.getByTestId('chat-server-chip')).toBeVisible();
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(1);
+		await main.getByTestId('chat-history-item').first().click();
+		await expect(main.getByTestId('canonical-user-message')).toHaveCount(1);
+		await expect(main.getByTestId('canonical-assistant-message')).toHaveCount(1);
+		const regets = await callsOf(page, 'getConversation');
+		expect(regets).toHaveLength(2);
+		for (const call of regets) {
+			expect(call.runId).toBe(GLOBAL_CONV);
+			expect(call.serverId).toBe(GLOBAL_CONSULT_SERVER_ID);
+		}
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+	});
+
+	test('D-1: a fresh draft re-pinned to another real server lists, submits and tails on THAT server; the pinned scope stays invisible', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// Fresh draft: explicit pick of Server Beta.
+		await main.getByTestId('chat-server-picker').selectOption({ label: 'Server Beta' });
+		await expect(main.getByTestId('chat-server-chip')).toContainText('Server Beta');
+
+		// The history list follows the draft choice: SERVER_A's recorded rows
+		// never render under the Beta scope.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-empty')).toBeVisible();
+		const lists = await callsOf(page, 'listCanonicalConversations');
+		expect(lists.length).toBeGreaterThanOrEqual(1);
+		expect(lists[lists.length - 1].serverId).toBe(SERVER_B);
+
+		// Submit: the create names Beta; every follow-up read matches it.
+		await main.getByTestId('compose-message').fill('Beta-scoped question.');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Beta-scoped question.'
+		);
+		const creates = await callsOf(page, 'createConversation');
+		expect(creates).toHaveLength(1);
+		expect((creates[0].payload as Record<string, unknown>).server_id).toBe(SERVER_B);
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'beta answer');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		await expect(main.getByTestId('canonical-assistant-message').last()).toContainText(
+			'beta answer'
+		);
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+		for (const call of await callsOf(page, 'listConversationEvents')) {
+			expect(call.serverId).toBe(SERVER_B);
+		}
+		for (const call of await callsOf(page, 'listConversationMessages')) {
+			expect(call.serverId).toBe(SERVER_B);
+		}
+
+		// The Beta conversation lands in the (Beta-scoped) drawer history.
+		await expect(main.getByTestId('history-row')).toHaveCount(1);
+		await expect(main.getByTestId('history-row').first()).toContainText(
+			String(conversationId).slice(0, 8)
+		);
+	});
+
+	test('D-1: a slow history response from a superseded scope never overwrites the current scope page', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+		await page.evaluate(
+			([sentinel, conversationId]) =>
+				window.__maiChatApi!.seedCanonicalRow(sentinel, conversationId, 'Late consult'),
+			[GLOBAL_CONSULT_SERVER_ID, GLOBAL_CONV]
+		);
+
+		// Arm a slow Global list, then unpin and refresh: the Global page is
+		// in flight for 600 ms.
+		await page.evaluate(() => window.__maiChatApi!.armSlowList(600));
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+
+		// While it is in flight, the draft re-pins to Server Beta and
+		// refreshes: Beta resolves immediately (empty page).
+		await main.getByTestId('chat-server-picker').selectOption({ label: 'Server Beta' });
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-empty')).toBeVisible();
+
+		// The late GLOBAL response lands — and must be discarded: the drawer
+		// still shows Beta's page, never a cross-server row.
+		await page.waitForTimeout(900);
+		await expect(main.getByTestId('history-empty')).toBeVisible();
+		await expect(main.getByTestId('history-row')).toHaveCount(0);
+
+		// The guard wedged nothing: a fresh Global load renders the row.
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row')).toHaveCount(1);
+		await expect(main.getByTestId('history-row').first()).toContainText('Late consult');
 	});
 });
