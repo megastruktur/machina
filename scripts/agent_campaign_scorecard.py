@@ -59,6 +59,26 @@ def _load(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _case_limitations(case: dict[str, Any]) -> list[str]:
+    """Every disclosed limitation of one registry case, de-duplicated.
+
+    Limitations may live at the CASE level (``case["disclosed_limitations"]``)
+    or nested under the GRADER (``case["grader"]["disclosed_limitations"]``).
+    The 23-evals registry carried them only under ``grader``, which this
+    reader silently dropped (defect found on act 23d) — read BOTH places,
+    de-duplicated per (case, text), preserving first-seen order.
+    """
+    seen: dict[str, None] = {}
+    for source in (
+        case.get("disclosed_limitations") or [],
+        (case.get("grader") or {}).get("disclosed_limitations") or [],
+    ):
+        for text in source:
+            if isinstance(text, str) and text.strip():
+                seen.setdefault(text, None)
+    return list(seen)
+
+
 def build_scorecard(evidence_dir: Path) -> dict[str, Any]:
     cases_doc = _load(CASES_PATH) or {"cases": []}
     registry: dict[str, dict[str, Any]] = {
@@ -102,7 +122,7 @@ def build_scorecard(evidence_dir: Path) -> dict[str, Any]:
             "mode": "scripted",
             "scripted_model_calls": record.get("model_calls"),
         }
-        for limitation in case.get("disclosed_limitations", []) or []:
+        for limitation in _case_limitations(case):
             not_measured.append(
                 {
                     "case": case_id,
@@ -213,7 +233,14 @@ def _render(scorecard: dict[str, Any]) -> str:
                 f"  {leg.get('case', '?')}: requests={leg.get('requests')} "
                 f"wall={leg.get('wall_clock_minutes')}min "
                 f"reserved=${leg.get('reserved_spend_usd')}"
+                + (
+                    f" satisfied={leg.get('satisfied')}"
+                    if isinstance(leg.get("satisfied"), bool)
+                    else ""
+                )
             )
+            if leg.get("satisfied") is False and leg.get("detail"):
+                lines.append(f"    PROVIDER-QUALITY FAILURE: {leg['detail']}")
     else:
         lines.append(
             "  (none measured — scripted legs are reported in bucket 1 and "

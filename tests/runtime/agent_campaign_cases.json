@@ -1,6 +1,6 @@
 {
   "schema": "act-evals-cases/1",
-  "description": "Scenario registry for the 23-evals cross-domain acceptance (act_RUNTIME.md rows C1..X1). Each case carries the semantic observable a user would judge and a DETERMINISTIC grader spec. Graders are outcome/constraint-level: none of them accepts or rejects based on an exact tool-call sequence. Mode 'scripted' means exercised through the real app/worker/store with the harness's own deterministic scripted-model fixtures (V2/V4 seam-proof pattern); scripted results are labelled scripted, never live. Live-provider legs require the ratified evaluation budget (60 requests / 30 minutes / USD 5, first bound wins) and an authorized isolated provider configuration; a live leg that cannot run is reported not_measured with its reason, never as a pass.",
+  "description": "Scenario registry for the 23-evals cross-domain acceptance (act_RUNTIME.md rows C1..X1). Each case carries the semantic observable a user would judge and a DETERMINISTIC grader spec. Graders are outcome/constraint-level: none of them accepts or rejects based on an exact tool-call sequence. Mode 'scripted' means exercised through the real app/worker/store with the harness's own deterministic scripted-model fixtures (V2/V4 seam-proof pattern); scripted results are labelled scripted, never live. Live-provider legs run against the local LiteLLM proxy (127.0.0.1:4000/v1 on the host, litellm:4000 on the compose net) through the REAL intake seam (the final_result/TurnInterpretation output tool), inside a DISPOSABLE marked container on the compose infra network — the production credential travels only through the fixture env-file mount, never through a repo file. The ratified evaluation budget (60 requests / 30 minutes / USD 5, first bound wins) bounds every live leg; a live leg that cannot run is reported not_measured with its reason, never as a pass.",
   "budget": {
     "requests_cap": 60,
     "wall_clock_minutes_cap": 30,
@@ -60,8 +60,8 @@
       "id": "C4",
       "domain": "continuity",
       "mode": "scripted",
-      "interaction": "Retry the identical client_request_id after the first turn completed; then reuse the key with different content.",
-      "observable": "One message, one intake result: the retry deduplicates onto the same turn and the conflicting reuse is a structured 409, never a duplicate effect.",
+      "interaction": "Retry the identical client_request_id after the first turn completed; then reuse the key with different content. The crash-restart leg parks the first turn at the durable reconciling checkpoint on an unknown-status effect, SIGKILLs the worker mid-park, starts a fresh worker, resumes the run deliberately through the product's sanctioned EngineClient.resume_run surface (never blind launch recovery) and resolves the uncertain step through the real reconciliation producer RecoveryService.aresolve_step (FINAL_SUCCEEDED).",
+      "observable": "One message, one run row, one intake result across the crash: the uncertain effect is never re-dispatched (journal begin/effect markers exactly once) and the restart adds no extra planner model call; the reconciliation resolution moves the step out of outcome_unknown to a terminal state and the run reaches terminal; the retry deduplicates onto the same message and run identities and the conflicting key reuse is a structured 409, never a duplicate effect.",
       "grader": {
         "kind": "single_intake_result",
         "checks": [
@@ -77,13 +77,13 @@
       "domain": "steering",
       "mode": "scripted",
       "interaction": "Steer during a two-call batch (first call parked in-flight), then send Pause; release the in-flight call.",
-      "observable": "Pause is deterministic (no planner call needed); the new command starts only after the applicable steering/scope check and is never dispatched after the pause; the in-flight effect completes honestly at most once; natural-language steering stays pending, not silently dropped.",
+      "observable": "Pause is deterministic (no planner call needed); the new command starts only after the applicable steering/scope check and is never dispatched after the pause; the in-flight effect completes honestly at most once; natural-language steering stays pending, not silently dropped. The run ends terminal (succeeded) with agent.completed stopped_by=pause, no additional planner model call.",
       "grader": {
         "kind": "pause_gates_next_effect",
         "checks": [
           "exactly one fixture.priv effect begins and completes once",
           "the second call never begins after the pause",
-          "run ends cancelled with no additional planner model call",
+          "run ends terminal (succeeded) with agent.completed stopped_by=pause, no additional planner model call",
           "steering row persisted with no applied timestamp (pending vs applied honest)"
         ]
       }
@@ -218,15 +218,25 @@
       "mode": "scripted",
       "interaction": "Page the task item list with a small page size and follow the Load-more cursor (the data the 360x640 panel renders).",
       "observable": "Every collection page is bounded and carries limit/offset/total/has_more; pages are disjoint and ordered; the browser-layout leg itself is out of this harness's runtime and is disclosed separately.",
+      "browser_leg": {
+        "covered_by": [
+          "frontend/tests/task-plan.spec.ts (U1 test: 'at 360x640 the ready plan renders bounded dedup pages', no-horizontal-overflow assertion)",
+          "frontend/tests/task-understanding.spec.ts (U1 at 360x640: scope/constraints/questions/plan render)",
+          "frontend/tests/task-evidence.spec.ts (U1 evidence list: bounded scroll container at 360x640, no horizontal overflow)"
+        ],
+        "command": "cd frontend && NODE_OPTIONS=\"--max-old-space-size=1024\" pnpm exec playwright test --workers=1 tests/task-plan.spec.ts tests/task-understanding.spec.ts tests/task-evidence.spec.ts",
+        "evidence": "V2/V3 feature-gate verdicts (act_evidence/V2, act_evidence/V3): the journeys above were executed and green at the feature gates"
+      },
+      "disclosed_limitations": [
+        "the runtime harness exercises the pagination DATA the 360x640 panel renders, not a browser; visual layout/overflow at 360x640 is covered by the V2/V3 feature-gate Playwright journeys named in browser_leg, not re-claimed here"
+      ],
       "grader": {
         "kind": "bounded_pages_load_more",
         "checks": [
           "envelope carries limit, offset, total, has_more",
           "offset pages are disjoint and preserve deterministic order",
-          "has_more == (offset + returned < total)"
-        ],
-        "disclosed_limitations": [
-          "visual layout/overflow at 360x640 is not exercised by this runtime harness; covered by the V2/V3 feature gates, not re-claimed here"
+          "has_more == (offset + returned < total)",
+          "browser_leg reference integrity: the named Playwright suites exist and contain the 360x640 assertions"
         ]
       }
     },
@@ -267,6 +277,9 @@
       "mode": "scripted",
       "interaction": "A scripted privileged effect ends in a terminal-shaped host receipt whose outcome is unknown; retry the same client_request_id while parked.",
       "observable": "The run parks on the persisted reconciliation deadline with an explicit awaiting-reconciliation event; no termination is claimed without acknowledgement; the retry attaches without a second effect; the 300 s production expiry itself is not awaited inside the evaluation budget (disclosed).",
+      "disclosed_limitations": [
+        "the production 300 s reconcile deadline expiry is not awaited within the evaluation budget; the parked run is dropped with the disposable fixture"
+      ],
       "grader": {
         "kind": "unknown_effect_honest",
         "checks": [
@@ -274,9 +287,6 @@
           "exactly one awaiting_reconciliation event",
           "exactly one effect begin (retry attaches, never re-dispatches)",
           "no terminal/succeeded claim while uncertain"
-        ],
-        "disclosed_limitations": [
-          "the production 300 s reconcile deadline expiry is not awaited within the evaluation budget; the parked run is dropped with the disposable fixture"
         ]
       }
     },
@@ -299,14 +309,16 @@
       "id": "E2",
       "domain": "evidence",
       "mode": "scripted",
-      "interaction": "Submit a completion proposal citing a fabricated evidence id through the real completion seam.",
-      "observable": "The proposal is rejected with zero effects (no receipt, no revision bump, no criterion advance) and the task stays unverified.",
+      "interaction": "Submit completion proposals citing fabricated, wrong-target and stale evidence ids through the real completion seam.",
+      "observable": "Every unsupported citation is rejected with zero effects (no receipt, no revision bump, no criterion advance) and the task stays unverified: a fabricated id fails the source-existence check, a real-but-foreign id (another conversation's message) fails the conversation-scoped predicate, and a recorded failure/unknown certainty backing a passed claim is certainty_incompatible.",
       "grader": {
         "kind": "fabricated_evidence_rejected",
         "checks": [
-          "finalize outcome recorded == false with value-free rejection fields",
+          "fabricated id: finalize outcome recorded == false with value-free rejection fields",
+          "wrong-target id (real record from another conversation): rejected unknown_evidence_ref",
+          "stale certainty (recorded failure backing a passed claim): rejected certainty_incompatible",
           "task status remains not verified",
-          "no criterion advanced to passed"
+          "no criterion advanced to passed; zero revision bumps and receipts persisted"
         ]
       }
     },

@@ -19,11 +19,23 @@ scenarios can reference identities that only exist after the previous HTTP
 submission. Every scripted result is labelled scripted — never live.
 
 Live-provider legs: the ratified budget (60 requests / 30 minutes / USD 5,
-first bound wins) is instrumented in the scorecard. No authorized isolated
-provider endpoint is composed in this environment, so every live leg is
-reported not_measured with that reason — never as a pass. No destructive
-replay: only disposable fixture resources marked ``act-evals-``; no
-production DB, no ``machina-postgres-1``, no ``mai-wire-test-pg``.
+first bound wins) bounds every live leg. The authorized endpoint is the
+LOCAL LiteLLM proxy (``litellm:4000`` on the compose infra network). The
+production credential resolves only through the EnvResolver, so a live leg
+runs INSIDE a DISPOSABLE marked container on that network: the credential
+env-file is bind-mounted read-only at ``/run/secrets/mai-credentials.env``
+and resolved through the production ``ModelConfigStore``/``EnvResolver``
+seam — the value is never read by the harness, never printed, never
+written to any file. The live model drives the REAL intake seam (the
+``final_result``/``TurnInterpretation`` output-tool contract via
+``mai.agents.intake.ainterpret_turn``), never a raw provider call. Legs
+outside the ratified subset (or a leg whose plumbing cannot run) are
+reported not_measured with that exact reason — never as a pass; a live
+model failing a judged observable is a REPORTED provider-quality failure.
+
+No destructive replay: only disposable fixture resources marked
+``act-evals-``; no production DB, no ``machina-postgres-1``, no
+``mai-wire-test-pg``, no running compose container is touched.
 
 Acceptance semantics: every grader is deterministic and judges the
 OUTCOME/CONSTRAINT a user would judge. No grader inspects an exact
@@ -1294,12 +1306,26 @@ def _check(case_id: str, condition: bool, message: str) -> None:
 def _persist_scenarios():
     yield
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    cases_out: dict[str, Any] = {}
+    for case_id, record in RECORDS.items():
+        measured, skip_reason = LIVE_FLAGS.get(
+            case_id, (False, LIVE_SKIP_DEFAULT)
+        )
+        cases_out[case_id] = {
+            **record,
+            "live_measured": measured,
+            "live_skip_reason": None if measured else skip_reason,
+        }
     document = {
         "schema": "act-evals-scenarios/1",
-        "mode": "scripted (deterministic fixtures through the real "
-        "app/worker/store; labelled scripted, never live)",
+        "mode": "scripted + budgeted live-provider legs (scripted legs run "
+        "deterministic fixtures through the real app/worker/store and are "
+        "labelled scripted, never live; live legs ran through the REAL "
+        "intake seam against the local LiteLLM proxy inside a disposable "
+        "marked container, bounded by the ratified budget)",
         "source": _source_identity(),
-        "cases": RECORDS,
+        "cases": cases_out,
+        "provider_legs": PROVIDER_LEGS,
     }
     (EVIDENCE_DIR / "scenarios.json").write_text(
         json.dumps(document, indent=2, sort_keys=True, default=str) + "\n",
@@ -1860,6 +1886,293 @@ def test_c4_idempotent_retry(harness: _Harness) -> None:
         scenario.stop()
 
 
+@_journal_tails_on_failure
+def test_c4_checkpoint_worker_stop_restart(harness: _Harness) -> None:
+    """The crash-restart half of C4 (brief 23e §3/§4).
+
+    The run parks at the durable ``reconciling`` checkpoint on an
+    unknown-status effect; the worker is SIGKILLed mid-park. A FRESH
+    worker is started and the run is resumed through the product's
+    sanctioned resume surface — ``EngineClient.resume_run`` (guard rule
+    8), called from the test process, never blind launch recovery — and
+    the uncertain step is resolved through the real reconciliation
+    producer (``RecoveryService.aresolve_step``). The uncertain effect
+    must never be re-dispatched, the restart must add no extra planner
+    model call, and the identical retry must still deduplicate onto the
+    original message/run identities.
+    """
+    env = harness
+    scenario = Scenario(env, "c4restart")
+    scenario.behavior({"fixture.priv:m1": "unknown_status"})
+    scenario.script(
+        [
+            {
+                "needs": ["msg1", "crid1"],
+                "final_result": _plan_payload_template("msg1", "crid1"),
+            },
+            {
+                "tool_call": {
+                    "name": "fixture_priv",
+                    "args": {"marker": "m1"},
+                    "id": "c4ra",
+                }
+            },
+        ]
+    )
+    message_text = "Run the crash-restart command (c4 checkpoint restart)"
+    scenario.spawn()
+    try:
+        status, body = _submit_turn(env, None, message_text)
+        _check("C4", status == 201, f"turn admitted: {status}")
+        conversation_id = uuid.UUID(body["conversation_id"])
+        scenario.context(
+            msg1=str(body["message_id"]),
+            crid1=body.get("client_request_id", str(uuid.uuid4())),
+        )
+        crid = body["client_request_id"]
+        run_id = uuid.UUID(body["run_id"])
+
+        # Parked at the durable reconciling checkpoint; the effect's
+        # step row is outcome_unknown (never re-dispatched while open).
+        view = _await_state(env, run_id, "reconciling", 60.0)
+        _check("C4", view["state"] == "reconciling", f"parked at reconciling: {view}")
+        uncertain_rows = _psql(
+            env.url,
+            "SELECT seq, state FROM job_steps "
+            f"WHERE run_id = '{run_id}' AND state = 'outcome_unknown'",
+        )
+        _check(
+            "C4",
+            len(uncertain_rows) == 1,
+            f"exactly one outcome_unknown step row at the park: {uncertain_rows}",
+        )
+        seq = int(uncertain_rows[0][0])
+        begins_at_park = scenario.count("begin:fixture.priv:m1")
+        model_calls_before_restart = scenario.count("model_call")
+        _check(
+            "C4",
+            begins_at_park == 1,
+            f"the uncertain effect began exactly once before the crash: {begins_at_park}",
+        )
+
+        # SIGKILL the worker mid-park. The workflow row stays owned by
+        # the dead attempt (PENDING + owner_xid) — exactly the state a
+        # blind launch redispatch cannot safely re-execute (dbos 3.2.0
+        # owner CAS on the step checkpoint) — so this leg resumes the
+        # run DELIBERATELY instead of relying on launch recovery.
+        assert scenario.worker is not None
+        scenario.worker.send_signal(signal.SIGKILL)
+        scenario.worker.wait(timeout=WORKER_STOP_TIMEOUT)
+        dead_owner_rows = int(
+            _psql_scalar(
+                env.url,
+                "SELECT count(*) FROM dbos.workflow_status "
+                f"WHERE workflow_uuid = '{run_id}' AND status = 'PENDING' "
+                "AND owner_xid IS NOT NULL",
+            )
+            or 0
+        )
+        _check(
+            "C4",
+            dead_owner_rows == 1,
+            "the killed attempt still owns the workflow row after SIGKILL",
+        )
+
+        # Fresh worker. The recovered run replays its recorded rounds,
+        # so its script carries ONLY the planned continuation entry (a
+        # full re-serve would let a re-plan consume a stale entry); the
+        # killed worker's log is preserved before the respawn truncates.
+        worker_log = scenario.dir / "worker.log"
+        if worker_log.exists():
+            worker_log.rename(scenario.dir / "worker-killed.log")
+        (scenario.dir / "model-script.json").write_text(
+            json.dumps(
+                [{"text": "the reconciled outcome is reported; the run is complete"}]
+            ),
+            encoding="utf-8",
+        )
+        scenario.spawn()
+
+        # Deliberate resume through the product's sanctioned surface —
+        # from the TEST process (the client never launches an engine).
+        # resume_workflows sets status=ENQUEUED AND owner_xid=NULL,
+        # recovery_attempts=0: precisely the field the dead attempt
+        # left stale.
+        from mai.jobs.engine import EngineClient
+
+        with EngineClient(env.url) as client:
+            client.resume_run(str(run_id))
+
+        # Resolve the uncertain step through the REAL reconciliation
+        # producer: outcome_unknown -> terminal under a FINAL host
+        # verdict, receipt reason 'reconciliation', parked run woken on
+        # the resume topic.
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        from mai.execution.reconcile import ReconciliationClass
+        from mai.jobs.recovery import RecoveryService
+
+        service_engine = create_async_engine(env.url, poolclass=NullPool)
+        service = RecoveryService(
+            env.url,
+            async_sessionmaker(service_engine, expire_on_commit=False),
+        )
+        try:
+            resolved = _run(
+                service.aresolve_step(
+                    str(run_id),
+                    seq,
+                    ReconciliationClass.FINAL_SUCCEEDED,
+                    source="act-evals-c4-crash-restart",
+                )
+            )
+        finally:
+            service.close()
+            _run(service_engine.dispose())
+        _check(
+            "C4",
+            resolved.state.value == "succeeded" and resolved.seq == seq,
+            f"resolution moved the uncertain step to a terminal state: {resolved}",
+        )
+
+        view = _await_terminal(env, run_id, RUN_TIMEOUT, case_id="C4")
+        _check(
+            "C4",
+            view["state"] == "succeeded",
+            f"run reached terminal after the deliberate resume: {view}",
+        )
+        step_state = _psql_scalar(
+            env.url,
+            "SELECT state FROM job_steps WHERE run_id = "
+            f"'{run_id}' AND seq = {seq}",
+        )
+        _check(
+            "C4",
+            step_state == "succeeded",
+            f"the resolved step row is terminal: {step_state}",
+        )
+        resolve_reason = _psql_scalar(
+            env.url,
+            "SELECT receipt->>'reason' FROM job_steps "
+            f"WHERE run_id = '{run_id}' AND seq = {seq}",
+        )
+        _check(
+            "C4",
+            resolve_reason == "reconciliation",
+            f"the step was resolved by the reconciliation producer: {resolve_reason}",
+        )
+
+        # Exactly one of everything, across the crash.
+        msg_rows = int(
+            _psql_scalar(
+                env.url,
+                "SELECT count(*) FROM conversation_messages "
+                f"WHERE client_request_id = '{crid}'",
+            )
+            or 0
+        )
+        _check("C4", msg_rows == 1, f"exactly one message row for the key: {msg_rows}")
+        run_rows = int(
+            _psql_scalar(
+                env.url,
+                f"SELECT count(*) FROM job_runs WHERE run_id = '{run_id}'",
+            )
+            or 0
+        )
+        _check("C4", run_rows == 1, f"exactly one run row: {run_rows}")
+        intake_links = int(
+            _psql_scalar(
+                env.url,
+                "SELECT count(*) FROM conversation_runs "
+                f"WHERE run_id = '{run_id}'",
+            )
+            or 0
+        )
+        _check(
+            "C4",
+            intake_links == 1,
+            f"exactly one intake result (conversation_runs link): {intake_links}",
+        )
+
+        # The uncertain effect was NOT re-dispatched by the restart:
+        # the journal shows the effect marker exactly once and the
+        # begin count did not grow for that attempt.
+        _check(
+            "C4",
+            scenario.count("begin:fixture.priv:m1") == begins_at_park
+            and scenario.count("effect:fixture.priv:m1") == 1,
+            "the uncertain effect was never re-dispatched after the restart",
+        )
+        # No extra planner model call after the resume: the restart
+        # itself adds nothing; exactly the planned final-answer round
+        # runs (an unplanned call would surface as a script spare).
+        model_calls_after = scenario.count("model_call")
+        _check(
+            "C4",
+            model_calls_after == model_calls_before_restart + 1
+            and scenario.count("script_spare") == 0,
+            f"restart added only the planned final round "
+            f"({model_calls_before_restart} before -> {model_calls_after} after, "
+            f"spares={scenario.count('script_spare')})",
+        )
+
+        # The identical retry still deduplicates onto the same
+        # message/run identities; the one-of-every-thing counts hold.
+        retry_status, retry_body = _resubmit_turn(
+            env, conversation_id, crid, message_text
+        )
+        _check(
+            "C4",
+            retry_status == 200,
+            f"retry after the crash-restart deduplicated: {retry_status}",
+        )
+        _check(
+            "C4",
+            retry_body.get("message_id") == body["message_id"]
+            and retry_body.get("run_id") == body["run_id"],
+            "retry attaches to the same message and run identities",
+        )
+        msg_after = int(
+            _psql_scalar(
+                env.url,
+                "SELECT count(*) FROM conversation_messages "
+                f"WHERE client_request_id = '{crid}'",
+            )
+            or 0
+        )
+        runs_after = int(
+            _psql_scalar(
+                env.url,
+                f"SELECT count(*) FROM job_runs WHERE run_id = '{run_id}'",
+            )
+            or 0
+        )
+        intake_after = int(
+            _psql_scalar(
+                env.url,
+                "SELECT count(*) FROM conversation_runs "
+                f"WHERE run_id = '{run_id}'",
+            )
+            or 0
+        )
+        _check(
+            "C4",
+            msg_after == 1 and runs_after == 1 and intake_after == 1,
+            "row counts stay exactly one after the retry "
+            f"(messages={msg_after}, runs={runs_after}, intake={intake_after})",
+        )
+        _record(
+            "C4",
+            verdict="pass",
+            restart="EngineClient.resume_run + RecoveryService.aresolve_step",
+            resolved_seq=seq,
+            retry=retry_status,
+        )
+    finally:
+        scenario.stop()
+
+
 # ---------------------------------------------------------------------------
 # C5 — steering during a gated two-call batch, then deterministic Pause
 # ---------------------------------------------------------------------------
@@ -1954,26 +2267,32 @@ def test_c5_steering_pause_gates_next_effect(harness: _Harness) -> None:
         # and the run could never reach its terminal pause boundary.
         scenario.release_gate("fixture.priv", "m1")
         view = _await_terminal(env, run_id, RUN_TIMEOUT, case_id="C5")
-        # The boundary-stop proof checks record BEFORE the terminal-state
-        # check: that check is red by the application-owned registry
-        # mismatch (the ratified row says 'cancelled', the shipped
-        # boundary stop lands 'succeeded' + stopped_by — see
-        # row-ownership.json), and a failing _check aborts the row. The
-        # abort must never erase the evidence that the pause was consumed
-        # honestly at the safe boundary.
+        # Ratified registry row (23d, captain Option A): the boundary stop
+        # is REVIEWED application behaviour — the run ends TERMINAL
+        # (succeeded) with agent.completed carrying stopped_by=pause
+        # (run.py:2839-2844 writes the key, run.py:3627-3630 carries it in
+        # the run summary; backend/tests/test_chat_steering_continuity.py
+        # 'Terminal run => lease released + honest stopped_by event'
+        # pins exactly this). The 23c row text said 'run ends cancelled':
+        # that registry wording was the defect (a deterministic boundary
+        # stop is not a cancellation), and this check now asserts the
+        # ratified observable. The row's substantive content — pause is
+        # deterministic, the in-flight effect completed honestly exactly
+        # once, the second call never dispatched — stays asserted below,
+        # unchanged.
+        stopped_data = None
         stopped = 0
         stopped_deadline = time.monotonic() + 10.0
         while time.monotonic() < stopped_deadline:
-            stopped = int(
-                _psql_scalar(
-                    env.url,
-                    "SELECT count(*) FROM job_events WHERE run_id = "
-                    f"'{run_id}' AND type = 'agent.completed' "
-                    "AND data::text LIKE '%stopped_by%'",
-                )
-                or 0
+            stopped_data = _psql_scalar(
+                env.url,
+                "SELECT data FROM job_events WHERE run_id = "
+                f"'{run_id}' AND type = 'agent.completed' "
+                "AND data->>'stopped_by' IS NOT NULL "
+                "ORDER BY seq DESC LIMIT 1",
             )
-            if stopped >= 1:
+            if stopped_data is not None:
+                stopped = 1
                 break
             time.sleep(0.2)
         _check(
@@ -1981,6 +2300,13 @@ def test_c5_steering_pause_gates_next_effect(harness: _Harness) -> None:
             stopped == 1,
             "the engine consumed the pause at the safe boundary "
             f"(agent.completed carries stopped_by): {stopped}",
+        )
+        _check(
+            "C5",
+            isinstance(stopped_data, dict)
+            and stopped_data.get("stopped_by") == "pause",
+            "agent.completed carries stopped_by == 'pause': "
+            f"{stopped_data}",
         )
         _check(
             "C5",
@@ -2007,7 +2333,12 @@ def test_c5_steering_pause_gates_next_effect(harness: _Harness) -> None:
             int(pending) == 1,
             "natural-language steering stayed pending (not silently dropped)",
         )
-        _check("C5", view["state"] == "cancelled", f"run cancelled by pause: {view}")
+        _check(
+            "C5",
+            view["state"] in TERMINAL_STATES and view["state"] == "succeeded",
+            "run ends terminal (succeeded) with agent.completed "
+            f"stopped_by=pause: state={view['state']}",
+        )
         _record("C5", verdict="pass", final_state=view["state"])
     finally:
         scenario.stop()
@@ -2175,7 +2506,44 @@ def test_u1_task_items_pagination(harness: _Harness) -> None:
         page2_status == 200 and not (ids1 & ids2),
         "Load-more page disjoint and ordered",
     )
-    _record("U1", verdict="pass", total=page1["total"])
+    # -- U1 browser leg (R-23-evals item 5, option D1+D2): the 360x640
+    # visual journeys live in the named Playwright suites (V2/V3
+    # feature-gate evidence); this runtime harness exercises the
+    # pagination DATA those panels render. The reference is CHECKED, not
+    # assumed: the named files must exist and carry the 360x640
+    # assertions, or the registry's browser_leg claim is false.
+    browser_leg = CASES["U1"].get("browser_leg") or {}
+    missing_or_empty = [
+        path
+        for path in browser_leg.get("covered_by", [])
+        if "360x640" not in path
+        or not (REPO_ROOT / path.split(" (")[0]).is_file()
+        or "360"
+        not in (REPO_ROOT / path.split(" (")[0]).read_text(encoding="utf-8")
+    ]
+    _check(
+        "U1",
+        bool(browser_leg.get("covered_by"))
+        and bool(browser_leg.get("command"))
+        and not missing_or_empty,
+        f"browser_leg reference integrity (named suites exist and assert "
+        f"360x640): missing={missing_or_empty}",
+    )
+    limitations = CASES["U1"].get("disclosed_limitations") or []
+    _check(
+        "U1",
+        any("360x640" in entry for entry in limitations),
+        "case-level disclosed_limitations carries the 360x640 disclosure "
+        "(the scorecard surfaces case-level entries)",
+    )
+    _record(
+        "U1",
+        verdict="pass",
+        total=page1["total"],
+        browser_leg="reference integrity checked; the 360x640 journeys "
+        "themselves are owned by the V2/V3 feature-gate Playwright verdicts "
+        "(disclosed, not re-claimed here)",
+    )
 
 
 @_journal_tails_on_failure
@@ -3294,15 +3662,59 @@ def test_e3_wrapper_success_domain_failure(harness: _Harness) -> None:
 
 @_journal_tails_on_failure
 def test_e2_fabricated_evidence_rejected(harness: _Harness) -> None:
-    from mai.agents.task_completion import CompletionProposal, afinalize_completion
+    from mai.agents.task_completion import (
+        CompletionProposal,
+        EvidenceCertainty,
+        afinalize_completion,
+    )
     from mai.agents.task_store import aget_task
 
     env = harness
     seed = _seed_task_via_intake(env, "Seed the completion task (e2)")
     task_id = uuid.UUID(str(seed["task_id"]))
     conversation_id = uuid.UUID(str(seed["conversation_id"]))
+    revision0 = int(_task_header(env, conversation_id)["revision"])
 
-    async def _propose() -> dict[str, Any]:
+    def _zero_effects(document: dict[str, Any], label: str) -> None:
+        """Every E2 rejection has ZERO effects: no receipt, no revision
+        bump, no criterion advance (task_store.apropose_completion and the
+        module-level certainty gate both fail closed before any write)."""
+        header = _task_header(env, conversation_id)
+        _check(
+            "E2",
+            header["status"] != "verified",
+            f"{label}: task stays unverified: {header['status']}",
+        )
+        _check(
+            "E2",
+            int(_task_header(env, conversation_id)["revision"]) == revision0,
+            f"{label}: no revision bump (revision == {revision0})",
+        )
+        receipts = _psql_scalar(
+            env.url,
+            "SELECT count(*) FROM agent_task_completions "
+            f"WHERE task_id = '{task_id}'",
+        )
+        _check("E2", int(receipts) == 0, f"{label}: no completion receipt persisted: {receipts}")
+        bumps = _psql_scalar(
+            env.url,
+            "SELECT count(*) FROM agent_task_revisions "
+            f"WHERE task_id = '{task_id}' AND kind = 'completion'",
+        )
+        _check("E2", int(bumps) == 0, f"{label}: no completion revision rows: {bumps}")
+        passed = _psql_scalar(
+            env.url,
+            "SELECT count(*) FROM agent_task_criteria "
+            f"WHERE task_id = '{task_id}' AND verification = 'passed'",
+        )
+        _check("E2", int(passed) == 0, f"{label}: no criterion advanced to passed: {passed}")
+        _check(
+            "E2",
+            document.get("recorded") is False,
+            f"{label}: proposal rejected (recorded == false): {document}",
+        )
+
+    async def _propose(criterion_refs: list[dict[str, Any]], certainty: list[EvidenceCertainty]) -> dict[str, Any]:
         task = await aget_task(
             env.app.state.session_factory, task_id, server_id=env.server_id
         )
@@ -3318,15 +3730,10 @@ def test_e2_fabricated_evidence_rejected(harness: _Harness) -> None:
                 {
                     "criterion_id": "done",
                     "result": "passed",
-                    "evidence_refs": [
-                        {
-                            "kind": "observation",
-                            "evidence_id": str(uuid.uuid4()),
-                        }
-                    ],
+                    "evidence_refs": criterion_refs,
                 }
             ],
-            evidence_certainty=[],
+            evidence_certainty=certainty,
         )
         observation = await afinalize_completion(
             env.app.state.session_factory,
@@ -3335,19 +3742,100 @@ def test_e2_fabricated_evidence_rejected(harness: _Harness) -> None:
         )
         return observation.document()
 
-    document = _run(_propose())
+    # -- variant 1: FABRICATED evidence id (exists nowhere) ------------------
+    # The proposal CLAIMS certain success for the fabricated ref, so the
+    # module-level certainty gate passes and the STORE's existence check
+    # (validate_completion_verdict against the task-scoped evidence
+    # registry) is the seam under test: unknown_evidence_ref, zero effects.
+    fabricated_id = str(uuid.uuid4())
+    document = _run(
+        _propose(
+            [{"kind": "observation", "evidence_id": fabricated_id}],
+            [
+                EvidenceCertainty(
+                    evidence_id=fabricated_id,
+                    domain_outcome="success",
+                    effect_certainty="certain",
+                )
+            ],
+        )
+    )
+    _zero_effects(document, "fabricated id")
     _check(
         "E2",
-        document.get("recorded") is False,
-        f"fabricated-evidence proposal rejected: {document}",
+        "unknown_evidence_ref" in (document.get("rejection_fields") or {}).values(),
+        f"fabricated id rejected value-free at the store: {document.get('rejection_fields')}",
     )
-    header = _task_header(env, conversation_id)
+
+    # -- variant 2: WRONG-TARGET evidence (REAL record, FOREIGN scope) -------
+    # A conversation_messages id that genuinely exists — but belongs to a
+    # DIFFERENT conversation. The store's source predicate is
+    # conversation-scoped (_EVIDENCE_SOURCE_SQL MESSAGE:
+    # 'WHERE message_id = :eid AND conversation_id = :cid') and the
+    # completion verdict validates against the TASK-scoped evidence
+    # registry, so the foreign record is unknown_evidence_ref, never
+    # silently accepted.
+    foreign = _seed_task_via_intake(
+        env, "Seed the FOREIGN conversation task (e2 wrong-target)"
+    )
+    foreign_message_id = str(foreign["message_id"])
+    assert foreign["conversation_id"] != str(conversation_id)
+    document = _run(
+        _propose(
+            [{"kind": "message", "evidence_id": foreign_message_id}],
+            [
+                EvidenceCertainty(
+                    evidence_id=foreign_message_id,
+                    domain_outcome="success",
+                    effect_certainty="certain",
+                )
+            ],
+        )
+    )
+    _zero_effects(document, "wrong-target id")
     _check(
         "E2",
-        header["status"] != "verified",
-        f"task stays unverified: {header['status']}",
+        "unknown_evidence_ref" in (document.get("rejection_fields") or {}).values(),
+        f"wrong-target (foreign-conversation) record rejected: {document.get('rejection_fields')}",
     )
-    _record("E2", verdict="pass", fields=document.get("fields"))
+
+    # -- variant 3: STALE evidence certainty (recorded FAILURE backing a
+    # passed claim) ----------------------------------------------------------
+    # The proposal copies the REAL EvidenceCertainty record shape; a
+    # recorded domain failure can never support a passed claim
+    # (task_completion._supports_passed: only certain+success does), so
+    # the module-level gate rejects with certainty_incompatible BEFORE any
+    # store write.
+    stale_id = str(uuid.uuid4())
+    document = _run(
+        _propose(
+            [{"kind": "observation", "evidence_id": stale_id}],
+            [
+                EvidenceCertainty(
+                    evidence_id=stale_id,
+                    domain_outcome="failure",
+                    effect_certainty="certain",
+                )
+            ],
+        )
+    )
+    _zero_effects(document, "stale certainty")
+    _check(
+        "E2",
+        "certainty_incompatible" in (document.get("rejection_fields") or {}).values(),
+        f"stale certainty (recorded failure vs passed claim) rejected: {document.get('rejection_fields')}",
+    )
+    _check(
+        "E2",
+        document.get("rejection_code") == "completion_missing_evidence",
+        f"rejection carries the stable code: {document.get('rejection_code')}",
+    )
+    _record(
+        "E2",
+        verdict="pass",
+        fabricated=dict(document.get("rejection_fields") or {}),
+        variants=["fabricated", "wrong_target", "stale_certainty"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3839,3 +4327,582 @@ def test_x1_outcome_graded_not_sequence(harness: _Harness) -> None:
         )
     finally:
         scenario.stop()
+
+
+# ---------------------------------------------------------------------------
+# Live-provider legs (act 23d, item F): budgeted provider-quality evidence
+# through the REAL intake seam, inside a disposable marked container.
+#
+# The production credential (MAI_GATEWAY_KEY) only resolves inside the
+# compose network's env-file mount, so the leg runner is executed in a
+# disposable ``mai-backend`` container (``--user 0:0`` — the mounted env
+# file is root-owned 0600) attached to the infra network where
+# ``http://litellm:4000/v1`` answers. The credential value crosses the
+# boundary ONLY as the read-only bind mount into the production
+# EnvResolver; it is never read by this harness, never printed, and never
+# written to a repo/evidence file.
+# ---------------------------------------------------------------------------
+
+#: Host path of the compose credential env-file (bind source only; the
+#: harness NEVER reads this file — it only hands the path to docker).
+LIVE_ENV_FILE = os.environ.get(
+    "MAI_ACT_LIVE_ENV_FILE",
+    "/home/megastruktur/data/machina/mai-credentials.env",
+)
+#: Docker-visible work root (/tmp is mount-namespaced on this host).
+LIVE_WORK_ROOT = Path(
+    os.environ.get("MAI_ACT_LIVE_WORK_ROOT", "/home/megastruktur/act-evals-live")
+)
+LIVE_IMAGE = "mai-backend:latest"
+LIVE_TIMEOUT_SECONDS = 600.0
+
+#: Conservative reservation for z-ai-coding/glm-5.3-flash: the model has
+#: NO published cost in the proxy, so the reservation uses the HIGHER of
+#: the two published per-token rates (glm-5.3: input 1.4e-06/tok, output
+#: 4.4e-06/tok) over the OBSERVED per-leg usage — an upper-bound
+#: reservation, never a measured price.
+LIVE_RATES_NOTE = (
+    "glm-5.3-flash has no published proxy cost; reserved at the higher "
+    "published rates (glm-5.3: input 1.4e-06/tok, output 4.4e-06/tok) "
+    "over the OBSERVED per-leg usage (upper bound, never a price)"
+)
+LIVE_INPUT_RATE = 1.4e-06
+LIVE_OUTPUT_RATE = 4.4e-06
+
+#: Legs whose observable is MODEL COMPETENCE (registry P1/P2), judged
+#: outcome-level. Plumbing rows (worker/store/UI) stay deterministic-only.
+LIVE_LEG_CASES = ("P1", "P2")
+
+#: provider-quality leg records consumed by the scorecard
+#: (requests / wall_clock_minutes / reserved_spend_usd per leg).
+PROVIDER_LEGS: list[dict[str, Any]] = []
+
+#: case_id -> (live_measured, skip_reason). Rows absent from LIVE_LEG_CASES
+#: stay deterministic-only with the default reason below.
+LIVE_FLAGS: dict[str, tuple[bool, str | None]] = {}
+
+LIVE_SKIP_DEFAULT = (
+    "not in the ratified live subset (P1/P2 model-competence legs); the "
+    "production credential resolves only inside the compose network, so "
+    "host-side worker subprocesses cannot dial the live endpoint — the "
+    "deterministic scripted leg proves the plumbing at the real seams and "
+    "no provider-quality claim is made"
+)
+
+LIVE_RUNNER_SOURCE = '''
+"""Budgeted live-provider leg runner (act 23d).
+
+Runs INSIDE a disposable marked container on the compose infra network.
+The production credential is mounted read-only at
+/run/secrets/mai-credentials.env and resolved through the production
+EnvResolver — this script never parses, prints or persists it. The live
+model drives the REAL intake seam (final_result/TurnInterpretation output
+tool via mai.agents.intake.ainterpret_turn), never a raw provider call.
+Every leg is bounded by the ratified caps; the runner stops at the first
+bound. Output: /work/legs.json (value-free; no credential material).
+"""
+import asyncio
+import json
+import os
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+BASE_URL = os.environ.get("LIVE_BASE_URL", "http://litellm:4000/v1")
+MODEL_ID = os.environ.get("LIVE_MODEL", "z-ai-coding/glm-5.3-flash")
+ENV_FILE = os.environ.get("LIVE_ENV_FILE", "/run/secrets/mai-credentials.env")
+CAPS = {
+    "requests": int(os.environ.get("LIVE_CAP_REQUESTS", "60")),
+    "wall_clock_minutes": float(os.environ.get("LIVE_CAP_MINUTES", "30")),
+    "reserved_spend_usd": float(os.environ.get("LIVE_CAP_USD", "5")),
+}
+INPUT_RATE = 1.4e-06
+OUTPUT_RATE = 4.4e-06
+RATES_NOTE = (
+    "glm-5.3-flash has no published proxy cost; reserved at the higher "
+    "published rates (glm-5.3: input 1.4e-06/tok, output 4.4e-06/tok) "
+    "over the OBSERVED per-leg usage (upper bound, never a price)"
+)
+#: z-ai-coding/glm-5.3-flash is a REASONING model: measured against the
+#: P2 prompt, max_tokens=256 is consumed entirely by reasoning tokens
+#: (finish_reason 'length', no tool call); 2048 lets the structured
+#: final_result tool call land (~50s per call at that budget).
+MAX_TOKENS = 2048
+
+LEGS = [
+    {
+        "case": "P1",
+        "leg": "compact structured answer via the real intake seam",
+        "prompt": "Say hello and tell me what you can do in one short paragraph.",
+        "judge": "answer",
+    },
+    {
+        "case": "P2",
+        "leg": "missing prerequisite surfaces as questions/assumptions, not facts",
+        "prompt": (
+            "Set up a replicated PostgreSQL cluster across two brand-new "
+            "production servers and fail over to the replica if the primary "
+            "dies. Note: I have not given you any server addresses, "
+            "credentials or SSH access yet."
+        ),
+        "judge": "assumptions",
+    },
+]
+
+
+def _build_model():
+    from mai.agents.model_store import ModelConfigStore
+    from mai.credentials.env import build_runtime_env_resolver
+
+    root = Path(tempfile.mkdtemp(prefix="live-model-root-"))
+    store = ModelConfigStore(root)
+    store.write_connection(
+        "gateway",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "gateway",
+                "base_url": BASE_URL,
+                "credential_ref": "MAI_GATEWAY_KEY",
+                "timeout_seconds": 240,
+                "capabilities": {"tool_calls": True},
+            }
+        )
+        + "\\n",
+        expected_revision=0,
+    )
+    store.write_profile(
+        "flash",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "flash",
+                "connection": "gateway",
+                "model": MODEL_ID,
+                "max_tokens": MAX_TOKENS,
+            }
+        )
+        + "\\n",
+        expected_revision=0,
+    )
+    store.set_selection("gateway", "flash", expected_revision=0)
+    binding = store.bind("gateway", "flash")
+    resolver = build_runtime_env_resolver(ENV_FILE, None)
+    return binding.rebuild(resolver=resolver).model
+
+
+def _snapshot(content):
+    from mai.agents.intake import IntakeSnapshot
+    from mai.contracts.conversations import MessageRole
+
+    return IntakeSnapshot(
+        server_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        source_message_id=uuid.uuid4(),
+        source_message_role=MessageRole.USER,
+        source_message_content=content,
+        transcript=((MessageRole.USER, content),),
+        transcript_omitted_older=False,
+        task_id=None,
+        task_revision=None,
+        task_phase=None,
+        task_title=None,
+        steps=(),
+        steps_omitted=False,
+        constraints=(),
+        constraints_omitted=False,
+    )
+
+
+def _clip(value, limit=200):
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _judge(entry, turn, record):
+    kind = str(getattr(turn, "turn_kind", "?"))
+    questions = list(getattr(turn, "open_questions", []) or [])
+    assumptions = list(getattr(turn, "assumptions", []) or [])
+    observed = {
+        "turn_kind": kind,
+        "model_calls": record.model_calls,
+        "attempts": record.attempts,
+        "repaired": record.repaired,
+        "function_tools": record.function_tools,
+        "open_questions": len(questions),
+        "assumptions": len(assumptions),
+    }
+    if entry["judge"] == "answer":
+        answer = getattr(turn, "answer_text", None)
+        observed["answer_chars"] = len(answer) if isinstance(answer, str) else 0
+        observed["answer_excerpt"] = _clip(answer or "")
+        satisfied = (
+            kind == "answer"
+            and isinstance(answer, str)
+            and 0 < len(answer) <= 1500
+            and record.model_calls == 1
+            and record.repaired is False
+        )
+        detail = (
+            "one-call compact answer turn" if satisfied else
+            f"not a one-call compact answer (kind={kind}, "
+            f"chars={observed['answer_chars']}, calls={record.model_calls}, "
+            f"repaired={record.repaired})"
+        )
+        return satisfied, detail, observed
+    satisfied = bool(questions) and kind != "answer"
+    if kind in ("plan", "new_task"):
+        satisfied = satisfied and bool(assumptions)
+    observed["first_question"] = _clip(
+        getattr(questions[0], "question", None) if questions else None
+    )
+    detail = (
+        "missing prerequisite recorded as unverified (open question"
+        + (" + explicit assumption)" if assumptions else ")")
+        if satisfied
+        else f"missing prerequisite not surfaced as unverified "
+        f"(kind={kind}, questions={len(questions)}, "
+        f"assumptions={len(assumptions)})"
+    )
+    return satisfied, detail, observed
+
+
+async def _run_all(model, entries, used):
+    from mai.agents.intake import IntakeRejection, ainterpret_turn
+    from pydantic_ai import capture_run_messages
+
+    def _observed_usage(messages):
+        """REAL token counts from the captured model messages (sum over
+        every model response this intake interpretation produced)."""
+        try:
+            total_in = 0
+            total_out = 0
+            for message in messages or ():
+                usage = getattr(message, "usage", None)
+                if usage is None:
+                    continue
+                total_in += int(getattr(usage, "input_tokens", 0) or 0)
+                total_out += int(getattr(usage, "output_tokens", 0) or 0)
+            return {"input_tokens": total_in, "output_tokens": total_out}
+        except Exception:  # noqa: BLE001 - usage is best-effort accounting
+            return None
+
+    legs = []
+    for entry in entries:
+        if (
+            used["requests"] >= CAPS["requests"]
+            or used["minutes"] >= CAPS["wall_clock_minutes"]
+            or used["usd"] >= CAPS["reserved_spend_usd"]
+        ):
+            used["stopped"] = (
+                f"budget bound reached before this leg "
+                f"(requests={used['requests']}, "
+                f"minutes={used['minutes']:.2f}, "
+                f"usd={used['usd']:.4f})"
+            )
+            break
+        requests = 0
+        measured_failure = False
+        t0 = time.monotonic()
+        try:
+            with capture_run_messages() as captured:
+                turn, record = await ainterpret_turn(
+                    model, _snapshot(entry["prompt"])
+                )
+            requests = int(record.model_calls)
+            satisfied, detail, observed = _judge(entry, turn, record)
+            usage = _observed_usage(captured)
+            if usage is not None:
+                observed["usage"] = usage
+            error = None
+        except IntakeRejection as exc:
+            # The live model failed to produce a schema-valid
+            # TurnInterpretation within the bounded repair budget: a
+            # REPORTED provider-quality failure, never a hidden skip. The
+            # attempts DID hit the provider and are counted.
+            requests = int(getattr(exc, "model_calls", 0) or 0)
+            satisfied = False
+            measured_failure = requests > 0
+            detail = (
+                "intake rejected the live model's interpretation after "
+                f"bounded repair (provider-quality failure): {dict(exc.fields)}"
+            )
+            observed = {
+                "attempts": getattr(exc, "attempts", 0),
+                "model_calls": requests,
+                "repaired": getattr(exc, "repaired", False),
+                "rejection_fields": dict(getattr(exc, "fields", {})),
+            }
+            usage = _observed_usage(captured)
+            if usage is not None:
+                observed["usage"] = usage
+            error = "IntakeRejection"
+        except Exception as exc:  # noqa: BLE001 - plumbing, not a verdict
+            satisfied, detail, observed = False, "runner/provider plumbing error", {}
+            usage = None
+            error = f"{type(exc).__name__}: {_clip(str(exc), 300)}"
+        wall_minutes = (time.monotonic() - t0) / 60.0
+        used["requests"] += requests
+        used["minutes"] += wall_minutes
+        # Conservative reservation from the OBSERVED usage at the higher
+        # published rates (upper bound, never a price); legs that made no
+        # request reserve nothing.
+        reserved = 0.0
+        if requests > 0 and usage:
+            reserved = (
+                usage.get("input_tokens", 0) * INPUT_RATE
+                + usage.get("output_tokens", 0) * OUTPUT_RATE
+            )
+        used["usd"] += reserved
+        legs.append(
+            {
+                "case": entry["case"],
+                "leg": entry["leg"],
+                "requests": requests,
+                "wall_clock_minutes": round(wall_minutes, 4),
+                "reserved_spend_usd": round(reserved, 6),
+                "reserved_formula": RATES_NOTE,
+                "model": MODEL_ID,
+                "endpoint_base_url": BASE_URL,
+                "measured_failure": measured_failure,
+                "satisfied": satisfied,
+                "detail": detail,
+                "observed": observed,
+                "error": error,
+            }
+        )
+    return legs
+
+
+def main():
+    model = _build_model()
+    used = {"requests": 0, "minutes": 0.0, "usd": 0.0, "stopped": None}
+    legs = asyncio.run(_run_all(model, LEGS, used))
+    document = {
+        "schema": "act-live-legs/1",
+        "model": MODEL_ID,
+        "endpoint_base_url": BASE_URL,
+        "caps": CAPS,
+        "totals": {
+            "requests": used["requests"],
+            "wall_clock_minutes": round(used["minutes"], 4),
+            "reserved_spend_usd": round(used["usd"], 6),
+        },
+        "stopped_at_bound": used["stopped"],
+        "rates_note": RATES_NOTE,
+        "legs": legs,
+    }
+    out = Path(os.environ.get("LIVE_OUTPUT", "/work/legs.json"))
+    out.write_text(json.dumps(document, indent=2, sort_keys=True) + "\\n")
+    os.chmod(out, 0o644)
+    print("LIVE_LEGS " + json.dumps(document["totals"], sort_keys=True))
+
+
+main()
+'''
+
+_ast.parse(LIVE_RUNNER_SOURCE, mode="exec")  # the runner must stay parseable
+
+
+def _live_network() -> str | None:
+    """The compose network that hosts BOTH the stack and the litellm proxy."""
+    proc = _docker(
+        [
+            "inspect",
+            "machina-mai-api-1",
+            "--format",
+            "{{range $k,$v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
+        ]
+    )
+    if proc.returncode != 0:
+        return None
+    for net in (line.strip() for line in proc.stdout.splitlines()):
+        if not net:
+            continue
+        attached = _docker(
+            [
+                "network",
+                "inspect",
+                net,
+                "--format",
+                "{{range .Containers}}{{.Name}} {{end}}",
+            ]
+        )
+        if attached.returncode == 0 and "litellm" in attached.stdout.split():
+            return net
+    return None
+
+
+def test_live_provider_legs_budgeted() -> None:
+    """Budgeted live-provider legs (P1/P2) through the REAL intake seam.
+
+    The leg runner executes inside a disposable marked container on the
+    compose infra network; the credential crosses only as the read-only
+    env-file mount into the production EnvResolver. Every request, minute
+    and reserved dollar is counted; the first bound stops the legs. If any
+    piece of the plumbing is unavailable, the legs are recorded
+    not_measured with that exact reason — never fabricated, never faked.
+    """
+    budget_doc = json.loads(CASES_PATH.read_text(encoding="utf-8")).get(
+        "budget", {}
+    )
+    caps = {
+        "requests": int(budget_doc.get("requests_cap", 60)),
+        "minutes": float(budget_doc.get("wall_clock_minutes_cap", 30)),
+        "usd": float(budget_doc.get("reserved_spend_usd_cap", 5.0)),
+    }
+
+    def _skip_all(reason: str) -> None:
+        for case_id in LIVE_LEG_CASES:
+            LIVE_FLAGS[case_id] = (False, reason)
+        print(f"[live-legs] not measured: {reason}")
+
+    net = _live_network()
+    if net is None:
+        _skip_all(
+            "the compose infra network hosting the litellm proxy is not "
+            "discoverable from this host (docker inspect found no stack "
+            "network with a litellm container attached)"
+        )
+        return
+    if not Path(LIVE_ENV_FILE).exists():
+        _skip_all(
+            f"the credential env-file bind source does not exist on this "
+            f"host: {LIVE_ENV_FILE} (the harness never reads the file; "
+            "docker would fail the mount)"
+        )
+        return
+    src_root = BACKEND_ROOT / "src"
+    if not src_root.is_dir():
+        _skip_all("backend/src is not present next to the harness")
+        return
+
+    work = LIVE_WORK_ROOT / uuid.uuid4().hex[:12]
+    work.mkdir(parents=True, exist_ok=True)
+    container = f"{CONTAINER_MARK}live-{uuid.uuid4().hex[:12]}"
+    (work / "live_runner.py").write_text(LIVE_RUNNER_SOURCE, encoding="utf-8")
+    proc = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container,
+            "--user",
+            "0:0",
+            "--network",
+            net,
+            "-e",
+            "PYTHONPATH=/work/src",
+            "-e",
+            f"LIVE_CAP_REQUESTS={caps['requests']}",
+            "-e",
+            f"LIVE_CAP_MINUTES={caps['minutes']}",
+            "-e",
+            f"LIVE_CAP_USD={caps['usd']}",
+            "-v",
+            f"{LIVE_ENV_FILE}:/run/secrets/mai-credentials.env:ro",
+            "-v",
+            f"{work}:/work:rw",
+            "-v",
+            f"{src_root}:/work/src:ro",
+            LIVE_IMAGE,
+            "python",
+            "/work/live_runner.py",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=LIVE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    try:
+        if proc.returncode != 0:
+            _skip_all(
+                "the in-container leg runner failed: rc="
+                f"{proc.returncode} stderr_tail="
+                f"{proc.stderr.strip()[-400:]!r}"
+            )
+            return
+        legs_path = work / "legs.json"
+        try:
+            document = json.loads(legs_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError) as exc:
+            _skip_all(f"the leg runner produced no parsable legs.json: {exc}")
+            return
+        by_case = {
+            leg.get("case"): leg for leg in document.get("legs", []) if leg.get("case")
+        }
+        ran_cases = set(by_case)
+        for case_id in LIVE_LEG_CASES:
+            leg = by_case.get(case_id)
+            if leg is None:
+                LIVE_FLAGS[case_id] = (
+                    False,
+                    document.get("stopped_at_bound")
+                    or "the leg never started inside the bounded runner",
+                )
+                continue
+            if leg.get("requests", 0) <= 0 and leg.get("error"):
+                # A plumbing error made NO provider request: nothing was
+                # measured — an honest not_measured, never a bucket-2 leg.
+                LIVE_FLAGS[case_id] = (False, f"runner plumbing error: {leg['error']}")
+                continue
+            PROVIDER_LEGS.append(
+                {
+                    "case": case_id,
+                    "leg": leg["leg"],
+                    "requests": leg["requests"],
+                    "wall_clock_minutes": leg["wall_clock_minutes"],
+                    "reserved_spend_usd": leg["reserved_spend_usd"],
+                    "model": leg["model"],
+                    "satisfied": leg["satisfied"],
+                    "measured_failure": leg.get("measured_failure", False),
+                    "detail": leg["detail"],
+                    "observed": leg["observed"],
+                    "reserved_formula": leg.get("reserved_formula"),
+                    "error": leg.get("error"),
+                }
+            )
+            if leg.get("requests", 0) > 0 and leg.get("error") is None:
+                LIVE_FLAGS[case_id] = (True, None)
+            else:
+                # A leg with provider requests but a non-None error stays
+                # in bucket 2 (it really ran and its spend counts) while
+                # the ROW does not claim a measured live outcome.
+                LIVE_FLAGS[case_id] = (
+                    False,
+                    f"the leg ran ({leg.get('requests', 0)} requests) but "
+                    f"errored: {leg.get('error')}",
+                )
+        # Preserve the runner's own output (value-free) for forensics.
+        legs_path = work / "legs.json"
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        (EVIDENCE_DIR / "provider_legs_raw.json").write_text(
+            legs_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        for case_id, leg in sorted(by_case.items()):
+            print(
+                f"[live-legs] {case_id}: satisfied={leg['satisfied']} "
+                f"requests={leg['requests']} "
+                f"minutes={leg['wall_clock_minutes']} "
+                f"reserved_usd={leg['reserved_spend_usd']} :: {leg['detail']}"
+            )
+        print(
+            f"[live-legs] totals: {document.get('totals')} "
+            f"stopped_at_bound={document.get('stopped_at_bound')}"
+        )
+        for case_id in LIVE_LEG_CASES:
+            if case_id not in ran_cases:
+                print(
+                    f"[live-legs] {case_id}: NOT MEASURED "
+                    f"({LIVE_FLAGS[case_id][1]})"
+                )
+    finally:
+        # Teardown hygiene: --rm removes the container on exit; if the run
+        # failed in a way that left it, remove it explicitly and never
+        # leak a marked container.
+        _docker(["rm", "-f", container])
+        import shutil
+
+        shutil.rmtree(work, ignore_errors=True)
