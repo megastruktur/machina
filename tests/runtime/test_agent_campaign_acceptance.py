@@ -1671,12 +1671,14 @@ def test_c3_long_transcript_bounded_window(harness: _Harness) -> None:
 
         # -- C3: fill the transcript past the 20-message window --------------
         total_before = _messages(env, conversation_id)[1]["total"]
+        filler_msg_ids: list[str] = []
         for i in range(10):
             filler = (
                 f"{filler_marker} {i}: " + "x" * 3400 + f" tail-{filler_marker}-{i}"
             )
             status_f, body_f = _submit_turn(env, conversation_id, filler)
             assert status_f == 201, body_f
+            filler_msg_ids.append(str(body_f["message_id"]))
             scenario.context(**{f"msgf{i}": str(body_f["message_id"])})
             view_f = _await_terminal(
                 env, uuid.UUID(body_f["run_id"]), RUN_TIMEOUT, case_id="C3"
@@ -1739,10 +1741,34 @@ def test_c3_long_transcript_bounded_window(harness: _Harness) -> None:
             CONSTRAINT_TEXT in last_prompt,
             "assembled prompt carries the constraint despite truncation",
         )
+        # The window keeps the LAST DEFAULT_TRANSCRIPT_LIMIT messages
+        # (intake.py: the snapshot transcript is 1:1 with the store page,
+        # oldest first), so the OLDEST filler rows legitimately drop out
+        # of the assembled prompt while the most recent ones stay. Grade
+        # the real observable: every filler whose user row fell outside
+        # the snapshot window is fully absent from the prompt (head and
+        # tail marker), every filler still inside the window is present
+        # (its head marker survives the per-row truncation), and the
+        # window really did omit at least one filler row.
+        status_fin, page_fin = _messages(env, conversation_id, limit=100)
+        assert status_fin == 200, page_fin
+        ordered_ids = [str(row["message_id"]) for row in page_fin["items"]]
+        window_start = page_fin["total"] - len(snapshot.transcript)
+        filler_rows = {i: ordered_ids.index(filler_msg_ids[i]) for i in range(10)}
+        out_of_window = [i for i, pos in filler_rows.items() if pos < window_start]
+        in_window = [i for i, pos in filler_rows.items() if pos >= window_start]
         _check(
             "C3",
-            filler_marker not in last_prompt,
-            "assembled prompt omits truncated filler (bounded window)",
+            bool(out_of_window)
+            and all(
+                f"{filler_marker} {i}: " not in last_prompt
+                and f"tail-{filler_marker}-{i}" not in last_prompt
+                for i in out_of_window
+            )
+            and all(f"{filler_marker} {i}: " in last_prompt for i in in_window),
+            "assembled prompt omits the OLDEST out-of-window filler rows "
+            f"({out_of_window}) while the in-window fillers stay ({in_window}) "
+            "(bounded window)",
         )
         _record(
             "C3",
@@ -1919,10 +1945,43 @@ def test_c5_steering_pause_gates_next_effect(harness: _Harness) -> None:
             mutate=True,
         )
         _check("C5", pause_status == 201, f"pause recorded: {pause_status} {pause_body}")
-        # the in-flight effect completes honestly (exactly once)
-        scenario.release_gate("fixture_priv", "m1")
+        # the in-flight effect completes honestly (exactly once). The
+        # gate file is keyed by the CAPABILITY identifier inside the
+        # executor (FixtureExecutor: gate-{capability_id}-{marker} with
+        # capability_id = descriptor identifier 'fixture.priv'), never by
+        # the tool name — releasing 'fixture_priv' wrote a gate file the
+        # parked call does not watch, so the effect could never complete
+        # and the run could never reach its terminal pause boundary.
+        scenario.release_gate("fixture.priv", "m1")
         view = _await_terminal(env, run_id, RUN_TIMEOUT, case_id="C5")
-        _check("C5", view["state"] == "cancelled", f"run cancelled by pause: {view}")
+        # The boundary-stop proof checks record BEFORE the terminal-state
+        # check: that check is red by the application-owned registry
+        # mismatch (the ratified row says 'cancelled', the shipped
+        # boundary stop lands 'succeeded' + stopped_by — see
+        # row-ownership.json), and a failing _check aborts the row. The
+        # abort must never erase the evidence that the pause was consumed
+        # honestly at the safe boundary.
+        stopped = 0
+        stopped_deadline = time.monotonic() + 10.0
+        while time.monotonic() < stopped_deadline:
+            stopped = int(
+                _psql_scalar(
+                    env.url,
+                    "SELECT count(*) FROM job_events WHERE run_id = "
+                    f"'{run_id}' AND type = 'agent.completed' "
+                    "AND data::text LIKE '%stopped_by%'",
+                )
+                or 0
+            )
+            if stopped >= 1:
+                break
+            time.sleep(0.2)
+        _check(
+            "C5",
+            stopped == 1,
+            "the engine consumed the pause at the safe boundary "
+            f"(agent.completed carries stopped_by): {stopped}",
+        )
         _check(
             "C5",
             scenario.count("effect:fixture.priv:m1") == 1,
@@ -1948,6 +2007,7 @@ def test_c5_steering_pause_gates_next_effect(harness: _Harness) -> None:
             int(pending) == 1,
             "natural-language steering stayed pending (not silently dropped)",
         )
+        _check("C5", view["state"] == "cancelled", f"run cancelled by pause: {view}")
         _record("C5", verdict="pass", final_state=view["state"])
     finally:
         scenario.stop()
@@ -2975,12 +3035,25 @@ def test_s2_unknown_effect_honest(harness: _Harness) -> None:
         run_id = uuid.UUID(body["run_id"])
         view = _await_state(env, run_id, "reconciling", 60.0)
         _check("S2", view["state"] == "reconciling", f"honest parked state: {view}")
-        awaiting = _psql_scalar(
-            env.url,
-            "SELECT count(*) FROM job_events WHERE run_id = "
-            f"'{run_id}' AND type = 'agent.awaiting_reconciliation'",
-        )
-        _check("S2", int(awaiting) == 1, f"one awaiting-reconciliation event: {awaiting}")
+        # The park commit is two writes (aobserve_enter_wait: the facade
+        # `reconciling` transition, THEN the awaiting_reconciliation event
+        # with the deadline) — a state-poll read can land between them.
+        # Bounded-wait for the event; the assertion stays exact (one).
+        awaiting = 0
+        event_deadline = time.monotonic() + 10.0
+        while time.monotonic() < event_deadline:
+            awaiting = int(
+                _psql_scalar(
+                    env.url,
+                    "SELECT count(*) FROM job_events WHERE run_id = "
+                    f"'{run_id}' AND type = 'agent.awaiting_reconciliation'",
+                )
+                or 0
+            )
+            if awaiting >= 1:
+                break
+            time.sleep(0.2)
+        _check("S2", awaiting == 1, f"one awaiting-reconciliation event: {awaiting}")
         retry_status, retry_body = _resubmit_turn(
             env,
             conversation_id,
@@ -3108,9 +3181,13 @@ def test_e3_wrapper_success_domain_failure(harness: _Harness) -> None:
             "fixture.read:mwrap": {
                 "status": "succeeded",
                 "exit_code": 0,
-                "subchecks": [
-                    {"name": "svc_active", "status": "failed", "detail": "unit inactive"}
-                ],
+                # Production _subcheck_page (tools.py) accepts ONLY a
+                # non-empty string name plus a boolean passed; any other
+                # entry shape makes the whole section untrustworthy and
+                # fail-closes the domain outcome to unknown. The wrapper
+                # success must carry its domain failure in the shape
+                # production actually parses.
+                "subchecks": [{"name": "svc_active", "passed": False}],
             }
         }
     )
@@ -3305,11 +3382,17 @@ def test_i1_bounded_no_progress_hints(harness: _Harness) -> None:
                 "needs": ["msg1", "crid1"],
                 "final_result": _plan_payload_template("msg1", "crid1"),
             },
+            # Six polls of ONE equivalent operation: the flat-poll signal
+            # judges the trailing run of the SAME request (capability +
+            # canonical payload hash), so every poll must carry the same
+            # payload — only the tool_call id differs per round. Distinct
+            # markers would make each poll a different request and the
+            # streak could never reach the FLAT_POLL bound.
             *[
                 {
                     "tool_call": {
                         "name": "fixture_read",
-                        "args": {"marker": f"q{i}"},
+                        "args": {"marker": "q"},
                         "id": f"p{i}",
                     }
                 }
@@ -3361,15 +3444,72 @@ def test_i1_bounded_no_progress_hints(harness: _Harness) -> None:
                 phrase not in hint_text.lower(),
                 f"hint never asserts {phrase!r}",
             )
-        denied = _psql_scalar(
-            env.url,
-            "SELECT count(*) FROM job_steps WHERE run_id = "
-            f"'{body['run_id']}' AND state = 'denied'",
+        # The three denials live in the TOOL vocabulary (ToolResult:
+        # status='denied', effect='not_attempted'), NOT in job_steps.state
+        # — the frozen step state machine (contracts/jobs.py StepState:
+        # pending/running/succeeded/failed/cancelled/outcome_unknown/
+        # cancel_requested) has no 'denied' state, and a policy refusal
+        # happens pre-dispatch, so no denied step row can ever exist.
+        # Grade them where they actually live: the hint round's executor
+        # history carries exactly three fixture.read tool-returns, all
+        # the SAME pre-dispatch refusal (identical payload hash —
+        # equivalent queries), zero effects ran, and the delivered hint
+        # names the capability, the query fingerprint and the refusal.
+        denial_returns = []
+        for message in hint_rounds[0]:
+            for part in message.get("parts", []):
+                if part.get("part_kind") != "tool-return":
+                    continue
+                content = part.get("content")
+                document = (
+                    json.loads(content) if isinstance(content, str) else content
+                )
+                if (
+                    isinstance(document, dict)
+                    and document.get("capability_id") == "fixture.read"
+                ):
+                    denial_returns.append(document)
+        _check(
+            "I1",
+            len(denial_returns) == 3,
+            f"three real denial tool-results before the hint: {len(denial_returns)}",
         )
         _check(
             "I1",
-            int(denied) == 3,
-            f"three real denials before the hint: {denied}",
+            bool(denial_returns)
+            and all(
+                document.get("status") == "denied"
+                and document.get("reason") == "capability_denied_by_policy"
+                and document.get("effect") == "not_attempted"
+                and document.get("executor_ok") is False
+                and document.get("output") is None
+                for document in denial_returns
+            ),
+            "every refusal is the honest pre-dispatch denial "
+            "(not_attempted, no executor output — nothing ran)",
+        )
+        _check(
+            "I1",
+            len({document.get("payload_hash") for document in denial_returns}) == 1,
+            "the three denials are equivalent queries (identical payload hash)",
+        )
+        applied = _psql_scalar(
+            env.url,
+            "SELECT count(*) FROM job_steps WHERE run_id = "
+            f"'{body['run_id']}' AND state = 'succeeded'",
+        )
+        _check(
+            "I1",
+            int(applied) == 0,
+            "zero applied (succeeded) steps for the denial run — the "
+            f"refusals were pre-dispatch (not_attempted): {applied}",
+        )
+        _check(
+            "I1",
+            "fixture.read" in hint_text
+            and "query fingerprint" in hint_text
+            and "capability_denied_by_policy" in hint_text,
+            "the hint carries the capability, the fingerprint and the refusal",
         )
 
         # I1b: five unchanged executed polls stay silent; the note at the
