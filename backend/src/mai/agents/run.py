@@ -181,6 +181,10 @@ from mai.capabilities.dispatch import (
     CapabilityDispatcher,
     canonical_payload_hash,
 )
+from mai.capabilities.task_state import (
+    TASK_PROPOSE_UPDATE_CAPABILITY,
+    TASK_UPDATE_ITEM_CAPABILITY,
+)
 from mai.contracts.conversations import (
     ConversationContractError,
     SteerAction,
@@ -747,6 +751,18 @@ def _intake_summary_document(intake: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+#: The frozen first and last lines of the rendered task block (the
+#: surgical replacement markers of :func:`_history_with_refreshed_task_block`).
+TASK_BLOCK_HEADER_LINE: Final[str] = (
+    "# Active task episode (validated by structured intake)"
+)
+TASK_BLOCK_CLOSER: Final[str] = (
+    "Work toward the plan under these constraints. The phase above "
+    "gates target effects at every tool boundary (plan: none, "
+    "inspect: read-only, act: granted capabilities)."
+)
+
+
 def _task_context_block(header: Mapping[str, object]) -> str:
     """The deterministic bounded task-state block for the seed's system
     prompt (the task/phase binding of AC 2).
@@ -762,7 +778,7 @@ def _task_context_block(header: Mapping[str, object]) -> str:
     """
     lines = [
         "",
-        "# Active task episode (validated by structured intake)",
+        TASK_BLOCK_HEADER_LINE,
         (
             f"task_id: {header.get('task_id')} "
             f"(revision {header.get('revision')}, "
@@ -801,12 +817,55 @@ def _task_context_block(header: Mapping[str, object]) -> str:
         lines.append(
             f"(constraints show the first {len(constraints)}; more exist)"
         )
-    lines.append(
-        "Work toward the plan under these constraints. The phase above "
-        "gates target effects at every tool boundary (plan: none, "
-        "inspect: read-only, act: granted capabilities)."
-    )
+    lines.append(TASK_BLOCK_CLOSER)
     return "\n".join(lines)
+
+
+def _history_with_refreshed_task_block(
+    history_json: str, header: Mapping[str, object] | None
+) -> str:
+    """Re-bind the CURRENT task block into the seed's leading system part.
+
+    The in-run refresh seam 13-intake-runner left open: after a
+    successful ``task.update_item`` / ``task.propose_update`` the NEXT
+    model round must see the current task state without restarting the
+    run and without a second task episode. The fresh header renders
+    through the SAME deterministic block renderer (same page bounds,
+    same stated omissions) and is surgically swapped between the frozen
+    markers inside the LEADING ``SystemPromptPart`` — the part the
+    pinned compaction stack re-emits verbatim, so steering and
+    compaction keep carrying the refreshed state. Idempotent: the same
+    task state renders the same block, so a refresh adds no effect
+    beyond the caller's own mutation. ``None``/empty header or a
+    history whose system part never carried a bound block (legacy
+    unbound run) changes NOTHING — fail-closed inert, never a second
+    binding.
+    """
+    if not isinstance(header, Mapping) or not header:
+        return history_json
+    messages = ModelMessagesTypeAdapter.validate_json(
+        history_json.encode("utf-8")
+    )
+    for message in messages:
+        if type(message).__name__ != "ModelRequest":
+            continue
+        for part in message.parts:
+            if getattr(part, "part_kind", None) != "system-prompt":
+                continue
+            content = str(part.content)
+            start = content.find("\n" + TASK_BLOCK_HEADER_LINE)
+            if start < 0:
+                return history_json  # never bound: inert
+            end_at = content.find(TASK_BLOCK_CLOSER, start)
+            if end_at < 0:
+                return history_json  # truncated/markerless: inert
+            part.content = (
+                content[:start]
+                + _task_context_block(header)
+                + content[end_at + len(TASK_BLOCK_CLOSER) :]
+            )
+            return ModelMessagesTypeAdapter.dump_json(messages).decode("utf-8")
+    return history_json
 
 
 def _result_document(
@@ -1931,6 +1990,38 @@ class AgentRunExecutor:
             "constraints_omitted": constraints_page.has_more,
         }
 
+    async def arefresh_task_header(
+        self, intent: AgentRunIntent
+    ) -> dict[str, object] | None:
+        """The CURRENT header of THIS run's bound task (refresh seam).
+
+        Read after a successful in-run ``task.*`` mutation so the next
+        model round's leading system part can carry the current state
+        (the seam 13-intake-runner left open). The run link is the
+        single source of the bound task (§1 — the same row
+        :meth:`abound_task_phase` reads). ``None`` = no bound task
+        (nothing to refresh; the legacy unbound shape) or the task
+        vanished between mutation and read (unreachable under the
+        writer lease; honestly unbound rather than fabricated).
+        Read-only: no effect beyond the caller's own task mutation.
+        """
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT r.task_id FROM conversation_runs r "
+                        "WHERE r.run_id = :rid AND r.task_id IS NOT NULL "
+                        "ORDER BY r.created_at DESC, r.run_id LIMIT 1"
+                    ),
+                    {"rid": uuid.UUID(intent.run_id)},
+                )
+            ).first()
+        if row is None or row[0] is None:
+            return None
+        return await self._atask_header(
+            uuid.UUID(str(row[0])), server_id=uuid.UUID(intent.server_id)
+        )
+
     async def abound_task_phase(self, intent: AgentRunIntent) -> Phase | None:
         """The phase of the task THIS run is bound to, when any.
 
@@ -2942,6 +3033,22 @@ def _agent_tool_execute(payload_json: str, call_json: str) -> dict[str, object]:
     return executor.run(executor.aexecute_tool(intent, json.loads(call_json)))
 
 
+@DBOS.step(name="agents.task_header_refreshed")
+def _agent_task_header_refreshed(
+    payload_json: str,
+) -> dict[str, object] | None:
+    """Read the CURRENT bound task header after an in-run mutation.
+
+    Checkpointed so a recovered run replays the recorded read instead of
+    re-reading task state that later rounds may have mutated again
+    (deterministic across restarts, C2/C4). Read-only against the task
+    store: the refresh adds no effect beyond the caller's own mutation.
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    return executor.run(executor.arefresh_task_header(intent))
+
+
 @DBOS.step(name="agents.read_step")
 def _agent_read_step(payload_json: str, seq: int) -> dict[str, object] | None:
     """Poll one tool-call row for a reconciliation resolution."""
@@ -3320,6 +3427,7 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                 raise AgentStageError(TOOL_BUDGET_REASON)
             results: dict[str, str] = {}
             steering_interrupt = False
+            task_mutated = False
             for call in calls:
                 # Safe boundary BEFORE EACH NEW tool effect (C5/C6):
                 # steering or a deterministic stop gates the next
@@ -3345,8 +3453,28 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                         "reason": outcome.get("reason"),
                     }
                 )
+                if (
+                    str(call.get("capability_id") or "")
+                    in (
+                        TASK_PROPOSE_UPDATE_CAPABILITY,
+                        TASK_UPDATE_ITEM_CAPABILITY,
+                    )
+                    and str(outcome["state"]) == StepState.SUCCEEDED.value
+                ):
+                    task_mutated = True
             if stopped_by is not None:
                 break
+            if task_mutated:
+                # In-run task-header refresh (the seam 13-intake-runner
+                # left open): the NEXT model round re-reads the current
+                # task state through the SAME leading system part — no
+                # run restart, no second task episode. Checkpointed read
+                # + deterministic re-bind; idempotent, so a refresh adds
+                # no effect beyond the mutation the model itself made.
+                history_json = _history_with_refreshed_task_block(
+                    history_json,
+                    _agent_task_header_refreshed(payload_json),
+                )
             if steering_interrupt:
                 # The model must SEE the steering before any further
                 # effect: the not-yet-dispatched deferred calls carry

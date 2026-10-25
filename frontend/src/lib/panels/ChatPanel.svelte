@@ -76,6 +76,8 @@
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import TaskEvidence from './chat/TaskEvidence.svelte';
 	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
+	import TaskPlan from './chat/TaskPlan.svelte';
+	import { taskServices, type TaskApi, type TaskServices } from '../workspace/entries/07-web-tasks.js';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -691,6 +693,31 @@
 		return api as CanonicalChatApi;
 	});
 
+	/**
+	 * §8 Plan section services (act `18-plan-ui`): narrow the task slice off
+	 * the SAME composed client the panel already carries — a bag without the
+	 * task methods keeps the plan section honestly unbound (fail closed, no
+	 * fallback client). Like every panel seam, it consumes `panel.services`
+	 * only; no hidden global state.
+	 */
+	function readTaskServices(services: PanelServices): TaskServices | null {
+		const candidate = services.api as Partial<TaskApi> | undefined;
+		if (typeof candidate !== 'object' || candidate === null) return null;
+		for (
+			const name of [
+				'getConversationTask',
+				'listTaskSteps',
+				'listTaskEvidence',
+				'listTaskRevisions',
+				'submitTaskCorrection'
+			] as const
+		) {
+			if (typeof candidate[name] !== 'function') return null;
+		}
+		return taskServices(candidate as TaskApi);
+	}
+	const taskServicesBag = $derived(readTaskServices(panel.services));
+
 	// Canonical conversation state (single-writer instance locals; no
 	// module-level singletons, ADR §5 rule 4).
 	let canonicalId = $state<string | null>(null);
@@ -714,6 +741,19 @@
 	let controlNote = $state<string | null>(null);
 
 	const canonicalMode = $derived(canonicalId !== null);
+
+	/**
+	 * The newest recorded USER message of the canonical transcript: the
+	 * source anchor every plan revision proposal must carry (§8 "always
+	 * source-linked"). `null` honestly disables the proposal form.
+	 */
+	const lastCanonicalUserMessageId = $derived.by<string | null>(() => {
+		for (let index = canonicalMessages.length - 1; index >= 0; index -= 1) {
+			const message = canonicalMessages[index];
+			if (message.role === 'user') return message.message_id;
+		}
+		return null;
+	});
 
 	/**
 	 * Honest status text for a canonical conversation: the lease-holding
@@ -2872,6 +2912,19 @@
 
 				{#if taskOutcome !== null}
 					<TaskEvidence document={taskOutcome} />
+				{/if}
+
+				{#if canonicalMode}
+					<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
+					     progress, evidence links and revision proposals. Fails closed
+					     (honest unbound/unavailable states) without task services or
+					     without an active task episode; never disturbs the outcome block. -->
+					<TaskPlan
+						services={taskServicesBag}
+						conversationId={canonicalId}
+						serverId={serverScope}
+						sourceMessageId={lastCanonicalUserMessageId}
+					/>
 				{/if}
 
 				{#if canonicalMode && canonicalCompleteness !== 'complete'}

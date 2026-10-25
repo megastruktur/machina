@@ -132,6 +132,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         INTERNAL_API_CAPABILITY_IDS,
         build_internal_api_capabilities,
     )
+    from mai.capabilities.task_state import (
+        TASK_STATE_CAPABILITY_IDS,
+        build_task_state_capabilities,
+    )
     from mai.capabilities.chat_read import (
         ChatReadSessionCapability,
         chat_read_descriptor,
@@ -339,6 +343,16 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     for desc in internal_api.descriptors:
         registry.register(desc)
 
+    # Task-state agent tools (act §7; 14b-worker-lane-wiring): the SAME
+    # composition seam the API process uses (``app.state.internal_api``),
+    # so a worker-bound agent can read and update the task bound to its
+    # own run identity. Descriptors are validated fail-closed at build
+    # time; ``session_factory`` is always composed here (the worker owns
+    # the database), so the unavailable fallback never applies.
+    task_state = build_task_state_capabilities(session_factory=sessions)
+    for desc in task_state.descriptors:
+        registry.register(desc)
+
     async def _upsert_map_cap(call: CapabilityCall) -> ExecutorResult:
         if service_map_store is None:
             return ExecutorResult(
@@ -363,6 +377,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         "web.read": web_read_cap,
         UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
+        **task_state.executors,
     }
     plugin_executors: dict[str, object] = {}
     # Capability identifier → owning loaded NativePlugin (built-ins are
@@ -586,10 +601,18 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             pass
         # Automatically grant internal API capabilities (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
-        # app.delete_map_entry, chat.read_session) and controller-side web
-        # research capabilities (web.search, web.read) to every enrolled
-        # server and General Consult so they work out of the box.
-        for cap_id in (*INTERNAL_API_CAPABILITY_IDS, "web.search", "web.read"):
+        # app.delete_map_entry, chat.read_session), the task-state agent
+        # tools (run-identity scoped: another conversation's task is
+        # invisible, no arbitrary cross-task selection) and
+        # controller-side web research capabilities (web.search,
+        # web.read) to every enrolled server and General Consult so they
+        # work out of the box.
+        for cap_id in (
+            *INTERNAL_API_CAPABILITY_IDS,
+            *TASK_STATE_CAPABILITY_IDS,
+            "web.search",
+            "web.read",
+        ):
             grants.setdefault(cap_id, set()).update(enrolled_servers)
         return {cid: frozenset(sids) for cid, sids in grants.items()}
 

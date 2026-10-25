@@ -204,6 +204,48 @@ export type ConversationSteerRequest = components['schemas']['ConversationSteerR
 export type ConversationSteerView = components['schemas']['ChatSteerView'];
 
 /**
+ * Task surface (§8; 15-task-api). Types come verbatim from the generated
+ * schema (`operations`/`components`); these aliases only give the methods
+ * and their consumers stable names. The header read is the compact §8 view
+ * (no unbounded arrays); the items/constraints/evidence/revisions reads are
+ * the scoped paginated page family (C01 rule 2: explicit `server_id`, never
+ * a hidden selection; AGENTS.md §1 bounded pages with same-filter totals).
+ */
+export type TaskView = components['schemas']['TaskView'];
+export type TaskCounts = components['schemas']['TaskCounts'];
+export type TaskOutcome = components['schemas']['TaskOutcome'];
+export type TaskStepsPage = components['schemas']['TaskStepsPage'];
+export type TaskStepView = components['schemas']['TaskStepView'];
+export type TaskConstraintsPage = components['schemas']['TaskConstraintsPage'];
+export type TaskConstraintView = components['schemas']['TaskConstraintView'];
+export type TaskEvidencePage = components['schemas']['TaskEvidencePage'];
+export type TaskEvidenceView = components['schemas']['TaskEvidenceView'];
+export type TaskRevisionsPage = components['schemas']['TaskRevisionsPage'];
+export type TaskRevisionView = components['schemas']['TaskRevisionView'];
+export type TaskMutationOutcome = components['schemas']['TaskMutationOutcome'];
+export type TaskCorrectionBody = components['schemas']['TaskCorrectionBody'];
+export type TaskDecisionBody = components['schemas']['TaskDecisionBody'];
+export type TaskPlanPatch = components['schemas']['TaskPlanPatch'];
+export type TaskPlanStep = components['schemas']['TaskPlanStep'];
+export type TaskStepOperation = components['schemas']['TaskStepOperation'];
+export type ConstraintProposal = components['schemas']['ConstraintProposal'];
+export type EvidenceRef = components['schemas']['EvidenceRef'];
+
+/**
+ * Query of the task items/constraints pages: the bounded page plus the
+ * explicit P3 history switch. Superseded rows stay RECORDED server-side and
+ * are served only when a caller asks for them by name.
+ */
+export interface TaskCollectionQuery {
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+	/** Include superseded rows (recorded P3 history) in the page. */
+	includeSuperseded?: boolean;
+}
+
+/**
  * Query of the canonical events page: the `afterSeq` replay cursor (the
  * conversation-local monotonic sequence; only strictly newer events are
  * returned) plus the bounded page size. There is no `offset` on this route —
@@ -497,6 +539,18 @@ function pageSuffix(page?: { limit?: number; offset?: number }): string {
 	return query === '' ? '' : `&${query}`;
 }
 
+/** Renders the task-collection query (bounded page + the P3 history switch). */
+function taskQuerySuffix(query?: TaskCollectionQuery): string {
+	const params = new URLSearchParams();
+	if (query?.limit !== undefined) params.set('limit', String(query.limit));
+	if (query?.offset !== undefined) params.set('offset', String(query.offset));
+	if (query?.includeSuperseded !== undefined) {
+		params.set('include_superseded', String(query.includeSuperseded));
+	}
+	const rendered = params.toString();
+	return rendered === '' ? '' : `&${rendered}`;
+}
+
 /**
  * Typed boundary over the frozen P02 surface (`operations` of the schema),
  * grown by mai-wire-desktop with the full MAI v1 feature transport (P03–P12)
@@ -623,6 +677,70 @@ export interface MaiApiClient {
 		conversationId: string,
 		payload: ConversationSteerRequest
 	): Promise<ConversationSteerView>;
+
+	// Task surface (§8; 15-task-api). Every method takes its explicit
+	// `server_id` (C01 rule 2); every collection read is a bounded page
+	// (AGENTS.md §1); the two mutations are CAS + idempotency-key guarded
+	// (201 created / 200 deduplicated / structured 409 revision_conflict /
+	// scope-blind 404 task_not_found). Plan review (revisions), decisions
+	// and operation approvals (the C03 surface) stay three distinct routes.
+	/**
+	 * GET /api/v1/chat/conversations/{id}/task?server_id=… — the
+	 * conversation's ONE active task header (revision, phase, status,
+	 * counts); absent conversation, foreign scope and absent episode all
+	 * collapse into the SAME scope-blind 404.
+	 */
+	getConversationTask(conversationId: string, serverId: string): Promise<TaskView>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/items?server_id=… — deterministic
+	 * `(position, step_id)` plan-step page; superseded rows are recorded P3
+	 * history, served only when `includeSuperseded` asks for them.
+	 */
+	listTaskSteps(
+		taskId: string,
+		serverId: string,
+		query?: TaskCollectionQuery
+	): Promise<TaskStepsPage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/constraints?server_id=… — deterministic
+	 * `(position, id)` constraint page carrying origin (user vs model) and
+	 * source-message anchors.
+	 */
+	listTaskConstraints(
+		taskId: string,
+		serverId: string,
+		query?: TaskCollectionQuery
+	): Promise<TaskConstraintsPage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/evidence?server_id=… — provenance
+	 * identities only (kind + referenced record id + safe note); the route
+	 * never inlines the referenced content.
+	 */
+	listTaskEvidence(taskId: string, serverId: string, page?: PageQuery): Promise<TaskEvidencePage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/revisions?server_id=… — the append-only
+	 * shared revision ledger, newest first (the P5 reconnect truth: UI and
+	 * agent tools re-derive the same server revision from it).
+	 */
+	listTaskRevisions(
+		taskId: string,
+		serverId: string,
+		page?: PageQuery
+	): Promise<TaskRevisionsPage>;
+	/**
+	 * POST /api/v1/chat/tasks/{id}/revisions — one authenticated user
+	 * correction/proposal: CAS `base_revision` (stale = structured 409
+	 * revision_conflict, never last-writer-wins), `idempotency_key`
+	 * (retransmission replays onto the SAME revision, 200 deduplicated),
+	 * mandatory source-linked `source_message_id`. Always author="user".
+	 */
+	submitTaskCorrection(taskId: string, payload: TaskCorrectionBody): Promise<TaskMutationOutcome>;
+	/**
+	 * POST /api/v1/chat/tasks/{id}/decisions — one explicit user decision:
+	 * advisory phase selection or pause/cancel (frozen transitions). Never
+	 * applies a plan delta, never authorizes or terminates an operation.
+	 */
+	submitTaskDecision(taskId: string, payload: TaskDecisionBody): Promise<TaskMutationOutcome>;
 
 	/** GET /api/v1/models/connections — value-free references. */
 	listConnections(): Promise<ModelConnectionList>;
@@ -968,6 +1086,47 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<ConversationSteerView>(
 				'POST',
 				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/steer`,
+				payload
+			),
+
+		// Task surface (§8; 15-task-api). Same transport as every other
+		// method: session cookies, CSRF double-submit on the two mutations,
+		// C01 envelope errors through `ApiError`.
+		getConversationTask: (conversationId, serverId) =>
+			requestJson<TaskView>(
+				'GET',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/task?server_id=${encodeURIComponent(serverId)}`
+			),
+		listTaskSteps: (taskId, serverId, query) =>
+			requestJson<TaskStepsPage>(
+				'GET',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/items?server_id=${encodeURIComponent(serverId)}${taskQuerySuffix(query)}`
+			),
+		listTaskConstraints: (taskId, serverId, query) =>
+			requestJson<TaskConstraintsPage>(
+				'GET',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/constraints?server_id=${encodeURIComponent(serverId)}${taskQuerySuffix(query)}`
+			),
+		listTaskEvidence: (taskId, serverId, page) =>
+			requestJson<TaskEvidencePage>(
+				'GET',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/evidence?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		listTaskRevisions: (taskId, serverId, page) =>
+			requestJson<TaskRevisionsPage>(
+				'GET',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/revisions?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		submitTaskCorrection: (taskId, payload) =>
+			requestJson<TaskMutationOutcome>(
+				'POST',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/revisions`,
+				payload
+			),
+		submitTaskDecision: (taskId, payload) =>
+			requestJson<TaskMutationOutcome>(
+				'POST',
+				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/decisions`,
 				payload
 			),
 

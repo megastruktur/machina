@@ -135,6 +135,11 @@ from mai.api.auth import (
     _require_session,
 )
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
+from mai.capabilities.task_state import (
+    TASK_PROPOSE_UPDATE_CAPABILITY,
+    TASK_STATE_CAPABILITY_IDS,
+    TASK_UPDATE_ITEM_CAPABILITY,
+)
 from mai.plugins.config import PluginConfigStore, parse_plugin_config_text
 from mai.policy.config import GrantConfigStore
 from mai.api.jobs import (
@@ -269,17 +274,21 @@ SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
 
 #: Built-in controller-side defaults of the auto-resolved chat grant
 #: set (alongside ``INTERNAL_API_CAPABILITY_IDS``): document retrieval,
-#: web research, the HTTP service probe and the host journal reader.
+#: web research, the HTTP service probe, the host journal reader and the
+#: task-state agent tools (run-identity scoped: the model can only see
+#: and update the task bound to its own conversation — §7).
 BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "docs.retrieve",
     "web.search",
     "web.read",
     "service.http",
     "host.logs",
+    *TASK_STATE_CAPABILITY_IDS,
 )
 
 #: Capabilities a read-only conversation strips even without a
-#: registry descriptor: raw shell and every internal-API mutation.
+#: registry descriptor: raw shell and every internal-API mutation plus
+#: the task mutation lane (``task.read`` is read-class and survives).
 READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
     {
         "host.shell",
@@ -290,6 +299,8 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "app.upsert_catalog_runbook",
         "app.delete_catalog_runbook",
         "secret.store",
+        TASK_PROPOSE_UPDATE_CAPABILITY,
+        TASK_UPDATE_ITEM_CAPABILITY,
     }
 )
 

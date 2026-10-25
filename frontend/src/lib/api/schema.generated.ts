@@ -825,6 +825,175 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/conversations/{conversation_id}/task": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The conversation's ONE active task header (§8; no unbounded arrays)
+         * @description The compact §8 header view for the conversation's active episode.
+         *
+         *     Resolution goes through the conversation row's ``active_task_id`` —
+         *     the ONE task pointer §1 defines — so a completed episode's history
+         *     never masquerades as the current task. Absent conversation, foreign
+         *     scope and absent episode all collapse into the SAME scope-blind 404:
+         *     existence never leaks (C8).
+         */
+        get: operations["read_conversation_task_api_v1_chat_conversations__conversation_id__task_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped plan-step page (§8; AGENTS.md §1)
+         * @description The deterministic plan-step page, ordered ``(position, step_id)``.
+         *
+         *     ``total`` is the ``COUNT(*)`` under the identical filter predicate;
+         *     superseded rows stay recorded and are served only when explicitly
+         *     requested (P3). Cross-server access is the scope-blind 404 (C8).
+         */
+        get: operations["list_task_steps_api_v1_chat_tasks__task_id__items_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/constraints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped constraint page (§8; AGENTS.md §1)
+         * @description The deterministic constraint page, ordered ``(position, id)``.
+         *
+         *     The §1/§6 safety boundary is read like every other collection:
+         *     bounded, deterministic, never silently truncated — every row carries
+         *     its ``origin`` (user requirement vs model inference) and its source
+         *     message anchors.
+         */
+        get: operations["list_task_constraints_api_v1_chat_tasks__task_id__constraints_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded server-scoped evidence-registry page (§8/§9)
+         * @description The deterministic evidence-registry page, ordered ``(created_at, id)``.
+         *
+         *     Provenance IDENTITIES only (kind + referenced record ID + safe note):
+         *     the route never re-fetches or inlines the referenced source content.
+         */
+        get: operations["list_task_evidence_api_v1_chat_tasks__task_id__evidence_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded revision-ledger page (§8 audit; P5 shared truth)
+         * @description The append-only revision ledger, newest revision first (§8).
+         *
+         *     The SAME ledger the agent tools write, so a reconnecting UI (P5)
+         *     re-derives the shared server revision and the pending/applied
+         *     distinction from one authoritative history — never from browser
+         *     state.
+         */
+        get: operations["list_task_revisions_api_v1_chat_tasks__task_id__revisions_get"];
+        put?: never;
+        /**
+         * One authenticated user correction/proposal under CAS + idempotency (§8)
+         * @description The user correction route (§8): ONE shared revision service call.
+         *
+         *     Always ``author="user"`` — a user correction is never authored as the
+         *     model — and always SOURCE-LINKED: the frozen patch model requires the
+         *     user message being corrected, and the store existence-checks it
+         *     against the task's conversation (P4) before recording the revision.
+         *     A stale tab's ``base_revision`` is the structured
+         *     ``409 revision_conflict`` — never last-writer-wins (C6); a
+         *     retransmitted ``idempotency_key`` replays onto the SAME revision (C4,
+         *     ``200 deduplicated``). Plan review never touches the phase, the
+         *     status or any approval (§6).
+         */
+        post: operations["submit_task_correction_api_v1_chat_tasks__task_id__revisions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/tasks/{task_id}/decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * One explicit user decision: phase selection or pause/cancel (§8)
+         * @description The user decision route (§8): DISTINCT from plan review and from
+         *     operation approval.
+         *
+         *     The route performs metadata-only header updates through the ONE
+         *     store's CAS seam: phase selection is advisory (never permission) and
+         *     pause/cancel follow the frozen outcome transitions (a cancelled
+         *     episode closes and releases the conversation's active-task pointer).
+         *     It NEVER applies a plan delta, NEVER authorizes a pending operation
+         *     and NEVER terminates one — effect authorization stays on the C03
+         *     approvals surface, unchanged (§6: metadata decisions cannot change
+         *     grants). A stale ``expected_revision`` (the named revision the user
+         *     reviewed) is the structured ``409 revision_conflict`` (C6); a
+         *     retransmitted ``client_request_id`` replays (``200 deduplicated``).
+         */
+        post: operations["submit_task_decision_api_v1_chat_tasks__task_id__decisions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/models/connections": {
         parameters: {
             query?: never;
@@ -2164,6 +2333,12 @@ export interface components {
             alert: components["schemas"]["AlertView"];
         };
         /**
+         * ActionRisk
+         * @description Declared risk/action class of a step (§5 "risk/action class").
+         * @enum {string}
+         */
+        ActionRisk: "read_only" | "mutating" | "irreversible";
+        /**
          * AdoptBody
          * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
          *
@@ -2879,6 +3054,56 @@ export interface components {
             bindings: components["schemas"]["BindingView"][];
         };
         /**
+         * ConstraintOrigin
+         * @description Source anchor distinguishing user requirements from model inferences
+         *     (act_CONTRACTS §5 ``constraints_proposed``).
+         * @enum {string}
+         */
+        ConstraintOrigin: "user" | "model";
+        /**
+         * ConstraintProposal
+         * @description One proposed constraint with source anchors (§5 ``constraints_proposed``).
+         *
+         *     ``origin`` distinguishes user requirements from model inferences: a
+         *     model-generated update can never remove/supersede a USER-origin constraint
+         *     (§6) — that needs an explicit user correction through the revision API.
+         */
+        ConstraintProposal: {
+            /**
+             * Constraint Id
+             * @description Stable slug of the proposed constraint
+             */
+            constraint_id: string;
+            /**
+             * Category
+             * @description Constraint category slug, e.g. safety or scope
+             */
+            category: string;
+            /**
+             * Statement
+             * @description Safe constraint statement; no secret material
+             */
+            statement: string;
+            /** @description Whether the user stated this or the model inferred it */
+            origin: components["schemas"]["ConstraintOrigin"];
+            /**
+             * Source Message Refs
+             * @description User messages this constraint is anchored to
+             */
+            source_message_refs?: string[];
+            /**
+             * Suggested
+             * @description Whether to add a new constraint or supersede an existing one
+             * @enum {string}
+             */
+            suggested: "add" | "supersede";
+            /**
+             * Supersedes Constraint Id
+             * @description Existing constraint ID replaced by a supersede proposal
+             */
+            supersedes_constraint_id?: string | null;
+        };
+        /**
          * ContainerView
          * @description One observed container (the discovery safe view: no env/mounts).
          */
@@ -3455,7 +3680,7 @@ export interface components {
             /** Origin Revision */
             origin_revision?: string | null;
             /** @default unverified */
-            verification: components["schemas"]["VerificationStatus"];
+            verification: components["schemas"]["mai__knowledge__documents__VerificationStatus"];
         };
         /**
          * DocumentDeleteBody
@@ -3553,6 +3778,35 @@ export interface components {
             evaluated: number;
             /** Outcomes */
             outcomes: components["schemas"]["EvaluateOutcomeView"][];
+        };
+        /**
+         * EvidenceKind
+         * @description What kind of sourced record an evidence reference points at (§5 facts;
+         *     §9 evidence validator checks provenance, task/target and observation type).
+         * @enum {string}
+         */
+        EvidenceKind: "message" | "observation" | "run_event" | "artifact" | "document";
+        /**
+         * EvidenceRef
+         * @description One sourced evidence reference (§5 facts; §9 evidence binding).
+         *
+         *     ``evidence_id`` points at an existing sourced record in the task/conversation
+         *     scope; existence is checked by the runtime store, never assumed here.
+         */
+        EvidenceRef: {
+            /** @description Kind of sourced record referenced */
+            kind: components["schemas"]["EvidenceKind"];
+            /**
+             * Evidence Id
+             * Format: uuid
+             * @description Opaque UUID of the referenced record
+             */
+            evidence_id: string;
+            /**
+             * Note
+             * @description Short safe annotation for UI display
+             */
+            note?: string | null;
         };
         /**
          * ExecutionEnvironment
@@ -4367,6 +4621,12 @@ export interface components {
             /** Password */
             password: string;
         };
+        /**
+         * PatchOp
+         * @description Bounded patch operation kinds (§5 "add/update/supersede operations").
+         * @enum {string}
+         */
+        PatchOp: "add" | "update" | "supersede";
         /**
          * Phase
          * @description Application task phases (act_CONTRACTS §5/§6): advisory, never permission.
@@ -5468,6 +5728,12 @@ export interface components {
             resource?: string | null;
         };
         /**
+         * StepStatus
+         * @description Frozen todo statuses (act_CONTRACTS §7; additions need reconciliation).
+         * @enum {string}
+         */
+        StepStatus: "pending" | "in_progress" | "blocked" | "executed" | "skipped";
+        /**
          * StepView
          * @description One durable step row (intent + safe receipt; C04 rule 4).
          */
@@ -5503,6 +5769,717 @@ export interface components {
             sub_state: string | null;
             /** Description */
             description: string | null;
+        };
+        /**
+         * TaskConstraintView
+         * @description One constraint row with its source anchors (§5/§6).
+         *
+         *     ``origin`` distinguishes user requirements from model inferences —
+         *     the authority fact that keeps a model correction from ever erasing a
+         *     user prohibition (P4).
+         */
+        TaskConstraintView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Constraint Id
+             * @description Stable slug of the constraint
+             */
+            constraint_id: string;
+            /**
+             * Category
+             * @description Constraint category slug, e.g. safety
+             */
+            category: string;
+            /**
+             * Statement
+             * @description Safe constraint statement; no secret material
+             */
+            statement: string;
+            /** @description Whether the user stated this or the model inferred it */
+            origin: components["schemas"]["ConstraintOrigin"];
+            /**
+             * Source Message Refs
+             * @description User messages this constraint is anchored to
+             */
+            source_message_refs: string[];
+            /**
+             * Position
+             * @description Deterministic list position
+             */
+            position: number;
+            /**
+             * Superseded At
+             * @description RFC3339 UTC supersede timestamp for recorded history, else null
+             */
+            superseded_at: string | null;
+            /**
+             * Superseded By
+             * @description Constraint ID that replaced this row, else null (P3 history)
+             */
+            superseded_by: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
+        };
+        /**
+         * TaskConstraintsPage
+         * @description One bounded constraint page (§8 ``GET constraints``; AGENTS.md §1).
+         */
+        TaskConstraintsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Constraint rows in deterministic (position, id) order
+             */
+            items?: components["schemas"]["TaskConstraintView"][];
+        };
+        /**
+         * TaskCorrectionBody
+         * @description One authenticated user correction/proposal (§8 ``POST revisions``).
+         *
+         *     The body embeds the FROZEN ratified patch model — the exact same
+         *     validated delta the model tools submit — so CAS (``base_revision``),
+         *     idempotency (``idempotency_key``) and the mandatory source message
+         *     (``source_message_id``) are contract-owned, not re-implemented here.
+         *     The route always stores ``author="user"``.
+         */
+        TaskCorrectionBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
+             */
+            server_id: string;
+            /** @description The bounded plan delta (user correction/proposal) with CAS base_revision, idempotency key and source message reference */
+            patch: components["schemas"]["TaskPlanPatch"];
+            /**
+             * Constraint Proposals
+             * @description Bounded constraint add/supersede proposals anchored to user messages
+             */
+            constraint_proposals?: components["schemas"]["ConstraintProposal"][];
+        };
+        /**
+         * TaskCounts
+         * @description List counts for the compact task view (§8: no unbounded arrays).
+         */
+        TaskCounts: {
+            /**
+             * Steps Total
+             * @description Total plan steps on the task
+             */
+            steps_total: number;
+            /**
+             * Steps Executed
+             * @description Steps in executed status
+             */
+            steps_executed: number;
+            /**
+             * Constraints Total
+             * @description Active constraints on the task
+             */
+            constraints_total: number;
+            /**
+             * Evidence Total
+             * @description Evidence records on the task
+             */
+            evidence_total: number;
+            /**
+             * Criteria Total
+             * @description Acceptance criteria on the task
+             */
+            criteria_total: number;
+            /**
+             * Criteria Verified
+             * @description Criteria currently passed
+             */
+            criteria_verified: number;
+        };
+        /**
+         * TaskDecisionBody
+         * @description One explicit user decision (§8 ``POST decisions``).
+         *
+         *     Phase selection is ADVISORY (never permission, §6) and pause/cancel
+         *     move only the domain outcome layer through its frozen transition map.
+         *     A decision NEVER applies a plan delta (that is the revisions route)
+         *     and NEVER authorizes or terminates a pending operation (that is the
+         *     C03 approvals surface; §6: metadata decisions cannot change grants).
+         */
+        TaskDecisionBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
+             */
+            server_id: string;
+            /**
+             * Expected Revision
+             * @description The named revision this decision reviewed; a stale value is the structured 409 revision_conflict (C6)
+             */
+            expected_revision: number;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Caller key so retransmitted decisions deduplicate (§1)
+             */
+            client_request_id: string;
+            /** @description The user's chosen next phase (plan|inspect|act); advisory only, never permission (§6) */
+            requested_phase?: components["schemas"]["Phase"] | null;
+            /**
+             * Task Action
+             * @description Explicit deterministic control: pause parks the open episode as needs_input, cancel closes it (terminal)
+             */
+            task_action?: ("pause" | "cancel") | null;
+        };
+        /**
+         * TaskEvidencePage
+         * @description One bounded evidence page (§8 ``GET evidence``; AGENTS.md §1).
+         */
+        TaskEvidencePage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Evidence rows in deterministic (created_at, id) order
+             */
+            items?: components["schemas"]["TaskEvidenceView"][];
+        };
+        /**
+         * TaskEvidenceView
+         * @description One evidence-registry row (§9 provenance identities only).
+         *
+         *     The registry stores WHICH sourced record backs the task (kind + ID +
+         *     optional safe note), never a copy of the referenced content.
+         */
+        TaskEvidenceView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Evidence Id
+             * Format: uuid
+             * @description Opaque UUID of the referenced record
+             */
+            evidence_id: string;
+            /** @description Kind of sourced record referenced */
+            kind: components["schemas"]["EvidenceKind"];
+            /**
+             * Note
+             * @description Short safe annotation for UI display, when recorded
+             */
+            note: string | null;
+            /**
+             * Origin Step Id
+             * @description Step that first registered this evidence, when known
+             */
+            origin_step_id: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC registration timestamp
+             */
+            created_at: string;
+        };
+        /**
+         * TaskMutationOutcome
+         * @description The shared outcome of one accepted/replayed task mutation (§1).
+         *
+         *     The fresh header view (revision, phase, status, counts), the
+         *     append-only revision row this mutation produced (source-linked,
+         *     authority-recorded) and the honest idempotency disposition
+         *     (``created`` | ``deduplicated``).
+         */
+        TaskMutationOutcome: {
+            /** @description The fresh compact header view after the mutation (§8) */
+            task: components["schemas"]["TaskView"];
+            /** @description The revision-ledger row this mutation produced/replayed */
+            revision: components["schemas"]["TaskRevisionView"];
+            /**
+             * Disposition
+             * @description created for a first application, deduplicated for an idempotent replay (C4)
+             * @enum {string}
+             */
+            disposition: "created" | "deduplicated";
+        };
+        /**
+         * TaskOutcome
+         * @description Application task outcome (act_CONTRACTS §9); technical RunState frozen
+         *     at C05 rule 2 is untouched — this is the domain layer above it.
+         * @enum {string}
+         */
+        TaskOutcome: "in_progress" | "needs_input" | "partially_verified" | "verified" | "failed" | "cancelled";
+        /**
+         * TaskPlanPatch
+         * @description Bounded plan delta (§5 ``todo_patch``, §7 ``task.propose_update``).
+         *
+         *     A patch is a DELTA against the current task at ``base_revision`` — never
+         *     whole-list replacement — and stays strictly under the 16 KiB serialized
+         *     budget so it can never blow the capability dispatcher envelope.
+         */
+        TaskPlanPatch: {
+            /**
+             * Schema Version
+             * @description Patch schema version; consumers fail closed on drift
+             * @default 1
+             */
+            schema_version: number;
+            /**
+             * Source Message Id
+             * Format: uuid
+             * @description User message this interpretation/patch was produced from
+             */
+            source_message_id: string;
+            /**
+             * Base Revision
+             * @description Expected task revision for compare-and-swap (§1)
+             */
+            base_revision: number;
+            /**
+             * Idempotency Key
+             * Format: uuid
+             * @description Caller key so retransmitted patches deduplicate (§1)
+             */
+            idempotency_key: string;
+            /**
+             * Title
+             * @description Proposed task header title (≤ 240 chars)
+             */
+            title?: string | null;
+            /**
+             * Summary
+             * @description Proposed task summary (≤ 1000 chars)
+             */
+            summary?: string | null;
+            /**
+             * Rationale
+             * @description Why this delta is proposed (≤ 1000 chars)
+             */
+            rationale?: string | null;
+            /**
+             * Operations
+             * @description Bounded add/update/supersede operations (max 12)
+             */
+            operations?: components["schemas"]["TaskStepOperation"][];
+        };
+        /**
+         * TaskPlanStep
+         * @description One stable plan item (§7): bounded, dependency-linked, evidence-bound.
+         *
+         *     ``executed`` without evidence references is invalid (P4): "done" is only
+         *     rendered from agreed checks, never from a model-ticked boolean.
+         */
+        TaskPlanStep: {
+            /**
+             * Step Id
+             * @description Stable item ID that survives replanning deltas
+             */
+            step_id: string;
+            /**
+             * Title
+             * @description Short step title safe for browser display
+             */
+            title: string;
+            /**
+             * @description Frozen todo status of this step
+             * @default pending
+             */
+            status: components["schemas"]["StepStatus"];
+            /**
+             * @description Separate verification state bound to evidence
+             * @default not_checked
+             */
+            verification: components["schemas"]["mai__contracts__tasks__VerificationStatus"];
+            /**
+             * Evidence Refs
+             * @description Sourced evidence supporting executed/verified state
+             */
+            evidence_refs?: components["schemas"]["EvidenceRef"][];
+            /**
+             * Depends On
+             * @description Stable step IDs this step depends on; no cycles
+             */
+            depends_on?: string[];
+            /**
+             * @description Declared risk/action class of the step
+             * @default read_only
+             */
+            risk: components["schemas"]["ActionRisk"];
+            /**
+             * Prerequisite Unresolved
+             * @description True when a required prerequisite is still missing
+             * @default false
+             */
+            prerequisite_unresolved: boolean;
+            /**
+             * Expected Check
+             * @description The check that will decide this step is done
+             */
+            expected_check?: string | null;
+            /**
+             * Skip Reason
+             * @description Required reason when status is skipped
+             */
+            skip_reason?: string | null;
+        };
+        /**
+         * TaskRevisionView
+         * @description One append-only revision-log row (§8 audit; P5 shared truth).
+         *
+         *     ``author`` is the stored authority fact (``user`` for every correction
+         *     this surface accepts — never the model) and ``source_message_id`` is
+         *     the user message the revision was produced from, so a disputed
+         *     interpretation always explains itself through its origin (§8 UI
+         *     contract).
+         */
+        TaskRevisionView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Revision
+             * @description The optimistic revision token (§1)
+             */
+            revision: number;
+            /**
+             * Kind
+             * @description Frozen revision kind (create|plan_patch|item_update|metadata|completion)
+             */
+            kind: string;
+            /**
+             * Author
+             * @description Stored authority: user, model or system (§6)
+             */
+            author: string;
+            /**
+             * Source Message Id
+             * @description User message this revision was produced from, when linked
+             */
+            source_message_id: string | null;
+            /**
+             * Item Id
+             * @description Stable item ID for item-scoped revisions, else null
+             */
+            item_id: string | null;
+            /**
+             * Payload
+             * @description Bounded revision summary (operation/constraint identities)
+             */
+            payload: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Applied At
+             * @description RFC3339 UTC application timestamp
+             */
+            applied_at: string;
+        };
+        /**
+         * TaskRevisionsPage
+         * @description One bounded revision-ledger page (§8; AGENTS.md §1), newest first.
+         */
+        TaskRevisionsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Revision rows in deterministic revision-descending order
+             */
+            items?: components["schemas"]["TaskRevisionView"][];
+        };
+        /**
+         * TaskStepOperation
+         * @description One bounded patch operation against a single step (§5 delta semantics).
+         */
+        TaskStepOperation: {
+            /** @description Patch operation kind: add, update or supersede */
+            op: components["schemas"]["PatchOp"];
+            /** @description The step payload the operation applies */
+            step: components["schemas"]["TaskPlanStep"];
+            /**
+             * Position
+             * @description Requested list position for ordering-sensitive updates
+             */
+            position?: number | null;
+            /**
+             * Supersedes Step Id
+             * @description Existing step ID replaced by a supersede operation
+             */
+            supersedes_step_id?: string | null;
+        };
+        /**
+         * TaskStepView
+         * @description One plan item (§7 vocabulary mirror of the storage row).
+         *
+         *     ``executed``/``skipped`` stay visible with their evidence references
+         *     and skip reasons — "done" is rendered from agreed checks, never a
+         *     ticked boolean (§7); superseded rows stay RECORDED (P3).
+         */
+        TaskStepView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Step Id
+             * @description Stable item ID that survives replanning
+             */
+            step_id: string;
+            /**
+             * Title
+             * @description Short step title safe for browser display
+             */
+            title: string;
+            /** @description Frozen todo status of this step */
+            status: components["schemas"]["StepStatus"];
+            /** @description Separate verification state bound to evidence */
+            verification: components["schemas"]["VerificationStatus-Output"];
+            /**
+             * Position
+             * @description Deterministic list position
+             */
+            position: number;
+            /** @description Declared risk/action class of the step */
+            risk: components["schemas"]["ActionRisk"];
+            /**
+             * Prerequisite Unresolved
+             * @description True when a required prerequisite is still missing
+             */
+            prerequisite_unresolved: boolean;
+            /**
+             * Expected Check
+             * @description The check that will decide this step is done, when declared
+             */
+            expected_check: string | null;
+            /**
+             * Skip Reason
+             * @description Recorded reason when the step is skipped, otherwise null
+             */
+            skip_reason: string | null;
+            /**
+             * Result Summary
+             * @description Safe bounded result summary, when one was recorded
+             */
+            result_summary: string | null;
+            /**
+             * Evidence Refs
+             * @description Sourced evidence supporting executed/verified state
+             */
+            evidence_refs: components["schemas"]["EvidenceRef"][];
+            /**
+             * Depends On
+             * @description Stable step IDs this step depends on (no cycles)
+             */
+            depends_on: string[];
+            /**
+             * Superseded At
+             * @description RFC3339 UTC supersede timestamp for recorded history, else null
+             */
+            superseded_at: string | null;
+            /**
+             * Superseded By
+             * @description Step ID that replaced this row, else null (P3 history)
+             */
+            superseded_by: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
+        };
+        /**
+         * TaskStepsPage
+         * @description One bounded plan-step page (§8 ``GET items``; AGENTS.md §1).
+         */
+        TaskStepsPage: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Owning task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Step rows in deterministic (position, step_id) order
+             */
+            items?: components["schemas"]["TaskStepView"][];
+        };
+        /**
+         * TaskView
+         * @description Compact task header view (§8 ``GET task`` shape): revision, phase,
+         *     status and counts only — item/constraint/evidence collections are fetched
+         *     as explicitly paginated pages, never embedded here.
+         */
+        TaskView: {
+            /**
+             * Task Id
+             * Format: uuid
+             * @description Opaque stable task identity (§1)
+             */
+            task_id: string;
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this task (§1)
+             */
+            server_id: string;
+            /**
+             * Revision
+             * @description Current optimistic revision token
+             */
+            revision: number;
+            /**
+             * Title
+             * @description Task header title (≤ 240 chars)
+             */
+            title: string;
+            /**
+             * Summary
+             * @description Task summary (≤ 1000 chars)
+             */
+            summary?: string | null;
+            /** @description Advisory phase; never permission */
+            requested_phase: components["schemas"]["Phase"];
+            /** @description Domain outcome layer above RunState */
+            status: components["schemas"]["TaskOutcome"];
+            /**
+             * Active Step Id
+             * @description Step currently being worked on, if any
+             */
+            active_step_id?: string | null;
+            /** @description List counts for bounded rendering */
+            counts: components["schemas"]["TaskCounts"];
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-revision timestamp
+             */
+            updated_at: string;
         };
         /**
          * TerminalSessionInfoView
@@ -5641,10 +6618,22 @@ export interface components {
         };
         /**
          * VerificationStatus
+         * @description Verification is separate from execution and bound to evidence (§7).
+         * @enum {string}
+         */
+        "VerificationStatus-Output": "not_checked" | "passed" | "failed" | "unavailable";
+        /**
+         * VerificationStatus
+         * @description Verification is separate from execution and bound to evidence (§7).
+         * @enum {string}
+         */
+        mai__contracts__tasks__VerificationStatus: "not_checked" | "passed" | "failed" | "unavailable";
+        /**
+         * VerificationStatus
          * @description C07 rule 5 boundary: outcomes are separated from hypotheses.
          * @enum {string}
          */
-        VerificationStatus: "unverified" | "verified" | "hypothesis";
+        mai__knowledge__documents__VerificationStatus: "unverified" | "verified" | "hypothesis";
     };
     responses: never;
     parameters: never;
@@ -7915,6 +8904,420 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_conversation_task_api_v1_chat_conversations__conversation_id__task_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_steps_api_v1_chat_tasks__task_id__items_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                /** @description Include superseded rows (recorded P3 history) in the page */
+                include_superseded?: boolean;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_constraints_api_v1_chat_tasks__task_id__constraints_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                /** @description Include superseded rows (recorded P3 history) in the page */
+                include_superseded?: boolean;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskConstraintsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_evidence_api_v1_chat_tasks__task_id__evidence_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskEvidencePage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_task_revisions_api_v1_chat_tasks__task_id__revisions_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRevisionsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_task_correction_api_v1_chat_tasks__task_id__revisions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskCorrectionBody"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of an already-applied correction (C4) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale base revision (C6) or contract rejection */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The proposed patch is contract-invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    submit_task_decision_api_v1_chat_tasks__task_id__decisions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskDecisionBody"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of an already-applied decision (C4) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationOutcome"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No task in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale named revision (C6) or frozen-transition rejection */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The decision is contract-invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
