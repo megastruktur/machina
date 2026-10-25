@@ -2972,52 +2972,61 @@
 					{/if}
 				</p>
 
-				{#if taskOutcome !== null}
-					<TaskEvidence document={taskOutcome} />
-				{/if}
-
-				{#if canonicalMode}
-					<!-- §8 Understanding section (act 17-understanding-ui): the ONE
-					     active task episode's scope/summary/constraints/plan, read
-					     only through the same bound task services. Fails closed
-					     (honest unbound/unavailable states) without task services or
-					     without an active episode; never fabricates content. -->
-					<TaskUnderstanding
-						services={taskServicesBag}
-						conversationId={canonicalId}
-						serverId={canonicalScope}
-					/>
-
-					<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
-					     progress, evidence links and revision proposals. Fails closed
-					     (honest unbound/unavailable states) without task services or
-					     without an active task episode; never disturbs the outcome block. -->
-					<TaskPlan
-						services={taskServicesBag}
-						conversationId={canonicalId}
-						serverId={canonicalScope}
-						sourceMessageId={lastCanonicalUserMessageId}
-					/>
-				{/if}
-
-				{#if canonicalMode && canonicalCompleteness !== 'complete'}
-					<div
-						class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
-						role="alert"
-						data-testid="legacy-gaps-banner"
-					>
-						<span>
-							Recorded history is {canonicalCompleteness}: earlier messages may be
-							missing, and new mutations require explicit scope confirmation
-							(§4 — nothing is reconstructed or invented).
-						</span>
-						{#each canonicalGaps as gap, gapIndex (gapIndex)}
-							<span class="mai-chat__gap" data-testid="legacy-gap">{gap.description}</span>
-						{/each}
-					</div>
-				{/if}
-
+				<!-- 24d grid usability: the outcome/§8/gap content lives INSIDE
+				     the bounded conversation scroll region. As direct children of
+				     the conversation grid they auto-placed into an implicit
+				     ~6300px row, starved the minmax(0,1fr) column to 0px (zero-
+				     width task text) and the transcript row to 0 height
+				     (R-24c FAIL_REPAIRABLE). Inside the scroll container every
+				     block spans the full section width and long task content
+				     stays reachable through the working vertical scroll path
+				     instead of starving the transcript. -->
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
+					{#if taskOutcome !== null}
+						<TaskEvidence document={taskOutcome} />
+					{/if}
+
+					{#if canonicalMode}
+						<!-- §8 Understanding section (act 17-understanding-ui): the ONE
+						     active task episode's scope/summary/constraints/plan, read
+						     only through the same bound task services. Fails closed
+						     (honest unbound/unavailable states) without task services or
+						     without an active episode; never fabricates content. -->
+						<TaskUnderstanding
+							services={taskServicesBag}
+							conversationId={canonicalId}
+							serverId={canonicalScope}
+						/>
+
+						<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
+						     progress, evidence links and revision proposals. Fails closed
+						     (honest unbound/unavailable states) without task services or
+						     without an active task episode; never disturbs the outcome block. -->
+						<TaskPlan
+							services={taskServicesBag}
+							conversationId={canonicalId}
+							serverId={canonicalScope}
+							sourceMessageId={lastCanonicalUserMessageId}
+						/>
+					{/if}
+
+					{#if canonicalMode && canonicalCompleteness !== 'complete'}
+						<div
+							class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
+							role="alert"
+							data-testid="legacy-gaps-banner"
+						>
+							<span>
+								Recorded history is {canonicalCompleteness}: earlier messages may be
+								missing, and new mutations require explicit scope confirmation
+								(§4 — nothing is reconstructed or invented).
+							</span>
+							{#each canonicalGaps as gap, gapIndex (gapIndex)}
+								<span class="mai-chat__gap" data-testid="legacy-gap">{gap.description}</span>
+							{/each}
+						</div>
+					{/if}
+
 					{#if canonicalMode}
 						{#if canonicalBusy}
 							<div class="mai-chat__state" role="status" data-testid="canonical-restoring">

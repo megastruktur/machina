@@ -3531,6 +3531,53 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
 		await expect(main.getByTestId('task-plan-evidence-empty')).toBeVisible();
 		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+
+		// 24d grid usability: the focused terminal reopen must be genuinely
+		// usable at 360×640 — full-width task blocks with readable text
+		// columns, a transcript with real height, and no horizontal overflow.
+		const geometry24d = await main
+			.getByTestId('chat-conversation')
+			.evaluate((section: HTMLElement) => {
+				const clientWidth = (selector: string) =>
+					section.querySelector<HTMLElement>(selector)?.clientWidth ?? null;
+				const scroll = section.querySelector<HTMLElement>('.mai-chat__conversation-scroll');
+				return {
+					sectionWidth: Math.round(section.getBoundingClientRect().width),
+					sectionClientWidth: section.clientWidth,
+					sectionScrollWidth: section.scrollWidth,
+					understandingWidth: clientWidth('[data-testid="task-understanding"]'),
+					planWidth: clientWidth('[data-testid="task-plan"]'),
+					scopeTitleWidth: clientWidth('[data-testid="task-understanding-scope-title"]'),
+					scopeSummaryWidth: clientWidth('[data-testid="task-understanding-scope-summary"]'),
+					constraintRowWidth: clientWidth('[data-testid="task-understanding-constraint-row"]'),
+					planTitleWidth: clientWidth('[data-testid="task-plan-title"]'),
+					planEvidenceEmptyWidth: clientWidth('[data-testid="task-plan-evidence-empty"]'),
+					transcriptClientHeight: scroll?.clientHeight ?? 0,
+					docScrollWidth: document.documentElement.scrollWidth,
+					viewportWidth: window.innerWidth
+				};
+			});
+		console.log('[24D-PROBE] focused terminal geometry', JSON.stringify(geometry24d));
+		expect(geometry24d.sectionWidth, 'focused terminal section width').toBeGreaterThanOrEqual(200);
+		expect(geometry24d.understandingWidth, 'focused terminal understanding width').toBeGreaterThanOrEqual(200);
+		expect(geometry24d.planWidth, 'focused terminal plan width').toBeGreaterThanOrEqual(200);
+		for (const [name, width] of [
+			['scope title', geometry24d.scopeTitleWidth],
+			['scope summary', geometry24d.scopeSummaryWidth],
+			['constraint row', geometry24d.constraintRowWidth],
+			['plan title', geometry24d.planTitleWidth],
+			['plan evidence empty', geometry24d.planEvidenceEmptyWidth]
+		] as const) {
+			expect(width, `focused terminal ${name} text width`).toBeGreaterThan(0);
+		}
+		expect(geometry24d.transcriptClientHeight, 'focused terminal transcript height').toBeGreaterThan(0);
+		expect(
+			geometry24d.sectionScrollWidth,
+			'focused terminal section horizontal overflow'
+		).toBeLessThanOrEqual(geometry24d.sectionClientWidth + 1);
+		expect(geometry24d.docScrollWidth, 'focused terminal page horizontal overflow').toBeLessThanOrEqual(
+			geometry24d.viewportWidth + 1
+		);
 	});
 
 	test('a plain canonical conversation without a task reopens with visible messages and no task fabrication', async ({
@@ -3586,6 +3633,33 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		]) {
 			expect(await callsOf(page, op), op).toHaveLength(0);
 		}
+		// 24d grid usability: the unbound notes must be READABLE at this
+		// viewport — full-width blocks with real text columns, not the
+		// 0-width one-glyph column R-24c measured — and the transcript keeps
+		// real height.
+		const unbound24d = await main
+			.getByTestId('chat-conversation')
+			.evaluate((section: HTMLElement) => {
+				const clientWidth = (selector: string) =>
+					section.querySelector<HTMLElement>(selector)?.clientWidth ?? 0;
+				return {
+					sectionWidth: Math.round(section.getBoundingClientRect().width),
+					understandingWidth: clientWidth('[data-testid="task-understanding"]'),
+					unboundNoteWidth: clientWidth('[data-testid="task-understanding-unbound"]'),
+					planWidth: clientWidth('[data-testid="task-plan"]'),
+					planUnboundNoteWidth: clientWidth('[data-testid="task-plan-unbound"]'),
+					transcriptClientHeight:
+						section.querySelector<HTMLElement>('.mai-chat__conversation-scroll')?.clientHeight ??
+						0
+				};
+			});
+		console.log('[24D-PROBE] focused unbound geometry', JSON.stringify(unbound24d));
+		expect(unbound24d.sectionWidth, 'focused unbound section width').toBeGreaterThanOrEqual(200);
+		expect(unbound24d.understandingWidth, 'focused unbound understanding width').toBeGreaterThanOrEqual(200);
+		expect(unbound24d.unboundNoteWidth, 'focused unbound note text width').toBeGreaterThan(100);
+		expect(unbound24d.planWidth, 'focused unbound plan width').toBeGreaterThanOrEqual(200);
+		expect(unbound24d.planUnboundNoteWidth, 'focused unbound plan note text width').toBeGreaterThan(100);
+		expect(unbound24d.transcriptClientHeight, 'focused unbound transcript height').toBeGreaterThan(0);
 		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
 	});
 
@@ -3622,5 +3696,20 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		await expect(main.getByTestId('chat-conversation')).not.toHaveClass(
 			/mai-chat__section--idle/
 		);
+
+		// 24d: the 404 error surface must stay READABLE — real width and a
+		// horizontal text column, never a crushed sliver or a vertical badge.
+		const problem24d = await main.getByTestId('canonical-problem').evaluate((el: HTMLElement) => {
+			const r = el.getBoundingClientRect();
+			return {
+				width: Math.round(r.width),
+				height: Math.round(r.height),
+				textWidth: el.clientWidth
+			};
+		});
+		console.log('[24D-PROBE] focused 404 geometry', JSON.stringify(problem24d));
+		expect(problem24d.width, '404 problem width').toBeGreaterThanOrEqual(200);
+		expect(problem24d.textWidth, '404 problem text width').toBeGreaterThan(100);
+		expect(problem24d.height, '404 problem height').toBeLessThanOrEqual(200);
 	});
 });

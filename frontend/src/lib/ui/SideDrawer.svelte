@@ -85,6 +85,22 @@
 		width: 3.25rem;
 	}
 
+	/* Pocket viewports: an EXPANDED drawer OVERLAYS the workspace instead of
+	 * riding the shell flex row — an in-flow expanded drawer squeezed the
+	 * stage to an 80px rail at 360×640 and crushed the bottom chat dock
+	 * inside it (R-24c: 18px-wide conversation). The COLLAPSED rail stays
+	 * in-flow so the dock and windows yield to it exactly as on desktop.
+	 * Expand/collapse behavior and the toggle are unchanged; desktop widths
+	 * are unaffected. */
+	@media (max-width: 640px) {
+		.mai-side-drawer:not(.mai-side-drawer--collapsed) {
+			position: absolute;
+			top: 0;
+			bottom: 0;
+			left: 0;
+		}
+	}
+
 	.mai-side-drawer__header {
 		flex: 0 0 auto;
 		display: flex;

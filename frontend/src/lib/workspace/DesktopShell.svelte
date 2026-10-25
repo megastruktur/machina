@@ -1438,7 +1438,14 @@
 	.mai-desktop-shell__dock {
 		position: absolute;
 		bottom: var(--mai-space-2);
-		left: calc(100% - var(--mai-space-3) - min(860px, calc(100% - 2 * var(--mai-space-4))));
+		/* Right-anchored HUD: the dock hugs the shell's right edge instead of
+		 * deriving its OFFSET from the stage width (R-24c: the offset math
+		 * pushed a crushed 48px dock to the viewport's right edge). The WIDTH
+		 * stays stage-relative on purpose: the pocket overlay drawer (see
+		 * SideDrawer) keeps the stage at full shell width when expanded, and
+		 * a collapsed in-flow rail makes the dock yield to the rail. */
+		left: auto;
+		right: var(--mai-space-3);
 		transform: none;
 		width: min(860px, calc(100% - 2 * var(--mai-space-4)));
 		z-index: 5;

@@ -706,6 +706,281 @@ interface CanonicalRequest {
 	epoch: number;
 }
 
+/** One element's box plus its scroll/client metrics (rounded rects). */
+interface GeometryBox {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	clientWidth: number;
+	clientHeight: number;
+	scrollWidth: number;
+	scrollHeight: number;
+}
+
+/** GeometryBox plus the element's own text client width. */
+interface GeometryPart extends GeometryBox {
+	textWidth: number;
+}
+
+/** Semantic readability facts of the status badge's laid-out text. */
+interface StatusReadability {
+	/** Laid-out line boxes of the badge text (one-glyph column ≈ glyph count). */
+	lineBoxes: number;
+	/** Client width of the badge box (the text column width). */
+	textWidth: number;
+	/** scrollWidth − clientWidth: >0 means clipped/truncated text. */
+	scrollDelta: number;
+	/** Computed line height in px (the height bound is expressed against it). */
+	lineHeight: number;
+	visibility: string;
+	display: string;
+}
+
+/** The 24d usability snapshot of one reopened conversation section. */
+interface ConversationGeometry {
+	section: GeometryBox;
+	state: (GeometryPart & StatusReadability) | null;
+	statusLine: GeometryBox | null;
+	trigger: GeometryBox | null;
+	understanding: GeometryPart | null;
+	scopeTitle: GeometryPart | null;
+	scopeSummary: GeometryPart | null;
+	constraintRow: GeometryPart | null;
+	plan: GeometryPart | null;
+	planTitle: GeometryPart | null;
+	planEvidenceEmpty: GeometryPart | null;
+	transcript: GeometryBox | null;
+	stage: GeometryBox | null;
+	dock: GeometryBox | null;
+	docScrollWidth: number;
+	viewport: { width: number; height: number };
+}
+
+/**
+ * 24d grid usability: geometry snapshot of the reopened conversation
+ * section (R-24c measured an 18px right-edge sliver with a 0-height
+ * transcript row and zero-width task text; text/attribute assertions
+ * cannot see that, bounding boxes and client metrics can).
+ */
+function collectConversationGeometry(dock: Locator): Promise<ConversationGeometry> {
+	return dock.getByTestId('chat-conversation').evaluate((section: HTMLElement) => {
+		const box = (el: Element) => {
+			const r = el.getBoundingClientRect();
+			return {
+				x: Math.round(r.x),
+				y: Math.round(r.y),
+				width: Math.round(r.width),
+				height: Math.round(r.height),
+				clientWidth: el.clientWidth,
+				clientHeight: el.clientHeight,
+				scrollWidth: el.scrollWidth,
+				scrollHeight: el.scrollHeight
+			};
+		};
+		const pick = (selector: string) => {
+			const el = section.querySelector<HTMLElement>(selector);
+			return el === null ? null : { ...box(el), textWidth: el.clientWidth };
+		};
+		const scroll = section.querySelector<HTMLElement>('.mai-chat__conversation-scroll');
+		const stage = section.closest('.mai-desktop-shell__stage');
+		const dock = section.closest('[data-testid="bottom-chat-dock"]');
+		const statusEl = section.querySelector<HTMLElement>('[data-testid="conversation-state"]');
+		let state: (GeometryPart & StatusReadability) | null = null;
+		if (statusEl !== null) {
+			const range = document.createRange();
+			range.selectNodeContents(statusEl);
+			const lineRects = [...range.getClientRects()].filter(
+				(rect) => rect.width > 0 && rect.height > 0
+			);
+			const cs = getComputedStyle(statusEl);
+			state = {
+				...box(statusEl),
+				textWidth: statusEl.clientWidth,
+				lineBoxes: lineRects.length,
+				scrollDelta: statusEl.scrollWidth - statusEl.clientWidth,
+				lineHeight: parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) || 16,
+				visibility: cs.visibility,
+				display: cs.display
+			};
+		}
+		return {
+			section: box(section),
+			state,
+			statusLine: pick('.mai-chat__conversation-status'),
+			trigger: pick('[data-testid="chat-details-trigger"]'),
+			understanding: pick('[data-testid="task-understanding"]'),
+			scopeTitle: pick('[data-testid="task-understanding-scope-title"]'),
+			scopeSummary: pick('[data-testid="task-understanding-scope-summary"]'),
+			constraintRow: pick('[data-testid="task-understanding-constraint-row"]'),
+			plan: pick('[data-testid="task-plan"]'),
+			planTitle: pick('[data-testid="task-plan-title"]'),
+			planEvidenceEmpty: pick('[data-testid="task-plan-evidence-empty"]'),
+			transcript: scroll === null ? null : box(scroll),
+			stage: stage === null ? null : box(stage),
+			dock: dock === null ? null : box(dock),
+			docScrollWidth: document.documentElement.scrollWidth,
+			viewport: { width: window.innerWidth, height: window.innerHeight }
+		};
+	});
+}
+
+/**
+ * 24d: current stage width in px — used to wait out the drawer's width
+ * transition before collecting geometry (the collapse animates ~180ms).
+ */
+function stageWidthOf(dock: Locator): Promise<number> {
+	return dock.getByTestId('chat-conversation').evaluate((section: HTMLElement) => {
+		const stage = section.closest('.mai-desktop-shell__stage');
+		return stage === null ? 0 : Math.round(stage.getBoundingClientRect().width);
+	});
+}
+
+/**
+ * The 24d usability gate: BOTH axes of the reopened conversation surface —
+ * full-width blocks, readable status/text columns, real transcript height,
+ * a bounded section that never widens the page.
+ */
+function expectUsableConversation(g: ConversationGeometry, label: string): void {
+	// Host axis (coordinator addendum): the stage and the floating dock keep
+	// usable widths — no 80px stage, no 48px dock sliver. (With the drawer
+	// collapsed to its in-flow 52px rail the stage is ~308px and the dock
+	// ~276px at 360; fully overlay-free expansion gives 360/328.)
+	expect(g.stage, `${label} stage mounted`).not.toBeNull();
+	expect(g.stage!.width, `${label} stage width`).toBeGreaterThanOrEqual(280);
+	expect(g.dock, `${label} dock mounted`).not.toBeNull();
+	expect(g.dock!.width, `${label} dock width`).toBeGreaterThanOrEqual(240);
+	expect(g.dock!.x, `${label} dock x`).toBeGreaterThanOrEqual(-1);
+	expect(g.dock!.x + g.dock!.width, `${label} dock right edge`).toBeLessThanOrEqual(
+		g.viewport.width + 1
+	);
+	// Width axis: the section spans the dock width — never a right sliver.
+	expect(g.section.width, `${label} section width`).toBeGreaterThanOrEqual(200);
+	expect(g.section.x, `${label} section x`).toBeGreaterThanOrEqual(0);
+	expect(g.section.x + g.section.width, `${label} section right edge`).toBeLessThanOrEqual(
+		g.viewport.width + 1
+	);
+	expect(g.section.height, `${label} section height`).toBeGreaterThan(0);
+	// The section never becomes the scroll surface itself and never widens
+	// the page: content overflow is confined to the transcript container.
+	expect(g.section.height, `${label} section bounded height`).toBeLessThanOrEqual(
+		g.viewport.height + 1
+	);
+	expect(g.section.scrollWidth, `${label} section horizontal overflow`).toBeLessThanOrEqual(
+		g.section.clientWidth + 1
+	);
+	expect(g.docScrollWidth, `${label} page horizontal overflow`).toBeLessThanOrEqual(
+		g.viewport.width + 1
+	);
+	// Status stays a READABLE horizontal badge in the full content row — the
+	// R-24c defect rendered it as a 26px-wide one-glyph vertical column
+	// (26×149 active-run / 26×233 terminal on base). The gate is semantic,
+	// never an absolute width floor: a short state word ('Working',
+	// 'Conversation', 'Done') passes at any honest width, while the
+	// one-glyph column fails on line-box count, height and row placement.
+	expect(g.state, `${label} status mounted`).not.toBeNull();
+	expect(g.state!.display, `${label} status rendered`).not.toBe('none');
+	expect(g.state!.visibility, `${label} status visible`).toBe('visible');
+	// Positive text column; nothing hidden or clipped (honest wire, C08 r6).
+	expect(g.state!.textWidth, `${label} status text width`).toBeGreaterThan(0);
+	expect(g.state!.scrollDelta, `${label} status clipped text`).toBeLessThanOrEqual(1);
+	// The text lays out as at most ~3 horizontal lines — the base defect
+	// wrapped one word into 7+ one-glyph lines (147–233px tall columns).
+	expect(g.state!.lineBoxes, `${label} status line boxes`).toBeGreaterThanOrEqual(1);
+	expect(g.state!.lineBoxes, `${label} status wraps horizontally`).toBeLessThanOrEqual(3);
+	expect(g.state!.height, `${label} status bounded height`).toBeLessThanOrEqual(
+		g.state!.lineHeight * 3 + 2
+	);
+	// The status row consumes the section width not used by the Details
+	// trigger: the badge lives in the full-width content column, never in a
+	// starved sliver.
+	expect(g.statusLine, `${label} status row mounted`).not.toBeNull();
+	expect(g.trigger, `${label} details trigger mounted`).not.toBeNull();
+	expect(
+		g.statusLine!.width + g.trigger!.width,
+		`${label} status row spans content width`
+	).toBeGreaterThanOrEqual(g.section.clientWidth - 12);
+	// Task blocks read at full content width with real text columns.
+	expect(g.understanding, `${label} understanding mounted`).not.toBeNull();
+	expect(g.understanding!.width, `${label} understanding width`).toBeGreaterThanOrEqual(200);
+	expect(g.plan, `${label} plan mounted`).not.toBeNull();
+	expect(g.plan!.width, `${label} plan width`).toBeGreaterThanOrEqual(200);
+	for (const [name, box] of [
+		['scope title', g.scopeTitle],
+		['scope summary', g.scopeSummary],
+		['constraint row', g.constraintRow],
+		['plan title', g.planTitle],
+		['plan evidence empty', g.planEvidenceEmpty]
+	] as const) {
+		expect(box, `${label} ${name} mounted`).not.toBeNull();
+		expect(box!.textWidth, `${label} ${name} text width`).toBeGreaterThan(0);
+	}
+	// Height axis: the transcript row keeps real height; long task content
+	// lives inside the bounded scroll container instead of starving it.
+	expect(g.transcript, `${label} transcript mounted`).not.toBeNull();
+	expect(g.transcript!.clientHeight, `${label} transcript client height`).toBeGreaterThan(0);
+	expect(g.transcript!.scrollWidth, `${label} transcript horizontal overflow`).toBeLessThanOrEqual(
+		g.transcript!.clientWidth + 1
+	);
+}
+
+/**
+ * 24d: a recorded message must be genuinely reachable in the transcript
+ * viewport through the normal vertical scroll path (normal scrolling, not
+ * element handles or programmatic reveal of a collapsed row).
+ */
+async function expectMessageReachable(dock: Locator, label: string): Promise<void> {
+	const reach = await dock
+		.getByTestId('chat-conversation')
+		.evaluate(async (section: HTMLElement) => {
+			const scroll = section.querySelector<HTMLElement>('.mai-chat__conversation-scroll');
+			if (scroll === null) return { ok: false, detail: 'no transcript scroll container' };
+			const viewport = scroll.getBoundingClientRect();
+			const before = scroll.scrollTop;
+			// Bring the FIRST recorded message into the transcript viewport —
+			// normal scrolling through the bounded region (the live run's
+			// in-progress turn may legitimately render below the recorded
+			// transcript, so the bottom of the region is not the target).
+			const first = scroll.querySelector<HTMLElement>(
+				'[data-testid="canonical-user-message"], [data-testid="canonical-assistant-message"]'
+			);
+			if (first === null) return { ok: false, detail: 'no recorded message in the region' };
+			const target =
+				first.getBoundingClientRect().top - viewport.top + scroll.scrollTop - 8;
+			scroll.scrollTop = Math.max(0, Math.min(target, scroll.scrollHeight - scroll.clientHeight));
+			const settled = Promise.withResolvers<void>();
+			requestAnimationFrame(() => requestAnimationFrame(() => settled.resolve()));
+			await settled.promise;
+			const messages = [
+				...scroll.querySelectorAll<HTMLElement>(
+					'[data-testid="canonical-user-message"], [data-testid="canonical-assistant-message"]'
+				)
+			];
+			const rects = messages.map((message) => {
+				const r = message.getBoundingClientRect();
+				return [Math.round(r.top), Math.round(r.bottom), Math.round(r.width)];
+			});
+			const visible = messages.filter((message) => {
+				const r = message.getBoundingClientRect();
+				return (
+					r.width > 0 &&
+					r.height > 0 &&
+					r.bottom > viewport.top &&
+					r.top < viewport.bottom &&
+					r.right > viewport.left &&
+					r.left < viewport.right
+				);
+			});
+			return {
+				ok:
+					visible.length > 0 &&
+					(scroll.scrollTop > before || Math.abs(target - before) <= 1),
+				detail: `messages=${messages.length} visible=${visible.length} scrolled ${before}→${scroll.scrollTop} (target ${Math.round(target)}) scrollHeight=${scroll.scrollHeight} clientHeight=${scroll.clientHeight} rects=${JSON.stringify(rects)} viewportTop=${Math.round(viewport.top)} bottom=${Math.round(viewport.bottom)}`
+			};
+		});
+	expect(reach.ok, `${label} recorded message reachable (${reach.detail})`).toBe(true);
+}
+
 test('live dock Global journey (24a D-1): unpin → Global history → submit → drawer shows it → restore/reload stays on the sentinel', async ({
 	page,
 	context
@@ -1311,8 +1586,13 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await page.setViewportSize({ width: 360, height: 640 });
 	await page.reload();
 	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	// Pocket overlay UX: the EXPANDED drawer overlays the dock, so dock
+	// interactions happen drawer-collapsed and drawer interactions happen
+	// drawer-expanded. Collapse → unpin the chip → expand → pick history.
+	await page.getByTestId('side-drawer-toggle').click();
 	await dock.getByTestId('chat-server-chip-remove').click();
 	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+	await page.getByTestId('side-drawer-toggle').click();
 	await drawer.getByTestId('drawer-history-toggle').click();
 	await drawer.getByTestId('drawer-history-toggle').click();
 	await expect(
@@ -1335,6 +1615,18 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	expect(scopeBox!.x).toBeGreaterThanOrEqual(0);
 	expect(scopeBox!.x + scopeBox!.width).toBeLessThanOrEqual(360);
 	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+	// 24d: the ACTIVE-RUN reopen must also be geometrically usable — the
+	// pocket leg reopens with the run still live and Understanding/Plan
+	// ready, exactly the pre-existing crush shape R-24c measured on base.
+	// Collapse the drawer first: at pocket width the drawer overlays the
+	// workspace, and the READABLE dock state is drawer-collapsed (the same
+	// convention as the `real dock 360` pocket test).
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
+	const pocketGeometry24d = await collectConversationGeometry(dock);
+	console.log('[24D-PROBE] composed active-run geometry', JSON.stringify(pocketGeometry24d));
+	expectUsableConversation(pocketGeometry24d, 'active-run reopen');
+	await expectMessageReachable(dock, 'active-run reopen');
 	// The pocket epoch obeys the same scope rule: post-unpin every canonical
 	// read rides the sentinel and nothing 404s.
 	const pocket = canonicalRequests.filter((one) => one.epoch === 2);
@@ -1362,6 +1654,9 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	conversations.get(CREATED_ID)!.updatedAt = '2026-10-25T15:30:00Z';
 	await page.reload();
 	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	// Pocket overlay UX: collapse before the dock interaction, expand for
+	// the drawer history pick.
+	await page.getByTestId('side-drawer-toggle').click();
 	await dock.getByTestId('chat-server-chip-remove').click();
 	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
 	// The blank draft keeps the idle/compact collapse: no fake expansion, no
@@ -1369,6 +1664,8 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await expect(dock.getByTestId('chat-conversation')).toHaveClass(/mai-chat__section--idle/);
 	await expect(dock.getByTestId('chat-conversation')).not.toBeVisible();
 	await expect(dock.getByTestId('task-understanding')).toHaveCount(0);
+	// Re-expand the overlay drawer for the history pick.
+	await page.getByTestId('side-drawer-toggle').click();
 	await drawer.getByTestId('drawer-history-toggle').click();
 	await drawer.getByTestId('drawer-history-toggle').click();
 	await expect(
@@ -1398,6 +1695,32 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
 	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
 	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+	// 24d grid usability: the settled terminal reopen must be geometrically
+	// usable at 360×640 — full-width blocks, readable status and text, real
+	// transcript height with a working bounded scroll path, and no
+	// horizontal overflow anywhere. Collapse the overlay drawer first: the
+	// READABLE dock state is drawer-collapsed (`real dock 360` convention).
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
+	const geometry24d = await collectConversationGeometry(dock);
+	console.log('[24D-PROBE] composed terminal geometry', JSON.stringify(geometry24d));
+	expectUsableConversation(geometry24d, 'terminal reopen');
+	await expectMessageReachable(dock, 'terminal reopen');
+	// 24d root-cause #1 regression gate: with the drawer EXPANDED at pocket
+	// width it must OVERLAY the workspace (stage stays full width) instead
+	// of squeezing it to the 80px rail that starved the dock to 48px.
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
+	const expanded24d = await collectConversationGeometry(dock);
+	console.log('[24D-PROBE] composed drawer-expanded geometry', JSON.stringify(expanded24d));
+	expect(expanded24d.stage, 'drawer-expanded stage mounted').not.toBeNull();
+	expect(expanded24d.stage!.width, 'drawer-expanded stage width').toBeGreaterThanOrEqual(280);
+	expect(expanded24d.dock, 'drawer-expanded dock mounted').not.toBeNull();
+	expect(expanded24d.dock!.width, 'drawer-expanded dock width').toBeGreaterThanOrEqual(240);
+	expect(expanded24d.section.width, 'drawer-expanded section width').toBeGreaterThanOrEqual(200);
+	// Restore the collapsed read state for the remaining audits.
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
 	// The terminal epoch obeys the same scope rule: post-unpin every canonical
 	// read rides the sentinel and nothing 404s.
 	const terminal = canonicalRequests.filter((one) => one.epoch === 3);
