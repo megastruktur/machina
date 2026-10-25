@@ -586,6 +586,19 @@
 		createConversation: api.createConversation,
 		submitConversationMessage: api.submitConversationMessage,
 		steerConversation: api.steerConversation,
+		// §8 task surface (24b D-2, 15-task-api/16-task-client): the REAL
+		// client's task methods ride the same dock slice so
+		// ChatPanel.readTaskServices() binds them and TaskUnderstanding +
+		// TaskPlan render server truth. The OFFLINE memory slice below omits
+		// every one of them — it fails closed honestly and makes zero task
+		// requests (no fabricated task data offline).
+		getConversationTask: api.getConversationTask,
+		listTaskSteps: api.listTaskSteps,
+		listTaskConstraints: api.listTaskConstraints,
+		listTaskEvidence: api.listTaskEvidence,
+		listTaskRevisions: api.listTaskRevisions,
+		submitTaskCorrection: api.submitTaskCorrection,
+		submitTaskDecision: api.submitTaskDecision,
 		/** Live-transport marker read by ChatPanel.profilesLive (not on the wire). */
 		listProfiles: async () => []
 	};

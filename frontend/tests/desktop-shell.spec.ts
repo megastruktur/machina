@@ -671,6 +671,11 @@ const GLOBAL_SENTINEL = '00000000-0000-0000-0000-000000000000';
 const PRE_GLOBAL_ID = '9ce236c1-a253-48b9-9eaa-350016223e2f';
 const CREATED_ID = '4ea2eca6-d7f0-415d-a131-ce0d1742f51a';
 const CREATED_RUN = '10bc17bc-6211-4a8a-b48e-b490d9b5284b';
+/** The §8 task episode riding the created conversation (24b D-2). */
+const CREATED_TASK = '71a5c9d8-3e2f-4b6a-9c4d-1f2e3a4b5c6d';
+const TASK_STEP_A = 'inventory-dependent-jobs';
+const TASK_STEP_B = 'disable-and-remove-unit';
+const TASK_EVIDENCE = '9f8e7d6c-5a4b-4c3d-8e2f-1a2b3c4d5e6f';
 const CSRF_COOKIE = 'mai_csrf';
 
 interface MockMessage {
@@ -686,6 +691,8 @@ interface MockConversation {
 	createdAt: string;
 	updatedAt: string;
 	activeRunId: string | null;
+	/** The conversation's ONE §8 task episode (24b D-2), else null. */
+	activeTaskId: string | null;
 	messages: MockMessage[];
 }
 
@@ -725,6 +732,7 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		createdAt: '2026-10-25T15:00:00Z',
 		updatedAt: '2026-10-25T15:05:00Z',
 		activeRunId: null,
+		activeTaskId: null,
 		messages: [
 			{
 				message_id: 'aa000000-0000-4000-8000-000000000001',
@@ -747,6 +755,9 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		createdAt: now,
 		updatedAt: now,
 		activeRunId: null,
+		// The plan-only V6 episode: a task with steps/constraints but NO
+		// outcome document and ZERO evidence rows (honest empty state).
+		activeTaskId: CREATED_TASK,
 		messages: []
 	});
 
@@ -769,7 +780,7 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 			created_at: row.createdAt,
 			updated_at: row.updatedAt,
 			message_count: row.messages.length,
-			active_task_id: null,
+			active_task_id: row.activeTaskId,
 			active_run_id: row.activeRunId
 		};
 	};
@@ -778,6 +789,29 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		history_completeness: 'complete',
 		missing_range: null,
 		legacy_gaps: []
+	});
+	/** The §8 compact header of the created episode (D-2; plan-only V6 shape). */
+	const taskHeaderOf = (conversationId: string): Record<string, unknown> => ({
+		task_id: CREATED_TASK,
+		conversation_id: conversationId,
+		server_id: GLOBAL_SENTINEL,
+		revision: 3,
+		title: 'Decommission the legacy cron job',
+		summary:
+			'Understood: disable the nightly cron on megaserver, confirm nothing depends on it, then remove the unit.',
+		requested_phase: 'act',
+		status: 'in_progress',
+		active_step_id: TASK_STEP_B,
+		counts: {
+			steps_total: 2,
+			steps_executed: 1,
+			constraints_total: 1,
+			evidence_total: 0,
+			criteria_total: 2,
+			criteria_verified: 0
+		},
+		created_at: now,
+		updated_at: now
 	});
 	const notFound = (
 		route: Route,
@@ -898,10 +932,26 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 					latest_seq: row.messages.length,
 					history_completeness: 'complete',
 					active_run_id: row.activeRunId,
-					active_task_id: null,
+					active_task_id: row.activeTaskId,
 					pending_steering: 0
 				}
 			});
+		}
+		if (tail === 'task') {
+			// GET /api/v1/chat/conversations/{id}/task — the ONE active episode
+			// header, scope-checked exactly like the backend: no episode in
+			// this server scope collapses into the SAME scope-blind 404.
+			if (row.activeTaskId === null) {
+				record(404);
+				return fulfillJson(route, 404, {
+					detail: {
+						code: 'task_not_found',
+						message: 'no active task episode in the requesting server scope'
+					}
+				});
+			}
+			record(200);
+			return fulfillJson(route, 200, taskHeaderOf(conversationId));
 		}
 		// GET /api/v1/chat/conversations/{id} — header + gap honesty.
 		record(200);
@@ -950,6 +1000,132 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 				submitted_at: row.createdAt,
 				updated_at: row.updatedAt
 			})
+		});
+	});
+
+	// The §8 task collections of the created episode (24b D-2): bounded,
+	// scope-checked pages. The evidence page is HONESTLY empty (total 0 —
+	// the V6 plan-only episode produced no outcome document and zero
+	// evidence rows, which must render as absence, never fabrication).
+	const taskRequests: Array<{ path: string; serverId: string | null; status: number }> = [];
+	await page.route('**/api/v1/chat/tasks/**', async (route) => {
+		const url = new URL(route.request().url());
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const taskId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : '';
+		const tail = parts[5] ?? '';
+		const serverId = url.searchParams.get('server_id');
+		const entry = { path: url.pathname + url.search, serverId, status: 200 };
+		taskRequests.push(entry);
+		if (taskId !== CREATED_TASK || serverId !== GLOBAL_SENTINEL) {
+			entry.status = 404;
+			return fulfillJson(route, 404, {
+				detail: {
+					code: 'task_not_found',
+					message: 'no such task in the requesting server scope'
+				}
+			});
+		}
+		const pageOf = (items: unknown[]) => ({
+			task_id: taskId,
+			limit: Number(url.searchParams.get('limit') ?? 10),
+			offset: Number(url.searchParams.get('offset') ?? 0),
+			total: items.length,
+			has_more: false,
+			items
+		});
+		if (tail === 'items') {
+			return fulfillJson(
+				route,
+				200,
+				pageOf([
+					{
+						task_id: taskId,
+						step_id: TASK_STEP_A,
+						title: 'Inventory dependent jobs',
+						status: 'executed',
+						verification: 'passed',
+						position: 1,
+						risk: 'read_only',
+						prerequisite_unresolved: false,
+						expected_check: 'cron inventory shows no dependent job',
+						skip_reason: null,
+						result_summary: 'No downstream job references the legacy unit.',
+						evidence_refs: [{ kind: 'observation', evidence_id: TASK_EVIDENCE, note: null }],
+						depends_on: [],
+						superseded_at: null,
+						superseded_by: null,
+						created_at: now,
+						updated_at: now
+					},
+					{
+						task_id: taskId,
+						step_id: TASK_STEP_B,
+						title: 'Disable and remove the unit',
+						status: 'in_progress',
+						verification: 'not_checked',
+						position: 2,
+						risk: 'mutating',
+						prerequisite_unresolved: false,
+						expected_check: null,
+						skip_reason: null,
+						result_summary: null,
+						evidence_refs: [],
+						depends_on: [TASK_STEP_A],
+						superseded_at: null,
+						superseded_by: null,
+						created_at: now,
+						updated_at: now
+					}
+				])
+			);
+		}
+		if (tail === 'constraints') {
+			return fulfillJson(
+				route,
+				200,
+				pageOf([
+					{
+						task_id: taskId,
+						constraint_id: 'no-scheduler-restart',
+						category: 'safety',
+						statement:
+							'Never restart the production scheduler while the legacy unit is disabled.',
+						origin: 'user',
+						source_message_refs: ['bb000000-0000-4000-8000-000000000001'],
+						position: 1,
+						superseded_at: null,
+						superseded_by: null,
+						created_at: now,
+						updated_at: now
+					}
+				])
+			);
+		}
+		if (tail === 'revisions') {
+			return fulfillJson(
+				route,
+				200,
+				pageOf([
+					{
+						task_id: taskId,
+						revision: 1,
+						kind: 'create',
+						author: 'model',
+						source_message_id: null,
+						item_id: null,
+						payload: null,
+						applied_at: now
+					}
+				])
+			);
+		}
+		if (tail === 'evidence') {
+			// Zero rows: the explicit empty state is the honest render.
+			return fulfillJson(route, 200, pageOf([]));
+		}
+		entry.status = 404;
+		return fulfillJson(route, 404, {
+			detail: { code: 'not_found', message: 'unknown task collection' }
 		});
 	});
 
@@ -1054,6 +1230,29 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await expect(dock.getByTestId('canonical-assistant-message')).toContainText('Recorded dock reply.');
 	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
 
+	// --- 24b D-2: the dock's bound task services mount the §8 blocks --------
+	// TaskUnderstanding renders the REAL episode (scope, summary, constraints,
+	// steps); TaskPlan renders the real steps and the honest evidence-empty
+	// state. The plan-only episode has NO outcome document: TaskEvidence
+	// stays absent — absence is the honesty proof, nothing is fabricated.
+	await expect(dock.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-understanding-scope-title')).toHaveText(
+		'Decommission the legacy cron job'
+	);
+	await expect(dock.getByTestId('task-understanding-scope-summary')).toContainText('Understood:');
+	await expect(dock.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
+	await expect(dock.getByTestId('task-understanding-step-row')).toHaveCount(2);
+	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-plan-title')).toHaveText(
+		'Decommission the legacy cron job'
+	);
+	await expect(dock.getByTestId('task-plan-step-row')).toHaveCount(2);
+	await expect(dock.getByTestId('task-plan-evidence-empty')).toHaveText(
+		'No evidence records linked.'
+	);
+	await expect(dock.getByTestId('task-plan-revision-row')).toHaveCount(1);
+	await expect(dock.getByTestId('task-outcome')).toHaveCount(0);
+
 	// --- reload: a fresh shell restores the same Global conversation --------
 	epoch = 1;
 	await page.reload();
@@ -1103,5 +1302,67 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	for (const one of eventReads) {
 		expect(one.serverId).toBe(GLOBAL_SENTINEL);
 		expect(one.status).toBe(200);
+	}
+
+	// --- the pocket leg (24b): the same restore at 360×640 -------------------
+	// Understanding must VISIBLY render real scope/summary/constraints/steps
+	// at the V6 viewport — composition proof, not a unit fixture.
+	epoch = 2;
+	await page.setViewportSize({ width: 360, height: 640 });
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+	await dock.getByTestId('chat-server-chip-remove').click();
+	await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await drawer.getByTestId('drawer-history-toggle').click();
+	await expect(
+		drawer.getByTestId('drawer-history-item').filter({ hasText: CREATED_ID.slice(0, 8) })
+	).toHaveCount(1);
+	await drawer
+		.getByTestId('drawer-history-item')
+		.filter({ hasText: CREATED_ID.slice(0, 8) })
+		.click();
+	await expect(dock.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-understanding-scope-title')).toHaveText(
+		'Decommission the legacy cron job'
+	);
+	await expect(dock.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
+	await expect(dock.getByTestId('task-understanding-step-row')).toHaveCount(2);
+	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
+	const scopeBox = await dock.getByTestId('task-understanding-scope').boundingBox();
+	expect(scopeBox, 'understanding scope box').not.toBeNull();
+	expect(scopeBox!.x).toBeGreaterThanOrEqual(0);
+	expect(scopeBox!.x + scopeBox!.width).toBeLessThanOrEqual(360);
+	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
+	// The pocket epoch obeys the same scope rule: post-unpin every canonical
+	// read rides the sentinel and nothing 404s.
+	const pocket = canonicalRequests.filter((one) => one.epoch === 2);
+	expect(pocket.length, 'epoch 2 recorded').toBeGreaterThan(0);
+	const pocketSentinel = pocket.findIndex((one) => one.serverId === GLOBAL_SENTINEL);
+	expect(pocketSentinel, 'epoch 2 sentinel seen').toBeGreaterThan(-1);
+	for (const [index, one] of pocket.entries()) {
+		if (index < pocketSentinel) {
+			expect(one.serverId, `epoch 2 pre-unpin ${one.path}`).toBe(LIVE_SERVER_ID);
+		} else {
+			expect(one.serverId, `epoch 2 post-unpin ${one.path}`).toBe(GLOBAL_SENTINEL);
+		}
+		expect(one.status, one.path).toBeLessThan(400);
+	}
+
+	// --- the §8 task-read audit ----------------------------------------------
+	// Pre-repair the dock's services bag carried NO task methods: both blocks
+	// rendered "unbound" and these requests never left the page. Every task
+	// read must ride the recorded Global sentinel scope and succeed.
+	expect(taskRequests.length, 'task reads recorded').toBeGreaterThanOrEqual(4);
+	for (const one of taskRequests) {
+		expect(one.serverId, one.path).toBe(GLOBAL_SENTINEL);
+		expect(one.status, one.path).toBeLessThan(400);
+	}
+	for (const tail of ['items', 'constraints', 'evidence', 'revisions']) {
+		expect(
+			taskRequests.some((one) => one.path.includes(`/tasks/${CREATED_TASK}/${tail}`)),
+			`task ${tail} read`
+		).toBe(true);
 	}
 });

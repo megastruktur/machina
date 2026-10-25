@@ -126,6 +126,8 @@ interface ChatWindowApi {
 	lastCanonicalId(): string | null;
 	/** Cross-server probe: returns ONLY the structured code (C8). */
 	probeCrossServer(): Promise<{ code: string }>;
+	/** Cross-server TASK probe: returns ONLY the structured code (24b D-2, C8). */
+	probeCrossServerTask(): Promise<{ code: string }>;
 	/** Extra metadata-only canonical rows for list pagination. */
 	seedCanonicalConversations(count: number): void;
 	/** Seed one complete canonical row on ANY recorded scope (24a: the
@@ -157,6 +159,10 @@ declare global {
 		 * store mounts (scenario 'canonical' — the §3 surface is exercised
 		 * with the panel's canonical-first behavior). */
 		__maiChatCanonical?: boolean;
+		/** Set by a test init script: the §8 task slice rides the bag (24b
+		 * D-2 — the same slice the composed desktop binds from the real
+		 * client). Without it the panel must fail closed honestly. */
+		__maiChatTasks?: boolean;
 	}
 }
 
@@ -737,6 +743,269 @@ const APP_SOURCE = `
 		}
 	};
 
+	// --- §8 task fixture slice (24b D-2) --------------------------------------
+	// Rides the bag ONLY when the init script sets __maiChatTasks: exactly the
+	// slice the composed desktop binds from the real client. ONE plan-only
+	// episode per canonical conversation, scope-checked like the backend
+	// (absent row, foreign scope → the SAME scope-blind 404 task_not_found),
+	// bounded pages, and an HONEST evidence page (total 0 — no outcome
+	// document exists for a plan-only episode and none is fabricated).
+	const TASKS_BOUND = window.__maiChatTasks === true;
+	const TASK_STEP_A = 'inventory-dependent-jobs';
+	const TASK_STEP_B = 'disable-and-remove-unit';
+	function taskIdOf(conversationId) {
+		return 'f1000000-0000-4000-8000-' + String(conversationId).replace(/-/g, '').slice(0, 12);
+	}
+	function rowByTask(taskId) {
+		const wanted = String(taskId);
+		return (
+			Object.values(canonicalStore).find(
+				(row) => taskIdOf(row.conversation_id) === wanted
+			) ?? null
+		);
+	}
+	function taskOf(row) {
+		return {
+			task_id: taskIdOf(row.conversation_id),
+			conversation_id: row.conversation_id,
+			server_id: row.server_id,
+			revision: 3,
+			title: 'Fixture plan-only task',
+			summary: 'Understood: repair the dock; constraints recorded; plan proposed.',
+			requested_phase: 'act',
+			status: 'in_progress',
+			active_step_id: TASK_STEP_B,
+			counts: {
+				steps_total: 2,
+				steps_executed: 1,
+				constraints_total: 1,
+				evidence_total: 0,
+				criteria_total: 2,
+				criteria_verified: 0
+			},
+			created_at: '2026-10-16T08:00:00Z',
+			updated_at: '2026-10-16T08:30:00Z'
+		};
+	}
+	function taskNotFound() {
+		return new ApiError(
+			404,
+			'task_not_found',
+			'no active task episode in the requesting server scope'
+		);
+	}
+	const taskApi = {
+		async getConversationTask(conversationId, serverId) {
+			calls.push({ op: 'getConversationTask', runId: conversationId, serverId });
+			const row = canonicalStore[String(conversationId)];
+			if (!row || row.server_id !== serverId) throw taskNotFound();
+			return clone(taskOf(row));
+		},
+		async listTaskSteps(taskId, serverId, query) {
+			calls.push({
+				op: 'listTaskSteps',
+				runId: taskId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(query ?? {}))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== serverId) throw taskNotFound();
+			const items = [
+				{
+					task_id: taskId,
+					step_id: TASK_STEP_A,
+					title: 'Inventory dependent jobs',
+					status: 'executed',
+					verification: 'passed',
+					position: 1,
+					risk: 'read_only',
+					prerequisite_unresolved: false,
+					expected_check: 'cron inventory shows no dependent job',
+					skip_reason: null,
+					result_summary: 'No downstream job references the legacy unit.',
+					evidence_refs: [
+						{
+							kind: 'observation',
+							evidence_id: '9f8e7d6c-5a4b-4c3d-8e2f-1a2b3c4d5e6f',
+							note: null
+						}
+					],
+					depends_on: [],
+					superseded_at: null,
+					superseded_by: null,
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:10:00Z'
+				},
+				{
+					task_id: taskId,
+					step_id: TASK_STEP_B,
+					title: 'Disable and remove the unit',
+					status: 'in_progress',
+					verification: 'not_checked',
+					position: 2,
+					risk: 'mutating',
+					prerequisite_unresolved: false,
+					expected_check: null,
+					skip_reason: null,
+					result_summary: null,
+					evidence_refs: [],
+					depends_on: [TASK_STEP_A],
+					superseded_at: null,
+					superseded_by: null,
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:20:00Z'
+				}
+			];
+			const limit = query?.limit ?? 10;
+			const offset = query?.offset ?? 0;
+			const sliced = items.slice(offset, offset + limit);
+			return {
+				task_id: taskId,
+				limit,
+				offset,
+				total: items.length,
+				has_more: offset + sliced.length < items.length,
+				items: clone(sliced)
+			};
+		},
+		async listTaskConstraints(taskId, serverId, query) {
+			calls.push({
+				op: 'listTaskConstraints',
+				runId: taskId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(query ?? {}))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== serverId) throw taskNotFound();
+			const items = [
+				{
+					task_id: taskId,
+					constraint_id: 'no-scheduler-restart',
+					category: 'safety',
+					statement: 'Never restart the production scheduler while the unit is disabled.',
+					origin: 'user',
+					source_message_refs: [row.messages.find((one) => one.role === 'user')?.message_id ?? ''],
+					position: 1,
+					superseded_at: null,
+					superseded_by: null,
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:00:00Z'
+				}
+			];
+			const limit = query?.limit ?? 10;
+			const offset = query?.offset ?? 0;
+			const sliced = items.slice(offset, offset + limit);
+			return {
+				task_id: taskId,
+				limit,
+				offset,
+				total: items.length,
+				has_more: offset + sliced.length < items.length,
+				items: clone(sliced)
+			};
+		},
+		async listTaskEvidence(taskId, serverId, page) {
+			calls.push({
+				op: 'listTaskEvidence',
+				runId: taskId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== serverId) throw taskNotFound();
+			return {
+				task_id: taskId,
+				limit: page?.limit ?? 10,
+				offset: page?.offset ?? 0,
+				// The plan-only honesty: zero recorded evidence rows.
+				total: 0,
+				has_more: false,
+				items: []
+			};
+		},
+		async listTaskRevisions(taskId, serverId, page) {
+			calls.push({
+				op: 'listTaskRevisions',
+				runId: taskId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== serverId) throw taskNotFound();
+			const items = [
+				{
+					task_id: taskId,
+					revision: 1,
+					kind: 'create',
+					author: 'model',
+					source_message_id: null,
+					item_id: null,
+					payload: null,
+					applied_at: '2026-10-16T08:00:00Z'
+				}
+			];
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const sliced = items.slice(offset, offset + limit);
+			return {
+				task_id: taskId,
+				limit,
+				offset,
+				total: items.length,
+				has_more: offset + sliced.length < items.length,
+				items: clone(sliced)
+			};
+		},
+		async submitTaskCorrection(taskId, payload) {
+			calls.push({
+				op: 'submitTaskCorrection',
+				runId: taskId,
+				payload: JSON.parse(JSON.stringify(payload))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== payload.server_id) throw taskNotFound();
+			const header = taskOf(row);
+			return {
+				task: Object.assign(clone(header), { revision: header.revision + 1 }),
+				revision: {
+					task_id: taskId,
+					revision: header.revision + 1,
+					kind: 'plan_patch',
+					author: 'user',
+					source_message_id: payload.patch?.source_message_id ?? null,
+					item_id: null,
+					payload: null,
+					applied_at: '2026-10-16T09:30:00Z'
+				},
+				disposition: 'created'
+			};
+		},
+		async submitTaskDecision(taskId, payload) {
+			calls.push({
+				op: 'submitTaskDecision',
+				runId: taskId,
+				payload: JSON.parse(JSON.stringify(payload))
+			});
+			const row = rowByTask(taskId);
+			if (!row || row.server_id !== payload.server_id) throw taskNotFound();
+			const header = taskOf(row);
+			return {
+				task: clone(header),
+				revision: {
+					task_id: taskId,
+					revision: header.revision,
+					kind: 'metadata',
+					author: 'user',
+					source_message_id: null,
+					item_id: null,
+					payload: null,
+					applied_at: '2026-10-16T09:30:00Z'
+				},
+				disposition: 'created'
+			};
+		}
+	};
+
 	let approvalReadFailure = null;
 	let failNextRead = null;
 	let decideFailure = null;
@@ -746,6 +1015,9 @@ const APP_SOURCE = `
 		// The canonical slice rides ONLY when the scenario mounted the
 		// canonical store: the legacy bag stays byte-identical otherwise.
 		...(canonical ? canonicalApi : {}),
+		// The §8 task slice rides ONLY when the init script binds it (24b
+		// D-2): the unbound path stays the fail-closed behavior under test.
+		...(TASKS_BOUND ? taskApi : {}),
 		async submitMessage(payload) {
 			const wire = JSON.parse(JSON.stringify(payload));
 			calls.push({ op: 'submitMessage', payload: wire });
@@ -1047,6 +1319,22 @@ const APP_SOURCE = `
 			// ONLY the structured code — never conversation content (C8).
 			try {
 				await canonicalApi.getConversation(CANON_CONV, SERVER_B);
+				return { code: 'leaked' };
+			} catch (error) {
+				return {
+					code:
+						error !== null && typeof error === 'object' && 'code' in error
+							? String(error.code)
+							: 'unknown'
+				};
+			}
+		},
+		async probeCrossServerTask() {
+			// Drives the REAL harness task header read across scopes; returns
+			// ONLY the structured code — the scope-blind 404 is the contract
+			// (24b D-2, C8).
+			try {
+				await taskApi.getConversationTask(CANON_CONV, SERVER_B);
 				return { code: 'leaked' };
 			} catch (error) {
 				return {
@@ -1405,14 +1693,19 @@ test.beforeEach(async ({ page }) => {
 	});
 });
 
-async function openFixture(page: Page, scenario: Scenario): Promise<Page> {
+async function openFixture(
+	page: Page,
+	scenario: Scenario,
+	opts?: { tasks?: boolean }
+): Promise<Page> {
 	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
 	await page.addInitScript(
 		(value) => {
-			window.__maiChatScenario = value;
-			window.__maiChatCanonical = value === 'canonical';
+			window.__maiChatScenario = value.scenario;
+			window.__maiChatCanonical = value.scenario === 'canonical';
+			window.__maiChatTasks = value.tasks === true;
 		},
-		scenario
+		{ scenario, tasks: opts?.tasks === true }
 	);
 	await page.goto(FIXTURE_URL);
 	await expect(page.getByTestId('host-main').getByTestId('chat-root')).toBeVisible();
@@ -3005,5 +3298,147 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		await main.getByTestId('history-refresh').click();
 		await expect(main.getByTestId('history-row')).toHaveCount(1);
 		await expect(main.getByTestId('history-row').first()).toContainText('Late consult');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 24b D-2 — the §8 task blocks mount through the panel's services bag. The
+// composed defect was BINDING: the dock's bag carried no task methods, so
+// TaskPlan stayed unbound and TaskUnderstanding never mounted. These focused
+// proofs pin the panel-side contract around the composed coverage in
+// desktop-shell.spec.ts (the bag here is the same slice the composed desktop
+// binds from the real client).
+// ---------------------------------------------------------------------------
+
+test.describe('dock task services mount (24b D-2)', () => {
+	test('a restored Global conversation mounts Understanding + Plan on the recorded sentinel scope with the honest evidence-empty state', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical', { tasks: true });
+		const main = page.getByTestId('host-main');
+		await page.evaluate(
+			([sentinel, conversationId]) =>
+				window.__maiChatApi!.seedCanonicalRow(sentinel, conversationId, 'Recorded consult'),
+			[GLOBAL_CONSULT_SERVER_ID, GLOBAL_CONV]
+		);
+
+		// Unpin → the Global row appears → restore it.
+		await main.getByTestId('chat-server-chip-remove').click();
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('chat-history-item')).toHaveCount(1);
+		await main.getByTestId('chat-history-item').first().click();
+
+		// Understanding: ready, with the REAL server-backed sections.
+		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('task-understanding-scope-title')).toHaveText(
+			'Fixture plan-only task'
+		);
+		await expect(main.getByTestId('task-understanding-scope-summary')).toContainText(
+			'Understood:'
+		);
+		await expect(main.getByTestId('task-understanding-scope-meta')).toContainText('evidence 0');
+		await expect(main.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
+		await expect(main.getByTestId('task-understanding-step-row')).toHaveCount(2);
+
+		// Plan: ready, with real steps; evidence total 0 renders the honest
+		// empty state; NO outcome document exists for the plan-only episode,
+		// so TaskEvidence stays absent — nothing is fabricated.
+		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('task-plan-title')).toHaveText('Fixture plan-only task');
+		await expect(main.getByTestId('task-plan-step-row')).toHaveCount(2);
+		await expect(main.getByTestId('task-plan-evidence-empty')).toHaveText(
+			'No evidence records linked.'
+		);
+		await expect(main.getByTestId('task-plan-revision-row')).toHaveCount(1);
+		await expect(main.getByTestId('task-outcome')).toHaveCount(0);
+		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+
+		// Scope: every §8 read rode the row's RECORDED sentinel — never the
+		// previously pinned panel scope (the 24a scope rule extends to tasks).
+		for (const op of [
+			'getConversationTask',
+			'listTaskSteps',
+			'listTaskConstraints',
+			'listTaskEvidence',
+			'listTaskRevisions'
+		]) {
+			const taskCalls = await callsOf(page, op);
+			expect(taskCalls.length, op).toBeGreaterThanOrEqual(1);
+			for (const call of taskCalls) {
+				expect(call.serverId, `${op} scope`).toBe(GLOBAL_CONSULT_SERVER_ID);
+			}
+		}
+	});
+
+	test('a server-scoped conversation mounts the task blocks on ITS recorded server and refuses a foreign scope', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical', { tasks: true });
+		const main = page.getByTestId('host-main');
+
+		// Default draft: pinned Server Alpha. The preseeded row is recorded
+		// on Alpha; restore it from the history selector.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await main.getByTestId('chat-history-item').filter({ hasText: 'Restore me' }).click();
+
+		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+		for (const op of [
+			'getConversationTask',
+			'listTaskSteps',
+			'listTaskConstraints',
+			'listTaskEvidence',
+			'listTaskRevisions'
+		]) {
+			const taskCalls = await callsOf(page, op);
+			expect(taskCalls.length, op).toBeGreaterThanOrEqual(1);
+			for (const call of taskCalls) {
+				expect(call.serverId, `${op} scope`).toBe(SERVER_A);
+			}
+		}
+
+		// The scope-blind rule (C8): the SAME conversation probed under
+		// Server Beta's scope 404s — no existence or content leak.
+		const probe = await page.evaluate(() => window.__maiChatApi!.probeCrossServerTask());
+		expect(probe.code).toBe('task_not_found');
+	});
+
+	test('without a bound task slice both blocks fail closed honestly and make zero task requests', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await main.getByTestId('chat-history-item').filter({ hasText: 'Restore me' }).click();
+		await expect(main.getByTestId('canonical-user-message').first()).toContainText(
+			'Restore question'
+		);
+
+		// The bag carries the canonical slice but NO task methods: both §8
+		// blocks render their explicit unbound state — nothing fetched,
+		// nothing fabricated, no task collections in the DOM.
+		await expect(main.getByTestId('task-understanding')).toHaveAttribute(
+			'data-state',
+			'unbound'
+		);
+		await expect(main.getByTestId('task-understanding-unbound')).toBeVisible();
+		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'unbound');
+		await expect(main.getByTestId('task-plan-unbound')).toBeVisible();
+		await expect(main.getByTestId('task-understanding-scope-title')).toHaveCount(0);
+		await expect(main.getByTestId('task-plan-title')).toHaveCount(0);
+		for (const op of [
+			'getConversationTask',
+			'listTaskSteps',
+			'listTaskConstraints',
+			'listTaskEvidence',
+			'listTaskRevisions',
+			'submitTaskCorrection'
+		]) {
+			expect(await callsOf(page, op), op).toHaveLength(0);
+		}
 	});
 });

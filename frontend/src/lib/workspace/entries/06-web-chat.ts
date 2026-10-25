@@ -39,7 +39,16 @@ import type {
 	ConversationEventsQuery,
 	ConversationSteerRequest,
 	ConversationSteerView,
-	SubscribeEventsOptions
+	SubscribeEventsOptions,
+	TaskCollectionQuery,
+	TaskConstraintsPage,
+	TaskCorrectionBody,
+	TaskDecisionBody,
+	TaskEvidencePage,
+	TaskMutationOutcome,
+	TaskRevisionsPage,
+	TaskStepsPage,
+	TaskView
 } from '../../api/client.js';
 import { subscribeEvents } from '../../api/client.js';
 import type { PanelEntryInput } from '../registry.js';
@@ -231,6 +240,58 @@ export interface ChatApi {
 	 * `/api/v1/models`). Not part of the wire contract.
 	 */
 	listProfiles?(): Promise<readonly string[]>;
+
+	// --- §8 task surface (24b D-2) ------------------------------------------
+	// Optional slice: the real composed client provides every method (V6 D-2:
+	// the dock bag carried none, so ChatPanel.readTaskServices() failed the
+	// whole slice and TaskUnderstanding/TaskPlan stayed unbound). A host
+	// without the 15-task-api client methods omits them and the §8 blocks
+	// fail closed — honest unbound states, zero network calls, nothing
+	// fabricated. Absent conversation, foreign scope and absent episode are
+	// the SAME scope-blind 404 (`task_not_found`), never an existence leak.
+	/**
+	 * GET /api/v1/chat/conversations/{id}/task?server_id=… — the ONE active
+	 * task episode header (revision, phase, status, counts).
+	 */
+	getConversationTask?(conversationId: string, serverId: string): Promise<TaskView>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/items?server_id=… — deterministic
+	 * `(position, step_id)` plan-step page; superseded rows stay recorded (P3).
+	 */
+	listTaskSteps?(
+		taskId: string,
+		serverId: string,
+		query?: TaskCollectionQuery
+	): Promise<TaskStepsPage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/constraints?server_id=… — deterministic
+	 * `(position, id)` constraint page with origin and source-message anchors.
+	 */
+	listTaskConstraints?(
+		taskId: string,
+		serverId: string,
+		query?: TaskCollectionQuery
+	): Promise<TaskConstraintsPage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/evidence?server_id=… — provenance
+	 * identities only; referenced content is never inlined.
+	 */
+	listTaskEvidence?(taskId: string, serverId: string, page?: PageQuery): Promise<TaskEvidencePage>;
+	/**
+	 * GET /api/v1/chat/tasks/{id}/revisions?server_id=… — the append-only
+	 * shared revision ledger, newest first (the P5 reconnect truth).
+	 */
+	listTaskRevisions?(taskId: string, serverId: string, page?: PageQuery): Promise<TaskRevisionsPage>;
+	/**
+	 * POST /api/v1/chat/tasks/{id}/revisions — one authenticated user
+	 * correction/proposal under CAS + idempotency; always author="user".
+	 */
+	submitTaskCorrection?(taskId: string, payload: TaskCorrectionBody): Promise<TaskMutationOutcome>;
+	/**
+	 * POST /api/v1/chat/tasks/{id}/decisions — one explicit user decision
+	 * (advisory phase / pause / cancel through the frozen transitions).
+	 */
+	submitTaskDecision?(taskId: string, payload: TaskDecisionBody): Promise<TaskMutationOutcome>;
 }
 
 /** One server option offered by the draft-mode server picker. */

@@ -77,6 +77,7 @@
 	import TaskEvidence from './chat/TaskEvidence.svelte';
 	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
 	import TaskPlan from './chat/TaskPlan.svelte';
+	import TaskUnderstanding from './chat/TaskUnderstanding.svelte';
 	import { taskServices, type TaskApi, type TaskServices } from '../workspace/entries/07-web-tasks.js';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
@@ -2968,6 +2969,17 @@
 				{/if}
 
 				{#if canonicalMode}
+					<!-- §8 Understanding section (act 17-understanding-ui): the ONE
+					     active task episode's scope/summary/constraints/plan, read
+					     only through the same bound task services. Fails closed
+					     (honest unbound/unavailable states) without task services or
+					     without an active episode; never fabricates content. -->
+					<TaskUnderstanding
+						services={taskServicesBag}
+						conversationId={canonicalId}
+						serverId={canonicalScope}
+					/>
+
 					<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
 					     progress, evidence links and revision proposals. Fails closed
 					     (honest unbound/unavailable states) without task services or

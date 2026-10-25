@@ -145,7 +145,16 @@ function liveChatServices(sessionJar: CookieJar): { client: MaiApiClient; chat: 
 		listConversationEvents: client.listConversationEvents,
 		createConversation: client.createConversation,
 		submitConversationMessage: client.submitConversationMessage,
-		steerConversation: client.steerConversation
+		steerConversation: client.steerConversation,
+		// §8 task slice (24b D-2): the same real-client bindings the composed
+		// desktop passes; `Required<>` pins them on the composition contract.
+		getConversationTask: client.getConversationTask,
+		listTaskSteps: client.listTaskSteps,
+		listTaskConstraints: client.listTaskConstraints,
+		listTaskEvidence: client.listTaskEvidence,
+		listTaskRevisions: client.listTaskRevisions,
+		submitTaskCorrection: client.submitTaskCorrection,
+		submitTaskDecision: client.submitTaskDecision
 	};
 	return { client, chat: chatServices(chat).api as Required<ChatApi> };
 }
