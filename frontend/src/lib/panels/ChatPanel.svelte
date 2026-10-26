@@ -77,8 +77,11 @@
 	import TaskEvidence from './chat/TaskEvidence.svelte';
 	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
 	import TaskPlan from './chat/TaskPlan.svelte';
+	import type { PlanState } from './chat/TaskPlan.svelte';
 	import TaskUnderstanding from './chat/TaskUnderstanding.svelte';
-	import { taskServices, type TaskApi, type TaskServices } from '../workspace/entries/07-web-tasks.js';
+	import type { UnderstandingState } from './chat/TaskUnderstanding.svelte';
+	import { ListTodo } from 'lucide-svelte';
+	import { taskServices, type TaskApi, type TaskServices, type TaskView } from '../workspace/entries/07-web-tasks.js';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
@@ -797,6 +800,12 @@
 		// clears it (the fold re-derives from the replayed run record, or the
 		// block stays honestly absent — never a stale verdict).
 		taskOutcome = null;
+		// The §8 mirrors belong to the same conversation identity: a switch
+		// clears them so the drawer trigger/badge never shows a stale episode.
+		taskPlanState = 'unbound';
+		taskPlanHeader = null;
+		taskUnderstandingState = 'unbound';
+		taskUnderstandingHeader = null;
 		controlNote = null;
 	}
 
@@ -1190,6 +1199,7 @@
 		decisionStatus = null;
 		resetFold();
 		detailsOpen = false;
+		tasksOpen = false;
 		resetCanonicalView();
 		canonicalId = conversationId;
 		// The row's recorded scope rules the detail read and every read
@@ -1521,6 +1531,7 @@
 		decisionStatus = null;
 		resetFold();
 		detailsOpen = false;
+		tasksOpen = false;
 		// The recorded conversation RESTORES its frozen context and locks it:
 		// the General Consult sentinel restores as the consult badge, any
 		// other id restores as the Server Chip, the recorded `@service` tags
@@ -1559,6 +1570,7 @@
 		decisionStatus = null;
 		resetFold();
 		detailsOpen = false;
+		tasksOpen = false;
 		composeMessage = '';
 		composeProfile = 'default';
 		readOnlyMode = false;
@@ -2514,6 +2526,100 @@
 	});
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let detailsOpen = $state(false);
+
+	// --- Task Inspector drawer (cti-01) --------------------------------------
+	// The outcome/§8 blocks moved OUT of the transcript scroll into one
+	// slide-over drawer. The §8 children mirror their honest state upward
+	// through optional $bindable props — the trigger and badge below read
+	// exactly what the blocks render, with zero duplicated network reads
+	// (C08 rule 6).
+	let tasksOpen = $state(false);
+	let taskPlanState = $state<PlanState>('unbound');
+	let taskPlanHeader = $state<TaskView | null>(null);
+	let taskUnderstandingState = $state<UnderstandingState>('unbound');
+	let taskUnderstandingHeader = $state<TaskView | null>(null);
+	let tasksTriggerEl = $state<HTMLButtonElement | null>(null);
+
+	/** A drawer can open only on honest server-backed task truth. */
+	const tasksAvailable = $derived(
+		(canonicalMode &&
+			(taskPlanState === 'ready' ||
+				taskUnderstandingState === 'ready' ||
+				taskPlanState === 'error' ||
+				taskUnderstandingState === 'error')) ||
+		taskOutcome !== null
+	);
+
+	/** The trigger's honest data-state (never a fabricated availability). */
+	const tasksTriggerState = $derived.by<PlanState | 'idle' | 'outcome'>(() => {
+		if (!canonicalMode && display === null && taskOutcome === null) return 'idle';
+		if (canonicalMode && (taskPlanState === 'ready' || taskUnderstandingState === 'ready')) {
+			return 'ready';
+		}
+		if (canonicalMode && (taskPlanState === 'error' || taskUnderstandingState === 'error')) {
+			return 'error';
+		}
+		if (taskOutcome !== null) return 'outcome';
+		if (canonicalMode) return taskPlanState;
+		return 'unavailable';
+	});
+
+	/** Subtle badge: plan steps, else outcome criteria, else a bare dot. */
+	const tasksBadge = $derived.by<string | null>(() => {
+		if (!tasksAvailable) return null;
+		if (
+			taskPlanState === 'ready' &&
+			taskPlanHeader !== null &&
+			taskPlanHeader.counts.steps_total > 0
+		) {
+			return `${taskPlanHeader.counts.steps_executed}/${taskPlanHeader.counts.steps_total}`;
+		}
+		if (
+			taskUnderstandingState === 'ready' &&
+			taskUnderstandingHeader !== null &&
+			taskUnderstandingHeader.counts.steps_total > 0
+		) {
+			return `${taskUnderstandingHeader.counts.steps_executed}/${taskUnderstandingHeader.counts.steps_total}`;
+		}
+		if (taskOutcome !== null && taskOutcome.criteria.total > 0) {
+			return `${taskOutcome.criteria.supported}/${taskOutcome.criteria.total}`;
+		}
+		return '●';
+	});
+
+	function openTasksPanel(): void {
+		// Mutual exclusion with the Details drawer: one drawer at a time.
+		tasksOpen = true;
+		detailsOpen = false;
+	}
+
+	/** Closing the drawer always returns focus to its trigger, whether the
+	     close came from the ✕ button or Escape (never stranded on a hidden
+	     control). */
+	function closeTasksPanel(): void {
+		tasksOpen = false;
+		tasksTriggerEl?.focus();
+	}
+
+	/** Escape inside the drawer (or on its trigger) closes it; focus returns. */
+	function handleTasksKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Escape' && tasksOpen) {
+			event.stopPropagation();
+			closeTasksPanel();
+		}
+	}
+
+	// Details can also open through its own disclosure binding, so the
+	// exclusion is enforced here too — one drawer at a time.
+	$effect(() => {
+		if (detailsOpen) tasksOpen = false;
+	});
+	// A drawer never stays open behind a disabled trigger (conversation
+	// transitions reset both; this covers every other availability loss).
+	$effect(() => {
+		if (!tasksAvailable && tasksOpen) tasksOpen = false;
+	});
+
 	let stoppingRun = $state(false);
 	const canStopRun = $derived(
 		api !== null && display !== null && jobInProgress && !cancelRequested && !stoppingRun
@@ -2911,7 +3017,34 @@
 			aria-label="Open conversation"
 			data-testid="chat-conversation"
 		>
+			{#snippet tasksTrigger()}
+				<button
+					type="button"
+					class="mai-chat__tasks-trigger"
+					data-testid="chat-tasks-trigger"
+					data-state={tasksTriggerState}
+					aria-label="Task plan and understanding"
+					title="Task plan and understanding"
+					aria-expanded={tasksOpen}
+					aria-controls="{uid}-tasks"
+					disabled={!tasksAvailable}
+					onclick={openTasksPanel}
+					onkeydown={handleTasksKeydown}
+					bind:this={tasksTriggerEl}
+				>
+					<ListTodo size={14} strokeWidth={2} aria-hidden="true" />
+					{#if tasksBadge !== null}
+						<span class="mai-chat__tasks-badge" data-testid="chat-tasks-badge">{tasksBadge}</span>
+					{/if}
+				</button>
+			{/snippet}
+
 			{#if display === null && !canonicalMode}
+				<!-- Idle: the trigger stays reachable (disabled) in a compact
+				     top-right bar — nothing is inspectable before a conversation. -->
+				<div class="mai-chat__conversation-actions">
+					{@render tasksTrigger()}
+				</div>
 				<div class="mai-chat__state" role="status" data-testid="chat-none">
 					<p>No conversation is open. Send a message or open one from the list.</p>
 				</div>
@@ -2972,44 +3105,18 @@
 					{/if}
 				</p>
 
-				<!-- 24d grid usability: the outcome/§8/gap content lives INSIDE
-				     the bounded conversation scroll region. As direct children of
-				     the conversation grid they auto-placed into an implicit
-				     ~6300px row, starved the minmax(0,1fr) column to 0px (zero-
-				     width task text) and the transcript row to 0 height
-				     (R-24c FAIL_REPAIRABLE). Inside the scroll container every
-				     block spans the full section width and long task content
+				<!-- 24d grid usability: the transcript/gap-banner content lives
+				     INSIDE the bounded conversation scroll region. As direct
+				     children of the conversation grid they auto-placed into an
+				     implicit ~6300px row, starved the minmax(0,1fr) column to
+				     0px (zero-width task text) and the transcript row to 0
+				     height (R-24c FAIL_REPAIRABLE). Inside the scroll container
+				     every block spans the full section width and long content
 				     stays reachable through the working vertical scroll path
-				     instead of starving the transcript. -->
+				     instead of starving the transcript. (cti-01: the outcome/§8
+				     blocks left this region for the Task Inspector drawer — the
+				     same grid-starvation rationale keeps the gap banner here.) -->
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
-					{#if taskOutcome !== null}
-						<TaskEvidence document={taskOutcome} />
-					{/if}
-
-					{#if canonicalMode}
-						<!-- §8 Understanding section (act 17-understanding-ui): the ONE
-						     active task episode's scope/summary/constraints/plan, read
-						     only through the same bound task services. Fails closed
-						     (honest unbound/unavailable states) without task services or
-						     without an active episode; never fabricates content. -->
-						<TaskUnderstanding
-							services={taskServicesBag}
-							conversationId={canonicalId}
-							serverId={canonicalScope}
-						/>
-
-						<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
-						     progress, evidence links and revision proposals. Fails closed
-						     (honest unbound/unavailable states) without task services or
-						     without an active task episode; never disturbs the outcome block. -->
-						<TaskPlan
-							services={taskServicesBag}
-							conversationId={canonicalId}
-							serverId={canonicalScope}
-							sourceMessageId={lastCanonicalUserMessageId}
-						/>
-					{/if}
-
 					{#if canonicalMode && canonicalCompleteness !== 'complete'}
 						<div
 							class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
@@ -3365,7 +3472,11 @@
 					{/if}
 				</div>
 
-				<DetailsDisclosure bind:open={detailsOpen} id="{uid}-details" testId="chat-details">
+				<!-- cti-01: the tasks trigger sits right left of the Details
+				     disclosure in one flex wrapper (grid-area 1 / 2). -->
+				<div class="mai-chat__conversation-actions">
+					{@render tasksTrigger()}
+					<DetailsDisclosure bind:open={detailsOpen} id="{uid}-details" testId="chat-details">
 					<div class="mai-chat__drawer-head">
 						<span class="mai-chat__drawer-title">⚙ Conversation Details</span>
 						<Button
@@ -3537,7 +3648,68 @@
 					</div>
 				{/if}
 				</DetailsDisclosure>
+				</div>
 			{/if}
+
+			<!-- cti-01 Task Inspector drawer: the outcome/§8 blocks moved out of
+			     the transcript scroll into this slide-over sheet (same right
+			     edge, same overlay mechanics as the Details drawer). -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions:
+			     The keydown catches Escape bubbling from focusable drawer
+			     children — the intended disclosure pattern. -->
+			<div
+				id="{uid}-tasks"
+				class="mai-chat__tasks-panel"
+				role="region"
+				aria-label="Task Plan & Understanding"
+				aria-hidden={!tasksOpen}
+				hidden={!tasksOpen}
+				data-testid="chat-tasks-panel"
+				onkeydown={handleTasksKeydown}
+			>
+				<div class="mai-chat__drawer-head">
+					<span class="mai-chat__drawer-title">📋 Task Plan &amp; Outcome</span>
+					<Button
+						size="sm"
+						variant="ghost"
+						onclick={closeTasksPanel}
+						aria-label="Close task panel"
+						data-testid="chat-tasks-close"
+					>
+						✕
+					</Button>
+				</div>
+				{#if taskOutcome !== null}
+					<TaskEvidence document={taskOutcome} />
+				{/if}
+				{#if canonicalMode && canonicalId !== null}
+					<!-- §8 Understanding section (act 17-understanding-ui): the ONE
+					     active task episode's scope/summary/constraints/plan, read
+					     only through the same bound task services. Fails closed
+					     (honest unbound/unavailable states) without task services or
+					     without an active episode; never fabricates content. -->
+					<TaskUnderstanding
+						bind:status={taskUnderstandingState}
+						bind:taskHeader={taskUnderstandingHeader}
+						services={taskServicesBag}
+						conversationId={canonicalId}
+						serverId={canonicalScope}
+					/>
+
+					<!-- §8 Plan section (act 18-plan-ui): persistent todos, dependencies,
+					     progress, evidence links and revision proposals. Fails closed
+					     (honest unbound/unavailable states) without task services or
+					     without an active task episode; never disturbs the outcome block. -->
+					<TaskPlan
+						bind:status={taskPlanState}
+						bind:taskHeader={taskPlanHeader}
+						services={taskServicesBag}
+						conversationId={canonicalId}
+						serverId={canonicalScope}
+						sourceMessageId={lastCanonicalUserMessageId}
+					/>
+				{/if}
+			</div>
 		</section>
 
 		<section class="mai-chat__section mai-chat__section--compose" aria-label="Compose" data-testid="chat-compose">
@@ -3738,12 +3910,23 @@
 	.mai-chat__inline-alerts { grid-area: 2 / 1 / auto / -1; }
 	.mai-chat__inline-alerts:empty { display: none; }
 	.mai-chat__section--conversation > .mai-chat__conversation-scroll { grid-area: 3 / 1 / auto / -1; }
-	.mai-chat__section--conversation > :global(.mai-details) { display: contents; }
-	.mai-chat__section--conversation > :global(.mai-details > .mai-details__trigger) {
+	/* cti-01: the tasks trigger + Details disclosure share one flex wrapper
+	 * on the status row; in the idle section the same class is a plain
+	 * full-width bar pinning the (disabled) trigger to the top right. */
+	.mai-chat__conversation-actions {
 		grid-area: 1 / 2;
+		justify-self: end;
+		display: inline-flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 0.35rem;
 		min-height: 28px;
 	}
-	.mai-chat__section--conversation > :global(.mai-details > .mai-details__panel) {
+	.mai-chat__conversation-actions > :global(.mai-details) { display: contents; }
+	.mai-chat__conversation-actions > :global(.mai-details > .mai-details__trigger) {
+		min-height: 28px;
+	}
+	.mai-chat__section--conversation :global(.mai-details > .mai-details__panel) {
 		position: absolute;
 		top: 0;
 		right: 0;
@@ -3793,6 +3976,63 @@
 			opacity: 1;
 		}
 	}
+
+	/* cti-01: compact icon-only Task Inspector trigger beside the Details
+	 * disclosure — same visual weight, badge stays subtle. */
+	.mai-chat__tasks-trigger {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		min-height: 28px;
+		padding: 0 var(--mai-space-2, 8px);
+		background: transparent;
+		border: var(--mai-border-width, 1px) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md, 2px);
+		color: var(--mai-color-text-muted);
+		cursor: pointer;
+		font-size: var(--mai-text-sm, 0.875rem);
+	}
+	.mai-chat__tasks-trigger:hover:enabled {
+		color: var(--mai-color-text);
+		border-color: var(--mai-color-border-strong);
+	}
+	.mai-chat__tasks-trigger:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.mai-chat__tasks-trigger[aria-expanded='true'] {
+		color: var(--mai-color-brass);
+		border-color: var(--mai-color-border-strong);
+	}
+	.mai-chat__tasks-badge {
+		font-family: var(--mai-font-mono, monospace);
+		font-size: var(--mai-text-xs, 0.75rem);
+		line-height: 1;
+	}
+
+	/* cti-01 Task Inspector drawer: the same right-edge slide-over sheet as
+	 * the Details drawer; overlaying the body never steals scroll height. */
+	.mai-chat__tasks-panel {
+		position: absolute;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		width: min(26rem, 92%);
+		max-height: none;
+		margin-top: 0;
+		z-index: 25;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		box-sizing: border-box;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-md, 0.75rem);
+		padding: var(--space-md, 0.75rem);
+		background: var(--bg-elevated, #141821);
+		border-left: 1px solid var(--border-default, #2d3343);
+		box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+	}
+	.mai-chat__tasks-panel[hidden] { display: none !important; }
 
 	.mai-chat__conversation-scroll {
 		display: flex;

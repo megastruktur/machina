@@ -743,6 +743,8 @@ interface ConversationGeometry {
 	state: (GeometryPart & StatusReadability) | null;
 	statusLine: GeometryBox | null;
 	trigger: GeometryBox | null;
+	/** cti-01: the Task Inspector trigger sharing the status row. */
+	tasksTrigger: GeometryBox | null;
 	understanding: GeometryPart | null;
 	scopeTitle: GeometryPart | null;
 	scopeSummary: GeometryPart | null;
@@ -809,6 +811,7 @@ function collectConversationGeometry(dock: Locator): Promise<ConversationGeometr
 			state,
 			statusLine: pick('.mai-chat__conversation-status'),
 			trigger: pick('[data-testid="chat-details-trigger"]'),
+			tasksTrigger: pick('[data-testid="chat-tasks-trigger"]'),
 			understanding: pick('[data-testid="task-understanding"]'),
 			scopeTitle: pick('[data-testid="task-understanding-scope-title"]'),
 			scopeSummary: pick('[data-testid="task-understanding-scope-summary"]'),
@@ -891,16 +894,42 @@ function expectUsableConversation(g: ConversationGeometry, label: string): void 
 	expect(g.state!.height, `${label} status bounded height`).toBeLessThanOrEqual(
 		g.state!.lineHeight * 3 + 2
 	);
-	// The status row consumes the section width not used by the Details
-	// trigger: the badge lives in the full-width content column, never in a
-	// starved sliver.
+	// The status row consumes the section width not used by its TWO
+	// triggers: the badge lives in the full-width content column, never in
+	// a starved sliver. (cti-01: the row carries the Task Inspector trigger
+	// beside the Details disclosure — the span formula tracks the real row
+	// composition. The slack covers the sum's blind spot — the 0.35rem
+	// flex gap BETWEEN the two triggers plus rounding — measured 2px over
+	// the old −12 at the minimum pocket dock width; the starvation defect
+	// class this gate guards (26px one-glyph column vs ~246px section)
+	// misses by three orders of magnitude, not by single digits.)
 	expect(g.statusLine, `${label} status row mounted`).not.toBeNull();
 	expect(g.trigger, `${label} details trigger mounted`).not.toBeNull();
+	expect(g.tasksTrigger, `${label} tasks trigger mounted`).not.toBeNull();
 	expect(
-		g.statusLine!.width + g.trigger!.width,
+		g.statusLine!.width + g.tasksTrigger!.width + g.trigger!.width,
 		`${label} status row spans content width`
-	).toBeGreaterThanOrEqual(g.section.clientWidth - 12);
-	// Task blocks read at full content width with real text columns.
+	).toBeGreaterThanOrEqual(g.section.clientWidth - 20);
+	// Task blocks: cti-01 moved them into the Task Inspector drawer — the
+	// closed-drawer snapshot measures display:none zeros BY DESIGN, so
+	// their usable-geometry gate lives in expectUsableTaskInspector and
+	// runs only against a snapshot collected with the drawer OPEN.
+	// Height axis: the transcript row keeps real height; long task content
+	// lives in the drawer instead of starving the transcript.
+	expect(g.transcript, `${label} transcript mounted`).not.toBeNull();
+	expect(g.transcript!.clientHeight, `${label} transcript client height`).toBeGreaterThan(0);
+	expect(g.transcript!.scrollWidth, `${label} transcript horizontal overflow`).toBeLessThanOrEqual(
+		g.transcript!.clientWidth + 1
+	);
+}
+
+/**
+ * cti-01: usable §8 geometry INSIDE the open Task Inspector drawer —
+ * full-width blocks with real text columns at any viewport (the 1280×800
+ * proof rides the D-2 restore section, the 360×640 proofs ride the pocket
+ * legs). Requires a snapshot collected while `chat-tasks-panel` is open.
+ */
+function expectUsableTaskInspector(g: ConversationGeometry, label: string): void {
 	expect(g.understanding, `${label} understanding mounted`).not.toBeNull();
 	expect(g.understanding!.width, `${label} understanding width`).toBeGreaterThanOrEqual(200);
 	expect(g.plan, `${label} plan mounted`).not.toBeNull();
@@ -915,13 +944,6 @@ function expectUsableConversation(g: ConversationGeometry, label: string): void 
 		expect(box, `${label} ${name} mounted`).not.toBeNull();
 		expect(box!.textWidth, `${label} ${name} text width`).toBeGreaterThan(0);
 	}
-	// Height axis: the transcript row keeps real height; long task content
-	// lives inside the bounded scroll container instead of starving it.
-	expect(g.transcript, `${label} transcript mounted`).not.toBeNull();
-	expect(g.transcript!.clientHeight, `${label} transcript client height`).toBeGreaterThan(0);
-	expect(g.transcript!.scrollWidth, `${label} transcript horizontal overflow`).toBeLessThanOrEqual(
-		g.transcript!.clientWidth + 1
-	);
 }
 
 /**
@@ -945,9 +967,12 @@ async function expectMessageReachable(dock: Locator, label: string): Promise<voi
 				'[data-testid="canonical-user-message"], [data-testid="canonical-assistant-message"]'
 			);
 			if (first === null) return { ok: false, detail: 'no recorded message in the region' };
-			const target =
-				first.getBoundingClientRect().top - viewport.top + scroll.scrollTop - 8;
-			scroll.scrollTop = Math.max(0, Math.min(target, scroll.scrollHeight - scroll.clientHeight));
+			// Bring the FIRST recorded message into the transcript viewport —
+			// normal scrolling through the bounded region (the live run's
+			// in-progress turn may legitimately render below the recorded
+			// transcript, so the bottom of the region is not the target).
+			const rawTarget = first.getBoundingClientRect().top - viewport.top + scroll.scrollTop - 8;
+			scroll.scrollTop = Math.max(0, Math.min(rawTarget, scroll.scrollHeight - scroll.clientHeight));
 			const settled = Promise.withResolvers<void>();
 			requestAnimationFrame(() => requestAnimationFrame(() => settled.resolve()));
 			await settled.promise;
@@ -972,10 +997,17 @@ async function expectMessageReachable(dock: Locator, label: string): Promise<voi
 				);
 			});
 			return {
+				// Reachability: the normal scroll path moved the region toward
+				// the first recorded message, OR no scroll was possible because
+				// that message already sits at/above the top of the scroll
+				// range (rawTarget <= 0 — flush with the unscrolled viewport
+				// top); `visible` is the cross-proof in every branch.
 				ok:
 					visible.length > 0 &&
-					(scroll.scrollTop > before || Math.abs(target - before) <= 1),
-				detail: `messages=${messages.length} visible=${visible.length} scrolled ${before}→${scroll.scrollTop} (target ${Math.round(target)}) scrollHeight=${scroll.scrollHeight} clientHeight=${scroll.clientHeight} rects=${JSON.stringify(rects)} viewportTop=${Math.round(viewport.top)} bottom=${Math.round(viewport.bottom)}`
+					(scroll.scrollTop > before ||
+						Math.abs(rawTarget - before) <= 1 ||
+						rawTarget <= 0),
+				detail: `messages=${messages.length} visible=${visible.length} scrolled ${before}→${scroll.scrollTop} (target ${Math.round(rawTarget)}) scrollHeight=${scroll.scrollHeight} clientHeight=${scroll.clientHeight} rects=${JSON.stringify(rects)} viewportTop=${Math.round(viewport.top)} bottom=${Math.round(viewport.bottom)}`
 			};
 		});
 	expect(reach.ok, `${label} recorded message reachable (${reach.detail})`).toBe(true);
@@ -1528,6 +1560,38 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await expect(dock.getByTestId('task-plan-revision-row')).toHaveCount(1);
 	await expect(dock.getByTestId('task-outcome')).toHaveCount(0);
 
+	// cti-01 drawer seam: the §8 blocks mount inside the Task Inspector
+	// slide-over — the transcript scroll keeps zero task children, the
+	// drawer defaults closed, and the trigger reads the loaded episode
+	// honestly (badge 1/2: steps_executed 1 of steps_total 2).
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+	).toHaveCount(0);
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeEnabled();
+	await expect(dock.getByTestId('chat-tasks-trigger')).toHaveAttribute('data-state', 'ready');
+	await expect(dock.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+
+	// Opening the drawer reveals both ready blocks at full usable width
+	// (the 1280×800 proof; the 360×640 proofs ride the pocket legs below),
+	// and closing restores the clean transcript view with focus on the
+	// trigger.
+	await dock.getByTestId('chat-tasks-trigger').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeVisible();
+	await expect(dock.getByTestId('task-understanding')).toBeVisible();
+	await expect(dock.getByTestId('task-plan')).toBeVisible();
+	const drawerOpen1280 = await collectConversationGeometry(dock);
+	expectUsableTaskInspector(drawerOpen1280, 'task drawer open 1280');
+	await dock.getByTestId('chat-tasks-close').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeFocused();
+
 	// --- reload: a fresh shell restores the same Global conversation --------
 	epoch = 1;
 	await page.reload();
@@ -1609,11 +1673,22 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	await expect(dock.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
 	await expect(dock.getByTestId('task-understanding-step-row')).toHaveCount(2);
 	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
-	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
-	const scopeBox = await dock.getByTestId('task-understanding-scope').boundingBox();
-	expect(scopeBox, 'understanding scope box').not.toBeNull();
-	expect(scopeBox!.x).toBeGreaterThanOrEqual(0);
-	expect(scopeBox!.x + scopeBox!.width).toBeLessThanOrEqual(360);
+	// cti-01 drawer seam: with the side drawer still EXPANDED it overlays
+	// the dock, so only attribute-level proofs run here — the drawer-open
+	// visibility/geometry proof follows once the dock is honestly
+	// reachable (collapsed side drawer).
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeEnabled();
+	await expect(dock.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+	).toHaveCount(0);
 	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
 	// 24d: the ACTIVE-RUN reopen must also be geometrically usable — the
 	// pocket leg reopens with the run still live and Understanding/Plan
@@ -1623,6 +1698,25 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	// convention as the `real dock 360` pocket test).
 	await page.getByTestId('side-drawer-toggle').click();
 	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
+	// cti-01: the drawer-open §8 proof at 360×640 — Understanding and Plan
+	// must be usable INSIDE the Task Inspector over the restored transcript
+	// (bounded by the pocket viewport), then closing restores the clean
+	// transcript view with focus on the trigger.
+	await dock.getByTestId('chat-tasks-trigger').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeVisible();
+	await expect(dock.getByTestId('task-understanding')).toBeVisible();
+	await expect(dock.getByTestId('task-plan')).toBeVisible();
+	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
+	const scopeBox = await dock.getByTestId('task-understanding-scope').boundingBox();
+	expect(scopeBox, 'understanding scope box').not.toBeNull();
+	expect(scopeBox!.x).toBeGreaterThanOrEqual(0);
+	expect(scopeBox!.x + scopeBox!.width).toBeLessThanOrEqual(360);
+	const pocketDrawerOpen = await collectConversationGeometry(dock);
+	console.log('[24D-PROBE] composed active-run task drawer', JSON.stringify(pocketDrawerOpen));
+	expectUsableTaskInspector(pocketDrawerOpen, 'active-run task drawer');
+	await dock.getByTestId('chat-tasks-close').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeFocused();
 	const pocketGeometry24d = await collectConversationGeometry(dock);
 	console.log('[24D-PROBE] composed active-run geometry', JSON.stringify(pocketGeometry24d));
 	expectUsableConversation(pocketGeometry24d, 'active-run reopen');
@@ -1693,7 +1787,22 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		'Decommission the legacy cron job'
 	);
 	await expect(dock.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
-	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
+	// cti-01 drawer seam: attribute-level proofs while the expanded side
+	// drawer overlays the dock — closed drawer, clean transcript scroll,
+	// honest trigger. The drawer-open proof runs below once the dock is
+	// reachable.
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeEnabled();
+	await expect(dock.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+	).toHaveCount(0);
+	await expect(
+		dock.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+	).toHaveCount(0);
 	await expect(dock.getByTestId('canonical-problem')).toHaveCount(0);
 	// 24d grid usability: the settled terminal reopen must be geometrically
 	// usable at 360×640 — full-width blocks, readable status and text, real
@@ -1702,6 +1811,19 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 	// READABLE dock state is drawer-collapsed (`real dock 360` convention).
 	await page.getByTestId('side-drawer-toggle').click();
 	await expect.poll(() => stageWidthOf(dock), { timeout: 5000 }).toBeGreaterThanOrEqual(280);
+	// cti-01: the drawer-open §8 proof at 360×640 — the blocks must be
+	// usable INSIDE the Task Inspector over the restored transcript.
+	await dock.getByTestId('chat-tasks-trigger').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeVisible();
+	await expect(dock.getByTestId('task-understanding')).toBeVisible();
+	await expect(dock.getByTestId('task-plan')).toBeVisible();
+	await expect(dock.getByTestId('task-plan-evidence-empty')).toBeVisible();
+	const terminalDrawerOpen = await collectConversationGeometry(dock);
+	console.log('[24D-PROBE] composed terminal task drawer', JSON.stringify(terminalDrawerOpen));
+	expectUsableTaskInspector(terminalDrawerOpen, 'terminal task drawer');
+	await dock.getByTestId('chat-tasks-close').click();
+	await expect(dock.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(dock.getByTestId('chat-tasks-trigger')).toBeFocused();
 	const geometry24d = await collectConversationGeometry(dock);
 	console.log('[24D-PROBE] composed terminal geometry', JSON.stringify(geometry24d));
 	expectUsableConversation(geometry24d, 'terminal reopen');

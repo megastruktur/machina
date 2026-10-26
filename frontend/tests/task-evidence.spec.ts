@@ -769,6 +769,20 @@ const PARTIAL_OUTCOME: WireOutcome = {
 	proposal: 'none'
 };
 
+/** ti-01: two passed criteria — the drawer badge reads the full 2/2. */
+const VERIFIED_OUTCOME: WireOutcome = {
+	task_id: TASK_ID,
+	outcome: 'verified',
+	verified: true,
+	recorded: true,
+	criteria: { total: 2, supported: 2, failed: 0, unavailable: 0 },
+	criterion_states: [
+		{ criterion_id: 'service_restart', state: 'passed' },
+		{ criterion_id: 'health_check_green', state: 'passed' }
+	],
+	proposal: 'none'
+};
+
 /** E2: the completion proposal was rejected — nothing recorded, all open. */
 const REJECTED_OUTCOME: WireOutcome = {
 	task_id: TASK_ID,
@@ -825,7 +839,22 @@ test('E1: a succeeded run with incomplete verification renders partially verifie
 	await waitForStreamRequests(2);
 
 	await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
-	const block = main.getByTestId('task-outcome');
+
+	// cti-01: the outcome moved into the Task Inspector drawer. The trigger
+	// is enabled with the badge; the transcript scroll holds NO outcome.
+	const trigger = main.getByTestId('chat-tasks-trigger');
+	await expect(trigger).toBeEnabled();
+	await expect(trigger).toHaveAttribute('data-state', 'outcome');
+	await expect(main.getByTestId('chat-tasks-badge')).toHaveText('1/3');
+	await expect(
+		main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+	).toHaveCount(0);
+
+	const panel = main.getByTestId('chat-tasks-panel');
+	await expect(panel).toBeHidden();
+	await trigger.click();
+	await expect(panel).toBeVisible();
+	const block = panel.getByTestId('task-outcome');
 	await expect(block).toBeVisible();
 	// The verdict is driven by the DOCUMENT, not by the run's success state.
 	await expect(block.getByTestId('task-outcome-verdict')).toHaveText('partially verified');
@@ -848,6 +877,57 @@ test('E1: a succeeded run with incomplete verification renders partially verifie
 	await expect(block.getByTestId('task-outcome-meta')).toHaveText('Showing 3 of 3 criteria.');
 });
 
+test('ChatPanel taskOutcome integration — the drawer trigger opens the Task Inspector panel', async ({
+	page
+}) => {
+	await openFixture(page, 'outcome');
+	const main = page.getByTestId('host-main');
+	await submitFromHost(page, 'Verify the fixture deployment twice');
+	const runId = await submittedRunId(page);
+
+	await page.evaluate((id) => window.__maiTaskApi!.completeRun(id), runId);
+	await queueStreamPair({ frames: [completedFrame(VERIFIED_OUTCOME)] });
+	await waitForStreamRequests(2);
+	await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+
+	// The trigger is enabled with the outcome badge; the outcome block is
+	// NOT in the transcript scroll anymore (cti-01 drawer cutover).
+	const trigger = main.getByTestId('chat-tasks-trigger');
+	await expect(trigger).toBeEnabled();
+	await expect(trigger).toHaveAttribute('data-state', 'outcome');
+	await expect(main.getByTestId('chat-tasks-badge')).toHaveText('2/2');
+	await expect(
+		main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+	).toHaveCount(0);
+
+	// Closed by default; opening reveals the outcome INSIDE the panel.
+	const panel = main.getByTestId('chat-tasks-panel');
+	await expect(panel).toBeHidden();
+	await trigger.click();
+	await expect(panel).toBeVisible();
+	const block = panel.getByTestId('task-outcome');
+	await expect(block).toBeVisible();
+	await expect(block.getByTestId('task-outcome-verdict')).toHaveText('fully verified');
+	await expect(block.getByTestId('task-outcome-counts')).toHaveText(
+		'2 supported · 0 failed · 0 unavailable · 2 total'
+	);
+	await expect(block.getByTestId('task-outcome-criterion')).toHaveCount(2);
+	await expect(block.getByTestId('task-outcome-meta')).toHaveText('Showing 2 of 2 criteria.');
+
+	// Escape with focus on the trigger closes the drawer and refocuses it.
+	await page.keyboard.press('Escape');
+	await expect(panel).toBeHidden();
+	await expect(trigger).toBeFocused();
+
+	// The ✕ close button also closes the drawer and restores focus to the
+	// trigger — focus never stays stranded on the hidden close control.
+	await trigger.click();
+	await expect(panel).toBeVisible();
+	await main.getByTestId('chat-tasks-close').click();
+	await expect(panel).toBeHidden();
+	await expect(trigger).toBeFocused();
+});
+
 test('E2: a rejected completion proposal renders the stable rejection and never a verified outcome', async ({
 	page
 }) => {
@@ -860,7 +940,16 @@ test('E2: a rejected completion proposal renders the stable rejection and never 
 	await queueStreamPair({ frames: [completedFrame(REJECTED_OUTCOME)] });
 	await waitForStreamRequests(2);
 
-	const block = main.getByTestId('task-outcome');
+	// cti-01: rejected verdicts live in the drawer too (badge 0 supported
+	// of 2 criteria); the panel opens on the trigger.
+	const trigger = main.getByTestId('chat-tasks-trigger');
+	await expect(trigger).toBeEnabled();
+	await expect(main.getByTestId('chat-tasks-badge')).toHaveText('0/2');
+	const panel = main.getByTestId('chat-tasks-panel');
+	await expect(panel).toBeHidden();
+	await trigger.click();
+	await expect(panel).toBeVisible();
+	const block = panel.getByTestId('task-outcome');
 	await expect(block).toBeVisible();
 	await expect(block.getByTestId('task-outcome-verdict')).toHaveText('in progress');
 	await expect(block).not.toContainText('fully verified');
@@ -888,7 +977,14 @@ test('U1: a 12-criterion outcome pages at 10 with Load more inside a bounded con
 	await queueStreamPair({ frames: [completedFrame(twelveCriterionOutcome())] });
 	await waitForStreamRequests(2);
 
-	const block = main.getByTestId('task-outcome');
+	// cti-01: the paged criteria live inside the drawer's TaskEvidence block.
+	const trigger = main.getByTestId('chat-tasks-trigger');
+	await expect(trigger).toBeEnabled();
+	await expect(main.getByTestId('chat-tasks-badge')).toHaveText('2/12');
+	await trigger.click();
+	const panel = main.getByTestId('chat-tasks-panel');
+	await expect(panel).toBeVisible();
+	const block = panel.getByTestId('task-outcome');
 	await expect(block).toBeVisible();
 	const list = block.getByTestId('task-outcome-criteria');
 	// Bounded scroll container (AGENTS.md §1): the list scrolls, never the page.
@@ -922,6 +1018,11 @@ test('U2: no task_outcome key and a malformed document render NO outcome block',
 	await waitForStreamRequests(2);
 	await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
 	await expect(main.getByTestId('task-outcome')).toHaveCount(0);
+	// cti-01: without an outcome (and without §8 services) the trigger is
+	// disabled and the drawer stays closed.
+	await expect(main.getByTestId('chat-tasks-trigger')).toBeDisabled();
+	await expect(main.getByTestId('chat-tasks-trigger')).toHaveAttribute('data-state', 'unavailable');
+	await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
 
 	// (b) Malformed document (unknown outcome word, non-array states): the
 	// fail-closed narrow renders nothing rather than a guessed verdict.
@@ -949,6 +1050,26 @@ test('U2: no task_outcome key and a malformed document render NO outcome block',
 	await waitForStreamRequests(4);
 	await expect(main.getByTestId('task-outcome')).toHaveCount(0);
 	await expect(main).not.toContainText('fully verified');
+
+	// (c) Structurally wrong document (schema-shaped, not a task_outcome):
+	// the fail-closed narrow rejects it — no block, no badge, no drawer.
+	await submitFromHost(page, 'Run a schema-mismatched summary');
+	const schemaRunId = await submittedRunId(page);
+	await page.evaluate((id) => window.__maiTaskApi!.completeRun(id), schemaRunId);
+	await queueStreamPair({
+		frames: [
+			frame(1, 'agent.completed', {
+				rounds: 1,
+				tool_calls: 0,
+				output_chars: 4,
+				task_outcome: { schema_version: 2 }
+			})
+		]
+	});
+	await waitForStreamRequests(6);
+	await expect(main.getByTestId('chat-tasks-trigger')).toBeDisabled();
+	await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(main.getByTestId('task-outcome')).toHaveCount(0);
 });
 
 test('C2: reopening the finished chat preserves the recorded outcome and records no mutation', async ({
@@ -969,7 +1090,15 @@ test('C2: reopening the finished chat preserves the recorded outcome and records
 	// The run binds and finishes with the partial outcome document.
 	await page.evaluate((id) => window.__maiTaskApi!.completeRun(id as string), conversationId);
 	await queueStreamPair({ frames: [completedFrame(PARTIAL_OUTCOME)] });
-	const block = main.getByTestId('task-outcome');
+	// cti-01: the outcome is presented through the Task Inspector drawer.
+	const trigger = main.getByTestId('chat-tasks-trigger');
+	await expect(trigger).toBeEnabled();
+	await expect(main.getByTestId('chat-tasks-badge')).toHaveText('1/3');
+	const panel = main.getByTestId('chat-tasks-panel');
+	await expect(panel).toBeHidden();
+	await trigger.click();
+	await expect(panel).toBeVisible();
+	const block = panel.getByTestId('task-outcome');
 	await expect(block).toBeVisible();
 	await expect(block.getByTestId('task-outcome-verdict')).toHaveText('partially verified');
 
@@ -981,7 +1110,12 @@ test('C2: reopening the finished chat preserves the recorded outcome and records
 		'Check the fixture deployment'
 	);
 
-	// The outcome survives the reopen — the SAME server-delivered document.
+	// The reopen reset the drawer; the recorded outcome survives it — the
+	// SAME server-delivered document, still presented in the drawer.
+	await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+	await expect(main.getByTestId('chat-tasks-trigger')).toBeEnabled();
+	await main.getByTestId('chat-tasks-trigger').click();
+	await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
 	await expect(main.getByTestId('task-outcome')).toBeVisible();
 	await expect(main.getByTestId('task-outcome-verdict')).toHaveText('partially verified');
 	await expect(main.getByTestId('task-outcome-counts')).toHaveText(

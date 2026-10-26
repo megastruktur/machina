@@ -38,7 +38,8 @@
 		TaskConstraintView,
 		TaskServices,
 		TaskStepView,
-		TaskUnderstandingSections
+		TaskUnderstandingSections,
+		TaskView
 	} from '../../workspace/entries/07-web-tasks.js';
 
 	/**
@@ -49,7 +50,7 @@
 	 * (Declared before any rune-initialized statement: svelte2tsx misorders
 	 * type aliases interleaved after them.)
 	 */
-	type UnderstandingState = 'unbound' | 'loading' | 'unavailable' | 'error' | 'ready';
+	export type UnderstandingState = 'unbound' | 'loading' | 'unavailable' | 'error' | 'ready';
 
 	interface Props {
 		/** The task service bag from the opener; a missing bag fails closed. */
@@ -60,13 +61,23 @@
 		serverId: string | null;
 		/** Bounded page size override (tests); server bounds still apply. */
 		pageSize?: number;
+		/**
+		 * Optional parent binding (cti-01 Task Inspector drawer): mirrors
+		 * `uiState` upward so the host trigger/badge reads the honest render
+		 * state without any second network read. Absent binding ⇒ local only.
+		 */
+		status?: UnderstandingState;
+		/** Optional parent binding: mirrors the ready task header (badge counts). */
+		taskHeader?: TaskView | null;
 	}
 
 	let {
 		services,
 		conversationId,
 		serverId,
-		pageSize = TASK_UNDERSTANDING_PAGE_LIMIT
+		pageSize = TASK_UNDERSTANDING_PAGE_LIMIT,
+		status = $bindable<UnderstandingState>('unbound'),
+		taskHeader = $bindable<TaskView | null>(null)
 	}: Props = $props();
 
 	/** Bounded section page size (AGENTS.md §1). */
@@ -75,6 +86,14 @@
 	let uiState = $state<UnderstandingState>('unbound');
 	let problem = $state<{ status: number; code: string; message: string } | null>(null);
 	let sections = $state<TaskUnderstandingSections | null>(null);
+
+	// cti-01: one-way mirror onto the optional parent bindings — the Task
+	// Inspector drawer reads the honest state without duplicating a single
+	// fetch (C08 rule 6). The effect only writes; it never reads the bindings.
+	$effect(() => {
+		status = uiState;
+		taskHeader = sections?.header ?? null;
+	});
 
 	/** Deduplicated, append-only section pages (AGENTS.md §1). */
 	let constraints = $state<readonly TaskConstraintView[]>([]);
