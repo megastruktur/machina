@@ -76,7 +76,8 @@ const RUN_PIN = '44b05a60-1e2b-4c3d-9a8b-7c6d5e4f3a21';
  * credential metadata entirely (brief acceptance 1).
  */
 const CREDENTIAL_REF = 'env:MAI_FIXTURE_CREDENTIAL';
-const HOST_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxtFIXTURE';
+/** Synthetic pinned fingerprint (SHA256: form, as enrollment stores it). */
+const HOST_KEY = 'SHA256:F1xTur3F1nGeRPr1nT0000000000000000000000000';
 
 /** The frozen stale-edit conflict message of the profile API (servers.py). */
 const CONFLICT_MESSAGE = 'the profile changed since the last observed revision';
@@ -495,10 +496,19 @@ page
 	await expect(a.getByTestId('edit-capabilities-chip')).toHaveCount(2);
 	await expect(a.getByTestId('prompt-text-input')).toHaveValue('# Server instructions for alpha');
 
+	// so-03: the stored host key fingerprint is displayed READ-ONLY as
+	// `SSH host key (pinned)`; the rotation and credential inputs are gone.
+	const pinned = a.getByTestId('pinned-host-key');
+	await expect(pinned).toHaveValue(HOST_KEY);
+	await expect(pinned).toHaveAttribute('readonly', '');
+	await expect(a.getByText('SSH host key (pinned)')).toBeVisible();
+	await expect(a.getByTestId('edit-host-key')).toHaveCount(0);
+	await expect(a.getByTestId('edit-credential-key')).toHaveCount(0);
+	await expect(a.getByText('Rotate credential env key')).toHaveCount(0);
+
 	// Acceptance 1: no credential material anywhere in the rendered document.
 	const content = await page.content();
 	expect(content).not.toContain(CREDENTIAL_REF);
-	expect(content).not.toContain(HOST_KEY);
 	expect(content).not.toContain('credential_ref');
 	await expect(page.locator('input[type="password"]')).toHaveCount(0);
 
@@ -534,12 +544,17 @@ page
 		expected_revision: number;
 		name: string;
 		capabilities: string[];
+		ssh: { host_key: string; credential_ref: string };
 	};
 	expect(payload.prompt_revision).toBe(2); // auto-bumped 1 → 2
 	expect(payload.prompt_text).toBe('# Alpha runbook\nKeep containers under 1 GiB.');
 	expect(payload.expected_revision).toBe(1);
 	expect(payload.name).toBe('alpha-renamed');
 	expect(payload.capabilities).toEqual(['host.shell', 'shell']);
+	// so-03: ordinary edits submit the STORED trust fields unchanged — the
+	// pinned host key and credential reference can never drift via this panel.
+	expect(payload.ssh.host_key).toBe(HOST_KEY);
+	expect(payload.ssh.credential_ref).toBe(CREDENTIAL_REF);
 
 	// Post-commit triple shown; the silent re-read confirms the record.
 	await expect(a.getByTestId('profile-revision')).toHaveText('2');

@@ -53,6 +53,18 @@ type ProfileResult = paths['/api/v1/servers']['post']['responses'][201]['content
 type _ResultIsGenerated = Assert<
 	ProfileResult extends components['schemas']['ProfileMutationResult'] ? true : false
 >;
+type TestBody = paths['/api/v1/servers/onboarding/test']['post']['requestBody']['content']['application/json'];
+type _TestBodyIsGenerated = Assert<
+	TestBody extends components['schemas']['OnboardingTestRequest'] ? true : false
+>;
+type EnrollBody = paths['/api/v1/servers/onboarding/enroll']['post']['requestBody']['content']['application/json'];
+type _EnrollBodyIsGenerated = Assert<
+	EnrollBody extends components['schemas']['OnboardingEnrollRequest'] ? true : false
+>;
+type ControllerKey = paths['/api/v1/servers/onboarding/controller-key']['get']['responses'][200]['content']['application/json'];
+type _ControllerKeyIsGenerated = Assert<
+	ControllerKey extends components['schemas']['ControllerKeyResponse'] ? true : false
+>;
 
 // ---------------------------------------------------------------------------
 // Node boundary layer — injected-fetch stubs
@@ -271,6 +283,93 @@ test.describe('typed boundary transport (injected fetch)', () => {
 				}
 			})
 		).rejects.toThrow('API 401 conflict');
+	});
+
+	test('onboarding surface: controller-key GET, test/enroll POST with CSRF, no credential_ref', async () => {
+		const { fetch, calls } = stubFetch((request) => {
+			const path = new URL(request.url).pathname;
+			if (path === '/api/v1/servers/onboarding/controller-key') {
+				return jsonResponse(200, {
+					public_key: 'ssh-ed25519 AAAA-fixture mai-controller',
+					key_type: 'ssh-ed25519',
+					fingerprint: 'SHA256:fixture'
+				});
+			}
+			if (path === '/api/v1/servers/onboarding/test') {
+				return jsonResponse(200, {
+					candidates: [{ host_key: 'SHA256:a', key_type: 'ssh-ed25519' }]
+				});
+			}
+			if (path === '/api/v1/servers/onboarding/enroll') {
+				return jsonResponse(201, {
+					server_id: '0d0a1b2c-3d4e-4f5a-6b7c-8d9e0f1a2b3c',
+					revision: 1,
+					schema_revision: 1,
+					sha256: 'c'.repeat(64)
+				});
+			}
+			return jsonResponse(404, {
+				error: { code: 'not_found', message: 'no such route', request_id: 'req-x', fields: {} }
+			});
+		});
+		const client = createMaiApiClient({ fetch, getCsrfToken: () => 'csrf-token-9' });
+
+		// GET: safe method — no CSRF header, exact typed answer.
+		const key = await client.readControllerKey();
+		expect(key).toEqual({
+			public_key: 'ssh-ed25519 AAAA-fixture mai-controller',
+			key_type: 'ssh-ed25519',
+			fingerprint: 'SHA256:fixture'
+		});
+
+		// POST discovery (host_key: null) + POST confirmed enroll.
+		const discovery = await client.testOnboardingConnection({
+			ssh: { host: 't.example.internal', port: 22, user: 'deploy' },
+			privilege: 'sudo',
+			host_key: null,
+			timeout_seconds: 10
+		});
+		expect(discovery).toEqual({
+			candidates: [{ host_key: 'SHA256:a', key_type: 'ssh-ed25519' }]
+		});
+		const enrolled = await client.enrollViaOnboarding({
+			name: 'fixture',
+			prompt_revision: 1,
+			prompt_text: 'fixture prompt',
+			environment: 'linux_ssh',
+			privilege: 'sudo',
+			capabilities: ['host.shell'],
+			ssh: { host: 't.example.internal', port: 22, user: 'deploy' },
+			host_key: 'SHA256:a',
+			host_key_confirmed: true,
+			timeout_seconds: 10
+		});
+		expect(enrolled).toMatchObject({ revision: 1 });
+
+		const [keyCall, testCall, enrollCall] = calls;
+		expect(keyCall.method).toBe('GET');
+		expect(keyCall.headers['x-csrf-token']).toBeUndefined();
+		expect(keyCall.url).toContain('/api/v1/servers/onboarding/controller-key');
+		expect(testCall.method).toBe('POST');
+		expect(testCall.headers['x-csrf-token']).toBe('csrf-token-9');
+		expect(testCall.url).toContain('/api/v1/servers/onboarding/test');
+		expect(enrollCall.method).toBe('POST');
+		expect(enrollCall.url).toContain('/api/v1/servers/onboarding/enroll');
+		expect(JSON.parse(enrollCall.body ?? '{}')).not.toHaveProperty('credential_ref');
+
+		// Structured 409 on the new surface maps to the same typed ApiError.
+		const conflicting = createMaiApiClient({
+			fetch: async () => jsonResponse(409, ENVELOPE_CONFLICT),
+			getCsrfToken: () => 'csrf-token-9'
+		});
+		await expect(
+			conflicting.testOnboardingConnection({
+				ssh: { host: 't.example.internal', port: 22, user: 'deploy' },
+				privilege: 'sudo',
+				host_key: 'SHA256:stale',
+				timeout_seconds: 10
+			})
+		).rejects.toMatchObject({ status: 409, code: 'conflict' });
 	});
 });
 
