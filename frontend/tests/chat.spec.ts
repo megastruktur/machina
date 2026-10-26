@@ -3330,6 +3330,31 @@ test.describe('dock task services mount (24b D-2)', () => {
 		await expect(main.getByTestId('chat-history-item')).toHaveCount(1);
 		await main.getByTestId('chat-history-item').first().click();
 
+		// cti-01 drawer seam: the §8 blocks mount inside the Task Inspector
+		// slide-over, NEVER inline in the transcript scroll. The drawer
+		// defaults closed and the trigger reads the loaded episode honestly
+		// (badge 1/2: steps_executed 1 of steps_total 2).
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+		).toHaveCount(0);
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeEnabled();
+		await expect(main.getByTestId('chat-tasks-trigger')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+
+		// Opening the drawer reveals both ready §8 blocks; the transcript
+		// scroll keeps zero task children while they are shown.
+		await main.getByTestId('chat-tasks-trigger').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await expect(main.getByTestId('task-understanding')).toBeVisible();
+		await expect(main.getByTestId('task-plan')).toBeVisible();
+
 		// Understanding: ready, with the REAL server-backed sections.
 		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
 		await expect(main.getByTestId('task-understanding-scope-title')).toHaveText(
@@ -3354,6 +3379,31 @@ test.describe('dock task services mount (24b D-2)', () => {
 		await expect(main.getByTestId('task-plan-revision-row')).toHaveCount(1);
 		await expect(main.getByTestId('task-outcome')).toHaveCount(0);
 		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
+
+		// Mutual exclusion: one drawer at a time. Both drawers overlay the
+		// same right edge, so while one is open the sibling trigger sits
+		// under the overlay — the switch rides the keyboard path (focus +
+		// Enter, exactly what a keyboard user does), never a pointer click
+		// through the overlay.
+		await main.getByTestId('chat-details-trigger').focus();
+		await page.keyboard.press('Enter');
+		await expect(main.getByTestId('chat-details-panel')).toBeVisible();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await main.getByTestId('chat-tasks-trigger').focus();
+		await page.keyboard.press('Enter');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await expect(main.getByTestId('chat-details-panel')).toBeHidden();
+
+		// Closing restores the clean transcript view; focus returns to the
+		// trigger for both close affordances (✕ and Escape).
+		await main.getByTestId('chat-tasks-close').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeFocused();
+		await main.getByTestId('chat-tasks-trigger').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeFocused();
 
 		// Scope: every §8 read rode the row's RECORDED sentinel — never the
 		// previously pinned panel scope (the 24a scope rule extends to tasks).
@@ -3386,6 +3436,30 @@ test.describe('dock task services mount (24b D-2)', () => {
 
 		await expect(main.getByTestId('task-understanding')).toHaveAttribute('data-state', 'ready');
 		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+
+		// cti-01 drawer seam: the blocks mount inside the Task Inspector
+		// drawer on the recorded scope — the transcript scroll stays clean,
+		// the trigger reads the loaded episode, and the drawer opens with
+		// both blocks visible.
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+		).toHaveCount(0);
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeEnabled();
+		await expect(main.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await main.getByTestId('chat-tasks-trigger').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await expect(main.getByTestId('task-understanding')).toBeVisible();
+		await expect(main.getByTestId('task-plan')).toBeVisible();
+		await main.getByTestId('chat-tasks-close').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeFocused();
 		for (const op of [
 			'getConversationTask',
 			'listTaskSteps',
@@ -3421,16 +3495,43 @@ test.describe('dock task services mount (24b D-2)', () => {
 
 		// The bag carries the canonical slice but NO task methods: both §8
 		// blocks render their explicit unbound state — nothing fetched,
-		// nothing fabricated, no task collections in the DOM.
+		// nothing fabricated, no task collections in the DOM. (cti-01: the
+		// blocks live in the CLOSED Task Inspector drawer — their honest
+		// notes stay mounted behind display:none, so presence, not
+		// visibility, is the assertion here.)
 		await expect(main.getByTestId('task-understanding')).toHaveAttribute(
 			'data-state',
 			'unbound'
 		);
-		await expect(main.getByTestId('task-understanding-unbound')).toBeVisible();
+		await expect(main.getByTestId('task-understanding-unbound')).toHaveCount(1);
 		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'unbound');
-		await expect(main.getByTestId('task-plan-unbound')).toBeVisible();
+		await expect(main.getByTestId('task-plan-unbound')).toHaveCount(1);
 		await expect(main.getByTestId('task-understanding-scope-title')).toHaveCount(0);
 		await expect(main.getByTestId('task-plan-title')).toHaveCount(0);
+
+		// cti-01 drawer seam: with no bound slice the inspector cannot open
+		// — a disabled 'unbound' trigger, no badge, a hidden drawer, and a
+		// transcript scroll that keeps zero task children at real height.
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeDisabled();
+		await expect(main.getByTestId('chat-tasks-trigger')).toHaveAttribute(
+			'data-state',
+			'unbound'
+		);
+		await expect(main.getByTestId('chat-tasks-badge')).toHaveCount(0);
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+		).toHaveCount(0);
+		const unboundDrawerTranscriptHeight = await main
+			.locator('.mai-chat__conversation-scroll')
+			.evaluate((el: HTMLElement) => el.clientHeight);
+		expect(unboundDrawerTranscriptHeight, 'unbound transcript height').toBeGreaterThan(0);
 		for (const op of [
 			'getConversationTask',
 			'listTaskSteps',
@@ -3529,6 +3630,30 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		await expect(main.getByTestId('task-understanding-constraint-row')).toHaveCount(1);
 		await expect(main.getByTestId('task-understanding-step-row')).toHaveCount(2);
 		await expect(main.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+
+		// cti-01 drawer seam: the §8 blocks live in the Task Inspector
+		// drawer — the transcript scroll keeps zero task children, the
+		// trigger reads the restored episode, and the drawer opens with
+		// the real blocks inside (the 24d geometry proof below runs
+		// against this OPEN drawer; the closed snapshot would measure
+		// display:none zeros by design).
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+		).toHaveCount(0);
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeEnabled();
+		await expect(main.getByTestId('chat-tasks-trigger')).toHaveAttribute('data-state', 'ready');
+		await expect(main.getByTestId('chat-tasks-badge')).toHaveText('1/2');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await main.getByTestId('chat-tasks-trigger').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await expect(main.getByTestId('task-understanding')).toBeVisible();
+		await expect(main.getByTestId('task-plan')).toBeVisible();
 		await expect(main.getByTestId('task-plan-evidence-empty')).toBeVisible();
 		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
 
@@ -3578,6 +3703,17 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		expect(geometry24d.docScrollWidth, 'focused terminal page horizontal overflow').toBeLessThanOrEqual(
 			geometry24d.viewportWidth + 1
 		);
+
+		// Closing the drawer restores the clean transcript view; focus
+		// returns to the trigger for both close affordances (✕ and Escape).
+		await main.getByTestId('chat-tasks-close').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeFocused();
+		await main.getByTestId('chat-tasks-trigger').click();
+		await expect(main.getByTestId('chat-tasks-panel')).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeFocused();
 	});
 
 	test('a plain canonical conversation without a task reopens with visible messages and no task fabrication', async ({
@@ -3633,32 +3769,41 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		]) {
 			expect(await callsOf(page, op), op).toHaveLength(0);
 		}
-		// 24d grid usability: the unbound notes must be READABLE at this
-		// viewport — full-width blocks with real text columns, not the
-		// 0-width one-glyph column R-24c measured — and the transcript keeps
-		// real height.
+		// cti-01 drawer seam: with no bound slice the inspector cannot open
+		// — a disabled 'unbound' trigger, no badge, a hidden drawer, and a
+		// transcript scroll that keeps zero task children. The unbound
+		// notes stay mounted INSIDE the closed drawer (presence above);
+		// their readable geometry belongs to the drawer's own open state,
+		// which is unreachable exactly because the honesty gate holds.
+		await expect(main.getByTestId('chat-tasks-trigger')).toBeDisabled();
+		await expect(main.getByTestId('chat-tasks-trigger')).toHaveAttribute(
+			'data-state',
+			'unbound'
+		);
+		await expect(main.getByTestId('chat-tasks-badge')).toHaveCount(0);
+		await expect(main.getByTestId('chat-tasks-panel')).toBeHidden();
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-understanding')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-plan')
+		).toHaveCount(0);
+		await expect(
+			main.locator('.mai-chat__conversation-scroll').getByTestId('task-outcome')
+		).toHaveCount(0);
+		// 24d grid usability: the transcript keeps real height at this
+		// viewport — not the 0-height row R-24c measured.
 		const unbound24d = await main
 			.getByTestId('chat-conversation')
 			.evaluate((section: HTMLElement) => {
-				const clientWidth = (selector: string) =>
-					section.querySelector<HTMLElement>(selector)?.clientWidth ?? 0;
+				const scroll = section.querySelector<HTMLElement>('.mai-chat__conversation-scroll');
 				return {
 					sectionWidth: Math.round(section.getBoundingClientRect().width),
-					understandingWidth: clientWidth('[data-testid="task-understanding"]'),
-					unboundNoteWidth: clientWidth('[data-testid="task-understanding-unbound"]'),
-					planWidth: clientWidth('[data-testid="task-plan"]'),
-					planUnboundNoteWidth: clientWidth('[data-testid="task-plan-unbound"]'),
-					transcriptClientHeight:
-						section.querySelector<HTMLElement>('.mai-chat__conversation-scroll')?.clientHeight ??
-						0
+					transcriptClientHeight: scroll?.clientHeight ?? 0
 				};
 			});
 		console.log('[24D-PROBE] focused unbound geometry', JSON.stringify(unbound24d));
 		expect(unbound24d.sectionWidth, 'focused unbound section width').toBeGreaterThanOrEqual(200);
-		expect(unbound24d.understandingWidth, 'focused unbound understanding width').toBeGreaterThanOrEqual(200);
-		expect(unbound24d.unboundNoteWidth, 'focused unbound note text width').toBeGreaterThan(100);
-		expect(unbound24d.planWidth, 'focused unbound plan width').toBeGreaterThanOrEqual(200);
-		expect(unbound24d.planUnboundNoteWidth, 'focused unbound plan note text width').toBeGreaterThan(100);
 		expect(unbound24d.transcriptClientHeight, 'focused unbound transcript height').toBeGreaterThan(0);
 		await expect(main.getByTestId('canonical-problem')).toHaveCount(0);
 	});
