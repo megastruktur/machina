@@ -65,7 +65,7 @@
 	 * (Declared before any rune-initialized statement: svelte2tsx misorders
 	 * type aliases interleaved after them.)
 	 */
-	type PlanState = 'unbound' | 'loading' | 'unavailable' | 'error' | 'ready';
+	export type PlanState = 'unbound' | 'loading' | 'unavailable' | 'error' | 'ready';
 
 	/** The honest proposal lifecycle (pending/applied distinction, P5). */
 	type ProposalState = 'idle' | 'pending' | 'applied' | 'conflict' | 'error';
@@ -88,6 +88,14 @@
 		pageSize?: number;
 		/** Bounded header-poll interval in ms; 0 disables the poll (tests). */
 		pollMs?: number;
+		/**
+		 * Optional parent binding (cti-01 Task Inspector drawer): mirrors
+		 * `uiState` upward so the host trigger/badge reads the honest render
+		 * state without any second network read. Absent binding ⇒ local only.
+		 */
+		status?: PlanState;
+		/** Optional parent binding: mirrors the ready task header (badge counts). */
+		taskHeader?: TaskView | null;
 	}
 
 	let {
@@ -96,7 +104,9 @@
 		serverId,
 		sourceMessageId = null,
 		pageSize = 10,
-		pollMs = 15000
+		pollMs = 15000,
+		status = $bindable<PlanState>('unbound'),
+		taskHeader = $bindable<TaskView | null>(null)
 	}: Props = $props();
 
 	/** Bounded section page size (AGENTS.md §1). */
@@ -107,6 +117,14 @@
 	let uiState = $state<PlanState>('unbound');
 	let problem = $state<{ status: number; code: string; message: string } | null>(null);
 	let header = $state<TaskView | null>(null);
+
+	// cti-01: one-way mirror onto the optional parent bindings — the Task
+	// Inspector drawer reads the honest state without duplicating a single
+	// fetch (C08 rule 6). The effect only writes; it never reads the bindings.
+	$effect(() => {
+		status = uiState;
+		taskHeader = header;
+	});
 
 	/** Deduplicated, append-only section pages (AGENTS.md §1). */
 	let steps = $state<readonly TaskStepView[]>([]);
