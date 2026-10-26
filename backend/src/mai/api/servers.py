@@ -44,10 +44,11 @@ profile edit that carries the new edition number through the same pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Literal
 
 import yaml
 from fastapi import APIRouter, FastAPI, Request, Response
@@ -57,6 +58,7 @@ from starlette.status import (
     HTTP_200_OK,
     HTTP_201_CREATED,
     HTTP_401_UNAUTHORIZED,
+    HTTP_403_FORBIDDEN,
     HTTP_404_NOT_FOUND,
     HTTP_409_CONFLICT,
     HTTP_422_UNPROCESSABLE_CONTENT,
@@ -79,6 +81,21 @@ from mai.contracts.server import (
     ServerProfile,
     parse_server_profile_text,
 )
+from mai.credentials.env import EnvFileError, EnvResolver
+from mai.execution.onboarding import (
+    ConnectionTestResult,
+    ExportedPublicKey,
+    OnboardingError,
+    OnboardingErrorCode,
+    default_credential_ref,
+    discover_host_key_candidates,
+    durable_known_hosts_path,
+    export_public_key,
+    pin_durable_host_key,
+    resolve_default_identity_key,
+    run_connection_test,
+)
+from mai.execution.ssh import ScannedHostKey, SshIdentity
 from mai.profiles.files import (
     SERVERS_DIR,
     FileStoreErrorCode,
@@ -207,6 +224,124 @@ class ProfileListResponse(BaseModel):
     """Every stored server profile in deterministic ``(name, id)`` order."""
 
     servers: list[ProfileResponse]
+
+
+# ---------------------------------------------------------------------------
+# Guided-onboarding wire shapes (so_PLAN: controller key + connection test;
+# transport only — the browser never names a credential reference or key
+# path, and the enroll route does not exist until campaign task 02)
+# ---------------------------------------------------------------------------
+
+
+class ControllerKeyResponse(BaseModel):
+    """The controller public half only: one OpenSSH public-key line."""
+
+    public_key: str
+    key_type: str
+    fingerprint: str
+
+
+class OnboardingSshTarget(BaseModel):
+    """Requested SSH endpoint; field rules mirror the canonical schema.
+
+    The patterns are local copies of the canonical schema's
+    ``_SSH_HOST_RE``/``_SSH_USER_RE`` (shape owner ``mai.contracts.server``
+    is outside this task's allowlist). They are a transport hardening, not
+    cosmetic: a value beginning with ``-`` (e.g. ``user="-oProxyCommand=…"``
+    — reviewer-proved) would otherwise reach the ``ssh``/``ssh-keyscan``
+    argv as a LOCAL option instead of a user/host.
+    """
+
+    host: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=r"^[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9_])?$",
+    )
+    port: int = Field(ge=1, le=65535)
+    user: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$",
+    )
+
+
+class OnboardingTestRequest(BaseModel):
+    """Test payload: discovery when ``host_key`` is null, else pinned test."""
+
+    ssh: OnboardingSshTarget
+    privilege: PrivilegeMode
+    host_key: str | None = Field(
+        default=None,
+        pattern=r"^SHA256:[A-Za-z0-9+/]{43}$",
+        description="Selected candidate fingerprint; null = discovery only",
+    )
+    timeout_seconds: int = Field(default=10, ge=5, le=30)
+
+
+class OnboardingCandidate(BaseModel):
+    """One scanned host-key candidate; no authentication claim is made."""
+
+    host_key: str
+    key_type: str
+
+
+class OnboardingDiscoveryResponse(BaseModel):
+    """All scanned candidates, deduplicated in scan order."""
+
+    candidates: list[OnboardingCandidate]
+
+
+class OnboardingIdentityView(BaseModel):
+    """The Linux identity the real target reported (observed facts only)."""
+
+    hostname: str
+    os_id: str | None
+    os_version_id: str | None
+    kernel: str
+    boot_id: str | None
+
+
+class OnboardingTestResult(BaseModel):
+    """One successful pinned test: the accepted key actually authenticated."""
+
+    host_key: str
+    key_type: str
+    authentication: Literal["ok"]
+    privilege: PrivilegeMode
+    probe_environment: OnboardingIdentityView
+
+
+class OnboardingEnrollRequest(BaseModel):
+    """Confirmed-enrollment payload (so_PLAN "Confirmed enrollment").
+
+    The existing ``ProfileCreate`` fields with ``ssh`` reduced to the bare
+    endpoint ``{host, port, user}`` plus the observed ``host_key`` and the
+    explicit ``host_key_confirmed`` consent flag. The browser never submits
+    ``credential_ref``: the server stores its own configured default
+    (``MAI_SSH_CREDENTIAL_REF`` override, else ``MAI_SSH_KEY_MAI``).
+    ``host_key_confirmed`` is consent to FIRST-USE trust only — enrollment
+    still re-verifies the target immediately before persisting anything.
+    """
+
+    name: str
+    prompt_revision: int | None = Field(default=None, ge=1)
+    prompt_text: str | None = None
+    environment: ExecutionEnvironment = ExecutionEnvironment.LINUX_SSH
+    privilege: PrivilegeMode
+    capabilities: list[str]
+    ssh: OnboardingSshTarget
+    host_key: str = Field(
+        pattern=r"^SHA256:[A-Za-z0-9+/]{43}$",
+        description="The fingerprint the administrator selected and tested",
+    )
+    host_key_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Explicit consent to first-use host-key trust; false/absent "
+            "rejects enrollment before any scan or write"
+        ),
+    )
+    timeout_seconds: int = Field(default=10, ge=5, le=30)
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +823,423 @@ async def edit_profile(
     return _mutation_result(server_id, result)
 
 
+# ---------------------------------------------------------------------------
+# Guided onboarding (so_PLAN: read-only building blocks; task 02 owns enroll)
+# ---------------------------------------------------------------------------
+
+
+#: HTTP status + envelope code per structured onboarding rejection. The
+#: code field preserves the so_PLAN vocabulary verbatim (the admin needs to
+#: distinguish auth_failed from unreachable); 409 host-key mismatch follows
+#: the established applications/terminal mapping, transport failures are
+#: 503 with the structured code, and only request-shape problems are 422.
+_ONBOARDING_ERROR_STATUS: Final[dict[OnboardingErrorCode, tuple[int, str]]] = {
+    OnboardingErrorCode.HOST_KEY_MISMATCH: (HTTP_409_CONFLICT, "host_key_mismatch"),
+    OnboardingErrorCode.HOST_KEY_PIN_EXISTS: (HTTP_409_CONFLICT, "conflict"),
+    OnboardingErrorCode.INVALID_CONFIGURATION: (
+        HTTP_422_UNPROCESSABLE_CONTENT,
+        "invalid_configuration",
+    ),
+    OnboardingErrorCode.KEY_EXPORT_FAILED: (
+        HTTP_422_UNPROCESSABLE_CONTENT,
+        "validation_failed",
+    ),
+}
+
+
+def _onboarding_error_response(
+    request: Request, exc: OnboardingError
+) -> JSONResponse:
+    """Render one structured, value-free onboarding rejection (C01)."""
+    status, code = _ONBOARDING_ERROR_STATUS.get(
+        exc.code, (HTTP_503_SERVICE_UNAVAILABLE, exc.code.value)
+    )
+    return render_error_envelope(request, status, code, exc.detail)
+
+
+def _remove_orphan_pin(pin_path: Path) -> bool:
+    """Best-effort removal of the pin THIS request just created.
+
+    Returns ``True`` when a leftover remains (removal failed), so the
+    response can report the orphan honestly instead of claiming a rollback
+    the architecture does not provide. Only the pin written by this same
+    enrollment is ever passed here; pre-existing entries were refused
+    before any write and never reach this helper.
+    """
+    try:
+        pin_path.unlink(missing_ok=True)
+    except OSError:
+        return True
+    return pin_path.exists()
+
+
+def _credential_service(request: Request) -> EnvResolver:
+    """The lifespan-built credential resolver; without it fail closed."""
+    resolver = getattr(request.app.state, "credentials", None)
+    if resolver is None:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "credential source is not configured",
+        )
+    return resolver
+
+
+def _credentials_unavailable(request: Request) -> BoundaryError:
+    """Value-free 503 for a resolver-level rejection (no path, no value)."""
+    return BoundaryError(
+        HTTP_503_SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the default SSH credential reference is not configured in the "
+        "credential source",
+    )
+
+
+def _export_controller_key(resolver: EnvResolver, env: Mapping[str, str] | None) -> ExportedPublicKey:
+    """Blocking pair: resolve the default reference, then bounded export."""
+    return export_public_key(resolve_default_identity_key(resolver, env))
+
+
+onboarding_router = APIRouter(
+    prefix="/api/v1/servers/onboarding", tags=["servers"]
+)
+
+
+@onboarding_router.get(
+    "/controller-key",
+    status_code=HTTP_200_OK,
+    response_model=ControllerKeyResponse,
+    summary="Export the controller public key for authorized_keys",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Controller key missing, invalid or unsupported",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential resolver or reference unavailable",
+        },
+    },
+)
+async def get_controller_key(request: Request) -> Response:
+    """Return the configured controller's public key (session required).
+
+    Safe method: layer 1 only (no Origin/CSRF). The public half is derived
+    with one bounded ``ssh-keygen -y`` off the event loop; the response
+    never contains private material, the resolver path or an env value.
+    """
+    await _require_session(request)
+    resolver = _credential_service(request)
+    try:
+        exported = await asyncio.to_thread(
+            _export_controller_key, resolver, request.app.state.env
+        )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    return ControllerKeyResponse(
+        public_key=exported.public_key,
+        key_type=exported.key_type,
+        fingerprint=exported.fingerprint,
+    )
+
+
+@onboarding_router.post(
+    "/test",
+    status_code=HTTP_200_OK,
+    response_model=OnboardingDiscoveryResponse | OnboardingTestResult,
+    summary="Discover host-key candidates or run the pinned connection test",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin or CSRF rejection",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Target presents none of the accepted fingerprint",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Invalid configuration; nothing ran",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential source or target transport unavailable",
+        },
+    },
+)
+async def test_connection(
+    request: Request, payload: OnboardingTestRequest
+) -> Response:
+    """Candidate discovery or the side-effect-free pinned test.
+
+    Mutation-order boundary (session → origin → CSRF) even though the
+    endpoint writes nothing: discovery makes no authentication claim and
+    the confirmed test binds every connection to the exact fingerprint the
+    administrator selected, through a newly created temporary known-hosts
+    file that is removed on every path. All blocking subprocess work runs
+    off the event loop; no durable state exists anywhere (task 02 owns
+    enrollment persistence).
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    app_env: Mapping[str, str] | None = request.app.state.env
+    timeout = float(payload.timeout_seconds)
+    identity = SshIdentity(
+        host=payload.ssh.host,
+        port=payload.ssh.port,
+        user=payload.ssh.user,
+        host_key=payload.host_key or "",
+        credential_ref=default_credential_ref(app_env),
+    )
+    scanned: tuple[ScannedHostKey, ...] | None = None
+    result: ConnectionTestResult | None = None
+    try:
+        if payload.host_key is None:
+            # Discovery makes no authentication claim and touches no
+            # credential: a keyscan needs no resolver, so fail-closed
+            # credential handling applies only to the confirmed test.
+            scanned = await asyncio.to_thread(
+                discover_host_key_candidates, identity, timeout=timeout
+            )
+        else:
+            resolver = _credential_service(request)
+            key_path = await asyncio.to_thread(
+                resolve_default_identity_key, resolver, app_env
+            )
+            result = await asyncio.to_thread(
+                run_connection_test,
+                identity,
+                privilege=payload.privilege,
+                key_path=key_path,
+                timeout=timeout,
+            )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    if scanned is not None:
+        candidates: list[OnboardingCandidate] = []
+        seen: set[tuple[str, str]] = set()
+        for key in scanned:
+            marker = (key.key_type, key.fingerprint)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            candidates.append(
+                OnboardingCandidate(host_key=key.fingerprint, key_type=key.key_type)
+            )
+        return OnboardingDiscoveryResponse(candidates=candidates)
+    assert result is not None
+    return OnboardingTestResult(
+        host_key=result.host_key,
+        key_type=result.key_type,
+        authentication="ok",
+        privilege=result.privilege,
+        probe_environment=OnboardingIdentityView(
+            hostname=result.identity.hostname,
+            os_id=result.identity.os_id,
+            os_version_id=result.identity.os_version_id,
+            kernel=(
+                f"{result.identity.kernel_name} {result.identity.kernel_release}"
+            ),
+            boot_id=result.identity.boot_id,
+        ),
+    )
+
+
+@onboarding_router.post(
+    "/enroll",
+    status_code=HTTP_201_CREATED,
+    response_model=ProfileMutationResult,
+    summary=(
+        "Enroll the verified SSH target: persist the host-key pin and "
+        "canonical profile"
+    ),
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin or CSRF rejection",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": (
+                "Target presents none of the accepted fingerprint, a pin "
+                "already exists for the minted identity, or the canonical "
+                "write conflicts"
+            ),
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": (
+                "Host-key trust not explicitly confirmed, invalid request "
+                "shape, or profile document validation failure"
+            ),
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential source or target transport unavailable",
+        },
+    },
+)
+async def enroll_server(
+    request: Request, payload: OnboardingEnrollRequest
+) -> Response:
+    """Confirmed enrollment: re-verify, then persist pin + canonical profile.
+
+    Order is the whole contract (so_PLAN "Confirmed enrollment"):
+
+    1. Explicit trust first: absent/false ``host_key_confirmed`` is a
+       ``422 host_key_confirmation_required`` BEFORE any scan, credential
+       resolution or write — confirmation is consent to first-use trust,
+       never a bypass of verification.
+    2. Immediate pre-write re-verification through the exact task-01
+       routine (:func:`run_connection_test`, off the event loop): bounded
+       rescan requiring the accepted fingerprint into a temporary pinned
+       known-hosts file, real pinned SSH identity probe, requested bounded
+       privilege check. A changed fingerprint is ``409 host_key_mismatch``
+       with zero canonical or durable-pin writes.
+    3. Only after verification: the matching key is persisted as the ONE
+       canonical enrolled pin at ``<data_root>/servers/<server_uuid>/
+       known_hosts`` (:func:`durable_known_hosts_path` — the exact file
+       ``mai.api.terminal._known_hosts_path`` and the other pinned
+       consumers read; atomic 0600, never overwriting a pre-existing entry,
+       one more exact-fingerprint rescan at write time). Then the canonical
+       document (with the server-side default ``credential_ref`` and the
+       confirmed ``host_key``) goes through the existing journal pipeline
+       (:meth:`apply_upsert`) plus the prompt write, mirroring
+       ``POST /servers`` exactly.
+    4. A canonical/prompt failure is never a false success: the pin created
+       moments earlier is removed (best effort, without touching any
+       pre-existing file) and a leftover is reported in the error envelope.
+
+    The response is the existing :class:`ProfileMutationResult`; no
+    credential material, resolver path or key path is ever returned.
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    if not payload.host_key_confirmed:
+        # Consent gate before EVERY effect: no scan, no resolution, no write.
+        return render_error_envelope(
+            request,
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "host_key_confirmation_required",
+            "enrollment requires explicit host-key trust confirmation "
+            "(host_key_confirmed)",
+        )
+    prompt_err = _validate_prompt_text(request, payload.prompt_text)
+    if prompt_err is not None:
+        return prompt_err
+    store, projection = _canonical_service(request)
+    resolver = _credential_service(request)
+    app_env: Mapping[str, str] | None = request.app.state.env
+    identity = SshIdentity(
+        host=payload.ssh.host,
+        port=payload.ssh.port,
+        user=payload.ssh.user,
+        host_key=payload.host_key,
+        credential_ref=default_credential_ref(app_env),
+    )
+    # (2) Immediate pre-write verification — the task-01 routine verbatim.
+    try:
+        key_path = await asyncio.to_thread(
+            resolve_default_identity_key, resolver, app_env
+        )
+        verified = await asyncio.to_thread(
+            run_connection_test,
+            identity,
+            privilege=payload.privilege,
+            key_path=key_path,
+            timeout=float(payload.timeout_seconds),
+        )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    # (3) Persistence: durable pin first, then the canonical pipeline.
+    server_id = uuid.uuid4()
+    canonical_request = ProfileCreate(
+        name=payload.name,
+        prompt_revision=payload.prompt_revision,
+        prompt_text=payload.prompt_text,
+        environment=payload.environment,
+        ssh=SshIdentityBody(
+            host=identity.host,
+            port=identity.port,
+            user=identity.user,
+            host_key=verified.host_key,
+            credential_ref=identity.credential_ref,
+        ),
+        privilege=payload.privilege,
+        capabilities=payload.capabilities,
+    )
+    resolved_revision = (
+        payload.prompt_revision if payload.prompt_revision is not None else 1
+    )
+    resolved_prompt = (
+        payload.prompt_text
+        if payload.prompt_text is not None
+        else f"# Server instructions for {payload.name.strip()}\n"
+    )
+    pin_path = durable_known_hosts_path(store.root, server_id)
+    try:
+        # (3) The single canonical pin, freshly re-verified moments ago.
+        await asyncio.to_thread(
+            pin_durable_host_key, server_id, identity, data_root=store.root
+        )
+    except OnboardingError as exc:
+        # Refused pin (pre-existing entry) or a key that changed again:
+        # nothing canonical exists, the envelope is the whole truth.
+        return _onboarding_error_response(request, exc)
+    try:
+        result = await projection.apply_upsert(
+            store,
+            server_id,
+            _canonical_document(
+                server_id, canonical_request, prompt_revision=resolved_revision
+            ),
+            expected_revision=0,
+        )
+        _write_prompt_text(store, server_id, resolved_prompt)
+    except (ProfileValidationError, ProfileFileError, ProjectionError) as exc:
+        if _remove_orphan_pin(pin_path):
+            return render_error_envelope(
+                request,
+                HTTP_409_CONFLICT,
+                "conflict",
+                f"enrollment failed after the host-key pin was written and "
+                f"the orphan pin for server {server_id} could not be "
+                "removed; recovery required",
+            )
+        return _profile_error(request, exc)
+    except Exception:
+        # Unmapped failure (bug or infrastructure): still no false success,
+        # still best-effort orphan cleanup, then the app's generic 500 path.
+        _remove_orphan_pin(pin_path)
+        raise
+    return _mutation_result(server_id, result)
+
+
 def register_servers(app: FastAPI) -> None:
-    """Register the profile surface under the shared boundary (api-wiring)."""
+    """Register the profile surface under the shared boundary (api-wiring).
+
+    The static onboarding routes are included BEFORE the profile router so
+    ``/onboarding/*`` precedes ``/{server_id}`` in match order (so_PLAN).
+    """
+    app.include_router(onboarding_router)
     app.include_router(router)

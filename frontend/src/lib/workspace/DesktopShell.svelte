@@ -226,11 +226,10 @@
 	import WindowSwitcher from './WindowSwitcher.svelte';
 	import ChatPanel from '$lib/panels/ChatPanel.svelte';
 	import Button from '../ui/Button.svelte';
-	import CapabilityPicker from '../ui/CapabilityPicker.svelte';
-	import Field from '../ui/Field.svelte';
-	import Select from '../ui/Select.svelte';
 	import GlassSurface from '$lib/ui/GlassSurface.svelte';
 	import SideDrawer from '$lib/ui/SideDrawer.svelte';
+	// Guided enrollment (so-03): the focused extraction of the old inline form.
+	import ServerEnrollment from './ServerEnrollment.svelte';
 	import ServerTreeNav from './ServerTreeNav.svelte';
 	import ChatDrawerSection from './ChatDrawerSection.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
@@ -407,20 +406,48 @@
 	let live = $state(false);
 	let liveServers = $state<ProfileResponse[]>([]);
 
-	/** Enrollment form visibility/busy/error (live mode only). */
+	/** Enrollment drawer visibility (live mode only); the guided flow itself
+	 * lives in ServerEnrollment and remounts fresh on every open. */
 	let enrollOpen = $state(false);
-	let enrollBusy = $state(false);
-	let enrollError = $state<string | null>(null);
-	let enrollName = $state('');
-	let enrollEnvironment = $state<'linux_ssh'>('linux_ssh');
-	let enrollPromptText = $state('');
-	let enrollHost = $state('');
-	let enrollPort = $state('22');
-	let enrollUser = $state('');
-	let enrollHostKey = $state('');
-	let enrollCredentialRef = $state('');
-	let enrollPrivilege = $state<'none' | 'sudo' | 'root'>('sudo');
-	let enrollCapabilities = $state<string[]>([
+	/** True when opening enrollment collapsed a pocket-overlay drawer, so
+	 * closing can restore the user's own drawer state. */
+	let enrollCollapsedDrawer = $state(false);
+
+	/**
+	 * Pocket viewports (≤640px) render an EXPANDED SideDrawer as an overlay
+	 * above the stage (SideDrawer R-24c), which would hide the guided
+	 * enrollment card entirely. Opening enrollment collapses it; closing
+	 * restores it. Desktop widths never overlay, so nothing changes there.
+	 */
+	function pocketViewport(): boolean {
+		return (
+			typeof window !== 'undefined' &&
+			window.matchMedia('(max-width: 640px)').matches
+		);
+	}
+
+	function toggleEnroll(): void {
+		if (!enrollOpen && pocketViewport() && !drawerCollapsed) {
+			drawerCollapsed = true;
+			enrollCollapsedDrawer = true;
+		} else if (enrollOpen && enrollCollapsedDrawer) {
+			drawerCollapsed = false;
+			enrollCollapsedDrawer = false;
+		}
+		enrollOpen = !enrollOpen;
+	}
+
+	/** Close enrollment, restoring a pocket drawer this flow collapsed. */
+	function closeEnrollment(): void {
+		if (enrollCollapsedDrawer) {
+			drawerCollapsed = false;
+			enrollCollapsedDrawer = false;
+		}
+		enrollOpen = false;
+	}
+
+	/** Default capability set offered to a newly enrolled server. */
+	const ENROLL_CAPABILITIES: string[] = [
 		'app.adopt',
 		'app.delete_map_entry',
 		'app.discover',
@@ -440,7 +467,7 @@
 		'service.http',
 		'web.read',
 		'web.search'
-	]);
+	];
 
 	/** Launcher options: live profiles replace the fixture pair when live. */
 	const serverOptions = $derived.by<{ id: ServerId; label: string }[]>(() =>
@@ -517,51 +544,17 @@
 		}
 	}
 
-	/** Enroll one server through the reviewed create route, then refresh. */
-	async function enrollServer(event: SubmitEvent): Promise<void> {
-		event.preventDefault();
-		enrollError = null;
-		const port = Number(enrollPort);
-		if (!enrollPromptText.trim()) {
-			enrollError = 'Server system prompt is required.';
-			return;
-		}
-		if (!Number.isInteger(port) || port < 1 || port > 65535) {
-			enrollError = 'SSH port must be an integer between 1 and 65535.';
-			return;
-		}
-		enrollBusy = true;
-		try {
-			await api.createProfile({
-				name: enrollName,
-				prompt_revision: 1,
-				prompt_text: enrollPromptText,
-				environment: enrollEnvironment,
-				ssh: {
-					host: enrollHost,
-					port,
-					user: enrollUser,
-					host_key: enrollHostKey,
-					credential_ref: enrollCredentialRef
-				},
-				privilege: enrollPrivilege,
-				capabilities: [...enrollCapabilities]
-			});
-			enrollName = '';
-			enrollPromptText = '';
-			enrollHost = '';
-			enrollUser = '';
-			enrollHostKey = '';
-			enrollCredentialRef = '';
-			enrollOpen = false;
-			await connectLive();
-			status = 'Server enrolled.';
-		} catch (error) {
-			enrollError =
-				error instanceof ApiError ? `${error.code}: ${error.message}` : 'Enrollment failed.';
-		} finally {
-			enrollBusy = false;
-		}
+	/**
+	 * Post-enrollment hand-off from the guided flow (so-03): close the drawer,
+	 * refresh the live server list and SELECT the new server — the same
+	 * load/select behavior the shell already owns.
+	 */
+	async function handleEnrolled(serverId: string): Promise<void> {
+		closeEnrollment();
+		await connectLive();
+		selectedServerId = serverId;
+		const label = liveServers.find((profile) => String(profile.server_id) === serverId)?.name;
+		status = `Server enrolled: ${label ?? serverId}.`;
 	}
 
 	// --- Per-panel service slices (each entry's exact contract) ---------------
@@ -1135,7 +1128,7 @@
 				size="sm"
 				variant="secondary"
 				data-testid="desktop-enroll-toggle"
-				onclick={() => (enrollOpen = !enrollOpen)}
+				onclick={toggleEnroll}
 			>
 				{enrollOpen ? 'Close enrollment' : 'Enroll server'}
 			</Button>
@@ -1155,58 +1148,16 @@
 		{/snippet}
 	</SideDrawer>
 
-	<div class="mai-desktop-shell__stage">
+	<div
+		class="mai-desktop-shell__stage"
+		class:mai-desktop-shell__stage--enrolling={live && enrollOpen}
+	>
 		{#if live && enrollOpen}
-			<!-- Inline enrollment: one reviewed create call; the field set mirrors
-			     the frozen ProfileCreate document (C02 rule 1) exactly. -->
-			<form class="mai-desktop-shell__enroll" onsubmit={enrollServer} data-testid="enroll-server">
-				<Field label="Display name" bind:value={enrollName} required />
-				<Select
-					id="mai-enroll-environment"
-					label="Environment"
-					bind:value={enrollEnvironment}
-				>
-					<option value="linux_ssh">linux_ssh (Linux over OpenSSH)</option>
-				</Select>
-				<Field label="SSH host" bind:value={enrollHost} required />
-				<Field label="SSH port" inputmode="numeric" bind:value={enrollPort} required />
-				<Field label="SSH user" bind:value={enrollUser} required />
-				<Field label="Host key (SHA256 fingerprint)" bind:value={enrollHostKey} required />
-				<Field label="Credential reference" bind:value={enrollCredentialRef} required />
-				<Select
-					id="mai-enroll-privilege"
-					label="Privilege mode"
-					bind:value={enrollPrivilege}
-				>
-					<option value="none">none</option>
-					<option value="sudo">sudo</option>
-					<option value="root">root</option>
-				</Select>
-				<div class="mai-desktop-shell__enroll-caps">
-					<CapabilityPicker
-						label="Capabilities"
-						bind:value={enrollCapabilities}
-						disabled={enrollBusy}
-						testId="enroll-capabilities"
-					/>
-				</div>
-				<label class="mai-desktop-shell__enroll-prompt">
-					<span>Server system prompt (required)</span>
-					<textarea
-						rows="4"
-						bind:value={enrollPromptText}
-						placeholder="# Server instructions&#10;Describe this server's role, OS, and operational rules..."
-						required
-						data-testid="enroll-prompt-text"
-					></textarea>
-				</label>
-				{#if enrollError}
-					<p class="mai-desktop-shell__enroll-error" role="alert" data-testid="enroll-error">
-						{enrollError}
-					</p>
-				{/if}
-				<Button type="submit" loading={enrollBusy} data-testid="enroll-submit">Enroll</Button>
-			</form>
+			<!-- Guided enrollment (so-03): extracted focused component; remounts
+			     fresh on every open, so reopening always starts cleanly. -->
+			<div class="mai-desktop-shell__enroll-slot">
+				<ServerEnrollment api={api} capabilities={ENROLL_CAPABILITIES} onenrolled={handleEnrolled} />
+			</div>
 		{/if}
 
 		<div class="mai-desktop-shell__desktop" bind:this={desktopEl} data-testid="desktop">
@@ -1357,56 +1308,24 @@
 		border-color: var(--mai-color-brass);
 	}
 
-	/* Inline server enrollment (live mode only): a compact field grid. */
-	.mai-desktop-shell__enroll {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
-		gap: var(--mai-space-2);
-		align-items: end;
-		padding: var(--mai-card-pad, var(--mai-space-3));
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-lg);
+	/* Guided enrollment slot (so-03): while the card is open the stage
+	   switches to `--enrolling` — the desktop canvas yields a strip and the
+	   card takes the stage height, scrolling internally, so every control
+	   stays reachable at short viewports (360x640) without page scroll. */
+	.mai-desktop-shell__enroll-slot {
+		position: relative;
 		z-index: 15;
-	}
-
-	.mai-desktop-shell__enroll-caps,
-	.mai-desktop-shell__enroll-prompt {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
-		grid-column: 1 / -1;
-		font-size: var(--mai-text-xs);
-		font-weight: var(--mai-weight-semibold);
-		color: var(--mai-color-text-muted);
+		flex: 1 1 auto;
+		min-height: 0;
+		min-width: 0;
+		overflow-y: auto;
 	}
 
-	.mai-desktop-shell__enroll-prompt textarea {
-		width: 100%;
-		min-height: 5.5rem;
-		padding: var(--mai-space-2) var(--mai-space-3);
-		color: var(--mai-color-text);
-		background: var(--mai-color-surface-sunken);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
-		border-radius: var(--mai-radius-md);
-		font-family: var(--mai-font-mono);
-		font-size: var(--mai-text-xs);
-		line-height: 1.5;
-		resize: vertical;
-		box-sizing: border-box;
-	}
-
-	.mai-desktop-shell__enroll-prompt textarea:focus-visible {
-		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
-		outline-offset: var(--mai-focus-ring-offset);
-		border-color: var(--mai-color-accent);
-	}
-
-	.mai-desktop-shell__enroll-error {
-		margin: 0;
-		grid-column: 1 / -1;
-		font-size: var(--mai-text-sm);
-		color: var(--mai-status-danger-text);
+	.mai-desktop-shell__stage--enrolling .mai-desktop-shell__desktop {
+		min-height: 0;
+		flex: 0 1 7rem;
 	}
 
 	/* Transparent spatial line-grid canvas: no solid/overlay fill; only

@@ -25,7 +25,7 @@ Every action follows an explicit loop:
 - **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Plugin Forms, Overview Dashboard, and Memory & Local Models.
 - **Supervised SSH Execution & Policy Gates:** Key-only OpenSSH supervision with pinned host-key fingerprints, explicit capability grants (`none`, `narrow`, `broad`), one-use approval tokens for mutating operations, and secret-redacted command receipts.
 - **Durable Job Engine & Scheduling:** PostgreSQL-backed (`dbos`) workflows with lease fencing, crash recovery without blind re-execution of dangerous host steps, and cron/interval scheduling.
-- **Application Lifecycle Management:** Discover running services, adopt existing stacks, or install/update/remove curated digest-pinned recipes (`example-http.yaml`, `example-stateful.yaml`, `local-inference.yaml`, `odysseus.yaml`) with automatic health-gate rollback.
+- **Application Lifecycle Management:** Discover running services, adopt existing stacks, or install/update/remove curated digest-pinned recipes (`example-http.yaml`, `example-stateful.yaml`, `odysseus.yaml`) with automatic health-gate rollback.
 - **Knowledge, Retrieval & Optional Long-Term Memory:** Markdown document store with `pgvector` + full-text hybrid search, optional SearXNG web search (`--profile search`), and optional Hindsight conversational memory (`--profile memory`).
 - **Monitoring, Security Posture & Notifications:** Read-only collectors for system resources, network listeners, processes, cron/systemd timers, SSH/firewall/privilege posture, and package/image updates, feeding a deduplicated findings & notification inbox.
 - **Plugins, MCP & Skills:** Extend capabilities via Python entry-point plugins (`mai.capabilities`), stdio or streamable-HTTP Model Context Protocol (MCP) servers, and portable skill packages (`docs/plugins/quickstart.md`).
@@ -191,11 +191,11 @@ Before enrolling a server in the Machina UI (**Enroll server** in the left drawe
      sudo ufw allow from 172.32.0.0/16 to any port 22 proto tcp comment "machina -> host ssh"
      ```
    - If Machina connects from another host, allow that controller's IP/CIDR (`/32` or subnet).
-5. **Read the target server's SSH host-key fingerprint (for the Enrollment form):**
+5. **Optionally read the target server's SSH host-key fingerprint (for independent comparison during enrollment):**
    ```bash
    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-   # Copy the SHA256:... token into the "Host key (SHA256 fingerprint)" field in Machina
    ```
+   The guided enrollment flow (see [`docs/operations/quickstart.md`](docs/operations/quickstart.md) §2.1) discovers the host keys the target actually presents and you select the matching candidate in the UI — there is no raw host-key field to paste a fingerprint into.
 
 ---
 
@@ -271,7 +271,7 @@ sudo bash scripts/uninstall-host.sh \
 | `backend/` | FastAPI + DBOS controller package (`mai`): API routes, auth, capability policy, SSH supervision, durable jobs, knowledge/retrieval, memory, monitoring, notifications, plugins |
 | `frontend/` | SvelteKit windowed desktop workspace (`mai-web`) and Playwright test suites (`frontend/tests/`) |
 | `compose.yaml` | Container topology: `postgres`, `mai-api`, `mai-web` + profile-gated `mai-worker`, `searxng` + `valkey`, `hindsight` |
-| `catalogue/` | Curated application & model recipes (`example-http.yaml`, `example-stateful.yaml`, `local-inference.yaml`, `odysseus.yaml`) |
+| `catalogue/` | Curated application & model recipes (`example-http.yaml`, `example-stateful.yaml`, `odysseus.yaml`) |
 | `scripts/` | Operator tooling: `install-host.sh`, `backup-restore.sh`, `uninstall-host.sh`, `runtime_check.py` |
 | `deploy/` | Service deployment notes (`deploy/hindsight/README.md`) and SearXNG configuration (`deploy/searxng/settings.yml`) |
 | `docs/operations/` | Operator runbooks: [`quickstart.md`](docs/operations/quickstart.md), [`recovery.md`](docs/operations/recovery.md), [`uninstall.md`](docs/operations/uninstall.md), [`acceptance.md`](docs/operations/acceptance.md) |

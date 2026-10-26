@@ -102,6 +102,107 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/onboarding/controller-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export the controller public key for authorized_keys
+         * @description Return the configured controller's public key (session required).
+         *
+         *     Safe method: layer 1 only (no Origin/CSRF). The public half is derived
+         *     with one bounded ``ssh-keygen -y`` off the event loop; the response
+         *     never contains private material, the resolver path or an env value.
+         */
+        get: operations["get_controller_key_api_v1_servers_onboarding_controller_key_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/onboarding/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discover host-key candidates or run the pinned connection test
+         * @description Candidate discovery or the side-effect-free pinned test.
+         *
+         *     Mutation-order boundary (session → origin → CSRF) even though the
+         *     endpoint writes nothing: discovery makes no authentication claim and
+         *     the confirmed test binds every connection to the exact fingerprint the
+         *     administrator selected, through a newly created temporary known-hosts
+         *     file that is removed on every path. All blocking subprocess work runs
+         *     off the event loop; no durable state exists anywhere (task 02 owns
+         *     enrollment persistence).
+         */
+        post: operations["test_connection_api_v1_servers_onboarding_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/onboarding/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Enroll the verified SSH target: persist the host-key pin and canonical profile
+         * @description Confirmed enrollment: re-verify, then persist pin + canonical profile.
+         *
+         *     Order is the whole contract (so_PLAN "Confirmed enrollment"):
+         *
+         *     1. Explicit trust first: absent/false ``host_key_confirmed`` is a
+         *        ``422 host_key_confirmation_required`` BEFORE any scan, credential
+         *        resolution or write — confirmation is consent to first-use trust,
+         *        never a bypass of verification.
+         *     2. Immediate pre-write re-verification through the exact task-01
+         *        routine (:func:`run_connection_test`, off the event loop): bounded
+         *        rescan requiring the accepted fingerprint into a temporary pinned
+         *        known-hosts file, real pinned SSH identity probe, requested bounded
+         *        privilege check. A changed fingerprint is ``409 host_key_mismatch``
+         *        with zero canonical or durable-pin writes.
+         *     3. Only after verification: the matching key is persisted as the ONE
+         *        canonical enrolled pin at ``<data_root>/servers/<server_uuid>/
+         *        known_hosts`` (:func:`durable_known_hosts_path` — the exact file
+         *        ``mai.api.terminal._known_hosts_path`` and the other pinned
+         *        consumers read; atomic 0600, never overwriting a pre-existing entry,
+         *        one more exact-fingerprint rescan at write time). Then the canonical
+         *        document (with the server-side default ``credential_ref`` and the
+         *        confirmed ``host_key``) goes through the existing journal pipeline
+         *        (:meth:`apply_upsert`) plus the prompt write, mirroring
+         *        ``POST /servers`` exactly.
+         *     4. A canonical/prompt failure is never a false success: the pin created
+         *        moments earlier is removed (best effort, without touching any
+         *        pre-existing file) and a leftover is reported in the error envelope.
+         *
+         *     The response is the existing :class:`ProfileMutationResult`; no
+         *     credential material, resolver path or key path is ever returned.
+         */
+        post: operations["enroll_server_api_v1_servers_onboarding_enroll_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/servers": {
         parameters: {
             query?: never;
@@ -3126,6 +3227,18 @@ export interface components {
             compose_service: string | null;
         };
         /**
+         * ControllerKeyResponse
+         * @description The controller public half only: one OpenSSH public-key line.
+         */
+        ControllerKeyResponse: {
+            /** Public Key */
+            public_key: string;
+            /** Key Type */
+            key_type: string;
+            /** Fingerprint */
+            fingerprint: string;
+        };
+        /**
          * ConversationCurrentView
          * @description Current-state catch-up block on every events page (§3).
          *
@@ -4612,6 +4725,136 @@ export interface components {
             category?: string | null;
             /** Detail */
             detail: components["schemas"]["ComposeDetailView"] | components["schemas"]["StandaloneDetailView"] | components["schemas"]["SystemdUnitDetailView"];
+        };
+        /**
+         * OnboardingCandidate
+         * @description One scanned host-key candidate; no authentication claim is made.
+         */
+        OnboardingCandidate: {
+            /** Host Key */
+            host_key: string;
+            /** Key Type */
+            key_type: string;
+        };
+        /**
+         * OnboardingDiscoveryResponse
+         * @description All scanned candidates, deduplicated in scan order.
+         */
+        OnboardingDiscoveryResponse: {
+            /** Candidates */
+            candidates: components["schemas"]["OnboardingCandidate"][];
+        };
+        /**
+         * OnboardingEnrollRequest
+         * @description Confirmed-enrollment payload (so_PLAN "Confirmed enrollment").
+         *
+         *     The existing ``ProfileCreate`` fields with ``ssh`` reduced to the bare
+         *     endpoint ``{host, port, user}`` plus the observed ``host_key`` and the
+         *     explicit ``host_key_confirmed`` consent flag. The browser never submits
+         *     ``credential_ref``: the server stores its own configured default
+         *     (``MAI_SSH_CREDENTIAL_REF`` override, else ``MAI_SSH_KEY_MAI``).
+         *     ``host_key_confirmed`` is consent to FIRST-USE trust only — enrollment
+         *     still re-verifies the target immediately before persisting anything.
+         */
+        OnboardingEnrollRequest: {
+            /** Name */
+            name: string;
+            /** Prompt Revision */
+            prompt_revision?: number | null;
+            /** Prompt Text */
+            prompt_text?: string | null;
+            /** @default linux_ssh */
+            environment: components["schemas"]["ExecutionEnvironment"];
+            privilege: components["schemas"]["PrivilegeMode"];
+            /** Capabilities */
+            capabilities: string[];
+            ssh: components["schemas"]["OnboardingSshTarget"];
+            /**
+             * Host Key
+             * @description The fingerprint the administrator selected and tested
+             */
+            host_key: string;
+            /**
+             * Host Key Confirmed
+             * @description Explicit consent to first-use host-key trust; false/absent rejects enrollment before any scan or write
+             * @default false
+             */
+            host_key_confirmed: boolean;
+            /**
+             * Timeout Seconds
+             * @default 10
+             */
+            timeout_seconds: number;
+        };
+        /**
+         * OnboardingIdentityView
+         * @description The Linux identity the real target reported (observed facts only).
+         */
+        OnboardingIdentityView: {
+            /** Hostname */
+            hostname: string;
+            /** Os Id */
+            os_id: string | null;
+            /** Os Version Id */
+            os_version_id: string | null;
+            /** Kernel */
+            kernel: string;
+            /** Boot Id */
+            boot_id: string | null;
+        };
+        /**
+         * OnboardingSshTarget
+         * @description Requested SSH endpoint; field rules mirror the canonical schema.
+         *
+         *     The patterns are local copies of the canonical schema's
+         *     ``_SSH_HOST_RE``/``_SSH_USER_RE`` (shape owner ``mai.contracts.server``
+         *     is outside this task's allowlist). They are a transport hardening, not
+         *     cosmetic: a value beginning with ``-`` (e.g. ``user="-oProxyCommand=…"``
+         *     — reviewer-proved) would otherwise reach the ``ssh``/``ssh-keyscan``
+         *     argv as a LOCAL option instead of a user/host.
+         */
+        OnboardingSshTarget: {
+            /** Host */
+            host: string;
+            /** Port */
+            port: number;
+            /** User */
+            user: string;
+        };
+        /**
+         * OnboardingTestRequest
+         * @description Test payload: discovery when ``host_key`` is null, else pinned test.
+         */
+        OnboardingTestRequest: {
+            ssh: components["schemas"]["OnboardingSshTarget"];
+            privilege: components["schemas"]["PrivilegeMode"];
+            /**
+             * Host Key
+             * @description Selected candidate fingerprint; null = discovery only
+             */
+            host_key?: string | null;
+            /**
+             * Timeout Seconds
+             * @default 10
+             */
+            timeout_seconds: number;
+        };
+        /**
+         * OnboardingTestResult
+         * @description One successful pinned test: the accepted key actually authenticated.
+         */
+        OnboardingTestResult: {
+            /** Host Key */
+            host_key: string;
+            /** Key Type */
+            key_type: string;
+            /**
+             * Authentication
+             * @constant
+             */
+            authentication: "ok";
+            privilege: components["schemas"]["PrivilegeMode"];
+            probe_environment: components["schemas"]["OnboardingIdentityView"];
         };
         /**
          * PasswordBody
@@ -6806,6 +7049,191 @@ export interface operations {
             };
             /** @description No valid session */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    get_controller_key_api_v1_servers_onboarding_controller_key_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ControllerKeyResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Controller key missing, invalid or unsupported */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Credential resolver or reference unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    test_connection_api_v1_servers_onboarding_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OnboardingTestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OnboardingDiscoveryResponse"] | components["schemas"]["OnboardingTestResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin or CSRF rejection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Target presents none of the accepted fingerprint */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Invalid configuration; nothing ran */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Credential source or target transport unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    enroll_server_api_v1_servers_onboarding_enroll_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OnboardingEnrollRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProfileMutationResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin or CSRF rejection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Target presents none of the accepted fingerprint, a pin already exists for the minted identity, or the canonical write conflicts */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Host-key trust not explicitly confirmed, invalid request shape, or profile document validation failure */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Credential source or target transport unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

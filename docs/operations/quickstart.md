@@ -60,19 +60,72 @@ ssh-keygen -t ed25519 -f ~/.ssh/mai_controller -N "" -C mai-controller
 scp ~/.ssh/mai_controller.pub root@TARGET:/root/mai_controller.pub
 ```
 
-### 2.1 Preparing a target server manually (remote user & permissions)
+### 2.1 Enrolling a server through the UI (guided) and its manual prerequisites
 
-When onboarding any additional Linux server through the UI (**Enroll server** in the left navigation drawer) — or verifying permissions on the primary host — ensure the remote SSH user (`mai`) exists on the target server with the following permissions:
+Every additional Linux server is enrolled in the browser: open **Enroll
+server** in the left navigation drawer and follow the guided flow. The one
+external step is authorizing the controller's public key on the target —
+MAI never provisions users, groups, sudoers rules or firewall rules for you.
+
+**Guided browser flow (in order):**
+
+1. **Copy the public key** — the enrollment card shows the controller's
+   PUBLIC key with a **Copy public key** button. The controller key is the
+   installer-provisioned `MAI_SSH_KEY_MAI` resolver entry; there is no
+   credential field in the browser, and nothing to type or paste from a
+   shell. (Operators may point the server at a different installed key by
+   setting `MAI_SSH_CREDENTIAL_REF` in the `mai-api`/worker environment —
+   a reference NAME, never a secret value, and never a browser input.)
+2. **Authorize it on the target** using your existing admin access: append
+   the copied PUBLIC line to the target user's `authorized_keys` (`0700` on
+   `.ssh`, `0600` on `authorized_keys`, owned by that user).
+3. **Fill the SSH details** in the same card: display name, SSH host, port,
+   user, and privilege mode — `sudo` requires noninteractive passwordless
+   sudo for the operations you want MAI to perform, `root` requires the SSH
+   user to actually be uid 0, `none` performs no elevation check.
+4. **Test connection** — one guided action. It first scans the endpoint:
+   discovery lists the host keys the target actually presents
+   (trust-on-first-use candidate collection; this is NOT yet an
+   authenticated connection). When exactly ONE host key is presented, the
+   same action continues straight into the pinned test with it — no extra
+   click. When several keys are presented, you must select one explicitly
+   (the button then reads **Test selected host key**) before the pinned
+   test runs. Compare the offered fingerprint(s) against one you obtained
+   independently (e.g. `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+   run on the target) whenever the host is not already independently
+   trusted. The pinned test connects with that exact fingerprint pinned and
+   reports the real Linux identity (hostname, OS, kernel) plus the
+   privilege result; it is side-effect-free.
+5. **Trust and enroll** — tick **Trust this host key**, complete the form,
+   and press **Enroll server**. Enroll re-verifies the connection against
+   the accepted fingerprint immediately before writing: a key that changed
+   between test and enroll is refused (`host_key_mismatch`) and nothing is
+   written; keys are never silently rotated. On success the canonical
+   profile plus exactly ONE host-key pin are stored
+   (`<data_root>/servers/<server_id>/known_hosts`), the new server is
+   selected in the workspace, its profile panel shows the pinned host key
+   read-only, and the pinned identity probe works immediately with no
+   second trust step. A HOST key that changes later is refused on every
+   connection — MAI never auto-rotates a host pin; accepting a new host
+   fingerprint is an explicit admin re-enrollment of that server with the
+   new fingerprint recorded. Rotating the CONTROLLER's own SSH key is a
+   separate, supported operation (see `uninstall.md` Mode 1 — controller
+   key only).
+
+**Manual prerequisites on the target (still yours — nothing is
+auto-provisioned):**
 
 1. **Service account + `docker` group membership** (required so `docker ps -a` and `docker compose` over SSH can read `/var/run/docker.sock` without `permission_denied`):
    ```bash
    sudo useradd --create-home --shell /bin/bash --comment "mai-controller" mai
    sudo usermod -aG docker mai
    ```
-2. **Controller public key in `/home/mai/.ssh/authorized_keys`** (`0700` on `.ssh`, `0600` on `authorized_keys`, owned by `mai:mai`).
-3. **Sudoers rule in `/etc/sudoers.d/90-mai-mai`** (`0440`, validated with `visudo -cf`):
-   - `narrow` (`privilege: sudo`): `mai ALL=(root) NOPASSWD: /usr/bin/systemctl start docker.service, /usr/bin/systemctl stop docker.service, /usr/bin/systemctl restart docker.service, /usr/bin/systemctl status docker.service`
-   - `broad` (`privilege: root`): `mai ALL=(ALL) NOPASSWD: ALL`
+2. **Controller public key in `/home/mai/.ssh/authorized_keys`** — the line
+   copied from the enrollment card (step 2 above), with `0700` on `.ssh`,
+   `0600` on `authorized_keys`, owned by `mai:mai`.
+3. **Sudoers rule in `/etc/sudoers.d/90-mai-mai`** (`0440`, validated with `visudo -cf`) matching the privilege mode you will select:
+   - `sudo` (narrow grant): `mai ALL=(root) NOPASSWD: /usr/bin/systemctl start docker.service, /usr/bin/systemctl stop docker.service, /usr/bin/systemctl restart docker.service, /usr/bin/systemctl status docker.service`
+   - `root` (broad grant): `mai ALL=(ALL) NOPASSWD: ALL`
 4. **Scoped SSH firewall rule**: allow TCP port `22` from the controller IP or from the `mai` Docker bridge subnet (e.g. `172.32.0.0/16` when `mai-api` connects to its own host via the bridge gateway `172.32.0.1`).
 
 ## 3. Plan first (read-only, exit 0)
@@ -194,8 +247,10 @@ curl -fsS -X POST https://your.origin/api/v1/auth/bootstrap \
 
 Log in through the UI (session cookie `mai_session` + CSRF token, server-side
 revocation, wrong-password ≡ throttled latency). From here, enroll further
-managed servers inside the app — the quickstart host is already enrolled by
-step 7 of the installer.
+managed servers through the guided flow in the app: open **Enroll server**,
+copy the displayed controller public key to the target's `authorized_keys`,
+run the guided test, compare the offered fingerprint, trust it and enroll
+(§2.1) — the quickstart host is already enrolled by step 7 of the installer.
 
 ## 8. Optional stack profiles
 

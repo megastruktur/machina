@@ -29,8 +29,10 @@
 	 *    explicit Reload before saving again.
 	 *  - Credential non-disclosure (brief acceptance 1): the profile API
 	 *    returns no secret values; the panel additionally renders neither
-	 *    `ssh.credential_ref` (a reference, not a display field) nor
-	 *    `ssh.host_key` — target identity is `server_id` + name + endpoint.
+	 *    `ssh.credential_ref` (a reference, not a display field) nor any
+	 *    private material. Since so-03 the stored `ssh.host_key` fingerprint IS
+	 *    displayed — as a read-only `SSH host key (pinned)` field that ordinary
+	 *    edits never rewrite (key rotation is explicitly deferred).
 	 *  - No module-level state and no `window`/`document` access (ADR §5
 	 *    rule 4): safe to evaluate per SSR request; instances share nothing.
 	 *
@@ -89,8 +91,6 @@
 	let sshUserInput = $state('');
 	let privilegeInput = $state<'none' | 'sudo' | 'root'>('sudo');
 	let capabilitiesList = $state<string[]>([]);
-	let hostKeyInput = $state('');
-	let credentialKeyInput = $state('');
 	let promptTextInput = $state('');
 
 	let saving = $state(false);
@@ -163,9 +163,7 @@
 			parsedPort !== p.ssh.port ||
 			sshUserInput.trim() !== p.ssh.user ||
 			privilegeInput !== p.privilege ||
-			parsedCapabilities.join(',') !== p.capabilities.join(',') ||
-			hostKeyInput.trim() !== '' ||
-			credentialKeyInput.trim() !== ''
+			parsedCapabilities.join(',') !== p.capabilities.join(',')
 		);
 	});
 	const saveDisabled = $derived(
@@ -180,8 +178,6 @@
 		sshUserInput = profile.ssh.user;
 		privilegeInput = profile.privilege;
 		capabilitiesList = [...profile.capabilities];
-		hostKeyInput = '';
-		credentialKeyInput = '';
 		promptTextInput = defaultPromptFor(profile);
 	}
 
@@ -249,8 +245,11 @@
 		const nextName = nameInput.trim();
 		const nextHost = sshHostInput.trim();
 		const nextUser = sshUserInput.trim();
-		const nextHostKey = hostKeyInput.trim() || profile.ssh.host_key;
-		const nextCredentialRef = credentialKeyInput.trim() || profile.ssh.credential_ref;
+		// Trust fields are NOT editable here (so-03): the stored pinned
+		// fingerprint and credential reference are submitted unchanged; key
+		// rotation is explicitly deferred to a separately designed flow.
+		const nextHostKey = profile.ssh.host_key;
+		const nextCredentialRef = profile.ssh.credential_ref;
 		const nextCapabilities = [...parsedCapabilities];
 		const nextPrompt = promptTextInput;
 
@@ -510,18 +509,12 @@
 
 					<div class="mai-server-profile__grid">
 						<Field
-							label="Rotate SSH host key (SHA256:...)"
-							hint="Leave blank to keep stored fingerprint."
-							bind:value={hostKeyInput}
+							label="SSH host key (pinned)"
+							value={view.profile.ssh.host_key}
+							readonly
+							hint="Pinned at enrollment — shown read-only; rotation is not available in this release."
 							autocomplete="off"
-							data-testid="edit-host-key"
-						/>
-						<Field
-							label="Rotate credential env key"
-							hint="Leave blank to keep stored variable reference."
-							bind:value={credentialKeyInput}
-							autocomplete="off"
-							data-testid="edit-credential-key"
+							data-testid="pinned-host-key"
 						/>
 					</div>
 

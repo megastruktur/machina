@@ -114,6 +114,16 @@ export type ProfileEdit = components['schemas']['ProfileEdit'];
 export type ProfileMutationResult = components['schemas']['ProfileMutationResult'];
 export type ProfileResponse = components['schemas']['ProfileResponse'];
 
+/** Guided onboarding surface (so-01/so-02 wire models; generated schema only). */
+export type ControllerKeyResponse = components['schemas']['ControllerKeyResponse'];
+export type OnboardingCandidate = components['schemas']['OnboardingCandidate'];
+export type OnboardingDiscoveryResponse = components['schemas']['OnboardingDiscoveryResponse'];
+export type OnboardingEnrollRequest = components['schemas']['OnboardingEnrollRequest'];
+export type OnboardingIdentityView = components['schemas']['OnboardingIdentityView'];
+export type OnboardingSshTarget = components['schemas']['OnboardingSshTarget'];
+export type OnboardingTestRequest = components['schemas']['OnboardingTestRequest'];
+export type OnboardingTestResult = components['schemas']['OnboardingTestResult'];
+
 /** Generated wire shapes consumed by the feature panels (P03–P12). */
 export type AckResult = components['schemas']['AckResult'];
 export type AdoptBody = components['schemas']['AdoptBody'];
@@ -575,6 +585,26 @@ export interface MaiApiClient {
 	/** PUT /api/v1/servers/{server_id} — revision-checked edit (C01 rule 6). */
 	editProfile(serverId: string, payload: ProfileEdit): Promise<ProfileMutationResult>;
 
+	/**
+	 * GET /api/v1/servers/onboarding/controller-key — the controller's public
+	 * key half only (no resolver path, private material or env value).
+	 */
+	readControllerKey(): Promise<ControllerKeyResponse>;
+	/**
+	 * POST /api/v1/servers/onboarding/test — side-effect-free connection test:
+	 * `host_key: null` is candidate discovery ONLY, a fingerprint is a pinned
+	 * authentication test (`OnboardingTestResult`).
+	 */
+	testOnboardingConnection(
+		payload: OnboardingTestRequest
+	): Promise<OnboardingDiscoveryResponse | OnboardingTestResult>;
+	/**
+	 * POST /api/v1/servers/onboarding/enroll — confirmed guided enrollment.
+	 * The browser never submits `credential_ref`; the server stores its own
+	 * configured default. `host_key_confirmed: true` is explicit consent.
+	 */
+	enrollViaOnboarding(payload: OnboardingEnrollRequest): Promise<ProfileMutationResult>;
+
 	/** GET /api/v1/grants — committed policy (404 before first commit). */
 	readGrants(): Promise<GrantsConfigView>;
 	/** PUT /api/v1/grants — one versioned edit; the route derives revision+1. */
@@ -960,6 +990,23 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<ProfileMutationResult>(
 				'PUT',
 				`/api/v1/servers/${encodeURIComponent(serverId)}`,
+				payload
+			),
+		readControllerKey: () =>
+			requestJson<ControllerKeyResponse>(
+				'GET',
+				'/api/v1/servers/onboarding/controller-key'
+			),
+		testOnboardingConnection: (payload) =>
+			requestJson<OnboardingDiscoveryResponse | OnboardingTestResult>(
+				'POST',
+				'/api/v1/servers/onboarding/test',
+				payload
+			),
+		enrollViaOnboarding: (payload) =>
+			requestJson<ProfileMutationResult>(
+				'POST',
+				'/api/v1/servers/onboarding/enroll',
 				payload
 			),
 
