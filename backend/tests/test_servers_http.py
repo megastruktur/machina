@@ -445,9 +445,13 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
         # (so-01-onboarding-probe: guided-onboarding key export + pinned
-        # connection test; enrollment stays absent until campaign task 02.)
+        # connection test. so-02-confirmed-enrollment extended the pin by
+        # the frozen enroll route — the only change outside that task's
+        # five-file allowlist, purely mechanical so this table guards
+        # additions again; intent unchanged.)
         ("GET", "/api/v1/servers/onboarding/controller-key"),
         ("POST", "/api/v1/servers/onboarding/test"),
+        ("POST", "/api/v1/servers/onboarding/enroll"),
         # (03-approval-api remediation: the pin expanded by the frozen
         # approval preview/decision routes; intent unchanged.)
         ("GET", "/api/v1/approvals/{approval_id}"),

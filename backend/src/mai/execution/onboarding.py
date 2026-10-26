@@ -34,7 +34,19 @@ Ownership map:
   remote ``id -u`` uid 0 for root, nothing for none). The temporary file is
   removed on success and failure; no durable state exists on any path.
 
-There is no enrollment here: durable pin/profile writes belong to task 02.
+Confirmed enrollment (task 02) adds the durable side of the seam:
+:func:`pin_durable_host_key` persists the verified accepted key as ONE
+canonical enrolled pin at ``<data_root>/servers/<server_uuid>/known_hosts``
+— the profile-relative path already consumed by ``api/terminal.py``
+(``_known_hosts_path``), ``api/applications.py``, ``api/password_challenges``
+and ``capabilities/internal_api.py`` — with the existing atomic pin-helper
+semantics and an absolute no-clobber rule (a pre-existing entry is never
+overwritten). This single location is the user-approved contract amendment
+(R1's temporary dual-write bridge was canceled before commit; the jobs
+worker's own ``<data_root>/known_hosts/<uuid>.known_hosts`` re-pin cache is
+a separate, untouched resource). The canonical profile write itself stays at
+the HTTP layer (it owns store + projection); this module never fabricates
+success for it.
 Blocking subprocess work in this module is synchronous by design — the HTTP
 layer owns dispatching it off the event loop (``asyncio.to_thread``).
 """
@@ -46,6 +58,7 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from collections.abc import Mapping
 from enum import StrEnum
@@ -56,9 +69,11 @@ from mai.credentials.env import EnvResolver
 from mai.execution.ssh import (
     DEFAULT_COMMAND_TIMEOUT,
     MAX_COMMAND_OUTPUT_BYTES,
+    PinnedHostKey,
     ScannedHostKey,
     SshConnectError,
     TargetIdentity,
+    pin_host_key,
     probe_environment,
     resolve_identity_key,
     scan_host_keys,
@@ -77,7 +92,9 @@ __all__ = [
     "OnboardingErrorCode",
     "default_credential_ref",
     "discover_host_key_candidates",
+    "durable_known_hosts_path",
     "export_public_key",
+    "pin_durable_host_key",
     "run_connection_test",
 ]
 
@@ -87,6 +104,28 @@ __all__ = [
 DEFAULT_CREDENTIAL_REF_VAR = "MAI_SSH_CREDENTIAL_REF"
 #: Installer-compatible fallback reference when the override is unset.
 FALLBACK_CREDENTIAL_REF = "MAI_SSH_KEY_MAI"
+
+#: Directory/file layout note for the durable enrollment pin: the canonical
+#: location is the profile-relative per-server directory (see
+#: :func:`durable_known_hosts_path`); there is deliberately NO root-level
+#: ``<data_root>/known_hosts/<uuid>`` enrollment pin (user-approved contract
+#: amendment — the root-level ``known_hosts/`` directory remains the jobs
+#: worker's own re-pin cache, untouched by enrollment).
+
+
+def durable_known_hosts_path(
+    data_root: str | os.PathLike[str], server_id: uuid.UUID
+) -> Path:
+    """The canonical enrolled-pin path: ``<data_root>/servers/<uuid>/known_hosts``.
+
+    One file per server identity, named ``known_hosts`` inside the server's
+    own directory — byte-identical to ``mai.api.terminal._known_hosts_path``
+    and the same construction in ``api/applications.py``,
+    ``api/password_challenges.py`` and ``capabilities/internal_api.py``, so
+    the enrolled pin is the exact file every existing pinned consumer reads.
+    """
+    return Path(data_root) / "servers" / str(server_id) / "known_hosts"
+
 
 #: Wall-clock budget for one ``ssh-keygen -y`` export (so_PLAN: bounded to
 #: 10 seconds).
@@ -138,6 +177,9 @@ class OnboardingErrorCode(StrEnum):
     SSH_FAILED = "ssh_failed"
     PRIVILEGE_UNAVAILABLE = "privilege_unavailable"
     KEY_EXPORT_FAILED = "key_export_failed"
+    #: The durable enrollment pin path already holds an entry (enrollment is
+    #: strictly first-use trust; an existing entry is never overwritten).
+    HOST_KEY_PIN_EXISTS = "host_key_pin_exists"
 
 
 class OnboardingError(ValueError):
@@ -554,3 +596,67 @@ def _map_remote_failure(stderr: str, endpoint: str, label: str) -> OnboardingErr
         OnboardingErrorCode.SSH_FAILED,
         f"{endpoint} {label} failed at the transport level",
     )
+
+
+# ---------------------------------------------------------------------------
+# Confirmed enrollment (durable pin persistence; canonical write = HTTP layer)
+# ---------------------------------------------------------------------------
+
+
+def pin_durable_host_key(
+    server_id: uuid.UUID,
+    identity: SshIdentity,
+    *,
+    data_root: str | os.PathLike[str],
+) -> PinnedHostKey:
+    """Persist the verified accepted host key as the durable enrollment pin.
+
+    Contract (so_PLAN "Confirmed enrollment", item 4/5):
+
+    - The pin path is :func:`durable_known_hosts_path` — the ONE canonical
+      enrolled pin at ``<data_root>/servers/<uuid>/known_hosts``, the exact
+      file the existing pinned consumers read; the caller must have
+      re-verified the target immediately before (``run_connection_test``),
+      and this helper re-scans once more through the existing atomic pin
+      helper :func:`~mai.execution.ssh.pin_host_key`: the written line is
+      the key the target presents NOW with exactly the accepted fingerprint
+      (tmp + fsync + ``os.replace``, mode 0600), so a target that changed
+      its key between verification and persistence is refused with nothing
+      written.
+    - A pre-existing entry is NEVER overwritten: an existing pin file (or
+      symlink) at the exact path is ``host_key_pin_exists`` — enrollment is
+      first-use trust only. For the freshly minted ``server_uuid`` of one
+      enrollment this is a defensive invariant; it also makes a repeated
+      call with the same identity a structured no-op refusal instead of a
+      silent rewrite.
+    - The ``servers/`` and ``servers/<uuid>/`` directories are created and
+      enforced 0700 (mirroring ``ProfileFileStore._ensure_server_dir``); the
+      pin file is 0600 (public key material only, confined to the service
+      user).
+    """
+    if not identity.host_key or not _FINGERPRINT_RE.match(identity.host_key):
+        raise OnboardingError(
+            OnboardingErrorCode.INVALID_CONFIGURATION,
+            "host_key is required for the durable pin and must be a "
+            "SHA256:<43-char> OpenSSH fingerprint",
+        )
+    pin_path = durable_known_hosts_path(data_root, server_id)
+    if pin_path.exists() or pin_path.is_symlink():
+        raise OnboardingError(
+            OnboardingErrorCode.HOST_KEY_PIN_EXISTS,
+            f"a known-hosts pin already exists for server {server_id}; "
+            "first-use trust is never overwritten (key rotation needs an "
+            "explicitly designed re-verification flow)",
+        )
+    pin_dir = pin_path.parent
+    pin_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(pin_dir.parent, 0o700)
+    os.chmod(pin_dir, 0o700)
+    try:
+        return pin_host_key(identity, pin_path)
+    except SshConnectError as exc:
+        # A refused pin leaves NO file; the 0700 directories themselves are
+        # the only possible remainder and hold nothing.
+        raise _wrap_transport(exc) from None
+
+

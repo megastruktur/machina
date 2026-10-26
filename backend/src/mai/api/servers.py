@@ -89,7 +89,9 @@ from mai.execution.onboarding import (
     OnboardingErrorCode,
     default_credential_ref,
     discover_host_key_candidates,
+    durable_known_hosts_path,
     export_public_key,
+    pin_durable_host_key,
     resolve_default_identity_key,
     run_connection_test,
 )
@@ -307,6 +309,39 @@ class OnboardingTestResult(BaseModel):
     authentication: Literal["ok"]
     privilege: PrivilegeMode
     probe_environment: OnboardingIdentityView
+
+
+class OnboardingEnrollRequest(BaseModel):
+    """Confirmed-enrollment payload (so_PLAN "Confirmed enrollment").
+
+    The existing ``ProfileCreate`` fields with ``ssh`` reduced to the bare
+    endpoint ``{host, port, user}`` plus the observed ``host_key`` and the
+    explicit ``host_key_confirmed`` consent flag. The browser never submits
+    ``credential_ref``: the server stores its own configured default
+    (``MAI_SSH_CREDENTIAL_REF`` override, else ``MAI_SSH_KEY_MAI``).
+    ``host_key_confirmed`` is consent to FIRST-USE trust only — enrollment
+    still re-verifies the target immediately before persisting anything.
+    """
+
+    name: str
+    prompt_revision: int | None = Field(default=None, ge=1)
+    prompt_text: str | None = None
+    environment: ExecutionEnvironment = ExecutionEnvironment.LINUX_SSH
+    privilege: PrivilegeMode
+    capabilities: list[str]
+    ssh: OnboardingSshTarget
+    host_key: str = Field(
+        pattern=r"^SHA256:[A-Za-z0-9+/]{43}$",
+        description="The fingerprint the administrator selected and tested",
+    )
+    host_key_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Explicit consent to first-use host-key trust; false/absent "
+            "rejects enrollment before any scan or write"
+        ),
+    )
+    timeout_seconds: int = Field(default=10, ge=5, le=30)
 
 
 # ---------------------------------------------------------------------------
@@ -800,6 +835,7 @@ async def edit_profile(
 #: 503 with the structured code, and only request-shape problems are 422.
 _ONBOARDING_ERROR_STATUS: Final[dict[OnboardingErrorCode, tuple[int, str]]] = {
     OnboardingErrorCode.HOST_KEY_MISMATCH: (HTTP_409_CONFLICT, "host_key_mismatch"),
+    OnboardingErrorCode.HOST_KEY_PIN_EXISTS: (HTTP_409_CONFLICT, "conflict"),
     OnboardingErrorCode.INVALID_CONFIGURATION: (
         HTTP_422_UNPROCESSABLE_CONTENT,
         "invalid_configuration",
@@ -819,6 +855,22 @@ def _onboarding_error_response(
         exc.code, (HTTP_503_SERVICE_UNAVAILABLE, exc.code.value)
     )
     return render_error_envelope(request, status, code, exc.detail)
+
+
+def _remove_orphan_pin(pin_path: Path) -> bool:
+    """Best-effort removal of the pin THIS request just created.
+
+    Returns ``True`` when a leftover remains (removal failed), so the
+    response can report the orphan honestly instead of claiming a rollback
+    the architecture does not provide. Only the pin written by this same
+    enrollment is ever passed here; pre-existing entries were refused
+    before any write and never reach this helper.
+    """
+    try:
+        pin_path.unlink(missing_ok=True)
+    except OSError:
+        return True
+    return pin_path.exists()
 
 
 def _credential_service(request: Request) -> EnvResolver:
@@ -1004,6 +1056,183 @@ async def test_connection(
             boot_id=result.identity.boot_id,
         ),
     )
+
+
+@onboarding_router.post(
+    "/enroll",
+    status_code=HTTP_201_CREATED,
+    response_model=ProfileMutationResult,
+    summary=(
+        "Enroll the verified SSH target: persist the host-key pin and "
+        "canonical profile"
+    ),
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin or CSRF rejection",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": (
+                "Target presents none of the accepted fingerprint, a pin "
+                "already exists for the minted identity, or the canonical "
+                "write conflicts"
+            ),
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": (
+                "Host-key trust not explicitly confirmed, invalid request "
+                "shape, or profile document validation failure"
+            ),
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential source or target transport unavailable",
+        },
+    },
+)
+async def enroll_server(
+    request: Request, payload: OnboardingEnrollRequest
+) -> Response:
+    """Confirmed enrollment: re-verify, then persist pin + canonical profile.
+
+    Order is the whole contract (so_PLAN "Confirmed enrollment"):
+
+    1. Explicit trust first: absent/false ``host_key_confirmed`` is a
+       ``422 host_key_confirmation_required`` BEFORE any scan, credential
+       resolution or write — confirmation is consent to first-use trust,
+       never a bypass of verification.
+    2. Immediate pre-write re-verification through the exact task-01
+       routine (:func:`run_connection_test`, off the event loop): bounded
+       rescan requiring the accepted fingerprint into a temporary pinned
+       known-hosts file, real pinned SSH identity probe, requested bounded
+       privilege check. A changed fingerprint is ``409 host_key_mismatch``
+       with zero canonical or durable-pin writes.
+    3. Only after verification: the matching key is persisted as the ONE
+       canonical enrolled pin at ``<data_root>/servers/<server_uuid>/
+       known_hosts`` (:func:`durable_known_hosts_path` — the exact file
+       ``mai.api.terminal._known_hosts_path`` and the other pinned
+       consumers read; atomic 0600, never overwriting a pre-existing entry,
+       one more exact-fingerprint rescan at write time). Then the canonical
+       document (with the server-side default ``credential_ref`` and the
+       confirmed ``host_key``) goes through the existing journal pipeline
+       (:meth:`apply_upsert`) plus the prompt write, mirroring
+       ``POST /servers`` exactly.
+    4. A canonical/prompt failure is never a false success: the pin created
+       moments earlier is removed (best effort, without touching any
+       pre-existing file) and a leftover is reported in the error envelope.
+
+    The response is the existing :class:`ProfileMutationResult`; no
+    credential material, resolver path or key path is ever returned.
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    if not payload.host_key_confirmed:
+        # Consent gate before EVERY effect: no scan, no resolution, no write.
+        return render_error_envelope(
+            request,
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "host_key_confirmation_required",
+            "enrollment requires explicit host-key trust confirmation "
+            "(host_key_confirmed)",
+        )
+    prompt_err = _validate_prompt_text(request, payload.prompt_text)
+    if prompt_err is not None:
+        return prompt_err
+    store, projection = _canonical_service(request)
+    resolver = _credential_service(request)
+    app_env: Mapping[str, str] | None = request.app.state.env
+    identity = SshIdentity(
+        host=payload.ssh.host,
+        port=payload.ssh.port,
+        user=payload.ssh.user,
+        host_key=payload.host_key,
+        credential_ref=default_credential_ref(app_env),
+    )
+    # (2) Immediate pre-write verification — the task-01 routine verbatim.
+    try:
+        key_path = await asyncio.to_thread(
+            resolve_default_identity_key, resolver, app_env
+        )
+        verified = await asyncio.to_thread(
+            run_connection_test,
+            identity,
+            privilege=payload.privilege,
+            key_path=key_path,
+            timeout=float(payload.timeout_seconds),
+        )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    # (3) Persistence: durable pin first, then the canonical pipeline.
+    server_id = uuid.uuid4()
+    canonical_request = ProfileCreate(
+        name=payload.name,
+        prompt_revision=payload.prompt_revision,
+        prompt_text=payload.prompt_text,
+        environment=payload.environment,
+        ssh=SshIdentityBody(
+            host=identity.host,
+            port=identity.port,
+            user=identity.user,
+            host_key=verified.host_key,
+            credential_ref=identity.credential_ref,
+        ),
+        privilege=payload.privilege,
+        capabilities=payload.capabilities,
+    )
+    resolved_revision = (
+        payload.prompt_revision if payload.prompt_revision is not None else 1
+    )
+    resolved_prompt = (
+        payload.prompt_text
+        if payload.prompt_text is not None
+        else f"# Server instructions for {payload.name.strip()}\n"
+    )
+    pin_path = durable_known_hosts_path(store.root, server_id)
+    try:
+        # (3) The single canonical pin, freshly re-verified moments ago.
+        await asyncio.to_thread(
+            pin_durable_host_key, server_id, identity, data_root=store.root
+        )
+    except OnboardingError as exc:
+        # Refused pin (pre-existing entry) or a key that changed again:
+        # nothing canonical exists, the envelope is the whole truth.
+        return _onboarding_error_response(request, exc)
+    try:
+        result = await projection.apply_upsert(
+            store,
+            server_id,
+            _canonical_document(
+                server_id, canonical_request, prompt_revision=resolved_revision
+            ),
+            expected_revision=0,
+        )
+        _write_prompt_text(store, server_id, resolved_prompt)
+    except (ProfileValidationError, ProfileFileError, ProjectionError) as exc:
+        if _remove_orphan_pin(pin_path):
+            return render_error_envelope(
+                request,
+                HTTP_409_CONFLICT,
+                "conflict",
+                f"enrollment failed after the host-key pin was written and "
+                f"the orphan pin for server {server_id} could not be "
+                "removed; recovery required",
+            )
+        return _profile_error(request, exc)
+    except Exception:
+        # Unmapped failure (bug or infrastructure): still no false success,
+        # still best-effort orphan cleanup, then the app's generic 500 path.
+        _remove_orphan_pin(pin_path)
+        raise
+    return _mutation_result(server_id, result)
 
 
 def register_servers(app: FastAPI) -> None:

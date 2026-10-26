@@ -41,11 +41,13 @@ from mai.execution.onboarding import (
     OnboardingErrorCode,
     default_credential_ref,
     discover_host_key_candidates,
+    durable_known_hosts_path,
     export_public_key,
+    pin_durable_host_key,
     resolve_default_identity_key,
     run_connection_test,
 )
-from mai.execution.ssh import target_fingerprint
+from mai.execution.ssh import probe_environment, target_fingerprint
 
 #: Synthetic non-disclosure marker (NOT a secret): the fixture "private key"
 #: file body used when a rejection must not leak file content.
@@ -840,3 +842,145 @@ class TestUnreachableRealTransport:
                 timeout=5,
             )
         assert excinfo.value.code is OnboardingErrorCode.UNREACHABLE
+
+
+# ---------------------------------------------------------------------------
+# Confirmed enrollment: durable pin persistence (task 02)
+# ---------------------------------------------------------------------------
+
+
+class TestDurableHostKeyPin:
+    """The single canonical ``servers/<uuid>/known_hosts`` pin contract."""
+
+    def test_pin_writes_matching_key_at_canonical_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _fake_transport(monkeypatch, _PIN_A, {})
+        server_id = uuid.uuid4()
+        pinned = pin_durable_host_key(
+            server_id, _identity(host_key=_PIN_A), data_root=tmp_path
+        )
+        assert pinned.fingerprint == _PIN_A
+        assert pinned.key_type == "ssh-ed25519"
+        pin_path = durable_known_hosts_path(tmp_path, server_id)
+        assert pin_path == tmp_path / "servers" / str(server_id) / "known_hosts"
+        # Exactly the accepted key line, file 0600, both directories 0700.
+        assert pin_path.read_text(encoding="utf-8") == (
+            f"[127.0.0.1]:2222 ssh-ed25519 {_blob_for(_PIN_A)}\n"
+        )
+        assert (os.stat(pin_path).st_mode & 0o777) == 0o600
+        assert (os.stat(pin_path.parent).st_mode & 0o777) == 0o700
+        assert (os.stat(pin_path.parent.parent).st_mode & 0o777) == 0o700
+        # No root-level pin directory exists: enrollment writes ONE pin.
+        assert not (tmp_path / "known_hosts").exists()
+
+    def test_pre_existing_pin_is_never_overwritten(self, tmp_path: Path) -> None:
+        server_id = uuid.uuid4()
+        pin_path = durable_known_hosts_path(tmp_path, server_id)
+        pin_path.parent.mkdir(parents=True)
+        pin_path.write_text("pre-existing\n", encoding="utf-8")
+        with pytest.raises(OnboardingError) as excinfo:
+            pin_durable_host_key(
+                server_id, _identity(host_key=_PIN_A), data_root=tmp_path
+            )
+        assert excinfo.value.code is OnboardingErrorCode.HOST_KEY_PIN_EXISTS
+        assert pin_path.read_text(encoding="utf-8") == "pre-existing\n"
+
+    def test_pre_existing_symlink_is_refused(self, tmp_path: Path) -> None:
+        server_id = uuid.uuid4()
+        pin_path = durable_known_hosts_path(tmp_path, server_id)
+        pin_path.parent.mkdir(parents=True)
+        pin_path.symlink_to(tmp_path / "elsewhere")
+        with pytest.raises(OnboardingError) as excinfo:
+            pin_durable_host_key(
+                server_id, _identity(host_key=_PIN_A), data_root=tmp_path
+            )
+        assert excinfo.value.code is OnboardingErrorCode.HOST_KEY_PIN_EXISTS
+        assert pin_path.is_symlink()
+
+    def test_changed_presented_key_writes_no_pin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _fake_transport(monkeypatch, _PIN_B, {})
+        server_id = uuid.uuid4()
+        with pytest.raises(OnboardingError) as excinfo:
+            pin_durable_host_key(
+                server_id, _identity(host_key=_PIN_A), data_root=tmp_path
+            )
+        assert excinfo.value.code is OnboardingErrorCode.HOST_KEY_MISMATCH
+        # No durable pin file exists after the refused write.
+        assert not durable_known_hosts_path(tmp_path, server_id).exists()
+
+    def test_malformed_fingerprint_rejected_before_any_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            raise AssertionError("no subprocess may run for a malformed pin")
+
+        monkeypatch.setattr(subprocess, "run", boom)
+        with pytest.raises(OnboardingError) as excinfo:
+            pin_durable_host_key(
+                uuid.uuid4(), _identity(host_key="not-a-fingerprint"),
+                data_root=tmp_path,
+            )
+        assert excinfo.value.code is OnboardingErrorCode.INVALID_CONFIGURATION
+
+
+@pytest.mark.real_target
+class TestEnrollmentSeamAgainstFixture:
+    """Real transport: pin → durable read-back → probe with no new trust."""
+
+    def test_persisted_pin_serves_probe_environment_immediately(
+        self, so_sshd: SoSshdFixture
+    ) -> None:
+        from types import SimpleNamespace
+
+        from mai.api.terminal import _known_hosts_path
+
+        data_root = so_sshd.scratch / "enroll-root"
+        server_id = uuid.uuid4()
+        pin = pin_durable_host_key(
+            server_id, so_sshd.identity, data_root=data_root
+        )
+        assert pin.fingerprint == so_sshd.identity.host_key
+        pin_path = durable_known_hosts_path(data_root, server_id)
+        # The canonical pin IS the consumer path: byte-identical to what
+        # terminal._known_hosts_path resolves for this server.
+        assert pin_path == _known_hosts_path(
+            SimpleNamespace(root=data_root), server_id
+        )
+        # Durable read-back: exactly one managed line for the accepted key.
+        lines = pin_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert target_fingerprint(*lines[0].split()[1:]) == pin.fingerprint
+        # No root-level pin exists: enrollment writes exactly ONE pin.
+        assert not (data_root / "known_hosts").exists()
+        # The existing pinned probe_environment works IMMEDIATELY against
+        # the persisted pin — no second trust step, no temporary file.
+        observed = probe_environment(
+            so_sshd.identity,
+            key_path=so_sshd.key_path,
+            known_hosts_path=pin_path,
+        )
+        assert observed.kernel_name == "Linux"
+        assert observed.os_id == "arch"
+        assert observed.boot_id
+
+    def test_second_server_pins_separately_without_touching_the_first(
+        self, so_sshd: SoSshdFixture
+    ) -> None:
+        data_root = so_sshd.scratch / "enroll-root"
+        first = uuid.uuid4()
+        pin_durable_host_key(first, so_sshd.identity, data_root=data_root)
+        first_path = durable_known_hosts_path(data_root, first)
+        before = first_path.read_bytes()
+        # A second enrollment of the SAME verified target is its own pin
+        # file; the first server's pin is byte-identical afterwards.
+        second = uuid.uuid4()
+        pin_durable_host_key(second, so_sshd.identity, data_root=data_root)
+        assert durable_known_hosts_path(data_root, second).read_bytes() == before
+        assert first_path.read_bytes() == before
+        assert sorted(
+            p.name for p in data_root.joinpath("servers").iterdir()
+        ) == sorted({str(first), str(second)})
+        assert not (data_root / "known_hosts").exists()
