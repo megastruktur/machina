@@ -44,10 +44,11 @@ profile edit that carries the new edition number through the same pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Literal
 
 import yaml
 from fastapi import APIRouter, FastAPI, Request, Response
@@ -57,6 +58,7 @@ from starlette.status import (
     HTTP_200_OK,
     HTTP_201_CREATED,
     HTTP_401_UNAUTHORIZED,
+    HTTP_403_FORBIDDEN,
     HTTP_404_NOT_FOUND,
     HTTP_409_CONFLICT,
     HTTP_422_UNPROCESSABLE_CONTENT,
@@ -79,6 +81,19 @@ from mai.contracts.server import (
     ServerProfile,
     parse_server_profile_text,
 )
+from mai.credentials.env import EnvFileError, EnvResolver
+from mai.execution.onboarding import (
+    ConnectionTestResult,
+    ExportedPublicKey,
+    OnboardingError,
+    OnboardingErrorCode,
+    default_credential_ref,
+    discover_host_key_candidates,
+    export_public_key,
+    resolve_default_identity_key,
+    run_connection_test,
+)
+from mai.execution.ssh import ScannedHostKey, SshIdentity
 from mai.profiles.files import (
     SERVERS_DIR,
     FileStoreErrorCode,
@@ -207,6 +222,91 @@ class ProfileListResponse(BaseModel):
     """Every stored server profile in deterministic ``(name, id)`` order."""
 
     servers: list[ProfileResponse]
+
+
+# ---------------------------------------------------------------------------
+# Guided-onboarding wire shapes (so_PLAN: controller key + connection test;
+# transport only — the browser never names a credential reference or key
+# path, and the enroll route does not exist until campaign task 02)
+# ---------------------------------------------------------------------------
+
+
+class ControllerKeyResponse(BaseModel):
+    """The controller public half only: one OpenSSH public-key line."""
+
+    public_key: str
+    key_type: str
+    fingerprint: str
+
+
+class OnboardingSshTarget(BaseModel):
+    """Requested SSH endpoint; field rules mirror the canonical schema.
+
+    The patterns are local copies of the canonical schema's
+    ``_SSH_HOST_RE``/``_SSH_USER_RE`` (shape owner ``mai.contracts.server``
+    is outside this task's allowlist). They are a transport hardening, not
+    cosmetic: a value beginning with ``-`` (e.g. ``user="-oProxyCommand=…"``
+    — reviewer-proved) would otherwise reach the ``ssh``/``ssh-keyscan``
+    argv as a LOCAL option instead of a user/host.
+    """
+
+    host: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=r"^[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9_])?$",
+    )
+    port: int = Field(ge=1, le=65535)
+    user: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$",
+    )
+
+
+class OnboardingTestRequest(BaseModel):
+    """Test payload: discovery when ``host_key`` is null, else pinned test."""
+
+    ssh: OnboardingSshTarget
+    privilege: PrivilegeMode
+    host_key: str | None = Field(
+        default=None,
+        pattern=r"^SHA256:[A-Za-z0-9+/]{43}$",
+        description="Selected candidate fingerprint; null = discovery only",
+    )
+    timeout_seconds: int = Field(default=10, ge=5, le=30)
+
+
+class OnboardingCandidate(BaseModel):
+    """One scanned host-key candidate; no authentication claim is made."""
+
+    host_key: str
+    key_type: str
+
+
+class OnboardingDiscoveryResponse(BaseModel):
+    """All scanned candidates, deduplicated in scan order."""
+
+    candidates: list[OnboardingCandidate]
+
+
+class OnboardingIdentityView(BaseModel):
+    """The Linux identity the real target reported (observed facts only)."""
+
+    hostname: str
+    os_id: str | None
+    os_version_id: str | None
+    kernel: str
+    boot_id: str | None
+
+
+class OnboardingTestResult(BaseModel):
+    """One successful pinned test: the accepted key actually authenticated."""
+
+    host_key: str
+    key_type: str
+    authentication: Literal["ok"]
+    privilege: PrivilegeMode
+    probe_environment: OnboardingIdentityView
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +788,229 @@ async def edit_profile(
     return _mutation_result(server_id, result)
 
 
+# ---------------------------------------------------------------------------
+# Guided onboarding (so_PLAN: read-only building blocks; task 02 owns enroll)
+# ---------------------------------------------------------------------------
+
+
+#: HTTP status + envelope code per structured onboarding rejection. The
+#: code field preserves the so_PLAN vocabulary verbatim (the admin needs to
+#: distinguish auth_failed from unreachable); 409 host-key mismatch follows
+#: the established applications/terminal mapping, transport failures are
+#: 503 with the structured code, and only request-shape problems are 422.
+_ONBOARDING_ERROR_STATUS: Final[dict[OnboardingErrorCode, tuple[int, str]]] = {
+    OnboardingErrorCode.HOST_KEY_MISMATCH: (HTTP_409_CONFLICT, "host_key_mismatch"),
+    OnboardingErrorCode.INVALID_CONFIGURATION: (
+        HTTP_422_UNPROCESSABLE_CONTENT,
+        "invalid_configuration",
+    ),
+    OnboardingErrorCode.KEY_EXPORT_FAILED: (
+        HTTP_422_UNPROCESSABLE_CONTENT,
+        "validation_failed",
+    ),
+}
+
+
+def _onboarding_error_response(
+    request: Request, exc: OnboardingError
+) -> JSONResponse:
+    """Render one structured, value-free onboarding rejection (C01)."""
+    status, code = _ONBOARDING_ERROR_STATUS.get(
+        exc.code, (HTTP_503_SERVICE_UNAVAILABLE, exc.code.value)
+    )
+    return render_error_envelope(request, status, code, exc.detail)
+
+
+def _credential_service(request: Request) -> EnvResolver:
+    """The lifespan-built credential resolver; without it fail closed."""
+    resolver = getattr(request.app.state, "credentials", None)
+    if resolver is None:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "credential source is not configured",
+        )
+    return resolver
+
+
+def _credentials_unavailable(request: Request) -> BoundaryError:
+    """Value-free 503 for a resolver-level rejection (no path, no value)."""
+    return BoundaryError(
+        HTTP_503_SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the default SSH credential reference is not configured in the "
+        "credential source",
+    )
+
+
+def _export_controller_key(resolver: EnvResolver, env: Mapping[str, str] | None) -> ExportedPublicKey:
+    """Blocking pair: resolve the default reference, then bounded export."""
+    return export_public_key(resolve_default_identity_key(resolver, env))
+
+
+onboarding_router = APIRouter(
+    prefix="/api/v1/servers/onboarding", tags=["servers"]
+)
+
+
+@onboarding_router.get(
+    "/controller-key",
+    status_code=HTTP_200_OK,
+    response_model=ControllerKeyResponse,
+    summary="Export the controller public key for authorized_keys",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Controller key missing, invalid or unsupported",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential resolver or reference unavailable",
+        },
+    },
+)
+async def get_controller_key(request: Request) -> Response:
+    """Return the configured controller's public key (session required).
+
+    Safe method: layer 1 only (no Origin/CSRF). The public half is derived
+    with one bounded ``ssh-keygen -y`` off the event loop; the response
+    never contains private material, the resolver path or an env value.
+    """
+    await _require_session(request)
+    resolver = _credential_service(request)
+    try:
+        exported = await asyncio.to_thread(
+            _export_controller_key, resolver, request.app.state.env
+        )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    return ControllerKeyResponse(
+        public_key=exported.public_key,
+        key_type=exported.key_type,
+        fingerprint=exported.fingerprint,
+    )
+
+
+@onboarding_router.post(
+    "/test",
+    status_code=HTTP_200_OK,
+    response_model=OnboardingDiscoveryResponse | OnboardingTestResult,
+    summary="Discover host-key candidates or run the pinned connection test",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin or CSRF rejection",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "Target presents none of the accepted fingerprint",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Invalid configuration; nothing ran",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Credential source or target transport unavailable",
+        },
+    },
+)
+async def test_connection(
+    request: Request, payload: OnboardingTestRequest
+) -> Response:
+    """Candidate discovery or the side-effect-free pinned test.
+
+    Mutation-order boundary (session → origin → CSRF) even though the
+    endpoint writes nothing: discovery makes no authentication claim and
+    the confirmed test binds every connection to the exact fingerprint the
+    administrator selected, through a newly created temporary known-hosts
+    file that is removed on every path. All blocking subprocess work runs
+    off the event loop; no durable state exists anywhere (task 02 owns
+    enrollment persistence).
+    """
+    await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    app_env: Mapping[str, str] | None = request.app.state.env
+    timeout = float(payload.timeout_seconds)
+    identity = SshIdentity(
+        host=payload.ssh.host,
+        port=payload.ssh.port,
+        user=payload.ssh.user,
+        host_key=payload.host_key or "",
+        credential_ref=default_credential_ref(app_env),
+    )
+    scanned: tuple[ScannedHostKey, ...] | None = None
+    result: ConnectionTestResult | None = None
+    try:
+        if payload.host_key is None:
+            # Discovery makes no authentication claim and touches no
+            # credential: a keyscan needs no resolver, so fail-closed
+            # credential handling applies only to the confirmed test.
+            scanned = await asyncio.to_thread(
+                discover_host_key_candidates, identity, timeout=timeout
+            )
+        else:
+            resolver = _credential_service(request)
+            key_path = await asyncio.to_thread(
+                resolve_default_identity_key, resolver, app_env
+            )
+            result = await asyncio.to_thread(
+                run_connection_test,
+                identity,
+                privilege=payload.privilege,
+                key_path=key_path,
+                timeout=timeout,
+            )
+    except EnvFileError:
+        raise _credentials_unavailable(request) from None
+    except OnboardingError as exc:
+        return _onboarding_error_response(request, exc)
+    if scanned is not None:
+        candidates: list[OnboardingCandidate] = []
+        seen: set[tuple[str, str]] = set()
+        for key in scanned:
+            marker = (key.key_type, key.fingerprint)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            candidates.append(
+                OnboardingCandidate(host_key=key.fingerprint, key_type=key.key_type)
+            )
+        return OnboardingDiscoveryResponse(candidates=candidates)
+    assert result is not None
+    return OnboardingTestResult(
+        host_key=result.host_key,
+        key_type=result.key_type,
+        authentication="ok",
+        privilege=result.privilege,
+        probe_environment=OnboardingIdentityView(
+            hostname=result.identity.hostname,
+            os_id=result.identity.os_id,
+            os_version_id=result.identity.os_version_id,
+            kernel=(
+                f"{result.identity.kernel_name} {result.identity.kernel_release}"
+            ),
+            boot_id=result.identity.boot_id,
+        ),
+    )
+
+
 def register_servers(app: FastAPI) -> None:
-    """Register the profile surface under the shared boundary (api-wiring)."""
+    """Register the profile surface under the shared boundary (api-wiring).
+
+    The static onboarding routes are included BEFORE the profile router so
+    ``/onboarding/*`` precedes ``/{server_id}`` in match order (so_PLAN).
+    """
+    app.include_router(onboarding_router)
     app.include_router(router)

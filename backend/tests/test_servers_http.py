@@ -444,6 +444,10 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("POST", "/api/v1/servers"),
         ("GET", "/api/v1/servers/{server_id}"),
         ("PUT", "/api/v1/servers/{server_id}"),
+        # (so-01-onboarding-probe: guided-onboarding key export + pinned
+        # connection test; enrollment stays absent until campaign task 02.)
+        ("GET", "/api/v1/servers/onboarding/controller-key"),
+        ("POST", "/api/v1/servers/onboarding/test"),
         # (03-approval-api remediation: the pin expanded by the frozen
         # approval preview/decision routes; intent unchanged.)
         ("GET", "/api/v1/approvals/{approval_id}"),
@@ -474,6 +478,24 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("PATCH", "/api/v1/chat/runs/{run_id}"),
         ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
         ("GET", "/api/v1/chat/runs/{run_id}/events"),
+        # (so-01-onboarding-probe reconciliation, NOT a new surface: these
+        # conversation/task read+steer routes already existed at base
+        # 9d786cf but were never pinned — the pin test failed there too.
+        # Pinned here so the table guards future additions again.)
+        ("GET", "/api/v1/chat/conversations"),
+        ("POST", "/api/v1/chat/conversations"),
+        ("GET", "/api/v1/chat/conversations/{conversation_id}"),
+        ("POST", "/api/v1/chat/conversations/{conversation_id}/messages"),
+        ("GET", "/api/v1/chat/conversations/{conversation_id}/messages"),
+        ("GET", "/api/v1/chat/conversations/{conversation_id}/events"),
+        ("GET", "/api/v1/chat/conversations/{conversation_id}/task"),
+        ("POST", "/api/v1/chat/conversations/{conversation_id}/steer"),
+        ("GET", "/api/v1/chat/tasks/{task_id}/items"),
+        ("GET", "/api/v1/chat/tasks/{task_id}/revisions"),
+        ("POST", "/api/v1/chat/tasks/{task_id}/revisions"),
+        ("GET", "/api/v1/chat/tasks/{task_id}/constraints"),
+        ("GET", "/api/v1/chat/tasks/{task_id}/evidence"),
+        ("POST", "/api/v1/chat/tasks/{task_id}/decisions"),
         # (mai-wire-desktop/chat: the lazy-loaded single tool step read.)
         ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
         # (06-model-api: stored connections/profiles/selection + probe.)
