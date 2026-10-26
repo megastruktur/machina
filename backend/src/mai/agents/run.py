@@ -184,6 +184,7 @@ from mai.capabilities.dispatch import (
 )
 from mai.capabilities.task_state import (
     TASK_PROPOSE_UPDATE_CAPABILITY,
+    TASK_READ_CAPABILITY,
     TASK_UPDATE_ITEM_CAPABILITY,
 )
 from mai.contracts.conversations import (
@@ -731,6 +732,26 @@ def compose_round_prompt(
     if steered_prompt is None:
         return progress_note
     return f"{steered_prompt}\n\n{progress_note}"
+
+
+def _phase_action_for_capability(capability_id: str, effect_class: str) -> PhaseAction:
+    """The §6 phase-gate action of one capability (pure, deterministic).
+
+    Task-state tools are run control over the task record itself, never
+    target-server effects: ``task.propose_update`` proposes plan content
+    (:attr:`PhaseAction.PLAN_PROPOSAL`) and ``task.read`` /
+    ``task.update_item`` are bookkeeping on the same record
+    (:attr:`PhaseAction.METADATA_UPDATE`) — both ratified as allowed in
+    every phase. Every OTHER capability maps by its descriptor's effect
+    class: ``read`` collects evidence, anything else executes steps.
+    """
+    if capability_id == TASK_PROPOSE_UPDATE_CAPABILITY:
+        return PhaseAction.PLAN_PROPOSAL
+    if capability_id in (TASK_READ_CAPABILITY, TASK_UPDATE_ITEM_CAPABILITY):
+        return PhaseAction.METADATA_UPDATE
+    if effect_class == "read":
+        return PhaseAction.COLLECT_EVIDENCE
+    return PhaseAction.EXECUTE_STEPS
 
 
 # ---------------------------------------------------------------------------
@@ -2504,17 +2525,18 @@ class AgentRunExecutor:
         # Phase gate (§6; task-phase-gate resource): a task-bound run
         # executes target effects only in ``act`` and reads only in
         # ``inspect``/``act`` — the ratified ``validate_phase`` mapping.
-        # The denial lands BEFORE the fence marker: no effect was even
-        # planned, and the honest failed row tells the model why.
+        # Task-state tools are run control, not target effects:
+        # ``task.propose_update`` maps to PLAN_PROPOSAL and ``task.read``
+        # / ``task.update_item`` to METADATA_UPDATE (allowed in every
+        # phase); target read tools map to COLLECT_EVIDENCE and target
+        # non-read tools to EXECUTE_STEPS. The denial lands BEFORE the
+        # fence marker: no effect was even planned, and the honest failed
+        # row tells the model why.
         phase = await self.abound_task_phase(intent)
         if phase is not None:
             descriptor = self._bridge_of(intent).descriptor_for(str(capability_id))
             effect_class = str(getattr(descriptor, "effect_class", "") or "")
-            action = (
-                PhaseAction.COLLECT_EVIDENCE
-                if effect_class == "read"
-                else PhaseAction.EXECUTE_STEPS
-            )
+            action = _phase_action_for_capability(str(capability_id), effect_class)
             try:
                 validate_phase(phase, action)
             except TaskContractError:
