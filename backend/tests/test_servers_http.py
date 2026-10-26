@@ -97,41 +97,47 @@ def _alembic_config() -> AlembicConfig:
 
 
 def _reset_fixture_db(url: str) -> None:
-    """Reset the disposable fixture database to pre-bootstrap state.
+    """Reset the DISPOSABLE fixture database to pre-bootstrap state.
 
-    The list is explicit and dependency-safe: every application table
-    created by the migration chain (``0001``..``0007``) plus the
-    ``server_observations_seq`` sequence, which ``0007`` owns and does
-    not drop with its table. The same pattern is used by
-    ``tests/test_jobs_http.py`` and ``tests/test_schedules_http.py``.
-    No wildcard, no ``CASCADE``, no constraint-disabling and no product
-    migration is involved.
+    The disposable database may carry ``public`` tables beyond this suite's
+    own era — from later migrations (``0008``+ conversations/agent tasks) or
+    from other suites sharing the same pytest process — so the reset
+    enumerates the actual tables of THIS database and drops each by name in
+    one statement: no wildcard, no ``CASCADE``, no constraint-disabling and
+    no product migration is involved. This mirrors the reviewed pattern in
+    ``tests/test_onboarding_http.py`` (the previous explicit ``0001``..
+    ``0007`` list went stale the moment the chain grew and made a shared
+    ``upgrade head`` fail with ``DuplicateTable``). The
+    ``server_observations_seq`` sequence is dropped explicitly because
+    ``0007`` owns it and does not drop it with its table.
     """
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version, notification_alerts, "
-            "observation_findings, server_observations, knowledge_doc_chunks, "
-            "knowledge_documents, application_projection_journal, "
-            "application_projection"
-        )
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+                "ORDER BY tablename"
+            ).fetchall()
+        ]
+        if names:
+            # One statement: FK constraints WITHIN the dropped set are fine.
+            list_sql = ", ".join(f'"{name}"' for name in names)
+            conn.execute(f"DROP TABLE IF EXISTS {list_sql}")
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()
 
 
 @pytest.fixture(scope="session")
 def migrated_url() -> Iterator[str]:
-    """Disposable fixture database migrated from zero through ``head`` (0007).
+    """Disposable fixture database migrated from zero through ``head``.
 
     The reset must be complete: an earlier module in the same pytest
-    process may have migrated the shared disposable database all the way
-    to ``0007``, so dropping only the profile-era tables would leave the
-    later-schema tables behind and make ``upgrade head`` fail with
-    ``DuplicateTable`` (observed on ``job_runs``). The session teardown
-    resets the same database back to pre-bootstrap state so a repeated
-    run against the very same disposable database starts clean again.
+    process may have migrated the shared disposable database further than
+    this suite's own tables, so the enumerated reset above drops whatever
+    ``public`` tables exist and ``upgrade head`` starts from zero. The
+    session teardown resets the same database back to pre-bootstrap state
+    so a repeated run against the very same disposable database starts
+    clean again.
     """
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
