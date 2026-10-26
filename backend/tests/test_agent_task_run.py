@@ -61,6 +61,11 @@ from mai.capabilities.dispatch import (
     ExecutorResult,
     canonical_payload_hash,
 )
+from mai.capabilities.task_state import (
+    TASK_PROPOSE_UPDATE_CAPABILITY,
+    TASK_READ_CAPABILITY,
+    TASK_UPDATE_ITEM_CAPABILITY,
+)
 from mai.contracts.conversations import SteerAction
 from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
@@ -397,6 +402,12 @@ def _compose(
     registry = CapabilityRegistry()
     registry.register(_descriptor(READ_CAP, "read"))
     registry.register(_descriptor(PRIV_CAP, "privileged"))
+    # Task-state tools ride the SAME fixture descriptors: the phase gate
+    # maps them by capability id (§6), so their registered effect class
+    # only matters for the target-capability control cases.
+    registry.register(_descriptor(TASK_READ_CAPABILITY, "read"))
+    registry.register(_descriptor(TASK_PROPOSE_UPDATE_CAPABILITY, "mutate"))
+    registry.register(_descriptor(TASK_UPDATE_ITEM_CAPABILITY, "mutate"))
     journal = tmp_path / "journal.log"
     executor = JournalExecutor(journal)
     dispatcher = CapabilityDispatcher(
@@ -405,6 +416,9 @@ def _compose(
         grants=lambda: {
             READ_CAP: frozenset({SERVER_UUID}),
             PRIV_CAP: frozenset({SERVER_UUID}),
+            TASK_READ_CAPABILITY: frozenset({SERVER_UUID}),
+            TASK_PROPOSE_UPDATE_CAPABILITY: frozenset({SERVER_UUID}),
+            TASK_UPDATE_ITEM_CAPABILITY: frozenset({SERVER_UUID}),
         },
         policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
         adopted=lambda server_id: True,
@@ -909,13 +923,19 @@ class TestPhaseGate:
         tmp_path,
         run_id: str,
         capability_id: str,
+        allowed: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, object], list[str]]:
         composed, journal_executor = _compose(
             sessions, task_run_url, tmp_path, DispatchModel([], []).model
         )
-        outcome = _run(
-            composed.aexecute_tool(_intent_of(run_id), _tool_call(capability_id))
+        intent = (
+            _intent_of(run_id)
+            if allowed is None
+            else agent_run.parse_agent_run_intent(
+                harness._canonical(harness._intent_document(run_id, allowed=allowed))
+            )
         )
+        outcome = _run(composed.aexecute_tool(intent, _tool_call(capability_id)))
         journal_path = journal_executor.journal
         lines = (
             journal_path.read_text().splitlines()
@@ -1009,6 +1029,83 @@ class TestPhaseGate:
         )
         assert outcome["state"] == "succeeded"
         assert f"effect:{READ_CAP}:m1" in journal
+
+    @pytest.mark.anyio
+    async def test_task_state_tools_allowed_in_plan_and_inspect_phases(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        """Task-state tools are run control, never target effects: the
+        §6 gate maps them to always-allowed actions (``task.propose_update``
+        → PLAN_PROPOSAL, ``task.read``/``task.update_item`` →
+        METADATA_UPDATE), so they dispatch in EVERY phase — while target
+        capabilities stay strictly gated in the same phases.
+        """
+        # The run context enables the task tools next to the target
+        # capabilities (the same allowlist for the controls below, so the
+        # outcomes are phase-driven, not allowlist-driven).
+        allowed = (
+            READ_CAP,
+            PRIV_CAP,
+            TASK_READ_CAPABILITY,
+            TASK_PROPOSE_UPDATE_CAPABILITY,
+            TASK_UPDATE_ITEM_CAPABILITY,
+        )
+        for capability_id in (
+            TASK_READ_CAPABILITY,
+            TASK_PROPOSE_UPDATE_CAPABILITY,
+            TASK_UPDATE_ITEM_CAPABILITY,
+        ):
+            for phase in ("plan", "inspect", "act"):
+                run_id = str(uuid.uuid4())
+                await _alinked_turn(sessions, run_id)
+                await _ainsert_run(sessions, run_id)
+                await _abind_phase(sessions, run_id, phase)
+
+                outcome, journal = await self._denied_or_dispatched(
+                    sessions,
+                    task_run_url,
+                    tmp_path,
+                    run_id,
+                    capability_id,
+                    allowed=allowed,
+                )
+                assert outcome["state"] == "succeeded", (
+                    capability_id,
+                    phase,
+                    outcome["reason"],
+                )
+                assert f"effect:{capability_id}:m1" in journal
+
+        # Controls: target capabilities remain gated in these phases.
+        plan_run = str(uuid.uuid4())
+        await _alinked_turn(sessions, plan_run)
+        await _ainsert_run(sessions, plan_run)
+        await _abind_phase(sessions, plan_run, "plan")
+        plan_outcome, _plan_journal = await self._denied_or_dispatched(
+            sessions,
+            task_run_url,
+            tmp_path,
+            plan_run,
+            READ_CAP,
+            allowed=allowed,
+        )
+        assert plan_outcome["state"] == "failed"
+        assert plan_outcome["reason"] == "phase_not_allowed"
+
+        inspect_run = str(uuid.uuid4())
+        await _alinked_turn(sessions, inspect_run)
+        await _ainsert_run(sessions, inspect_run)
+        await _abind_phase(sessions, inspect_run, "inspect")
+        inspect_outcome, _inspect_journal = await self._denied_or_dispatched(
+            sessions,
+            task_run_url,
+            tmp_path,
+            inspect_run,
+            PRIV_CAP,
+            allowed=allowed,
+        )
+        assert inspect_outcome["state"] == "failed"
+        assert inspect_outcome["reason"] == "phase_not_allowed"
 
 
 # ---------------------------------------------------------------------------
