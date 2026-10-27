@@ -477,6 +477,7 @@ def _render_system_prompt(materials: ServerContextMaterials, role: str) -> str:
         f"\nRole: {role}\n"
         "\n# Server scope\n"
         f"server_id: {materials.server_id}\n"
+        f"server_name: {materials.profile.name}\n"
         f"prompt_revision: {materials.prompt_revision}\n"
         f"prompt_sha256: {materials.prompt_sha256}\n"
         f"\n## Administrator server instructions (revision "

@@ -326,6 +326,8 @@ class DispatchModel:
         self.soft = soft
         self.intake_calls = 0
         self.round_calls = 0
+        #: Full prompt text of each intake call (pinned-scope proofs).
+        self.intake_prompts: list[str] = []
 
     @property
     def model(self) -> FunctionModel:
@@ -345,6 +347,7 @@ class DispatchModel:
             if self.intake_calls >= len(self.intake_payloads):
                 raise AssertionError("scripted intake model exhausted")
             self._mark("intake_call")
+            self.intake_prompts.append(prompt_text)
             self.intake_calls += 1
             payload = self.intake_payloads[self.intake_calls - 1]
             return ModelResponse(
@@ -397,8 +400,14 @@ def _compose(
     task_run_url: str,
     tmp_path: Path,
     model: FunctionModel,
+    *,
+    data_root: Path | None = None,
 ) -> tuple[agent_run.AgentRunExecutor, JournalExecutor]:
-    """The executor composition with the REAL dispatcher (gate tests)."""
+    """The executor composition with the REAL dispatcher (gate tests).
+
+    ``data_root`` overrides the fixture data root (pinned-scope tests
+    enroll the SAME fixture server under the canonical name "Frame").
+    """
     registry = CapabilityRegistry()
     registry.register(_descriptor(READ_CAP, "read"))
     registry.register(_descriptor(PRIV_CAP, "privileged"))
@@ -425,7 +434,8 @@ def _compose(
         credentials=lambda: EnvResolver(_write_env(tmp_path)),
         executor=executor,
     )
-    model_root, data_root = _prepare_roots(tmp_path)
+    model_root, fixture_data_root = _prepare_roots(tmp_path)
+    data_root = data_root if data_root is not None else fixture_data_root
     composed = agent_run.AgentRunExecutor(
         sessions=sessions,
         dispatcher=dispatcher,
@@ -1506,3 +1516,245 @@ async def _asteering_rows(
 async def _noop_insert(run_id: str) -> None:
     """The ``job_runs`` row exists already (the test inserted it)."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# pinned server scope in the FIRST intake call (chat-server-scope-fix)
+# ---------------------------------------------------------------------------
+
+
+def _frame_data_root(tmp_path: Path) -> Path:
+    """The SAME fixture server enrolled under the canonical name "Frame"
+    (SteamOS Steam Frame VR headset acceptance wording)."""
+    from mai.profiles.files import ProfileFileStore
+
+    root = tmp_path / "frame-data-root"
+    harness._write_data_root(root)
+    store = ProfileFileStore(root)
+    stored = store.read(SERVER_UUID)
+    store.write(
+        SERVER_UUID,
+        stored.text.replace('name: "agent-run-fixture"', 'name: "Frame"'),
+        expected_revision=stored.revision,
+    )
+    return root
+
+
+class TestPinnedScopeFirstIntakeCall:
+    @pytest.mark.anyio
+    async def test_ports_wording_gets_frame_scope_and_inspects(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = await _alinked_turn(
+            sessions, run_id, message="Which ports are open on the device?"
+        )
+        await _ainsert_run(sessions, run_id)
+        payload = intake_fixtures._plan_payload(
+            message_id,
+            objective="Inspect listening/open ports on Frame",
+            operations=[intake_fixtures._add_op("s1_ports")],
+            phase="inspect",
+        )
+        scripted = DispatchModel([payload], [])
+        executor, journal_executor = _compose(
+            sessions,
+            task_run_url,
+            tmp_path,
+            scripted.model,
+            data_root=_frame_data_root(tmp_path),
+        )
+
+        result = _run(
+            executor.ainterpret_intake_turn(_intent_of(run_id), _pins_of(executor))
+        )
+
+        # The FIRST model call received the pinned Frame scope.
+        assert scripted.intake_calls == 1
+        prompt = scripted.intake_prompts[0]
+        assert "# Pinned server scope" in prompt
+        assert f"server_id: {SERVER_ID}" in prompt
+        assert "server_name: Frame" in prompt
+        assert "environment: linux_ssh" in prompt
+        # Not a clarify: an inspect-phase task naming Frame was planned.
+        assert result["turn_kind"] == "plan"
+        assert result["applied"] is True and result["disposition"] == "created"
+        assert result["requested_phase"] == "inspect"
+        task_row = await _fetchone(
+            sessions,
+            "SELECT summary FROM agent_tasks WHERE task_id = :t",
+            t=uuid.UUID(str(result["task_id"])),
+        )
+        assert "Frame" in task_row[0]
+
+        # The executor (not intake) performs reads: a harmless READ tool
+        # attempt against the ORIGINAL pinned ExecutionContext runs the
+        # gated read; no mutation/approval expansion happens.
+        outcome = _run(
+            executor.aexecute_tool(_intent_of(run_id), _tool_call(READ_CAP))
+        )
+        assert outcome["state"] == "succeeded"
+        journal = (
+            journal_executor.journal.read_text().splitlines()
+            if journal_executor.journal.exists()
+            else []
+        )
+        assert f"effect:{READ_CAP}:m1" in journal
+        assert not any(line.startswith(f"effect:{PRIV_CAP}") for line in journal)
+        assert await _count(sessions, "approvals") == 0
+        # Intake itself stayed tool-free.
+        usage = result["planner_usage"]
+        assert usage["function_tools"] == 0
+
+    @pytest.mark.anyio
+    async def test_service_inventory_wording_retains_frame_scope(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = await _alinked_turn(
+            sessions, run_id, message="What do you know about this service?"
+        )
+        await _ainsert_run(sessions, run_id)
+        payload = intake_fixtures._plan_payload(
+            message_id,
+            objective=(
+                "Inspect Frame's existing service inventory "
+                "(app.discover / app.list_adopted)"
+            ),
+            operations=[intake_fixtures._add_op("s1_inventory")],
+            phase="inspect",
+        )
+        scripted = DispatchModel([payload], [])
+        executor, _journal = _compose(
+            sessions,
+            task_run_url,
+            tmp_path,
+            scripted.model,
+            data_root=_frame_data_root(tmp_path),
+        )
+
+        result = _run(
+            executor.ainterpret_intake_turn(_intent_of(run_id), _pins_of(executor))
+        )
+
+        prompt = scripted.intake_prompts[0]
+        assert "server_name: Frame" in prompt
+        assert f"server_id: {SERVER_ID}" in prompt
+        # Retains Frame and plans inventory inspection — not a clarify
+        # about which device/server the conversation targets.
+        assert result["turn_kind"] == "plan"
+        assert result["applied"] is True and result["disposition"] == "created"
+        task_row = await _fetchone(
+            sessions,
+            "SELECT summary FROM agent_tasks WHERE task_id = :t",
+            t=uuid.UUID(str(result["task_id"])),
+        )
+        assert "Frame" in task_row[0]
+
+    def test_pinned_frame_scope_flows_full_route_intake_to_executor_read(
+        self, task_run_url, domain, scenario, composition
+    ) -> None:
+        """Full orchestration (real DBOS worker + engine + dispatcher):
+        the ORIGINAL ports wording must keep the pinned Frame scope end
+        to end — the FIRST intake call and every executor round receive
+        "server_name: Frame", intake applies an inspect task, and the
+        executor (not intake) performs one harmless gated READ against
+        the original pinned ExecutionContext. No approval/mutation."""
+        composition()
+        # Re-enroll the SAME fixture server under the canonical name
+        # "Frame"; the worker reads this data root (MAI_FX_DATA_ROOT).
+        from mai.profiles.files import ProfileFileStore
+
+        data_root = scenario / "data-root"
+        store = ProfileFileStore(data_root)
+        stored = store.read(SERVER_UUID)
+        store.write(
+            SERVER_UUID,
+            stored.text.replace('name: "agent-run-fixture"', 'name: "Frame"'),
+            expected_revision=stored.revision,
+        )
+        (scenario / "expect-scope.txt").write_text("Frame", encoding="utf-8")
+        harness._write_policy_files(scenario, grants=[{READ_CAP: True}])
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = _run(
+            _alinked_turn(domain, run_id, message="Which ports are open on the device?")
+        )
+        _run(_ainsert_run(domain, run_id))
+        intake_payload = intake_fixtures._plan_payload(
+            message_id,
+            objective="Inspect listening/open ports on Frame",
+            operations=[intake_fixtures._add_op("s1_ports")],
+            phase="inspect",
+        )
+        harness._script(
+            scenario,
+            [
+                {
+                    "tool_call": {
+                        "name": "final_result",
+                        "args": {"response": intake_payload},
+                    }
+                },
+                harness._tool_call_entry(),
+                {"text": "ports inspected; done"},
+            ],
+        )
+        document = harness._intent_document(
+            run_id, connection="gateway", profile="fast", wait_poll_seconds=0.5
+        )
+        client = EngineClient(task_run_url)
+        worker = None
+        try:
+            worker = harness._spawn_worker(
+                task_run_url, scenario / "handlers", scenario, "frame"
+            )
+            _run(harness._enqueue_run(client, _noop_insert, run_id, document))
+            harness._wait_until(
+                lambda: (harness._terminal_engine_state(client, run_id) or "")
+                == "succeeded",
+                harness.RUN_TIMEOUT,
+                "run success",
+            )
+        finally:
+            if worker is not None:
+                harness._stop(worker)
+            client.close()
+
+        # Intake applied an INSPECT task (not a clarify) naming Frame.
+        intake_events = [
+            event
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == INTAKE_EVENT_TYPE
+        ]
+        assert len(intake_events) == 1
+        data = intake_events[0]["data"]
+        assert data["turn_kind"] == "plan" and data["applied"] is True
+        assert data["requested_phase"] == "inspect"
+        with psycopg.connect(task_run_url) as conn:
+            summary = conn.execute(
+                "SELECT t.summary FROM agent_tasks t "
+                "JOIN conversation_runs r ON r.task_id = t.task_id "
+                "WHERE r.run_id = %s",
+                (uuid.UUID(run_id),),
+            ).fetchone()[0]
+            approvals = conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
+        assert "Frame" in summary
+        # EVERY model call (intake + executor rounds) saw the Frame scope.
+        model_calls = _count_marker(scenario, "model_call")
+        assert model_calls >= 2  # intake + at least one executor round
+        assert _count_marker(scenario, "scope_name_seen") == model_calls
+        assert _count_marker(scenario, "scope_name_missing") == 0
+        # The executor performed exactly one harmless gated read; no
+        # privileged effect and no approvals were created.
+        assert _count_marker(scenario, "effect:fixture.read:m1") == 1
+        assert not any(
+            line.startswith("effect:fixture.priv")
+            for line in harness._journal_lines(scenario)
+        )
+        assert approvals == 0
+        completed = [
+            event
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == "agent.completed"
+        ]
+        assert len(completed) == 1

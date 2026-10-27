@@ -269,6 +269,7 @@ def test_system_prompt_is_exact_composition_with_verbatim_prompt(
         f"\nRole: {ROLE}\n"
         "\n# Server scope\n"
         f"server_id: {SERVER_A}\n"
+        "server_name: alpha-host\n"
         "prompt_revision: 3\n"
         f"prompt_sha256: {materials.prompt_sha256}\n"
         "\n## Administrator server instructions (revision 3)\n"
@@ -283,6 +284,22 @@ def test_system_prompt_is_exact_composition_with_verbatim_prompt(
     assert assembled.model_connection == "gateway"
     assert assembled.model_profile == "fast"
     assert assembled.schema_version == CONTEXT_SCHEMA_VERSION
+
+
+def test_system_prompt_names_the_pinned_server_canonical_label(
+    data_root: Path, binding
+) -> None:
+    """The main executor prompt carries the canonical display name next to
+    the authoritative UUID (pinned-scope fix): the name is a label only,
+    the UUID stays the identity/authorization line."""
+    for server_id, name in ((SERVER_A, "alpha-host"), (SERVER_B, "beta-host")):
+        materials = load_server_context(data_root, server_id)
+        assembled = _assemble(binding, materials)
+        assert f"server_id: {server_id}\n" in assembled.system_prompt
+        assert f"server_name: {name}\n" in assembled.system_prompt
+        # No cross-server leak: the other server's label never appears.
+        other = "beta-host" if name == "alpha-host" else "alpha-host"
+        assert f"server_name: {other}" not in assembled.system_prompt
 
 
 def test_missing_prompt_is_structured_rejection(data_root: Path) -> None:

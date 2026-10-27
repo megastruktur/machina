@@ -85,6 +85,7 @@ from mai.contracts.tasks import (
     TaskFieldError,
     TaskPlanPatch,
 )
+from mai.agents.context import ServerContextMaterials
 
 __all__ = [
     "DEFAULT_TRANSCRIPT_LIMIT",
@@ -132,6 +133,7 @@ _ACTIVE_TASK_EXISTS: Final[str] = "active_task_exists"
 _NO_ACTIVE_TASK: Final[str] = "no_active_task"
 _UNEXPECTED_FOR_CREATE: Final[str] = "unexpected_for_create"
 _CONSTRAINT_ORIGIN_ANCHOR: Final[str] = "constraint_origin_anchor"
+_SERVER_SCOPE_MISMATCH: Final[str] = "server_scope_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +188,16 @@ class IntakeSnapshot:
     #: deterministic ``(position, constraint_id)`` order (bounded page).
     constraints: tuple[tuple[str, str, str], ...]
     constraints_omitted: bool
+    #: Canonical display name of the pinned server (label only; the
+    #: ``server_id`` above is the ONLY identity/authorization). ``None``
+    #: means the canonical profile was unavailable at composition time —
+    #: rendered explicitly, never silently dropped.
+    server_name: str | None = None
+    #: ``linux_ssh``-style environment label of the pinned profile.
+    server_environment: str | None = None
+    #: Bounded projection of the canonical administrator server
+    #: instructions for the pinned server.
+    server_instructions: str | None = None
 
 
 class IntakeRejection(ValueError):
@@ -247,6 +259,7 @@ async def aload_intake_snapshot(
     conversation_id: uuid.UUID,
     source_message_id: uuid.UUID,
     transcript_limit: int = DEFAULT_TRANSCRIPT_LIMIT,
+    server_materials: ServerContextMaterials | None = None,
 ) -> IntakeSnapshot:
     """Load the canonical bounded snapshot one turn is interpreted against.
 
@@ -254,10 +267,24 @@ async def aload_intake_snapshot(
     source message does not exist in the requested server scope, or when
     the source message is not a verified user message (§1: roles are
     producer-assigned; intake interprets USER turns only).
+
+    ``server_materials`` carries the host-pinned canonical server
+    identity (name/environment/instructions from the SAME producer as
+    executor assembly) into the FIRST intake call. It is validated
+    fail-closed: a mismatch with the conversation's ``server_id`` is
+    rejected BEFORE any model call; the pinned ``server_id`` (not the
+    display name) remains the only identity/authorization.
     """
     if not 1 <= transcript_limit <= task_store.MAX_PAGE_LIMIT:
         raise ValueError(
             f"transcript_limit must be in [1, {task_store.MAX_PAGE_LIMIT}]"
+        )
+    if server_materials is not None and server_materials.server_id != server_id:
+        raise IntakeRejection(
+            {"server_id": _SERVER_SCOPE_MISMATCH},
+            attempts=0,
+            repaired=False,
+            model_calls=0,
         )
     try:
         conversation = await conversation_store.aget_conversation(
@@ -378,7 +405,21 @@ async def aload_intake_snapshot(
         constraints_omitted=(
             constraints_page.has_more if constraints_page is not None else False
         ),
+        server_name=(
+            server_materials.profile.name if server_materials is not None else None
+        ),
+        server_environment=(
+            server_materials.profile.environment.value
+            if server_materials is not None
+            else None
+        ),
+        server_instructions=(
+            _project(server_materials.prompt_text)
+            if server_materials is not None
+            else None
+        ),
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +462,24 @@ Hard rules:
   executed or verified without real evidence references.
 - Facts reference existing records only; anything else is an explicit
   `assumptions` entry.
+
+Pinned server scope:
+- The conversation may be pinned to one server, shown under
+  "# Pinned server scope". Its server_id is the ONLY identity and
+  authorization; the name is a display label.
+- While a server is pinned, references like "this server", "this
+  device" or "the device" mean THAT server. Do not ask the user to
+  re-identify it and never claim no server/device context exists.
+- The pinned scope is not knowledge of unseen service facts: a turn
+  needing live state (ports, services, inventory) should become a
+  plan with requested_phase "inspect" targeting the pinned server so
+  the executor can inspect it with its existing gated tools.
+- After appropriate available inspection, genuine ambiguity about
+  WHICH service may still be a clarify. Never invent inventory,
+  ports or other unseen facts.
+- You cannot change the pinned scope: never propose another server
+  id/name as the target, and never treat a name you mention as
+  authorization.
 """
 
 
@@ -430,6 +489,40 @@ def build_snapshot_prompt(snapshot: IntakeSnapshot) -> str:
     lines.append(
         f"conversation_id: {snapshot.conversation_id}"
     )
+    if snapshot.server_id == uuid.UUID(int=0):
+        lines.append("# Pinned server scope")
+        lines.append(f"server_id: {uuid.UUID(int=0)}")
+        if snapshot.server_name is not None:
+            lines.append(f"server_name: {snapshot.server_name}")
+        lines.append(
+            "scope: general consult — no specific server is pinned; "
+            "interpret the turn without a target server and never guess "
+            "a host"
+        )
+    else:
+        lines.append("# Pinned server scope")
+        lines.append(f"server_id: {snapshot.server_id}")
+        lines.append(
+            "server_name: "
+            + (
+                snapshot.server_name
+                if snapshot.server_name is not None
+                else "(canonical profile unavailable; the server_id above "
+                "remains the pinned scope)"
+            )
+        )
+        if snapshot.server_environment is not None:
+            lines.append(f"environment: {snapshot.server_environment}")
+        if snapshot.server_instructions is not None:
+            lines.append(
+                "administrator server instructions (bounded): "
+                + snapshot.server_instructions
+            )
+        else:
+            lines.append(
+                "administrator server instructions: (canonical profile "
+                "unavailable)"
+            )
     if snapshot.transcript_omitted_older:
         lines.append(
             f"(older transcript turns exist and are omitted from this "
@@ -1098,6 +1191,7 @@ async def arun_intake_turn(
     source_message_id: uuid.UUID,
     max_repair_attempts: int = MAX_INTAKE_REPAIR_ATTEMPTS,
     transcript_limit: int = DEFAULT_TRANSCRIPT_LIMIT,
+    server_materials: ServerContextMaterials | None = None,
 ) -> IntakeOutcome:
     """Interpret and apply one accepted user turn end-to-end.
 
@@ -1106,6 +1200,9 @@ async def arun_intake_turn(
     Any unrepairable failure raises :class:`IntakeRejection` with
     value-free fields and honest attempt accounting; nothing is persisted
     for a rejected turn (P4: no effects on invalid intake).
+
+    ``server_materials`` (validated fail-closed in the snapshot loader)
+    renders the pinned server identity into the FIRST intake call.
     """
     snapshot = await aload_intake_snapshot(
         sessions,
@@ -1113,6 +1210,7 @@ async def arun_intake_turn(
         conversation_id=conversation_id,
         source_message_id=source_message_id,
         transcript_limit=transcript_limit,
+        server_materials=server_materials,
     )
     agent = IntakeAgent(model, max_repair_attempts=max_repair_attempts)
     core_agent = agent._build_agent()  # noqa: SLF001 - same-module seam

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import pathlib
 from typing import Sequence
 
 import psycopg
@@ -55,10 +56,13 @@ from mai.agents.conversation_store import (
     asubmit_turn,
 )
 from mai.agents.intake import (
+    IntakeSnapshot,
     IntakeRejection,
     aload_intake_snapshot,
     apropose_model_task_update,
     arun_intake_turn,
+    build_repair_prompt,
+    build_snapshot_prompt,
     validate_intake_decision,
 )
 from mai.agents.task_store import (
@@ -1320,3 +1324,205 @@ async def test_n2_blocked_variant_persists_nothing_on_active_task(sessions) -> N
     assert await _count(sessions, "agent_tasks") == 1
     assert await _count(sessions, "agent_task_steps") == 1
     assert await _count(sessions, "agent_task_revisions") == 1
+
+
+# ---------------------------------------------------------------------------
+# pinned server scope in the FIRST intake call (chat-server-scope-fix)
+# ---------------------------------------------------------------------------
+
+#: Second synthetic scope: never enrolled as a conversation scope here —
+#: it exists only as canonical profile material that must NOT leak.
+SERVER_B = "b20c9d6f-2e3a-4b5c-8d7e-1f2a3b4c5d6e"
+
+_SCOPE_HOST_KEY = "SHA256:" + "A" * 43
+
+FRAME_INSTRUCTIONS = (
+    "Frame is a SteamOS Steam Frame VR headset.\n"
+    "Manage services through the adopted service inventory only.\n"
+)
+
+
+def _scope_profile_text(server_id: uuid.UUID, name: str) -> str:
+    from mai.contracts.server import SCHEMA_VERSION
+
+    return (
+        f"schema_version: {SCHEMA_VERSION}\n"
+        f'server_id: "{server_id}"\n'
+        f'name: "{name}"\n'
+        "prompt_revision: 1\n"
+        "environment: linux_ssh\n"
+        "ssh:\n"
+        '  host: "198.51.100.99"\n'
+        "  port: 22\n"
+        '  user: "frame"\n'
+        f'  host_key: "{_SCOPE_HOST_KEY}"\n'
+        '  credential_ref: "MAI_SSH_KEY_FRAME"\n'
+        "privilege: none\n"
+        "capabilities: []\n"
+    )
+
+
+def _scope_materials(root, server_id: uuid.UUID, name: str, instructions: str):
+    from pathlib import Path
+
+    from mai.agents.context import load_server_context
+    from mai.profiles.files import ProfileFileStore
+
+    root = Path(root)
+    store = ProfileFileStore(root)
+    store.write(server_id, _scope_profile_text(server_id, name), expected_revision=0)
+    server_dir = root / "servers" / str(server_id)
+    server_dir.mkdir(parents=True, exist_ok=True)
+    (server_dir / "prompt.md").write_text(instructions, encoding="utf-8")
+    return load_server_context(root, server_id)
+
+
+def _bare_snapshot(**overrides: object) -> IntakeSnapshot:
+    """A minimal valid snapshot for prompt-level scope rendering tests."""
+    from mai.contracts.conversations import MessageRole
+
+    base: dict[str, object] = dict(
+        server_id=uuid.UUID(SERVER_A),
+        conversation_id=uuid.uuid4(),
+        source_message_id=uuid.uuid4(),
+        source_message_role=MessageRole.USER,
+        source_message_content="Which ports are open on the device?",
+        transcript=(),
+        transcript_omitted_older=False,
+        task_id=None,
+        task_revision=None,
+        task_phase=None,
+        task_title=None,
+        steps=(),
+        steps_omitted=False,
+        constraints=(),
+        constraints_omitted=False,
+    )
+    base.update(overrides)
+    return IntakeSnapshot(**base)  # type: ignore[arg-type]
+
+
+class TestPinnedServerScope:
+    @pytest.mark.anyio
+    async def test_snapshot_prompt_renders_pinned_scope_and_repair_preserves_it(
+        self, sessions, tmp_path
+    ) -> None:
+        materials = _scope_materials(
+            tmp_path, uuid.UUID(SERVER_A), "Frame", FRAME_INSTRUCTIONS
+        )
+        conversation_id = await _make_conversation(sessions)
+        message_id = await _submit_user(
+            sessions, conversation_id, "Which ports are open on the device?"
+        )
+        snapshot = await aload_intake_snapshot(
+            sessions,
+            server_id=uuid.UUID(SERVER_A),
+            conversation_id=conversation_id,
+            source_message_id=message_id,
+            server_materials=materials,
+        )
+        assert snapshot.server_name == "Frame"
+        assert snapshot.server_environment == "linux_ssh"
+        assert "Steam Frame VR headset" in snapshot.server_instructions
+
+        prompt = build_snapshot_prompt(snapshot)
+        assert "# Pinned server scope" in prompt
+        assert f"server_id: {SERVER_A}" in prompt
+        assert "server_name: Frame" in prompt
+        assert "environment: linux_ssh" in prompt
+        assert "Steam Frame VR headset" in prompt
+        # The deterministic pinned-scope instructions ride the prompt.
+        assert '"the device" mean THAT server' in prompt
+        # Repair carries the FULL snapshot again: the scope survives.
+        repair = build_repair_prompt(snapshot, {"turn_kind": "invalid_kind"})
+        assert "# Pinned server scope" in repair
+        assert "server_name: Frame" in repair
+
+    @pytest.mark.anyio
+    async def test_two_servers_never_leak_each_others_scope(
+        self, sessions, tmp_path
+    ) -> None:
+        materials_frame = _scope_materials(
+            tmp_path, uuid.UUID(SERVER_A), "Frame", FRAME_INSTRUCTIONS
+        )
+        other_instructions = "OtherBox is an unrelated synthetic backup host.\n"
+        _scope_materials(
+            tmp_path, uuid.UUID(SERVER_B), "OtherBox", other_instructions
+        )
+        conversation_id = await _make_conversation(sessions)
+        message_id = await _submit_user(sessions, conversation_id, "check the device")
+
+        frame_snapshot = await aload_intake_snapshot(
+            sessions,
+            server_id=uuid.UUID(SERVER_A),
+            conversation_id=conversation_id,
+            source_message_id=message_id,
+            server_materials=materials_frame,
+        )
+        frame_prompt = build_snapshot_prompt(frame_snapshot)
+        assert "server_name: Frame" in frame_prompt
+        assert "OtherBox" not in frame_prompt
+        assert "unrelated synthetic backup host" not in frame_prompt
+
+        # The other server's materials render their own scope only.
+        other_prompt = build_snapshot_prompt(
+            _bare_snapshot(
+                server_id=uuid.UUID(SERVER_B),
+                server_name="OtherBox",
+                server_environment="linux_ssh",
+                server_instructions=other_instructions,
+            )
+        )
+        assert "server_name: OtherBox" in other_prompt
+        assert "Frame" not in other_prompt
+        assert "Steam Frame VR headset" not in other_prompt
+
+    def test_global_consult_scope_is_explicit(self) -> None:
+        from mai.agents.context import load_server_context
+
+        materials = load_server_context(
+            pathlib.Path("/nonexistent-data-root"), uuid.UUID(int=0)
+        )
+        prompt = build_snapshot_prompt(
+            _bare_snapshot(
+                server_id=materials.server_id,
+                server_name=materials.profile.name,
+                server_environment=materials.profile.environment.value,
+                server_instructions=materials.prompt_text,
+            )
+        )
+        assert "# Pinned server scope" in prompt
+        assert "no specific server is pinned" in prompt
+        assert "general_consult" in prompt
+
+    def test_unavailable_profile_is_rendered_explicitly(self) -> None:
+        prompt = build_snapshot_prompt(_bare_snapshot())
+        assert f"server_id: {SERVER_A}" in prompt
+        assert "(canonical profile unavailable" in prompt
+        assert "administrator server instructions: (canonical profile unavailable)" in (
+            prompt
+        )
+
+    @pytest.mark.anyio
+    async def test_scope_mismatch_rejected_before_model_calls(
+        self, sessions, tmp_path
+    ) -> None:
+        materials_other = _scope_materials(
+            tmp_path, uuid.UUID(SERVER_B), "OtherBox", "irrelevant\n"
+        )
+        conversation_id = await _make_conversation(sessions)
+        message_id = await _submit_user(sessions, conversation_id, "check the device")
+        scripted = ScriptedModel([])  # any call fails the test
+
+        with pytest.raises(IntakeRejection) as excinfo:
+            await arun_intake_turn(
+                scripted.model,
+                sessions,
+                server_id=uuid.UUID(SERVER_A),
+                conversation_id=conversation_id,
+                source_message_id=message_id,
+                server_materials=materials_other,
+            )
+        assert excinfo.value.fields == {"server_id": "server_scope_mismatch"}
+        assert excinfo.value.model_calls == 0
+        assert scripted.calls == 0

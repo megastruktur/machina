@@ -1848,6 +1848,17 @@ class AgentRunExecutor:
         planner_model = (
             resolved.model if isinstance(resolved, ResolvedModel) else resolved
         )
+        # Pinned-server context for the FIRST intake call: the SAME
+        # canonical producer as executor assembly. An unavailable
+        # profile/prompt is represented EXPLICITLY in the intake
+        # snapshot prompt ("canonical profile unavailable"); the pinned
+        # server_id stays the scope either way (never inferred away).
+        try:
+            server_materials = load_server_context(
+                self._data_root, uuid.UUID(intent.server_id)
+            )
+        except ContextError:
+            server_materials = None
 
         try:
             outcome = await arun_intake_turn(
@@ -1856,6 +1867,7 @@ class AgentRunExecutor:
                 server_id=uuid.UUID(intent.server_id),
                 conversation_id=conversation_id,
                 source_message_id=source_message_id,
+                server_materials=server_materials,
             )
         except IntakeRejection as exc:
             await self._emit_once(

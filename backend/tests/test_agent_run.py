@@ -773,6 +773,21 @@ def _script_model():
 
     def _model_fn(messages, info):
         _mark("model_call")
+        # Pinned-scope visibility (chat-server-scope-fix): when the
+        # scenario pins an expected canonical server name, journal
+        # whether THIS call's full message surface actually carried it.
+        expected_scope = os.environ.get("MAI_FX_EXPECT_SCOPE_NAME")
+        if expected_scope:
+            surface = "\\n".join(
+                str(getattr(part, "content", "") or "")
+                for message in messages
+                for part in getattr(message, "parts", [])
+            )
+            _mark(
+                "scope_name_seen"
+                if f"server_name: {expected_scope}" in surface
+                else "scope_name_missing"
+            )
         # Journal what the model sees as the latest tool return, so the
         # resume path's honesty is observable from the scenario journal.
         for message in reversed(messages):
@@ -1004,6 +1019,12 @@ def _spawn_worker(
     env["MAI_FX_ENV"] = str(scenario / "fixture.env")
     env["MAI_FX_MODEL_ROOT"] = str(scenario / "model-root")
     env["MAI_FX_DATA_ROOT"] = str(scenario / "data-root")
+    expect_scope = scenario / "expect-scope.txt"
+    env.pop("MAI_FX_EXPECT_SCOPE_NAME", None)
+    if expect_scope.exists():
+        env["MAI_FX_EXPECT_SCOPE_NAME"] = expect_scope.read_text(
+            encoding="utf-8"
+        ).strip()
     web_path = scenario / "web-read.json"
     env.pop("MAI_FX_WEB_READ", None)
     if web_path.exists():
