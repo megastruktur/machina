@@ -1066,11 +1066,21 @@
 	 * idempotency key; continuation is the conversation id; `expected_revision`
 	 * pins the task revision so a stale writer fails closed (409), and an
 	 * active lease surfaces `queued_followup` instead of a second executor.
+	 *
+	 * A4 recovery: the legacy "Continue with changes" handover rides THIS
+	 * SAME operation with `requested_phase: 'act'` and the explicit task
+	 * revision handed over by the plan block — one click, one submit, never
+	 * a decisions endpoint or a second executor. Read-only mode never
+	 * reaches it (the plan block hides the action; the guard below is belt).
 	 */
-	async function submitCanonicalTurn(rawUserPrompt: string): Promise<void> {
+	async function submitCanonicalTurn(
+		rawUserPrompt: string,
+		recovery?: { requestedPhase: 'act'; expectedRevision: number }
+	): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const openId = canonicalId;
 		if (canonicalRef === null || canonicalScope === null) return;
+		if (recovery !== undefined && readOnlyMode) return;
 		const clientRequestId = crypto.randomUUID();
 		// A NEW conversation targets the explicit DRAFT choice (the sentinel
 		// when the server chip was removed); a FOLLOW-UP targets the open
@@ -1087,15 +1097,17 @@
 							client_request_id: clientRequestId,
 							message: rawUserPrompt,
 							profile: composeProfile.trim(),
-							requested_phase: readOnlyMode ? 'plan' : null,
+							requested_phase: recovery ? 'act' : readOnlyMode ? 'plan' : null,
 							task_action: 'continue'
 						})
 					: await canonicalRef.submitConversationMessage(openId, {
 							server_id: serverId,
 							client_request_id: clientRequestId,
 							message: rawUserPrompt,
-							expected_revision: lastRevision,
-							requested_phase: readOnlyMode ? 'plan' : null,
+							expected_revision: recovery
+								? recovery.expectedRevision
+								: lastRevision,
+							requested_phase: recovery ? 'act' : readOnlyMode ? 'plan' : null,
 							task_action: 'continue'
 						});
 			if (disposed) return;
@@ -1113,6 +1125,13 @@
 			if (!disposed) void loadHistory();
 		} catch (error) {
 			if (disposed) return;
+			if (recovery !== undefined) {
+				// A4: the recovery handover renders its OWN honest outcome in
+				// the plan block (stale revision / transport); the composer
+				// area stays untouched and the failure propagates so no
+				// success is claimed.
+				throw error;
+			}
 			const code = codeOf(error) ?? 'unavailable';
 			composeProblem = {
 				code,
@@ -1134,6 +1153,24 @@
 		} finally {
 			if (!disposed) composeBusy = false;
 		}
+	}
+
+	/**
+	 * A4 legacy recovery: the ONE-click "Continue with changes" handover.
+	 * The phase decision and the canonical continuation ride ONE existing
+	 * submit operation (`requested_phase: 'act'`, `task_action: 'continue'`,
+	 * the plan block's explicit `expected_revision`, the pinned
+	 * `server_id`) — never a decisions endpoint or a second executor. This
+	 * approves NO operation: grants and operation approvals still gate
+	 * every effect. Read-only mode never offers the action; the guard is
+	 * belt against future callers.
+	 */
+	async function continueWithChanges(expectedRevision: number): Promise<void> {
+		if (readOnlyMode) return;
+		await submitCanonicalTurn(
+			'Continue with changes: advance this task to the act phase and proceed with the remaining plan.',
+			{ requestedPhase: 'act', expectedRevision }
+		);
 	}
 
 	/**
@@ -3707,6 +3744,8 @@
 						conversationId={canonicalId}
 						serverId={canonicalScope}
 						sourceMessageId={lastCanonicalUserMessageId}
+						readOnly={readOnlyMode}
+						onContinueWithChanges={continueWithChanges}
 					/>
 				{/if}
 			</div>

@@ -75,6 +75,10 @@ interface TaskPlanWindowApi {
 	seedEpisode(): void;
 	/** Hold every submit in flight (pending/applied distinction proof). */
 	holdSubmit(on: boolean): void;
+	/** A4: the recorded recovery handovers (component → parent contract). */
+	recoveryCalls: Array<{ expectedRevision: number }>;
+	/** Hold the recovery handover in flight (pending state proof). */
+	holdRecovery(on: boolean): void;
 }
 
 declare global {
@@ -84,6 +88,14 @@ declare global {
 		__maiTaskPlanScenario?: Scenario;
 		__maiTaskPlanPollMs?: number;
 		__maiTaskPlanStorage?: string[];
+		/** A4: recovery handover behavior of the fixture parent. */
+		__maiTaskPlanRecovery?: 'resolve' | 'conflict' | 'transport' | 'pending' | 'absent';
+		/** A4: read-only mode of the fixture host. */
+		__maiTaskPlanReadOnly?: boolean;
+		/** A4: header phase override (act proves the gate stays off). */
+		__maiTaskPlanPhase?: 'inspect' | 'act';
+		/** A4: header outcome override (terminal episodes prove it too). */
+		__maiTaskPlanOutcome?: string;
 	}
 }
 
@@ -232,8 +244,8 @@ const APP_SOURCE = `
 			revision,
 			title: 'Renew the TLS certificate on edge-01',
 			summary: scenario === 'empty' ? null : 'Replace the expiring certificate and verify the deployment.',
-			requested_phase: 'inspect',
-			status: 'in_progress',
+			requested_phase: window.__maiTaskPlanPhase ?? 'inspect',
+			status: window.__maiTaskPlanOutcome ?? 'in_progress',
 			active_step_id: scenario === 'empty' ? null : 's2',
 			counts: {
 				steps_total: active.length,
@@ -397,6 +409,32 @@ const APP_SOURCE = `
 		setTimeout(() => { show = true; }, 0);
 	}
 
+	// --- A4 recovery: the fixture parent's canonical-submit stand-in ---------
+	// Mirrors ChatPanel wiring: ONE canonical follow-up handover with the
+	// component-supplied expectedRevision; behavior per __maiTaskPlanRecovery.
+	const recoveryMode = window.__maiTaskPlanRecovery ?? 'none';
+	const hostReadOnly = window.__maiTaskPlanReadOnly ?? false;
+	const recoveryCalls = [];
+	let recoveryHold = false;
+	let recoveryRelease = null;
+
+	async function continueWithChanges(expectedRevision) {
+		recoveryCalls.push({ expectedRevision });
+		if (recoveryHold) {
+			const held = Promise.withResolvers();
+			recoveryRelease = held.resolve;
+			await held.promise;
+			return;
+		}
+		if (recoveryMode === 'conflict') {
+			throw new ApiError(409, 'revision_conflict', 'expected task revision does not match the current revision');
+		}
+		if (recoveryMode === 'transport') {
+			throw new ApiError(503, 'unavailable', 'the canonical submit endpoint is unreachable');
+		}
+		// 'resolve' | 'pending': the canonical turn was durably admitted.
+	}
+
 	window.__maiTaskPlanApi = {
 		calls,
 		remount,
@@ -435,6 +473,15 @@ const APP_SOURCE = `
 				holdResolve = null;
 				resolve(undefined);
 			}
+		},
+		recoveryCalls,
+		holdRecovery(on) {
+			recoveryHold = on;
+			if (!on && recoveryRelease !== null) {
+				const release = recoveryRelease;
+				recoveryRelease = null;
+				release(undefined);
+			}
 		}
 	};
 </script>
@@ -448,6 +495,8 @@ const APP_SOURCE = `
 				serverId={SERVER_A}
 				sourceMessageId={scenario === 'unanchored' ? null : ANCHOR}
 				pollMs={pollMs}
+				readOnly={hostReadOnly}
+				onContinueWithChanges={recoveryMode === 'absent' ? undefined : continueWithChanges}
 			/>
 		{/if}
 	</ComponentHost>
@@ -584,13 +633,38 @@ test.beforeEach(async ({ page }) => {
 	});
 });
 
-async function openFixture(page: Page, scenario: Scenario, pollMs = 0): Promise<void> {
+/** A4 fixture options: recovery handover behavior + header overrides. */
+interface RecoveryFixture {
+	recovery?: 'resolve' | 'conflict' | 'transport' | 'pending' | 'absent';
+	readOnly?: boolean;
+	phase?: 'inspect' | 'act';
+	outcome?: string;
+}
+
+async function openFixture(
+	page: Page,
+	scenario: Scenario,
+	pollMs = 0,
+	recovery: RecoveryFixture = {}
+): Promise<void> {
 	await page.addInitScript(
-		({ scenarioValue, pollValue }) => {
+		({ scenarioValue, pollValue, recoveryOptions }) => {
 			window.__maiTaskPlanScenario = scenarioValue;
 			window.__maiTaskPlanPollMs = pollValue;
+			if (recoveryOptions.recovery !== undefined) {
+				window.__maiTaskPlanRecovery = recoveryOptions.recovery;
+			}
+			if (recoveryOptions.readOnly !== undefined) {
+				window.__maiTaskPlanReadOnly = recoveryOptions.readOnly;
+			}
+			if (recoveryOptions.phase !== undefined) {
+				window.__maiTaskPlanPhase = recoveryOptions.phase;
+			}
+			if (recoveryOptions.outcome !== undefined) {
+				window.__maiTaskPlanOutcome = recoveryOptions.outcome;
+			}
 		},
-		{ scenarioValue: scenario, pollValue: pollMs }
+		{ scenarioValue: scenario, pollValue: pollMs, recoveryOptions: recovery }
 	);
 	await page.goto(FIXTURE_URL);
 }
@@ -1018,4 +1092,162 @@ test('criterion 1: remount (reopen) re-derives the same plan read-only with zero
 	// Storage honesty: zero localStorage/sessionStorage access, ever.
 	const storageAccess = await page.evaluate(() => window.__maiTaskPlanStorage ?? []);
 	expect(storageAccess).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// A4 (agent-interaction-recovery): the legacy-stuck-task recovery action
+// ---------------------------------------------------------------------------
+
+async function recoveryCallsOf(page: Page): Promise<Array<{ expectedRevision: number }>> {
+	return page.evaluate(() => window.__maiTaskPlanApi?.recoveryCalls ?? []);
+}
+
+test('A4: a legacy inspect task offers Continue with changes; ONE click hands over the explicit revision', async ({
+	page
+}) => {
+	await openFixture(page, 'ready', 0, { recovery: 'resolve' });
+
+	const recovery = page.getByTestId('task-plan-recovery');
+	await expect(recovery).toBeVisible();
+	await expect(recovery).toHaveAttribute('data-state', 'idle');
+	// Human-readable explainer: stranded phase, state-changing next step,
+	// and the explicit no-approval statement.
+	await expect(page.getByTestId('task-plan-recovery-explainer')).toContainText(
+		'waiting in the inspect phase'
+	);
+	await expect(page.getByTestId('task-plan-recovery-explainer')).toContainText(
+		'change target state'
+	);
+	await expect(page.getByTestId('task-plan-recovery-explainer')).toContainText(
+		'does not approve any operation'
+	);
+
+	// The handover is held in flight first: the pending state is honest and
+	// the button cannot double-fire.
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(true));
+	await page.getByTestId('task-plan-recovery-continue').click();
+	await expect(recovery).toHaveAttribute('data-state', 'pending');
+	await expect(page.getByTestId('task-plan-recovery-continue')).toBeDisabled();
+
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(false));
+	await expect(recovery).toHaveAttribute('data-state', 'submitted');
+	await expect(page.getByTestId('task-plan-recovery-submitted')).toContainText(
+		'Recovery turn submitted'
+	);
+	// No task success is claimed — only that the TURN was admitted and no
+	// operation was approved.
+	await expect(page.getByTestId('task-plan-recovery-submitted')).toContainText(
+		'No operation has been approved'
+	);
+	await expect(page.getByTestId('task-plan-recovery-submitted')).not.toContainText(
+		'verified'
+	);
+
+	// The component→parent contract: exactly ONE handover carrying the
+	// header revision at click time.
+	expect(await recoveryCallsOf(page)).toEqual([{ expectedRevision: 4 }]);
+
+	// The handover follows the LIVE header: after a server-side revision
+	// move + explicit refresh, the next click carries the new revision.
+	await page.evaluate(() => window.__maiTaskPlanApi?.bumpRevision(9));
+	await page.getByTestId('task-plan-refresh').click();
+	await expect(page.getByTestId('task-plan-progress')).toContainText('rev 9');
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(true));
+	await page.getByTestId('task-plan-recovery-continue').click();
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(false));
+	await expect(recovery).toHaveAttribute('data-state', 'submitted');
+	expect(await recoveryCallsOf(page)).toEqual([
+		{ expectedRevision: 4 },
+		{ expectedRevision: 9 }
+	]);
+});
+
+test('A4: a stale revision on the recovery submit is visible and claims no success', async ({
+	page
+}) => {
+	await openFixture(page, 'ready', 0, { recovery: 'conflict' });
+
+	await page.getByTestId('task-plan-recovery-continue').click();
+
+	await expect(page.getByTestId('task-plan-recovery')).toHaveAttribute('data-state', 'error');
+	const problem = page.getByTestId('task-plan-recovery-problem');
+	await expect(problem).toContainText('stale revision');
+	await expect(problem).toContainText('Nothing was changed');
+	await expect(page.getByTestId('task-plan-recovery-submitted')).toHaveCount(0);
+	expect(await recoveryCallsOf(page)).toEqual([{ expectedRevision: 4 }]);
+});
+
+test('A4: a transport failure on the recovery submit is visible and claims no success', async ({
+	page
+}) => {
+	await openFixture(page, 'ready', 0, { recovery: 'transport' });
+
+	await page.getByTestId('task-plan-recovery-continue').click();
+
+	await expect(page.getByTestId('task-plan-recovery')).toHaveAttribute('data-state', 'error');
+	await expect(page.getByTestId('task-plan-recovery-problem')).toContainText(
+		'was not recorded (unavailable)'
+	);
+	await expect(page.getByTestId('task-plan-recovery-problem')).toContainText(
+		'no success is claimed'
+	);
+	await expect(page.getByTestId('task-plan-recovery-submitted')).toHaveCount(0);
+});
+
+test('A4: a direct act-phase task never shows the recovery gate', async ({ page }) => {
+	await openFixture(page, 'ready', 0, { recovery: 'resolve', phase: 'act' });
+
+	await expect(page.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(page.getByTestId('task-plan-recovery')).toHaveCount(0);
+});
+
+test('A4: a terminal episode never shows the recovery gate', async ({ page }) => {
+	await openFixture(page, 'ready', 0, { recovery: 'resolve', outcome: 'verified' });
+
+	await expect(page.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(page.getByTestId('task-plan-recovery')).toHaveCount(0);
+});
+
+test('A4: read-only mode never offers the recovery action', async ({ page }) => {
+	await openFixture(page, 'ready', 0, { recovery: 'resolve', readOnly: true });
+
+	await expect(page.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(page.getByTestId('task-plan-recovery')).toHaveCount(0);
+});
+
+test('A4: without a wired canonical submission the action is never offered', async ({ page }) => {
+	await openFixture(page, 'ready', 0, { recovery: 'absent' });
+
+	await expect(page.getByTestId('task-plan')).toHaveAttribute('data-state', 'ready');
+	await expect(page.getByTestId('task-plan-recovery')).toHaveCount(0);
+});
+
+test('A4: at 360x640 the recovery action stays usable with no horizontal overflow', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 360, height: 640 });
+	await openFixture(page, 'ready', 0, { recovery: 'resolve' });
+
+	const recovery = page.getByTestId('task-plan-recovery');
+	await expect(recovery).toBeVisible();
+	const button = page.getByTestId('task-plan-recovery-continue');
+	await expect(button).toBeVisible();
+	await expect(button).toBeInViewport();
+
+	// One click, one handover — usable at the smallest supported viewport.
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(true));
+	await button.click();
+	await expect(recovery).toHaveAttribute('data-state', 'pending');
+	await page.evaluate(() => window.__maiTaskPlanApi?.holdRecovery(false));
+	await expect(recovery).toHaveAttribute('data-state', 'submitted');
+	expect(await recoveryCallsOf(page)).toEqual([{ expectedRevision: 4 }]);
+
+	// The existing plan remains readable and paginated next to the block.
+	await expect(page.getByTestId('task-plan-steps-meta')).toHaveText(
+		'Showing 10 of 12 items.'
+	);
+	await page.getByTestId('task-plan-steps-more').click();
+	await expect(page.getByTestId('task-plan-step-row')).toHaveCount(12);
+	const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+	expect(scrollWidth).toBeLessThanOrEqual(360);
 });

@@ -96,6 +96,22 @@
 		status?: PlanState;
 		/** Optional parent binding: mirrors the ready task header (badge counts). */
 		taskHeader?: TaskView | null;
+		/**
+		 * A4 recovery: read-only mode NEVER offers the recovery action.
+		 */
+		readOnly?: boolean;
+		/**
+		 * A4 legacy recovery: ONE canonical follow-up submission for an
+		 * open task stranded in `inspect`. The parent performs the
+		 * EXISTING composer submit (`requested_phase: 'act'`,
+		 * `task_action: 'continue'`, this explicit `expectedRevision`, the
+		 * pinned `server_id`) — never a decisions endpoint or a second
+		 * executor. The promise resolves when the turn is durably admitted
+		 * and rejects with the structured failure (stale revision,
+		 * transport) so the block stays honest; it never claims task
+		 * success. Absent callback ⇒ the action is never offered.
+		 */
+		onContinueWithChanges?: (expectedRevision: number) => Promise<void>;
 	}
 
 	let {
@@ -106,7 +122,9 @@
 		pageSize = 10,
 		pollMs = 15000,
 		status = $bindable<PlanState>('unbound'),
-		taskHeader = $bindable<TaskView | null>(null)
+		taskHeader = $bindable<TaskView | null>(null),
+		readOnly = false,
+		onContinueWithChanges = undefined
 	}: Props = $props();
 
 	/** Bounded section page size (AGENTS.md §1). */
@@ -455,6 +473,57 @@
 		);
 	});
 
+	// --- A4 legacy-stuck-task recovery (agent-interaction-recovery) ----------
+
+	type RecoveryState = 'idle' | 'pending' | 'submitted' | 'error';
+
+	let recoveryState = $state<RecoveryState>('idle');
+	let recoveryDetail = $state<string | null>(null);
+
+	/**
+	 * The recovery action exists ONLY for an OPEN episode already stranded
+	 * in the `inspect` phase that cannot advance on its own. A direct
+	 * simple operation is accepted `act` from the outset (A5) and never
+	 * sees this block; read-only mode never offers it; a terminal episode
+	 * is never resurrected by it. The callback's absence keeps the block
+	 * off (hosts that do not wire the canonical submission).
+	 */
+	const recoveryVisible = $derived.by(() => {
+		if (readOnly || onContinueWithChanges === undefined) return false;
+		if (uiState !== 'ready' || header === null) return false;
+		if (header.requested_phase !== 'inspect') return false;
+		return header.status === 'in_progress' || header.status === 'needs_input';
+	});
+
+	function recoveryProblemText(error: unknown): string {
+		if (error instanceof ApiError && error.code === 'revision_conflict') {
+			return 'The task changed while submitting (stale revision). Nothing was changed; review the current plan, then retry.';
+		}
+		if (error instanceof ApiError) {
+			return `The recovery turn was not recorded (${error.code}). Nothing was changed; no success is claimed.`;
+		}
+		return 'The recovery turn could not be recorded. Nothing was changed; no success is claimed.';
+	}
+
+	async function continueWithChanges(): Promise<void> {
+		if (!recoveryVisible || header === null || recoveryState === 'pending') return;
+		// Scope and revision are EXPLICIT at the handover: the parent submits
+		// the canonical follow-up against THIS pinned scope and revision.
+		const expectedRevision = header.revision;
+		recoveryState = 'pending';
+		recoveryDetail = null;
+		try {
+			await onContinueWithChanges?.(expectedRevision);
+			// Honest outcome: the TURN was admitted — nothing about the task
+			// outcome is claimed, and no operation was approved by this click.
+			recoveryState = 'submitted';
+			recoveryDetail = null;
+		} catch (error) {
+			recoveryState = 'error';
+			recoveryDetail = recoveryProblemText(error);
+		}
+	}
+
 	function statusText(status: string): string {
 		return STATUS_TEXT[status] ?? status;
 	}
@@ -652,6 +721,41 @@
 				Refresh plan
 			</Button>
 		</div>
+
+		{#if recoveryVisible}
+			<div class="mai-task-plan__recovery" data-testid="task-plan-recovery" data-state={recoveryState}>
+				<p class="mai-task-plan__note" data-testid="task-plan-recovery-explainer">
+					This task is waiting in the inspect phase and cannot advance on its own.
+					Continuing with changes moves it to the act phase — the next steps
+					will change target state. This does not approve any operation:
+					existing grants and approvals still apply.
+				</p>
+				<Button
+					variant="secondary"
+					size="sm"
+					loading={recoveryState === 'pending'}
+					disabled={recoveryState === 'pending'}
+					onclick={continueWithChanges}
+					data-testid="task-plan-recovery-continue"
+				>
+					Continue with changes
+				</Button>
+				{#if recoveryState === 'submitted'}
+					<p class="mai-task-plan__note" data-testid="task-plan-recovery-submitted" data-state="submitted">
+						Recovery turn submitted; the run continues this task. No operation
+						has been approved and no outcome is claimed yet.
+					</p>
+				{:else if recoveryState === 'error' && recoveryDetail !== null}
+					<p
+						class="mai-task-plan__warning"
+						data-testid="task-plan-recovery-problem"
+						data-state="error"
+					>
+						{recoveryDetail}
+					</p>
+				{/if}
+			</div>
+		{/if}
 
 		<div class="mai-task-plan__section" data-testid="task-plan-steps" role="group" aria-label="Plan items">
 			<h4 class="mai-task-plan__heading">Plan items</h4>
@@ -1050,6 +1154,19 @@
 		color: var(--mai-color-text-muted, inherit);
 		font-size: var(--mai-text-xs, 0.75rem);
 		overflow-wrap: anywhere;
+	}
+	/* A4 recovery: a bounded, visually distinct affordance for a legacy
+	   inspect-stranded episode only — never a normal-path gate. */
+	.mai-task-plan__recovery {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: var(--mai-space-2, 8px);
+		padding: var(--mai-space-2, 8px);
+		border: 1px dashed var(--mai-color-border-strong, currentColor);
+		border-radius: var(--mai-radius-sm, 4px);
+		min-width: 0;
+		max-width: 100%;
 	}
 	.mai-task-plan__warning {
 		margin: 0;
