@@ -1792,20 +1792,6 @@
 
 	// --- canonical chronological turn feeds (W2 preflight visibility) --------
 	//
-	// DEBUG: trace duplicate keys in canonicalMessages
-	$effect(() => {
-		const ids = canonicalMessages.map((m) => m.message_id);
-		const seen = new Set<string>();
-		const dupes: string[] = [];
-		for (const id of ids) {
-			if (seen.has(id)) dupes.push(id);
-			seen.add(id);
-		}
-		if (dupes.length > 0) {
-			console.error('W2-DUPE-KEYS', JSON.stringify(dupes), JSON.stringify(ids));
-		}
-	});
-	//
 	// ONE event-ordered activity list per user turn, anchored to the exact
 	// persisted identity the canonical submit response returns (message_id +
 	// run_id) or to the conversation's persisted `active_run_id` on restore.
