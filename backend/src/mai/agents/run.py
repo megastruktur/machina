@@ -2338,10 +2338,22 @@ class AgentRunExecutor:
                 f"tool_surface_{error.code.value}",
                 error_type=type(error).__name__,
             ) from None
+        # W3 (§6 guidance): a task-bound ``inspect`` round is not OFFERED
+        # target effects the phase gate necessarily refuses (e.g.
+        # ``host.shell``); permitted reads and task metadata/plan tools
+        # stay offered. Guidance only: unbound, plan and act rounds keep
+        # the full enabled surface, and the execution boundary re-derives
+        # the phase and stays fail-closed at every tool call.
+        phase = await self.abound_task_phase(intent)
+        model_tools = (
+            bridge.tools_for_phase(phase, _phase_action_for_capability)
+            if phase is Phase.INSPECT
+            else bridge.tools
+        )
 
         agent: Agent[None, str | DeferredToolRequests] = Agent(
             model=resolved_model,
-            tools=[_deferring_tool(tool) for tool in bridge.tools],
+            tools=[_deferring_tool(tool) for tool in model_tools],
             output_type=[str, DeferredToolRequests],
             capabilities=[
                 _compaction_capability(binding.profile.context_limit)

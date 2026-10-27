@@ -79,7 +79,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -104,6 +104,10 @@ from mai.contracts.tasks import (
     EffectCertainty,
     EvidenceKind,
     ExecutionStatus,
+    Phase,
+    PhaseAction,
+    TaskContractError,
+    validate_phase,
 )
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
@@ -935,6 +939,39 @@ class CapabilityToolBridge:
         """The newest registered descriptor behind one enabled tool."""
         binding = self._bindings.get(capability_id)
         return None if binding is None else binding.descriptor
+
+    def tools_for_phase(
+        self,
+        phase: Phase,
+        action_of: Callable[[str, str], PhaseAction],
+    ) -> tuple[Tool, ...]:
+        """The phase-guided tool surface (§6 guidance).
+
+        Excludes enabled tools whose §6 phase action ``phase`` necessarily
+        refuses (for a task-bound ``inspect`` round: target execute
+        effects such as ``host.shell`` — the model is never invited into
+        a necessarily-refused attempt). ``action_of`` is the runner's
+        ratified capability→action mapping (:func:`mai.agents.run.
+        _phase_action_for_capability`), so task-state control tools stay
+        classified exactly as the execution gate classifies them.
+
+        GUIDANCE, not the permission boundary: the dispatcher's
+        ``validate_phase`` gate stays fail-closed at the execution
+        boundary — replayed, stale, racing or direct calls are still
+        denied before dispatch; this filter only shapes the offer.
+        """
+        kept: list[Tool] = []
+        for binding in self._bindings.values():
+            action = action_of(
+                binding.capability_id,
+                str(binding.descriptor.effect_class),
+            )
+            try:
+                validate_phase(phase, action)
+            except TaskContractError:
+                continue
+            kept.append(binding.tool)
+        return tuple(kept)
 
     def _build_tool(
         self, capability_id: str, descriptor: CapabilityDescriptor, name: str

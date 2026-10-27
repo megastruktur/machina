@@ -38,7 +38,14 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import FunctionModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -55,6 +62,7 @@ from mai.agents.conversation_store import (
 )
 from mai.agents.model_store import ModelConfigStore
 from mai.agents.models import SCHEMA_VERSION as MODEL_SCHEMA_VERSION
+from mai.agents.tools import CapabilityToolBridge, tool_name_for
 from mai.capabilities.dispatch import (
     EFFECT_NOT_ATTEMPTED,
     CapabilityDispatcher,
@@ -67,6 +75,7 @@ from mai.capabilities.task_state import (
     TASK_UPDATE_ITEM_CAPABILITY,
 )
 from mai.contracts.conversations import SteerAction
+from mai.contracts.tasks import Phase
 from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
 from mai.jobs import engine as job_engine
@@ -74,7 +83,7 @@ from mai.jobs.engine import EngineClient
 from mai.jobs.resource_locks import ResourceLockService
 from mai.plugins.registry import CapabilityRegistry, parse_descriptor
 from mai.policy.approvals import ApprovalStore
-from mai.policy.evaluate import Policy
+from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
 
 #: Re-exported fixture objects: the SAME proven 06 harness fixtures
 #: (fresh scenario dir with the real worker handler module + the
@@ -328,6 +337,10 @@ class DispatchModel:
         self.round_calls = 0
         #: Full prompt text of each intake call (pinned-scope proofs).
         self.intake_prompts: list[str] = []
+        #: Names of the function tools each model call was OFFERED
+        #: (additive W3 observability: the offer, not the call, is the
+        #: availability contract).
+        self.offered_tool_names: list[list[str]] = []
 
     @property
     def model(self) -> FunctionModel:
@@ -339,6 +352,9 @@ class DispatchModel:
                 handle.write(marker + "\n")
 
     def _respond(self, messages, info):  # noqa: ANN001 - FunctionModel ABI
+        self.offered_tool_names.append(
+            sorted(definition.name for definition in info.function_tools)
+        )
         last = messages[-1]
         prompt_text = "".join(
             str(getattr(part, "content", "") or "") for part in last.parts
@@ -1213,6 +1229,167 @@ class TestPureProjections:
 # ---------------------------------------------------------------------------
 # C5 at the seam (in-process): steering + compaction preserve the binding
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# W3 — phase-aware model-facing tool availability (§6 guidance)
+# ---------------------------------------------------------------------------
+
+
+def _history_seed() -> str:
+    """One minimal valid model-messages history for ``amodel_round``."""
+    return ModelMessagesTypeAdapter.dump_json(
+        [ModelRequest(parts=[UserPromptPart(content="inspect the host")])]
+    ).decode("utf-8")
+
+
+class TestInspectPhaseToolAvailability:
+    def _allowed(self) -> tuple[str, ...]:
+        """A mixed enabled surface: a target read, a target effect and
+        the task-metadata controls."""
+        return (
+            READ_CAP,
+            PRIV_CAP,
+            TASK_READ_CAPABILITY,
+            TASK_UPDATE_ITEM_CAPABILITY,
+        )
+
+    @pytest.mark.anyio
+    async def test_inspect_round_offers_reads_and_metadata_not_effects(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        """W3: an inspect-phase task-bound round is offered the target
+        read and the task-metadata tools but NOT necessarily-refused
+        target effects (``fixture.priv`` stands in for ``host.shell``:
+        the same EXECUTE_STEPS §6 action). Guidance only — the offer
+        shapes the round; the execution boundary stays fail-closed (the
+        sibling inspect denial test proves the pre-dispatch refusal)."""
+        run_id = str(uuid.uuid4())
+        await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+        await _abind_phase(sessions, run_id, "inspect")
+
+        scripted = DispatchModel([], [{"text": "inspected"}])
+        composed, _journal_executor = _compose(
+            sessions, task_run_url, tmp_path, scripted.model
+        )
+        intent = agent_run.parse_agent_run_intent(
+            harness._canonical(
+                harness._intent_document(run_id, allowed=self._allowed())
+            )
+        )
+        _run(
+            composed.amodel_round(
+                intent, _pins_of(composed), _history_seed(), None, 0
+            )
+        )
+        offered = set(scripted.offered_tool_names[-1])
+        assert tool_name_for(READ_CAP) in offered
+        assert tool_name_for(TASK_READ_CAPABILITY) in offered
+        assert tool_name_for(TASK_UPDATE_ITEM_CAPABILITY) in offered
+        assert tool_name_for(PRIV_CAP) not in offered
+
+    @pytest.mark.anyio
+    async def test_act_round_keeps_granted_execute_effects_offered(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        """W3 guard: an act-phase round keeps the full enabled surface —
+        granted execute effects stay offered (the boundary still gates
+        every effect at dispatch)."""
+        run_id = str(uuid.uuid4())
+        await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+        await _abind_phase(sessions, run_id, "act")
+
+        scripted = DispatchModel([], [{"text": "done"}])
+        composed, _journal_executor = _compose(
+            sessions, task_run_url, tmp_path, scripted.model
+        )
+        intent = agent_run.parse_agent_run_intent(
+            harness._canonical(
+                harness._intent_document(run_id, allowed=self._allowed())
+            )
+        )
+        _run(
+            composed.amodel_round(
+                intent, _pins_of(composed), _history_seed(), None, 0
+            )
+        )
+        offered = set(scripted.offered_tool_names[-1])
+        assert {
+            tool_name_for(READ_CAP),
+            tool_name_for(PRIV_CAP),
+            tool_name_for(TASK_READ_CAPABILITY),
+            tool_name_for(TASK_UPDATE_ITEM_CAPABILITY),
+        } <= offered
+
+    @pytest.mark.anyio
+    async def test_inspect_bridge_surface_excludes_host_shell(
+        self, sessions, tmp_path
+    ) -> None:
+        """W3 at the bridge seam: a literal ``host.shell`` descriptor is
+        excluded from the inspect offer while target reads and task
+        metadata/plan tools stay; the unfiltered ``tools`` property is
+        untouched (the execution boundary keeps its own fail-closed
+        ``validate_phase`` gate for replayed, stale, racing or direct
+        calls)."""
+        registry = CapabilityRegistry()
+        surface = (
+            ("host.shell", "privileged"),
+            (READ_CAP, "read"),
+            (TASK_READ_CAPABILITY, "read"),
+            (TASK_PROPOSE_UPDATE_CAPABILITY, "mutate"),
+            (TASK_UPDATE_ITEM_CAPABILITY, "mutate"),
+        )
+        for capability_id, effect_class in surface:
+            registry.register(_descriptor(capability_id, effect_class))
+
+        async def _refuse(call) -> object:  # noqa: ANN001 - test double
+            raise AssertionError(f"executor must never run here: {call}")
+
+        dispatcher = CapabilityDispatcher(
+            registry=registry,
+            approvals=ApprovalStore(sessions),
+            grants=lambda: {},
+            policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
+            adopted=lambda server_id: True,
+            credentials=lambda: EnvResolver(_write_env(tmp_path)),
+            executor=_refuse,
+        )
+        context = ExecutionContext(
+            principal="hash:fixture-principal",
+            server_id=SERVER_UUID,
+            run_id=uuid.uuid4(),
+            parent_scope=None,
+            profile_revision="profile-1",
+            prompt_revision="prompt-1",
+            credential_references=(),
+            allowed_capabilities=tuple(
+                capability_id for capability_id, _ in surface
+            ),
+            mode=PolicyMode.DELEGATED,
+        )
+        bridge = CapabilityToolBridge(
+            registry=registry, dispatcher=dispatcher, context=context
+        )
+        offered = {
+            tool.name
+            for tool in bridge.tools_for_phase(
+                Phase.INSPECT, agent_run._phase_action_for_capability
+            )
+        }
+        assert tool_name_for("host.shell") not in offered
+        assert {
+            tool_name_for(READ_CAP),
+            tool_name_for(TASK_READ_CAPABILITY),
+            tool_name_for(TASK_PROPOSE_UPDATE_CAPABILITY),
+            tool_name_for(TASK_UPDATE_ITEM_CAPABILITY),
+        } <= offered
+        # The unfiltered surface is untouched: filtering is guidance at
+        # the offer seam, never a surface reduction at the boundary.
+        assert {tool.name for tool in bridge.tools} == {
+            tool_name_for(capability_id) for capability_id, _ in surface
+        }
 
 
 class TestBindingPreservedAcrossSteerAndCompaction:
