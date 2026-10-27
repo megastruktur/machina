@@ -2965,6 +2965,36 @@
 		</section>
 		{/snippet}
 		<header class="mai-chat__header">
+			{#if isDocked && dockCollapsed}
+				<!-- Minimized launcher: ONE slim single-row control — the whole pill
+				     is the restore affordance (label + live WORKING badge + chevron).
+				     Draft context (pinned server/@service chips and their remove
+				     buttons) lives in state, not in the collapsed view; it reappears
+				     untouched on expand. The working state stays visible and announced
+				     while collapsed (C08 rule 6): the badge replaces the prompt label. -->
+				<button
+					type="button"
+					class="mai-chat__dock-launcher"
+					tabindex={2}
+					onclick={() => (dockCollapsed = false)}
+					aria-expanded="false"
+					aria-label="Expand chat dock"
+					data-testid="bottom-chat-dock-toggle"
+				>
+					<span class="mai-chat__dock-launcher-label">Ask M.A.I. …</span>
+					{#if jobInProgress}
+						<span
+							class="mai-chat__badge mai-chat__badge--active"
+							role="status"
+							data-testid="chat-header-working"
+						>
+							<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
+							WORKING · {elapsedSeconds}s
+						</span>
+					{/if}
+					<span class="mai-chat__dock-launcher-chevron" aria-hidden="true">▴</span>
+				</button>
+			{:else}
 			<div class="mai-chat__header-row">
 				<!-- Left side of the header: Target server selector, active server/consult
 				     chip, @service chips, and the + @service selector. -->
@@ -3067,25 +3097,8 @@
 				<!-- Right side of the header: working badge (when docked) and the dock
 				     collapse button, plus sr-only / standalone New Chat & History controls. -->
 				<div class="mai-chat__header-right">
-					{#if isDocked}
-						{#if dockCollapsed && jobInProgress}
-							<span class="mai-chat__badge mai-chat__badge--active" data-testid="chat-header-working">
-								WORKING · {elapsedSeconds}s
-							</span>
-						{/if}
-					{:else}
+					{#if !isDocked}
 						<h3 class="mai-chat__title">Conversation</h3>
-					{/if}
-					{#if isDocked && dockCollapsed}
-						<Button
-							size="sm"
-							pill
-							variant="secondary"
-							tabindex={2}
-							onclick={() => (dockCollapsed = false)}
-						>
-							Ask M.A.I.…
-						</Button>
 					{/if}
 					{#if isDocked}
 						<Button
@@ -3126,6 +3139,7 @@
 					</div>
 				</div>
 			</div>
+			{/if}
 			{#if historyOpen}
 				<!-- One bounded history picker; selection restores transcript and
 				     frozen server/service context without displacing the chat. -->
@@ -4014,9 +4028,59 @@
 
 	.mai-chat--dock-collapsed { height: auto; }
 	.mai-chat--docked .mai-chat__body:has(.mai-chat__section--idle) { height: auto; }
-	/* Minimized spotlight pill: the collapsed bar keeps only the pinned
-	 * context chip, the live WORKING badge and the expand controls. */
-	.mai-chat--dock-collapsed .mai-chat__compose-context { display: none; }
+
+	/* Minimized spotlight launcher: the whole collapsed pill is ONE slim
+	 * restore control (label + live WORKING badge + chevron) in a single
+	 * row. The label ellipsizes instead of wrapping, so the row holds at
+	 * every width (1280 desktop and 360 narrow); the badge and chevron
+	 * never shrink. */
+	.mai-chat__dock-launcher {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		min-height: var(--mai-target-min, 32px);
+		padding: var(--mai-space-1, 0.25rem) var(--mai-space-3, 0.75rem);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md, 6px);
+		background: var(--mai-surface-glass-raised, var(--mai-color-surface));
+		color: var(--mai-color-text);
+		font-family: var(--mai-font-display);
+		font-size: var(--mai-text-sm);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		cursor: pointer;
+		transition:
+			background-color var(--mai-motion-fast) ease,
+			border-color var(--mai-motion-fast) ease;
+	}
+	.mai-chat__dock-launcher:hover {
+		border-color: var(--mai-color-brass);
+		background: var(--mai-color-surface-raised);
+	}
+	.mai-chat__dock-launcher:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: 2px;
+	}
+	.mai-chat__dock-launcher-label {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		text-align: left;
+	}
+	.mai-chat__dock-launcher .mai-chat__badge {
+		flex: 0 0 auto;
+		white-space: nowrap;
+	}
+	.mai-chat__dock-launcher-chevron {
+		flex: 0 0 auto;
+		color: var(--mai-color-text-muted);
+	}
 
 	.mai-chat__body[hidden] {
 		display: none;

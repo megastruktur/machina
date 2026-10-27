@@ -558,6 +558,101 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 	});
 }
 
+for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) {
+	test(`collapsed dock ${viewport.width}: one launcher row, contained, restores context on expand`, async ({page}) => {
+		await page.setViewportSize(viewport);
+		const requests: string[] = [];
+		page.on('request', r => requests.push(r.url()));
+		await page.goto('/');
+		// Existing user-controlled shell navigation, not a geometry override.
+		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
+		const dock = page.getByTestId('bottom-chat-dock');
+
+		// Draft + @service context that must survive the collapse untouched.
+		// The submit consumes its draft, so the preserved draft is typed after.
+		await dock.getByTestId('chat-service-picker-toggle').click();
+		await dock.getByTestId('chat-service-option').first().click();
+		await expect(dock.getByTestId('chat-service-chip')).toHaveCount(1);
+		// A live run must survive collapsed as the announced WORKING badge.
+		await dock.getByTestId('compose-message').fill('Fixture message');
+		await dock.getByTestId('chat-submit').click();
+		await expect(dock.getByTestId('conversation-state')).toHaveText('Running');
+		await dock.getByTestId('compose-message').fill('Preserve this dock draft');
+
+		await dock.getByTestId('bottom-chat-dock-toggle').click();
+		await expect(dock.getByTestId('chat-root')).toBeHidden();
+
+		// ONE restore control with an honest disclosure name; nothing else
+		// is clickable inside the collapsed dock.
+		const launcher = dock.getByTestId('bottom-chat-dock-toggle');
+		await expect(launcher).toHaveCount(1);
+		await expect(dock.locator('button:visible')).toHaveCount(1);
+		await expect(launcher).toHaveAttribute('aria-expanded', 'false');
+		await expect(launcher).toHaveAttribute('aria-label', 'Expand chat dock');
+		// No server/service context chips or remove buttons while collapsed.
+		await expect(dock.getByTestId('chat-server-chip')).toHaveCount(0);
+		await expect(dock.getByTestId('chat-service-chip')).toHaveCount(0);
+		await expect(dock.getByTestId('chat-server-chip-remove')).toHaveCount(0);
+		// Working state stays visible and announced while collapsed.
+		const working = dock.getByTestId('chat-header-working');
+		await expect(working).toBeVisible();
+		await expect(working).toHaveAttribute('role', 'status');
+		await expect(working).toContainText(/WORKING · \d+s/);
+
+		// Geometry: a slim single-row pill, every painted element inside the
+		// dock border (not merely on screen — the R-24c fault painted chips
+		// hundreds of px past a 30px pill) and inside the viewport.
+		const geo = await page.evaluate(() => {
+			const dockEl = document.querySelector('[data-testid="bottom-chat-dock"]')!;
+			const dr = dockEl.getBoundingClientRect();
+			const boxes = [...dockEl.querySelectorAll('*')]
+				.filter((el) => el.getClientRects().length > 0)
+				.map((el) => {
+					const r = el.getBoundingClientRect();
+					return { x: r.x, y: r.y, right: r.right, bottom: r.bottom };
+				});
+			const doc = document.documentElement;
+			return {
+				dock: { x: dr.x, y: dr.y, right: dr.right, bottom: dr.bottom, h: dr.height },
+				boxes,
+				scrollW: doc.scrollWidth,
+				vw: doc.clientWidth,
+				vh: doc.clientHeight
+			};
+		});
+		expect(geo.boxes.length).toBeGreaterThan(0);
+		for (const b of geo.boxes) {
+			expect(b.right).toBeLessThanOrEqual(geo.vw);
+			expect(b.x).toBeGreaterThanOrEqual(0);
+			expect(b.bottom).toBeLessThanOrEqual(geo.vh);
+			expect(b.y).toBeGreaterThanOrEqual(0);
+			// Contained by the pill border (1px clip-edge tolerance).
+			expect(b.right, 'within dock right edge').toBeLessThanOrEqual(geo.dock.right + 1);
+			expect(b.bottom, 'within dock bottom edge').toBeLessThanOrEqual(geo.dock.bottom + 1);
+			expect(b.x, 'within dock left edge').toBeGreaterThanOrEqual(geo.dock.x - 1);
+			expect(b.y, 'within dock top edge').toBeGreaterThanOrEqual(geo.dock.y - 1);
+		}
+		expect(geo.scrollW).toBeLessThanOrEqual(viewport.width);
+		expect(geo.dock.h, 'collapsed pill stays slim').toBeLessThanOrEqual(56);
+		const launcherH = await launcher.evaluate((el) => el.getBoundingClientRect().height);
+		expect(launcherH, 'launcher is a single slim row').toBeLessThanOrEqual(44);
+		// Narrow width: the label ellipsizes on one line instead of wrapping.
+		if (viewport.width === 360) {
+			const oneLine = await dock.locator('.mai-chat__dock-launcher-label')
+				.evaluate((el) => el.scrollHeight <= el.clientHeight + 1);
+			expect(oneLine, 'label does not wrap').toBe(true);
+		}
+
+		// Expansion restores the prior context and draft untouched.
+		await launcher.click();
+		await expect(dock.getByTestId('chat-root')).toBeVisible();
+		await expect(dock.getByTestId('compose-message')).toHaveValue('Preserve this dock draft');
+		await expect(dock.getByTestId('chat-server-chip')).toHaveAttribute('data-locked', 'true');
+		await expect(dock.getByTestId('chat-service-chip')).toHaveText('@enshrouded');
+		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
+	});
+}
+
 test('drawer Chat History limits to 10 chats, scrolls internally, and loads more on demand', async ({
 	page
 }) => {

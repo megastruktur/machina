@@ -1381,16 +1381,24 @@
 	}
 
 	/* Minimized spotlight pill: collapsed, the dock shrinks from the wide
-	   composer slab to a content-sized floating pill on the same anchor. */
+	   composer slab to a slim floating pill on the same anchor. The width is
+	   DETERMINISTIC, not content-driven: nested percentage/flex chains
+	   contribute ~0 during intrinsic sizing, so `width: auto` collapsed to a
+	   30px sliver whose controls painted far beyond it (R-24c), and the live
+	   timer would jitter the width every second. A fixed slim cap keeps one
+	   stable row at 1280 and 360; the launcher label ellipsizes instead of
+	   widening the pill, and `overflow: hidden` clips so no control can ever
+	   paint outside the border or the viewport. */
 	.mai-desktop-shell__dock--collapsed {
-		width: auto;
-		max-width: min(560px, calc(100% - 2 * var(--mai-space-4)));
+		width: min(420px, calc(100% - 2 * var(--mai-space-4)));
 		border-radius: 999px;
 		padding: 6px 14px;
+		overflow: hidden;
 	}
 
 	.mai-desktop-shell__dock-body {
 		overflow: visible;
+		min-width: 0;
 	}
 
 	.mai-desktop-shell__taskbar {
