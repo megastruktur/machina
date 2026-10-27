@@ -2101,6 +2101,33 @@ test('no bound decision record renders an honest absent state with the recorded 
 	await expect(section.getByTestId('approval-absent')).toBeVisible();
 });
 
+test('live model thinking and every tool call stream with scrubbed args and results', async ({ page }) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	await submitFromHost(page, 'host-main', 'Inspect the live operation');
+	queueStreamPair({ frames: [
+		frame(1, 'agent.output_delta', { round: 0, kind: 'thinking', part_index: 0, delta: 'I should inspect ' }),
+		frame(2, 'agent.output_delta', { round: 0, kind: 'thinking', part_index: 0, delta: 'the runbook.' }),
+		frame(3, 'agent.tool_requested', {
+			tool_call_id: 'live-call', capability_id: 'app.list_catalog',
+			args: { limit: 10, api_key: '[REDACTED]' }, args_partial: false, args_valid: true
+		})
+	] });
+	await expect(main.getByTestId('assistant-model-thinking')).toHaveText('I should inspect the runbook.');
+	await expect(main.getByTestId('assistant-tool-card')).toContainText('app.list_catalog');
+	await main.getByTestId('assistant-tool-card').locator('summary').click();
+	await expect(main.getByTestId('assistant-tool-args')).toContainText('[REDACTED]');
+	queueStreamPair({ frames: [
+		frame(4, 'agent.tool_result', {
+			tool_call_id: 'live-call', capability_id: 'app.list_catalog', step_seq: 1,
+			state: 'succeeded', result: { items: ['kb'], total: 1 }
+		})
+	] });
+	await expect(main.getByTestId('assistant-tool-result')).toContainText('kb');
+	await expect(main.getByTestId('assistant-tool-card')).toHaveCount(1);
+	await expect(main.getByTestId('assistant-tool-card')).toContainText('SUCCEEDED');
+});
+
 test('Details defaults closed and preserves draft, transcript, scope and subscriptions', async ({ page }) => {
 	await openFixture(page, 'compose');
 	const main = page.getByTestId('host-main');

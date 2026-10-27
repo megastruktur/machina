@@ -119,7 +119,16 @@ from pydantic_ai.exceptions import CallDeferred
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
+    PartDeltaEvent,
+    PartStartEvent,
     SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallEvent,
+    ToolCallPart,
+    ToolResultEvent,
     UserPromptPart,
 )
 from pydantic_ai.tools import (
@@ -167,6 +176,7 @@ from mai.agents.output_safety import (
     project_document,
     project_text,
     redact_values,
+    redact_document,
 )
 from mai.agents.tools import (
     TOOL_RESULT_SCHEMA_VERSION,
@@ -460,6 +470,14 @@ AGENT_CONTEXT_EVENT_TYPE: Final[str] = "agent.context_assembled"
 AGENT_HISTORY_EVENT_TYPE: Final[str] = "agent.conversation_history"
 AGENT_INTAKE_EVENT_TYPE: Final[str] = "agent.intake_interpreted"
 AGENT_ROUND_EVENT_TYPE: Final[str] = "agent.model_round"
+#: Live, sanitized model output. Deltas are observations only: the durable
+#: model-round checkpoint remains the authority for tool execution.
+AGENT_OUTPUT_DELTA_EVENT_TYPE: Final[str] = "agent.output_delta"
+AGENT_TOOL_REQUESTED_EVENT_TYPE: Final[str] = "agent.tool_requested"
+AGENT_TOOL_RESULT_EVENT_TYPE: Final[str] = "agent.tool_result"
+#: Bound individual events without coalescing away provider output.
+STREAM_DELTA_MAX_CHARS: Final[int] = 4096
+STREAM_TOOL_DETAIL_MAX_CHARS: Final[int] = 32768
 AGENT_RECONCILING_EVENT_TYPE: Final[str] = "agent.awaiting_reconciliation"
 AGENT_COMPLETED_EVENT_TYPE: Final[str] = "agent.completed"
 AGENT_FAILED_EVENT_TYPE: Final[str] = "agent.failed"
@@ -1227,6 +1245,181 @@ def _compaction_capability(context_limit: int | None) -> TieredCompaction[None]:
         target_fraction=COMPACTION_TARGET_FRACTION,
         context_window=context_limit,
     )
+
+# ---------------------------------------------------------------------------
+# live model/tool observation (additive to the durable round checkpoint)
+# ---------------------------------------------------------------------------
+
+
+def _safe_stream_args(
+    capability_id: str, args: object
+) -> tuple[object, bool]:
+    """Project provider tool arguments through the normal output-safety seam.
+
+    A partial JSON fragment is deliberately retained as text: it lets the UI
+    show the call forming without pretending that it is executable. All
+    complete arguments are recursively redacted before they are persisted.
+    """
+    raw: object = args
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            safe = project_text(raw, max_chars=STREAM_TOOL_DETAIL_MAX_CHARS)
+            return safe, len(safe) < len(raw)
+    if isinstance(raw, Mapping):
+        safe_args = _scrubbed_step_params(capability_id, dict(raw), [])
+        safe_args = redact_document(safe_args)
+        # A parsed object does not retain the literal separators that make
+        # ``"api_key": "..."`` recognizable to the text scrubber. Redact
+        # secret-named fields structurally, not only their string values.
+        if isinstance(safe_args, Mapping):
+            safe_args = {
+                str(key): (
+                    REDACTED
+                    if any(part in str(key).casefold() for part in (
+                        "password", "secret", "token", "credential", "api_key", "apikey"
+                    ))
+                    else value
+                )
+                for key, value in safe_args.items()
+            }
+    else:
+        safe_args = redact_document(raw)
+    rendered = json.dumps(safe_args, ensure_ascii=False)
+    if len(rendered) > STREAM_TOOL_DETAIL_MAX_CHARS:
+        return rendered[:STREAM_TOOL_DETAIL_MAX_CHARS], True
+    return safe_args, False
+
+
+def _tool_event_parts(event: ToolCallEvent | ToolResultEvent) -> tuple[str, str]:
+    part = event.part
+    return str(part.tool_name), str(event.tool_call_id)
+
+
+class ModelEventStreamObserver:
+    """Forward live PydanticAI observations to the persisted SSE event log.
+
+    No observation authorizes an effect. Deferred calls are still translated
+    and executed by the existing checkpointed model-round/tool-step path.
+    """
+
+    def __init__(self, executor: AgentRunExecutor, intent: AgentRunIntent, round_index: int):
+        self._executor = executor
+        self._intent = intent
+        self._round_index = round_index
+        self._names = {
+            tool_name_for(capability_id): capability_id
+            for capability_id in executor._bridge_of(intent).enabled_capabilities
+        }
+
+    async def __call__(self, _run_context: object, events: Any) -> None:
+        async for event in events:
+            if isinstance(event, PartStartEvent):
+                await self._part(event.index, event.part)
+            elif isinstance(event, PartDeltaEvent):
+                await self._delta(event.index, event.delta)
+            elif isinstance(event, ToolCallEvent):
+                await self._tool_requested(event)
+            elif isinstance(event, ToolResultEvent):
+                await self._tool_result(event)
+
+    def _capability_id(self, tool_name: str) -> str:
+        return self._names.get(tool_name, tool_name)
+
+    async def _delta(self, index: int, delta: object) -> None:
+        kind = ""
+        text = ""
+        if isinstance(delta, ThinkingPartDelta):
+            kind, text = "thinking", delta.content_delta or ""
+        elif isinstance(delta, TextPartDelta):
+            kind, text = "text", delta.content_delta
+        if not kind or not text:
+            return
+        await self._emit_text(kind, text, index)
+
+    async def _part(self, index: int, part: object) -> None:
+        kind = ""
+        text = ""
+        if isinstance(part, ThinkingPart):
+            kind, text = "thinking", part.content
+        elif isinstance(part, TextPart):
+            kind, text = "text", part.content
+        elif isinstance(part, ToolCallPart):
+            await self._tool_part(part, index)
+            return
+        if kind and text:
+            await self._emit_text(kind, text, index)
+
+    async def _emit_text(self, kind: str, text: str, index: int) -> None:
+        # A provider can emit a large chunk. Preserve all of it in bounded
+        # consecutive deltas instead of silently dropping the tail.
+        for offset in range(0, len(text), STREAM_DELTA_MAX_CHARS):
+            fragment = text[offset : offset + STREAM_DELTA_MAX_CHARS]
+            safe = project_text(fragment, max_chars=STREAM_DELTA_MAX_CHARS)
+            await self._executor._steps.aemit_run_event(
+                self._intent.run_id,
+                AGENT_OUTPUT_DELTA_EVENT_TYPE,
+                {
+                    "round": self._round_index,
+                    "kind": kind,
+                    "part_index": index,
+                    "delta": safe,
+                    "redacted": safe != fragment,
+                },
+            )
+
+    async def _tool_part(self, part: ToolCallPart, index: int) -> None:
+        capability_id = self._capability_id(str(part.tool_name))
+        args, truncated = _safe_stream_args(capability_id, part.args)
+        await self._executor._steps.aemit_run_event(
+            self._intent.run_id,
+            AGENT_TOOL_REQUESTED_EVENT_TYPE,
+            {
+                "round": self._round_index,
+                "tool_call_id": str(part.tool_call_id),
+                "capability_id": capability_id,
+                "args": args,
+                "args_partial": True,
+                "truncated": truncated,
+                "part_index": index,
+            },
+        )
+
+    async def _tool_requested(self, event: ToolCallEvent) -> None:
+        tool_name, tool_call_id = _tool_event_parts(event)
+        capability_id = self._capability_id(tool_name)
+        args, truncated = _safe_stream_args(capability_id, event.part.args)
+        await self._executor._steps.aemit_run_event(
+            self._intent.run_id,
+            AGENT_TOOL_REQUESTED_EVENT_TYPE,
+            {
+                "round": self._round_index,
+                "tool_call_id": tool_call_id,
+                "capability_id": capability_id,
+                "args": args,
+                "args_partial": False,
+                "args_valid": event.args_valid,
+                "truncated": truncated,
+            },
+        )
+
+    async def _tool_result(self, event: ToolResultEvent) -> None:
+        tool_name, tool_call_id = _tool_event_parts(event)
+        result = event.part.model_response_str()
+        safe = project_text(result, max_chars=STREAM_TOOL_DETAIL_MAX_CHARS)
+        await self._executor._steps.aemit_run_event(
+            self._intent.run_id,
+            AGENT_TOOL_RESULT_EVENT_TYPE,
+            {
+                "round": self._round_index,
+                "tool_call_id": tool_call_id,
+                "capability_id": self._capability_id(tool_name),
+                "result": safe,
+                "truncated": len(safe) < len(result),
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # the shared whole-stream event producer (agent-side seam)
@@ -2403,6 +2596,9 @@ class AgentRunExecutor:
                 prompt_text,
                 message_history=history,
                 deferred_tool_results=deferred,
+                event_stream_handler=ModelEventStreamObserver(
+                    self, intent, round_index
+                ),
             )
         except Exception as error:
             kind: ProviderFailureKind = classify_provider_error(error)
@@ -2552,6 +2748,48 @@ class AgentRunExecutor:
 
     # -- one exactly-once tool attempt (the bridge seam) --------------------
 
+    async def _aemit_tool_observation(
+        self,
+        intent: AgentRunIntent,
+        event_type: str,
+        call: Mapping[str, object],
+        receipt: Mapping[str, object] | None = None,
+    ) -> None:
+        """Project one model-requested/executed tool call into the live fold.
+
+        ``step_seq`` correlates this additive observation with the durable
+        step events; receipt values have already crossed the secret/output
+        safety boundary in ``aexecute_tool``. The observation never authorizes
+        or substitutes for the durable step transition.
+        """
+        capability_id = str(call.get("capability_id") or call.get("tool_name") or "unknown")
+        data: dict[str, object] = {
+            "tool_call_id": str(call.get("tool_call_id") or f"step-{call['seq']}"),
+            "capability_id": capability_id,
+            "step_seq": int(str(call["seq"])),
+        }
+        payload = call.get("payload")
+        if isinstance(payload, Mapping):
+            data["args"], data["truncated"] = _safe_stream_args(capability_id, payload)
+        if receipt is not None:
+            data["reason"] = receipt.get("reason")
+            data["state"] = receipt.get("state")
+            response = receipt.get("response")
+            if response is not None:
+                if isinstance(response, str):
+                    safe = project_text(response, max_chars=STREAM_TOOL_DETAIL_MAX_CHARS)
+                    data["result"] = safe
+                    data["truncated"] = len(safe) < len(response)
+                else:
+                    safe_response = redact_document(response)
+                    rendered = json.dumps(safe_response, ensure_ascii=False)
+                    if len(rendered) > STREAM_TOOL_DETAIL_MAX_CHARS:
+                        data["result"] = rendered[:STREAM_TOOL_DETAIL_MAX_CHARS]
+                        data["truncated"] = True
+                    else:
+                        data["result"] = safe_response
+        await self._steps.aemit_run_event(intent.run_id, event_type, data)
+
     async def aexecute_tool(
         self, intent: AgentRunIntent, call: Mapping[str, object]
     ) -> dict[str, object]:
@@ -2579,6 +2817,10 @@ class AgentRunExecutor:
         if state != StepState.PENDING.value:
             receipt = row["receipt"] if isinstance(row["receipt"], Mapping) else {}
             resolved = isinstance(receipt, Mapping) and bool(receipt.get("resolution"))
+            await self._aemit_tool_observation(
+                intent, AGENT_TOOL_RESULT_EVENT_TYPE, call,
+                {**dict(receipt), "state": state},
+            )
             return {
                 "seq": seq,
                 "state": state,
@@ -2730,6 +2972,10 @@ class AgentRunExecutor:
             reason=reason,
             op_id=str(outcome.op_id),
         )
+        await self._aemit_tool_observation(
+            intent, AGENT_TOOL_RESULT_EVENT_TYPE, call,
+            {**receipt, "state": step_state.value, "reason": reason},
+        )
         result_text = _result_document(
             intent=intent,
             capability_id=outcome.capability_id,
@@ -2839,6 +3085,12 @@ class AgentRunExecutor:
                 reason=reason,
                 op_id=None,
             )
+        await self._aemit_tool_observation(
+            intent,
+            AGENT_TOOL_RESULT_EVENT_TYPE,
+            call,
+            {**receipt, "state": StepState.FAILED.value, "reason": reason},
+        )
         return {
             "seq": seq,
             "state": StepState.FAILED.value,

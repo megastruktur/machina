@@ -586,6 +586,7 @@
 						userMessage: messageText,
 						modelLabel: resolvedModel ?? display.model_profile,
 						thinkingSteps: [...thinkingSteps],
+						modelThinking: liveModelThinking,
 						toolCalls: [...visibleToolCalls],
 						reply: latestAssistantReply || streamedReply
 					}
@@ -1640,6 +1641,10 @@
 		status: 'requested' | 'running' | 'succeeded' | 'failed';
 		reason: string;
 		opId: string;
+		toolCallId: string;
+		args: unknown;
+		result: unknown;
+		truncated: boolean;
 	};
 
 	type ToolStepDetail = {
@@ -1655,6 +1660,7 @@
 	async function loadToolStepDetail(tc: VisibleToolCall): Promise<void> {
 		const key = `${tc.runId}:${tc.stepSeq}`;
 		const existing = expandedToolDetails[key];
+		if (tc.args !== undefined && (tc.result !== undefined || tc.status !== 'succeeded')) return;
 		if (existing && (existing.loading || (existing.error === null && existing.response !== null))) {
 			return;
 		}
@@ -1720,6 +1726,7 @@
 		userMessage: string;
 		modelLabel: string;
 		thinkingSteps: string[];
+		modelThinking?: string;
 		toolCalls: VisibleToolCall[];
 		reply: string;
 	};
@@ -1730,6 +1737,13 @@
 	let streamedReply = $state<string>('');
 	let isStreamingReply = $state(false);
 	let thinkingSteps = $state<string[]>([]);
+	let streamedThinkingByPart = $state<Record<string, string>>({});
+	const liveModelThinking = $derived(
+		Object.entries(streamedThinkingByPart)
+			.sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+			.map(([, text]) => text)
+			.join('\n\n')
+	);
 	let visibleToolCalls = $state<VisibleToolCall[]>([]);
 	let conversationScrollEl = $state<HTMLElement | null>(null);
 	let streamRevealTimer: ReturnType<typeof setInterval> | null = null;
@@ -1811,9 +1825,71 @@
 		return '—';
 	}
 
+	function applyToolObservation(data: Record<string, unknown>, event: MaiRunEvent): void {
+		const capabilityId = typeof data.capability_id === 'string' ? data.capability_id : null;
+		if (capabilityId === null) return;
+		const toolCallId = typeof data.tool_call_id === 'string' ? data.tool_call_id : `event-${event.seq}`;
+		const seqValue = data.step_seq;
+		const stepSeq = typeof seqValue === 'number' ? String(seqValue) : typeof seqValue === 'string' ? seqValue : '';
+		const reason = typeof data.reason === 'string' ? data.reason : '';
+		const completed = event.type === 'agent.tool_result';
+		const state = typeof data.state === 'string' ? data.state : '';
+		const status: VisibleToolCall['status'] = completed
+			? ['failed', 'cancelled', 'outcome_unknown'].includes(state) ? 'failed' : 'succeeded'
+			: 'requested';
+		const current = visibleToolCalls.find((one) => one.toolCallId === toolCallId)
+			?? (stepSeq !== '' ? visibleToolCalls.find((one) =>
+				one.capabilityId === capabilityId && (one.stepSeq === stepSeq || one.stepSeq === '') &&
+				(one.status === 'requested' || one.status === 'running')
+			) : undefined);
+		const observed: VisibleToolCall = {
+			id: current?.id ?? `tool-${event.run_id ?? activeRunId}-${toolCallId}`,
+			runId: event.run_id ?? activeRunId ?? '',
+			capabilityId,
+			stepSeq: current?.stepSeq || stepSeq,
+			payloadHash: current?.payloadHash ?? '',
+			status,
+			reason,
+			opId: current?.opId ?? '',
+			toolCallId,
+			args: Object.prototype.hasOwnProperty.call(data, 'args') ? data.args : current?.args,
+			result: completed && Object.prototype.hasOwnProperty.call(data, 'result')
+				? data.result : current?.result,
+			truncated: data.truncated === true || current?.truncated === true
+		};
+		visibleToolCalls = current
+			? visibleToolCalls.map((one) => one.id === current.id ? observed : one)
+			: [...visibleToolCalls, observed];
+		queueMicrotask(scrollToConversationBottom);
+	}
+
 	function foldEvent(event: MaiRunEvent): void {
-		const data = event.data;
+		const data = recordOf(event.data);
+		if (data === null) return;
 		switch (event.type) {
+			case 'agent.output_delta': {
+				const kind = typeof data.kind === 'string' ? data.kind : null;
+				const delta = typeof data.delta === 'string' ? data.delta : null;
+				const partIndex = data.part_index;
+				if (delta === null || (kind !== 'thinking' && kind !== 'text')) break;
+				if (kind === 'thinking') {
+					const key = `${data.round ?? 0}:${typeof partIndex === 'number' ? partIndex : 'unknown'}`;
+					streamedThinkingByPart = {
+						...streamedThinkingByPart,
+						[key]: (streamedThinkingByPart[key] ?? '') + delta
+					};
+				} else {
+					streamedReply += delta;
+					isStreamingReply = true;
+				}
+				queueMicrotask(scrollToConversationBottom);
+				break;
+			}
+			case 'agent.tool_requested':
+			case 'agent.tool_result': {
+				applyToolObservation(data, event);
+				break;
+			}
 			case 'chat.submitted': {
 				const record = recordOf(data);
 				const attachments = Array.isArray(record?.attachments) ? record.attachments : [];
@@ -1885,7 +1961,10 @@
 				const record = recordOf(data);
 				const round = rowOf(data, 'round');
 				if (typeof record?.thinking === 'string' && record.thinking.trim() !== '') {
-					addThinkingStep(record.thinking);
+					const key = `${data.round ?? 0}:checkpoint`;
+					if (!(key in streamedThinkingByPart)) {
+						streamedThinkingByPart = { ...streamedThinkingByPart, [key]: record.thinking };
+					}
 				}
 				if (record?.status === 'tool_calls') {
 					const calls = Array.isArray(record.tool_calls) ? record.tool_calls : [];
@@ -1906,7 +1985,11 @@
 								payloadHash: hashStr,
 								status: 'requested',
 								reason: 'dispatched',
-								opId: '—'
+								opId: '—',
+								toolCallId: `step-${event.run_id ?? activeRunId}-${seqStr}`,
+								args: undefined,
+								result: undefined,
+								truncated: false
 							}
 						];
 					}
@@ -1927,7 +2010,8 @@
 					addThinkingStep(`Round ${round}: synthesized final response (${rowOf(data, 'output_chars')} chars)`);
 					if (replyOutput !== '') {
 						latestAssistantReply = replyOutput;
-						startStreamReveal(replyOutput);
+						if (streamedReply.trim() !== replyOutput) startStreamReveal(replyOutput);
+						else stopStreamReveal();
 					}
 					pushEntry({
 						seq: event.seq,
@@ -1988,7 +2072,11 @@
 							payloadHash: '—',
 							status: 'running',
 							reason: 'running',
-							opId: '—'
+							opId: '—',
+							toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
+							args: undefined,
+							result: undefined,
+							truncated: false
 						}
 					];
 				}
@@ -2064,7 +2152,11 @@
 							payloadHash: '—',
 							status: isOk ? 'succeeded' : 'failed',
 							reason: displayReason,
-							opId: shortId(opId)
+							opId: shortId(opId),
+							toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
+							args: undefined,
+							result: undefined,
+							truncated: false
 						}
 					];
 				}
@@ -2368,6 +2460,7 @@
 		latestAssistantReply = '';
 		streamedReply = '';
 		thinkingSteps = [];
+		streamedThinkingByPart = {};
 		visibleToolCalls = [];
 		lastSeq = 0;
 		appliedEvents = 0;
@@ -2738,8 +2831,8 @@
 		if (!canonicalMode || !rootTerminal) return;
 		stopStreamReveal();
 		streamedReply = '';
-		thinkingSteps = [];
-		visibleToolCalls = [];
+		// Keep the completed model/tool activity visible in canonical history.
+		// The final reply is already available from the durable transcript.
 		void refreshCanonicalTail();
 	});
 
@@ -3354,8 +3447,8 @@
 					{/if}
 					{/if}
 
-					{#if !canonicalMode || jobInProgress}
-					<div class="mai-chat__bubble mai-chat__bubble--assistant">
+					{#if !canonicalMode || jobInProgress || thinkingSteps.length > 0 || liveModelThinking !== '' || visibleToolCalls.length > 0}
+					<div class="mai-chat__bubble mai-chat__bubble--assistant" data-testid="live-assistant-turn">
 						<div class="mai-chat__bubble-header">
 							<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
 							{#if display !== null}
@@ -3363,7 +3456,13 @@
 							{/if}
 						</div>
 						<div class="mai-chat__bubble-body" data-testid="assistant-reply">
-							{#if thinkingSteps.length > 0 || !rootTerminal}
+							{#if liveModelThinking !== ''}
+							<details class="mai-chat__thinking-details" data-testid="assistant-model-thinking-block" open={!rootTerminal}>
+								<summary class="mai-chat__thinking-summary">&gt; Model thinking</summary>
+								<blockquote class="mai-chat__thinking-quote" data-testid="assistant-model-thinking">{liveModelThinking}</blockquote>
+							</details>
+						{/if}
+						{#if thinkingSteps.length > 0 || !rootTerminal}
 								<details
 									class="mai-chat__thinking-details"
 									data-testid="assistant-thinking-block"
@@ -3429,11 +3528,23 @@
 											</span>
 										</summary>
 											<div class="mai-chat__tool-card-body">
+												{#if tc.args !== undefined}
+													<div class="mai-chat__tool-card-section">
+														<span class="mai-chat__tool-card-label">PARAMS</span>
+														<pre class="mai-chat__tool-card-pre" data-testid="assistant-tool-args">{formatStepJson(tc.args)}</pre>
+													</div>
+												{/if}
+												{#if tc.result !== undefined}
+													<div class="mai-chat__tool-card-section">
+														<span class="mai-chat__tool-card-label">RESPONSE{tc.truncated ? ' (TRUNCATED)' : ''}</span>
+														<pre class="mai-chat__tool-card-pre" data-testid="assistant-tool-result">{formatStepJson(tc.result)}</pre>
+													</div>
+												{/if}
 												{#if stepDetail?.loading}
 													<div class="mai-chat__tool-card-loading">Loading params &amp; response…</div>
 												{:else if stepDetail?.error}
 													<div class="mai-chat__tool-card-error">{stepDetail.error}</div>
-												{:else if stepDetail}
+												{:else if stepDetail && (tc.args === undefined || tc.result === undefined)}
 													<div class="mai-chat__tool-card-section">
 														<span class="mai-chat__tool-card-label">PARAMS</span>
 														<pre class="mai-chat__tool-card-pre">{formatStepJson(stepDetail.params)}</pre>
