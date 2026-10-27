@@ -1795,6 +1795,9 @@
 	}
 	/** Watermark of the applied stream events (C08 rule 7 dedup). */
 	let lastSeq = $state(0);
+	/** The run `lastSeq` belongs to: run-local sequences never compare
+	 * across runs, so a follow-up turn's replay starts from zero again. */
+	let lastSeqRunId = $state('');
 	let appliedEvents = $state(0);
 	let streamStatus = $state<'off' | 'connecting' | 'reconnecting' | 'closed'>('off');
 	let streamProblem = $state<string | null>(null);
@@ -2502,15 +2505,22 @@
 			passCount += 1;
 			try {
 				await api.streamConversationEvents(id, {
-					cursor: lastSeq > 0 ? String(lastSeq) : null,
+					cursor: lastSeqRunId === id && lastSeq > 0 ? String(lastSeq) : null,
 					signal: controller.signal,
 					onEvent: (frame) => {
 						if (disposed || id !== activeRunId) return;
 						const event = readMaiEvent(frame);
 						// Watermark dedup (C08 rule 7): replayed or re-delivered
 						// frames at/below the last seen seq are dropped here, and a
-						// foreign run's frame never touches this transcript.
-						if (event === null || event.run_id !== id || event.seq <= lastSeq) return;
+						// foreign run's frame never touches this transcript. The
+						// watermark is run-scoped: a follow-up turn's run replays
+						// its OWN sequence from zero.
+						if (event === null || event.run_id !== id) return;
+						if (lastSeqRunId !== id) {
+							lastSeq = 0;
+							lastSeqRunId = id;
+						}
+						if (event.seq <= lastSeq) return;
 						lastSeq = event.seq;
 						foldEvent(event);
 						appliedEvents += 1;
@@ -3676,7 +3686,7 @@
 								Agent activity &amp; events ({transcript.length} recorded)
 							</summary>
 							<ul data-testid="transcript-list">
-								{#each transcript as entry (entry.seq)}
+								{#each transcript as entry, entryIndex (entryIndex)}
 									<li
 										class="mai-chat__entry"
 										data-testid="transcript-entry"

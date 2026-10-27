@@ -1845,6 +1845,16 @@ test('submit pins the window scope; the recorded conversation renders transcript
 	// The requested capability renders as the row KEY of the round entry.
 	await expect(transcript.getByText('fixture.exec')).toBeVisible();
 
+	// W2a regression: the legacy transcript drawer keys on the array index,
+	// not entry.seq, so duplicate seq values across turns can never crash
+	// Svelte with each_key_duplicate. The page-error handler would throw on
+	// such a crash; here we assert the entries render with their seq data
+	// intact, proving the index-based keying works.
+	const seqValues = await transcript.getByTestId('transcript-entry').evaluateAll((nodes) =>
+		nodes.map((node) => node.getAttribute('data-seq'))
+	);
+	expect(seqValues).toEqual(['1', '2', '3', '4']);
+
 	// The composed (not re-implemented) tree shows the honest empty state:
 	// no child runs exist for this childless submission.
 	const tree = main.getByTestId('conversation-children');
@@ -3026,6 +3036,115 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		const cancels = await callsOf(page, 'steerConversation');
 		expect(cancels).toHaveLength(2);
 		expect(cancels[1].payload).toMatchObject({ action: 'cancel' });
+	});
+
+	test('W2a: a follow-up run replaying seq 1/2 folds beside the previous run without a duplicate-key render crash', async ({
+		page
+	}) => {
+		const consoleErrors: string[] = [];
+		page.on('console', (message) => {
+			if (message.type() === 'error') consoleErrors.push(message.text());
+		});
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// Turn 1: a COMPLETED run whose legacy Details fold holds seq-keyed
+		// entries 1..5. Terminal state is set BEFORE the stream pass returns,
+		// so run 1's loop breaks instead of reconnecting behind a held route.
+		await main.getByTestId('compose-message').fill('First turn question');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'First turn question'
+		);
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		expect(conversationId).not.toBeNull();
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'First answer');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		queueStreamPair({
+			frames: [
+				frame(1, 'chat.submitted', {
+					submission_sha256: PAYLOAD_SHA,
+					handler: 'agent.run',
+					children: 0,
+					attachments: []
+				}),
+				frame(2, 'agent.started', {
+					connection: 'fixture-gateway',
+					profile: 'fixture-fast',
+					model: 'fixture-model-mini',
+					role: 'administrator',
+					rounds_budget: 8
+				}),
+				frame(3, 'agent.context_assembled', {
+					prompt_revision: 1,
+					truncated: false,
+					evidence_items: 0
+				}),
+				frame(4, 'agent.model_round', { round: 1, status: 'final', output_chars: 12 }),
+				frame(5, 'agent.completed', { rounds: 1, tool_calls: 0, output_chars: 12 })
+			]
+		});
+		await waitForStreamRequests(1);
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText('First answer');
+		await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+		await main.getByTestId('chat-details-trigger').click();
+		await main.getByTestId('conversation-transcript').locator('summary').click();
+		await expect(main.getByTestId('transcript-list')).toBeVisible();
+		const entriesAfterTurn1 = await main.getByTestId('transcript-entry').count();
+		expect(entriesAfterTurn1).toBeGreaterThan(0);
+		// The open drawer covers the composer; release it before the next turn.
+		await main.getByTestId('chat-details-close').click();
+		await expect(main.getByTestId('chat-details-trigger')).toHaveAttribute(
+			'aria-expanded',
+			'false'
+		);
+
+		// Turn 2: a NEW run in the SAME panel. Its own stream replays its OWN
+		// sequence from zero — seq 1/2 collide with run 1's still-folded
+		// entries, so the drawer's keyed rendering must survive the fold.
+		await main.getByTestId('compose-message').fill('Second turn question');
+		await main.getByTestId('chat-submit').click();
+		const follows = await callsOf(page, 'submitConversationMessage');
+		expect(follows).toHaveLength(1);
+		const followBody = follows[0].payload as Record<string, unknown>;
+		const run2 = String(followBody.client_request_id);
+		expect(run2).not.toBe(conversationId);
+		queueStreamPair({
+			frames: [
+				frame(1, 'chat.submitted', {
+					submission_sha256: PAYLOAD_SHA,
+					handler: 'agent.run',
+					children: 0,
+					attachments: []
+				}),
+				frame(2, 'agent.context_assembled', {
+					prompt_revision: 1,
+					truncated: false,
+					evidence_items: 0
+				})
+			]
+		});
+		await waitForStreamRequests(2);
+
+		// Both runs' entries render — duplicate seq values included — and the
+		// panel never hits the render boundary or logs each_key_duplicate.
+		await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
+		await expect(main.getByTestId('canonical-user-message')).toHaveCount(2);
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Second turn question'
+		);
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('transcript-list')).toBeVisible();
+		await expect(main.getByTestId('transcript-entry')).toHaveCount(entriesAfterTurn1 + 2);
+		const seqs = await main
+			.getByTestId('transcript-entry')
+			.evaluateAll((entries) => entries.map((entry) => entry.getAttribute('data-seq')));
+		expect(seqs.filter((seq) => seq === '1')).toHaveLength(2);
+		expect(seqs.filter((seq) => seq === '2')).toHaveLength(2);
+		expect(consoleErrors.join('\n')).not.toContain('each_key_duplicate');
 	});
 
 	test('C7: partial legacy history renders the gap banner and refuses mutations honestly', async ({
