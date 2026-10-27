@@ -407,18 +407,22 @@ def test_clarify_requires_open_questions() -> None:
     assert "value_error" in exc.fields.values()
 
 
-def test_task_variants_require_todo_patch() -> None:
+def test_todo_patch_required_for_plan_null_for_continue() -> None:
     plan = _plan_payload()
     del plan["todo_patch"]
     exc = _rejected_turn(plan)
     assert exc.fields.get("todo_patch") == "missing"
 
+    # A2: an ordinary continuation is ``todo_patch = null`` — a valid
+    # no-op decision, never a missing-field rejection.
     continue_payload: dict[str, object] = {
         "source_message_id": SRC,
         "turn_kind": "continue_task",
         "understanding": "continue",
     }
-    assert _rejected_turn(continue_payload).fields.get("todo_patch") == "missing"
+    turn = parse_turn_interpretation(continue_payload)
+    assert isinstance(turn, ContinueTaskTurn)
+    assert turn.todo_patch is None
 
 
 def test_answer_and_blocked_variants_reject_patch_fields() -> None:

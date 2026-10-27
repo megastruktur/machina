@@ -80,10 +80,13 @@ from mai.contracts.tasks import (
     ConstraintProposal,
     EvidenceKind,
     EvidenceRef,
+    PatchOp,
+    StepStatus,
     TaskContractError,
     TaskErrorCode,
     TaskFieldError,
     TaskPlanPatch,
+    VerificationStatus,
 )
 from mai.agents.context import ServerContextMaterials
 
@@ -134,6 +137,7 @@ _NO_ACTIVE_TASK: Final[str] = "no_active_task"
 _UNEXPECTED_FOR_CREATE: Final[str] = "unexpected_for_create"
 _CONSTRAINT_ORIGIN_ANCHOR: Final[str] = "constraint_origin_anchor"
 _SERVER_SCOPE_MISMATCH: Final[str] = "server_scope_mismatch"
+_PROGRESS_NOT_IN_PATCH: Final[str] = "progress_not_in_patch"
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +233,10 @@ class IntakeOutcome:
     """Result of one interpreted AND applied intake turn."""
 
     turn: TurnInterpretation
-    #: True when the decision was persisted to the task store
-    #: (``plan``/``new_task``/``continue_task``); False for
+    #: True when the decision bound a task episode
+    #: (``plan``/``new_task``/``continue_task`` — an ordinary
+    #: ``continue_task`` with ``todo_patch=None`` is a validated no-op
+    #: bound to the EXISTING episode); False for
     #: ``answer``/``clarify``/``blocked`` (no task machinery, P1).
     applied: bool
     task_id: uuid.UUID | None
@@ -442,10 +448,14 @@ Variant rules:
   `plan`/`inspect`/`act` as requested by the user — advisory, never
   permission).
 - `new_task`: the user explicitly starts a new goal episode.
-- `continue_task`: a delta against the CURRENT task at
-  `base_revision`; never whole-list replacement, never a goal change.
-  Preserve completed steps; update only affected items; new scope is
-  proposed, never silently approved.
+- `continue_task`: an ORDINARY continuation of the CURRENT task carries
+  `todo_patch: null` — the user saying "continue", answering a
+  question, or acknowledging progress edits no plan items. Carry a
+  delta ONLY to edit the plan itself (add/retitle/reorder/re-depend/
+  supersede pending items): a delta against the task at `base_revision`,
+  never whole-list replacement, never a goal change. Preserve completed
+  steps; update only affected items; new scope is proposed, never
+  silently approved.
 - `blocked`: the turn cannot proceed safely; state the stable
   `blocked_kind` and a safe reason.
 
@@ -460,6 +470,14 @@ Hard rules:
 - Never emit authority fields (`approved`, `grants`, `execute_now`,
   `bypass_approval`), never claim execution certainty, never mark steps
   executed or verified without real evidence references.
+- Plan editing and task progress are DIFFERENT things. A `todo_patch`
+  never reports task progress: item `status` and `verification` are
+  evidence-bound state maintained by the task progress tools, never a
+  model-ticked plan. Inside a `continue_task` delta every operation
+  stays `status: "pending"` / `verification: "not_checked"`; an
+  `update` echoes the step's current status and verification exactly
+  as shown in the snapshot. Never claim a step ran or passed through
+  the plan.
 - Facts reference existing records only; anything else is an explicit
   `assumptions` entry.
 
@@ -563,8 +581,10 @@ def build_snapshot_prompt(snapshot: IntakeSnapshot) -> str:
         for constraint_id, origin, statement in snapshot.constraints:
             lines.append(f"{constraint_id} | {origin} | {statement}")
         lines.append(
-            "Any continue_task delta MUST carry base_revision = "
-            f"{snapshot.task_revision}."
+            "An ordinary continuation carries `todo_patch: null`; a "
+            "continue_task delta MUST carry base_revision = "
+            f"{snapshot.task_revision} and never changes item status "
+            "or verification."
         )
     lines.append("")
     lines.append(
@@ -919,6 +939,77 @@ def _constraint_proposal_errors(
     return errors
 
 
+def _continue_progress_errors(
+    patch: TaskPlanPatch, snapshot: IntakeSnapshot
+) -> list[TaskFieldError]:
+    """Plan-edit vs progress defense on ``continue_task`` deltas (A2).
+
+    A ``continue_task`` ``todo_patch`` is plan editing ONLY: item
+    ``status`` and ``verification`` are evidence-bound task state owned
+    by the progress seams (``task.update_item`` / completion verdicts),
+    never a model-ticked plan. Adds/supersedes must start ``pending`` /
+    ``not_checked``; an ``update`` must echo the step's CURRENT state as
+    shown in the snapshot. The store independently re-checks update
+    equality at apply (single validation truth stays in the store); this
+    pre-check exists so the offending field path reaches the ONE bounded
+    structured repair BEFORE any apply attempt. Steps hidden by the
+    bounded snapshot page are left to the store's authoritative check.
+    """
+    current = {
+        step_id: (StepStatus(status), VerificationStatus(verification))
+        for step_id, status, verification, _title in snapshot.steps
+    }
+    errors: list[TaskFieldError] = []
+    for index, operation in enumerate(patch.operations):
+        step = operation.step
+        if operation.op is PatchOp.UPDATE:
+            state = current.get(step.step_id)
+            if state is None:
+                continue
+            if step.status is not state[0]:
+                errors.append(
+                    TaskFieldError(
+                        _PROGRESS_NOT_IN_PATCH,
+                        f"todo_patch.operations[{index}].step.status",
+                        "a continue_task plan patch never reports item "
+                        "progress; echo the current status shown in the "
+                        "snapshot or carry todo_patch: null",
+                    )
+                )
+            if step.verification is not state[1]:
+                errors.append(
+                    TaskFieldError(
+                        _PROGRESS_NOT_IN_PATCH,
+                        f"todo_patch.operations[{index}].step.verification",
+                        "a continue_task plan patch never reports item "
+                        "verification; echo the current verification shown "
+                        "in the snapshot or carry todo_patch: null",
+                    )
+                )
+            continue
+        if step.status is not StepStatus.PENDING:
+            errors.append(
+                TaskFieldError(
+                    _PROGRESS_NOT_IN_PATCH,
+                    f"todo_patch.operations[{index}].step.status",
+                    "a continue_task plan patch adds pending plan items "
+                    "only; execution status is reported through the task "
+                    "progress tools, never the plan",
+                )
+            )
+        if step.verification is not VerificationStatus.NOT_CHECKED:
+            errors.append(
+                TaskFieldError(
+                    _PROGRESS_NOT_IN_PATCH,
+                    f"todo_patch.operations[{index}].step.verification",
+                    "a continue_task plan patch adds unchecked plan items "
+                    "only; verification is evidence-bound task state, "
+                    "never a plan tick",
+                )
+            )
+    return errors
+
+
 def validate_intake_decision(
     turn: TurnInterpretation,
     snapshot: IntakeSnapshot,
@@ -943,7 +1034,13 @@ def validate_intake_decision(
     - create-variants cannot pin a task revision that does not exist;
     - constraint author↔origin anchoring (R-11 defense-in-depth);
     - turn-level evidence/source references exist (hallucinated refs are
-      rejected; the store re-checks patch-step evidence at apply).
+      rejected; the store re-checks patch-step evidence at apply);
+    - a ``continue_task`` ``todo_patch`` is a plan EDIT only: any
+      status/verification reporting through it is refused with the
+      offending field path so it reaches the ONE bounded structured
+      repair (the store re-checks update equality authoritatively at
+      apply); ``todo_patch = null`` is the validated ordinary
+      continuation.
 
     Raises :class:`TaskContractError` with value-free fields; the bounded
     repair loop feeds the mapping back to the model once, then fails
@@ -1013,13 +1110,21 @@ def validate_intake_decision(
                         "revision",
                     )
                 )
-            if turn.todo_patch.base_revision != snapshot.task_revision:
-                errors.append(
-                    TaskFieldError(
-                        TaskErrorCode.REVISION_CONFLICT,
-                        "todo_patch.base_revision",
-                        "patch base revision is stale",
+            if turn.todo_patch is not None:
+                if turn.todo_patch.base_revision != snapshot.task_revision:
+                    errors.append(
+                        TaskFieldError(
+                            TaskErrorCode.REVISION_CONFLICT,
+                            "todo_patch.base_revision",
+                            "patch base revision is stale",
+                        )
                     )
+                # A2: a continue_task patch is a plan EDIT; any
+                # status/verification reporting through it reaches the
+                # ONE bounded structured repair with the offending
+                # field path, BEFORE any apply attempt.
+                errors.extend(
+                    _continue_progress_errors(turn.todo_patch, snapshot)
                 )
 
     errors.extend(
@@ -1089,10 +1194,12 @@ async def aapply_intake(
 
     ``answer``/``clarify``/``blocked`` persist nothing (P1: no artificial
     todo machinery). ``plan``/``new_task`` create the episode;
-    ``continue_task`` applies the model-author CAS delta. All structural
-    patch/evidence/authority rules are enforced by the store's ratified
-    validators — a store rejection here is fail-closed and feeds the
-    bounded repair loop.
+    ``continue_task`` applies the model-author CAS delta, or — for the
+    ordinary ``todo_patch = null`` continuation — is a VALIDATED no-op
+    that binds the existing episode without any store write. All
+    structural patch/evidence/authority rules are enforced by the
+    store's ratified validators — a store rejection here is fail-closed
+    and feeds the bounded repair loop.
 
     Returns ``(task_id, revision, disposition)``; ``None`` when nothing
     was persisted. Raises :class:`TaskContractError` /
@@ -1125,6 +1232,11 @@ async def aapply_intake(
 
     assert isinstance(turn, ContinueTaskTurn)  # union is exhaustive
     assert snapshot.task_id is not None  # validate_intake_decision guarantees
+    if turn.todo_patch is None:
+        # Ordinary continuation (A2): a VALIDATED no-op — the decision
+        # binds the run to the active episode and persists nothing, so
+        # the task keeps its revision and ``disposition`` stays ``None``.
+        return (snapshot.task_id, snapshot.task_revision, None)
     result = await task_store.apropose_update(
         sessions,
         snapshot.task_id,

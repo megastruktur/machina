@@ -820,16 +820,23 @@ class PlanTurn(_TurnBase):
 
 
 class ContinueTaskTurn(_TurnBase):
-    """Continuation delta against the current task (§5): a patch against the
-    current plan, never whole-list replacement, never a goal change."""
+    """Continuation of the current task (§5): an ordinary continuation
+    carries ``todo_patch = null``; a carried patch is a plan EDIT against
+    the current plan — never whole-list replacement, never a goal change,
+    never a progress report (item status/verification is evidence-bound
+    task state, never a model-ticked plan)."""
 
     model_config = ConfigDict(extra="forbid")
 
     turn_kind: PyLiteral[TurnKind.CONTINUE_TASK] = Field(
-        description="Discriminator: continue the current task with a delta",
+        description="Discriminator: continue the current task",
     )
-    todo_patch: TaskPlanPatch = Field(
-        description="Bounded delta against the current task plan",
+    todo_patch: TaskPlanPatch | None = Field(
+        default=None,
+        description=(
+            "Bounded plan EDIT against the current task plan, or null "
+            "for an ordinary continuation that edits no plan items"
+        ),
     )
     facts: list[EvidenceRef] = Field(
         default_factory=list,
@@ -980,7 +987,10 @@ def turn_evidence_refs(turn: TurnInterpretation) -> Iterator[tuple[str, Evidence
     if isinstance(turn, (PlanTurn, ContinueTaskTurn, NewTaskTurn)):
         for index, ref in enumerate(turn.facts):
             yield f"facts[{index}]", ref
-        for op_index, operation in enumerate(turn.todo_patch.operations):
+        patch = turn.todo_patch
+        if patch is None:  # ordinary continue_task continuation
+            return
+        for op_index, operation in enumerate(patch.operations):
             for ref_index, ref in enumerate(operation.step.evidence_refs):
                 yield (
                     f"todo_patch.operations[{op_index}].step.evidence_refs[{ref_index}]",

@@ -759,6 +759,221 @@ async def test_p3_stale_revision_insisting_fails_closed(sessions) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A2 — plan editing vs task progress: ordinary continuation, one repair
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_a2_ordinary_continue_todo_patch_null_is_validated_noop(
+    sessions,
+) -> None:
+    conversation_id = await _make_conversation(sessions)
+    task_id, _evidence, revision = await _seed_continuation_task(
+        sessions, conversation_id
+    )
+    third = await _submit_user(sessions, conversation_id, "continue")
+    scripted = ScriptedModel(
+        [
+            {
+                "payload": _turn_base(
+                    "continue_task",
+                    third,
+                    understanding="the user continues the current task",
+                    todo_patch=None,
+                )
+            }
+        ]
+    )
+
+    outcome = await arun_intake_turn(
+        scripted.model,
+        sessions,
+        server_id=uuid.UUID(SERVER_A),
+        conversation_id=conversation_id,
+        source_message_id=third,
+    )
+
+    # One call, no repair, no store write: the validated no-op binds the
+    # EXISTING episode (disposition None, revision unchanged).
+    assert outcome.turn.turn_kind == "continue_task"
+    assert outcome.turn.todo_patch is None
+    assert outcome.applied is True
+    assert outcome.task_id == task_id
+    assert outcome.disposition is None
+    assert outcome.record.model_calls == 1
+    assert outcome.record.repaired is False
+    assert outcome.revision == revision
+    steps = await alist_steps(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    by_id = {step.step_id: step for step in steps.items}
+    assert by_id["s1_build"].status is StepStatus.EXECUTED
+    assert by_id["s2_deploy"].status is StepStatus.PENDING
+
+
+@pytest.mark.anyio
+async def test_a2_progress_report_patch_is_repaired_once_to_noop(
+    sessions,
+) -> None:
+    """Incident-shaped replay: the model reports step execution AND
+    verification through a continue_task plan patch — even backed by a
+    REAL evidence reference. The offending field paths reach the ONE
+    bounded structured repair, and the repaired decision is a validated
+    no-op continuation."""
+    conversation_id = await _make_conversation(sessions)
+    task_id, evidence_id, revision = await _seed_continuation_task(
+        sessions, conversation_id
+    )
+    third = await _submit_user(sessions, conversation_id, "deploy is done too")
+    progress_patch = _continue_payload(
+        third,
+        revision,
+        _update_op(
+            "s2_deploy",
+            status="executed",
+            verification="passed",
+            evidence_refs=[
+                {
+                    "kind": "message",
+                    "evidence_id": str(evidence_id),
+                    "note": "user confirmation",
+                }
+            ],
+        ),
+    )
+    noop = _turn_base(
+        "continue_task",
+        third,
+        understanding="the user continues the current task",
+        todo_patch=None,
+    )
+    scripted = ScriptedModel([{"payload": progress_patch}, {"payload": noop}])
+
+    outcome = await arun_intake_turn(
+        scripted.model,
+        sessions,
+        server_id=uuid.UUID(SERVER_A),
+        conversation_id=conversation_id,
+        source_message_id=third,
+    )
+
+    assert outcome.record.repaired is True
+    assert outcome.record.model_calls == 2
+    assert scripted.calls == 2
+    feedback = outcome.record.repair_feedback[0]
+    assert (
+        feedback["todo_patch.operations[0].step.status"]
+        == "progress_not_in_patch"
+    )
+    assert (
+        feedback["todo_patch.operations[0].step.verification"]
+        == "progress_not_in_patch"
+    )
+    # The repaired continuation is a validated no-op: nothing persisted.
+    assert outcome.turn.todo_patch is None
+    assert outcome.applied is True
+    assert outcome.task_id == task_id
+    assert outcome.disposition is None
+    assert outcome.revision == revision
+    steps = await alist_steps(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    by_id = {step.step_id: step for step in steps.items}
+    assert by_id["s2_deploy"].status is StepStatus.PENDING
+    assert by_id["s1_build"].status is StepStatus.EXECUTED
+
+
+@pytest.mark.anyio
+async def test_a2_progress_report_insisting_fails_closed(sessions) -> None:
+    conversation_id = await _make_conversation(sessions)
+    task_id, _evidence, revision = await _seed_continuation_task(
+        sessions, conversation_id
+    )
+    third = await _submit_user(sessions, conversation_id, "deploy is done too")
+    progress_patch = _continue_payload(
+        third,
+        revision,
+        _update_op(
+            "s2_deploy",
+            status="executed",
+            verification="passed",
+            evidence_refs=[
+                {
+                    "kind": "message",
+                    "evidence_id": str(_evidence),
+                    "note": "user confirmation",
+                }
+            ],
+        ),
+    )
+    scripted = ScriptedModel(
+        [{"payload": progress_patch}, {"payload": progress_patch}]
+    )
+
+    with pytest.raises(IntakeRejection) as excinfo:
+        await arun_intake_turn(
+            scripted.model,
+            sessions,
+            server_id=uuid.UUID(SERVER_A),
+            conversation_id=conversation_id,
+            source_message_id=third,
+        )
+    assert excinfo.value.attempts == 2
+    assert excinfo.value.repaired is True
+    assert any(
+        code == "progress_not_in_patch" for code in excinfo.value.fields.values()
+    )
+    task = await aget_task(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    assert task.revision == revision  # zero effects
+    steps = await alist_steps(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    by_id = {step.step_id: step for step in steps.items}
+    assert by_id["s2_deploy"].status is StepStatus.PENDING
+
+
+@pytest.mark.anyio
+async def test_a2_self_executed_add_via_continue_fails_closed(sessions) -> None:
+    """A continue_task patch cannot invent a completed item: an add
+    carrying executed/passed state is refused pre-apply even with a REAL
+    evidence reference (the store would have accepted it — regression)."""
+    conversation_id = await _make_conversation(sessions)
+    task_id, evidence_id, revision = await _seed_continuation_task(
+        sessions, conversation_id
+    )
+    third = await _submit_user(sessions, conversation_id, "mark it complete")
+    ghost_done = _continue_payload(
+        third,
+        revision,
+        _add_op(
+            "s3_ghost",
+            status="executed",
+            verification="passed",
+            evidence_refs=[
+                {
+                    "kind": "message",
+                    "evidence_id": str(evidence_id),
+                    "note": "user confirmation",
+                }
+            ],
+        ),
+    )
+    scripted = ScriptedModel([{"payload": ghost_done}, {"payload": ghost_done}])
+
+    with pytest.raises(IntakeRejection) as excinfo:
+        await arun_intake_turn(
+            scripted.model,
+            sessions,
+            server_id=uuid.UUID(SERVER_A),
+            conversation_id=conversation_id,
+            source_message_id=third,
+        )
+    assert excinfo.value.attempts == 2
+    assert (
+        excinfo.value.fields.get("todo_patch.operations[0].step.status")
+        == "progress_not_in_patch"
+    )
+    task = await aget_task(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    assert task.revision == revision  # zero effects
+    steps = await alist_steps(sessions, task_id, server_id=uuid.UUID(SERVER_A))
+    assert "s3_ghost" not in {step.step_id for step in steps.items}
+
+
+# ---------------------------------------------------------------------------
 # P4 — schema, sources, cycles, authority: bounded repair, zero effects
 # ---------------------------------------------------------------------------
 
