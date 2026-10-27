@@ -243,6 +243,7 @@ __all__ = [
     "DEFAULT_WAIT_POLL_SECONDS",
     "HANDLER_NAME",
     "AGENT_INTAKE_EVENT_TYPE",
+    "AGENT_INTAKE_STARTED_EVENT_TYPE",
     "INTAKE_NO_EXECUTOR_KINDS",
     "MAX_HISTORY_BYTES",
     "MAX_MAX_ROUNDS",
@@ -469,6 +470,11 @@ AGENT_STARTED_EVENT_TYPE: Final[str] = "agent.started"
 AGENT_CONTEXT_EVENT_TYPE: Final[str] = "agent.context_assembled"
 AGENT_HISTORY_EVENT_TYPE: Final[str] = "agent.conversation_history"
 AGENT_INTAKE_EVENT_TYPE: Final[str] = "agent.intake_interpreted"
+#: Additive, value-free preflight observation: emitted once BEFORE the
+#: intake planner call starts, so the UI can name the actually-running
+#: stage while that one un-streamed model call is pending. Carries no
+#: prompt, task content, model thoughts or secrets.
+AGENT_INTAKE_STARTED_EVENT_TYPE: Final[str] = "agent.intake_started"
 AGENT_ROUND_EVENT_TYPE: Final[str] = "agent.model_round"
 #: Live, sanitized model output. Deltas are observations only: the durable
 #: model-round checkpoint remains the authority for tool execution.
@@ -2072,6 +2078,10 @@ class AgentRunExecutor:
 
         Legacy runs without a conversation link return
         ``{"interpreted": False}`` and keep today's behavior unchanged.
+        Before the planner call, the additive value-free
+        ``agent.intake_started`` observation is persisted once (preflight
+        visibility: the UI can name the pending stage while the
+        un-streamed model call runs).
         """
         conversation_id = await conversation_context.aconversation_for_run(
             self._sessions, run_id=intent.run_id
@@ -2115,6 +2125,14 @@ class AgentRunExecutor:
             )
         except ContextError:
             server_materials = None
+
+        # Preflight visibility (additive, value-free): persist the start
+        # observation BEFORE the one un-streamed planner call so the UI
+        # can name the actually-running stage while it is pending. Never
+        # carries prompt, task content, model thoughts or secrets.
+        await self._emit_once(
+            intent.run_id, AGENT_INTAKE_STARTED_EVENT_TYPE, {"status": "started"}
+        )
 
         try:
             outcome = await arun_intake_turn(

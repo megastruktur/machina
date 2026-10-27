@@ -29,8 +29,10 @@ Fixtures carry only fixed opaque UUIDs and synthetic text.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -864,6 +866,78 @@ class TestIntakeCheckpointSeam:
         assert result == {"interpreted": False, "reason": "no_conversation_link"}
         assert scripted.intake_calls == 0
         assert _events_of(task_run_url, run_id) == []
+
+    @pytest.mark.anyio
+    async def test_intake_started_persists_while_planner_pending(
+        self, sessions, task_run_url, tmp_path
+    ) -> None:
+        """Preflight visibility: ``agent.intake_started`` is persisted and
+        observable while the intake planner call is still gated (pending),
+        and the stream then orders started → interpreted. The legacy
+        no-conversation-link run above proves the event never fires
+        without a canonical turn (zero events of ANY type)."""
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+        scripted = DispatchModel(
+            [intake_fixtures._answer_payload(message_id, "4")], []
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        async def _gated_respond(messages, info):  # noqa: ANN001 - FunctionModel ABI
+            if not release.is_set():
+                last = messages[-1]
+                prompt_text = "".join(
+                    str(getattr(part, "content", "") or "") for part in last.parts
+                )
+                if "# Canonical snapshot" in prompt_text:
+                    entered.set()
+                    await asyncio.to_thread(release.wait, 60)
+            return scripted._respond(messages, info)
+
+        executor, _journal = _compose(
+            sessions, task_run_url, tmp_path, FunctionModel(_gated_respond)
+        )
+
+        #: ``_run`` blocks its caller, so the interpretation runs on a
+        #: helper thread; THIS thread stays free to read the persisted
+        #: stream while the planner is parked inside the gated model call.
+        outcome: dict[str, object] = {}
+
+        def _invoke() -> None:
+            try:
+                outcome["result"] = _run(
+                    executor.ainterpret_intake_turn(
+                        _intent_of(run_id), _pins_of(executor)
+                    )
+                )
+            except BaseException as error:  # surfaced to the test below
+                outcome["error"] = error
+
+        worker = threading.Thread(target=_invoke, daemon=True)
+        worker.start()
+        try:
+            assert entered.wait(30), "gated intake model call never entered"
+            # The planner is parked INSIDE the model call: the started
+            # event is already persisted; no interpreted event can exist.
+            pending = _events_of(task_run_url, run_id)
+            assert [event["type"] for event in pending] == [
+                agent_run.AGENT_INTAKE_STARTED_EVENT_TYPE
+            ]
+            assert pending[0]["data"] == {"status": "started"}
+        finally:
+            release.set()
+            worker.join(60)
+        assert not worker.is_alive()
+        assert "error" not in outcome, outcome.get("error")
+        result = outcome["result"]
+        assert result["interpreted"] is True
+        # Completion ordering: started → interpreted, each exactly once.
+        assert [event["type"] for event in _events_of(task_run_url, run_id)] == [
+            agent_run.AGENT_INTAKE_STARTED_EVENT_TYPE,
+            agent_run.AGENT_INTAKE_EVENT_TYPE,
+        ]
 
 
 def _pins_of(executor: agent_run.AgentRunExecutor) -> dict[str, object]:
