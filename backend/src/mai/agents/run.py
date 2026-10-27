@@ -469,6 +469,23 @@ AGENT_FAILED_EVENT_TYPE: Final[str] = "agent.failed"
 #: effects — invalid intake can never enable execution (AC 1).
 INTAKE_REJECTED_REASON: Final[str] = "intake_rejected"
 
+#: A3 (agent-interaction-recovery): THE canonical assistant-visible
+#: outcome recorded ONCE when an intake turn exhausts its bounded repair
+#: (``intake_rejected``). Fixed safe text — it admits the interpretation
+#: failed, states this attempt performed no effects and that any task
+#: stays open; it never carries raw model output, field values, safe
+#: codes or internal exception details (those live only in the
+#: ``agent.intake_interpreted`` event). Recorded through the checkpointed
+#: :meth:`AgentRunExecutor.arecord_assistant_reply` producer BEFORE the
+#: run fails and releases its lease, so replays/restarts never duplicate
+#: the message and legacy unlinked runs record nothing.
+INTAKE_REJECTED_VISIBLE_REPLY: Final[str] = (
+    "I could not reliably interpret that message, so this attempt "
+    "performed no effects. Any task in this conversation remains open "
+    "and unchanged; nothing was executed or verified. Please rephrase "
+    "your message and try again."
+)
+
 #: Stable denial reason for a phase-gated tool effect (§6 phase gate):
 #: a task-bound run executes steps only in ``act`` and reads only in
 #: ``inspect``/``act`` — the ratified ``validate_phase`` vocabulary.
@@ -3741,6 +3758,22 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         _agent_run_finished(payload_json, canonical_json(summary))
         return {"run_id": intent.run_id, "state": "succeeded", **summary}
     except AgentStageError as stage:
+        if stage.reason == INTAKE_REJECTED_REASON:
+            # A3: an exhausted intake rejection is assistant-VISIBLE.
+            # ONE canonical safe reply is recorded through the
+            # checkpointed producer BEFORE the run fails and releases
+            # its lease: the conversation shows an honest terminal
+            # outcome (interpretation failed, no effects, task stays
+            # open) instead of silent termination. The producer is
+            # idempotent per run_id (content_ref ``agent-run:<run_id>``
+            # belt + DBOS step checkpoint), so a replayed/restarted
+            # workflow never duplicates the row; legacy runs without a
+            # conversation link record nothing. Safe field codes stay
+            # ONLY in the ``agent.intake_interpreted`` event (emitted by
+            # the intake seam); the visible text is the fixed constant.
+            _agent_assistant_recorded(
+                payload_json, INTAKE_REJECTED_VISIBLE_REPLY
+            )
         _agent_run_failed(payload_json, stage.reason)
         _release_lease_quietly(intent)
         raise AgentRunFailed(stage.reason) from None

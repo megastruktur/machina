@@ -1700,6 +1700,130 @@ async def _noop_insert(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# A3 — the assistant-visible outcome of an exhausted intake rejection
+# ---------------------------------------------------------------------------
+
+
+class TestIntakeRejectionVisibleOutcome:
+    def test_exhausted_intake_rejection_records_one_visible_reply(
+        self, task_run_url, domain, scenario, composition, tmp_path
+    ) -> None:
+        """A3 (real worker): an exhausted ``intake_rejected`` records
+        EXACTLY ONE canonical assistant-visible reply BEFORE the run
+        fails and releases its lease. The message never carries raw
+        model output, field values or safe codes (those stay in the
+        ``agent.intake_interpreted`` event); no task machinery exists;
+        no effect ran; a replayed producer step cannot duplicate."""
+        composition()
+        harness._write_policy_files(scenario, grants=[{READ_CAP: True}])
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = _run(_alinked_turn(domain, run_id))
+        _run(_ainsert_run(domain, run_id))
+        # Incident-shaped exhaustion: the interpretation cites a source
+        # message that does not exist; one bounded repair, then closed.
+        wrong_source = intake_fixtures._answer_payload(uuid.uuid4(), "4")
+        harness._script(
+            scenario,
+            [
+                {
+                    "tool_call": {
+                        "name": "final_result",
+                        "args": {"response": wrong_source},
+                    }
+                },
+                {
+                    "tool_call": {
+                        "name": "final_result",
+                        "args": {"response": wrong_source},
+                    }
+                },
+            ],
+        )
+        document = harness._intent_document(
+            run_id, connection="gateway", profile="fast", wait_poll_seconds=0.5
+        )
+        client = EngineClient(task_run_url)
+        worker = None
+        try:
+            worker = harness._spawn_worker(
+                task_run_url, scenario / "handlers", scenario, "w1"
+            )
+            _run(harness._enqueue_run(client, _noop_insert, run_id, document))
+            harness._wait_until(
+                lambda: (harness._terminal_engine_state(client, run_id) or "")
+                in ("succeeded", "failed"),
+                harness.RUN_TIMEOUT,
+                "rejected run terminal",
+            )
+        finally:
+            if worker is not None:
+                harness._stop(worker)
+            client.close()
+
+        # The run failed honestly with the classified intake reason and
+        # the value-free rejection event (safe codes stay in events).
+        assert harness._terminal_engine_state(client, run_id) == "failed"
+        assert harness._failure_reasons(task_run_url, run_id) == [
+            "intake_rejected"
+        ]
+        intake_event = _intake_event(task_run_url, run_id)
+        assert intake_event is not None
+        assert intake_event["data"]["rejected"] is True
+        assert intake_event["data"]["fields"] == {
+            "source_message_id": "source_message_mismatch"
+        }
+        # EXACTLY ONE canonical assistant-visible reply, recorded through
+        # the producer's ``agent-run:<run_id>`` marker.
+        with psycopg.connect(task_run_url) as conn:
+            rows = conn.execute(
+                "SELECT role, content, content_ref, source_kind "
+                "FROM conversation_messages WHERE conversation_id = %s "
+                "AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchall()
+        assert len(rows) == 1
+        role, content, content_ref, source_kind = rows[0]
+        assert content == agent_run.INTAKE_REJECTED_VISIBLE_REPLY
+        assert content_ref == f"agent-run:{run_id}"
+        assert role == "assistant" and source_kind == "system"
+        # Wire honesty: no field values, no safe codes, no model output.
+        assert "source_message_mismatch" not in content
+        assert str(wrong_source["source_message_id"]) not in content
+        assert "4" != content.strip()
+        # No task machinery, no effect, lease released.
+        with psycopg.connect(task_run_url) as conn:
+            tasks = conn.execute("SELECT COUNT(*) FROM agent_tasks").fetchone()[0]
+            link = conn.execute(
+                "SELECT task_id, released_at FROM conversation_runs "
+                "WHERE run_id = %s",
+                (uuid.UUID(run_id),),
+            ).fetchone()
+        assert tasks == 0
+        assert link is not None and link[0] is None
+        assert link[1] is not None  # the writer lease was released
+        assert _count_marker(scenario, "model_call") == 2  # intake only
+        assert _count_marker(scenario, "effect:fixture.read:m1") == 0
+        # The replay belt: a re-executed producer step for the SAME run
+        # (lost checkpoint) dedups onto the SAME row — never a duplicate.
+        executor, _journal = _compose(
+            domain, task_run_url, tmp_path, DispatchModel([], []).model
+        )
+        replayed = _run(
+            executor.arecord_assistant_reply(
+                _intent_of(run_id), agent_run.INTAKE_REJECTED_VISIBLE_REPLY
+            )
+        )
+        assert replayed["recorded"] is True
+        with psycopg.connect(task_run_url) as conn:
+            still_one = conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id = %s AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchone()[0]
+        assert still_one == 1
+
+
 def _frame_data_root(tmp_path: Path) -> Path:
     """The SAME fixture server enrolled under the canonical name "Frame"
     (SteamOS Steam Frame VR headset acceptance wording)."""
