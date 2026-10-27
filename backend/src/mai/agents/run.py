@@ -201,6 +201,7 @@ from mai.contracts.tasks import (
     Phase,
     PhaseAction,
     TaskContractError,
+    TaskOutcome,
     validate_phase,
 )
 from mai.credentials.env import EnvFileError, EnvResolver
@@ -424,6 +425,29 @@ ROUND_BUDGET_REASON: Final[str] = "round_budget_exhausted"
 HISTORY_BUDGET_REASON: Final[str] = "history_budget_exhausted"
 TOOL_BUDGET_REASON: Final[str] = "tool_call_budget_exhausted"
 CRASH_RECOVERY_RESULT_REASON: Final[str] = "crash_recovery"
+
+#: Stable additive ``agent.completed``/summary key qualifying a terminal
+#: success whose episode is still open (W2): present ONLY when the real
+#: final-seam task-outcome document reports an open domain outcome, next
+#: to the honest document itself. Verified/failed/cancelled verdicts and
+#: taskless runs keep every existing shape byte-identical.
+TASK_OPEN_EVENT_KEY: Final[str] = "task_open_reason"
+
+#: The one open-episode reason this runner emits: durable task criteria
+#: or steps remain unverified (the completion review keeps the episode
+#: open), so the run's success is qualified, never unqualified.
+TASK_OPEN_UNVERIFIED_REASON: Final[str] = "unverified_task_outcome"
+
+#: Domain outcomes that END the episode (§9); every other ``TaskOutcome``
+#: value is open and leaves the task exactly as resumable as it was.
+_TASK_CLOSED_OUTCOMES: Final[frozenset[str]] = frozenset(
+    item.value
+    for item in (
+        TaskOutcome.VERIFIED,
+        TaskOutcome.FAILED,
+        TaskOutcome.CANCELLED,
+    )
+)
 
 #: Event types this module owns in the shared per-run stream (C05 rule 4:
 #: the envelope SHAPE is frozen in ``mai.contracts.jobs``, the type
@@ -819,6 +843,28 @@ TASK_BLOCK_CLOSER: Final[str] = (
     "gates target effects at every tool boundary (plan: none, "
     "inspect: read-only, act: granted capabilities)."
 )
+
+
+def _task_open_reason(summary: Mapping[str, object]) -> str | None:
+    """The open-episode qualifier for one finishing run (pure, value-free).
+
+    Returns the stable reason ONLY when the real final-seam task-outcome
+    document (:func:`task_completion.aobserve_task_outcome`) reports an
+    OPEN domain outcome (``in_progress`` / ``needs_input`` /
+    ``partially_verified``): the run's own attempts may have succeeded
+    technically, but durable criteria or steps remain unverified, so the
+    terminal success must be explicitly qualified instead of presented
+    as an unqualified completion. Closed verdicts (``verified`` /
+    ``failed`` / ``cancelled``) and an absent/malformed document
+    (taskless runs) keep every existing surface byte-identical.
+    """
+    document = summary.get(task_completion.TASK_OUTCOME_SUMMARY_KEY)
+    if not isinstance(document, Mapping) or not document:
+        return None
+    outcome = document.get("outcome")
+    if not isinstance(outcome, str) or outcome in _TASK_CLOSED_OUTCOMES:
+        return None
+    return TASK_OPEN_UNVERIFIED_REASON
 
 
 def _task_context_block(header: Mapping[str, object]) -> str:
@@ -2876,6 +2922,12 @@ class AgentRunExecutor:
             # event carries the honest disposition; runs that end
             # normally keep the existing event shape byte-identical.
             completed_data[STOPPED_BY_EVENT_KEY] = stopped_by
+        task_open_reason = _task_open_reason(summary)
+        if task_open_reason is not None:
+            # W2: an open episode qualifies the terminal success — the
+            # event carries the stable reason next to the honest
+            # task_outcome document (never a fabricated completion).
+            completed_data[TASK_OPEN_EVENT_KEY] = task_open_reason
         await self._emit_once(intent.run_id, AGENT_COMPLETED_EVENT_TYPE, completed_data)
         await self.arelease_conversation_lease(intent)
         return current.value
@@ -3481,6 +3533,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             outcome_json = _agent_task_outcome_finalized(payload_json)
             if outcome_json != "null":
                 summary["task_outcome"] = json.loads(outcome_json)
+            task_open_reason = _task_open_reason(summary)
+            if task_open_reason is not None:
+                # W2: the durable episode is still open — the summary (and
+                # the completed event projected from it) qualifies the
+                # terminal success instead of presenting an unqualified
+                # completion while criteria remain unverified.
+                summary[TASK_OPEN_EVENT_KEY] = task_open_reason
             if stopped_by is not None:
                 summary[STOPPED_BY_EVENT_KEY] = stopped_by
             _agent_run_finished(payload_json, canonical_json(summary))
@@ -3658,6 +3717,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         outcome_json = _agent_task_outcome_finalized(payload_json)
         if outcome_json != "null":
             summary["task_outcome"] = json.loads(outcome_json)
+        task_open_reason = _task_open_reason(summary)
+        if task_open_reason is not None:
+            # W2: the durable episode is still open — the summary (and
+            # the completed event projected from it) qualifies the
+            # terminal success instead of presenting an unqualified
+            # completion while criteria remain unverified.
+            summary[TASK_OPEN_EVENT_KEY] = task_open_reason
         if stopped_by is not None:
             summary[STOPPED_BY_EVENT_KEY] = stopped_by
         _agent_run_finished(payload_json, canonical_json(summary))

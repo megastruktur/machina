@@ -48,7 +48,7 @@ from mai.agents.conversation_store import aattach_run, acreate_conversation
 from mai.agents.model_store import ModelConfigStore
 from mai.agents.task_store import acreate_task
 from mai.capabilities.dispatch import CapabilityDispatcher
-from mai.contracts.tasks import AcceptanceCriterion
+from mai.contracts.tasks import AcceptanceCriterion, TaskPlanStep
 from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
 from mai.jobs import engine as jobs_engine
@@ -533,8 +533,176 @@ class TestTaskOutcomeWire:
         assert data["output_chars"] == 7
         assert data[agent_run.STOPPED_BY_EVENT_KEY] == "pause"
         assert data[task_completion.TASK_OUTCOME_SUMMARY_KEY] == document
+        # W2: the fixture document's fresh episode is open, so the event
+        # also carries the honest open-episode qualifier (additive, next
+        # to the disposition and the document).
+        assert data[agent_run.TASK_OPEN_EVENT_KEY] == (
+            agent_run.TASK_OPEN_UNVERIFIED_REASON
+        )
         assert set(data) == {
             *LEGACY_KEYS,
             agent_run.STOPPED_BY_EVENT_KEY,
             task_completion.TASK_OUTCOME_SUMMARY_KEY,
+            agent_run.TASK_OPEN_EVENT_KEY,
         }
+
+
+# ---------------------------------------------------------------------------
+# W2 — the open-episode qualifier on an honest terminal success
+# ---------------------------------------------------------------------------
+
+
+def _outcome_document(outcome: str) -> dict[str, object]:
+    """One value-free final-seam document of the pinned wire shape."""
+    return {
+        "task_id": str(uuid.uuid4()),
+        "outcome": outcome,
+        "verified": outcome == "verified",
+        "recorded": False,
+        "criteria": {"total": 2, "supported": 0, "failed": 0, "unavailable": 2},
+        "criterion_states": [
+            {"criterion_id": "c1", "state": "unavailable"},
+            {"criterion_id": "c2", "state": "unavailable"},
+        ],
+        "proposal": "none",
+    }
+
+
+class TestOpenEpisodeQualifier:
+    @pytest.mark.parametrize("outcome", ["verified", "failed", "cancelled"])
+    def test_closed_outcomes_keep_the_shape_unqualified(self, outcome: str) -> None:
+        """A closed domain verdict (verified/failed/cancelled) never gains
+        the open-episode qualifier: the existing shapes stay untouched."""
+        summary = {
+            task_completion.TASK_OUTCOME_SUMMARY_KEY: _outcome_document(outcome)
+        }
+        assert agent_run._task_open_reason(summary) is None
+
+    @pytest.mark.parametrize(
+        "outcome", ["in_progress", "needs_input", "partially_verified"]
+    )
+    def test_open_outcomes_qualify_the_terminal_success(self, outcome: str) -> None:
+        """An open episode yields exactly the one stable qualifier."""
+        summary = {
+            task_completion.TASK_OUTCOME_SUMMARY_KEY: _outcome_document(outcome)
+        }
+        assert agent_run._task_open_reason(summary) == (
+            agent_run.TASK_OPEN_UNVERIFIED_REASON
+        )
+
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            {},
+            {task_completion.TASK_OUTCOME_SUMMARY_KEY: None},
+            {task_completion.TASK_OUTCOME_SUMMARY_KEY: "junk"},
+            {task_completion.TASK_OUTCOME_SUMMARY_KEY: {}},
+        ],
+        ids=["absent", "none", "string", "empty"],
+    )
+    def test_absent_or_malformed_documents_stay_unqualified(
+        self, summary: dict[str, object]
+    ) -> None:
+        """Taskless (document-absent) and malformed summaries never gain
+        the qualifier — the legacy surfaces stay byte-identical."""
+        assert agent_run._task_open_reason(summary) is None
+
+
+class TestOpenTaskQualifiedFinish:
+    async def test_open_episode_finish_is_explicitly_qualified(
+        self, sessions, executor
+    ) -> None:
+        """W2: an open episode never presents an unqualified run success.
+
+        The frozen terminal ``RunState`` stays ``succeeded`` (the attempt
+        itself did not fail: its read answered and its refusals were
+        proven no-effect), but the ``agent.completed`` event carries the
+        stable open-episode reason NEXT TO the honest ``task_outcome``
+        document. The persisted task stays exactly as resumable as it
+        was — outcome, revision, pending steps and unverified criteria
+        untouched — and the finish path records NO effects of its own.
+        """
+        conversation = await acreate_conversation(sessions, server_id=SERVER_UUID)
+        run_id = uuid.uuid4()
+        await _insert_run_row(sessions, str(run_id))
+        created = await acreate_task(
+            sessions,
+            server_id=SERVER_UUID,
+            conversation_id=conversation.conversation_id,
+            title="synthetic fixture task",
+            summary="fixture objective",
+            steps=[
+                TaskPlanStep(step_id="s1", title="step s1"),
+                TaskPlanStep(step_id="s2", title="step s2"),
+            ],
+            criteria=[
+                AcceptanceCriterion(criterion_id="c1", statement="criterion c1 holds"),
+                AcceptanceCriterion(criterion_id="c2", statement="criterion c2 holds"),
+            ],
+        )
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=SERVER_UUID,
+            run_id=run_id,
+            task_id=created.task.task_id,
+        )
+        intent = _intent(str(run_id))
+        executor.observe_run_started(intent)
+        document = executor.run(executor.afinalize_task_outcome(intent))
+        assert document is not None
+        assert document["outcome"] == "in_progress"  # open: nothing verified
+        summary = {
+            "rounds": 2,
+            "tool_calls": [{"name": "fixture.read", "status": "ok"}],
+            "output_chars": 42,
+            task_completion.TASK_OUTCOME_SUMMARY_KEY: document,
+        }
+        state = executor.run(executor.afinish_run(intent, summary))
+        assert state == "succeeded"
+        events = await _completed_data(sessions, run_id)
+        assert len(events) == 1  # _emit_once: exactly one emission
+        data = events[0]
+        # The success is QUALIFIED, never unqualified: the stable reason
+        # rides the event next to the honest document.
+        assert data[agent_run.TASK_OPEN_EVENT_KEY] == (
+            agent_run.TASK_OPEN_UNVERIFIED_REASON
+        )
+        assert data[task_completion.TASK_OUTCOME_SUMMARY_KEY] == document
+        assert data[task_completion.TASK_OUTCOME_SUMMARY_KEY]["verified"] is False
+        # Legacy keys keep their values.
+        assert data["rounds"] == 2
+        assert data["tool_calls"] == [{"name": "fixture.read", "status": "ok"}]
+        assert data["output_chars"] == 42
+        # Persisted truth: the task row stays open at revision 1, both
+        # plan steps stay pending, and the finish recorded NO step rows
+        # (no second execution, no fabricated effects).
+        async with sessions() as session:
+            task_row = (
+                await session.execute(
+                    text(
+                        "SELECT status, revision FROM agent_tasks "
+                        "WHERE task_id = :t"
+                    ),
+                    {"t": created.task.task_id},
+                )
+            ).first()
+            step_rows = (
+                await session.execute(
+                    text(
+                        "SELECT status, COUNT(*) FROM agent_task_steps "
+                        "WHERE task_id = :t GROUP BY status ORDER BY status"
+                    ),
+                    {"t": created.task.task_id},
+                )
+            ).all()
+            step_events = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM job_steps WHERE run_id = :r"),
+                    {"r": run_id},
+                )
+            ).scalar()
+        assert task_row[0] == "in_progress"
+        assert task_row[1] == 1
+        assert step_rows == [("pending", 2)]
+        assert step_events == 0
