@@ -3907,12 +3907,12 @@ export interface components {
          *     scope; existence is checked by the runtime store, never assumed here.
          */
         EvidenceRef: {
-            /** @description Kind of sourced record referenced */
+            /** @description Kind of the sourced record referenced: message, observation, run_event, artifact or document */
             kind: components["schemas"]["EvidenceKind"];
             /**
              * Evidence Id
              * Format: uuid
-             * @description Opaque UUID of the referenced record
+             * @description Canonical UUID of the referenced record (message_id, observation_id, run_id or doc_id) — the record must exist
              */
             evidence_id: string;
             /**

@@ -218,14 +218,18 @@ class TaskUpdateItemPayload(BaseModel):
     expected_revision: int = Field(
         ge=1,
         description=(
-            "Expected task revision for compare-and-swap; a stale value "
-            "is the stable revision_conflict, never last-writer-wins."
+            "Current task revision for compare-and-swap: read it from "
+            "task.read (section=header) immediately before this call; a "
+            "stale value is the stable revision_conflict, never "
+            "last-writer-wins."
         ),
     )
     idempotency_key: uuid.UUID = Field(
         description=(
             "Caller-generated key so a retransmitted update deduplicates "
-            "onto the SAME revision instead of double-applying."
+            "onto the SAME revision instead of double-applying. Must be a "
+            "canonical UUID string (8-4-4-4-12 hexadecimal, e.g. "
+            "str(uuid.uuid4())); any other format is refused."
         ),
     )
     status: StepStatus | None = Field(
@@ -255,14 +259,22 @@ class TaskUpdateItemPayload(BaseModel):
         max_length=MAX_EVIDENCE_REFS,
         description=(
             "Sourced evidence references merged into the item; executed "
-            "and passed/failed verdicts require at least one."
+            "and passed/failed verdicts require at least one. Each ref "
+            "cites a REAL record: kind is exactly one of message, "
+            "observation, run_event, artifact, document, and evidence_id "
+            "is that record's canonical UUID — a message UUID of THIS "
+            "conversation (preferred for user confirmations) or a run_id "
+            "linked to THIS conversation; observation/document records "
+            "must already exist; artifact has no registry and is always "
+            "refused."
         ),
     )
     source_message_id: uuid.UUID | None = Field(
         default=None,
         description=(
-            "Optional user message of this conversation the update was "
-            "produced from (existence-checked, P4)."
+            "Optional canonical UUID of a user message of THIS "
+            "conversation the update was produced from "
+            "(existence-checked, P4)."
         ),
     )
 
@@ -620,7 +632,11 @@ def build_task_state_capabilities(
             "conversation under compare-and-swap revision and "
             "idempotency rules: set its todo status, evidence-bound "
             "verification verdict, safe result summary and evidence "
-            "references. Executed/skipped items stay frozen; a passed "
+            "references. Read the current revision and step IDs from "
+            "task.read (section=header / steps) first: expected_revision "
+            "must equal that revision and idempotency_key must be a "
+            "fresh canonical UUID (reusing a key replays the SAME "
+            "revision). Executed/skipped items stay frozen; a passed "
             "verdict requires evidence and is never silently cleared."
         ),
     )

@@ -325,8 +325,18 @@ class EvidenceRef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: EvidenceKind = Field(description="Kind of sourced record referenced")
-    evidence_id: uuid.UUID = Field(description="Opaque UUID of the referenced record")
+    kind: EvidenceKind = Field(
+        description=(
+            "Kind of the sourced record referenced: message, observation, "
+            "run_event, artifact or document"
+        ),
+    )
+    evidence_id: uuid.UUID = Field(
+        description=(
+            "Canonical UUID of the referenced record (message_id, "
+            "observation_id, run_id or doc_id) — the record must exist"
+        ),
+    )
     note: str | None = Field(
         default=None,
         max_length=200,

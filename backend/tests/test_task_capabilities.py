@@ -449,6 +449,69 @@ class TestEnvelopeBound:
 
 
 # ---------------------------------------------------------------------------
+# AC — model-correctable request-model validation refusals (no DB: the
+# shared executor validates payloads before any store access)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+class TestRequestModelValidationRefusals:
+    """A refused payload names the offending field and the required
+    format/vocabulary so a model can correct and re-send; the supplied
+    values (possibly secret-shaped) are never echoed back."""
+
+    async def test_non_uuid_idempotency_key_is_actionable_without_echo(
+        self,
+    ) -> None:
+        composition = build_task_state_capabilities(session_factory=None)
+        context = _context(SERVER_A, uuid.uuid4())
+        secret_like = "sk-live-9f2c4e1a7b6d4e8fa0c3b6d1"
+        payload: dict[str, object] = {
+            "step_id": "s1",
+            "expected_revision": 1,
+            "idempotency_key": secret_like,
+        }
+        result = await composition.executors[TASK_UPDATE_ITEM_CAPABILITY](
+            _call(composition, TASK_UPDATE_ITEM_CAPABILITY, payload, context)
+        )
+        document = json.loads(result.output)
+        assert result.ok is False
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_request"
+        assert "idempotency_key" in document["message"]
+        assert "UUID" in document["message"]
+        # Value-free refusal: the supplied secret-shaped string is never
+        # echoed and no stack details leak.
+        assert secret_like not in result.output
+        assert "Traceback" not in result.output
+
+    async def test_invalid_evidence_kind_names_the_allowed_vocabulary(
+        self,
+    ) -> None:
+        composition = build_task_state_capabilities(session_factory=None)
+        context = _context(SERVER_A, uuid.uuid4())
+        payload: dict[str, object] = {
+            "step_id": "s1",
+            "expected_revision": 1,
+            "idempotency_key": str(uuid.uuid4()),
+            "evidence_refs": [
+                {"kind": "hunch", "evidence_id": str(uuid.uuid4())}
+            ],
+        }
+        result = await composition.executors[TASK_UPDATE_ITEM_CAPABILITY](
+            _call(composition, TASK_UPDATE_ITEM_CAPABILITY, payload, context)
+        )
+        document = json.loads(result.output)
+        assert result.ok is False
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_request"
+        assert "evidence_refs[0].kind" in document["message"]
+        for kind in EvidenceKind:
+            assert kind.value in document["message"]
+        assert "hunch" not in result.output
+
+
+# ---------------------------------------------------------------------------
 # AC 1 — same task service: bounded reads, CAS, idempotency (real PG)
 # ---------------------------------------------------------------------------
 

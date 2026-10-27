@@ -43,6 +43,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -52,11 +53,12 @@ from typing import (
     Mapping,
     Protocol,
     Sequence,
+    Union,
     get_args,
     get_origin,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from mai.applications.service_map import (
     CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
@@ -604,6 +606,101 @@ def build_descriptor(spec: InternalApiSpec) -> CapabilityDescriptor:
     return assert_agent_ready_descriptor(descriptor)
 
 
+#: Refusal-message bounds: report the first few errors and cap each part,
+#: so even a pathological payload produces a bounded refusal.
+_MAX_REPORTED_VALIDATION_ERRORS: Final[int] = 6
+_MAX_VALIDATION_GUIDANCE_CHARS: Final[int] = 200
+_MAX_VALIDATION_MESSAGE_CHARS: Final[int] = 1200
+
+_UUID_FORMAT_TEXT = (
+    "must be a canonical UUID string "
+    "(8-4-4-4-12 hexadecimal, e.g. str(uuid.uuid4()))"
+)
+
+
+def _annotation_guidance(annotation: object) -> str | None:
+    """Type-level correction guidance for UUID / enum-annotated fields."""
+    if isinstance(annotation, type) and issubclass(annotation, uuid.UUID):
+        return _UUID_FORMAT_TEXT
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        return "must be one of: " + ", ".join(item.value for item in annotation)
+    origin = get_origin(annotation)
+    if origin is Union:
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return _annotation_guidance(args[0])
+    return None
+
+
+def _field_guidance(
+    payload_model: type[BaseModel], loc: tuple[Any, ...]
+) -> str | None:
+    """Guidance for the payload-model field at ``loc`` (sequence indices skipped)."""
+    target: object = payload_model
+    for part in loc:
+        if isinstance(part, int):
+            continue
+        if not (isinstance(target, type) and issubclass(target, BaseModel)):
+            return None
+        field = target.model_fields.get(str(part))
+        if field is None:
+            return None
+        target = field.annotation
+    return _annotation_guidance(target)
+
+
+def _render_error_loc(loc: tuple[Any, ...]) -> str:
+    """One dotted payload path with sequence indices (``evidence_refs[0].kind``)."""
+    path = ""
+    for part in loc:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += ("." if path else "") + str(part)
+    return path or "payload"
+
+
+def _validation_refusal_message(
+    payload_model: type[BaseModel], exc: ValidationError
+) -> str:
+    """Field-specific, model-correctable refusal text for one rejected payload.
+
+    Names each offending field and the required format/vocabulary (UUID
+    shape, allowed enum values) so a model can fix and re-send WITHOUT
+    guessing. Value-free by construction: neither the supplied values
+    (possibly secret-shaped) nor validator internals or stack details are
+    ever echoed; the envelope code stays ``invalid_request``.
+    """
+    errors = exc.errors(
+        include_url=False, include_context=False, include_input=False
+    )
+    parts: list[str] = []
+    for error in errors[:_MAX_REPORTED_VALIDATION_ERRORS]:
+        loc = tuple(error.get("loc", ()))
+        guidance = _field_guidance(payload_model, loc)
+        if guidance is None:
+            error_type = error.get("type", "")
+            if error_type == "missing":
+                guidance = "this field is required"
+            elif error_type == "extra_forbidden":
+                guidance = "unexpected field (payloads reject extra inputs)"
+            else:
+                guidance = str(error.get("msg", "invalid value")).removeprefix(
+                    "Value error, "
+                )
+        parts.append(
+            f"{_render_error_loc(loc)}: {guidance}"[:_MAX_VALIDATION_GUIDANCE_CHARS]
+        )
+    if len(errors) > _MAX_REPORTED_VALIDATION_ERRORS:
+        parts.append(
+            f"payload: {len(errors) - _MAX_REPORTED_VALIDATION_ERRORS} "
+            "more invalid fields"
+        )
+    return ("invalid request payload — " + "; ".join(parts))[
+        :_MAX_VALIDATION_MESSAGE_CHARS
+    ]
+
+
 def build_executor(
     spec: InternalApiSpec, operation: InternalApiOperation
 ) -> Callable[[CapabilityCall], Any]:
@@ -618,6 +715,14 @@ def build_executor(
     async def _execute(call: CapabilityCall) -> ExecutorResult:
         try:
             payload_model = spec.payload_model.model_validate(call.payload)
+        except ValidationError as exc:
+            envelope = {
+                "status": "refused",
+                "code": "invalid_request",
+                "message": _validation_refusal_message(spec.payload_model, exc),
+                "capability_id": spec.capability_id,
+            }
+            return ExecutorResult(ok=False, output=json.dumps(envelope, sort_keys=True))
         except Exception:
             envelope = {
                 "status": "refused",
