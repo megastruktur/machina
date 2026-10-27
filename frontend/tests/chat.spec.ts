@@ -146,7 +146,9 @@ interface ChatWindowApi {
 
 declare global {
 	interface Window {
-		__maiChatApi?: ChatWindowApi;
+	__maiChatApi?: ChatWindowApi;
+	/** Render-boundary captures: the PanelHost `onpanelerror` observability seam. */
+	__maiPanelErrors?: Array<{ windowId: string; panelKind: string; message: string }>;
 		/** Set by a test init script: the boot scenario (chat-spec-owned name). */
 		__maiChatScenario?: Scenario;
 		__maiChatFramed?: boolean;
@@ -1389,7 +1391,17 @@ const APP_SOURCE = `
 	<ComponentHost label="Host main">
 		{#if showMain}
 			{#snippet mainPanel()}
-				<PanelHost {registry} descriptor={descriptor(WINDOWS.main, { kind: 'server', server_id: '${SERVER_A}' }, 1)} services={services} />
+				<PanelHost
+					{registry}
+					descriptor={descriptor(WINDOWS.main, { kind: 'server', server_id: '${SERVER_A}' }, 1)}
+					services={services}
+					onpanelerror={(windowId, panelKind, error) => {
+						const base = error instanceof Error ? error : new Error(String(error));
+						const stackLines = (base.stack || '').split('\\n').slice(0, 14).join(' | ');
+						const message = base.message + ' ||| ' + stackLines;
+						(window.__maiPanelErrors ??= []).push({ windowId: windowId, panelKind: panelKind, message: message });
+					}}
+				/>
 			{/snippet}
 			{#if window.__maiChatFramed}
 				<WindowFrame
@@ -1472,6 +1484,9 @@ let streamSessions: StreamSession[] = [];
 let streamRequests: Array<{ runId: string; cursor: string | null; path: string }> = [];
 /** Requests held open because no session was queued yet (the loop pauses). */
 let heldStreamRoutes: Array<{ route: Route; runId: string; cursor: string | null }> = [];
+/** Sessions queued for a SPECIFIC run (targeted release; never stolen by a
+ * stale held route of another run at the FIFO head). */
+const pendingSessions = new Map<string, StreamSession[]>();
 
 function frame(seq: number, type: string, data: Record<string, unknown>): StreamFrame {
 	return { seq, type, data };
@@ -1526,6 +1541,15 @@ async function handleEventStream(route: Route): Promise<void> {
 	}
 	const cursor = route.request().headers()['last-event-id'] ?? null;
 	streamRequests.push({ runId: match[1], cursor, path: url.pathname });
+	// A run-targeted session (queued BEFORE its request arrived) is served
+	// first; the shared FIFO below stays the legacy two-fold seam.
+	const pending = pendingSessions.get(match[1]);
+	if (pending !== undefined && pending.length > 0) {
+		const session = pending.shift() as StreamSession;
+		if (session.abort) await route.abort();
+		else await fulfillStream(route, session, match[1], cursor);
+		return;
+	}
 	const session = streamSessions.shift();
 	if (session) {
 		if (session.abort) await route.abort();
@@ -1533,6 +1557,30 @@ async function handleEventStream(route: Route): Promise<void> {
 		return;
 	}
 	heldStreamRoutes.push({ route, runId: match[1], cursor });
+}
+
+/**
+ * Queue TWO copies of a session for ONE run's stream: the visible window
+ * fold and the collapsed dock fold are the fixture's two live subscribers
+ * and each consumes one copy. Copies already-held requests of that run are
+ * released first (oldest first); leftovers wait for the run's next
+ * requests. Run-targeted: immune to FIFO theft by another run's route.
+ */
+function queueSessionFor(runId: string, session: StreamSession): void {
+	for (let copy = 0; copy < 2; copy += 1) {
+		const index = heldStreamRoutes.findIndex((one) => one.runId === runId);
+		if (index >= 0) {
+			const [held] = heldStreamRoutes.splice(index, 1);
+			void (session.abort
+				? held.route.abort()
+				: fulfillStream(held.route, session, held.runId, held.cursor)
+			).catch(() => {});
+			continue;
+		}
+		const list = pendingSessions.get(runId) ?? [];
+		list.push(session);
+		pendingSessions.set(runId, list);
+	}
 }
 
 /**
@@ -3446,6 +3494,182 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		await expect(main.getByTestId('history-row')).toHaveCount(1);
 		await expect(main.getByTestId('history-row').first()).toContainText('Late consult');
 	});
+
+	// --- W2b: per-turn chronological feed (event-ordered, preflight-aware) ---
+
+	test('W2b: second turn replays intake phase and event-ordered activity; final output renders exactly once', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+
+		// --- Turn 1: completes with a full frame lifecycle + durable reply.
+		await main.getByTestId('compose-message').fill('First turn question');
+		await main.getByTestId('compose-profile').fill('fixture-fast');
+		await main.getByTestId('chat-submit').click();
+		await expect(main.getByTestId('canonical-user-message')).toContainText(
+			'First turn question'
+		);
+		const conversationId = await page.evaluate(() => window.__maiChatApi!.lastCanonicalId());
+		expect(conversationId).not.toBeNull();
+		const turn1Conversation = String(conversationId);
+		await page.evaluate((id) => {
+			window.__maiChatApi!.appendAssistant(id as string, 'First answer');
+			window.__maiChatApi!.completeRun(id as string);
+		}, conversationId);
+		queueSessionFor(turn1Conversation, {
+			frames: [
+				frame(1, 'chat.submitted', { submission_sha256: PAYLOAD_SHA, handler: 'agent.run', children: 0, attachments: [] }),
+				frame(2, 'agent.started', { connection: 'fixture-gateway', profile: 'fixture-fast', model: 'fixture-model-mini', role: 'administrator', rounds_budget: 8 }),
+				frame(3, 'agent.context_assembled', { prompt_revision: 1, truncated: false, evidence_items: 0 }),
+				frame(4, 'agent.model_round', { round: 1, status: 'final', output_chars: 12 }),
+				frame(5, 'agent.completed', { rounds: 1, tool_calls: 0, output_chars: 12 })
+			]
+		});
+		await expect(main.getByTestId('canonical-assistant-message')).toContainText('First answer');
+		await expect(main.getByTestId('conversation-state')).toHaveText('Succeeded');
+		// The completed turn's feed stays anchored at its own user row.
+		const feed1 = main.getByTestId('turn-feed').first();
+		await expect(feed1.getByTestId('feed-event')).toContainText([
+			'Submission recorded',
+			'Conversation completed'
+		]);
+		await expect(feed1.getByTestId('turn-feed-working')).toHaveCount(0);
+
+		// --- Turn 2: a NEW run whose intake HOLDS after agent.started +
+		// agent.intake_started (delayed interpretation).
+		await main.getByTestId('compose-message').fill('Second turn question');
+		await main.getByTestId('chat-submit').click();
+		const follows = await callsOf(page, 'submitConversationMessage');
+		expect(follows).toHaveLength(1);
+		const run2 = String((follows[0].payload as Record<string, unknown>).client_request_id);
+		expect(run2).not.toBe(conversationId);
+		queueSessionFor(run2, {
+			frames: [
+				frame(1, 'chat.submitted', { submission_sha256: PAYLOAD_SHA, handler: 'agent.run', children: 0, attachments: [] }),
+				frame(2, 'agent.started', { connection: 'fixture-gateway', profile: 'fixture-fast', model: 'fixture-model-mini', role: 'administrator', rounds_budget: 8 }),
+				frame(3, 'agent.intake_started', { status: 'started' })
+			]
+		});
+		const feed2 = main.locator('[data-testid="turn-feed"]').nth(1);
+		// Held intake: the exact live phase label in the status AND in the
+		// expanded thinking section — never the stale binding line.
+		await expect(feed2.getByTestId('turn-feed-working')).toBeVisible();
+		await expect(feed2.locator('.mai-chat__work-indicator-label')).toHaveText(
+			'Understanding request & preparing task plan…'
+		);
+		await expect(feed2.getByTestId('thinking-intake-phase')).toBeVisible();
+		await expect(feed2.locator('.mai-chat__work-indicator-label')).not.toContainText(
+			'Binding model'
+		);
+		// Turn 2's live feed sits DIRECTLY under its own user row (between
+		// user-2 and the feed end), never below turn 1's persisted messages.
+		const placement = await main
+			.locator(
+				'[data-testid="canonical-user-message"], [data-testid="canonical-assistant-message"], [data-testid="turn-feed"]'
+			)
+			.evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+		expect(placement).toEqual([
+			'canonical-user-message',
+			'turn-feed',
+			'canonical-assistant-message',
+			'canonical-user-message',
+			'turn-feed'
+		]);
+
+		// The intake releases: the phase label clears and the ladder advances.
+		queueSessionFor(run2, {
+			frames: [
+				frame(4, 'agent.intake_interpreted', { interpreted: true, rejected: false, turn_kind: 'plan' })
+			]
+		});
+		await expect(
+			feed2.getByTestId('feed-phase').filter({ hasText: 'Request interpreted' })
+		).toHaveCount(1);
+		await expect(feed2.getByTestId('thinking-intake-phase')).toHaveCount(0);
+		await expect(feed2.locator('.mai-chat__work-indicator-label')).toHaveText(
+			'Assembling request context…'
+		);
+
+		// The rest of the run: context, reasoning, ONE tool call at its event
+		// position, streamed text, the round checkpoint, and completion.
+		queueSessionFor(run2, {
+			frames: [
+				frame(5, 'agent.context_assembled', { prompt_revision: 1, truncated: false, evidence_items: 0 }),
+				frame(6, 'agent.output_delta', { round: 1, kind: 'thinking', part_index: 0, delta: 'Inspecting the fleet ' }),
+				frame(7, 'agent.tool_requested', { tool_call_id: 'live-a', capability_id: 'app.list_catalog', args: { limit: 10 } }),
+				frame(8, 'agent.output_delta', { round: 1, kind: 'text', part_index: 0, delta: 'Checking the catalog ' }),
+				frame(9, 'agent.tool_result', { tool_call_id: 'live-a', capability_id: 'app.list_catalog', step_seq: 1, state: 'succeeded', result: { items: ['kb'], total: 1 } }),
+				frame(10, 'agent.model_round', { round: 1, status: 'tool_calls', tool_calls: [{ seq: 1, capability_id: 'app.list_catalog', payload_hash: PAYLOAD_SHA }] }),
+				frame(11, 'agent.output_delta', { round: 1, kind: 'text', part_index: 0, delta: 'done.' }),
+				frame(12, 'agent.model_round', { round: 1, status: 'final', output_chars: 27 }),
+				frame(13, 'agent.completed', { rounds: 1, tool_calls: 1, output_chars: 27 })
+			]
+		});
+		await expect(feed2.getByText('Conversation completed')).toBeVisible({ timeout: 15000 });
+		const order = await feed2
+			.locator('[data-testid^="feed-"]')
+			.evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+		expect(order).toEqual([
+			'feed-event', // chat.submitted (init)
+			'feed-phase', // Binding model … (historical line, in event order)
+			'feed-phase', // Intake planning started
+			'feed-phase', // Request interpreted
+			'feed-phase', // Context assembled
+			'feed-thinking', // streamed reasoning
+			'feed-tool-card', // tool call at its event position
+			'feed-text', // streamed text run
+			'feed-event', // Round 1 — requesting tools (checkpoint)
+			'feed-text', // interrupted text run: a NEW entry, never regrouped
+			'feed-event', // Round 1 — final answer recorded
+			'feed-event' // Conversation completed
+		]);
+		// The tool request → result is ONE card, updated in its original spot.
+		const toolCard = feed2.getByTestId('feed-tool-card');
+		await expect(toolCard).toHaveCount(1);
+		await expect(toolCard).toContainText('app.list_catalog');
+		await expect(toolCard).toContainText('SUCCEEDED');
+		await expect(toolCard).toContainText('kb');
+
+		// The durable transcript records turn 2's reply; the streamed copy
+		// collapses and the sentence exists exactly once in the panel.
+		await page.evaluate((cid) => {
+			window.__maiChatApi!.appendAssistant(String(cid), 'Checking the catalog done.');
+		}, conversationId);
+		await expect(main.getByTestId('canonical-assistant-message').last()).toContainText(
+			'Checking the catalog done.'
+		);
+		await expect(feed2.getByTestId('feed-text')).toHaveCount(0);
+		await expect(main.getByText('Checking the catalog done.')).toHaveCount(1);
+		// Turn 1's retained feed is untouched and the fold never hits the
+		// render boundary.
+		await expect(feed1.getByTestId('feed-event')).toContainText([
+			'Submission recorded',
+			'Conversation completed'
+		]);
+		await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
+		expect(await page.evaluate(() => window.__maiPanelErrors ?? [])).toEqual([]);
+	});
+
+	test('W2b restore honesty: a conversation restored without an attached run renders only recorded rows — no fabricated activity', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical');
+		const main = page.getByTestId('host-main');
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('chat-history-item').first().click();
+		// The bounded transcript window carries the LATEST recorded rows.
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Restore question 7'
+		);
+		await expect(main.getByTestId('canonical-assistant-message').last()).toContainText(
+			'Restore answer 7'
+		);
+		// No attached run ⇒ NO turn feed of any kind: recorded history only.
+		await expect(main.getByTestId('turn-feed')).toHaveCount(0);
+		await expect(main.getByTestId('turn-feed-working')).toHaveCount(0);
+	});
+
 });
 
 // ---------------------------------------------------------------------------

@@ -617,6 +617,10 @@
 			} else {
 				openConversation(created.conversation, isFollowUp);
 			}
+			// The accepted turn is queued/running: the pending-intake phase
+			// is the honest live status until the intake actually completes
+			// (or the run terminates) — never a historical init label (W2).
+			intakePending = true;
 			composeMessage = '';
 			composeAttachments = '';
 			void loadHistory();
@@ -766,6 +770,22 @@
 			if (message.role === 'user') return message.message_id;
 		}
 		return null;
+	});
+
+	/**
+	 * The anchored ACTIVE feed when its user row is not in the loaded
+	 * transcript window yet (submit admitted, tail refresh in flight): the
+	 * feed still renders — at the transcript end, never fabricated inside
+	 * history. `null` once the anchor row lands in its chronological slot.
+	 */
+	const orphanedActiveFeed = $derived.by<{ key: string; feed: TurnFeed } | null>(() => {
+		if (activeTurnMessageId === null) return null;
+		const feed = turnFeeds[activeTurnMessageId];
+		if (feed === undefined) return null;
+		if (canonicalMessages.some((message) => message.message_id === activeTurnMessageId)) {
+			return null;
+		}
+		return { key: activeTurnMessageId, feed };
 	});
 
 	/**
@@ -1042,6 +1062,11 @@
 						conversation = view;
 						refreshed = view;
 						startStream();
+						// W2: a restored conversation with an ATTACHED run anchors
+						// that run's live feed on the newest recorded user turn
+						// (the persisted active_run_id linkage). No feed is
+						// fabricated for recorded-only history.
+						bindOrphanFeed(activeRun);
 					}
 				} catch {
 					// The run row read failing must not kill the transcript
@@ -1119,6 +1144,23 @@
 			canonicalActiveScope = serverId;
 			lastRevision = submitted.revision;
 			lastDisposition = submitted.disposition;
+			// W2 exact turn anchor: the persisted (message_id, run_id) pair
+			// the submit response returns — never inferred from timestamps or
+			// transcript position. A queued follow-up (no second executor)
+			// anchors NO feed; the lease-holding run's own feed continues.
+			if (submitted.run_id !== null && submitted.run_id !== '') {
+				turnFeeds = {
+					...turnFeeds,
+					[submitted.message_id]: {
+						runId: submitted.run_id,
+						entries: [],
+						finalRound: null,
+						terminated: false
+					}
+				};
+				activeTurnMessageId = submitted.message_id;
+				intakePending = true;
+			}
 			composeMessage = '';
 			// The admitted turn is durable before the response: refresh the
 			// tail immediately, then the history list (message_count moved).
@@ -1748,6 +1790,283 @@
 	let conversationScrollEl = $state<HTMLElement | null>(null);
 	let streamRevealTimer: ReturnType<typeof setInterval> | null = null;
 
+	// --- canonical chronological turn feeds (W2 preflight visibility) --------
+	//
+	// DEBUG: trace duplicate keys in canonicalMessages
+	$effect(() => {
+		const ids = canonicalMessages.map((m) => m.message_id);
+		const seen = new Set<string>();
+		const dupes: string[] = [];
+		for (const id of ids) {
+			if (seen.has(id)) dupes.push(id);
+			seen.add(id);
+		}
+		if (dupes.length > 0) {
+			console.error('W2-DUPE-KEYS', JSON.stringify(dupes), JSON.stringify(ids));
+		}
+	});
+	//
+	// ONE event-ordered activity list per user turn, anchored to the exact
+	// persisted identity the canonical submit response returns (message_id +
+	// run_id) or to the conversation's persisted `active_run_id` on restore.
+	// Entries interleave exactly in event order — no type buckets — and a
+	// completed turn's feed stays rendered at its own anchor position.
+
+	type FeedEntry = {
+		id: string;
+		seq: number;
+		kind:
+			| 'submitted'
+			| 'steered'
+			| 'phase'
+			| 'thinking'
+			| 'text'
+			| 'tool'
+			| 'round'
+			| 'outcome'
+			| 'reconciling'
+			| 'completed'
+			| 'failed';
+		label: string;
+		text: string;
+		/** Model round the entry was produced in (streamed parts). */
+		round: number;
+		/** Dedup/coalescing identity (e.g. `tool:<call id>`); null = unique. */
+		mergeKey: string | null;
+		capabilityId: string | null;
+		toolCallId: string | null;
+		stepSeq: string;
+		status: 'requested' | 'running' | 'succeeded' | 'failed' | null;
+		args: unknown;
+		result: unknown;
+		truncated: boolean;
+		pendingIntake: boolean;
+	};
+
+	type TurnFeed = {
+		runId: string;
+		entries: FeedEntry[];
+		/** The round whose streamed text the durable transcript supersedes:
+		 * once the recorded assistant row lands, those entries are duplicates
+		 * and stop rendering (W2 dedup: streamed → recorded). */
+		finalRound: number | null;
+		/** Set by agent.completed/agent.failed: the run is over, so the
+		 * feed stops rendering live chrome (cursor, work indicator). */
+		terminated: boolean;
+	};
+
+	/** Feeds keyed by their anchored user message row (completed turns stay). */
+	let turnFeeds = $state<Record<string, TurnFeed>>({});
+	/** The ACTIVE turn's anchor: the persisted message identity, never a guess. */
+	let activeTurnMessageId = $state<string | null>(null);
+	/** Live phase flags: queued/running until the intake actually completes. */
+	let intakePending = $state(false);
+	let contextPending = $state(false);
+	let feedCounter = 0;
+
+	function feedEntry(
+		seq: number,
+		kind: FeedEntry['kind'],
+		label: string,
+		extra: Partial<FeedEntry> = {}
+	): Omit<FeedEntry, 'id'> {
+		return {
+			seq,
+			kind,
+			label,
+			text: '',
+			round: 0,
+			mergeKey: null,
+			capabilityId: null,
+			toolCallId: null,
+			stepSeq: '',
+			status: null,
+			args: undefined,
+			result: undefined,
+			truncated: false,
+			pendingIntake: false,
+			...extra
+		};
+	}
+
+	/** Terminal fold: the run is over, the feed's live chrome stops. */
+	function markFeedTerminated(feedKey: string | null): void {
+		if (feedKey === null) return;
+		const feed = turnFeeds[feedKey];
+		if (feed === undefined || feed.terminated) return;
+		turnFeeds = { ...turnFeeds, [feedKey]: { ...feed, terminated: true } };
+	}
+
+	/**
+	 * The streamed FINAL text exists only until the durable transcript
+	 * records it: once an assistant row sits between this anchor and the
+	 * next user turn, the feed's final-round text entries are duplicates
+	 * (W2: streamed → recorded, never rendered twice). Intermediate-round
+	 * text stays — the transcript never recorded it.
+	 */
+	function visibleFeedEntries(feed: TurnFeed, suppressStreamedText: boolean): FeedEntry[] {
+		if (!suppressStreamedText || feed.finalRound === null) return feed.entries;
+		return feed.entries.filter(
+			(entry) => !(entry.kind === 'text' && entry.round === feed.finalRound)
+		);
+	}
+
+	/** Whether the durable assistant reply for THIS user turn has landed in
+	 * the loaded transcript window (the recorded output is rendered there). */
+	function durableReplyLanded(messageId: string): boolean {
+		const anchor = canonicalMessages.findIndex((message) => message.message_id === messageId);
+		if (anchor < 0) return false;
+		for (let index = anchor + 1; index < canonicalMessages.length; index += 1) {
+			const message = canonicalMessages[index];
+			if (message === undefined) continue;
+			if (message.role === 'user') return false;
+			if (message.role === 'assistant') return true;
+		}
+		return false;
+	}
+
+	function writeFeedEntries(messageId: string, entries: FeedEntry[]): void {
+		const feed = turnFeeds[messageId];
+		if (feed === undefined) return;
+		turnFeeds = { ...turnFeeds, [messageId]: { ...feed, entries } };
+	}
+
+	/** The feed an event belongs to: EXACT run-id match against the anchored
+	 * turns; anything else (a foreign run, a conversation without a bound
+	 * run) contributes nothing — no fabricated activity. */
+	function feedSinkOf(event: MaiRunEvent): string | null {
+		if (!canonicalMode) return null;
+		for (const [messageId, feed] of Object.entries(turnFeeds)) {
+			if (feed.runId === event.run_id) return messageId;
+		}
+		return null;
+	}
+
+	function pushFeed(feedKey: string | null, entry: Omit<FeedEntry, 'id'>): void {
+		if (feedKey === null) return;
+		const feed = turnFeeds[feedKey];
+		if (feed === undefined) return;
+		feedCounter += 1;
+		writeFeedEntries(feedKey, [...feed.entries, { ...entry, id: `feed-${feedCounter}` }]);
+	}
+
+	/** Coalesce CONTIGUOUS deltas of one streamed part: the tail entry with
+	 * the same mergeKey grows in place; an interrupted run appends a NEW
+	 * entry so reasoning/text/tool interleave stays in true event order. */
+	function coalesceFeed(
+		feedKey: string | null,
+		mergeKey: string,
+		seq: number,
+		kind: 'thinking' | 'text',
+		round: number,
+		delta: string
+	): void {
+		if (feedKey === null || delta === '') return;
+		const feed = turnFeeds[feedKey];
+		if (feed === undefined) return;
+		const last = feed.entries[feed.entries.length - 1];
+		if (last !== undefined && last.mergeKey === mergeKey) {
+			const next = [...feed.entries];
+			next[next.length - 1] = { ...last, text: last.text + delta };
+			writeFeedEntries(feedKey, next);
+			return;
+		}
+		pushFeed(feedKey, feedEntry(seq, kind, '', { mergeKey, round, text: delta }));
+	}
+
+	/** One tool observation per call id: the result updates the request's
+	 * ORIGINAL position — never a second card, never a reorder. */
+	function upsertFeedTool(
+		feedKey: string | null,
+		mergeKey: string,
+		seq: number,
+		capabilityId: string,
+		patch: {
+			status?: FeedEntry['status'];
+			stepSeq?: string;
+			args?: unknown;
+			result?: unknown;
+			truncated?: boolean;
+		}
+	): void {
+		if (feedKey === null) return;
+		const feed = turnFeeds[feedKey];
+		if (feed === undefined) return;
+		const index = feed.entries.findIndex((entry) => entry.mergeKey === mergeKey);
+		if (index >= 0) {
+			const next = [...feed.entries];
+			next[index] = {
+				...next[index],
+				...(patch.status !== undefined ? { status: patch.status } : {}),
+				...(patch.stepSeq !== undefined ? { stepSeq: patch.stepSeq } : {}),
+				...(patch.args !== undefined ? { args: patch.args } : {}),
+				...(patch.result !== undefined ? { result: patch.result } : {})
+			};
+			writeFeedEntries(feedKey, next);
+			return;
+		}
+		pushFeed(
+			feedKey,
+			feedEntry(seq, 'tool', '', {
+				mergeKey,
+				capabilityId,
+				toolCallId: mergeKey.slice('tool:'.length),
+				stepSeq: patch.stepSeq ?? '',
+				status: patch.status ?? null,
+				args: patch.args,
+				result: patch.result,
+				truncated: patch.truncated ?? false
+			})
+		);
+	}
+
+	/** Row-transition events (step.started/completed) land on the matching
+	 * open tool entry when one exists; otherwise they are their own fact. */
+	function updateFeedToolByCapability(
+		feedKey: string | null,
+		capabilityId: string,
+		status: FeedEntry['status']
+	): boolean {
+		if (feedKey === null) return false;
+		const feed = turnFeeds[feedKey];
+		if (feed === undefined) return false;
+		for (let index = feed.entries.length - 1; index >= 0; index -= 1) {
+			const entry = feed.entries[index];
+			if (
+				entry !== undefined &&
+				entry.kind === 'tool' &&
+				entry.capabilityId === capabilityId &&
+				(entry.status === 'requested' || entry.status === 'running')
+			) {
+				const next = [...feed.entries];
+				next[index] = { ...entry, status };
+				writeFeedEntries(feedKey, next);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Bind an attached run observed on a RESTORED conversation to the
+	 * newest recorded user turn — the persisted `active_run_id` linkage.
+	 * A conversation without an attached run anchors NO feed (nothing is
+	 * fabricated for recorded-only history). */
+	function bindOrphanFeed(runId: string): void {
+		if (activeTurnMessageId !== null) return;
+		if (Object.values(turnFeeds).some((feed) => feed.runId === runId)) return;
+		for (let index = canonicalMessages.length - 1; index >= 0; index -= 1) {
+			const message = canonicalMessages[index];
+			if (message === undefined || message.role !== 'user') continue;
+			turnFeeds = {
+				...turnFeeds,
+				[message.message_id]: { runId, entries: [], finalRound: null, terminated: false }
+			};
+			activeTurnMessageId = message.message_id;
+			intakePending = true;
+			return;
+		}
+	}
+
 	function stopStreamReveal(): void {
 		if (streamRevealTimer !== null) {
 			clearInterval(streamRevealTimer);
@@ -1869,21 +2188,32 @@
 	function foldEvent(event: MaiRunEvent): void {
 		const data = recordOf(event.data);
 		if (data === null) return;
+		const feedKey = feedSinkOf(event);
 		switch (event.type) {
 			case 'agent.output_delta': {
 				const kind = typeof data.kind === 'string' ? data.kind : null;
 				const delta = typeof data.delta === 'string' ? data.delta : null;
 				const partIndex = data.part_index;
 				if (delta === null || (kind !== 'thinking' && kind !== 'text')) break;
+				const round = typeof data.round === 'number' ? data.round : 0;
 				if (kind === 'thinking') {
 					const key = `${data.round ?? 0}:${typeof partIndex === 'number' ? partIndex : 'unknown'}`;
 					streamedThinkingByPart = {
 						...streamedThinkingByPart,
 						[key]: (streamedThinkingByPart[key] ?? '') + delta
 					};
+					coalesceFeed(feedKey, `think:${key}`, event.seq, 'thinking', round, delta);
 				} else {
 					streamedReply += delta;
 					isStreamingReply = true;
+					coalesceFeed(
+						feedKey,
+						`text:${data.round ?? 0}:${typeof partIndex === 'number' ? partIndex : 'unknown'}`,
+						event.seq,
+						'text',
+						round,
+						delta
+					);
 				}
 				queueMicrotask(scrollToConversationBottom);
 				break;
@@ -1891,6 +2221,35 @@
 			case 'agent.tool_requested':
 			case 'agent.tool_result': {
 				applyToolObservation(data, event);
+				{
+					const capabilityId =
+						typeof data.capability_id === 'string' ? data.capability_id : null;
+					const toolCallId =
+						typeof data.tool_call_id === 'string' ? data.tool_call_id : `event-${event.seq}`;
+					if (capabilityId !== null) {
+						const completed = event.type === 'agent.tool_result';
+						const state = typeof data.state === 'string' ? data.state : '';
+						const seqValue = data.step_seq;
+						upsertFeedTool(feedKey, `tool:${toolCallId}`, event.seq, capabilityId, {
+							status: completed
+								? ['failed', 'cancelled', 'outcome_unknown'].includes(state)
+									? 'failed'
+									: 'succeeded'
+								: 'requested',
+							...(completed && typeof seqValue === 'string'
+								? { stepSeq: seqValue }
+								: typeof seqValue === 'number'
+									? { stepSeq: String(seqValue) }
+									: {}),
+							...(Object.prototype.hasOwnProperty.call(data, 'args')
+								? { args: data.args }
+								: {}),
+							...(completed && Object.prototype.hasOwnProperty.call(data, 'result')
+								? { result: data.result }
+								: {})
+						});
+					}
+				}
 				break;
 			}
 			case 'chat.submitted': {
@@ -1907,6 +2266,7 @@
 						{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
 					]
 				});
+				pushFeed(feedKey, feedEntry(event.seq, 'submitted', 'Submission recorded'));
 				break;
 			}
 			case 'chat.steered': {
@@ -1923,6 +2283,7 @@
 						{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
 					]
 				});
+				pushFeed(feedKey, feedEntry(event.seq, 'steered', 'Steering directive recorded'));
 				break;
 			}
 			case 'agent.started': {
@@ -1941,6 +2302,29 @@
 						{ k: 'rounds_budget', v: rowOf(data, 'rounds_budget') }
 					]
 				});
+				// The binding is a HISTORICAL line: the live phase stays the
+				// pending intake (explicit `agent.intake_started` when the W1
+				// backend emits it), never this label (W2 rule 3).
+				pushFeed(
+					feedKey,
+					feedEntry(event.seq, 'phase', `Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`)
+				);
+				intakePending = true;
+				break;
+			}
+			case 'agent.intake_started': {
+				// W1 preflight observation: the planner call is pending NOW.
+				pushFeed(
+					feedKey,
+					feedEntry(event.seq, 'phase', 'Intake planning started', { pendingIntake: true })
+				);
+				intakePending = true;
+				break;
+			}
+			case 'agent.intake_interpreted': {
+				pushFeed(feedKey, feedEntry(event.seq, 'phase', 'Request interpreted'));
+				intakePending = false;
+				contextPending = true;
 				break;
 			}
 			case 'agent.context_assembled': {
@@ -1958,6 +2342,11 @@
 						{ k: 'prompt_revision', v: rowOf(data, 'prompt_revision') }
 					]
 				});
+				pushFeed(feedKey, feedEntry(event.seq, 'phase', 'Context assembled'));
+				// Context assembly completes the pre-round stages even when a
+				// legacy run skipped the structured intake events.
+				intakePending = false;
+				contextPending = false;
 				break;
 			}
 			case 'agent.model_round': {
@@ -1967,6 +2356,18 @@
 					const key = `${data.round ?? 0}:checkpoint`;
 					if (!(key in streamedThinkingByPart)) {
 						streamedThinkingByPart = { ...streamedThinkingByPart, [key]: record.thinking };
+					}
+					// Checkpoint fills only an ABSENT streamed part (same dedup
+					// rule as the streamed store) — never a duplicate entry.
+					const feed = feedKey === null ? undefined : turnFeeds[feedKey];
+					if (feed !== undefined && !feed.entries.some((one) => one.mergeKey === `think:${key}`)) {
+						pushFeed(
+							feedKey,
+							feedEntry(event.seq, 'thinking', '', {
+								mergeKey: `think:${key}`,
+								text: record.thinking
+							})
+						);
 					}
 				}
 				if (record?.status === 'tool_calls') {
@@ -2008,6 +2409,10 @@
 							};
 						})
 					});
+					pushFeed(
+						feedKey,
+						feedEntry(event.seq, 'round', `Round ${round} — requesting tools`)
+					);
 				} else if (record?.status === 'final') {
 					const replyOutput = typeof record.output === 'string' ? record.output.trim() : '';
 					addThinkingStep(`Round ${round}: synthesized final response (${rowOf(data, 'output_chars')} chars)`);
@@ -2034,6 +2439,29 @@
 							}
 						]
 					});
+					// The final TEXT renders from the durable canonical
+					// transcript once it lands (W2 dedup: streamed→recorded);
+					// the feed records only the verifiable round fact.
+					pushFeed(
+						feedKey,
+						feedEntry(event.seq, 'round', `Round ${round} — final answer recorded`)
+					);
+					// Pin the superseded round: the streamed final text of THIS
+					// round stops rendering once the durable assistant row for
+					// the turn is visible (never rendered twice).
+					if (feedKey !== null) {
+						const feed = turnFeeds[feedKey];
+						if (feed !== undefined) {
+							const finalRound = typeof data.round === 'number' ? data.round : Number(data.round);
+							turnFeeds = {
+								...turnFeeds,
+								[feedKey]: {
+									...feed,
+									finalRound: Number.isFinite(finalRound) ? finalRound : null
+								}
+							};
+						}
+					}
 				}
 				break;
 			}
@@ -2089,6 +2517,19 @@
 					label: 'Tool attempt started',
 					rows: [{ k: 'capability_id', v: capId }]
 				});
+				if (
+					!updateFeedToolByCapability(feedKey, capId, 'running')
+				) {
+					pushFeed(
+						feedKey,
+						feedEntry(event.seq, 'tool', '', {
+							mergeKey: `step:${event.seq}`,
+							capabilityId: capId,
+							stepSeq: rowOf(data, 'step_seq'),
+							status: 'running'
+						})
+					);
+				}
 				break;
 			}
 			case 'step.completed': {
@@ -2173,6 +2614,16 @@
 						{ k: 'op_id', v: opId }
 					]
 				});
+				if (
+					!updateFeedToolByCapability(feedKey, capId, isOk ? 'succeeded' : 'failed')
+				) {
+					pushFeed(
+						feedKey,
+						feedEntry(event.seq, 'outcome', `Tool outcome recorded (${displayReason})`, {
+							capabilityId: capId
+						})
+					);
+				}
 				break;
 			}
 			case 'step.awaiting_approval': {
@@ -2186,6 +2637,10 @@
 					label: 'Outcome unknown — reconciliation pending',
 					rows: [{ k: 'deadline', v: rowOf(data, 'deadline') }]
 				});
+				pushFeed(
+					feedKey,
+					feedEntry(event.seq, 'reconciling', 'Outcome unknown — reconciliation pending')
+				);
 				break;
 			}
 			case 'agent.completed': {
@@ -2199,6 +2654,10 @@
 						{ k: 'output_chars', v: rowOf(data, 'output_chars') }
 					]
 				});
+				pushFeed(feedKey, feedEntry(event.seq, 'completed', 'Conversation completed'));
+				markFeedTerminated(feedKey);
+				intakePending = false;
+				contextPending = false;
 				// 21-outcome-ui: the run summary's additive `task_outcome`
 				// document (absent for taskless runs). Fail-closed narrow —
 				// the outcome block is driven by THIS document, never by the
@@ -2232,6 +2691,13 @@
 					label: 'Conversation failed',
 					rows: [{ k: 'reason', v: failReason }]
 				});
+				pushFeed(
+					feedKey,
+					feedEntry(event.seq, 'failed', `Conversation failed (${failReason})`)
+				);
+				markFeedTerminated(feedKey);
+				intakePending = false;
+				contextPending = false;
 				break;
 			}
 			case 'agent.delegation_planned': {
@@ -2466,6 +2932,13 @@
 		streamedThinkingByPart = {};
 		visibleToolCalls = [];
 		lastSeq = 0;
+		lastSeqRunId = '';
+		// Turn feeds belong to exactly one conversation identity: a switch
+		// clears every anchored feed; new activity anchors fresh (W2).
+		turnFeeds = {};
+		activeTurnMessageId = null;
+		intakePending = false;
+		contextPending = false;
 		appliedEvents = 0;
 		streamProblem = null;
 		refreshProblem = null;
@@ -2649,6 +3122,13 @@
 	});
 	const activeStepText = $derived.by(() => {
 		if (!jobInProgress) return '';
+		// The LIVE phase ladder (W2 rule 3): pending intake while the
+		// accepted turn is queued/running (explicit `agent.intake_started`
+		// or the honest generic estimate), then context assembly, then the
+		// actual round/tool work. Historical 'Binding model…' /
+		// 'Context assembled' lines NEVER masquerade as the current stage.
+		if (intakePending) return 'Understanding request & preparing task plan…';
+		if (contextPending) return 'Assembling request context…';
 		const activeTool = [...visibleToolCalls]
 			.reverse()
 			.find((c) => c.status === 'running' || c.status === 'requested');
@@ -2657,12 +3137,19 @@
 				? `Executing tool capability ${activeTool.capabilityId}…`
 				: `Dispatching tool capability ${activeTool.capabilityId}…`;
 		}
-		if (thinkingSteps.length > 0) {
-			const lastStep = thinkingSteps[thinkingSteps.length - 1] ?? '';
+		const stageSteps = thinkingSteps.filter(
+			(step) =>
+				!step.startsWith('Binding model ') &&
+				!step.startsWith('Assembled server context ')
+		);
+		if (stageSteps.length > 0) {
+			const lastStep = stageSteps[stageSteps.length - 1] ?? '';
 			if (lastStep.includes('finished')) return 'Synthesizing next cogitator round…';
 			return lastStep;
 		}
-		return 'Initializing cogitator & assembling server context…';
+		return thinkingSteps.length > 0
+			? 'Synthesizing next cogitator round…'
+			: 'Initializing cogitator & assembling server context…';
 	});
 	const isDocked = $derived(panel.descriptor?.window_id === 'mai-bottom-chat-dock');
 	let detailsOpen = $state(false);
@@ -2841,8 +3328,11 @@
 		if (!canonicalMode || !rootTerminal) return;
 		stopStreamReveal();
 		streamedReply = '';
-		// Keep the completed model/tool activity visible in canonical history.
-		// The final reply is already available from the durable transcript.
+		// W2: the streamed final text is deduplicated AGAINST the durable
+		// row at render time (visibleFeedEntries + durableReplyLanded) — it
+		// stays visible until the recorded copy actually renders, so the
+		// reply is never shown twice and never vanishes between copies.
+		// The turn's phase/thinking/tool activity STAYS at its anchor.
 		void refreshCanonicalTail();
 	});
 
@@ -3316,7 +3806,93 @@
 									</Button>
 								</div>
 							{/if}
-							{#each canonicalMessages as message (message.message_id)}
+							{#snippet turnFeed(feed: TurnFeed, live: boolean, turnKey: string, suppressStreamedText: boolean)}
+							<div
+								class="mai-chat__bubble mai-chat__bubble--assistant mai-chat__turn-feed"
+								data-testid="turn-feed"
+								data-turn={turnKey}
+								data-live={live ? 'true' : 'false'}
+							>
+								<div class="mai-chat__bubble-header">
+									<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
+								</div>
+								<div class="mai-chat__bubble-body">
+									{#each visibleFeedEntries(feed, suppressStreamedText) as entry (entry.id)}
+										{#if entry.kind === 'thinking'}
+											<blockquote class="mai-chat__thinking-quote" data-testid="feed-thinking" data-seq={entry.seq}>
+												<div class="mai-chat__thinking-line">
+													<span class="mai-chat__thinking-prefix">&gt;</span>
+													<span>{entry.text}</span>
+												</div>
+											</blockquote>
+										{:else if entry.kind === 'text'}
+											<p class="mai-chat__feed-text" data-testid="feed-text" data-seq={entry.seq}>
+												{entry.text}{#if live}<span class="mai-chat__stream-cursor" aria-hidden="true">▍</span>{/if}
+											</p>
+										{:else if entry.kind === 'tool'}
+											<details class="mai-chat__tool-card" data-testid="feed-tool-card" data-seq={entry.seq}>
+												<summary class="mai-chat__tool-card-summary">
+													<span class="mai-chat__tool-card-title">
+														▸ <span class:mai-chat__cog-spin={entry.status === 'running' || entry.status === 'requested'} aria-hidden="true">⚙</span> {entry.capabilityId}
+														{#if entry.stepSeq !== ''}<span class="mai-chat__tool-card-seq">#{entry.stepSeq}</span>{/if}
+													</span>
+													{#if entry.status !== null}
+														<span
+															class="mai-chat__badge"
+															class:mai-chat__badge--active={entry.status === 'running' || entry.status === 'requested'}
+															class:mai-chat__badge--ok={entry.status === 'succeeded'}
+															class:mai-chat__badge--danger={entry.status === 'failed'}
+														>
+															{entry.status.toUpperCase()}
+														</span>
+													{/if}
+												</summary>
+												<div class="mai-chat__tool-card-body">
+													{#if entry.args !== undefined}
+														<div class="mai-chat__tool-card-section">
+															<span class="mai-chat__tool-card-label">PARAMS</span>
+															<pre class="mai-chat__tool-card-pre">{formatStepJson(entry.args)}</pre>
+														</div>
+													{/if}
+													{#if entry.result !== undefined}
+														<div class="mai-chat__tool-card-section">
+															<span class="mai-chat__tool-card-label">RESPONSE{entry.truncated ? ' (TRUNCATED)' : ''}</span>
+															<pre class="mai-chat__tool-card-pre">{formatStepJson(entry.result)}</pre>
+														</div>
+													{/if}
+												</div>
+											</details>
+										{:else if entry.kind === 'phase'}
+											<div class="mai-chat__thinking-line" data-testid="feed-phase" data-seq={entry.seq} data-pending-intake={entry.pendingIntake ? 'true' : undefined}>
+												<span class="mai-chat__thinking-prefix">&gt;</span>
+												<span>{entry.label}</span>
+											</div>
+										{:else}
+											<p class="mai-chat__meta" data-testid="feed-event" data-seq={entry.seq} data-kind={entry.kind}>{entry.label}</p>
+										{/if}
+									{/each}
+									{#if live && intakePending}
+										<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
+											<span class="mai-chat__thinking-prefix">&gt;</span>
+											<span>Understanding request &amp; preparing task plan…</span>
+										</div>
+									{/if}
+									{#if live}
+										<div class="mai-chat__work-indicator" role="status" aria-live="polite" data-testid="turn-feed-working">
+											<div class="mai-chat__work-indicator-row">
+												<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
+												<span class="mai-chat__work-indicator-label">{activeStepText}</span>
+												<span class="mai-chat__work-indicator-elapsed">{elapsedSeconds}s</span>
+											</div>
+											<div class="mai-chat__work-bar" aria-hidden="true">
+												<div class="mai-chat__work-bar-fill"></div>
+											</div>
+										</div>
+									{/if}
+								</div>
+							</div>
+						{/snippet}
+						{#each canonicalMessages as message (message.message_id)}
 								{#if message.role === 'user'}
 									<div class="mai-chat__bubble mai-chat__bubble--user" data-testid="canonical-user-message">
 										<div class="mai-chat__bubble-header">
@@ -3356,7 +3932,24 @@
 												: ' (no inline content)'}
 									</p>
 								{/if}
+								{#if message.role === 'user' && turnFeeds[message.message_id] !== undefined}
+									{@render turnFeed(
+										turnFeeds[message.message_id],
+										message.message_id === activeTurnMessageId &&
+											!turnFeeds[message.message_id].terminated,
+										message.message_id,
+										durableReplyLanded(message.message_id)
+									)}
+								{/if}
 							{/each}
+							{#if orphanedActiveFeed !== null}
+								{@render turnFeed(
+									orphanedActiveFeed.feed,
+									!orphanedActiveFeed.feed.terminated,
+									orphanedActiveFeed.key,
+									false
+								)}
+							{/if}
 							<p class="mai-chat__meta" data-testid="transcript-window-meta">
 								Showing {canonicalMessages.length} of {canonicalTotal} recorded messages.
 							</p>
@@ -3471,7 +4064,7 @@
 					{/if}
 					{/if}
 
-					{#if !canonicalMode || jobInProgress || thinkingSteps.length > 0 || liveModelThinking !== '' || visibleToolCalls.length > 0}
+					{#if !canonicalMode && (jobInProgress || thinkingSteps.length > 0 || liveModelThinking !== '' || visibleToolCalls.length > 0)}
 					<div class="mai-chat__bubble mai-chat__bubble--assistant" data-testid="live-assistant-turn">
 						<div class="mai-chat__bubble-header">
 							<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
@@ -3503,7 +4096,13 @@
 										</span>
 									</summary>
 									<blockquote class="mai-chat__thinking-quote" data-testid="assistant-thinking">
-										{#if thinkingSteps.length === 0}
+										{#if intakePending}
+											<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
+												<span class="mai-chat__thinking-prefix">&gt;</span>
+												<span>Understanding request &amp; preparing task plan…</span>
+											</div>
+										{/if}
+										{#if thinkingSteps.length === 0 && !intakePending}
 											<div class="mai-chat__thinking-line">
 												<span class="mai-chat__thinking-prefix">&gt;</span>
 												<span>Initializing cogitator &amp; assembling server context…</span>
