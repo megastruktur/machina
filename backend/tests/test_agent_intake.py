@@ -88,6 +88,7 @@ from mai.contracts.tasks import (
     TaskContractError,
     TaskErrorCode,
     TaskPlanPatch,
+    VerificationStatus,
 )
 from mai.database import create_app_engine
 
@@ -971,6 +972,169 @@ async def test_a2_self_executed_add_via_continue_fails_closed(sessions) -> None:
     assert task.revision == revision  # zero effects
     steps = await alist_steps(sessions, task_id, server_id=uuid.UUID(SERVER_A))
     assert "s3_ghost" not in {step.step_id for step in steps.items}
+
+
+# ---------------------------------------------------------------------------
+# A5 — direct simple operations select act from the outset (one turn)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_addition_operations() -> tuple[dict, ...]:
+    """The reversible catalog-entry addition journey as plan steps:
+    preparatory read, bounded reversible mutation, evidence-bound check."""
+    return (
+        _add_op("s1_locate", risk="read_only"),
+        _add_op("s2_add_entry", risk="mutating"),
+        _add_op(
+            "s3_verify",
+            risk="read_only",
+            expected_check="the catalog lists the new entry",
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_a5_english_catalog_addition_selects_act_from_outset(
+    sessions,
+) -> None:
+    conversation_id = await _make_conversation(sessions)
+    message_id = await _submit_user(
+        sessions, conversation_id, "Add Frametop to the catalog on Frame"
+    )
+    scripted = ScriptedModel(
+        [
+            {
+                "payload": _plan_payload(
+                    message_id,
+                    objective="Add the Frametop catalog entry on Frame",
+                    operations=_catalog_addition_operations(),
+                    phase="act",
+                )
+            }
+        ]
+    )
+
+    outcome = await arun_intake_turn(
+        scripted.model,
+        sessions,
+        server_id=uuid.UUID(SERVER_A),
+        conversation_id=conversation_id,
+        source_message_id=message_id,
+    )
+
+    # act FROM THE OUTSET: exactly ONE accepted turn, no waiting state,
+    # no phase confirmation — inspection rides the act run itself.
+    assert outcome.turn.turn_kind == "plan"
+    assert outcome.turn.requested_phase is Phase.ACT
+    assert outcome.applied is True
+    assert outcome.disposition == "created"
+    assert outcome.record.model_calls == 1
+    assert outcome.record.function_tools == 0
+    task = await aget_task(
+        sessions, outcome.task_id, server_id=uuid.UUID(SERVER_A)
+    )
+    assert task.requested_phase is Phase.ACT
+    steps = await alist_steps(
+        sessions, outcome.task_id, server_id=uuid.UUID(SERVER_A)
+    )
+    by_id = {step.step_id: step for step in steps.items}
+    assert by_id["s1_locate"].risk.value == "read_only"
+    assert by_id["s2_add_entry"].risk.value == "mutating"
+    assert by_id["s3_verify"].risk.value == "read_only"
+    assert by_id["s3_verify"].expected_check == (
+        "the catalog lists the new entry"
+    )
+    # Nothing is executed or verified by intake itself: the plan starts
+    # pending and unchecked; verification stays evidence-bound.
+    assert all(
+        step.status is StepStatus.PENDING
+        and step.verification is VerificationStatus.NOT_CHECKED
+        for step in steps.items
+    )
+
+
+@pytest.mark.anyio
+async def test_a5_russian_direct_action_selects_act(sessions) -> None:
+    conversation_id = await _make_conversation(sessions)
+    message_id = await _submit_user(
+        sessions, conversation_id, "Добавь Frametop в каталог на Frame"
+    )
+    scripted = ScriptedModel(
+        [
+            {
+                "payload": _plan_payload(
+                    message_id,
+                    objective="Add the Frametop catalog entry on Frame",
+                    operations=_catalog_addition_operations(),
+                    phase="act",
+                )
+            }
+        ]
+    )
+
+    outcome = await arun_intake_turn(
+        scripted.model,
+        sessions,
+        server_id=uuid.UUID(SERVER_A),
+        conversation_id=conversation_id,
+        source_message_id=message_id,
+    )
+
+    assert outcome.turn.requested_phase is Phase.ACT
+    assert outcome.applied is True
+    assert outcome.disposition == "created"
+    assert outcome.record.model_calls == 1
+
+
+@pytest.mark.anyio
+async def test_a5_read_only_requests_stay_inspect(sessions) -> None:
+    for wording in (
+        "Which ports are open on the device?",
+        "Покажи открытые порты на сервере",
+    ):
+        conversation_id = await _make_conversation(sessions)
+        message_id = await _submit_user(sessions, conversation_id, wording)
+        scripted = ScriptedModel(
+            [
+                {
+                    "payload": _plan_payload(
+                        message_id,
+                        objective="Inspect listening ports",
+                        operations=[_add_op("s1_ports", risk="read_only")],
+                        phase="inspect",
+                    )
+                }
+            ]
+        )
+
+        outcome = await arun_intake_turn(
+            scripted.model,
+            sessions,
+            server_id=uuid.UUID(SERVER_A),
+            conversation_id=conversation_id,
+            source_message_id=message_id,
+        )
+
+        # Read-only intent stays inspect: no mutation eligibility is
+        # selected for an explore/inspect request.
+        assert outcome.turn.requested_phase is Phase.INSPECT
+        assert outcome.applied is True
+
+
+def test_a5_guidance_renders_autonomous_simple_operation_policy() -> None:
+    """The rendered snapshot prompt carries the phase policy: act from
+    the outset for explicit bounded changes, inspection as a preparatory
+    step inside the one run, eligibility-only semantics, verified
+    postcondition, read-only stays inspect, ambiguity stops."""
+    prompt = build_snapshot_prompt(_bare_snapshot())
+    assert 'requested_phase "act"' in prompt
+    assert "FROM THE OUTSET" in prompt
+    assert "PREPARATORY" in prompt
+    assert "inspect -> mutate -> verify -> report" in prompt
+    assert "ELIGIBILITY only" in prompt
+    assert "requested postcondition to be VERIFIED" in prompt
+    assert 'requested_phase "inspect"' in prompt
+    assert "Ambiguity is a stop, never a guess" in prompt
 
 
 # ---------------------------------------------------------------------------

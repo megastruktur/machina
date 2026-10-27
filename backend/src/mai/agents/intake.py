@@ -444,9 +444,9 @@ Variant rules:
 - `clarify`: the turn cannot proceed safely without user input; provide
   at least one open question with a stable proposal_id.
 - `plan`: propose a NEW task (objective, acceptance criteria, bounded
-  `todo_patch` delta with `add` operations only, requested_phase
-  `plan`/`inspect`/`act` as requested by the user — advisory, never
-  permission).
+  `todo_patch` delta with `add` operations only). Choose
+  `requested_phase` by the phase policy below — advisory, never
+  permission.
 - `new_task`: the user explicitly starts a new goal episode.
 - `continue_task`: an ORDINARY continuation of the CURRENT task carries
   `todo_patch: null` — the user saying "continue", answering a
@@ -458,6 +458,32 @@ Variant rules:
   silently approved.
 - `blocked`: the turn cannot proceed safely; state the stable
   `blocked_kind` and a safe reason.
+
+Requested phase — autonomous simple-operation policy:
+- An EXPLICIT, bounded request to add/install/change/enable one known
+  thing (a reversible catalog-entry addition, a bounded known-service
+  configuration update with backup) selects requested_phase "act"
+  FROM THE OUTSET. Never park it in "inspect" to wait: inside the
+  accepted "act" run, inspection is an automatic PREPARATORY tool
+  step, and the run proceeds inspect -> mutate -> verify -> report in
+  ONE turn — no second user message and no phase confirmation. Give
+  such a plan explicit verification steps with concrete
+  `expected_check` content.
+- An explore/inspect/read-only request ("show", "list", "which
+  ports") stays requested_phase "inspect" (or "plan" when the user
+  asked only for a proposal); never select "act" for read-only
+  intent.
+- "act" means ELIGIBILITY only: it never implies approval, a grant,
+  execution certainty or skipped verification. Effects still need
+  their existing grants and operation approvals, and success requires
+  the requested postcondition to be VERIFIED — finishing reads or
+  producing a todo is not success.
+- Ambiguity is a stop, never a guess: when the target or action is
+  unclear, a grant, credential or explicit operation approval is
+  missing, the work would expand scope, destroy/revert something or
+  disrupt a service, or verification may hit unexpected state,
+  respond `clarify` (or `blocked`) with the concrete reason instead
+  of selecting "act".
 
 Hard rules:
 - `source_message_id` must be exactly the interpreted user message id
@@ -488,10 +514,11 @@ Pinned server scope:
 - While a server is pinned, references like "this server", "this
   device" or "the device" mean THAT server. Do not ask the user to
   re-identify it and never claim no server/device context exists.
-- The pinned scope is not knowledge of unseen service facts: a turn
-  needing live state (ports, services, inventory) should become a
-  plan with requested_phase "inspect" targeting the pinned server so
-  the executor can inspect it with its existing gated tools.
+- The pinned scope is not knowledge of unseen service facts: an
+  EXPLORATORY turn needing live state (ports, services, inventory)
+  becomes a plan with requested_phase "inspect" targeting the pinned
+  server; an EXPLICIT bounded change still selects "act" and reads
+  the live state as its own preparatory step inside the run.
 - After appropriate available inspection, genuine ambiguity about
   WHICH service may still be a clarify. Never invent inventory,
   ports or other unseen facts.
