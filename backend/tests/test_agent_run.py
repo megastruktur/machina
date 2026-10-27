@@ -433,16 +433,28 @@ def _alembic_config() -> Config:
 
 
 def _drop_app_tables(url: str) -> None:
-    """Reset the fixture database to pre-bootstrap state (engine schema too)."""
+    """Reset the fixture database to pre-bootstrap state (engine schema too).
+
+    Full app set at the chain tip — the conversation domain (0008) AND
+    the agent-task domain (0009) are listed beside the jobs/approval
+    domains (chain-tip reconciliation, the ``test_agent_task_run``
+    DOMAIN_TABLES convention), so the zero-to-head fixture — and the
+    session-end teardown — stay order-independent after sibling suites
+    ran on the same shared database.
+    """
     with psycopg.connect(url) as conn:
         conn.execute(
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version, notification_alerts, "
-            "observation_findings, server_observations, knowledge_doc_chunks, "
-            "knowledge_documents, application_projection_journal, "
-            "application_projection"
+            "admin_credential, notification_alerts, observation_findings, "
+            "server_observations, knowledge_doc_chunks, knowledge_documents, "
+            "application_projection_journal, application_projection, "
+            "conversation_steering, conversation_runs, conversation_messages, "
+            "conversations, agent_task_completions, agent_task_revisions, "
+            "agent_task_evidence, agent_task_criteria, "
+            "agent_task_constraints, agent_task_steps, agent_tasks, "
+            "alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")

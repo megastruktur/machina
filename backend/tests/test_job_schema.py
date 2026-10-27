@@ -79,17 +79,19 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # assertions target the chain TIP; the tuple tracks the full chain.
 # Chain-tip reconciliation (card 10-observation-schema, exclusive
 # migration-chain owner): revision 0007 appends the bounded observation +
-# notification persistence; the tip constants are advanced here so this
-# file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+# notification persistence, revision 0008 the conversation domain and
+# revision 0009 the agent-task domain; the tip constants are advanced
+# here so this file's head assertions stay true.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009")
 
-# The exact public application schema after 0007 — nothing else, in
+# The exact public application schema after 0009 — nothing else, in
 # particular no engine-shadowing run-state table (C05 rule 1).
 # ``alembic_version`` is the chain's own bookkeeping table (since 0001).
 # The knowledge tables belong to 07-vector-schema (0005), the application
-# tables to 08-adoption (0006) and the observation tables to
-# 10-observation-schema (0007); they are part of the exact app set this
-# file pins at the tip.
+# tables to 08-adoption (0006), the observation tables to
+# 10-observation-schema (0007), the conversation tables to
+# 04-conversation-store (0008) and the agent-task tables to 09-agent-tasks
+# (0009); they are part of the exact app set this file pins at the tip.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -110,6 +112,17 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "conversations",
+        "conversation_messages",
+        "conversation_runs",
+        "conversation_steering",
+        "agent_tasks",
+        "agent_task_steps",
+        "agent_task_constraints",
+        "agent_task_criteria",
+        "agent_task_evidence",
+        "agent_task_revisions",
+        "agent_task_completions",
     }
 )
 
@@ -155,19 +168,33 @@ def _database_url(url: str, database: str) -> str:
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         # Full app set at the chain tip — the 07-vector-schema,
-        # 08-adoption AND 10-observation-schema tables are listed here
-        # (chain-tip reconciliation) so the zero-to-head fixture stays
-        # order-independent after 0007.
+        # 08-adoption, 10-observation-schema tables AND the conversation
+        # (0008) / agent-task (0009) domains are listed here (chain-tip
+        # reconciliation, the ``test_agent_task_run`` DOMAIN_TABLES
+        # convention) so the zero-to-head fixture stays order-independent
+        # after sibling suites ran on the same shared database: a partial
+        # list would leave ``agent_tasks`` rows behind and break the next
+        # suite's conversation-domain DELETE teardown.
         conn.execute(
             "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
+            "job_resource_locks, job_schedule_fires, job_schedules, "
             "job_events, job_steps, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "admin_credential, conversation_steering, conversation_runs, "
+            "conversation_messages, conversations, agent_task_completions, "
+            "agent_task_revisions, agent_task_evidence, "
+            "agent_task_criteria, agent_task_constraints, "
+            "agent_task_steps, agent_tasks, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Engine-owned shadow state: a sibling suite's engine launch on
+        # the SAME shared database leaves the ``dbos`` schema behind; the
+        # launch-ownership assertions below are only honest when this
+        # session starts without it (the ``test_agent_run`` fixture
+        # pattern).
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 

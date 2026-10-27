@@ -199,9 +199,19 @@ def _alembic_config() -> AlembicConfig:
 
 def _drop_all(url: str) -> None:
     with psycopg.connect(url) as conn:
+        # Full app set at the chain tip — the 09-agent-task tables (which
+        # hold the fk_agent_tasks_conversation dependency on
+        # conversations) are listed beside the conversation/job domains
+        # (chain-tip reconciliation, the ``test_agent_task_run``
+        # DOMAIN_TABLES convention) so the zero-to-head fixture stays
+        # order-independent after sibling suites ran on the same shared
+        # database.
         conn.execute(
             "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
-            "conversation_messages, conversations, job_resource_locks, "
+            "conversation_messages, conversations, agent_task_completions, "
+            "agent_task_revisions, agent_task_evidence, "
+            "agent_task_criteria, agent_task_constraints, "
+            "agent_task_steps, agent_tasks, job_resource_locks, "
             "job_schedule_fires, job_schedules, job_events, job_steps, "
             "job_runs, approvals, profile_projection_journal, "
             "profile_projection, admin_sessions, admin_credential, "
@@ -215,6 +225,15 @@ def _drop_all(url: str) -> None:
 
 
 _RESET_TABLES = (
+    # children before parents (FK-safe per-test reset): task children,
+    # then the task, then the conversation domain, then jobs/approvals.
+    "agent_task_completions",
+    "agent_task_revisions",
+    "agent_task_evidence",
+    "agent_task_criteria",
+    "agent_task_constraints",
+    "agent_task_steps",
+    "agent_tasks",
     "conversation_steering",
     "conversation_runs",
     "conversation_messages",
