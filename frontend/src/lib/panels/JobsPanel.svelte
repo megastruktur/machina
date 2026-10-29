@@ -98,7 +98,7 @@
 	// --- producer bounds mirrored for display only (server re-validates) -----
 
 	/** Bounded page size (C01 rule 5); the producer clamps the maximum. */
-	const PAGE_LIMIT = 50;
+	const PAGE_LIMIT = 10;
 	/** Fixed reconnect delay after a stream close/failure (bounded, visible). */
 	const BACKOFF_MS = 750;
 	/** Debounce for the durable refresh triggered by delivered events. */
@@ -140,7 +140,13 @@
 		'step.started': 'Step started',
 		'step.completed': 'Step completed',
 		'step.awaiting_approval': 'Step waiting for approval decision',
-		'step.reconciling': 'Step reconciling an unproven outcome'
+		'step.reconciling': 'Step reconciling an unproven outcome',
+		// Agent-run event vocabulary: deltas stay COMPACT (transient stream
+		// noise is never rendered as content, and thinking is never shown).
+		'agent.model_round': 'Model round',
+		'agent.tool_result': 'Tool result',
+		'agent.output_delta': 'Streaming delta (transient)',
+		'agent.failed': 'Run failed'
 	});
 
 	function isTerminal(state: string | null): boolean {
@@ -182,6 +188,104 @@
 		return id === '' ? '—' : id.slice(0, 8);
 	}
 
+	/** Full, useful timestamp text — timestamps are shown verbatim (ISO). */
+	function stampText(iso: string | null): string {
+		return iso === null || iso === '' ? '—' : iso;
+	}
+
+	/**
+	 * Honest completion text for one run row: there is NO completion_at wire
+	 * field — `updated_at` is labeled as a completion ONLY when the row's
+	 * state is terminal, never presented as a separate claim.
+	 */
+	function completionText(state: string | null, updatedAt: string): string | null {
+		if (state === 'succeeded') return `Completed ${stampText(updatedAt)}`;
+		if (state === 'failed' || state === 'cancelled') return `Ended ${stampText(updatedAt)}`;
+		return null;
+	}
+
+	// --- W3 watch report (durable final answer, tool results, failure) -------
+
+	/** Per-item display cap: one huge result cannot flood the report. */
+	const MAX_ITEM_CHARS = 2_000;
+	/** The final answer's display cap (the durable text stays in storage). */
+	const MAX_FINAL_CHARS = 20_000;
+
+	function bounded(text: string, cap: number): string {
+		return text.length <= cap
+			? text
+			: `${text.slice(0, cap)}… [+${text.length - cap} characters truncated]`;
+	}
+
+	function eventData(event: MaiRunEvent): Record<string, unknown> {
+		const data = event.data;
+		return typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
+	}
+
+	/**
+	 * The current answer: the LATEST `agent.model_round` event carrying
+	 * `status: "final"` and a string `data.output`. Deltas are never
+	 * concatenated into it and thinking is never read.
+	 */
+	const finalReport = $derived.by<{ text: string; at: string; truncated: boolean } | null>(
+		() => {
+			let chosen: MaiRunEvent | null = null;
+			for (const event of events) {
+				if (event.type !== 'agent.model_round') continue;
+				const data = eventData(event);
+				if (data.status !== 'final' || typeof data.output !== 'string') continue;
+				chosen = event;
+			}
+			if (chosen === null) return null;
+			const output = eventData(chosen).output as string;
+			return {
+				text: bounded(output, MAX_FINAL_CHARS),
+				at: chosen.ts,
+				truncated: output.length > MAX_FINAL_CHARS
+			};
+		}
+	);
+
+	/** Bounded tool-result projection: capability + useful text/JSON each. */
+	const toolResults = $derived.by<Array<{ seq: number; capability: string; text: string }>>(
+		() => {
+			const rows: Array<{ seq: number; capability: string; text: string }> = [];
+			for (const event of events) {
+				if (event.type !== 'agent.tool_result') continue;
+				const data = eventData(event);
+				const capability =
+					typeof data.capability_id === 'string' && data.capability_id !== ''
+						? data.capability_id
+						: 'unknown capability';
+				let text: string;
+				if (typeof data.result === 'string') text = data.result;
+				else if (data.result !== undefined) {
+					try {
+						text = JSON.stringify(data.result) ?? 'unrenderable result value';
+					} catch {
+						text = 'unrenderable result value';
+					}
+				} else {
+					text = '(no result payload recorded)';
+				}
+				rows.push({ seq: event.seq, capability, text: bounded(text, MAX_ITEM_CHARS) });
+			}
+			return rows;
+		}
+	);
+
+	/** The useful failure reason of the latest `agent.failed` event. */
+	const failedReason = $derived.by<string | null>(() => {
+		let reason: string | null = null;
+		for (const event of events) {
+			if (event.type !== 'agent.failed') continue;
+			const data = eventData(event);
+			const candidate = data.reason ?? data.error;
+			if (typeof candidate === 'string' && candidate.trim() !== '') reason = candidate;
+		}
+		return reason;
+	});
+
 	/** Abortable sleep: the reconnect backoff releases early on teardown. */
 	function sleep(ms: number, signal: AbortSignal): Promise<void> {
 		return new Promise((resolve) => {
@@ -215,12 +319,65 @@
 	let runsState = $state<ListState>({ status: 'loading' });
 	const runsHasMore = $derived(runsState.status === 'ready' && runs.length < runsTotal);
 
+	// --- W1 run filters (applied BEFORE pagination by the reviewed API) -------
+
+	/** Draft inputs: editing them alone never refetches. */
+	let qInput = $state('');
+	let dateFromInput = $state('');
+	let dateToInput = $state('');
+	/** The applied filter set the list currently renders. */
+	let runsFilter = $state<{ q?: string; date_from?: string; date_to?: string }>({});
+
+	/**
+	 * The Today preset translates BROWSER-LOCAL today into explicit ISO
+	 * instant bounds: local midnight inclusive (date_from) and the next
+	 * local midnight exclusive-exclusive upper edge (date_to). Ambiguous
+	 * local date text is never sent; the instant pair is timezone-safe.
+	 */
+	function localTodayBounds(): { date_from: string; date_to: string } {
+		const now = new Date();
+		const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+		const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+		return { date_from: start.toISOString(), date_to: end.toISOString() };
+	}
+
+	/** Applies the draft filters: offset resets to 0 and rows are replaced. */
+	function applyRunFilters(): void {
+		const q = qInput.trim();
+		const dateFrom = dateFromInput.trim();
+		const dateTo = dateToInput.trim();
+		runsFilter = {
+			...(q !== '' ? { q } : {}),
+			...(dateFrom !== '' ? { date_from: dateFrom } : {}),
+			...(dateTo !== '' ? { date_to: dateTo } : {})
+		};
+		void loadRuns();
+	}
+
+	/** The Today preset: explicit local-midnight bounds, then load page 0. */
+	function applyTodayFilter(): void {
+		const bounds = localTodayBounds();
+		dateFromInput = bounds.date_from;
+		dateToInput = bounds.date_to;
+		runsFilter = { ...bounds };
+		void loadRuns();
+	}
+
+	/** Clears every filter back to the unfiltered first page. */
+	function clearRunFilters(): void {
+		qInput = '';
+		dateFromInput = '';
+		dateToInput = '';
+		runsFilter = {};
+		void loadRuns();
+	}
+
 	async function loadRuns(): Promise<void> {
 		if (api === null || serverScope === null) return;
 		runsState = { status: 'loading' };
 		runsLoadingMore = false;
 		try {
-			const page = await api.listRuns(serverScope, { limit: PAGE_LIMIT });
+			const page = await api.listRuns(serverScope, { limit: PAGE_LIMIT, ...runsFilter });
 			if (disposed) return;
 			runs = page.runs;
 			runsTotal = page.total;
@@ -242,13 +399,14 @@
 		try {
 			const page = await api.listRuns(serverScope, {
 				limit: PAGE_LIMIT,
-				offset: runs.length
+				offset: runs.length,
+				...runsFilter
 			});
 			if (disposed) return;
 			const seen = new Set(runs.map((r) => r.run_id));
 			const appended = page.runs.filter((r) => !seen.has(r.run_id));
 			runs = [...runs, ...appended];
-			runsTotal = page.runs.length === 0 ? runs.length : page.total;
+			runsTotal = page.total;
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
@@ -261,6 +419,29 @@
 			if (!disposed) runsLoadingMore = false;
 		}
 	}
+
+	// --- pinned server name (W3: one narrow lookup, nonfatal) -----------------
+
+	let serverName = $state<string | null>(null);
+	let serverNameFailed = $state(false);
+
+	$effect(() => {
+		if (api === null || serverScope === null || api.readServerName === undefined) return;
+		const scope = serverScope;
+		api.readServerName(scope).then(
+			(name) => {
+				if (disposed || serverScope !== scope) return;
+				serverName = name;
+				serverNameFailed = false;
+			},
+			() => {
+				if (disposed || serverScope !== scope) return;
+				// Nonfatal: the UUID stays; jobs data keeps working.
+				serverName = null;
+				serverNameFailed = true;
+			}
+		);
+	});
 
 	// --- watched run: durable detail + persisted event stream -----------------
 
@@ -650,6 +831,13 @@
 			</div>
 			<p class="mai-jobs__meta">
 				<span class="mai-jobs__mono" data-testid="jobs-scope">Server {shortId(serverScope ?? '')}</span>
+				{#if serverName !== null}
+					<span data-testid="jobs-scope-name">{serverName}</span>
+				{:else if serverNameFailed}
+					<span class="mai-jobs__row-note" data-testid="jobs-scope-name-unavailable" role="status">
+						Server name unavailable — showing the pinned id.
+					</span>
+				{/if}
 				<span>Pinned scope — every action below names this target.</span>
 			</p>
 		</header>
@@ -665,6 +853,39 @@
 						<Button variant="secondary" onclick={loadRuns} data-testid="runs-refresh">Refresh</Button>
 					</div>
 					<div class="mai-jobs__section-body">
+						<div class="mai-jobs__form" role="search" aria-label="Filter runs" data-testid="runs-filters">
+							<div class="mai-jobs__grid">
+								<Field
+									label="Search (id, label, model profile)"
+									bind:value={qInput}
+									placeholder="deploy"
+									data-testid="runs-q-input"
+								/>
+								<Field
+									label="From (ISO instant, inclusive)"
+									bind:value={dateFromInput}
+									placeholder="2026-10-29T00:00:00Z"
+									data-testid="runs-date-from-input"
+								/>
+								<Field
+									label="To (ISO instant, inclusive)"
+									bind:value={dateToInput}
+									placeholder="2026-10-29T23:59:59Z"
+									data-testid="runs-date-to-input"
+								/>
+							</div>
+							<div class="mai-jobs__form-actions">
+								<Button variant="secondary" size="sm" onclick={applyRunFilters} data-testid="runs-apply-filters">
+									Apply filters
+								</Button>
+								<Button variant="secondary" size="sm" onclick={applyTodayFilter} data-testid="runs-today">
+									Today
+								</Button>
+								<Button variant="secondary" size="sm" onclick={clearRunFilters} data-testid="runs-clear-filters">
+									Clear
+								</Button>
+							</div>
+						</div>
 						{#if runsState.status === 'loading'}
 							<div class="mai-jobs__state" role="status" data-testid="runs-loading">
 								<p>Loading runs…</p>
@@ -681,14 +902,21 @@
 							</div>
 						{:else if runs.length === 0}
 							<div class="mai-jobs__state" role="status" data-testid="runs-empty">
-								<p>No runs are recorded for this server.</p>
+								{#if Object.keys(runsFilter).length > 0}
+									<p>No runs match the current filters.</p>
+								{:else}
+									<p>No runs are recorded for this server.</p>
+								{/if}
 							</div>
 						{:else}
 							<ul class="mai-jobs__rows" data-testid="runs-list">
 								{#each runs as row (row.run_id)}
 									<li class="mai-jobs__row" data-testid="run-row" data-run-id={row.run_id}>
 										<div class="mai-jobs__row-main">
-											<span class="mai-jobs__row-id" data-testid="run-row-id">{shortId(row.run_id)}</span>
+											<span class="mai-jobs__row-id" data-testid="run-row-label">
+												{row.label !== '' ? row.label : shortId(row.run_id)}
+											</span>
+											<span class="mai-jobs__meta mai-jobs__mono" data-testid="run-row-id">{row.run_id}</span>
 											<span
 												class="mai-jobs__badge"
 												class:mai-jobs__badge--ok={row.state === 'succeeded'}
@@ -698,6 +926,14 @@
 											>
 												{runStateText(row.state)}
 											</span>
+											<span class="mai-jobs__meta" data-testid="run-row-submitted">
+												Submitted {stampText(row.submitted_at)}
+											</span>
+											{#if completionText(row.state, row.updated_at) !== null}
+												<span class="mai-jobs__meta" data-testid="run-row-completed">
+													{completionText(row.state, row.updated_at)}
+												</span>
+											{/if}
 											{#if row.cancel_requested_at !== null}
 												<span class="mai-jobs__row-note" data-testid="run-row-cancel-note">
 													Cancellation requested
@@ -845,6 +1081,48 @@
 									{refreshProblem}
 								</p>
 							{/if}
+
+							<!-- W3 watch report: the durable final answer + tool results +
+							     failure reason. Deltas are transient and never rendered;
+							     thinking is never read; both lists stay bounded. -->
+							<div class="mai-jobs__report" data-testid="watch-report">
+								<p class="mai-jobs__workbench-title">
+									<span class="mai-jobs__section-icon"><ScrollText size={13} aria-hidden="true" /></span>
+									Report
+								</p>
+								{#if finalReport === null}
+									<p class="mai-jobs__meta" data-testid="watch-report-empty" role="status">
+										No final agent response is recorded for this run yet.
+									</p>
+								{:else}
+									<p class="mai-jobs__meta" data-testid="watch-report-meta">
+										Final response · {finalReport.at}{finalReport.truncated ? ' · truncated for display' : ''}
+									</p>
+									<pre class="mai-jobs__report-text" data-testid="watch-report-final">{finalReport.text}</pre>
+								{/if}
+								{#if failedReason !== null}
+									<p
+										class="mai-jobs__row-note mai-jobs__row-note--error"
+										role="alert"
+										data-testid="watch-failed"
+									>
+										Failure reason: {failedReason}
+									</p>
+								{/if}
+								{#if toolResults.length > 0}
+									<ul class="mai-jobs__rows" data-testid="tool-result-list">
+										{#each toolResults as row (row.seq)}
+											<li class="mai-jobs__event" data-testid="tool-result-row" data-tool-seq={row.seq}>
+												<span class="mai-jobs__event-seq">#{row.seq}</span>
+												<span class="mai-jobs__event-kind" data-testid="tool-result-capability">
+													{row.capability}
+												</span>
+												<pre class="mai-jobs__report-text" data-testid="tool-result-text">{row.text}</pre>
+											</li>
+										{/each}
+									</ul>
+								{/if}
+							</div>
 
 							<ul class="mai-jobs__events" data-testid="event-list">
 								{#each events as event (event.seq)}
@@ -1192,6 +1470,38 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--mai-space-2);
+	}
+
+	/* W3: the runs list scrolls within a bounded card (10-row pages must not
+	 * stretch the window); the runs list keeps its own scroll strip. */
+	section[aria-label='Runs'] .mai-jobs__rows {
+		max-height: calc(var(--mai-space-8) * 8);
+		overflow-y: auto;
+	}
+
+	/* W3 watch report: whitespace-preserving bounded text (final answer and
+	 * tool results keep their line structure; long text wraps, never scrolls
+	 * the card). */
+	.mai-jobs__report {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		padding: var(--mai-space-2) var(--mai-space-3);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-left: 3px solid var(--mai-color-brass);
+		border-radius: var(--mai-radius-sm);
+		max-height: calc(var(--mai-space-8) * 10);
+		overflow-y: auto;
+	}
+
+	.mai-jobs__report-text {
+		margin: 0;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		white-space: pre-wrap;
+		word-break: break-word;
+		color: var(--mai-color-text);
 	}
 
 	/* Recorded rows read as inset strips engraved into the raised plate. */

@@ -631,7 +631,10 @@
 		createSchedule: api.createSchedule,
 		updateSchedule: api.updateSchedule,
 		deleteSchedule: api.deleteSchedule,
-		streamRunEvents: browserRunEventStream
+		streamRunEvents: browserRunEventStream,
+		// W3 narrow name seam: resolve ONLY the pinned panel scope's enrolled
+		// profile name. Failure keeps the panel on the UUID (nonfatal there).
+		readServerName: async (serverId) => (await api.readProfile(serverId)).name
 	};
 
 	// ---------------------------------------------------------------------

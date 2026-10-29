@@ -59,6 +59,7 @@ interface JobsWindowApi {
 	failNextDeleteSchedule(failure: Fail | null): void;
 	armCancelOutcome(outcome: string | null): void;
 	toggleHost(host: 'A' | 'B'): void;
+	addRuns(serverId: string, count: number, prefix: string): void;
 	registry: {
 		kinds: string[];
 		scopeChecks: { serverScope: string; globalScope: string; unknownKind: string };
@@ -126,6 +127,7 @@ const APP_SOURCE = `
 				prompt_revision: 2,
 				model_profile: 'direct',
 				requested_grants: ['host.shell'],
+				label: 'Deploy API',
 				state,
 				cancel_requested_at: null,
 				submitted_at: '2026-10-15T09:00:00Z',
@@ -137,9 +139,13 @@ const APP_SOURCE = `
 	}
 	const runs = {
 		[SERVER_A]: {
-			[RUN_A]: runRow(RUN_A, SERVER_A, 'running', [step(1, 'succeeded'), step(2, 'running')]),
-			[RUN_C]: runRow(RUN_C, SERVER_A, 'succeeded', [step(1, 'succeeded')]),
-			[RUN_D]: runRow(RUN_D, SERVER_A, 'queued', [])
+			[RUN_A]: runRow(RUN_A, SERVER_A, 'running', [step(1, 'succeeded'), step(2, 'running')], {
+				label: 'Collect telemetry'
+			}),
+			[RUN_C]: runRow(RUN_C, SERVER_A, 'succeeded', [step(1, 'succeeded')], {
+				label: 'Rotate credentials'
+			}),
+			[RUN_D]: runRow(RUN_D, SERVER_A, 'queued', [], { label: 'Probe fleet' })
 		},
 		[SERVER_B]: {}
 	};
@@ -193,6 +199,14 @@ const APP_SOURCE = `
 	}
 
 	const restApi = {
+		// W3 narrow name seam: resolve the pinned scope's enrolled name; an
+		// unknown/unresolvable id 404s so the panel's nonfatal fallback is
+		// exercisable (host B pins such a target).
+		async readServerName(serverId) {
+			calls.push({ op: 'readServerName', arg: serverId });
+			if (serverId === SERVER_A) return 'Alpha Build Host';
+			throw new ApiError(404, 'not_found', 'no canonical profile for this server id');
+		},
 		async listRuns(serverId, page) {
 			calls.push({ op: 'listRuns', arg: serverId, payload: JSON.parse(JSON.stringify(page ?? {})) });
 			if (failNextListRuns) {
@@ -200,14 +214,32 @@ const APP_SOURCE = `
 				failNextListRuns = null;
 				throw new ApiError(failure.status, failure.code, failure.message);
 			}
-			const rows = Object.values(runs[serverId] ?? {}).map(runViewOf);
+			// The W1 contract: filters apply BEFORE pagination — the same
+			// predicate drives the slice AND the pre-slice total.
+			let rows = Object.values(runs[serverId] ?? {}).map(runViewOf);
+			if (page?.q !== undefined && page.q !== '') {
+				const needle = page.q.toLowerCase();
+				rows = rows.filter(
+					(row) =>
+						row.run_id.toLowerCase().includes(needle) ||
+						String(row.label ?? '').toLowerCase().includes(needle) ||
+						String(row.model_profile ?? '').toLowerCase().includes(needle)
+				);
+			}
+			if (page?.date_from !== undefined && page.date_from !== '') {
+				rows = rows.filter((row) => row.submitted_at >= page.date_from);
+			}
+			if (page?.date_to !== undefined && page.date_to !== '') {
+				rows = rows.filter((row) => row.submitted_at <= page.date_to);
+			}
+			const total = rows.length;
 			const limit = page?.limit ?? 50;
 			const offset = page?.offset ?? 0;
 			return {
 				runs: rows.slice(offset, offset + limit),
 				limit,
 				offset,
-				total: rows.length
+				total
 			};
 		},
 		async readRun(runId) {
@@ -418,6 +450,20 @@ const APP_SOURCE = `
 		toggleHost(host) {
 			if (host === 'A') showA = !showA;
 		},
+		// W3 pagination fixture: distinct submitted_at for deterministic
+		// ordering, unique run ids and useful labels.
+		addRuns(serverId, count, prefix) {
+			const store = runs[serverId];
+			if (!store) return;
+			for (let index = 0; index < count; index += 1) {
+				const runId = crypto.randomUUID();
+				store[runId] = runRow(runId, serverId, 'succeeded', [], {
+					label: prefix + ' ' + String(index + 1).padStart(2, '0'),
+					submitted_at: '2026-10-15T10:' + String(10 + index).padStart(2, '0') + ':00Z',
+					updated_at: '2026-10-15T10:' + String(10 + index).padStart(2, '0') + ':30Z'
+				});
+			}
+		},
 		registry: (() => {
 			function checkCode(kind, scope) {
 				const result = registry.checkScope(kind, scope);
@@ -508,6 +554,8 @@ mount(App, { target: document.getElementById('app') });
 interface StreamFrame {
 	seq: number;
 	type: string;
+	/** Optional frozen envelope `data` (agent rounds, tool results, failures). */
+	data?: unknown;
 }
 
 interface StreamSession {
@@ -534,7 +582,7 @@ function sseBody(runId: string, frames: StreamFrame[]): string {
 					ts: '2026-10-15T10:00:00Z',
 					type: frame.type,
 					v: 1,
-					data: {}
+					data: frame.data ?? {}
 				})}\n\n`
 		)
 		.join('');
@@ -1169,7 +1217,9 @@ test('hide/unmount releases the stream and refocus starts nothing; closing a win
 	let { calls } = await apiState(page);
 	expect(calls.filter((call) => call.op === 'cancelRun')).toHaveLength(0);
 	expect(
-		calls.filter((call) => !['listRuns', 'listSchedules', 'readRun'].includes(call.op))
+		calls.filter(
+			(call) => !['listRuns', 'listSchedules', 'readRun', 'readServerName'].includes(call.op)
+		)
 	).toHaveLength(0);
 
 	// Restore: a FRESH mount reloads the lists; the watched run resets to
@@ -1191,4 +1241,228 @@ test('hide/unmount releases the stream and refocus starts nothing; closing a win
 	expect(calls.filter((call) => call.op === 'updateSchedule')).toHaveLength(0);
 	expect(calls.filter((call) => call.op === 'deleteSchedule')).toHaveLength(0);
 	expect(streamRequests).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// W3: 10-row pagination + filters, Today bounds, enriched rows, watch report
+// ---------------------------------------------------------------------------
+
+test.describe('W3 run list and watch report', () => {
+	test.use({ timezoneId: 'Asia/Tokyo' });
+
+	test('10-row pages with load-more dedup; q/date filters ride the wire; Today emits exact local-midnight bounds', async ({
+		page
+	}) => {
+		const root = page.locator(`${hostA} [data-testid="jobs-root"]`);
+		await apiCall(page, 'addRuns', [SERVER_A, 24, 'Nightly sweep']);
+		// The initial page already loaded with the 3 seeded runs; refresh to
+		// page through the full 27-run store.
+		await root.getByTestId('runs-refresh').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(10);
+
+		// Page 0 asked for exactly 10 rows.
+		let calls = await callsOf(page, 'listRuns');
+		expect(calls.at(-1)?.payload).toEqual({ limit: 10 });
+
+		// Load more: the CURRENT offset rides the wire; run ids dedup and the
+		// filtered total updates; the control disappears when drained.
+		await root.getByTestId('runs-load-more').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(20, { timeout: 8000 });
+		calls = await callsOf(page, 'listRuns');
+		expect(calls.at(-1)?.payload).toEqual({ limit: 10, offset: 10 });
+		const ids = await root.getByTestId('run-row').evaluateAll((rows) =>
+			rows.map((row) => (row as HTMLElement).dataset.runId)
+		);
+		expect(new Set(ids).size).toBe(20);
+		await expect(root.getByTestId('runs-total')).toHaveText('Showing 20 of 27 recorded runs.');
+		await root.getByTestId('runs-load-more').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(27, { timeout: 8000 });
+		await expect(root.getByTestId('runs-load-more')).toHaveCount(0);
+
+		// q filter: applied to page 0, replaces rows, total is the FILTERED total.
+		await root.getByTestId('runs-q-input').fill('nightly sweep 0');
+		await root.getByTestId('runs-apply-filters').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(9, { timeout: 8000 }); // 01..09
+		calls = await callsOf(page, 'listRuns');
+		expect(calls.at(-1)?.payload).toEqual({ limit: 10, q: 'nightly sweep 0' });
+		await expect(root.getByTestId('runs-total')).toHaveText('Showing 9 of 9 recorded runs.');
+
+		// Explicit date bounds ride the wire verbatim as ISO instants.
+		await root.getByTestId('runs-q-input').fill('');
+		await root.getByTestId('runs-date-from-input').fill('2026-10-15T09:00:00Z');
+		await root.getByTestId('runs-date-to-input').fill('2026-10-15T09:59:59Z');
+		await root.getByTestId('runs-apply-filters').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(3, { timeout: 8000 }); // the three seeded runs
+		calls = await callsOf(page, 'listRuns');
+		expect(calls.at(-1)?.payload).toEqual({
+			limit: 10,
+			date_from: '2026-10-15T09:00:00Z',
+			date_to: '2026-10-15T09:59:59Z'
+		});
+
+		// Today preset: browser-LOCAL today (Asia/Tokyo) translated to exact
+		// ISO instants — local midnight inclusive, next local midnight as the
+		// exclusive upper edge. The emitted bounds are asserted verbatim.
+		await page.clock.setFixedTime(new Date('2026-11-05T10:00:00Z'));
+		await root.getByTestId('runs-clear-filters').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(10, { timeout: 8000 });
+		await root.getByTestId('runs-today').click();
+		await expect(root.getByTestId('run-row')).toHaveCount(0, { timeout: 8000 }); // no run submitted "today"
+		await expect(root.getByTestId('runs-empty')).toHaveText('No runs match the current filters.');
+		calls = await callsOf(page, 'listRuns');
+		expect(calls.at(-1)?.payload).toEqual({
+			limit: 10,
+			date_from: '2026-11-04T15:00:00.000Z', // Tokyo local midnight 2026-11-05
+			date_to: '2026-11-05T15:00:00.000Z' // Tokyo local midnight 2026-11-06
+		});
+		// The date inputs carry the same explicit instants (never "today" text).
+		await expect(root.getByTestId('runs-date-from-input')).toHaveValue('2026-11-04T15:00:00.000Z');
+		await expect(root.getByTestId('runs-date-to-input')).toHaveValue('2026-11-05T15:00:00.000Z');
+	});
+
+	test('rows show the human label, full run id, submitted and honest terminal completion', async ({
+		page
+	}) => {
+		const root = page.locator(`${hostA} [data-testid="jobs-root"]`);
+		// Label is the primary text; the full run id and full submitted stamp
+		// are visible next to it.
+		const rowA = root.locator(`[data-testid="run-row"][data-run-id="${RUN_A}"]`);
+		await expect(rowA.getByTestId('run-row-label')).toHaveText('Collect telemetry');
+		await expect(rowA.getByTestId('run-row-id')).toHaveText(RUN_A);
+		await expect(rowA.getByTestId('run-row-submitted')).toHaveText(
+			'Submitted 2026-10-15T09:00:00Z'
+		);
+		// A RUNNING row claims no completion (updated_at is not a completion).
+		await expect(rowA.getByTestId('run-row-completed')).toHaveCount(0);
+
+		// Terminal rows label updated_at honestly: Completed for succeeded,
+		// Ended for failed — never a separate wire-field claim.
+		const rowC = root.locator(`[data-testid="run-row"][data-run-id="${RUN_C}"]`);
+		await expect(rowC.getByTestId('run-row-completed')).toHaveText(
+			'Completed 2026-10-15T09:01:00Z'
+		);
+		await apiCall(page, 'setRunState', [RUN_A, 'failed', { updated_at: '2026-10-15T09:07:00Z' }]);
+		await root.getByTestId('runs-refresh').click();
+		await expect(
+			root.locator(`[data-testid="run-row"][data-run-id="${RUN_A}"] [data-testid="run-row-completed"]`)
+		).toHaveText('Ended 2026-10-15T09:07:00Z', { timeout: 8000 });
+	});
+
+	test('the pinned server name resolves through the narrow seam; failure keeps the UUID and says so', async ({
+		page
+	}) => {
+		const root = page.locator(`${hostA} [data-testid="jobs-root"]`);
+		await expect(root.getByTestId('jobs-scope-name')).toHaveText('Alpha Build Host');
+		await expect(root.getByTestId('jobs-scope-name-unavailable')).toHaveCount(0);
+		await expect(root.getByTestId('run-row')).toHaveCount(3); // jobs data unaffected
+
+		// Name lookup failure is nonfatal: UUID stays, honest note, list works.
+		const rootB = page.locator(`${hostB} [data-testid="jobs-root"]`);
+		await expect(rootB.getByTestId('jobs-scope-name')).toHaveCount(0);
+		await expect(rootB.getByTestId('jobs-scope-name-unavailable')).toHaveText(
+			'Server name unavailable — showing the pinned id.'
+		);
+		await expect(rootB.getByTestId('jobs-scope')).toHaveText('Server b7e4c2a0');
+		await expect(rootB.getByTestId('schedules-empty')).toHaveText(
+			'No schedules are recorded for this server.'
+		);
+	});
+
+	test('watch report renders the final answer, tool results and failure reason; deltas and thinking never surface', async ({
+		page
+	}) => {
+		const root = page.locator(`${hostA} [data-testid="jobs-root"]`);
+
+		// The report section exists only while a run is watched; before any
+		// final round arrives it says so honestly.
+		await root.locator(`[data-testid="run-row"][data-run-id="${RUN_A}"] [data-testid="run-watch"]`).click();
+		await expect(root.getByTestId('watched-state')).toHaveText('Running', { timeout: 8000 });
+		await expect(root.getByTestId('watch-report-empty')).toHaveText(
+			'No final agent response is recorded for this run yet.'
+		);
+		// Replay: the deltas must never appear as content; the final round is
+		// the current answer; the tool result carries capability + text; the
+		// failure reason is visibly useful.
+		const secretDelta = 'SECRET-DELTA-CONTENT-7f3a';
+		const secretThinking = 'SECRET-THINKING-CONTENT-91bc';
+		queueStreamSession({
+			runId: RUN_A,
+			frames: [
+				{
+					seq: 1,
+					type: 'agent.output_delta',
+					data: { output: secretDelta, thinking: secretThinking }
+				},
+				{
+					seq: 2,
+					type: 'agent.model_round',
+					data: { status: 'final', output: 'Deploy finished.\nAll 4 hosts green.' }
+				},
+				{
+					seq: 3,
+					type: 'agent.tool_result',
+					data: {
+						capability_id: 'host.shell',
+						result: { exit_code: 0, stdout: 'ok' }
+					}
+				},
+				{
+					seq: 4,
+					type: 'agent.failed',
+					data: { reason: 'verify step timed out after 30s' }
+				}
+			]
+		});
+		const finalText = root.getByTestId('watch-report-final');
+		await expect(finalText).toHaveText('Deploy finished.\nAll 4 hosts green.', {
+			timeout: 8000,
+			useInnerText: true
+		});
+		// Whitespace preserved (pre-wrap) and the final round is honest about
+		// its provenance timestamp.
+		await expect(finalText).toHaveCSS('white-space', 'pre-wrap');
+		await expect(root.getByTestId('watch-report-meta')).toContainText('Final response ·');
+		// Tool result: capability + bounded useful JSON text.
+		const toolRow = root.getByTestId('tool-result-row').first();
+		await expect(toolRow.getByTestId('tool-result-capability')).toHaveText('host.shell');
+		await expect(toolRow.getByTestId('tool-result-text')).toHaveText(
+			'{"exit_code":0,"stdout":"ok"}'
+		);
+		// Failure reason is visibly useful.
+		await expect(root.getByTestId('watch-failed')).toHaveText(
+			'Failure reason: verify step timed out after 30s'
+		);
+		// Delta content and thinking NEVER render — as content or anywhere.
+		const body = await page.locator(`${hostA} [data-testid="jobs-root"]`).innerText();
+		expect(body).not.toContain(secretDelta);
+		expect(body).not.toContain(secretThinking);
+		// The delta frame appears only as a compact lifecycle line (no payload).
+		const deltaRows = root.locator('[data-testid="event-row"]', {
+			hasText: 'Streaming delta (transient)'
+		});
+		await expect(deltaRows).toHaveCount(1);
+		expect((await deltaRows.first().innerText()).includes(secretDelta)).toBe(false);
+	});
+
+	test('replay stays bounded: 520 delivered events render at most 500 rows', async ({
+		page
+	}) => {
+		const root = page.locator(`${hostA} [data-testid="jobs-root"]`);
+		// RUN_A is running — a terminal run's stream never opens (nothing new
+		// can arrive), so the bounded-replay proof needs a live target.
+		await root.locator(`[data-testid="run-row"][data-run-id="${RUN_A}"] [data-testid="run-watch"]`).click();
+		const frames = Array.from({ length: 520 }, (_, index) => ({
+			seq: index + 1,
+			type: 'run.transition',
+			data: {}
+		}));
+		queueStreamSession({ runId: RUN_A, frames });
+		await expect(
+			page.locator(`${hostA} [data-testid="event-row"]`)
+		).toHaveCount(500, { timeout: 15000 });
+		// The watermark sits at the LAST delivered seq (520), not the cap.
+		await expect(
+			page.locator(`${hostA} [data-testid="event-row"][data-event-seq="520"]`)
+		).toHaveCount(1);
+	});
 });

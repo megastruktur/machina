@@ -1032,11 +1032,19 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				`/api/v1/jobs/runs/${encodeURIComponent(runId)}/cancel`,
 				payload
 			),
-		listRuns: (serverId, page) =>
-			requestJson<RunPage>(
-				'GET',
-				`/api/v1/jobs/runs?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
+		// Runs list (W1 filters ride the reviewed endpoint; URLSearchParams
+		// keeps the encoding of q and the explicit ISO date bounds honest).
+		listRuns: (serverId, page) => {
+			const params = new URLSearchParams({ server_id: serverId });
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			if (page?.q !== undefined && page.q !== '') params.set('q', page.q);
+			if (page?.date_from !== undefined && page.date_from !== '')
+				params.set('date_from', page.date_from);
+			if (page?.date_to !== undefined && page.date_to !== '')
+				params.set('date_to', page.date_to);
+			return requestJson<RunPage>('GET', `/api/v1/jobs/runs?${params.toString()}`);
+		},
 		submitChallenge: (payload) =>
 			requestJson<ChallengeOutcomeView>('POST', '/api/v1/password-challenges', payload),
 		terminalInfo: (serverId) =>

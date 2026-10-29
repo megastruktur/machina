@@ -49,12 +49,29 @@ export type ScheduleUpdateBody = components['schemas']['ScheduleUpdateBody'];
 /** Generated wire shape: one bounded schedule page. */
 export type SchedulePage = components['schemas']['SchedulePage'];
 
-/** Optional bounded-page query shared by the list routes (C01 rule 5). */
+/**
+ * Optional bounded-page query shared by the list routes (C01 rule 5). The
+ * jobs runs list additionally carries the reviewed W1 filters; the server
+ * applies them BEFORE pagination (the pre-slice `total` is filtered).
+ */
 export interface PageQuery {
 	/** Page size; server default and maximum are producer-owned bounds. */
 	limit?: number;
 	/** Page offset. */
 	offset?: number;
+	/**
+	 * Runs list only: case-insensitive substring search over run_id, label
+	 * and model_profile (W1). Never sent for other collections.
+	 */
+	q?: string;
+	/**
+	 * Runs list only: inclusive lower `submitted_at` bound as an explicit
+	 * ISO instant (W1). The Today preset translates browser-local midnight
+	 * to this bound client-side; ambiguous local date text is never sent.
+	 */
+	date_from?: string;
+	/** Runs list only: inclusive upper `submitted_at` bound (ISO instant). */
+	date_to?: string;
 }
 
 /**
@@ -77,6 +94,14 @@ export type RunEventStreamOptions = SubscribeEventsOptions;
 export interface JobsApi {
 	/** GET /api/v1/jobs/runs?server_id=… — explicit scope, never unfiltered (C01 r7). */
 	listRuns(serverId: string, page?: PageQuery): Promise<RunPage>;
+	/**
+	 * OPTIONAL name seam for the pinned scope (W3): resolves ONLY the panel's
+	 * pinned `server_id` to the enrolled profile's human name. When absent,
+	 * resolution fails, or the bag was composed without it, the panel keeps
+	 * the UUID and shows a visible name-unavailable state — jobs data never
+	 * depends on it. The narrow shape deliberately hides the full profile.
+	 */
+	readServerName?(serverId: string): Promise<string>;
 	/** GET /api/v1/jobs/runs/{run_id} — replayed state + durable steps. */
 	readRun(runId: string): Promise<RunDetail>;
 	/** POST /api/v1/jobs/runs/{run_id}/cancel — records the request once. */

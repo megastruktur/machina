@@ -637,6 +637,105 @@ test('live selected server survives reload, pins panel scope, and falls back whe
 	).toBeNull();
 });
 
+test('live jobs panel resolves the pinned server name through the real composition', async ({
+	page
+}) => {
+	const BETA = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+	const profileFor = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: {
+			host: `${name}.example`,
+			port: 22,
+			user: 'mai',
+			host_key: 'k',
+			credential_ref: 'MAI_SSH_KEY'
+		},
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [profileFor(SERVER_ALPHA_ID, 'Server Alpha'), profileFor(BETA, 'Server Beta')]
+			})
+		})
+	);
+	// The REAL composed readProfile path: the jobs panel's name seam calls
+	// GET /api/v1/servers/{id} through the base client.
+	let profileReads = 0;
+	await page.route('**/api/v1/servers/*', (route) => {
+		if (route.request().method() !== 'GET') return route.fallback();
+		const url = new URL(route.request().url());
+		if (url.pathname.endsWith('/memory/status') || url.pathname.endsWith('/terminal/info')) {
+			return route.fallback();
+		}
+		profileReads += 1;
+		const requested = decodeURIComponent(url.pathname.split('/').pop() ?? '');
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(profileFor(requested, requested === BETA ? 'Server Beta' : 'Server Alpha'))
+		});
+	});
+	await page.route('**/api/v1/jobs/runs?*', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ runs: [], limit: 10, offset: 0, total: 0 })
+		})
+	);
+	await page.route('**/api/v1/schedules?*', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ schedules: [], limit: 10, offset: 0, total: 0 })
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ profiles: [] })
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ schema_version: 1, connection: 'litellm', profile: '' })
+		})
+	);
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	// Select the NON-default server, then open the jobs panel pinned to it.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await page.getByTestId('open-jobs').click();
+	const jobsRoot = page.locator(`.mai-window-frame[data-panel-kind="jobs"]`);
+	await expect(jobsRoot).toHaveCount(1);
+	// The panel shows the resolved NAME of ITS pinned scope (Beta) — resolved
+	// through the real readProfile composition, not a second collection load.
+	await expect(jobsRoot.getByTestId('jobs-scope-name')).toHaveText('Server Beta');
+	await expect(jobsRoot.getByTestId('jobs-scope')).toHaveText(`Server ${BETA.slice(0, 8)}`);
+	await expect(jobsRoot.getByTestId('runs-empty')).toHaveText(
+		'No runs are recorded for this server.'
+	);
+	expect(profileReads).toBeGreaterThanOrEqual(1);
+});
+
 test('the bottom chat dock is always visible, interactive offline and performs no API requests', async ({
 	page
 }) => {
