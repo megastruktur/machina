@@ -1192,6 +1192,180 @@ class TestListAndGet:
 
 
 # ---------------------------------------------------------------------------
+# list filters: q text search + date range, applied BEFORE pagination (W1)
+# ---------------------------------------------------------------------------
+
+
+class TestListFilters:
+    async def _submit(
+        self,
+        jobs_app: FastAPI,
+        jar: dict[str, str],
+        server: uuid.UUID,
+        *,
+        steps: list[dict[str, Any]],
+        model_profile: str = "build-agent",
+    ) -> uuid.UUID:
+        run_id = uuid.uuid4()
+        response = await call_app(
+            jobs_app,
+            "POST",
+            "/api/v1/jobs/runs",
+            json_body={
+                "run_id": str(run_id),
+                "server_id": str(server),
+                "model_profile": model_profile,
+                "mode": "delegated",
+                "steps": steps,
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert response.status == 201, response.body
+        time.sleep(0.02)  # distinct submitted_at for deterministic order
+        return run_id
+
+    async def _list(self, jobs_app: FastAPI, jar: dict[str, str], query: str):
+        response = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?{query}",
+            cookies=jar,
+        )
+        assert response.status == 200, response.body
+        return response.json()
+
+    async def test_label_falls_back_to_first_capability(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[
+                {"capability_id": READ_CAP, "payload": {"marker": "m1"}},
+                {"capability_id": MUTATE_CAP, "payload": {"marker": "m2"}},
+            ],
+        )
+        page = await self._list(jobs_app, jar, f"server_id={server_a}")
+        labels = {run["run_id"]: run["label"] for run in page["runs"]}
+        assert labels[str(run_id)] == READ_CAP
+
+    async def test_label_from_payload_and_q_searches_labels(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        labeled = await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[
+                {"capability_id": READ_CAP, "payload": {"label": "Deploy API"}},
+            ],
+        )
+        plain = await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": MUTATE_CAP, "payload": {"marker": "m1"}}],
+        )
+        page = await self._list(jobs_app, jar, f"server_id={server_a}&q=deploy api")
+        assert page["total"] == 1  # filter runs BEFORE the LIMIT/OFFSET slice
+        assert [str(labeled)] == [run["run_id"] for run in page["runs"]]
+        assert page["runs"][0]["label"] == "Deploy API"
+        other = await self._list(jobs_app, jar, f"server_id={server_a}&q=fixture")
+        assert other["total"] == 1
+        assert [str(plain)] == [run["run_id"] for run in other["runs"]]
+
+    async def test_q_matches_model_profile_and_run_id(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}],
+            model_profile="probe-model",
+        )
+        by_profile = await self._list(
+            jobs_app, jar, f"server_id={server_a}&q=probe-model"
+        )
+        assert by_profile["total"] == 1
+        assert [str(run_id)] == [run["run_id"] for run in by_profile["runs"]]
+        by_id = await self._list(
+            jobs_app, jar, f"server_id={server_a}&q={str(run_id)[:8]}"
+        )
+        assert by_id["total"] == 1
+        assert [str(run_id)] == [run["run_id"] for run in by_id["runs"]]
+
+    async def test_date_range_filters_submitted_at(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}],
+        )
+        future_only = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&date_from=2099-01-01T00:00:00Z",
+        )
+        assert future_only["total"] == 0
+        assert future_only["runs"] == []
+        past_only = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&date_to=1990-01-01T00:00:00Z",
+        )
+        assert past_only["total"] == 0
+        spanning = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}"
+            "&date_from=2000-01-01T00:00:00Z&date_to=2099-01-01T00:00:00Z",
+        )
+        assert spanning["total"] == 1
+        invalid = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&date_from=not-a-date",
+            cookies=jar,
+        )
+        assert invalid.status == 422, invalid.body
+
+    async def test_filters_apply_before_pagination(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        first = await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": READ_CAP, "payload": {"label": "alpha one"}}],
+        )
+        await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": READ_CAP, "payload": {"label": "alpha two"}}],
+        )
+        await self._submit(
+            jobs_app,
+            jar,
+            server_a,
+            steps=[{"capability_id": READ_CAP, "payload": {"label": "beta"}}],
+        )
+        page = await self._list(
+            jobs_app, jar, f"server_id={server_a}&q=alpha&limit=1&offset=1"
+        )
+        assert page["total"] == 2  # the FILTERED total, not the scope total (3)
+        assert page["limit"] == 1
+        assert page["offset"] == 1
+        # submitted_at DESC order: offset 1 lands on the OLDER alpha run.
+        assert [str(first)] == [run["run_id"] for run in page["runs"]]
+
+
+# ---------------------------------------------------------------------------
 # live scenario: stream replay + disconnect + cancel (JOB-SUBMIT/EVT-REPLAY)
 # ---------------------------------------------------------------------------
 

@@ -286,18 +286,11 @@ def _drop_app_tables(url: str) -> None:
     import psycopg
 
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
-            "conversation_messages, conversations, "
-            "job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, notification_alerts, "
-            "observation_findings, server_observations, job_runs, approvals, "
-            "application_projection, application_projection_journal, "
-            "knowledge_doc_chunks, knowledge_documents, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (the applications suite's approach): the
+        # enumerated-drop list went stale across migrations 0005–0009
+        # (e.g. agent_tasks now holds an FK into conversations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 

@@ -644,6 +644,7 @@
 			prompt_revision: 1,
 			model_profile: profile,
 			requested_grants: [],
+			label: '',
 			state: 'running',
 			cancel_requested_at: null,
 			submitted_at: stamp(),

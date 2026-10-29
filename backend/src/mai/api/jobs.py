@@ -237,6 +237,7 @@ class RunView(BaseModel):
     prompt_revision: int
     model_profile: str
     requested_grants: list[str]
+    label: str
     state: str | None
     cancel_requested_at: str | None
     submitted_at: str
@@ -421,7 +422,7 @@ async def _replayed_state(lifecycle: RunLifecycle, run_id: str) -> str | None:
 _RUN_COLUMNS: Final[str] = """
     run_id::text AS run_id, server_id::text AS server_id,
     parent_run_id::text AS parent_run_id, depth, profile_revision,
-    prompt_revision, model_profile, requested_grants,
+    prompt_revision, model_profile, requested_grants, label,
     COALESCE(
         cancel_requested_at,
         (SELECT MAX(ts) FROM job_events
@@ -445,6 +446,7 @@ def _run_view(row: Mapping[str, object], state: str | None) -> RunView:
         prompt_revision=int(row["prompt_revision"]),  # type: ignore[arg-type]
         model_profile=str(row["model_profile"]),
         requested_grants=list(row["requested_grants"]),  # type: ignore[arg-type]
+        label=str(row["label"]),
         state=state,
         cancel_requested_at=(
             None
@@ -490,6 +492,23 @@ def _intent_document(
     }
 
 
+#: Bounded run label (the wire/human identifier stays display-safe).
+MAX_RUN_LABEL_CHARS: Final[int] = 200
+
+
+def _run_label(payload: RunSubmitBody) -> str:
+    """Derive the run label from the canonical intent (W1).
+
+    The first step's ``label`` payload field when it is a non-empty
+    string, else the first step's ``capability_id``. Overlong values are
+    truncated at :data:`MAX_RUN_LABEL_CHARS` (the stored CHECK bound).
+    """
+    first = payload.steps[0]
+    raw = first.payload.get("label")
+    label = raw if isinstance(raw, str) and raw.strip() else first.capability_id
+    return label.strip()[:MAX_RUN_LABEL_CHARS]
+
+
 async def _record_submit_intent(
     session: AsyncSession,
     *,
@@ -500,6 +519,7 @@ async def _record_submit_intent(
     model_profile: str,
     requested_grants: list[str],
     digest: str,
+    label: str,
     now: datetime,
     root_budget: dict[str, object] | None = None,
 ) -> bool:
@@ -523,11 +543,11 @@ async def _record_submit_intent(
                 INSERT INTO job_runs
                     (run_id, server_id, depth, profile_revision,
                      prompt_revision, model_profile, requested_grants,
-                     root_budget, submitted_at, updated_at)
+                     label, root_budget, submitted_at, updated_at)
                 VALUES
                     (:run_id, :server_id, 0, :profile_revision,
                      :prompt_revision, :model_profile, :requested_grants,
-                     :root_budget, :now, :now)
+                     :label, :root_budget, :now, :now)
                 ON CONFLICT (run_id) DO NOTHING
                 RETURNING run_id
                 """
@@ -539,6 +559,7 @@ async def _record_submit_intent(
                 "prompt_revision": prompt_revision,
                 "model_profile": model_profile,
                 "requested_grants": json.dumps(requested_grants),
+                "label": label,
                 "root_budget": (
                     json.dumps(root_budget) if root_budget is not None else None
                 ),
@@ -710,6 +731,7 @@ async def submit_run(request: Request, payload: RunSubmitBody) -> Response:
                 model_profile=payload.model_profile,
                 requested_grants=sorted({step.capability_id for step in payload.steps}),
                 digest=digest,
+                label=_run_label(payload),
                 now=datetime.now(timezone.utc),
             )
     if not created:
@@ -776,6 +798,9 @@ async def list_runs(
     server_id: uuid.UUID,
     limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=200),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
 ) -> Response:
     """One bounded page of one server's runs (C01 rules 5 and 7).
 
@@ -783,21 +808,42 @@ async def list_runs(
     required — default shared retrieval is never unfiltered multi-server
     access (C01 rule 7). States are replayed from the persisted
     transition events of exactly this page's runs.
+
+    Filters (``q`` case-insensitive substring over run_id, label and
+    model_profile; ``date_from``/``date_to`` over ``submitted_at``) apply
+    BEFORE pagination: the same predicate drives both the page query and
+    the pre-slice ``COUNT(*)``, so ``total`` is the filtered total.
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)
     factory = _sessions(request)
     scope = str(server_id)
+    predicates = ["server_id = :s"]
+    params: dict[str, object] = {"s": scope, "l": limit, "o": offset}
+    if q is not None:
+        needle = f"%{q}%"
+        predicates.append(
+            "(run_id::text ILIKE :q OR label ILIKE :q "
+            "OR model_profile ILIKE :q)"
+        )
+        params["q"] = needle
+    if date_from is not None:
+        predicates.append("submitted_at >= :date_from")
+        params["date_from"] = date_from.astimezone(timezone.utc)
+    if date_to is not None:
+        predicates.append("submitted_at <= :date_to")
+        params["date_to"] = date_to.astimezone(timezone.utc)
+    where = " AND ".join(predicates)
     async with factory() as session:
         rows = (
             (
                 await session.execute(
                     text(
                         f"SELECT {_RUN_COLUMNS} FROM job_runs "
-                        "WHERE server_id = :s ORDER BY submitted_at DESC, run_id "
+                        f"WHERE {where} ORDER BY submitted_at DESC, run_id "
                         "LIMIT :l OFFSET :o"
                     ),
-                    {"s": scope, "l": limit, "o": offset},
+                    params,
                 )
             )
             .mappings()
@@ -805,8 +851,8 @@ async def list_runs(
         )
         total = (
             await session.execute(
-                text("SELECT COUNT(*) FROM job_runs WHERE server_id = :s"),
-                {"s": scope},
+                text(f"SELECT COUNT(*) FROM job_runs WHERE {where}"),
+                {k: v for k, v in params.items() if k not in ("l", "o")},
             )
         ).scalar_one()
         run_ids = [str(row["run_id"]) for row in rows]

@@ -1526,6 +1526,7 @@ async def _submit_canonical_turn(
                 model_profile=model_profile,
                 requested_grants=sorted(capabilities),
                 digest=engine_digest,
+                label=next(iter(sorted(capabilities)), model_profile),
                 now=now,
             )
             if created:
@@ -2058,6 +2059,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
                 model_profile=payload.profile,
                 requested_grants=sorted(capabilities),
                 digest=engine_digest,
+                label=next(iter(sorted(capabilities)), payload.profile),
                 now=now,
                 root_budget=root_budget,
             )

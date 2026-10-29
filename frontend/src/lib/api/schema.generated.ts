@@ -401,6 +401,11 @@ export interface paths {
          *     required — default shared retrieval is never unfiltered multi-server
          *     access (C01 rule 7). States are replayed from the persisted
          *     transition events of exactly this page's runs.
+         *
+         *     Filters (``q`` case-insensitive substring over run_id, label and
+         *     model_profile; ``date_from``/``date_to`` over ``submitted_at``) apply
+         *     BEFORE pagination: the same predicate drives both the page query and
+         *     the pre-slice ``COUNT(*)``, so ``total`` is the filtered total.
          */
         get: operations["list_runs_api_v1_jobs_runs_get"];
         put?: never;
@@ -3702,6 +3707,8 @@ export interface components {
             model_profile: string;
             /** Requested Grants */
             requested_grants: string[];
+            /** Label */
+            label: string;
             /** State */
             state: string | null;
             /** Cancel Requested At */
@@ -5453,6 +5460,8 @@ export interface components {
             model_profile: string;
             /** Requested Grants */
             requested_grants: string[];
+            /** Label */
+            label: string;
             /** State */
             state: string | null;
             /** Cancel Requested At */
@@ -5551,6 +5560,8 @@ export interface components {
             model_profile: string;
             /** Requested Grants */
             requested_grants: string[];
+            /** Label */
+            label: string;
             /** State */
             state: string | null;
             /** Cancel Requested At */
@@ -7817,6 +7828,9 @@ export interface operations {
                 server_id: string;
                 limit?: number;
                 offset?: number;
+                q?: string | null;
+                date_from?: string | null;
+                date_to?: string | null;
             };
             header?: never;
             path?: never;

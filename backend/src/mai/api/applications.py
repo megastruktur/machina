@@ -2413,6 +2413,7 @@ async def execute_runbook(
                 model_profile=model_profile if model_profile is not None else "default",
                 requested_grants=sorted(capabilities),
                 digest=digest,
+                label=next(iter(sorted(capabilities)), "runbook"),
                 now=datetime.now(timezone.utc),
             )
     del created  # a freshly minted run id cannot duplicate; enqueue decides

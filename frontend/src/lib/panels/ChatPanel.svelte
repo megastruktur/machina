@@ -841,6 +841,7 @@
 			prompt_revision: 0,
 			model_profile: '',
 			requested_grants: [],
+			label: '',
 			state: null,
 			cancel_requested_at: null,
 			submitted_at: row.created_at,

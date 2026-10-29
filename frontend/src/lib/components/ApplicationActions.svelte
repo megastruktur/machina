@@ -575,6 +575,7 @@
 				prompt_revision: 0,
 				model_profile: '',
 				requested_grants: [],
+				label: '',
 				state: fallback.state,
 				cancel_requested_at: fallback.cancelRequestedAt,
 				submitted_at: '',
