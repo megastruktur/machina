@@ -40,6 +40,8 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
+from dbos import DBOS
+from dbos import error as dbos_error
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
@@ -1896,6 +1898,424 @@ class TestIntakeRejectionVisibleOutcome:
                 (conversation_id,),
             ).fetchone()[0]
         assert still_one == 1
+
+
+# ---------------------------------------------------------------------------
+# W3 — bounded intake stall (deadline-bounded step, classified timeout)
+# ---------------------------------------------------------------------------
+
+
+class TestIntakeTimeoutBoundary:
+    """W3: the DBOS-recorded intake step timeout is classified at the ONE
+    intake call site of the workflow — exactly one attempt, ONE value-free
+    ``agent.intake_timed_out`` event, ONE fixed safe assistant reply, a
+    failed run and a released lease; cancellation is never mislabeled."""
+
+    @pytest.fixture
+    def bounded(self, sessions, task_run_url, tmp_path):
+        """The composed executor registered as the process agent-run."""
+        executor, _journal = _compose(
+            sessions, task_run_url, tmp_path, DispatchModel([], []).model
+        )
+        agent_run.reset_agent_run()
+        agent_run.configure_agent_run(executor)
+        yield executor
+        agent_run.reset_agent_run()
+
+
+    @pytest.mark.anyio
+    async def test_recorded_timeout_fails_once_with_safe_reply(
+        self, sessions, task_run_url, tmp_path, monkeypatch, bounded
+    ) -> None:
+        """The boundary converts the recorded DBOSStepTimeoutError to the
+        classified ``intake_timeout`` failure: the intake seam is called
+        EXACTLY once (no retry), ONE value-free timeout event lands on the
+        stream, ONE fixed safe reply is recorded before the lease release,
+        and no task machinery exists."""
+        run_id = str(uuid.uuid4())
+        conversation_id, _message_id = await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+        calls: list[str] = []
+
+        def _recorded_timeout_intake(
+            payload_json: str, pins_json: str
+        ) -> dict[str, object]:
+            calls.append(payload_json)
+            raise dbos_error.DBOSStepTimeoutError(
+                "agents.intake_interpreted", agent_run.INTAKE_STEP_TIMEOUT_SECONDS
+            )
+
+        monkeypatch.setattr(
+            agent_run, "_agent_intake_interpreted", _recorded_timeout_intake
+        )
+        payload_json = harness._canonical(
+            harness._intent_document(
+                run_id, connection="gateway", profile="fast"
+            )
+        )
+        with pytest.raises(agent_run.AgentRunFailed) as excinfo:
+            await agent_run.run_agent_conversation(payload_json)
+
+        assert str(excinfo.value) == agent_run.INTAKE_TIMED_OUT_REASON
+        assert len(calls) == 1  # no automatic retry/re-execution
+        assert calls[0] == payload_json
+        # ONE value-free timeout observation, nothing else on the intake
+        # stream (no provider detail, no raw model output).
+        timed_out = [
+            event
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == agent_run.AGENT_INTAKE_TIMED_OUT_EVENT_TYPE
+        ]
+        assert len(timed_out) == 1
+        assert timed_out[0]["data"] == {
+            "interpreted": False,
+            "rejected": False,
+            "timed_out": True,
+        }
+        assert harness._failure_reasons(task_run_url, run_id) == [
+            agent_run.INTAKE_TIMED_OUT_REASON
+        ]
+        # EXACTLY ONE fixed safe timeout reply through the A3 producer.
+        with psycopg.connect(task_run_url) as conn:
+            rows = conn.execute(
+                "SELECT role, content, content_ref, source_kind "
+                "FROM conversation_messages WHERE conversation_id = %s "
+                "AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchall()
+            tasks = conn.execute("SELECT COUNT(*) FROM agent_tasks").fetchone()[0]
+            link = conn.execute(
+                "SELECT task_id, released_at FROM conversation_runs "
+                "WHERE run_id = %s",
+                (uuid.UUID(run_id),),
+            ).fetchone()
+        assert len(rows) == 1
+        role, content, content_ref, source_kind = rows[0]
+        assert role == "assistant" and source_kind == "system"
+        assert content == agent_run.INTAKE_TIMED_OUT_VISIBLE_REPLY
+        assert content_ref == f"agent-run:{run_id}"
+        assert tasks == 0
+        assert link is not None and link[0] is None
+        assert link[1] is not None  # the writer lease was released
+
+    @pytest.mark.anyio
+    async def test_reentered_timeout_seams_never_duplicate(
+        self, sessions, task_run_url, tmp_path, monkeypatch, bounded
+    ) -> None:
+        """The replay belt (the same discipline as the A3 rejection
+        test): a recovered workflow re-enters the boundary with the
+        RECORDED timeout, and even steps whose checkpoints were lost
+        re-execute onto the SAME stream row and the SAME transcript row.
+        The full replay (recorded step outputs, no planner call) is
+        proven against the real engine in TestIntakeTimeoutDurableEngine."""
+        run_id = str(uuid.uuid4())
+        conversation_id, _message_id = await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+
+        def _recorded_timeout_intake(
+            payload_json: str, pins_json: str
+        ) -> dict[str, object]:
+            raise dbos_error.DBOSStepTimeoutError(
+                "agents.intake_interpreted", agent_run.INTAKE_STEP_TIMEOUT_SECONDS
+            )
+
+        monkeypatch.setattr(
+            agent_run, "_agent_intake_interpreted", _recorded_timeout_intake
+        )
+        with pytest.raises(agent_run.AgentRunFailed) as excinfo:
+            await agent_run.run_agent_conversation(
+                harness._canonical(
+                    harness._intent_document(
+                        run_id, connection="gateway", profile="fast"
+                    )
+                )
+            )
+        assert str(excinfo.value) == agent_run.INTAKE_TIMED_OUT_REASON
+
+        # A replayed emission step and a replayed reply producer for the
+        # SAME run (lost checkpoints) both dedup — never a second row.
+        intent = _intent_of(run_id)
+        await bounded.aemit_intake_timed_out(intent)
+        replayed = await bounded.arecord_assistant_reply(
+            intent, agent_run.INTAKE_TIMED_OUT_VISIBLE_REPLY
+        )
+        assert replayed["recorded"] is True
+        timed_out = [
+            event
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == agent_run.AGENT_INTAKE_TIMED_OUT_EVENT_TYPE
+        ]
+        with psycopg.connect(task_run_url) as conn:
+            replies = conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id = %s AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchone()[0]
+        assert len(timed_out) == 1
+        assert replies == 1
+        assert harness._failure_reasons(task_run_url, run_id) == [
+            agent_run.INTAKE_TIMED_OUT_REASON
+        ]
+
+    @pytest.mark.anyio
+    async def test_cancellation_is_never_labeled_timeout(
+        self, sessions, task_run_url, tmp_path, monkeypatch, bounded
+    ) -> None:
+        """DBOS cancellation travels a disjoint exception hierarchy: it
+        re-raises as the engine's own exception after recording
+        ``cancelled`` — never classified ``intake_timeout``, never given a
+        timeout event or an assistant reply."""
+        run_id = str(uuid.uuid4())
+        conversation_id, _message_id = await _alinked_turn(sessions, run_id)
+        await _ainsert_run(sessions, run_id)
+
+        def _cancelled_intake(
+            payload_json: str, pins_json: str
+        ) -> dict[str, object]:
+            raise dbos_error.DBOSWorkflowCancelledError(
+                "workflow cancelled during intake"
+            )
+
+        monkeypatch.setattr(agent_run, "_agent_intake_interpreted", _cancelled_intake)
+        with pytest.raises(dbos_error.DBOSWorkflowCancelledError):
+            await agent_run.run_agent_conversation(
+                harness._canonical(
+                    harness._intent_document(
+                        run_id, connection="gateway", profile="fast"
+                    )
+                )
+            )
+
+        assert harness._failure_reasons(task_run_url, run_id) == []
+        timed_out = [
+            event
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == agent_run.AGENT_INTAKE_TIMED_OUT_EVENT_TYPE
+        ]
+        assert timed_out == []
+        with psycopg.connect(task_run_url) as conn:
+            replies = conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id = %s AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchone()[0]
+        assert replies == 0
+        # The cancellation path recorded ``cancelled`` on the frozen
+        # lifecycle (run.transition events), never a failure.
+        states = [
+            event["data"].get("to")
+            for event in _events_of(task_run_url, run_id)
+            if event["type"] == "run.transition"
+        ]
+        assert states and states[-1] == "cancelled"
+
+
+# The accelerated sibling of the production step: the SAME DBOS
+# supervision (watchdog cancel + durable step-error record + replay
+# rethrow), with a deadline the tests can actually wait for. The
+# production step keeps 660 s (above the provider SDK's 600 s read
+# timeout); these proofs bind the boundary semantics, not the number.
+_W3_TEST_STEP_TIMEOUT_SECONDS = 2.0
+
+
+@DBOS.step(
+    name="agents.intake_interpreted.w3test",
+    timeout_seconds=_W3_TEST_STEP_TIMEOUT_SECONDS,
+    retries_allowed=False,
+)
+async def _w3_accelerated_intake_interpreted(
+    payload_json: str, pins_json: str
+) -> dict[str, object]:
+    """Deadline-bounded intake interpretation (test-sibling of W3)."""
+    intent = agent_run.parse_agent_run_intent(payload_json)
+    executor = agent_run._resolve_agent_run()
+    return await executor.ainterpret_intake_turn(intent, json.loads(pins_json))
+
+
+class TestIntakeTimeoutDurableEngine:
+    """W3 (real in-process engine): the deadline-bounded intake step
+    times out under DBOS's own watchdog, fails the run exactly once, and
+    a recovery replay rethrows the recorded timeout without a second
+    planner call or duplicate reply/event. A slow-but-live planner call
+    under the same deadline completes untouched."""
+
+    @pytest.fixture
+    def engine_worker(self, task_run_url):
+        """In-process worker against the SAME fixture system schema."""
+        job_engine.launch_worker(task_run_url)
+        yield task_run_url
+        job_engine.shutdown()
+
+    @pytest.fixture
+    def accelerated(self, monkeypatch):
+        """Swap the production step for its accelerated test sibling."""
+        monkeypatch.setattr(
+            agent_run,
+            "_agent_intake_interpreted",
+            _w3_accelerated_intake_interpreted,
+        )
+
+    @staticmethod
+    def _hanging_model(counter: dict[str, int]) -> FunctionModel:
+        """A planner call that parks forever (hung provider call)."""
+
+        async def _hang(messages, info):  # noqa: ANN001 - FunctionModel ABI
+            counter["planner_calls"] = counter.get("planner_calls", 0) + 1
+            await asyncio.sleep(30.0)
+            raise AssertionError("a timed-out planner call never completes")
+
+        return FunctionModel(_hang)
+
+    def test_watchdog_timeout_fails_once_and_replay_never_reexecutes(
+        self, task_run_url, tmp_path, domain, engine_worker, accelerated
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        conversation_id, _message_id = _run(_alinked_turn(domain, run_id))
+        _run(_ainsert_run(domain, run_id))
+        counter: dict[str, int] = {}
+        executor, _journal = _compose(
+            domain, task_run_url, tmp_path, self._hanging_model(counter)
+        )
+        agent_run.reset_agent_run()
+        agent_run.configure_agent_run(executor)
+        document = harness._intent_document(
+            run_id, connection="gateway", profile="fast", wait_poll_seconds=0.5
+        )
+        client = EngineClient(task_run_url)
+        try:
+            _run(harness._enqueue_run(client, _noop_insert, run_id, document))
+            harness._wait_until(
+                lambda: (harness._terminal_engine_state(client, run_id) or "")
+                == "failed",
+                harness.RUN_TIMEOUT,
+                "timed-out run terminal",
+            )
+            first_snapshot = self._snapshot(task_run_url, run_id, conversation_id)
+            # The watchdog fired ONCE: one planner call, one timeout
+            # event, one safe reply, the classified failure.
+            assert counter["planner_calls"] == 1
+            assert first_snapshot["reasons"] == [agent_run.INTAKE_TIMED_OUT_REASON]
+            assert first_snapshot["timed_out_events"] == 1
+            assert first_snapshot["replies"] == 1
+            assert first_snapshot["timed_out_data"] == {
+                "interpreted": False,
+                "rejected": False,
+                "timed_out": True,
+            }
+
+            # Simulate the crash window a fresh worker recovers from: the
+            # workflow is PENDING with the step error already recorded,
+            # then launch recovery re-executes it.
+            with psycopg.connect(task_run_url) as conn:
+                conn.execute(
+                    "UPDATE dbos.workflow_status SET status = 'PENDING' "
+                    "WHERE workflow_uuid = %s",
+                    (run_id,),
+                )
+                conn.commit()
+            job_engine.shutdown()
+            job_engine.launch_worker(task_run_url)
+            harness._wait_until(
+                lambda: (harness._terminal_engine_state(client, run_id) or "")
+                == "failed",
+                harness.RUN_TIMEOUT,
+                "replayed run terminal",
+            )
+        finally:
+            agent_run.reset_agent_run()
+            client.close()
+
+        replayed = self._snapshot(task_run_url, run_id, conversation_id)
+        # Replay rethrew the RECORDED timeout: the planner was never
+        # called again, and no reply/event duplicated.
+        assert counter["planner_calls"] == 1
+        assert replayed["reasons"] == [agent_run.INTAKE_TIMED_OUT_REASON]
+        assert replayed["timed_out_events"] == 1
+        assert replayed["replies"] == 1
+        assert replayed["content"] == agent_run.INTAKE_TIMED_OUT_VISIBLE_REPLY
+
+    def test_slow_planner_call_under_deadline_completes(
+        self, task_run_url, tmp_path, domain, engine_worker, accelerated
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        conversation_id, message_id = _run(_alinked_turn(domain, run_id))
+        _run(_ainsert_run(domain, run_id))
+        counter: dict[str, int] = {}
+        scripted = DispatchModel(
+            [intake_fixtures._answer_payload(message_id, "4")], []
+        )
+
+        async def _slow_then_answer(
+            messages, info  # noqa: ANN001 - FunctionModel ABI
+        ):
+            counter["planner_calls"] = counter.get("planner_calls", 0) + 1
+            await asyncio.sleep(0.5)  # slow, but under the 2 s deadline
+            return scripted._respond(messages, info)
+
+        executor, _journal = _compose(
+            domain, task_run_url, tmp_path, FunctionModel(_slow_then_answer)
+        )
+        agent_run.reset_agent_run()
+        agent_run.configure_agent_run(executor)
+        document = harness._intent_document(
+            run_id, connection="gateway", profile="fast", wait_poll_seconds=0.5
+        )
+        client = EngineClient(task_run_url)
+        try:
+            _run(harness._enqueue_run(client, _noop_insert, run_id, document))
+            harness._wait_until(
+                lambda: (harness._terminal_engine_state(client, run_id) or "")
+                == "succeeded",
+                harness.RUN_TIMEOUT,
+                "slow-but-live run success",
+            )
+        finally:
+            agent_run.reset_agent_run()
+            client.close()
+
+        # Regression: a slow-but-live planner call completes INSIDE the
+        # deadline — interpreted, no timeout artifacts anywhere.
+        assert counter["planner_calls"] == 1
+        snapshot = self._snapshot(task_run_url, run_id, conversation_id)
+        assert snapshot["reasons"] == []
+        assert snapshot["timed_out_events"] == 0
+        types = [
+            event["type"] for event in _events_of(task_run_url, run_id)
+        ]
+        assert agent_run.AGENT_INTAKE_EVENT_TYPE in types
+        assert agent_run.AGENT_INTAKE_TIMED_OUT_EVENT_TYPE not in types
+        with psycopg.connect(task_run_url) as conn:
+            reply = conn.execute(
+                "SELECT content FROM conversation_messages "
+                "WHERE conversation_id = %s AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchall()
+        assert [row[0] for row in reply] == ["4"]  # the model answer, not a timeout text
+
+    @staticmethod
+    def _snapshot(
+        task_run_url: str, run_id: str, conversation_id: uuid.UUID
+    ) -> dict[str, object]:
+        """The durable timeout observables of one run."""
+        events = _events_of(task_run_url, run_id)
+        timed_out = [
+            event
+            for event in events
+            if event["type"] == agent_run.AGENT_INTAKE_TIMED_OUT_EVENT_TYPE
+        ]
+        with psycopg.connect(task_run_url) as conn:
+            rows = conn.execute(
+                "SELECT content FROM conversation_messages "
+                "WHERE conversation_id = %s AND role = 'assistant'",
+                (conversation_id,),
+            ).fetchall()
+        return {
+            "reasons": harness._failure_reasons(task_run_url, run_id),
+            "timed_out_events": len(timed_out),
+            "timed_out_data": timed_out[0]["data"] if timed_out else None,
+            "replies": len(rows),
+            "content": rows[0][0] if rows else None,
+        }
 
 
 def _frame_data_root(tmp_path: Path) -> Path:

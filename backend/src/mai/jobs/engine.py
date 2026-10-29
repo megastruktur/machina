@@ -66,8 +66,11 @@ arguments it is given and never logs connection material.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import re
+import threading
 import uuid
 from enum import StrEnum
 from typing import Final
@@ -262,15 +265,51 @@ def register_job_handler(name: str, handler: object) -> None:
         )
     _RUN_HANDLERS[name] = handler
 
+#: The one persistent loop async run handlers execute on (W3). Unlike a
+#: per-run ``asyncio.run`` loop it is NEVER closed mid-process: pooled
+#: async DB connections and loop-registered waiters survive every run.
+#: Sync handlers never touch it — they run on their own workflow thread
+#: exactly as before, so ``DBOS.start_workflow`` children (which the
+#: sync child-start path executes on workflow threads) are unchanged.
+_ASYNC_HANDLER_LOOP: asyncio.AbstractEventLoop | None = None
+_ASYNC_HANDLER_LOOP_LOCK = threading.Lock()
+
+
+def _async_handler_loop() -> asyncio.AbstractEventLoop:
+    """The lazily-started persistent loop (worker process concern)."""
+    global _ASYNC_HANDLER_LOOP
+    with _ASYNC_HANDLER_LOOP_LOCK:
+        if _ASYNC_HANDLER_LOOP is None:
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever, name="mai-async-handler-loop", daemon=True
+            )
+            thread.start()
+            _ASYNC_HANDLER_LOOP = loop
+    return _ASYNC_HANDLER_LOOP
+
 
 @DBOS.workflow(name=RUN_WORKFLOW_NAME)
 def run_workflow(handler_name: str, payload_json: str) -> object:
-    """The one durable Machina run workflow (registered at import)."""
+    """The one durable Machina run workflow (registered at import).
+
+    W3: an async handler (the agent run — its ONE bounded intake call
+    must be an awaited, deadline-supervised step) is driven to
+    completion on the persistent async-handler loop, right here on this
+    workflow thread; sync handlers (steps/delegation/schedules) keep
+    today's direct call on today's thread substrate. The durable
+    surface (name, inputs, step records) is unchanged — recorded runs
+    replay unchanged, so :data:`APPLICATION_VERSION` stays put.
+    """
     validate_handler_name(handler_name)
     validate_payload_json(payload_json)
     handler = _RUN_HANDLERS.get(handler_name)
     if handler is None:
         raise UnknownHandlerError(handler_name)
+    if inspect.iscoroutinefunction(handler):
+        return asyncio.run_coroutine_threadsafe(
+            handler(payload_json), _async_handler_loop()
+        ).result()
     return handler(payload_json)
 
 

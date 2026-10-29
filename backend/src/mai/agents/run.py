@@ -510,6 +510,45 @@ INTAKE_REJECTED_VISIBLE_REPLY: Final[str] = (
     "your message and try again."
 )
 
+#: Classified stage reason when the intake planner call exceeds its
+#: bounded step deadline (W3): the run records ``failed`` with ZERO
+#: model rounds and ZERO tool effects — a stalled intake can never
+#: enable execution. The durable DBOS step-error marker means a
+#: replayed/recovered workflow rethrows the recorded timeout at the
+#: call site instead of calling the planner again (no automatic retry:
+#: ``retries_allowed=False`` on the step).
+INTAKE_TIMED_OUT_REASON: Final[str] = "intake_timeout"
+
+#: The intake step's bounded stall deadline (W3). 660 s deliberately
+#: exceeds the provider SDK's 600 s default read timeout: a slow but
+#: live planner call still completes inside the step, while a hung one
+#: fails closed past it.
+INTAKE_STEP_TIMEOUT_SECONDS: Final[float] = 660.0
+
+#: Additive, value-free intake-timeout observation (W3): recorded ONCE
+#: when the intake step deadline expires, through the idempotent
+#: ``_emit_once`` seam. Carries only the L1 vocabulary
+#: (``interpreted``/``rejected``/``timed_out`` flags) — never prompt,
+#: task content, model output, provider or error internals.
+AGENT_INTAKE_TIMED_OUT_EVENT_TYPE: Final[str] = "agent.intake_timed_out"
+
+#: A3 (agent-interaction-recovery): THE canonical assistant-visible
+#: outcome recorded ONCE when the intake planner call exceeds its step
+#: deadline (``intake_timeout``). Fixed safe text — the same discipline
+#: as :data:`INTAKE_REJECTED_VISIBLE_REPLY` (admits the preparation
+#: timed out, states this attempt performed no effects, any task stays
+#: open; never carries raw model output or internal exception detail).
+#: Recorded through the checkpointed
+#: :meth:`AgentRunExecutor.arecord_assistant_reply` producer BEFORE the
+#: run fails and releases its lease, so replays/restarts never
+#: duplicate the message.
+INTAKE_TIMED_OUT_VISIBLE_REPLY: Final[str] = (
+    "Preparing that message took too long, so this attempt performed "
+    "no effects. Any task in this conversation remains open and "
+    "unchanged; nothing was executed or verified. Please send your "
+    "message again."
+)
+
 #: Stable denial reason for a phase-gated tool effect (§6 phase gate):
 #: a task-bound run executes steps only in ``act`` and reads only in
 #: ``inspect``/``act`` — the ratified ``validate_phase`` vocabulary.
@@ -3241,6 +3280,20 @@ class AgentRunExecutor:
             run_id, AGENT_FAILED_EVENT_TYPE, {"reason": reason}
         )
 
+    async def aemit_intake_timed_out(self, intent: AgentRunIntent) -> None:
+        """ONE value-free intake-timeout observation (W3, idempotent).
+
+        Emitted from the workflow boundary after the DBOS step deadline
+        expires (the step body itself was cancelled, so it can emit
+        nothing). Only the ``interpreted``/``rejected``/``timed_out``
+        flags — no prompt, model output, provider or error internals.
+        """
+        await self._emit_once(
+            intent.run_id,
+            AGENT_INTAKE_TIMED_OUT_EVENT_TYPE,
+            {"interpreted": False, "rejected": False, "timed_out": True},
+        )
+
     async def _emit_once(
         self, run_id: str, event_type: str, data: Mapping[str, object]
     ) -> None:
@@ -3323,7 +3376,9 @@ def reset_agent_run() -> None:
 
 
 # ---------------------------------------------------------------------------
-# the DBOS steps (sync; every async seam runs on the executor's one loop)
+# the DBOS steps (sync; every async seam runs on the executor's one loop
+# — EXCEPT the bounded intake step, an async step DBOS supervises with a
+# step deadline on the engine's persistent async-handler loop; W3)
 # ---------------------------------------------------------------------------
 
 
@@ -3368,11 +3423,15 @@ def _agent_conversation_seed(
     )
 
 
-@DBOS.step(name="agents.intake_interpreted")
-def _agent_intake_interpreted(
+@DBOS.step(
+    name="agents.intake_interpreted",
+    timeout_seconds=INTAKE_STEP_TIMEOUT_SECONDS,
+    retries_allowed=False,
+)
+async def _agent_intake_interpreted(
     payload_json: str, pins_json: str
 ) -> dict[str, object]:
-    """ONE checkpointed tool-free intake interpretation (13-intake-runner).
+    """ONE bounded checkpointed tool-free intake interpretation.
 
     The step result IS the C4 replay anchor: a recovered/replayed
     workflow re-reads the SAME accepted interpretation (same turn kind,
@@ -3382,12 +3441,35 @@ def _agent_intake_interpreted(
     rejection raises the classified ``intake_rejected`` stage failure
     after emitting the value-free fields (P4: no effects on invalid
     intake).
+
+    W3 bounded stall: the step deadline (660 s, above the provider
+    SDK's 600 s read timeout) lets a slow-but-live planner call finish
+    while a hung one fails closed. The timeout error is DBOS's OWN
+    durable step-error record: with ``retries_allowed=False`` there is
+    exactly one attempt, and a replayed workflow rethrows the recorded
+    timeout at this call instead of re-running the planner. The async
+    body runs on the engine's persistent async-handler loop, under
+    DBOS's deadline supervision — the executor's async seams stay
+    loop-agnostic.
     """
     intent = parse_agent_run_intent(payload_json)
     executor = _resolve_agent_run()
-    return executor.run(
-        executor.ainterpret_intake_turn(intent, json.loads(pins_json))
-    )
+    return await executor.ainterpret_intake_turn(intent, json.loads(pins_json))
+
+
+@DBOS.step(name="agents.intake_timed_out")
+def _agent_intake_timed_out(payload_json: str) -> None:
+    """ONE value-free intake-timeout observation (W3, checkpointed).
+
+    Called from the workflow boundary AFTER the bounded intake step
+    raised its recorded ``DBOSStepTimeoutError`` (the cancelled step
+    body can emit nothing itself). Checkpointed so a replay re-reads
+    the recorded output; the ``_emit_once`` belt keeps the stream free
+    of duplicates even if the checkpoint were lost.
+    """
+    intent = parse_agent_run_intent(payload_json)
+    executor = _resolve_agent_run()
+    executor.run(executor.aemit_intake_timed_out(intent))
 
 
 @DBOS.step(name="agents.assistant_recorded")
@@ -3739,16 +3821,19 @@ def _release_lease_quietly(intent: AgentRunIntent) -> None:
         pass
 
 
-def run_agent_conversation(payload_json: str) -> dict[str, object]:
+async def run_agent_conversation(payload_json: str) -> dict[str, object]:
     """Execute one durable agent conversation (see module docstring).
 
-    Registered as :data:`HANDLER_NAME` (module import) and executed
-    inside the engine's durable trampoline workflow. Classified stage
-    failures record ``failed`` and raise :class:`AgentRunFailed` (engine
-    ERROR — both sides agree); cancellation re-raises the engine's own
-    exception after recording ``cancelled``; integrity rejections from
-    the steps machinery propagate as-is (the reviewed writer's own
-    contract). Success returns the safe conversation summary document.
+    Registered as :data:`HANDLER_NAME` (module import) and driven on
+    the engine's persistent async-handler loop by the durable
+    trampoline workflow (async so the ONE bounded intake call can be an
+    awaited DBOS-supervised step). Classified
+    stage failures record ``failed`` and raise :class:`AgentRunFailed`
+    (engine ERROR — both sides agree); cancellation re-raises the
+    engine's own exception after recording ``cancelled``; integrity
+    rejections from the steps machinery propagate as-is (the reviewed
+    writer's own contract). Success returns the safe conversation
+    summary document.
     """
     intent = parse_agent_run_intent(payload_json)
     try:
@@ -3758,7 +3843,18 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         # 13-intake-runner: ONE checkpointed tool-free interpretation of
         # the accepted turn BEFORE any executor work (C4 anchor; planner
         # usage accounted; P4 rejection fails the run with zero effects).
-        intake = _agent_intake_interpreted(payload_json, pins_json)
+        # W3: the step is deadline-bounded — a stalled planner call
+        # raises the DBOS-recorded DBOSStepTimeoutError HERE (exactly
+        # once, no automatic retry), classified intake_timeout with ONE
+        # value-free observation. Cancellation travels a disjoint
+        # exception hierarchy and is never caught as a timeout.
+        try:
+            intake = await _agent_intake_interpreted(payload_json, pins_json)
+        except dbos_error.DBOSStepTimeoutError:
+            _agent_intake_timed_out(payload_json)
+            raise AgentStageError(
+                INTAKE_TIMED_OUT_REASON, error_type="DBOSStepTimeoutError"
+            ) from None
         assembled = _agent_context_assembled(payload_json, pins_json)
         intake_header = (
             intake.get("task_header")
@@ -3859,7 +3955,11 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                 canonical_json(pending_steered) if pending_steered else None
             )
             pending_steered = []
-            round_record = _agent_model_round(
+            # Off-loop (W3): this step parks for the whole model call
+            # on the executor's loop; offloading keeps the engine's one
+            # async-handler loop free to drive every other run.
+            round_record = await asyncio.to_thread(
+                _agent_model_round,
                 payload_json,
                 pins_json,
                 history_json,
@@ -3914,9 +4014,13 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
                     steering_interrupt = True
                     break
                 call_json = canonical_json(call)
-                outcome = _agent_tool_execute(payload_json, call_json)
+                outcome = await asyncio.to_thread(
+                    _agent_tool_execute, payload_json, call_json
+                )
                 if str(outcome["state"]) == StepState.OUTCOME_UNKNOWN.value:
-                    outcome = _settle_unknown(payload_json, call_json, call, outcome)
+                    outcome = await _settle_unknown(
+                        payload_json, call_json, call, outcome
+                    )
                 results[str(call["tool_call_id"])] = str(outcome["result_text"])
                 tool_records.append(
                     {
@@ -4044,6 +4148,18 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
             _agent_assistant_recorded(
                 payload_json, INTAKE_REJECTED_VISIBLE_REPLY
             )
+        elif stage.reason == INTAKE_TIMED_OUT_REASON:
+            # A3 (W3): the bounded intake timeout gets the SAME
+            # assistant-visible treatment — ONE fixed safe reply
+            # (timeout-specific constant; no raw model output or error
+            # internals) through the SAME idempotent checkpointed
+            # producer, then the run fails classified and releases its
+            # lease. A replay rethrows the recorded timeout at the
+            # boundary and re-reads the recorded reply: never a second
+            # message, never a second planner call.
+            _agent_assistant_recorded(
+                payload_json, INTAKE_TIMED_OUT_VISIBLE_REPLY
+            )
         _agent_run_failed(payload_json, stage.reason)
         _release_lease_quietly(intent)
         raise AgentRunFailed(stage.reason) from None
@@ -4069,7 +4185,7 @@ def run_agent_conversation(payload_json: str) -> dict[str, object]:
         raise
 
 
-def _settle_unknown(
+async def _settle_unknown(
     payload_json: str,
     call_json: str,
     call: Mapping[str, object],
@@ -4081,6 +4197,8 @@ def _settle_unknown(
     persisted deadline; the durable state (a reconciler-resolved step
     row) decides — never a retry and never an invented success. A
     ``cancelled`` resolution translates the run onto the frozen diagram.
+    (async + ``recv_async`` since the run handler became async: the
+    poll must await, never block, the loop that also drives other runs.)
     """
     intent = parse_agent_run_intent(payload_json)
     deadline = _deadline_of(
@@ -4140,7 +4258,7 @@ def _settle_unknown(
                 "op_id": receipt.get("op_id"),
                 "result_text": _timeout_result_document(intent, receipt),
             }
-        DBOS.recv(
+        await DBOS.recv_async(
             topic=RESUME_TOPIC,
             timeout_seconds=min(
                 intent.wait_poll_seconds,
