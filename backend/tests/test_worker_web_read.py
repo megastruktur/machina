@@ -206,7 +206,7 @@ class TestIncidentPayload:
         assert document["status"] == "ok"
         assert document["bytes_read"] == len(FIXTURE_HTML.encode())
 
-    async def test_over_budget_body_is_refused(self) -> None:
+    async def test_over_budget_body_is_explicit_partial_read(self) -> None:
         body = b"<p>" + (b"x" * (INCIDENT_MAX_BYTES + 4096)) + b"</p>"
         upstream = _RecordingTransport(body)
         capability = _wired_capability(upstream)
@@ -219,12 +219,14 @@ class TestIncidentPayload:
                 }
             )
         )
-        assert result.ok is False
+        assert result.ok is True
         document = json.loads(result.output)
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
-        assert document["bytes_read"] == 0
-        assert document["markdown"] == ""
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["bytes_read"] == INCIDENT_MAX_BYTES
+        assert document["markdown"] != ""
+        assert document["http_status"] == 200
 
     async def test_above_schema_maximum_rejected_before_transport(self) -> None:
         # W2: an out-of-schema payload is a known, structured refusal —
