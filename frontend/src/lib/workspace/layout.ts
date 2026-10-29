@@ -82,6 +82,18 @@ export const LAYOUT_STORAGE_KEY = 'mai.workspace.layout.v1';
 export const SESSION_STORAGE_KEY = 'mai.workspace.session.v1';
 
 /**
+ * Storage key of the selected-server preference: the bare canonical UUID of
+ * the server the operator last targeted (never a profile object, never a
+ * credential). It lives OUTSIDE the schema-v1 layout document so the frozen
+ * window contract stays untouched; it is cleared by the SAME session
+ * reconciliation and `clearStoredLayout` as the layout document.
+ */
+export const SELECTED_SERVER_STORAGE_KEY = 'mai.workspace.selected-server.v1';
+
+/** Canonical UUID shape (lowercase hex, 8-4-4-4-12) of a stored server id. */
+const SERVER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
  * Minimal storage boundary (structurally `Storage`). Injected by tests and
  * embedders; defaults to the browser's `localStorage` when available.
  */
@@ -191,14 +203,28 @@ export interface LayoutPersistence {
 	start(): () => void;
 	/** Writes the current effective layout once (the restore sanitize write). */
 	persistNow(): PersistOutcome;
-	/**
-	 * Reconciles the stored session marker with `sessionId`: a changed
-	 * identity (including logout, `null`) clears the stored layout. Call once
+	/** Reconciles the stored session marker with `sessionId`: a changed
+	 * identity (including logout, `null`) clears the stored layout AND the
+	 * stored selected-server preference together. Call once
 	 * at composition with the bound session and on every auth change.
 	 */
 	handleSessionChange(sessionId: string | null): SessionChangeOutcome;
-	/** Removes the stored layout document and session marker immediately. */
+	/** Removes the stored layout document, selected-server preference and session marker immediately. */
 	clearStoredLayout(): void;
+	/**
+	 * The stored selected server: the canonical UUID last accepted by
+	 * `setSelectedServerId`, or `null` when absent/stale/invalid (an invalid
+	 * stored value is removed on read — stale input cannot survive).
+	 * Restoring is the CALLER's policy: existence against the loaded
+	 * enrolled profiles is checked there, never here.
+	 */
+	getSelectedServerId(): string | null;
+	/**
+	 * Persists the selected server id (canonical UUID only — a profile
+	 * object or non-UUID value is rejected, never stored). No-op-without-
+	 * persistence (`persisted: false`) when storage is unavailable.
+	 */
+	setSelectedServerId(id: string): PersistOutcome;
 }
 
 /** Browser storage resolution at factory time — never at module scope. */
@@ -338,6 +364,7 @@ export function createLayoutPersistence(options: LayoutPersistenceOptions): Layo
 			return 'unchanged';
 		}
 		safeRemove(storage, LAYOUT_STORAGE_KEY);
+		safeRemove(storage, SELECTED_SERVER_STORAGE_KEY);
 		if (sessionId === null) {
 			safeRemove(storage, SESSION_STORAGE_KEY);
 		} else {
@@ -507,7 +534,30 @@ export function createLayoutPersistence(options: LayoutPersistenceOptions): Layo
 		clearStoredLayout(): void {
 			if (!storage) return;
 			safeRemove(storage, LAYOUT_STORAGE_KEY);
+			safeRemove(storage, SELECTED_SERVER_STORAGE_KEY);
 			safeRemove(storage, SESSION_STORAGE_KEY);
+		},
+		getSelectedServerId(): string | null {
+			if (!storage) return null;
+			const raw = safeGet(storage, SELECTED_SERVER_STORAGE_KEY);
+			if (raw === null) return null;
+			if (!SERVER_ID_PATTERN.test(raw)) {
+				// Stale/hostile stored value: remove it, read as absent. Only the
+				// exact canonical (lowercase) UUID shape survives; anything else
+				// is repaired by the caller's next fallback write.
+				safeRemove(storage, SELECTED_SERVER_STORAGE_KEY);
+				return null;
+			}
+			return raw;
+		},
+		setSelectedServerId(id: string): PersistOutcome {
+			if (!storage) return { ok: true, persisted: false };
+			if (!SERVER_ID_PATTERN.test(id)) {
+				return { ok: false, reason: 'selected server id must be a canonical UUID string' };
+			}
+			return safeSet(storage, SELECTED_SERVER_STORAGE_KEY, id)
+				? { ok: true, persisted: true }
+				: { ok: false, reason: 'selected server persistence failed' };
 		}
 	};
 }

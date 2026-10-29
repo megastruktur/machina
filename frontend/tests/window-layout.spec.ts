@@ -137,6 +137,9 @@ interface WindowLayoutProbeApi {
 	storageRead(key: string): string | null;
 	storageWrite(key: string, value: string): void;
 	storageRemove(key: string): void;
+	selectedGet(index: number): string | null;
+	selectedSet(index: number, id: string): { ok: boolean; persisted?: boolean; reason?: string };
+	clearStoredLayout(index: number): void;
 }
 
 declare global {
@@ -292,7 +295,10 @@ window.__maiLayoutApi = {
 	scopeCalls: (index) => [...scopeCalls[index]],
 	storageRead: (key) => window.localStorage.getItem(key),
 	storageWrite: (key, value) => window.localStorage.setItem(key, value),
-	storageRemove: (key) => window.localStorage.removeItem(key)
+	storageRemove: (key) => window.localStorage.removeItem(key),
+	selectedGet: (index) => compositions[index].persistence.getSelectedServerId(),
+	selectedSet: (index, id) => compositions[index].persistence.setSelectedServerId(id),
+	clearStoredLayout: (index) => compositions[index].persistence.clearStoredLayout()
 };
 
 mount(ComponentHost, { target: document.getElementById('app'), props: { label: 'MAI window layout probe' } });
@@ -462,6 +468,7 @@ const GEOMETRY_B = { x: 40, y: 40, width: 640, height: 400 };
 
 const LAYOUT_KEY = 'mai.workspace.layout.v1';
 const SESSION_KEY = 'mai.workspace.session.v1';
+const SELECTED_KEY = 'mai.workspace.selected-server.v1';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -500,7 +507,12 @@ test('probe mounts in the reviewed component-host; module surface is the factory
 	// Module surface: the factory plus the two storage-key constants — no
 	// module-level store, no SSR singleton, no hidden mutation target.
 	const surface = await page.evaluate(() => window.__maiLayoutApi!.surface());
-	expect(surface).toEqual(['LAYOUT_STORAGE_KEY', 'SESSION_STORAGE_KEY', 'createLayoutPersistence']);
+	expect(surface).toEqual([
+		'LAYOUT_STORAGE_KEY',
+		'SELECTED_SERVER_STORAGE_KEY',
+		'SESSION_STORAGE_KEY',
+		'createLayoutPersistence'
+	]);
 
 	// ADR §5 rule 4: no storage access at import/module-evaluation time.
 	expect(await storageRead(page, LAYOUT_KEY)).toBeNull();
@@ -1232,5 +1244,141 @@ test('restore reapplies stored presentations deterministically: minimized stays 
 	expect(effective.windows.map((window) => window.presentation)).toEqual(['minimized', 'maximized']);
 	// Focus falls to the topmost VISIBLE window (the maximized one).
 	expect(effective.focused_id).toBe(effective.windows[1].window_id);
+	expect(errors).toEqual([]);
+});
+
+// --- W2: selected-server preference (same session lifecycle as windows) ----
+
+test('selected server: canonical UUID persists, non-UUID and garbage are rejected or repaired', async ({
+	page
+}) => {
+	const errors: Error[] = [];
+	page.on('pageerror', (error) => errors.push(error));
+	await gotoProbe(page);
+
+	const index = await create(page);
+	const set = await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[index, SERVER_A] as const
+	);
+	expect(set).toEqual({ ok: true, persisted: true });
+	// The stored preference is the BARE canonical UUID string — no envelope,
+	// no server object, no profile fields.
+	expect(await storageRead(page, SELECTED_KEY)).toBe(SERVER_A);
+	expect(await page.evaluate((idx) => window.__maiLayoutApi!.selectedGet(idx), index)).toBe(
+		SERVER_A
+	);
+
+	// The layout document itself stays untouched by selection writes.
+	expect(await storageRead(page, LAYOUT_KEY)).toBeNull();
+
+	// Non-UUID values (profile-like objects, junk) are refused, never stored.
+	const reject = await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[index, JSON.stringify({ server_id: SERVER_A, name: 'Alpha', ssh: {} })] as const
+	);
+	expect(reject.ok).toBe(false);
+	expect(reject.persisted).toBeUndefined();
+	expect(await storageRead(page, SELECTED_KEY)).toBe(SERVER_A);
+
+	// Pre-seeded hostile/stale values read as absent AND are removed on read.
+	for (const hostile of [
+		'not-a-uuid',
+		JSON.stringify({ server_id: SERVER_A }),
+		SERVER_A.toUpperCase(),
+		''
+	]) {
+		await storageWrite(page, SELECTED_KEY, hostile);
+		expect(await page.evaluate((idx) => window.__maiLayoutApi!.selectedGet(idx), index)).toBeNull();
+		expect(await storageRead(page, SELECTED_KEY)).toBeNull();
+	}
+
+	// Backwards compatibility: an old document with no selection key still
+	// restores its windows; the selection reads as absent, not an error.
+	await storageWrite(
+		page,
+		LAYOUT_KEY,
+		JSON.stringify({
+			schema_version: 1,
+			revision: 3,
+			windows: [
+				{
+					window_id: '44b05a60-1e2b-4c3d-9a8b-7c6d5e4f3a99',
+					panel_kind: 'model-settings',
+					scope: { kind: 'global' },
+					geometry: GEOMETRY_A,
+					presentation: 'normal',
+					z: 1,
+					title_override: null
+				}
+			]
+		})
+	);
+	const report = await page.evaluate((idx) => window.__maiLayoutApi!.restore(idx), index);
+	expect(report.restored).toHaveLength(1);
+	expect(await page.evaluate((idx) => window.__maiLayoutApi!.selectedGet(idx), index)).toBeNull();
+	expect(errors).toEqual([]);
+});
+
+test('selected server clears together with the layout on identity change and clearStoredLayout; without storage it no-ops', async ({
+	page
+}) => {
+	const errors: Error[] = [];
+	page.on('pageerror', (error) => errors.push(error));
+	await gotoProbe(page);
+
+	const index = await create(page, { session: 'sess-1' });
+	await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[index, SERVER_B] as const
+	);
+	expect(await storageRead(page, SELECTED_KEY)).toBe(SERVER_B);
+
+	// A different identity clears the selection TOGETHER with the document —
+	// a server id from another session can never restore.
+	await page.evaluate((idx) => window.__maiLayoutApi!.sessionChange(idx, 'sess-2'), index);
+	expect(await storageRead(page, SELECTED_KEY)).toBeNull();
+
+	// Re-seed, then clearStoredLayout: same combined clearing.
+	await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[index, SERVER_A] as const
+	);
+	expect(await storageRead(page, SELECTED_KEY)).toBe(SERVER_A);
+	await page.evaluate((idx) => window.__maiLayoutApi!.clearStoredLayout(idx), index);
+	expect(await storageRead(page, SELECTED_KEY)).toBeNull();
+	expect(await storageRead(page, LAYOUT_KEY)).toBeNull();
+	// clearStoredLayout removes the marker too (pre-existing contract).
+	expect(await storageRead(page, SESSION_KEY)).toBeNull();
+
+	// Rebind the identity (writes the marker again), then re-seed: the same
+	// identity keeps the selection across a reload (same-session restore).
+	await page.evaluate((idx) => window.__maiLayoutApi!.sessionChange(idx, 'sess-2'), index);
+	expect(await storageRead(page, SESSION_KEY)).toBe('sess-2');
+
+	// Same identity keeps the selection across a reload (same-session restore).
+	await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[index, SERVER_A] as const
+	);
+	await page.reload();
+	await page.waitForFunction(() => window.__maiLayoutApi !== undefined, undefined, {
+		timeout: 15_000
+	});
+	const sameIndex = await create(page, { session: 'sess-2' });
+	expect(await page.evaluate((idx) => window.__maiLayoutApi!.selectedGet(idx), sameIndex)).toBe(
+		SERVER_A
+	);
+
+	// No storage: both operations degrade to a safe no-op.
+	const storageless = await create(page, { withoutStorage: true });
+	expect(
+		await page.evaluate((idx) => window.__maiLayoutApi!.selectedGet(idx), storageless)
+	).toBeNull();
+	const noop = await page.evaluate(
+		([idx, id]) => window.__maiLayoutApi!.selectedSet(idx, id),
+		[storageless, SERVER_A] as const
+	);
+	expect(noop).toEqual({ ok: true, persisted: false });
 	expect(errors).toEqual([]);
 });

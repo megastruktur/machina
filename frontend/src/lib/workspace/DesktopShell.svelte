@@ -367,6 +367,24 @@
 	let selectedServerId = $state<ServerId>(FIXTURE_SERVERS[0].id);
 
 	/**
+	 * Selection persistence (W2): every live selection change — tree nav,
+	 * dropdown, chat-dock focus, post-enrollment hand-off — persists through
+	 * the same controller that owns the window layout (one lifecycle). The
+	 * guard never persists fixture ids and never writes during initial
+	 * defaults or while the live list is absent; `connectLive`'s restore
+	 * lands on the same value the storage already holds, so the write-back
+	 * is an idempotent repair, not a clobber.
+	 */
+	$effect(() => {
+		if (
+			live &&
+			liveServers.some((profile) => String(profile.server_id) === selectedServerId)
+		) {
+			persistence.setSelectedServerId(selectedServerId);
+		}
+	});
+
+	/**
 	 * Launcher buttons. Two visible sets, keyed by the live-session state:
 	 * the interim fixtures when no backend session is active (the fixture
 	 * desktop — zero API requests, Playwright-stable), and the reviewed MAI
@@ -513,7 +531,16 @@
 			liveServers = servers;
 			live = true;
 			status = null;
-			if (servers.length > 0) selectedServerId = String(servers[0].server_id);
+			if (servers.length > 0) {
+				// Restore the stored choice ONLY when it still names an enrolled
+				// server; anything else (absent, deleted, stale, invalid) falls
+				// back to the first enrolled server and repairs the stored value.
+				const stored = persistence.getSelectedServerId();
+				const exists = stored !== null && servers.some((profile) => String(profile.server_id) === stored);
+				selectedServerId = exists ? stored : String(servers[0].server_id);
+				if (!exists) persistence.setSelectedServerId(selectedServerId);
+			}
+			// An empty enrolled list keeps the selection honest: no fabrication.
 		} catch (error) {
 			live = false;
 			liveServers = [];

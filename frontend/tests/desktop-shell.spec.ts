@@ -476,6 +476,167 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 	await expect(frame(page, 'runbooks').getByTestId('catalog-empty')).toBeVisible();
 });
 
+test('live selected server survives reload, pins panel scope, and falls back when stale', async ({
+	page
+}) => {
+	const SERVER_BETA_ID = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+	const SELECTED_KEY = 'mai.workspace.selected-server.v1';
+	const profileFor = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: { host: `${name}.example`, port: 22, user: 'mai', host_key: 'k', credential_ref: 'MAI_SSH_KEY' },
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+
+	// The readable `mai_csrf` cookie is the live-attach probe; the profiles
+	// list is mocked with TWO enrolled servers so a first-server default and
+	// a non-default choice are distinguishable.
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [
+					profileFor(SERVER_ALPHA_ID, 'Server Alpha'),
+					profileFor(SERVER_BETA_ID, 'Server Beta')
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [
+					{
+						schema_version: 1,
+						name: 'glm53flash',
+						connection: 'litellm',
+						model: 'z-ai-coding/glm-5.3-flash'
+					}
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				schema_version: 1,
+				connection: 'litellm',
+				profile: 'glm53flash'
+			})
+		})
+	);
+	// The Documents panel's list route: its pinned server_id is the scope proof.
+	await page.route('**/api/v1/docs**', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				server_id: new URL(route.request().url()).searchParams.get('server_id'),
+				app_id: null,
+				namespace: null,
+				documents: [],
+				total: 0,
+				limit: 10,
+				offset: 0
+			})
+		})
+	);
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	// First enrolled server is the honest default before any stored choice.
+	await expect(page.getByTestId('server-select')).toHaveValue(SERVER_ALPHA_ID);
+
+	// The operator selects the NON-default server; the choice persists
+	// immediately as the bare UUID.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect(page.getByTestId('server-select')).toHaveValue(SERVER_BETA_ID);
+	expect(await page.evaluate((key) => window.localStorage.getItem(key), SELECTED_KEY)).toBe(
+		SERVER_BETA_ID
+	);
+
+	// RELOAD: the restored selection is Server Beta, NOT the first server —
+	// and connectLive no longer overrides it.
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	await expect(page.getByTestId('server-select')).toHaveValue(SERVER_BETA_ID);
+
+	// The open-panel scope follows the restored selection: the Documents
+	// launcher carries Beta's label and its request is pinned to Beta's id.
+	const docUrls: string[] = [];
+	page.on('request', (request) => {
+		if (request.url().includes('/api/v1/docs')) docUrls.push(request.url());
+	});
+	await expect(page.getByTestId('open-documents')).toContainText('Open Documents — Server Beta');
+	await page.getByTestId('open-documents').click();
+	await expect(frame(page, 'documents')).toHaveCount(1);
+	await expect(
+		page.locator(`.mai-window-frame[data-panel-kind="documents"] .mai-window-frame__title`)
+	).toHaveText('Documents — Server Beta');
+	// The documents library loads on demand; the refresh button issues the
+	// pinned-scope list request.
+	await frame(page, 'documents').getByTestId('library-refresh').click();
+	expect(docUrls.some((url) => url.includes(`server_id=${SERVER_BETA_ID}`))).toBe(true);
+	// Selection never retargets the already-open window on later changes.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Alpha' });
+	await expect(
+		page.locator(`.mai-window-frame[data-panel-kind="documents"] .mai-window-frame__title`)
+	).toHaveText('Documents — Server Beta');
+
+	// A DELETED/unknown stored server falls back deterministically to the
+	// first enrolled server and repairs the stored value.
+	await page.evaluate(
+		([key, id]) => window.localStorage.setItem(key, id),
+		[SELECTED_KEY, '11111111-2222-4333-8444-555555555555'] as const
+	);
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	await expect(page.getByTestId('server-select')).toHaveValue(SERVER_ALPHA_ID);
+	expect(await page.evaluate((key) => window.localStorage.getItem(key), SELECTED_KEY)).toBe(
+		SERVER_ALPHA_ID
+	);
+
+	// A selection from ANOTHER session (foreign marker) never restores: the
+	// session reconciliation clears it together with the layout document.
+	await page.evaluate(
+		([selectedKey, sessionKey, betaId]) => {
+			window.localStorage.setItem(selectedKey, betaId);
+			window.localStorage.setItem(sessionKey, 'foreign-session');
+		},
+		[SELECTED_KEY, 'mai.workspace.session.v1', SERVER_BETA_ID] as const
+	);
+	await page.reload();
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	// The foreign selection was cleared (never restored); the shell falls
+	// back to the first enrolled server and repairs the stored value.
+	await expect(page.getByTestId('server-select')).toHaveValue(SERVER_ALPHA_ID);
+	expect(await page.evaluate((key) => window.localStorage.getItem(key), SELECTED_KEY)).toBe(
+		SERVER_ALPHA_ID
+	);
+	expect(
+		await page.evaluate(
+			(key) => window.localStorage.getItem(key),
+			'mai.workspace.session.v1'
+		)
+	).toBeNull();
+});
+
 test('the bottom chat dock is always visible, interactive offline and performs no API requests', async ({
 	page
 }) => {
