@@ -644,12 +644,13 @@ HANDLER_MODULE_SOURCE = '''
 effects, deterministic FunctionModel fake (or the production builder for
 dead-endpoint classification scenarios)."""
 
+import asyncio
 import json
 import os
 import time
 import uuid
 
-from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.exceptions import ModelHTTPError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -858,7 +859,31 @@ def _script_model():
             _mark("web_read_output_verified")
         return _entry_payload(script[index])
 
-    return FunctionModel(_model_fn)
+    async def _model_stream_fn(messages, info):
+        # The production run path is a STREAMED model round (run.py always
+        # supplies event_stream_handler), so the fake must speak provider
+        # deltas. The scripted decision is IDENTICAL to the non-streamed
+        # _model_fn — same journaling, same assertions, same replay-safe
+        # conversation position; only the transport differs. The sync
+        # decision runs off the event loop (a pydantic-ai sync function
+        # would run in an executor thread too), keeping the model-gate
+        # wait scenarios non-blocking for the worker loop.
+        response = await asyncio.to_thread(_model_fn, messages, info)
+        for index, part in enumerate(response.parts):
+            if isinstance(part, ToolCallPart):
+                yield {
+                    index: DeltaToolCall(
+                        name=part.tool_name,
+                        json_args=part.args_as_json_str(),
+                        tool_call_id=part.tool_call_id,
+                    )
+                }
+            elif isinstance(part, TextPart):
+                yield part.content
+
+    # ONE model, two transports: the durable worker always streams; the
+    # plain function keeps the fake honest for any non-streamed consumer.
+    return FunctionModel(_model_fn, stream_function=_model_stream_fn)
 
 
 def _build():
@@ -1611,22 +1636,25 @@ class TestDurableAgentRuns:
         assert page6["citation"] == f"{base}/alternative"
         assert page6["trust"] == "untrusted_external"
 
-        # -- the durable rows: every failure is a KNOWN outcome ------------
+        # -- the durable rows: honest outcomes ----------------------------
         rows = _read_step_rows(agent_url, run_id)
         # Round-major seq derivation (one tool call per round).
         assert [row["seq"] for row in rows] == [
             1, 9, 17, 25, 33, 41,
         ]
+        # The over-budget read SUCCEEDED as an honest truncated partial
+        # read (bounded web.read partial recovery); the 403/404 refusals
+        # are KNOWN failures. Nothing is ever outcome_unknown.
         assert [row["state"] for row in rows] == [
-            "failed", "succeeded", "failed", "failed", "succeeded", "succeeded",
+            "succeeded", "succeeded", "failed", "failed", "succeeded", "succeeded",
         ]
         assert all(row["state"] != "outcome_unknown" for row in rows)
         assert [row["receipt"]["reason"] for row in rows] == [
-            "response_too_large", "allowed", "fetch_error", "fetch_error",
+            "allowed", "allowed", "fetch_error", "fetch_error",
             "allowed", "allowed",
         ]
         assert [row["receipt"]["executor_ok"] for row in rows] == [
-            False, True, False, False, True, True,
+            True, True, False, False, True, True,
         ]
         # The recorded payload of every attempt (the explicit request).
         assert [row["receipt"]["params"]["url"] for row in rows] == [
@@ -1635,8 +1663,10 @@ class TestDurableAgentRuns:
         ]
         assert rows[4]["receipt"]["params"]["max_bytes"] == 524288
         assert rows[0]["receipt"]["params"]["max_bytes"] == 32768
-        # The refusals carried their honest answer into the durable receipt.
-        assert rows[0]["receipt"]["response"]["code"] == "response_too_large"
+        # The refusals carried their honest answer into the durable
+        # receipt; the truncated partial read carries the honest page
+        # (status ok, code None) — never a fabricated refusal.
+        assert rows[0]["receipt"]["response"]["code"] is None
         assert rows[2]["receipt"]["response"]["http_status"] == 403
         assert rows[3]["receipt"]["response"]["http_status"] == 404
 
@@ -1698,7 +1728,10 @@ class TestDurableAgentRuns:
         assert receipt["status"] == "succeeded"
         assert "stdout" not in receipt and "command" not in receipt
 
-        # Safe events on the shared whole-run stream (value-free).
+        # Safe events on the shared whole-run stream (value-free). The
+        # streamed model round (production event_stream_handler) also
+        # persists the live observations: tool calls requested, tool
+        # results and output deltas land beside the durable transitions.
         events = _read_events(agent_url, run_id)
         assert [event.seq for event in events] == list(range(1, len(events) + 1))
         types = [event.type for event in events]
@@ -1707,9 +1740,15 @@ class TestDurableAgentRuns:
             "run.transition",  # running
             "agent.started",
             "agent.context_assembled",
+            "agent.tool_requested",  # round 0: streamed tool-call part
+            "agent.tool_requested",  # round 0: FunctionToolCallEvent
             "agent.model_round",  # round 0: tool_calls
             "step.started",
             "step.completed",
+            "agent.tool_result",  # round 1: the tool return event
+            "agent.tool_requested",  # round 1: replayed deferred call
+            "agent.tool_result",  # round 1: consumed deferred result
+            "agent.output_delta",  # round 1: the final text part
             "agent.model_round",  # round 1: final
             "run.transition",  # succeeded
             "agent.completed",  # the safe conversation summary
