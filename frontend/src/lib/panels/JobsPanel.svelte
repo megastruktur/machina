@@ -141,11 +141,10 @@
 		'step.completed': 'Step completed',
 		'step.awaiting_approval': 'Step waiting for approval decision',
 		'step.reconciling': 'Step reconciling an unproven outcome',
-		// Agent-run event vocabulary: deltas stay COMPACT (transient stream
-		// noise is never rendered as content, and thinking is never shown).
+		// Agent-run event vocabulary: deltas are SKIPPED from the rendered
+		// collection entirely (no rows, no renaming); thinking is never shown.
 		'agent.model_round': 'Model round',
 		'agent.tool_result': 'Tool result',
-		'agent.output_delta': 'Streaming delta (transient)',
 		'agent.failed': 'Run failed'
 	});
 
@@ -558,7 +557,12 @@
 						// frames at/below the last seen seq are dropped here.
 						if (event === null || event.run_id !== runId || event.seq <= lastSeq) return;
 						lastSeq = event.seq;
-						events = [...events, event].slice(-MAX_RENDERED_EVENTS);
+						// Transient deltas never enter the rendered collection at
+						// all — no rows, no relabeling, no content — but they DO
+						// advance the watermark and arm the durable refresh.
+						if (event.type !== 'agent.output_delta') {
+							events = [...events, event].slice(-MAX_RENDERED_EVENTS);
+						}
 						streamStatus = 'live';
 						streamProblem = null;
 						scheduleWatchedRefresh();

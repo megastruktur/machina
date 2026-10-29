@@ -1380,42 +1380,35 @@ test.describe('W3 run list and watch report', () => {
 		await expect(root.getByTestId('watch-report-empty')).toHaveText(
 			'No final agent response is recorded for this run yet.'
 		);
-		// Replay: the deltas must never appear as content; the final round is
-		// the current answer; the tool result carries capability + text; the
-		// failure reason is visibly useful.
+		// Replay: MORE THAN 500 delta frames are delivered — every one is
+		// skipped from the rendered collection ENTIRELY (no rows, no content,
+		// no renaming) while the final round, the tool result and the failure
+		// reason render usefully.
 		const secretDelta = 'SECRET-DELTA-CONTENT-7f3a';
 		const secretThinking = 'SECRET-THINKING-CONTENT-91bc';
-		queueStreamSession({
-			runId: RUN_A,
-			frames: [
-				{
-					seq: 1,
-					type: 'agent.output_delta',
-					data: { output: secretDelta, thinking: secretThinking }
-				},
-				{
-					seq: 2,
-					type: 'agent.model_round',
-					data: { status: 'final', output: 'Deploy finished.\nAll 4 hosts green.' }
-				},
-				{
-					seq: 3,
-					type: 'agent.tool_result',
-					data: {
-						capability_id: 'host.shell',
-						result: { exit_code: 0, stdout: 'ok' }
-					}
-				},
-				{
-					seq: 4,
-					type: 'agent.failed',
-					data: { reason: 'verify step timed out after 30s' }
-				}
-			]
-		});
+		const frames: Array<{ seq: number; type: string; data?: unknown }> = [
+			{ seq: 1, type: 'run.transition', data: {} } // one plain lifecycle row
+		];
+		for (let seq = 2; seq <= 520; seq += 1) {
+			frames.push({
+				seq,
+				type: 'agent.output_delta',
+				data: { output: secretDelta, thinking: secretThinking }
+			});
+		}
+		frames.push(
+			{ seq: 521, type: 'agent.model_round', data: { status: 'final', output: 'Deploy finished.\nAll 4 hosts green.' } },
+			{
+				seq: 522,
+				type: 'agent.tool_result',
+				data: { capability_id: 'host.shell', result: { exit_code: 0, stdout: 'ok' } }
+			},
+			{ seq: 523, type: 'agent.failed', data: { reason: 'verify step timed out after 30s' } }
+		);
+		queueStreamSession({ runId: RUN_A, frames });
 		const finalText = root.getByTestId('watch-report-final');
 		await expect(finalText).toHaveText('Deploy finished.\nAll 4 hosts green.', {
-			timeout: 8000,
+			timeout: 15000,
 			useInnerText: true
 		});
 		// Whitespace preserved (pre-wrap) and the final round is honest about
@@ -1436,12 +1429,21 @@ test.describe('W3 run list and watch report', () => {
 		const body = await page.locator(`${hostA} [data-testid="jobs-root"]`).innerText();
 		expect(body).not.toContain(secretDelta);
 		expect(body).not.toContain(secretThinking);
-		// The delta frame appears only as a compact lifecycle line (no payload).
-		const deltaRows = root.locator('[data-testid="event-row"]', {
-			hasText: 'Streaming delta (transient)'
-		});
-		await expect(deltaRows).toHaveCount(1);
-		expect((await deltaRows.first().innerText()).includes(secretDelta)).toBe(false);
+		expect(body.toLowerCase()).not.toContain('delta');
+		// ZERO delta DOM rows: only the lifecycle, final-round, tool-result and
+		// failed lifecycle lines remain (4 rows from 523 delivered frames).
+		await expect(root.getByTestId('event-row')).toHaveCount(4);
+		await expect(
+			root.locator('[data-testid="event-row"]', { hasText: 'Run state changed' })
+		).toHaveCount(1);
+		await expect(
+			root.locator('[data-testid="event-row"]', { hasText: 'Model round' })
+		).toHaveCount(1);
+		// Deltas still advanced the seq watermark: the reconnect cursor is the
+		// LAST delivered seq (523), and the durable refresh was armed.
+		await waitForStreamRequests(2);
+		const cursors = streamRequests.map((request) => request.cursor);
+		expect(cursors.at(-1)).toBe('523');
 	});
 
 	test('replay stays bounded: 520 delivered events render at most 500 rows', async ({

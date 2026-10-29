@@ -1202,6 +1202,57 @@ class TestLifecycleSubmits:
         assert detail.status == 200, detail.body
         assert detail.json()["state"] == "queued"
 
+    async def test_lifecycle_submit_records_honest_service_label(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        """F3: the frozen run label names the service target and action.
+
+        The label is derived server-side from the validated recipe name and
+        the pinned lifecycle capability (never client text), rides the
+        digest-bound step payload, and lands in ``job_runs.label`` through
+        the REAL lifecycle-submit → jobs facade path.
+        """
+
+        async def _submit_and_label(
+            application_id: uuid.UUID, action: str, body: dict[str, Any]
+        ) -> str:
+            run_id = uuid.UUID(body["run_id"])
+            created = await call_app(
+                apps_app,
+                "POST",
+                f"{_apps_root(server_a)}/{application_id}/{action}",
+                json_body=body,
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert created.status == 201, created.body
+            detail = await call_app(
+                apps_app, "GET", f"/api/v1/jobs/runs/{run_id}", cookies=jar
+            )
+            assert detail.status == 200, detail.body
+            return detail.json()["label"]
+
+        # Install: "example-http — install" (recipe name — action).
+        install_label = await _submit_and_label(
+            uuid.uuid4(), "install", _install_body(uuid.uuid4())
+        )
+        assert install_label == "example-http — install"
+
+        # Update: same service target, honest update action; unusual recipe
+        # names (underscores/digits are valid slugs) pass through verbatim.
+        # The baseline assertion must pin a DIFFERENT revision (v1).
+        unusual_recipe = RECIPE_V1.replace(
+            "name: example-http", "name: omp_service_2"
+        )
+        update_label = await _submit_and_label(
+            uuid.uuid4(),
+            "update",
+            _update_body(
+                uuid.uuid4(), recipe=unusual_recipe, current_recipe=RECIPE_V1
+            ),
+        )
+        assert update_label == "omp_service_2 — update"
+
     async def test_remove_requires_explicit_data_intent(
         self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
     ) -> None:

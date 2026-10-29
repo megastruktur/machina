@@ -1877,6 +1877,14 @@ async def _lifecycle_submit(
     if data_intent is not None:
         # Explicit C09 rule 5 decision inside the digest-bound payload.
         payload["data_intent"] = data_intent.value
+    # F3: honest bounded display label inside the digest-bound payload —
+    # "<recipe name> — <action>" (e.g. "omp — update"). jobs.py derives the
+    # frozen job_runs.label from the first step's payload 'label' when it is
+    # a non-empty string; the 200-character bound matches the stored CHECK
+    # and unusual recipe names stay safe (truncated, never rejected). The
+    # action rides the pinned lifecycle capability (app.install/update/remove).
+    action = capability_id.rsplit(".", 1)[-1]
+    payload["label"] = f"{recipe.name} — {action}"[:200]
     return await _submit(
         request,
         server_id=server_id,
@@ -2413,7 +2421,9 @@ async def execute_runbook(
                 model_profile=model_profile if model_profile is not None else "default",
                 requested_grants=sorted(capabilities),
                 digest=digest,
-                label=next(iter(sorted(capabilities)), "runbook"),
+                # F3: honest bounded display label — "<runbook name> — <action>"
+                # (e.g. "omp — update"); 200 chars matches the stored CHECK.
+                label=f"{effective.name} — {payload.action}"[:200],
                 now=datetime.now(timezone.utc),
             )
     del created  # a freshly minted run id cannot duplicate; enqueue decides

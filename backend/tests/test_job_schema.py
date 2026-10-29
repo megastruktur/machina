@@ -79,10 +79,11 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # assertions target the chain TIP; the tuple tracks the full chain.
 # Chain-tip reconciliation (card 10-observation-schema, exclusive
 # migration-chain owner): revision 0007 appends the bounded observation +
-# notification persistence, revision 0008 the conversation domain and
-# revision 0009 the agent-task domain; the tip constants are advanced
-# here so this file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009")
+# notification persistence, revision 0008 the conversation domain,
+# revision 0009 the agent-task domain and revision 0010 the job_runs run
+# label (W1); the tip constants are advanced here so this file's head
+# assertions stay true.
+REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010")
 
 # The exact public application schema after 0009 — nothing else, in
 # particular no engine-shadowing run-state table (C05 rule 1).
@@ -867,6 +868,7 @@ async def test_job_runs_records_identity_without_engine_state(
         "prompt_revision",
         "model_profile",
         "requested_grants",
+        "label",
         "root_budget",
         "error_ref",
         "evidence_ref",
