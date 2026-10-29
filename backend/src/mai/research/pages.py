@@ -30,11 +30,19 @@ exclusively as a trusted capability implementation behind
   answer cannot redirect the dial off-policy — there is no window
   between validation and connect.
 - **Size/time/redirect budgets (acceptance 1)** — the response body is
-  read as a bounded stream: a ``Content-Length`` over the byte budget
-  refuses before reading, and the streaming read (the transfer itself,
-  not just the retained bytes) stops at budget+1 decoded bytes, so an
-  oversized page is ``response_too_large`` after at most ``max_bytes + 1``
-  bytes of work. The fetch has a bounded timeout, at most
+  read as a bounded stream that retains at most ``max_bytes`` decoded
+  bytes: an oversized document is *not* refused but cut at the budget
+  and returned as a deterministic partial read, flagged honestly
+  (``body_truncated``/``truncated``, ``bytes_read`` = retained bytes).
+  This holds for a declared ``Content-Length`` over the budget, for
+  chunked/unknown-length transfers, and for gzip (the budget counts
+  content-decoded bytes), so the transfer itself — not just the
+  retained bytes — stops at the budget and a malicious infinite stream
+  cannot exceed it; the stream context closes the response on the cut.
+  The read runs only after the MIME gate: unsupported types still
+  refuse ``unsupported_content_type`` before the body is touched, and
+  ``response_too_large`` now names only an answer that cannot fit the
+  output envelope at all. The fetch has a bounded timeout, at most
   ``MAX_REDIRECTS`` hops are followed, and only the HTML family and
   plain-text/Markdown documents are read (anything else is
   ``unsupported_content_type``). The capability is a reader, not a
@@ -338,8 +346,10 @@ class PageError(ValueError):
 
     Raised for malformed *direct* executor calls, for URLs that fail
     syntax validation, and for address-policy/redirect/byte/content
-    refusals raised by the provider (before or at the bounded point — an
-    oversized body is abandoned at budget+1 bytes). ``at_url`` records
+    refusals raised by the provider (before or at the bounded point —
+    an oversized *supported* body is no longer a refusal but a partial
+    read; the byte code remains for answers that cannot fit the output
+    envelope). ``at_url`` records
     which hop refused when it differs from the requested URL, so a
     redirect-hop refusal stays traceable without naming addresses.
     """
@@ -1006,7 +1016,11 @@ class RawPage:
     them; ``charset`` is the response-declared encoding (or ``utf-8``).
     ``http_status`` is the numeric status of the accepted response
     (``200`` for a read page), or ``None`` when the seam did not report
-    one (a hand-built page in a test fixture).
+    one (a hand-built page in a test fixture). ``body_truncated`` is
+    the honest raw-body cut flag: ``True`` exactly when the decoded
+    byte budget was hit while the stream still carried bytes, so the
+    retained ``body`` is a strict prefix of the response body and
+    ``bytes_read`` stays the count of actually retained bytes.
     """
 
     url: str
@@ -1016,6 +1030,7 @@ class RawPage:
     charset: str
     hops: int
     http_status: int | None = None
+    body_truncated: bool = False
 
 
 class PageProvider(Protocol):
@@ -1108,9 +1123,11 @@ class HttpPageProvider:
     (resolve + validate, then dial the validated address — the connect
     is pinned), the hop count, the HTTP status gate (a status of 400 or
     above is an HTTP error, judged before the body is touched), the
-    content-type gate, and the byte budget (``Content-Length``
-    pre-check, then a streaming read abandoned at budget+1 decoded
-    bytes). Sends a descriptive
+    content-type gate, and the byte budget (a bounded streaming read
+    that retains at most the budget in decoded bytes and cuts an
+    oversized document into an explicitly flagged partial page —
+    declared lengths, chunked transfers and gzip alike). Sends a
+    descriptive
     non-identifying User-Agent — no caller headers, no credentials, no
     host identity beyond the capability label (sanitized outbound
     context). The resolver and transport are constructor seams
@@ -1198,7 +1215,9 @@ class HttpPageProvider:
         address directly (pinned connect), so neither a redirect target
         nor a DNS answer change can bypass the policy. The body streams
         under the byte budget — the transfer itself is bounded, not just
-        the retained bytes. Refusals raise :class:`PageError` with the
+        the retained bytes; an oversized document is cut at the budget
+        into a partial page flagged ``body_truncated``, never refused
+        for its size. Refusals raise :class:`PageError` with the
         refusing hop URL; transport failures propagate as httpx2
         exceptions for the capability to classify.
         """
@@ -1271,13 +1290,23 @@ class HttpPageProvider:
     async def _read_body(
         self, response: object, url: str, hops: int, max_bytes: int
     ) -> RawPage:
-        """Content-type gate, length pre-check, bounded streaming read.
+        """Content-type gate, then the bounded streaming read.
 
         Runs inside the caller's ``client.stream`` context: the response
-        is closed by that context on every exit path, and the streaming
-        abort at budget+1 *decoded* bytes bounds the transfer itself.
-        Only a response the status gate already accepted (``< 400``)
-        reaches this method, so an error body is never read here.
+        is closed by that context on every exit path, including the
+        truncation cut. The read retains at most ``max_bytes`` decoded
+        bytes: the loop keeps whole chunks until one crosses the
+        remaining budget, keeps that chunk's allowed prefix, and stops —
+        nothing beyond the budget is pulled off the wire, so the
+        transfer itself is bounded and an infinite stream cannot exceed
+        it. A declared ``Content-Length`` never refuses the read (the
+        header is untrusted: oversized bodies are cut, lying headers
+        are irrelevant — the decoded-byte budget governs). Chunked and
+        gzip-encoded responses are bounded identically: ``aiter_bytes``
+        yields content-decoded bytes, so the budget counts decoded
+        bytes. Only a response the status gate already accepted
+        (``< 400``) reaches this method, so an error body is never read
+        here.
         """
         resp: httpx2.Response = response  # type: ignore[assignment]
         content_type = _media_type(resp.headers.get("content-type", ""))
@@ -1288,29 +1317,22 @@ class HttpPageProvider:
                 "type",
                 at_url=url,
             )
-        declared = resp.headers.get("content-length")
-        if declared is not None:
-            try:
-                if int(declared.strip()) > max_bytes:
-                    raise _reject(
-                        PageErrorCode.RESPONSE_TOO_LARGE,
-                        f"declared Content-Length exceeds the "
-                        f"{max_bytes}-byte budget",
-                        at_url=url,
-                    )
-            except ValueError:
-                pass  # non-numeric length: the streaming cap governs
         chunks: list[bytes] = []
         total = 0
+        body_truncated = False
         async for chunk in resp.aiter_bytes(_READ_CHUNK_BYTES):
+            remaining = max_bytes - total
+            if len(chunk) > remaining:
+                # The budget boundary: retain the allowed prefix of this
+                # chunk, mark the cut, and stop reading — a non-empty
+                # chunk past a full budget is itself proof of more data.
+                if remaining > 0:
+                    chunks.append(chunk[:remaining])
+                    total = max_bytes
+                body_truncated = True
+                break
             chunks.append(chunk)
             total += len(chunk)
-            if total > max_bytes:
-                raise _reject(
-                    PageErrorCode.RESPONSE_TOO_LARGE,
-                    f"response exceeded the {max_bytes}-byte budget",
-                    at_url=url,
-                )
         charset = _safe_charset(resp.charset_encoding)
         return RawPage(
             url=url,
@@ -1320,6 +1342,7 @@ class HttpPageProvider:
             charset=charset,
             hops=hops,
             http_status=int(resp.status_code),
+            body_truncated=body_truncated,
         )
 
 
@@ -1341,7 +1364,11 @@ class PageResult:
     response (``200`` for a read page, ``404``/``403``/``429``/``5xx``
     for an HTTP error) or ``None`` when no status was observed. It is
     a number and nothing else: no header, body or message detail ever
-    rides with it.
+    rides with it. ``body_truncated`` distinguishes raw-body
+    truncation (the byte budget cut the fetched body itself) from the
+    extracted-text cut: ``truncated`` is the aggregate honest flag
+    (either cut), so a raw-body cut forces ``truncated`` even when the
+    extracted Markdown happens to fit.
     """
 
     status: PageStatus
@@ -1353,6 +1380,7 @@ class PageResult:
     truncated: bool
     bytes_read: int
     redirects: int
+    body_truncated: bool = False
     error_type: str | None = None
     http_status: int | None = None
 
@@ -1370,6 +1398,7 @@ def result_document(result: PageResult) -> dict[str, object]:
         "title": result.title,
         "markdown": result.markdown,
         "truncated": result.truncated,
+        "body_truncated": result.body_truncated,
         "bytes_read": result.bytes_read,
         "redirects": result.redirects,
         "error_type": result.error_type,
@@ -1631,6 +1660,7 @@ def _too_large_envelope(
         "title": "",
         "markdown": "",
         "truncated": True,
+        "body_truncated": bool(document.get("body_truncated", False)),
         "bytes_read": document.get("bytes_read", 0),
         "redirects": document.get("redirects", 0),
         "error_type": _ENVELOPE_TOO_LARGE_ERROR_TYPE,
@@ -1744,16 +1774,23 @@ _ROOT_TOOL_DESCRIPTION = (
     "refused before any connection (code address_refused). The answer "
     "carries the requested URL, the final URL after redirects, a "
     "citation and a trust label, so quoted text stays traceable to the "
-    "fetchable source. Size budgets are separate: the raw-body byte "
-    "budget defaults to 262144 bytes and is capped at 1048576 bytes "
-    "(code response_too_large beyond it); the extracted-text character "
-    "budget is separate again (default 20000, maximum 100000), and a "
-    "cut answer is flagged truncated. "
+    "fetchable source. Size budgets are separate and cutting is "
+    "explicit: the raw-body byte budget defaults to 262144 bytes and is "
+    "capped at 1048576 bytes; a body over it is cut at the budget and "
+    "returned as a deterministic partial read — status stays ok with "
+    "truncated=true, body_truncated=true and bytes_read giving the "
+    "retained bytes — while the extracted-text character budget is "
+    "separate again (default 20000, maximum 100000): a cut there is "
+    "flagged truncated=true with body_truncated=false. The code "
+    "response_too_large is reserved for the rare answer that cannot fit "
+    "the output envelope at all. "
     "Recovery guidance: prefer a URL that was already discovered or "
     "given to you; on http_status 404 correct the URL or search for the "
     "page instead of retrying; on 403 use a different, accessible source "
     "rather than trying to get around the refusal; on 429 wait instead "
-    "of retrying rapidly; on response_too_large raise max_bytes only a "
+    "of retrying rapidly; a partial read is a usable excerpt, so prefer "
+    "using it or a more specific URL over raising max_bytes; if the "
+    "partial read is genuinely insufficient, raise max_bytes only a "
     "bounded step, and only when the document is genuinely worth it. "
     "Do not repeat an identical request that already failed. Failures "
     "are structured answers, not exceptions: status is ok, refused or "
@@ -1807,11 +1844,15 @@ def descriptor() -> CapabilityDescriptor:
                         "default": DEFAULT_MAX_BYTES,
                         "description": (
                             "Raw-body byte budget (default 262144, maximum "
-                            "1048576); a Content-Length over budget refuses "
-                            "before reading, the streaming read stops at "
-                            "budget+1 (code response_too_large). Raise it "
-                            "only for a document that is genuinely too big; "
-                            "the maximum is the hard cap."
+                            "1048576); a larger body is cut at this budget "
+                            "into an explicit partial read (truncated and "
+                            "body_truncated true, bytes_read = retained "
+                            "bytes), not refused — response_too_large "
+                            "appears only when even the fitted answer "
+                            "cannot fit the output envelope. The maximum "
+                            "is the hard cap; raise it only a bounded "
+                            "step when a partial read is genuinely "
+                            "insufficient."
                         ),
                     },
                     "timeout_seconds": {
@@ -1874,6 +1915,17 @@ def descriptor() -> CapabilityDescriptor:
                     "title": {"type": "string"},
                     "markdown": {"type": "string"},
                     "truncated": {"type": "boolean"},
+                    "body_truncated": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the raw body itself was cut at the "
+                            "raw-body byte budget (a deterministic partial "
+                            "read); distinguishes that cut from an "
+                            "extracted-text cut (truncated true with "
+                            "body_truncated false). A raw-body cut always "
+                            "forces truncated true."
+                        ),
+                    },
                     "bytes_read": {"type": "integer"},
                     "redirects": {"type": "integer"},
                     "error_type": {"type": ["string", "null"]},
@@ -2037,7 +2089,12 @@ class WebPageCapability:
                 final_url=normalize_citation_url(raw.url) or raw.url,
                 title=content.title,
                 markdown=content.markdown,
-                truncated=content.truncated,
+                # A raw-body cut is truncation even when the extracted
+                # Markdown happens to fit: the flag names the cut that
+                # happened, and ``body_truncated`` distinguishes which
+                # budget did it.
+                truncated=content.truncated or raw.body_truncated,
+                body_truncated=raw.body_truncated,
                 bytes_read=raw.bytes_read,
                 redirects=raw.hops,
                 http_status=raw.http_status,

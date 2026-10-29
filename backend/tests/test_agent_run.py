@@ -1303,11 +1303,12 @@ class TestDurableAgentRuns:
     ) -> None:
         """W6b: ordinary read failures are honest answers, not stalls.
 
-        A scripted sequence of REAL capability results — a size refusal, a
-        200 plain-text read, a 403 and a 404 (both carrying their numeric
-        ``http_status``), a valid 512 KiB-budget read and a successful
-        alternative — is delivered to the model through the real worker,
-        dispatcher, bridge and durable conversation. The model observes each
+        A scripted sequence of REAL capability results — a truncated
+        partial read, a 200 plain-text read, a 403 and a 404 (both
+        carrying their numeric ``http_status``), a valid 512 KiB-budget
+        read and a successful alternative — is delivered to the model
+        through the real worker, dispatcher, bridge and durable
+        conversation. The model observes each
         actual tool response; the run finishes successfully, every ordinary
         failure is recorded as a KNOWN outcome (never ``outcome_unknown``),
         the run never parks in reconciliation, and the successful answer
@@ -1329,7 +1330,8 @@ class TestDurableAgentRuns:
             json.dumps({
                 "hosts": [host],
                 "responses": [
-                    {   # 1. size refusal: the body is over the byte budget
+                    {   # 1. partial read: the body is over the requested
+                        #    byte budget
                         "host": host,
                         "path": "/too-big",
                         "status": 200,
@@ -1378,7 +1380,7 @@ class TestDurableAgentRuns:
         composition(capability="web.read")
         _write_policy_files(scenario, grants=[{"web.read": True}])
         _script(scenario, [
-            # round 0: the size refusal (max_bytes under the declared body)
+            # round 0: the over-budget body (a partial read, not a refusal)
             _tool_call_entry(
                 name="web_read", call_id="c1",
                 args={
@@ -1386,17 +1388,21 @@ class TestDurableAgentRuns:
                     "max_markdown_chars": 10000,
                 },
             ),
-            # round 1: observes read 1 (refused), then reads the plain page
+            # round 1: observes read 1 (a truncated partial read), then
+            # reads the plain page
             {
                 "expect_web_read": {
                     "capture": "r1",
-                    "status": "denied",
-                    "executor_ok": False,
+                    "status": "executed",
+                    "executor_ok": True,
                     "effect": "executed",
                     "page": {
-                        "status": "refused",
-                        "code": "response_too_large",
-                        "http_status": None,
+                        "status": "ok",
+                        "code": None,
+                        "http_status": 200,
+                        "bytes_read": 32768,
+                        "truncated": True,
+                        "body_truncated": True,
                     },
                 },
                 **_tool_call_entry(
@@ -1500,7 +1506,7 @@ class TestDurableAgentRuns:
                     "marker": alt_marker,
                 },
                 "text": (
-                    "The refused, forbidden and missing pages were reported "
+                    "The forbidden and missing pages were reported "
                     "honestly; the alternative source answered and is cited."
                 ),
             },
@@ -1544,7 +1550,7 @@ class TestDurableAgentRuns:
         assert [
             line for line in lines if line.startswith("tool_return:")
         ] == [
-            "tool_return:denied",    # size refusal
+            "tool_return:executed",  # partial read (over requested budget)
             "tool_return:executed",  # 200 plain-text read
             "tool_return:denied",    # 403
             "tool_return:denied",    # 404
@@ -1554,11 +1560,14 @@ class TestDurableAgentRuns:
 
         # -- each recorded envelope is the honest answer -------------------
         r1 = json.loads((scenario / "web-read.json.r1.result").read_text())
-        assert r1["status"] == "denied" and r1["executor_ok"] is False
+        assert r1["status"] == "executed" and r1["executor_ok"] is True
         page1 = json.loads(r1["output"]["text"])
-        assert page1["status"] == "refused"
-        assert page1["code"] == "response_too_large"
-        assert page1["http_status"] is None
+        assert page1["status"] == "ok"
+        assert page1["code"] is None
+        assert page1["http_status"] == 200
+        assert page1["truncated"] is True
+        assert page1["body_truncated"] is True
+        assert page1["bytes_read"] == 32768
         assert page1["trust"] == "untrusted_external"
         assert size_marker not in page1["markdown"]
 

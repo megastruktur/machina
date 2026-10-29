@@ -670,12 +670,15 @@ class TestProviderClassification:
         assert raw.content_type == "text/plain"
         assert raw.body == b"plain words"
 
-    async def test_declared_length_over_budget_refused_before_read(self) -> None:
-        body_served = False
+    async def test_declared_length_over_budget_returns_partial_page(self) -> None:
+        """An oversized declared ``Content-Length`` no longer refuses:
+        the same single GET reads at most the budgeted decoded prefix,
+        closes cleanly, and returns a partial page flagged
+        ``body_truncated`` — no HEAD, no Range, no second request."""
+        requests: list[httpx2.Request] = []
 
         def handler(request: httpx2.Request) -> httpx2.Response:
-            nonlocal body_served
-            body_served = True
+            requests.append(request)
             return httpx2.Response(
                 200,
                 headers={
@@ -688,18 +691,51 @@ class TestProviderClassification:
         provider = HttpPageProvider(
             resolver=_public_resolver, transport=httpx2.MockTransport(handler)
         )
-        with pytest.raises(PageError) as excinfo:
-            await provider.fetch(url="http://public.example/a", max_bytes=MIN_MAX_BYTES)
-        assert excinfo.value.code is PageErrorCode.RESPONSE_TOO_LARGE
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.body == b"x" * MIN_MAX_BYTES
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is True
+        assert raw.http_status == 200
+        # The same single GET: no HEAD probe, no Range request, no retry.
+        assert len(requests) == 1
+        assert requests[0].method == "GET"
+        assert "range" not in {key.lower() for key in requests[0].headers}
 
-    async def test_streaming_budget_aborts_chunked_oversized_body(self) -> None:
-        served = 0
+    async def test_lying_declared_length_does_not_refuse_small_body(self) -> None:
+        """The declared length is never trusted as refusal evidence: a
+        header claiming far over budget with a small actual body reads
+        the whole body and is not truncated (the decoded-byte budget
+        governs, not the header)."""
 
         def handler(request: httpx2.Request) -> httpx2.Response:
-            nonlocal served
-            served += 1
-            # Chunked (no Content-Length): the read must abort at
-            # budget+1 decoded bytes even though the body is huge.
+            return httpx2.Response(
+                200,
+                headers={
+                    "Content-Type": "text/html",
+                    "Content-Length": str(MIN_MAX_BYTES * 8),
+                },
+                content=b"<p>tiny</p>",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.body == b"<p>tiny</p>"
+        assert raw.bytes_read == len(b"<p>tiny</p>")
+        assert raw.body_truncated is False
+
+    async def test_chunked_oversized_body_returns_partial_page(self) -> None:
+        """Chunked/unknown-length overflow is a partial page, not a
+        refusal: the read stops once the decoded budget is retained."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            # Chunked (no Content-Length): the read must stop at the
+            # budgeted decoded prefix even though the body is huge.
             return httpx2.Response(
                 200,
                 headers={"Content-Type": "text/html", "Transfer-Encoding": "chunked"},
@@ -709,12 +745,60 @@ class TestProviderClassification:
         provider = HttpPageProvider(
             resolver=_public_resolver, transport=httpx2.MockTransport(handler)
         )
-        with pytest.raises(PageError) as excinfo:
-            await provider.fetch(url="http://public.example/a", max_bytes=MIN_MAX_BYTES)
-        assert excinfo.value.code is PageErrorCode.RESPONSE_TOO_LARGE
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.body == b"x" * MIN_MAX_BYTES
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is True
 
-    async def test_gzip_budget_counts_decoded_bytes(self) -> None:
+    async def test_chunked_body_exactly_on_budget_is_not_truncated(self) -> None:
+        """Exact boundary: a body of exactly ``max_bytes`` decoded bytes
+        is read whole and honestly not truncated."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                200,
+                headers={"Content-Type": "text/html", "Transfer-Encoding": "chunked"},
+                content=b"x" * MIN_MAX_BYTES,
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.body == b"x" * MIN_MAX_BYTES
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is False
+
+    async def test_chunked_oversize_by_one_byte_marks_truncated(self) -> None:
+        """One decoded byte over the budget is the truncation boundary:
+        the retained prefix is exactly the budget."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                200,
+                headers={"Content-Type": "text/html", "Transfer-Encoding": "chunked"},
+                content=b"x" * (MIN_MAX_BYTES + 1),
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is True
+
+    async def test_gzip_decoded_overflow_returns_partial_page(self) -> None:
+        """The budget counts content-decoded bytes: a gzip body that
+        decodes far over the budget yields the budgeted decoded prefix,
+        not a refusal."""
         big = gzip.compress(b"<p>" + b"y" * (MIN_MAX_BYTES * 4) + b"</p>")
+        assert len(big) < MIN_MAX_BYTES  # the compressed form fits; decoding does not
 
         def handler(request: httpx2.Request) -> httpx2.Response:
             return httpx2.Response(
@@ -730,9 +814,70 @@ class TestProviderClassification:
         provider = HttpPageProvider(
             resolver=_public_resolver, transport=httpx2.MockTransport(handler)
         )
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is True
+        # The retained bytes are the decoded document's exact prefix.
+        assert raw.body == (b"<p>" + b"y" * (MIN_MAX_BYTES * 4) + b"</p>")[
+            :MIN_MAX_BYTES
+        ]
+
+    async def test_large_stream_is_cut_at_budget_not_read_to_eof(self) -> None:
+        """Bounded work: a stream carrying far more than the budget is
+        abandoned at the cut — only a small prefix of its chunks is ever
+        consumed."""
+        total_chunks = 4096  # 4096 KiB ≫ the 16 KiB budget
+        yielded = 0
+
+        class _HugeStream(httpx2.AsyncByteStream):
+            async def __aiter__(self):
+                nonlocal yielded
+                for _ in range(total_chunks):
+                    yielded += 1
+                    yield b"z" * 1024
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                stream=_HugeStream(),
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        raw = await provider.fetch(
+            url="http://public.example/a", max_bytes=MIN_MAX_BYTES
+        )
+        assert raw.bytes_read == MIN_MAX_BYTES
+        assert raw.body_truncated is True
+        # The reader stopped long before the stream's end: bounded work
+        # despite a body that dwarfs the budget.
+        assert yielded < total_chunks / 4
+
+    async def test_oversized_unsupported_type_still_refused_before_body(self) -> None:
+        """The MIME gate precedes any budget logic: an unsupported type
+        with an oversized declared length refuses as a type refusal, not
+        a partial read."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                200,
+                headers={
+                    "Content-Type": "application/pdf",
+                    "Content-Length": str(MIN_MAX_BYTES * 8),
+                },
+                content=b"%PDF-1.7 binary",
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
         with pytest.raises(PageError) as excinfo:
             await provider.fetch(url="http://public.example/a", max_bytes=MIN_MAX_BYTES)
-        assert excinfo.value.code is PageErrorCode.RESPONSE_TOO_LARGE
+        assert excinfo.value.code is PageErrorCode.UNSUPPORTED_CONTENT_TYPE
 
 
 class TestRedirectHandling:
@@ -1042,9 +1187,10 @@ class TestHttpStatusOrdering:
         assert json.loads(result.output)["http_status"] == 404
         assert len(requests) == 1
 
-    async def test_oversized_200_still_response_too_large(self) -> None:
-        """The status gate changes nothing for a successful response:
-        an oversized 200 page is still a size refusal."""
+    async def test_oversized_200_is_explicit_partial_read(self) -> None:
+        """The status gate changes nothing for a successful response: an
+        oversized 200 page is a deterministic partial read — status ok,
+        truncated and body_truncated true, the numeric status kept."""
 
         def handler(request: httpx2.Request) -> httpx2.Response:
             return _status_response(
@@ -1062,9 +1208,90 @@ class TestHttpStatusOrdering:
             _call({"url": "http://public.example/a"}, _context())
         )
         document = json.loads(result.output)
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
-        assert document["http_status"] is None
+        assert result.ok is True
+        assert document["status"] == "ok"
+        assert document["code"] is None
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["http_status"] == 200
+        assert document["bytes_read"] == MIN_MAX_BYTES
+        assert document["citation"] == "http://public.example/a"
+
+    async def test_incomplete_html_markup_still_extracts_readable_prefix(self) -> None:
+        """A document that simply ends mid-tag (a partial page's shape)
+        is extracted tolerantly: title and the readable prefix survive,
+        no exception, no invented content — and the honest flags say
+        nothing was cut at either budget."""
+
+        doc = (
+            "<html><head><title>Cut Page</title></head><body>"
+            "<h1>Heading One</h1>"
+            "<p>Kept paragraph with <strong>bold</strong> text.</p>"
+            "<p>Trailing <a href=\"https://example.com/lon"
+        )
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                200,
+                content_type="text/html",
+                content_length=str(len(doc)),
+                payload=doc.encode(),
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/partial"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["title"] == "Cut Page"
+        assert "# Heading One" in document["markdown"]
+        assert "Kept paragraph" in document["markdown"]
+        assert "**bold**" in document["markdown"]
+        # The response itself was complete; nothing was cut.
+        assert document["truncated"] is False
+        assert document["body_truncated"] is False
+
+    async def test_budget_cut_inside_utf8_sequence_stays_readable(self) -> None:
+        """A byte-budget cut landing inside a multi-byte UTF-8 sequence
+        decodes with a replacement character instead of failing: title
+        and prose stay readable, and the read is flagged truncated."""
+
+        head = "<html><head><title>Unicøde Page</title></head><body><p>"
+        tail = " tail</p></body></html>"
+        # Pad so the raw-body budget cut lands exactly inside the
+        # 4-byte rocket emoji.
+        w_count = MIN_MAX_BYTES - len(head.encode()) - 2
+        html = head + "w" * w_count + "\U0001F680" + tail
+        payload = html.encode()
+        assert payload[MIN_MAX_BYTES - 2 : MIN_MAX_BYTES + 2] == "\U0001F680".encode()
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return _status_response(
+                200,
+                content_type="text/html",
+                content_length=str(len(payload)),
+                payload=payload,
+            )
+
+        provider = HttpPageProvider(
+            resolver=_public_resolver, transport=httpx2.MockTransport(handler)
+        )
+        capability = WebPageCapability(provider, default_max_bytes=MIN_MAX_BYTES)
+        result = await capability(
+            _call({"url": "http://public.example/unicode"}, _context())
+        )
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["title"] == "Unicøde Page"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["bytes_read"] == MIN_MAX_BYTES
+        assert "w" * 32 in document["markdown"]
+        assert "\ufffd" in document["markdown"]
 
     async def test_unsupported_binary_200_still_type_refusal(self) -> None:
         def handler(request: httpx2.Request) -> httpx2.Response:
@@ -1561,8 +1788,10 @@ class TestRawTextDocuments:
         assert document["markdown"] == hostile
         assert document["citation"] == "https://public.example/hostile.txt"
 
-    async def test_raw_byte_budget_still_applies_to_text(self) -> None:
-        """The raw byte budget is enforced before the text is read."""
+    async def test_raw_byte_budget_cuts_text_into_partial_read(self) -> None:
+        """The raw byte budget cuts a verbatim text document into an
+        explicit partial read: the retained text is the honest prefix,
+        flagged truncated even though no character budget was hit."""
 
         def handler(request: httpx2.Request) -> httpx2.Response:
             return _status_response(
@@ -1580,9 +1809,11 @@ class TestRawTextDocuments:
             _call({"url": "https://public.example/big.txt"}, _context())
         )
         document = json.loads(result.output)
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
-        assert document["bytes_read"] == 0
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["bytes_read"] == MIN_MAX_BYTES
+        assert document["markdown"] == "x" * MIN_MAX_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -2146,7 +2377,7 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk + b"\r\n")
                 self.wfile.write(b"0\r\n\r\n")
             except (BrokenPipeError, ConnectionResetError):
-                # The bounded reader aborts at budget+1: the server
+                # The bounded reader stops at the budget cut: the server
                 # finishing into a closed socket is the expected outcome.
                 pass
         elif path == "/gzip":
@@ -2255,24 +2486,41 @@ class TestControlledUpstream:
         assert document["code"] == "address_refused"
         assert _UpstreamHandler.requests == []
 
-    async def test_oversized_chunked_page_refused_within_budget(
+    async def test_oversized_chunked_page_is_partial_read(self, upstream: str) -> None:
+        """The real-socket chunked case: an oversized chunked HTML body
+        is cut at the byte budget and returned as an explicit partial
+        read — incomplete markup at the cut is tolerated, citation and
+        status stay intact."""
+        capability = _fixture_capability(upstream)
+        result = await capability(_call({"url": f"{upstream}/big"}, _context()))
+        assert result.ok is True
+        document = json.loads(result.output)
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["bytes_read"] == MIN_MAX_BYTES
+        assert document["citation"] == f"{upstream}/big"
+        assert document["http_status"] == 200
+        # The retained, incomplete document still yields readable Markdown.
+        assert "zzz" in document["markdown"]
+
+    async def test_gzip_page_over_decoded_budget_is_partial_read(
         self, upstream: str
     ) -> None:
         capability = _fixture_capability(upstream)
-        result = await capability(_call({"url": f"{upstream}/big"}, _context()))
-        assert result.ok is False
-        document = json.loads(result.output)
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
-        assert document["bytes_read"] == 0
-
-    async def test_gzip_page_decoded_within_budget(self, upstream: str) -> None:
-        capability = _fixture_capability(upstream)
         result = await capability(_call({"url": f"{upstream}/gzip"}, _context()))
         document = json.loads(result.output)
-        # PAGE_HTML * 200 decodes far over 16 KiB: the decoded budget bites.
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
+        # PAGE_HTML * 200 decodes far over 16 KiB: the decoded budget
+        # cuts the stream into an explicit partial read, and the title
+        # from the kept prefix survives.
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        # The kept prefix holds many repeats of the fixture page, and
+        # the extractor concatenates every <title> it saw — the title
+        # from the kept prefix survives.
+        assert document["title"].startswith("Fixture Page")
+        assert "Fixture Heading" in document["markdown"]
 
     async def test_redirect_to_private_refused_before_second_hop(
         self, upstream: str
@@ -2384,6 +2632,7 @@ class TestBoundedEnvelope:
                 "title": content.title,
                 "markdown": content.markdown,
                 "truncated": False,
+                "body_truncated": False,
                 "bytes_read": len(PAGE_HTML.encode()),
                 "redirects": 0,
                 "error_type": None,
@@ -2440,6 +2689,7 @@ class TestBoundedEnvelope:
             "title",
             "markdown",
             "truncated",
+            "body_truncated",
             "bytes_read",
             "redirects",
             "error_type",
@@ -3314,6 +3564,11 @@ class TestGeneratedToolDescription:
         # The byte budget: default 262144, hard cap 1048576.
         assert "262144" in root
         assert "1048576" in root
+        # An over-budget body is a deterministic partial read, not a
+        # refusal: status stays ok and the cut is explicit.
+        assert "partial read" in lowered
+        assert "body_truncated" in root
+        assert "deterministic" in lowered
         # The extracted-text budget is distinct from the byte budget.
         assert "20000" in root
         assert "100000" in root
@@ -3334,9 +3589,13 @@ class TestGeneratedToolDescription:
         assert "403" in root
         assert "429" in root
         assert "retrying rapidly" in lowered
-        # Size increase stays bounded.
+        # Size increase stays bounded; response_too_large survives only
+        # as the cannot-fit-the-envelope code, and a partial read is
+        # advised as usable rather than something to retry blindly.
         assert "response_too_large" in root
         assert "bounded" in lowered
+        assert "partial read is a usable excerpt" in lowered
+        assert "genuinely insufficient" in lowered
         # No identical repeat of a failed request.
         assert "do not repeat an identical request" in lowered
         # Structured failures and the numeric HTTP status.
@@ -3425,7 +3684,7 @@ class TestCliEntrypoint:
         assert document["code"] == "address_refused"
         assert _UpstreamHandler.requests == []
 
-    def test_cli_oversized_is_classified(self, upstream: str) -> None:
+    def test_cli_oversized_is_partial_read(self, upstream: str) -> None:
         proc = self._run(
             "read",
             "--url",
@@ -3436,8 +3695,10 @@ class TestCliEntrypoint:
         )
         assert proc.returncode == 0, proc.stderr
         document = json.loads(proc.stdout.strip().splitlines()[-1])
-        assert document["status"] == "refused"
-        assert document["code"] == "response_too_large"
+        assert document["status"] == "ok"
+        assert document["truncated"] is True
+        assert document["body_truncated"] is True
+        assert document["bytes_read"] == MIN_MAX_BYTES
 
     def test_cli_invalid_url_is_structured_rejection(self) -> None:
         proc = self._run("read", "--url", "ftp://example.com/a")
