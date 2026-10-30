@@ -35,6 +35,7 @@ from mai.capabilities.history_tags import (
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
+    TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
     TAGS_SEARCH_DEFAULT_LIMIT,
     TAGS_SEARCH_JOBS_CAPABILITY,
     TAGS_SEARCH_MAX_LIMIT,
@@ -44,6 +45,7 @@ from mai.capabilities.history_tags import (
     TagsCreatePayload,
     TagsListCatalogPayload,
     TagsRemovePayload,
+    TagsSearchConversationsPayload,
     TagsSearchJobsPayload,
     _aresolve_current_target,
     build_history_tag_capabilities,
@@ -56,6 +58,7 @@ from mai.capabilities.internal_api import (
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
+    aassign_conversation_tag,
     aassign_job_tag,
     acreate_tag,
     alist_tags,
@@ -142,6 +145,7 @@ def _minimal_payloads() -> dict[str, dict[str, object]]:
         TAGS_LIST_CATALOG_CAPABILITY: {},
         TAGS_DELETE_CAPABILITY: {"tag_id": tag},
         TAGS_SEARCH_JOBS_CAPABILITY: {"tag_ids": [tag]},
+        TAGS_SEARCH_CONVERSATIONS_CAPABILITY: {"tag_ids": [tag]},
     }
 
 
@@ -159,6 +163,7 @@ class TestDescriptors:
         assert by_id[TAGS_REMOVE_CAPABILITY].effect_class == "mutate"
         assert by_id[TAGS_LIST_FOR_CAPABILITY].effect_class == "read"
         assert by_id[TAGS_SEARCH_JOBS_CAPABILITY].effect_class == "read"
+        assert by_id[TAGS_SEARCH_CONVERSATIONS_CAPABILITY].effect_class == "read"
         for descriptor in composition.descriptors:
             assert_agent_ready_descriptor(descriptor)
             assert len(str(descriptor.input_schema["description"])) >= 30
@@ -211,6 +216,7 @@ class TestDescriptors:
             TAGS_LIST_CATALOG_CAPABILITY,
             TAGS_DELETE_CAPABILITY,
             TAGS_SEARCH_JOBS_CAPABILITY,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
         ):
             props = by_id[capability_id].input_schema["properties"]
             assert "replacement_tag_id" not in props
@@ -269,6 +275,23 @@ class TestDescriptors:
         assert search["properties"]["limit"]["minimum"] == 1
         assert search["properties"]["limit"]["maximum"] == TAGS_SEARCH_MAX_LIMIT
         assert search["properties"]["offset"]["minimum"] == 0
+
+    def test_search_conversations_declares_bounded_contract(self) -> None:
+        composition = _composition()
+        by_id = {d.identifier: d for d in composition.descriptors}
+        assert by_id[TAGS_SEARCH_CONVERSATIONS_CAPABILITY].effect_class == "read"
+        search = by_id[TAGS_SEARCH_CONVERSATIONS_CAPABILITY].input_schema
+        assert search["required"] == ["tag_ids"]
+        tag_ids = search["properties"]["tag_ids"]
+        assert tag_ids["minItems"] == 1
+        assert tag_ids["maxItems"] == TAGS_SEARCH_MAX_TAG_IDS
+        assert search["properties"]["match"]["enum"] == ["any", "all"]
+        assert search["properties"]["limit"]["minimum"] == 1
+        assert search["properties"]["limit"]["maximum"] == TAGS_SEARCH_MAX_LIMIT
+        assert search["properties"]["offset"]["minimum"] == 0
+        assert TagsSearchConversationsPayload(
+            tag_ids=[uuid.uuid4()]
+        ).match == "any"
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +418,47 @@ class TestSearchJobsPayloadContract:
     def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
         with pytest.raises(ValidationError):
             TagsSearchJobsPayload.model_validate(payload)
+
+
+class TestSearchConversationsPayloadContract:
+    def test_defaults_and_uuid_coercion(self) -> None:
+        tag = str(uuid.uuid4())
+        payload = TagsSearchConversationsPayload.model_validate(
+            {"tag_ids": [tag]}
+        )
+        assert payload.tag_ids == [uuid.UUID(tag)]
+        assert isinstance(payload.tag_ids[0], uuid.UUID)
+        assert payload.match == "any"
+        assert payload.limit == TAGS_SEARCH_DEFAULT_LIMIT
+        assert payload.offset == 0
+
+    def test_accepts_the_maximal_request(self) -> None:
+        tags = [str(uuid.uuid4()) for _ in range(TAGS_SEARCH_MAX_TAG_IDS)]
+        payload = TagsSearchConversationsPayload.model_validate(
+            {"tag_ids": tags, "match": "all", "limit": TAGS_SEARCH_MAX_LIMIT,
+             "offset": 25}
+        )
+        assert payload.match == "all"
+        assert len(payload.tag_ids) == TAGS_SEARCH_MAX_TAG_IDS
+        assert payload.limit == TAGS_SEARCH_MAX_LIMIT
+        assert payload.offset == 25
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"tag_ids": []},
+            {"tag_ids": [str(uuid.uuid4())] * 51},
+            {"tag_ids": ["not-a-uuid"]},
+            {"tag_ids": [str(uuid.uuid4())], "match": "some"},
+            {"tag_ids": [str(uuid.uuid4())], "limit": 0},
+            {"tag_ids": [str(uuid.uuid4())], "limit": 51},
+            {"tag_ids": [str(uuid.uuid4())], "offset": -1},
+        ],
+    )
+    def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
+        with pytest.raises(ValidationError):
+            TagsSearchConversationsPayload.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1392,6 +1456,337 @@ class TestSearchJobsWired:
         result, document = await _execute(
             composition,
             TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": tag_ids},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["match"] == "any"
+        assert document["total"] == 50
+        assert len(document["items"]) == 50
+        assert document["limit"] == TAGS_SEARCH_DEFAULT_LIMIT == 50
+        assert document["offset"] == 0
+        assert document["has_more"] is False and document["next_offset"] is None
+        for item in document["items"]:
+            preview = item["tag_preview"]
+            assert preview["total"] == 2  # the maximal 64-char name + reserved
+            assert len(preview["preview"]) == 2
+        assert len(json.dumps(document, sort_keys=True)) < 60000
+
+
+# ---------------------------------------------------------------------------
+# W4C-CONV — tags.search_conversations: same-server tag search (real PG)
+# ---------------------------------------------------------------------------
+
+
+def _insert_conversation(
+    url: str,
+    conversation_id: uuid.UUID,
+    server_id: uuid.UUID = uuid.UUID(SERVER_A),
+    updated_at: datetime | None = None,
+) -> None:
+    """One real conversations row seeded with the reserved unclassified tag."""
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (conversation_id, server_id, updated_at)
+            VALUES (%s, %s, COALESCE(%s, now()))
+            """,
+            (conversation_id, server_id, updated_at),
+        )
+        conn.execute(
+            "INSERT INTO conversation_tags (conversation_id, tag_id) "
+            "VALUES (%s, %s)",
+            (conversation_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+async def _assign_tag_to_conversation(
+    sessions: object, conversation_id: uuid.UUID, tag_id: uuid.UUID
+) -> None:
+    await aassign_conversation_tag(
+        sessions,  # type: ignore[arg-type]
+        conversation_id,
+        tag_id,
+        server_id=uuid.UUID(SERVER_A),
+        assigned_by="principal",
+        assignment_source="agent",
+    )
+
+
+@pytest.mark.anyio
+class TestSearchConversationsWired:
+    async def test_any_and_all_match_same_server_newest_first(
+        self, sessions, migrated_url
+    ) -> None:
+        base = datetime(2026, 10, 30, 12, 0, 0)
+        c1, c2, c3 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        _insert_conversation(migrated_url, c1, updated_at=base)
+        _insert_conversation(
+            migrated_url, c2, updated_at=base + timedelta(minutes=1)
+        )
+        _insert_conversation(
+            migrated_url, c3, updated_at=base + timedelta(minutes=2)
+        )
+        tag_a = await acreate_tag(sessions, name=f"w4cc-a-{uuid.uuid4()}")
+        tag_b = await acreate_tag(sessions, name=f"w4cc-b-{uuid.uuid4()}")
+        tag_c = await acreate_tag(sessions, name=f"w4cc-c-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        for conversation_id, tag_id in (
+            (c1, tag_a.tag_id),
+            (c2, tag_a.tag_id),
+            (c2, tag_b.tag_id),
+            (c3, tag_b.tag_id),
+        ):
+            await _assign_tag_to_conversation(sessions, conversation_id, tag_id)
+        # Another server's conversation carrying tag_a is invisible to
+        # this search.
+        foreign = uuid.uuid4()
+        _insert_conversation(
+            migrated_url,
+            foreign,
+            server_id=uuid.UUID(SERVER_B),
+            updated_at=base + timedelta(minutes=3),
+        )
+        await aassign_conversation_tag(
+            sessions,
+            foreign,
+            tag_a.tag_id,
+            server_id=uuid.UUID(SERVER_B),
+            assigned_by="principal",
+            assignment_source="agent",
+        )
+
+        result, any_doc = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {"tag_ids": [str(tag_a.tag_id), str(tag_b.tag_id)]},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert any_doc["status"] == "ok" and any_doc["ok"] is True
+        assert any_doc["match"] == "any"
+        assert any_doc["total"] == 3
+        assert [item["conversation_id"] for item in any_doc["items"]] == [
+            str(c3),
+            str(c2),
+            str(c1),
+        ]
+        assert any_doc["limit"] == TAGS_SEARCH_DEFAULT_LIMIT
+        assert any_doc["offset"] == 0
+        assert any_doc["has_more"] is False and any_doc["next_offset"] is None
+        row = any_doc["items"][0]
+        assert set(row) == {"conversation_id", "updated_at", "tag_preview"}
+        assert str(uuid.UUID(row["conversation_id"])) == row["conversation_id"]
+        datetime.fromisoformat(row["updated_at"])
+        assert set(row["tag_preview"]) == {"preview", "total"}
+        assert row["tag_preview"]["total"] == 2  # tag_b + reserved seed
+        assert set(row["tag_preview"]["preview"]) == {tag_b.name, "unclassified"}
+        c2_row = any_doc["items"][1]
+        assert c2_row["tag_preview"]["total"] == 3
+        assert set(c2_row["tag_preview"]["preview"]) == {
+            tag_a.name,
+            tag_b.name,
+            "unclassified",
+        }
+
+        result, all_doc = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {
+                "tag_ids": [str(tag_a.tag_id), str(tag_b.tag_id)],
+                "match": "all",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert all_doc["match"] == "all"
+        assert all_doc["total"] == 1
+        assert [item["conversation_id"] for item in all_doc["items"]] == [str(c2)]
+
+        # No conversation carries both a and c: an honest empty page,
+        # not a refusal.
+        result, empty = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {
+                "tag_ids": [str(tag_a.tag_id), str(tag_c.tag_id)],
+                "match": "all",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert empty["items"] == [] and empty["total"] == 0
+        assert empty["has_more"] is False and empty["next_offset"] is None
+
+    async def test_zero_uuid_general_consult_scope_is_hermetic(
+        self, sessions, migrated_url
+    ) -> None:
+        base = datetime(2026, 10, 30, 15, 0, 0)
+        consult = uuid.uuid4()
+        host = uuid.uuid4()
+        tag = await acreate_tag(sessions, name=f"w4cc-gc-{uuid.uuid4()}")
+        _insert_conversation(
+            migrated_url,
+            consult,
+            server_id=uuid.UUID(int=0),
+            updated_at=base,
+        )
+        _insert_conversation(
+            migrated_url,
+            host,
+            server_id=uuid.UUID(SERVER_A),
+            updated_at=base + timedelta(minutes=1),
+        )
+        await aassign_conversation_tag(
+            sessions,
+            consult,
+            tag.tag_id,
+            server_id=uuid.UUID(int=0),
+            assigned_by="principal",
+            assignment_source="agent",
+        )
+        await aassign_conversation_tag(
+            sessions,
+            host,
+            tag.tag_id,
+            server_id=uuid.UUID(SERVER_A),
+            assigned_by="principal",
+            assignment_source="agent",
+        )
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)]},
+            _context("00000000-0000-0000-0000-000000000000", uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["match"] == "any"
+        assert document["total"] == 1
+        assert [item["conversation_id"] for item in document["items"]] == [
+            str(consult)
+        ]
+        # The host server's conversation carrying the same tag never
+        # leaks into the General Consult scope.
+        assert str(host) not in [
+            item["conversation_id"] for item in document["items"]
+        ]
+
+    async def test_pagination_slices_newest_first_with_honest_meta(
+        self, sessions, migrated_url
+    ) -> None:
+        base = datetime(2026, 10, 30, 13, 0, 0)
+        conversations = [uuid.uuid4() for _ in range(4)]
+        for index, conversation_id in enumerate(conversations):
+            _insert_conversation(
+                migrated_url,
+                conversation_id,
+                updated_at=base + timedelta(minutes=index),
+            )
+        tag = await acreate_tag(sessions, name=f"w4cc-page-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        for conversation_id in conversations:
+            await _assign_tag_to_conversation(
+                sessions, conversation_id, tag.tag_id
+            )
+        newest_first = [
+            str(conversation_id) for conversation_id in reversed(conversations)
+        ]
+
+        result, first = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 0},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert first["total"] == 4
+        assert [item["conversation_id"] for item in first["items"]] == (
+            newest_first[:2]
+        )
+        assert first["limit"] == 2 and first["offset"] == 0
+        assert first["has_more"] is True and first["next_offset"] == 2
+
+        _, second = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 2},
+            context,
+        )
+        assert [item["conversation_id"] for item in second["items"]] == (
+            newest_first[2:]
+        )
+        assert second["total"] == 4
+        assert second["has_more"] is False and second["next_offset"] is None
+
+        _, beyond = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 99},
+            context,
+        )
+        assert beyond["items"] == [] and beyond["total"] == 4
+        assert beyond["has_more"] is False and beyond["next_offset"] is None
+
+    async def test_invalid_payloads_refuse_fail_closed(self, sessions) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        tag = str(uuid.uuid4())
+        for payload in (
+            {},
+            {"tag_ids": []},
+            {"tag_ids": [tag] * 51},
+            {"tag_ids": ["not-a-uuid"]},
+            {"tag_ids": [tag], "match": "some"},
+            {"tag_ids": [tag], "limit": 0},
+            {"tag_ids": [tag], "limit": 51},
+            {"tag_ids": [tag], "offset": -1},
+        ):
+            result, document = await _execute(
+                composition,
+                TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+                payload,
+                context,
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "invalid_request"
+
+    async def test_maximal_page_envelope_stays_under_60000_bytes(
+        self, sessions, migrated_url
+    ) -> None:
+        stem = f"w4cc-{uuid.uuid4().hex[:8]}"
+        tag_ids: list[str] = []
+        for index in range(50):
+            base = f"{stem}-{index:02d}-"
+            name = base + "x" * (TAGS_NAME_MAX_LENGTH - len(base))
+            assert len(name) == 64
+            tag = await acreate_tag(sessions, name=name)
+            tag_ids.append(str(tag.tag_id))
+        for index, tag_id in enumerate(tag_ids):
+            conversation_id = uuid.uuid4()
+            _insert_conversation(
+                migrated_url,
+                conversation_id,
+                updated_at=datetime(
+                    2026, 10, 30, 16, index % 60, index // 60
+                ),
+            )
+            await aassign_conversation_tag(
+                sessions,
+                conversation_id,
+                uuid.UUID(tag_id),
+                server_id=uuid.UUID(SERVER_A),
+                assigned_by="principal",
+                assignment_source="agent",
+            )
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
             {"tag_ids": tag_ids},
             _context(SERVER_A, uuid.uuid4()),
         )
