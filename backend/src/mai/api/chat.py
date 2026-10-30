@@ -134,6 +134,7 @@ from mai.api.auth import (
     _require_csrf,
     _require_session,
 )
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.task_state import (
     TASK_PROPOSE_UPDATE_CAPABILITY,
@@ -274,9 +275,11 @@ SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
 
 #: Built-in controller-side defaults of the auto-resolved chat grant
 #: set (alongside ``INTERNAL_API_CAPABILITY_IDS``): document retrieval,
-#: web research, the HTTP service probe, the host journal reader and the
+#: web research, the HTTP service probe, the host journal reader, the
 #: task-state agent tools (run-identity scoped: the model can only see
-#: and update the task bound to its own conversation — §7).
+#: and update the task bound to its own conversation — §7) and the
+#: ``tags.*`` history vocabulary (mutations stripped again by the
+#: read-only exclusion set below).
 BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "docs.retrieve",
     "web.search",
@@ -284,11 +287,14 @@ BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "service.http",
     "host.logs",
     *TASK_STATE_CAPABILITY_IDS,
+    *TAGS_CAPABILITY_IDS,
 )
 
 #: Capabilities a read-only conversation strips even without a
-#: registry descriptor: raw shell and every internal-API mutation plus
-#: the task mutation lane (``task.read`` is read-class and survives).
+#: registry descriptor: raw shell, every internal-API mutation, the
+#: ``tags.*`` mutations and the task mutation lane (``task.read`` is
+#: read-class and survives). Registered descriptors with a non-read
+#: effect are excluded on top by the registry pass.
 READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
     {
         "host.shell",
@@ -299,6 +305,10 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "app.upsert_catalog_runbook",
         "app.delete_catalog_runbook",
         "secret.store",
+        "tags.assign",
+        "tags.remove",
+        "tags.create",
+        "tags.delete",
         TASK_PROPOSE_UPDATE_CAPABILITY,
         TASK_UPDATE_ITEM_CAPABILITY,
     }

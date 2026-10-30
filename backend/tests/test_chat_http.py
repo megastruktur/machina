@@ -62,6 +62,7 @@ from mai.agents.budgets import (
 )
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.logs import write_evidence_artifact
 from mai.contracts.jobs import RunState, parse_job_event
@@ -1232,13 +1233,27 @@ async def test_submit_read_only_strips_mutation_capabilities(
     """``read_only=True`` strips the non-read vocabulary and pins the
     read fallbacks; the flag participates in the whole-submission
     digest (a flipped flag for the same key is a DIFFERENT submission)."""
+    tag_mutations = ["tags.assign", "tags.remove", "tags.create", "tags.delete"]
+    tag_reads = [
+        "tags.list_for",
+        "tags.list_catalog",
+        "tags.search_jobs",
+        "tags.search_conversations",
+        "tags.read_conversation",
+        "tags.read_job",
+    ]
     run_id = uuid.uuid4()
     created = await submit_chat(
         chat_app,
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=True,
     )
     assert created.status == 201, created.body
@@ -1250,6 +1265,9 @@ async def test_submit_read_only_strips_mutation_capabilities(
     assert "app.upsert_map_entry" not in grants
     assert "app.delete_map_entry" not in grants
     assert "secret.store" not in grants
+    # The four tags mutations are stripped; the six tags reads survive.
+    assert all(mutation not in grants for mutation in tag_mutations)
+    assert all(read in grants for read in tag_reads)
     # Read capabilities (explicit and internal) survive; the read
     # fallbacks are always ensured so the context tuple is non-empty.
     assert READ_CAP in grants
@@ -1263,7 +1281,12 @@ async def test_submit_read_only_strips_mutation_capabilities(
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=True,
     )
     assert duplicate.status == 200, duplicate.body
@@ -1273,11 +1296,39 @@ async def test_submit_read_only_strips_mutation_capabilities(
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=False,
     )
     assert writable.status == 409
     assert _error(writable)["code"] == "conflict"
+
+
+async def test_submit_explicit_tag_read_subset_is_not_broadened(
+    chat_app, jar, server_a
+) -> None:
+    """An explicit ``allowed_capabilities`` subset carries exactly the
+    requested ``tags.*`` reads: no built-in vocabulary joins and no
+    ``tags.*`` mutation is silently added."""
+    created = await submit_chat(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        allowed_capabilities=["tags.list_for", "tags.read_job"],
+    )
+    assert created.status == 201, created.body
+    grants = set(created.json()["conversation"]["requested_grants"])
+    # The explicit subset is preserved: the two requested reads are in
+    # and every other ``tags.*`` id (mutations included) stays out; the
+    # existing internal/web/plugins union is NOT tags-broadened.
+    requested = {"tags.list_for", "tags.read_job"}
+    assert requested <= grants
+    assert (set(TAGS_CAPABILITY_IDS) - requested).isdisjoint(grants)
 
 
 async def test_submit_read_only_filters_registry_effect_classes(
