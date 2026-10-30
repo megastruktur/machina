@@ -14,6 +14,8 @@ import uuid
 
 import pytest
 
+from pydantic import ValidationError
+
 from mai.agents.conversation_store import (
     aattach_run,
     acreate_conversation,
@@ -26,6 +28,8 @@ from mai.capabilities.history_tags import (
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
+    TagsAssignPayload,
+    TagsRemovePayload,
     _aresolve_current_target,
     build_history_tag_capabilities,
 )
@@ -179,6 +183,61 @@ class TestDescriptors:
         assert props["limit"]["minimum"] == 1
         assert props["limit"]["maximum"] == TAGS_LIST_MAX_LIMIT
         assert props["offset"]["minimum"] == 0
+
+
+# ---------------------------------------------------------------------------
+# AC 1b — payload runtime contract: one required scalar UUID per call
+# (the descriptor projection strips ``format`` by design, so UUID-ness
+# of ``tag_id`` is proven against the Pydantic models themselves)
+# ---------------------------------------------------------------------------
+
+
+SCALAR_PAYLOAD_MODELS = (TagsAssignPayload, TagsRemovePayload)
+
+
+class TestPayloadRuntimeContract:
+    @pytest.mark.parametrize("payload_model", SCALAR_PAYLOAD_MODELS)
+    def test_accepts_one_uuid_string_as_uuid(
+        self,
+        payload_model: type[TagsAssignPayload] | type[TagsRemovePayload],
+    ) -> None:
+        tag = str(uuid.uuid4())
+        payload = payload_model.model_validate(
+            {"target": "job", "tag_id": tag}
+        )
+        assert isinstance(payload.tag_id, uuid.UUID)
+        assert payload.tag_id == uuid.UUID(tag)
+
+    @pytest.mark.parametrize("payload_model", SCALAR_PAYLOAD_MODELS)
+    def test_rejects_missing_tag_id(
+        self,
+        payload_model: type[TagsAssignPayload] | type[TagsRemovePayload],
+    ) -> None:
+        with pytest.raises(ValidationError):
+            payload_model.model_validate({"target": "job"})
+
+    @pytest.mark.parametrize("payload_model", SCALAR_PAYLOAD_MODELS)
+    def test_rejects_legacy_tag_ids_list(
+        self,
+        payload_model: type[TagsAssignPayload] | type[TagsRemovePayload],
+    ) -> None:
+        tag = str(uuid.uuid4())
+        with pytest.raises(ValidationError):
+            payload_model.model_validate(
+                {"target": "job", "tag_ids": [tag]}
+            )
+
+    @pytest.mark.parametrize("payload_model", SCALAR_PAYLOAD_MODELS)
+    def test_rejects_any_list_tag_id_including_singleton(
+        self,
+        payload_model: type[TagsAssignPayload] | type[TagsRemovePayload],
+    ) -> None:
+        tag = str(uuid.uuid4())
+        for tag_id in ([tag], [tag, str(uuid.uuid4())]):
+            with pytest.raises(ValidationError):
+                payload_model.model_validate(
+                    {"target": "job", "tag_id": tag_id}
+                )
 
 
 # ---------------------------------------------------------------------------
