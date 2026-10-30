@@ -133,6 +133,7 @@ from mai.jobs.recovery import (
 )
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
 from mai.profiles.files import FileStoreErrorCode, ProfileFileError, StoredProfile
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 __all__ = ["register_jobs"]
 
@@ -569,6 +570,22 @@ async def _record_submit_intent(
     ).scalar()
     if inserted is None:
         return False
+    # 0011 mandatory-tag invariant: THIS transaction created the run, so the
+    # classification commits with the same transaction (history-tags
+    # W1-FIX1); the dedup replay path above returns unchanged.
+    await session.execute(
+        text(
+            """
+            INSERT INTO job_tags (job_id, tag_id, assignment_source)
+            VALUES (:run_id, :tag, :source)
+            """
+        ),
+        {
+            "run_id": uuid.UUID(run_id),
+            "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+            "source": SYSTEM_ASSIGNMENT_SOURCE,
+        },
+    )
     seq = (
         await session.execute(
             text("SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :r"),

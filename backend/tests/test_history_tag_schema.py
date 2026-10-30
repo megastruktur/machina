@@ -258,10 +258,13 @@ def _fetchall(url: str, sql: str, params: tuple = ()) -> list[tuple]:
 
 
 def test_revision_constants_target_the_0010_parent() -> None:
+    from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID as SRC_RESERVED_ID
+
     module = _migration_module()
     assert module.revision == "0011"
     assert module.down_revision == "0010"
-    assert module.RESERVED_UNCLASSIFIED_TAG_ID == RESERVED_ID
+    # The migration mirrors the runtime single source of truth (mai.tags).
+    assert module.RESERVED_UNCLASSIFIED_TAG_ID == SRC_RESERVED_ID == RESERVED_ID
 
 
 # ---------------------------------------------------------------------------

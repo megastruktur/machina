@@ -576,12 +576,12 @@ def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         conn.execute(
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version, notification_alerts, "
-            "observation_findings, server_observations, knowledge_doc_chunks, "
-            "knowledge_documents, application_projection_journal, "
-            "application_projection"
+            "job_schedules, job_events, job_steps, job_tags, job_runs, "
+            "approvals, profile_projection_journal, profile_projection, "
+            "admin_sessions, admin_credential, alembic_version, "
+            "notification_alerts, observation_findings, server_observations, "
+            "knowledge_doc_chunks, knowledge_documents, "
+            "application_projection_journal, application_projection, tags"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
@@ -599,6 +599,7 @@ def _truncate(url: str) -> None:
             "job_steps",
             "job_events",
             "job_schedules",
+            "job_tags",
             "job_runs",
             "approvals",
             "admin_sessions",

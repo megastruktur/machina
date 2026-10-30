@@ -66,7 +66,10 @@ depends_on: str | None = None
 
 # Fixed identity of the reserved ``unclassified`` catalog row. A constant (not
 # a random UUID) keeps re-upgrades idempotent and lets later slices reference
-# the default tag without a name lookup.
+# the default tag without a name lookup. Runtime single source of truth is
+# ``mai.tags.RESERVED_UNCLASSIFIED_TAG_ID``; this module mirrors the same
+# import-standalone value (the chain must not import application code), and
+# tests/test_history_tag_schema.py asserts the mirror equality.
 RESERVED_UNCLASSIFIED_TAG_ID = "6a1e9d3c-5b4f-4c2a-9e8d-7f0a1b2c3d4e"
 RESERVED_UNCLASSIFIED_NAME = "unclassified"
 RESERVED_UNCLASSIFIED_DESCRIPTION = (

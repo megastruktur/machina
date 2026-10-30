@@ -92,6 +92,7 @@ from mai.jobs import engine as _engine
 from mai.jobs.engine import EngineClient
 from mai.jobs.steps import StepsError
 from mai.policy.evaluate import ExecutionContext, ParentScope, PolicyError
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 if TYPE_CHECKING:
     # Type-only: the budgets module imports this module's bounds, so the
@@ -748,6 +749,25 @@ class DelegationExecutor:
                                 if parent_row.root_budget is not None
                                 else None
                             ),
+                        },
+                    )
+                    # 0011 mandatory-tag invariant: every child is classified
+                    # in the SAME transaction as its job_runs row;
+                    # ``ON CONFLICT DO NOTHING`` keeps the crash-window replay
+                    # idempotent (history-tags W1-FIX1).
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO job_tags (job_id, tag_id,
+                                                  assignment_source)
+                            VALUES (:run_id, :tag, :source)
+                            ON CONFLICT DO NOTHING
+                            """
+                        ),
+                        {
+                            "run_id": uuid.UUID(child.run_id),
+                            "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                            "source": SYSTEM_ASSIGNMENT_SOURCE,
                         },
                     )
 

@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.output_safety import REDACTED, project_text
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 from mai.contracts.conversations import (
     DEFAULT_PAGE_LIMIT,
     MAX_MESSAGE_CHARS,
@@ -428,6 +429,23 @@ async def acreate_conversation(
                 "mto": missing_range.to_sequence if missing_range else None,
                 "task": active_task_id,
                 "run": active_run_id,
+            },
+        )
+        # 0011 mandatory-tag invariant: the classification commits in the
+        # SAME transaction as the entity (history-tags W1-FIX1); the
+        # reserved default is replaced by meaningful tags later.
+        await session.execute(
+            text(
+                """
+                INSERT INTO conversation_tags (conversation_id, tag_id,
+                                               assignment_source)
+                VALUES (:cid, :tag, :source)
+                """
+            ),
+            {
+                "cid": cid,
+                "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                "source": SYSTEM_ASSIGNMENT_SOURCE,
             },
         )
     return await _achecked_conversation(sessions, cid, server_id=server_id)
