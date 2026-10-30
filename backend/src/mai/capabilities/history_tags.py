@@ -55,20 +55,19 @@ TAGS_LIST_MAX_LIMIT: Final[int] = 100
 
 
 class TagsAssignPayload(BaseModel):
-    """Attach existing history tags to the current target."""
+    """Attach an existing history tag to the current target."""
 
     target: Literal["job", "conversation"] = Field(
         description=(
-            "Which current target the tags attach to: the running job "
+            "Which current target the tag attaches to: the running job "
             "itself, or the conversation this run is actively bound to "
             "on this server."
         )
     )
-    tag_ids: list[uuid.UUID] = Field(
-        min_length=1,
+    tag_id: uuid.UUID = Field(
         description=(
-            "Canonical UUIDs of the history tags to attach; every tag "
-            "must already exist in the tag store."
+            "Canonical UUID of the existing history tag to attach; the "
+            "tag must already exist in the tag store."
         ),
     )
 
@@ -83,10 +82,9 @@ class TagsRemovePayload(BaseModel):
             "actively bound to on this server."
         )
     )
-    tag_ids: list[uuid.UUID] = Field(
-        min_length=1,
+    tag_id: uuid.UUID = Field(
         description=(
-            "Canonical UUIDs of the history tags to detach from the "
+            "Canonical UUID of the history tag to detach from the "
             "current target."
         ),
     )
@@ -201,11 +199,11 @@ def build_history_tag_capabilities(
         environments=["controller"],
         payload_model=TagsAssignPayload,
         description=(
-            "Attach one or more existing history tags to the current "
-            "target: the running job itself, or the conversation this "
-            "run is actively bound to on this server. Tags are "
-            "referenced by canonical UUID; another server's targets and "
-            "released conversation links are invisible."
+            "Attach one existing history tag to the current target: "
+            "the running job itself, or the conversation this run is "
+            "actively bound to on this server. The tag is referenced "
+            "by canonical UUID; another server's targets and released "
+            "conversation links are invisible."
         ),
     )
     async def _tags_assign(
@@ -225,11 +223,11 @@ def build_history_tag_capabilities(
         environments=["controller"],
         payload_model=TagsRemovePayload,
         description=(
-            "Detach one or more history tags from the current target: "
-            "the running job itself, or the conversation this run is "
+            "Detach one history tag from the current target: the "
+            "running job itself, or the conversation this run is "
             "actively bound to on this server. Optionally names one "
             "replacement tag UUID attached in place of the removed "
-            "ones; another server's targets and released links are "
+            "one; another server's targets and released links are "
             "invisible."
         ),
     )

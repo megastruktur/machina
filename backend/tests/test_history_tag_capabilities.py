@@ -108,8 +108,8 @@ async def _execute(
 def _minimal_payloads() -> dict[str, dict[str, object]]:
     tag = str(uuid.uuid4())
     return {
-        TAGS_ASSIGN_CAPABILITY: {"target": "job", "tag_ids": [tag]},
-        TAGS_REMOVE_CAPABILITY: {"target": "job", "tag_ids": [tag]},
+        TAGS_ASSIGN_CAPABILITY: {"target": "job", "tag_id": tag},
+        TAGS_REMOVE_CAPABILITY: {"target": "job", "tag_id": tag},
         TAGS_LIST_FOR_CAPABILITY: {"target": "conversation"},
     }
 
@@ -148,17 +148,14 @@ class TestDescriptors:
             assert target["enum"] == ["job", "conversation"]
             assert "target" in descriptor.input_schema["required"]
 
-    def test_tag_ids_are_required_uuid_lists(self) -> None:
+    def test_tag_id_is_a_required_singular_uuid(self) -> None:
         composition = _composition()
         by_id = {d.identifier: d for d in composition.descriptors}
         for capability_id in (TAGS_ASSIGN_CAPABILITY, TAGS_REMOVE_CAPABILITY):
             props = by_id[capability_id].input_schema["properties"]
-            tag_ids = props["tag_ids"]
-            assert tag_ids["type"] == "array"
-            assert tag_ids["minItems"] == 1
-            assert capability_id and "tag_ids" in (
-                by_id[capability_id].input_schema["required"]
-            )
+            assert props["tag_id"]["type"] == "string"
+            assert "tag_id" in by_id[capability_id].input_schema["required"]
+            assert "tag_ids" not in props
 
     def test_replacement_uuid_is_optional_only_on_remove(self) -> None:
         composition = _composition()
