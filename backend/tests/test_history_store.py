@@ -859,8 +859,9 @@ async def test_job_content_fields_state_and_honest_nones(
     """Frozen content row: identity, parentage, label, refs; honest Nones.
 
     ``state`` is ``None`` before any lifecycle event and replays from the
-    persisted event stream afterwards; ``label`` is honestly ``None`` for
-    a run submitted without one; an unborn link page is empty and honest.
+    persisted event stream afterwards; a run submitted without a label
+    stores the schema default empty string; an unborn link page is empty
+    and honest.
     """
     parent = uuid.uuid4()
     child = uuid.uuid4()
@@ -901,11 +902,11 @@ async def test_job_content_fields_state_and_honest_nones(
     content = await aread_job_content(factory, child, server_id=SERVER_A)
     assert content.state == "failed"
 
-    # Honest None label when the run was submitted without one.
+    # Label-less submit stores the schema default empty string verbatim.
     plain = uuid.uuid4()
     _insert_job_full(migrated_url, plain)
     bare = await aread_job_content(factory, plain, server_id=SERVER_A)
-    assert bare.label is None
+    assert bare.label == ""
     assert bare.state is None
 
 

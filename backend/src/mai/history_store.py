@@ -571,8 +571,8 @@ class JobContent:
 
     ``task_id`` is the newest non-null binding across ALL of the run's
     same-server links (released links included), not just the returned
-    page. ``label`` is the frozen-at-submit run label (honestly ``None``
-    when absent). ``state`` is the lifecycle state replayed from the
+    page. ``label`` is the frozen-at-submit run label, stored verbatim
+    (empty string when absent). ``state`` is the lifecycle state replayed from the
     run's persisted event stream (``None`` before the submit edge).
     """
 
@@ -683,7 +683,7 @@ async def aread_job_content(
         run_id=run_id,
         parent_run_id=run_row.parent_run_id,
         task_id=task_id,
-        label=run_row.label or None,
+        label=run_row.label,
         state=None if lifecycle_state is None else lifecycle_state.value,
         submitted_at=run_row.submitted_at,
         updated_at=run_row.updated_at,
