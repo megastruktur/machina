@@ -17,9 +17,10 @@ still preserves every record's final tag. The ``tags.search_jobs``
 and ``tags.search_conversations`` reads page this server's job runs
 and conversations by their tags through the read-only history
 store. The ``tags.read_conversation`` read pages one same-server
-conversation's stored (already-redacted) transcript through the
-reviewed char-paginated content reader. No registration, UI, or
-job reader belongs to this module.
+conversations stored (already-redacted) transcript through the reviewed
+char-paginated content reader, and the ``tags.read_job`` read pages one
+same-server job runs content and links through the reviewed job content
+reader. No registration or UI belongs to this module.
 """
 
 from __future__ import annotations
