@@ -33,8 +33,10 @@ triggers, and this store is the disciplined writer on top:
 - **Concurrency protocol**: every association write and every deletion
   takes ``FOR UPDATE`` on the catalog row first, so writers serialize per
   tag; foreign keys and the schema's deferred constraint triggers are the
-  backstop, and the invariant violations they raise are translated into
-  typed :class:`TagStoreError` codes (never raw DB errors).
+  backstop, and EVERY ``DBAPIError`` the write paths raise — including
+  commit-time P0001 from the deferred must-keep-one-tag triggers, which
+  surfaces as ``ProgrammingError`` — is translated into typed
+  :class:`TagStoreError` codes (never raw DB exceptions).
 - **Batch previews are N+1-free**: one grouped query per batch returns the
   bounded name preview and total count per entity (listing projections).
 
@@ -54,7 +56,7 @@ from enum import StrEnum
 from typing import Final
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.contracts.conversations import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
@@ -221,13 +223,15 @@ def _like_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
-def aclassify_integrity_error(exc: IntegrityError) -> TagStoreError:
+def aclassify_integrity_error(exc: DBAPIError) -> TagStoreError:
     """Translate a schema-level integrity failure into a typed store error.
 
     The deferred constraint triggers (migration 0011) are the invariant
     backstop against out-of-band writers and race windows; their messages
-    are matched value-free. RESTRICT/FK failures on ``tag_id`` mean the
-    catalog row is gone (a concurrent deletion won the lock protocol).
+    are matched value-free. They fire at COMMIT (SQLSTATE P0001, wrapped as
+    ``ProgrammingError``); FK/RESTRICT and unique failures arrive as
+    ``IntegrityError`` — both are ``DBAPIError`` subclasses, and only
+    ``exc.orig`` (sqlstate + message) is inspected here.
     """
     orig = exc.orig
     sqlstate = getattr(orig, "sqlstate", None) or ""
@@ -440,149 +444,167 @@ async def adelete_tag(
     ``replacement_tag_id`` inside this same transaction — otherwise
     ``tag_in_use`` is raised and nothing changes. The reserved
     ``unclassified`` row can never be deleted. The catalog-row lock
-    serializes this against concurrent association writers (see module
+    serializes this against concurrent association writers, and the FULL
+    transaction (commit included) is failure-translated: a commit-time
+    deferred-trigger refusal (a racing remover emptied an entity) surfaces
+    as the typed invariant code, never a raw DB exception (see module
     docstring).
     """
-    async with sessions() as session, session.begin():
-        locked = (
-            await session.execute(
-                text("SELECT tag_id FROM tags WHERE tag_id = :t FOR UPDATE"),
-                {"t": tag_id},
+    try:
+        async with sessions() as session, session.begin():
+            return await _adelete_tag_locked(
+                session, tag_id, force=force, replacement_tag_id=replacement_tag_id
             )
-        ).scalar()
-        if locked is None:
-            raise TagStoreError(TagErrorCode.TAG_NOT_FOUND, "no such tag", "tag_id")
-        if tag_id == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID):
+    except DBAPIError as exc:
+        raise aclassify_integrity_error(exc) from exc
+
+
+async def _adelete_tag_locked(
+    session: AsyncSession,
+    tag_id: uuid.UUID,
+    *,
+    force: bool,
+    replacement_tag_id: uuid.UUID | None,
+) -> int:
+    locked = (
+        await session.execute(
+            text("SELECT tag_id FROM tags WHERE tag_id = :t FOR UPDATE"),
+            {"t": tag_id},
+        )
+    ).scalar()
+    if locked is None:
+        raise TagStoreError(TagErrorCode.TAG_NOT_FOUND, "no such tag", "tag_id")
+    if tag_id == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID):
+        raise TagStoreError(
+            TagErrorCode.RESERVED_TAG,
+            "the reserved unclassified tag cannot be deleted",
+            "tag_id",
+        )
+    job_refs, conversation_refs = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    (SELECT count(*) FROM job_tags WHERE tag_id = :t),
+                    (SELECT count(*) FROM conversation_tags WHERE tag_id = :t)
+                """
+            ),
+            {"t": tag_id},
+        )
+    ).one()
+    total_refs = int(job_refs) + int(conversation_refs)
+    if total_refs == 0:
+        await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
+        return 0
+    if not force:
+        raise TagStoreError(
+            TagErrorCode.TAG_IN_USE,
+            "the tag is still assigned; delete with force after review",
+            "tag_id",
+        )
+    # Entities whose ONLY tag is the doomed one need the replacement
+    # (or the refusal below). The replacement itself is locked too, so
+    # a concurrent replacement deletion cannot strand the entity.
+    if replacement_tag_id is not None:
+        if replacement_tag_id == tag_id:
             raise TagStoreError(
-                TagErrorCode.RESERVED_TAG,
-                "the reserved unclassified tag cannot be deleted",
-                "tag_id",
-            )
-        job_refs, conversation_refs = (
-            await session.execute(
-                text(
-                    """
-                    SELECT
-                        (SELECT count(*) FROM job_tags WHERE tag_id = :t),
-                        (SELECT count(*) FROM conversation_tags WHERE tag_id = :t)
-                    """
-                ),
-                {"t": tag_id},
-            )
-        ).one()
-        total_refs = int(job_refs) + int(conversation_refs)
-        if total_refs == 0:
-            await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
-            return 0
-        if not force:
-            raise TagStoreError(
-                TagErrorCode.TAG_IN_USE,
-                "the tag is still assigned; delete with force after review",
-                "tag_id",
-            )
-        # Entities whose ONLY tag is the doomed one need the replacement
-        # (or the refusal below). The replacement itself is locked too, so
-        # a concurrent replacement deletion cannot strand the entity.
-        if replacement_tag_id is not None:
-            if replacement_tag_id == tag_id:
-                raise TagStoreError(
-                    TagErrorCode.VALIDATION,
-                    "the replacement must differ from the deleted tag",
-                    "replacement_tag_id",
-                )
-            replaced = (
-                await session.execute(
-                    text(
-                        "SELECT tag_id FROM tags WHERE tag_id = :r FOR UPDATE"
-                    ),
-                    {"r": replacement_tag_id},
-                )
-            ).scalar()
-            if replaced is None:
-                raise TagStoreError(
-                    TagErrorCode.TAG_NOT_FOUND,
-                    "no such replacement tag",
-                    "replacement_tag_id",
-                )
-        needy_jobs = (
-            await session.execute(
-                text(
-                    """
-                    SELECT jt.job_id FROM job_tags jt
-                    WHERE jt.tag_id = :t
-                      AND NOT EXISTS (
-                          SELECT 1 FROM job_tags other
-                          WHERE other.job_id = jt.job_id AND other.tag_id <> :t
-                      )
-                    """
-                ),
-                {"t": tag_id},
-            )
-        ).scalars().all()
-        needy_conversations = (
-            await session.execute(
-                text(
-                    """
-                    SELECT ct.conversation_id FROM conversation_tags ct
-                    WHERE ct.tag_id = :t
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_tags other
-                          WHERE other.conversation_id = ct.conversation_id
-                            AND other.tag_id <> :t
-                      )
-                    """
-                ),
-                {"t": tag_id},
-            )
-        ).scalars().all()
-        if (needy_jobs or needy_conversations) and replacement_tag_id is None:
-            raise TagStoreError(
-                TagErrorCode.TAG_IN_USE,
-                "some entities keep only this tag; pass replacement_tag_id "
-                "to re-classify them in the same transaction",
+                TagErrorCode.VALIDATION,
+                "the replacement must differ from the deleted tag",
                 "replacement_tag_id",
             )
-        if needy_jobs:
+        replaced = (
             await session.execute(
                 text(
-                    """
-                    INSERT INTO job_tags (job_id, tag_id, assignment_source)
-                    SELECT u.job_id, :r, :src
-                    FROM unnest(CAST(:jobs AS uuid[])) AS u(job_id)
-                    ON CONFLICT DO NOTHING
-                    """
+                    "SELECT tag_id FROM tags WHERE tag_id = :r FOR UPDATE"
                 ),
-                {
-                    "r": replacement_tag_id,
-                    "src": SYSTEM_ASSIGNMENT_SOURCE,
-                    "jobs": list(needy_jobs),
-                },
+                {"r": replacement_tag_id},
             )
-        if needy_conversations:
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO conversation_tags
-                        (conversation_id, tag_id, assignment_source)
-                    SELECT u.conversation_id, :r, :src
-                    FROM unnest(CAST(:convs AS uuid[])) AS u(conversation_id)
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                {
-                    "r": replacement_tag_id,
-                    "src": SYSTEM_ASSIGNMENT_SOURCE,
-                    "convs": list(needy_conversations),
-                },
+        ).scalar()
+        if replaced is None:
+            raise TagStoreError(
+                TagErrorCode.TAG_NOT_FOUND,
+                "no such replacement tag",
+                "replacement_tag_id",
             )
+    needy_jobs = (
         await session.execute(
-            text("DELETE FROM job_tags WHERE tag_id = :t"), {"t": tag_id}
+            text(
+                """
+                SELECT jt.job_id FROM job_tags jt
+                WHERE jt.tag_id = :t
+                  AND NOT EXISTS (
+                      SELECT 1 FROM job_tags other
+                      WHERE other.job_id = jt.job_id AND other.tag_id <> :t
+                  )
+                """
+            ),
+            {"t": tag_id},
         )
+    ).scalars().all()
+    needy_conversations = (
         await session.execute(
-            text("DELETE FROM conversation_tags WHERE tag_id = :t"), {"t": tag_id}
+            text(
+                """
+                SELECT ct.conversation_id FROM conversation_tags ct
+                WHERE ct.tag_id = :t
+                  AND NOT EXISTS (
+                      SELECT 1 FROM conversation_tags other
+                      WHERE other.conversation_id = ct.conversation_id
+                        AND other.tag_id <> :t
+                  )
+                """
+            ),
+            {"t": tag_id},
         )
-        await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
-        return total_refs
+    ).scalars().all()
+    if (needy_jobs or needy_conversations) and replacement_tag_id is None:
+        raise TagStoreError(
+            TagErrorCode.TAG_IN_USE,
+            "some entities keep only this tag; pass replacement_tag_id "
+            "to re-classify them in the same transaction",
+            "replacement_tag_id",
+        )
+    if needy_jobs:
+        await session.execute(
+            text(
+                """
+                INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                SELECT u.job_id, :r, :src
+                FROM unnest(CAST(:jobs AS uuid[])) AS u(job_id)
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            {
+                "r": replacement_tag_id,
+                "src": SYSTEM_ASSIGNMENT_SOURCE,
+                "jobs": list(needy_jobs),
+            },
+        )
+    if needy_conversations:
+        await session.execute(
+            text(
+                """
+                INSERT INTO conversation_tags
+                    (conversation_id, tag_id, assignment_source)
+                SELECT u.conversation_id, :r, :src
+                FROM unnest(CAST(:convs AS uuid[])) AS u(conversation_id)
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            {
+                "r": replacement_tag_id,
+                "src": SYSTEM_ASSIGNMENT_SOURCE,
+                "convs": list(needy_conversations),
+            },
+        )
+    await session.execute(
+        text("DELETE FROM job_tags WHERE tag_id = :t"), {"t": tag_id}
+    )
+    await session.execute(
+        text("DELETE FROM conversation_tags WHERE tag_id = :t"), {"t": tag_id}
+    )
+    await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
+    return total_refs
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +806,11 @@ async def aremove_job_tag(
                         "src": SYSTEM_ASSIGNMENT_SOURCE,
                     },
                 )
-    except IntegrityError as exc:
+    except DBAPIError as exc:
+        # The in-transaction refusal above is typed directly; anything from
+        # the DB — including the commit-time deferred-trigger P0001
+        # (ProgrammingError) when a racing remover emptied the entity — is
+        # classified here, after the transaction's commit/rollback ran.
         raise aclassify_integrity_error(exc) from exc
 
 
@@ -865,7 +891,9 @@ async def aremove_conversation_tag(
                         "src": SYSTEM_ASSIGNMENT_SOURCE,
                     },
                 )
-    except IntegrityError as exc:
+    except DBAPIError as exc:
+        # Mirrors aremove_job_tag: catch the commit-time deferred-trigger
+        # failure (P0001 as ProgrammingError) too, never leak raw DB errors.
         raise aclassify_integrity_error(exc) from exc
 
 

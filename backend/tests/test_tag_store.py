@@ -590,3 +590,115 @@ async def test_concurrent_assign_and_force_serializes_safely(
         assert _rows(
             migrated_url, "SELECT count(*) FROM job_tags WHERE job_id = %s", (job,)
         )[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# concurrency: commit-time deferred-trigger refusals are typed (LAST_TAG)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_two_concurrent_removers_loser_gets_typed_last_tag(
+    factory, migrated_url
+) -> None:
+    """Two removers race different tags off one job: exactly one commits.
+
+    Both pass their in-transaction checks (two tags present), so the loser's
+    refusal can only surface at COMMIT — deferred 0011 trigger, SQLSTATE
+    P0001 under asyncpg (a ProgrammingError). It must arrive as the typed
+    LAST_TAG code, and the job must retain its final tag.
+    """
+    _insert_job(migrated_url, JOB_A)
+    first = await acreate_tag(factory, name="racer-one")
+    second = await acreate_tag(factory, name="racer-two")
+    await aremove_job_tag(
+        factory,
+        JOB_A,
+        uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+        server_id=SERVER_A,
+        replacement_tag_id=first.tag_id,
+    )
+    await aassign_job_tag(factory, JOB_A, second.tag_id, server_id=SERVER_A)
+    assert _rows(
+        migrated_url, "SELECT count(*) FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )[0][0] == 2
+
+    results = await asyncio.gather(
+        aremove_job_tag(factory, JOB_A, first.tag_id, server_id=SERVER_A),
+        aremove_job_tag(factory, JOB_A, second.tag_id, server_id=SERVER_A),
+        return_exceptions=True,
+    )
+    losers = [r for r in results if r is not None]
+    winners = [r for r in results if r is None]
+    assert len(winners) == 1, f"expected exactly one committed remover: {results!r}"
+    assert len(losers) == 1, f"expected exactly one refused remover: {results!r}"
+    loser = losers[0]
+    assert isinstance(loser, TagStoreError), f"raw DB error leaked: {loser!r}"
+    assert loser.code is TagErrorCode.LAST_TAG
+    # Final-tag preservation: the loser's delete rolled back; the job keeps
+    # exactly one tag — the one the winner did not remove.
+    remaining = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert len(remaining) == 1
+    assert remaining[0][0] in (first.tag_id, second.tag_id)
+
+
+@pytest.mark.anyio
+async def test_concurrent_force_delete_vs_remover_typed_last_tag(
+    factory, migrated_url
+) -> None:
+    """Forced catalog deletion vs a concurrent conversation-tag remover.
+
+    The conversation keeps two tags; the force-delete cascades one, the
+    remover takes the other. Exactly one writer survives, the loser is the
+    typed LAST_TAG refusal (commit-time P0001 for whoever loses the commit
+    race), never a raw ProgrammingError, and the conversation always keeps
+    exactly one final tag. Exercises adelete_tag and
+    aremove_conversation_tag commit paths together.
+    """
+    _insert_conversation(migrated_url, CONV_A)
+    keeper = await acreate_tag(factory, name="keeper")
+    doomed = await acreate_tag(factory, name="doomed")
+    await aremove_conversation_tag(
+        factory,
+        CONV_A,
+        uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+        server_id=SERVER_A,
+        replacement_tag_id=keeper.tag_id,
+    )
+    await aassign_conversation_tag(factory, CONV_A, doomed.tag_id, server_id=SERVER_A)
+    assert _rows(
+        migrated_url,
+        "SELECT count(*) FROM conversation_tags WHERE conversation_id = %s",
+        (CONV_A,),
+    )[0][0] == 2
+
+    results = await asyncio.gather(
+        aremove_conversation_tag(factory, CONV_A, keeper.tag_id, server_id=SERVER_A),
+        adelete_tag(factory, doomed.tag_id, force=True),
+        return_exceptions=True,
+    )
+    # In the overlapped interleaving (the real race) both in-transaction
+    # checks pass and the loser is refused AT COMMIT — deferred 0011 trigger
+    # P0001 surfaced as the typed LAST_TAG. Boundary interleavings (one
+    # writer fully precedes the other's snapshot) yield the contracted
+    # in-transaction TAG_IN_USE / LAST_TAG refusals instead. Either way the
+    # refusal is typed — never a raw DB exception — and exactly one writer
+    # commits.
+    losers = [r for r in results if r is not None]
+    winners = [r for r in results if r is None]
+    assert len(winners) == 1, f"expected exactly one committed writer: {results!r}"
+    assert len(losers) == 1, f"expected exactly one refused writer: {results!r}"
+    loser = losers[0]
+    assert isinstance(loser, TagStoreError), f"raw DB error leaked: {loser!r}"
+    assert loser.code in {TagErrorCode.LAST_TAG, TagErrorCode.TAG_IN_USE}
+    # Final-tag preservation in every interleaving: exactly one tag remains
+    # on the conversation.
+    remaining = _rows(
+        migrated_url,
+        "SELECT tag_id FROM conversation_tags WHERE conversation_id = %s",
+        (CONV_A,),
+    )
+    assert len(remaining) == 1
+    assert remaining[0][0] in (keeper.tag_id, doomed.tag_id)
