@@ -1,13 +1,13 @@
-"""History-tag capability surface for the chat agent (W4A2 store wiring).
+"""History-tag capability surface for the chat agent (W4A3 store wiring).
 
-W4A2 scope: ``tags.assign`` and ``tags.remove`` are wired to the typed
-tag store — the current target is resolved per execution (the run itself
-for ``job``; the ONE active same-server conversation link for
-``conversation``), every classified store failure is projected onto a
-value-free refused envelope, and both operations stay idempotent with
-atomic replacement support on remove. ``tags.list_for`` remains an
-honest ``unavailable`` placeholder until W4A3. No registration,
-catalog, or history/UI surface belongs to this card.
+All three operations (``tags.assign``, ``tags.remove``, ``tags.list_for``)
+are wired to the typed tag store — the current target is resolved per
+execution (the run itself for ``job``; the ONE active same-server
+conversation link for ``conversation``), every classified store failure
+is projected onto a value-free refused envelope, mutations stay
+idempotent with atomic replacement support on remove, and ``list_for``
+returns one deterministic bounded page (limit/offset + honest total).
+No registration, catalog, or history/UI surface belongs to this card.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ from mai.tag_store import (
     aassign_job_tag,
     aremove_conversation_tag,
     aremove_job_tag,
+    atags_for_conversation,
+    atags_for_job,
 )
 
 TAGS_ASSIGN_CAPABILITY: Final[str] = "tags.assign"
@@ -209,13 +211,13 @@ def build_history_tag_capabilities(
     *,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> InternalApiComposition:
-    """Build the ``tags.*`` descriptors + executors (W4A2 wiring).
+    """Build the ``tags.*`` descriptors + executors (W4A3 wiring).
 
-    ``tags.assign`` and ``tags.remove`` resolve the current target and
-    write through the typed tag store (idempotent, scope-checked); they
-    refuse ``unavailable`` only when no ``session_factory`` is wired.
-    ``tags.list_for`` remains an honest ``unavailable`` placeholder
-    until W4A3. Descriptors are validated fail-closed at build time
+    All three operations resolve the current target and go through the
+    typed tag store: ``tags.assign``/``tags.remove`` write (idempotent,
+    scope-checked), ``tags.list_for`` reads one deterministic bounded
+    page. They refuse ``unavailable`` only when no ``session_factory``
+    is wired. Descriptors are validated fail-closed at build time
     (``assert_agent_ready_descriptor`` via :func:`build_descriptor`).
     """
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
@@ -364,7 +366,56 @@ def build_history_tag_capabilities(
     async def _tags_list_for(
         call: CapabilityCall, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        raise InternalApiError("unavailable", "not implemented until W4A3")
+        if session_factory is None:
+            raise InternalApiError("unavailable", "tag store is not configured")
+        target: Literal["job", "conversation"] = (
+            "job" if payload["target"] == "job" else "conversation"
+        )
+        limit = int(payload.get("limit", TAGS_LIST_DEFAULT_LIMIT))
+        offset = int(payload.get("offset", 0))
+        try:
+            entity_id = await _aresolve_current_target(
+                session_factory, call.context, target
+            )
+            if target == "job":
+                items, total = await atags_for_job(
+                    session_factory,
+                    entity_id,
+                    server_id=call.context.server_id,
+                    limit=limit,
+                    offset=offset,
+                )
+            else:
+                items, total = await atags_for_conversation(
+                    session_factory,
+                    entity_id,
+                    server_id=call.context.server_id,
+                    limit=limit,
+                    offset=offset,
+                )
+        except TagStoreError as exc:
+            raise _tags_refusal(exc) from exc
+        has_more = offset + len(items) < total
+        return {
+            "ok": True,
+            "target": target,
+            "entity_id": str(entity_id),
+            "items": [
+                {
+                    "tag_id": str(row.tag_id),
+                    "name": row.name,
+                    "assigned_by": row.assigned_by,
+                    "assignment_source": row.assignment_source,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in items
+            ],
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+            "has_more": has_more,
+            "next_offset": offset + len(items) if has_more else None,
+        }
 
     operations.append(_tags_list_for)
 

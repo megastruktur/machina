@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 
 import psycopg
 import pytest
@@ -26,6 +27,7 @@ from mai.capabilities.dispatch import CapabilityCall
 from mai.capabilities.history_tags import (
     TAGS_ASSIGN_CAPABILITY,
     TAGS_CAPABILITY_IDS,
+    TAGS_LIST_DEFAULT_LIMIT,
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
@@ -42,6 +44,7 @@ from mai.capabilities.internal_api import (
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
+    aassign_job_tag,
     acreate_tag,
     atags_for_conversation,
     atags_for_job,
@@ -248,8 +251,7 @@ class TestPayloadRuntimeContract:
 
 
 # ---------------------------------------------------------------------------
-# AC 2 — fail-closed surfaces: no factory refuses everything; the wired
-# store refuses only ``tags.list_for`` (the honest W4A3 placeholder)
+# AC 2 — fail-closed surfaces: no factory refuses everything (incl. list_for)
 # ---------------------------------------------------------------------------
 
 
@@ -265,19 +267,6 @@ class TestUnavailableExecutors:
             assert result.ok is False  # type: ignore[attr-defined]
             assert document["status"] == "refused"
             assert document["code"] == "unavailable"
-
-    async def test_list_for_stays_unavailable_until_w4a3(self, sessions) -> None:
-        composition = build_history_tag_capabilities(session_factory=sessions)
-        context = _context(SERVER_A, uuid.uuid4())
-        result, document = await _execute(
-            composition,
-            TAGS_LIST_FOR_CAPABILITY,
-            _minimal_payloads()[TAGS_LIST_FOR_CAPABILITY],
-            context,
-        )
-        assert result.ok is False  # type: ignore[attr-defined]
-        assert document["status"] == "refused"
-        assert document["code"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -617,3 +606,164 @@ class TestAssignRemoveWired:
             assert result.ok is True  # type: ignore[attr-defined]
             assert document["entity_id"] == str(conversation.conversation_id)
             assert document["replacement_tag_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# AC 5 — W4A3 list_for wiring: deterministic bounded real pages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+class TestListForWired:
+    async def test_job_pages_are_deterministic_first_next_final_beyond(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)
+        extras = [
+            await acreate_tag(sessions, name=f"w4a3-job-{uuid.uuid4()}")
+            for _ in range(2)
+        ]
+        for tag in extras:
+            await aassign_job_tag(
+                sessions,
+                run_id,
+                tag.tag_id,
+                server_id=uuid.UUID(SERVER_A),
+                assigned_by="seeder",
+                assignment_source="system",
+            )
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+        expected_order = sorted(
+            ["unclassified", extras[0].name, extras[1].name], key=str.lower
+        )
+
+        # First page (limit=1): lowest name, honest totals, advancing page.
+        result, first = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "job", "limit": 1, "offset": 0},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert first["status"] == "ok" and first["ok"] is True
+        assert first["target"] == "job" and first["entity_id"] == str(run_id)
+        assert first["limit"] == 1 and first["offset"] == 0
+        assert first["total"] == 3  # reserved seed + two assignments
+        assert first["has_more"] is True and first["next_offset"] == 1
+        assert [item["name"] for item in first["items"]] == [expected_order[0]]
+        row = first["items"][0]
+        assert set(row) == {
+            "tag_id",
+            "name",
+            "assigned_by",
+            "assignment_source",
+            "created_at",
+        }
+        assert str(uuid.UUID(row["tag_id"])) == row["tag_id"]
+        datetime.fromisoformat(row["created_at"])
+
+        # Next page continues the deterministic order.
+        _, second = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "job", "limit": 1, "offset": first["next_offset"]},
+            context,
+        )
+        assert [item["name"] for item in second["items"]] == [expected_order[1]]
+        assert second["has_more"] is True and second["next_offset"] == 2
+
+        # Final page ends the sequence: has_more False, next_offset None.
+        _, final = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "job", "limit": 1, "offset": second["next_offset"]},
+            context,
+        )
+        assert [item["name"] for item in final["items"]] == [expected_order[2]]
+        assert final["total"] == 3
+        assert final["has_more"] is False and final["next_offset"] is None
+
+        # Beyond the total: an honest empty page, not a refusal.
+        _, beyond = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "job", "limit": 1, "offset": 3},
+            context,
+        )
+        assert beyond["items"] == []
+        assert beyond["total"] == 3
+        assert beyond["has_more"] is False and beyond["next_offset"] is None
+
+    async def test_conversation_page_targets_active_link_with_typed_rows(
+        self, sessions
+    ) -> None:
+        conversation = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_A)
+        )
+        run_id = uuid.uuid4()
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_A),
+            run_id=run_id,
+        )
+        tag = await acreate_tag(sessions, name=f"w4a3-conv-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+        assigned, _ = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "conversation", "tag_id": str(tag.tag_id)},
+            context,
+        )
+        assert assigned.ok is True  # type: ignore[attr-defined]
+
+        result, document = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "conversation"},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["status"] == "ok"
+        assert document["target"] == "conversation"
+        assert document["entity_id"] == str(conversation.conversation_id)
+        assert document["limit"] == TAGS_LIST_DEFAULT_LIMIT
+        assert document["offset"] == 0
+        assert document["total"] >= 1
+        assert document["has_more"] is False and document["next_offset"] is None
+        mine = next(
+            item
+            for item in document["items"]
+            if item["tag_id"] == str(tag.tag_id)
+        )
+        assert mine["name"] == tag.name
+        assert mine["assigned_by"] == "principal"
+        assert mine["assignment_source"] == "agent"
+        datetime.fromisoformat(mine["created_at"])
+
+    async def test_cross_server_conversation_list_refuses_not_found(
+        self, sessions
+    ) -> None:
+        conversation = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_B)
+        )
+        run_id = uuid.uuid4()
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_B),
+            run_id=run_id,
+        )
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            {"target": "conversation"},
+            _context(SERVER_A, run_id),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "not_found"
