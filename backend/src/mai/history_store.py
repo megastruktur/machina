@@ -28,20 +28,26 @@ of entity references carrying a requested set of catalog tags.
   honest count reuse the W2 batch preview helpers (one grouped query per
   page, never one query per row).
 
-This module adds no content readers, no status/cursor filters, and no
-schema: it searches and projects references only.
+This module adds no status/cursor filters and no schema. W3A search
+projects references only; W3B adds exactly one content reader,
+:func:`aread_conversation_content`: bounded ``(seq, message_id)``-ordered
+transcript pages over a single server-scoped conversation, continuable by
+a message-index + character cursor. There is deliberately no job reader.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Final
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.agents.conversation_store import StoredMessage
+from mai.contracts.conversations import MessageRole, MessageSourceKind
 from mai.tag_store import (
     DEFAULT_PAGE_LIMIT,
     EntityTagPreview,
@@ -57,8 +63,11 @@ __all__ = [
     "MAX_PAGE_LIMIT",
     "ConversationSearchRow",
     "JobSearchRow",
+    "ConversationContentPage",
+    "ConversationContentWindow",
     "asearch_conversations_by_tags",
     "asearch_jobs_by_tags",
+    "aread_conversation_content",
 ]
 
 # Re-exported for callers composing the wire envelope next to the rows.
@@ -86,6 +95,50 @@ class ConversationSearchRow:
     conversation_id: uuid.UUID
     updated_at: datetime
     tag_preview: EntityTagPreview
+
+
+# ---------------------------------------------------------------------------
+# content-reader rows (W3B-CONV)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationContentWindow:
+    """One message's content slice inside a char-paginated page.
+
+    ``content`` is the stored (already redacted) text; ``char_cursor`` is
+    the zero-based position inside this message where the next page should
+    resume.  ``redacted`` and ``content_ref`` are preserved verbatim from
+    the stored row.
+    """
+
+    message_id: uuid.UUID
+    seq: int
+    role: str
+    source_kind: str
+    content: str
+    redacted: bool
+    content_ref: str | None
+    char_cursor: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationContentPage:
+    """One bounded, char-cursor-continuable transcript slice.
+
+    ``items`` are ordered by ``(seq, message_id)`` ascending; ``total`` is
+    the pre-slice message count under the identical scope predicate.
+    ``next_offset`` is the message index for the next page; ``next_char_cursor``
+    is the character position inside that message.  When ``has_more`` is
+    ``False`` both are ``None``.
+    """
+
+    conversation_id: uuid.UUID
+    items: list[ConversationContentWindow]
+    total: int
+    has_more: bool
+    next_offset: int | None
+    next_char_cursor: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +343,162 @@ async def asearch_conversations_by_tags(
         )
         for entity_id, sort_at in matches
     ], total
+
+
+# ---------------------------------------------------------------------------
+# conversation content reader (W3B-CONV)
+# ---------------------------------------------------------------------------
+
+
+def _check_content_bounds(max_chars: int, offset: int, char_cursor: int) -> None:
+    """Fail-closed validation for char-paginated reader bounds."""
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
+        raise ValueError("max_chars must be a positive integer")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError("offset must be an integer >= 0")
+    if not isinstance(char_cursor, int) or isinstance(char_cursor, bool) or char_cursor < 0:
+        raise ValueError("char_cursor must be an integer >= 0")
+
+
+async def aread_conversation_content(
+    sessions: async_sessionmaker[AsyncSession],
+    conversation_id: uuid.UUID,
+    *,
+    server_id: uuid.UUID,
+    offset: int = 0,
+    char_cursor: int = 0,
+    max_chars: int = 4096,
+) -> ConversationContentPage:
+    """Read a bounded, char-paginated slice of conversation content.
+
+    Messages are ordered by ``(seq, message_id)`` ascending.  The page
+    starts at message index ``offset`` and character position ``char_cursor``
+    inside that message.  At most ``max_chars`` characters of content are
+    returned across all messages in the page.
+
+    The conversation must belong to ``server_id``; otherwise a
+    ``ValueError`` is raised (fail-closed scope check).
+
+    Exact reconstruction: concatenating ``content`` across successive
+    pages (using ``next_offset``/``next_char_cursor``) yields the exact
+    concatenation of stored message contents with no skipped or repeated
+    characters.  Empty messages and ``seq`` gaps are handled naturally.
+    """
+    _check_content_bounds(max_chars, offset, char_cursor)
+
+    async with sessions() as session:
+        # Scope check: conversation must exist and belong to server_id.
+        conv = (
+            await session.execute(
+                text(
+                    "SELECT conversation_id FROM conversations "
+                    "WHERE conversation_id = :cid AND server_id = :sid"
+                ),
+                {"cid": conversation_id, "sid": server_id},
+            )
+        ).first()
+        if conv is None:
+            raise ValueError(
+                f"conversation {conversation_id} not found in server {server_id}"
+            )
+
+        # Total message count under the identical predicate.
+        total = int(
+            (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM conversation_messages "
+                        "WHERE conversation_id = :cid"
+                    ),
+                    {"cid": conversation_id},
+                )
+            ).scalar_one()
+        )
+
+        if total == 0 or offset >= total:
+            return ConversationContentPage(
+                conversation_id=conversation_id,
+                items=[],
+                total=total,
+                has_more=False,
+                next_offset=None,
+                next_char_cursor=None,
+            )
+
+        # Fetch the page of messages starting at offset.
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT message_id, seq, role, source_kind, content, "
+                    "redacted, content_ref "
+                    "FROM conversation_messages "
+                    "WHERE conversation_id = :cid "
+                    "ORDER BY seq, message_id "
+                    "LIMIT :l OFFSET :o"
+                ),
+                {"cid": conversation_id, "l": total - offset, "o": offset},
+            )
+        ).mappings().all()
+
+    # Build char-bounded windows.
+    items: list[ConversationContentWindow] = []
+    chars_used = 0
+    next_offset: int | None = None
+    next_char_cursor: int | None = None
+
+    for idx, row in enumerate(rows):
+        content: str = row["content"] or ""
+        msg_offset = offset + idx
+
+        # Determine start position inside this message.
+        start = char_cursor if idx == 0 else 0
+        if start > len(content):
+            raise ValueError(
+                f"char_cursor {start} beyond stored message length {len(content)} "
+                f"at offset {msg_offset}"
+            )
+
+        remaining = max_chars - chars_used
+        if remaining <= 0:
+            next_offset = msg_offset
+            next_char_cursor = 0
+            break
+
+        slice_end = min(start + remaining, len(content))
+        slice_content = content[start:slice_end]
+        chars_used += len(slice_content)
+
+        items.append(
+            ConversationContentWindow(
+                message_id=row["message_id"],
+                seq=row["seq"],
+                role=row["role"],
+                source_kind=row["source_kind"],
+                content=slice_content,
+                redacted=bool(row["redacted"]),
+                content_ref=row["content_ref"],
+                char_cursor=slice_end,
+            )
+        )
+
+        if slice_end < len(content):
+            # Truncated inside this message.
+            next_offset = msg_offset
+            next_char_cursor = slice_end
+            break
+    else:
+        # Consumed all fetched rows without hitting max_chars limit.
+        consumed = offset + len(rows)
+        if consumed < total:
+            next_offset = consumed
+            next_char_cursor = 0
+
+    has_more = next_offset is not None
+    return ConversationContentPage(
+        conversation_id=conversation_id,
+        items=items,
+        total=total,
+        has_more=has_more,
+        next_offset=next_offset,
+        next_char_cursor=next_char_cursor,
+    )

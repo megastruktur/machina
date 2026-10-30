@@ -36,6 +36,7 @@ from mai.history_store import (
     JobSearchRow,
     asearch_conversations_by_tags,
     asearch_jobs_by_tags,
+    aread_conversation_content,
 )
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
@@ -525,4 +526,198 @@ async def test_invalid_match_rejected(factory, migrated_url) -> None:
     with pytest.raises(ValueError):
         await asearch_conversations_by_tags(
             factory, server_id=SERVER_A, tag_ids=[tag.tag_id], match="bad"
+        )
+
+
+# ---------------------------------------------------------------------------
+# W3B-CONV — character-paginated conversation content reader
+# ---------------------------------------------------------------------------
+
+
+def _conv_insert(
+    url: str, conv_id: uuid.UUID, server_id: uuid.UUID = SERVER_A
+) -> None:
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "INSERT INTO conversations (conversation_id, server_id, title) "
+            "VALUES (%s, %s, %s)",
+            (conv_id, server_id, "test conv"),
+        )
+        conn.execute(
+            "INSERT INTO conversation_tags (conversation_id, tag_id) "
+            "VALUES (%s, %s)",
+            (conv_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+def _msg_insert(
+    url: str,
+    conv_id: uuid.UUID,
+    msg_id: uuid.UUID,
+    seq: int,
+    content: str,
+    role: str = "user",
+    source_kind: str = "browser",
+    redacted: bool = False,
+    content_ref: str | None = None,
+) -> None:
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(message_id, conversation_id, seq, role, source_kind, content, "
+            "content_fingerprint, redacted, content_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (msg_id, conv_id, seq, role, source_kind, content, "x" * 64, redacted, content_ref),
+        )
+
+
+@pytest.mark.anyio
+async def test_conversation_content_single_unicode_continuation(
+    factory, migrated_url
+) -> None:
+    """Single message with unicode, split across two pages by max_chars."""
+    conv = uuid.uuid4()
+    msg = uuid.uuid4()
+    text = "Hello 世界 🌍"
+    _conv_insert(migrated_url, conv)
+    _msg_insert(migrated_url, conv, msg, 1, text)
+
+    page1 = await aread_conversation_content(
+        factory, conv, server_id=SERVER_A, max_chars=5
+    )
+    assert len(page1.items) == 1
+    assert page1.items[0].content == text[:5]
+    assert page1.has_more is True
+    assert page1.next_offset == 0
+    assert page1.next_char_cursor == 5
+
+    page2 = await aread_conversation_content(
+        factory,
+        conv,
+        server_id=SERVER_A,
+        offset=page1.next_offset,
+        char_cursor=page1.next_char_cursor,
+        max_chars=100,
+    )
+    assert len(page2.items) == 1
+    assert page2.items[0].content == text[5:]
+    assert page2.has_more is False
+    assert page2.next_offset is None
+    assert page2.next_char_cursor is None
+
+    # Exact reconstruction
+    assert page1.items[0].content + page2.items[0].content == text
+
+
+@pytest.mark.anyio
+async def test_conversation_content_multi_message_and_gaps(
+    factory, migrated_url
+) -> None:
+    """Multiple messages with seq gaps; pages reconstruct exactly."""
+    conv = uuid.uuid4()
+    msgs = [
+        (uuid.uuid4(), 1, "first"),
+        (uuid.uuid4(), 5, "second"),
+        (uuid.uuid4(), 10, "third"),
+    ]
+    _conv_insert(migrated_url, conv)
+    for mid, seq, content in msgs:
+        _msg_insert(migrated_url, conv, mid, seq, content)
+
+    full = await aread_conversation_content(
+        factory, conv, server_id=SERVER_A, max_chars=1000
+    )
+    assert len(full.items) == 3
+    assert full.total == 3
+    assert full.has_more is False
+
+    # Paginate one message at a time
+    collected: list[str] = []
+    offset, cursor = 0, 0
+    while True:
+        page = await aread_conversation_content(
+            factory, conv, server_id=SERVER_A,
+            offset=offset, char_cursor=cursor, max_chars=1000,
+        )
+        collected.extend(w.content for w in page.items)
+        if not page.has_more:
+            break
+        offset, cursor = page.next_offset, page.next_char_cursor
+    assert collected == ["first", "second", "third"]
+
+
+@pytest.mark.anyio
+async def test_conversation_content_empty_messages(factory, migrated_url) -> None:
+    """Empty messages do not break pagination or reconstruction."""
+    conv = uuid.uuid4()
+    _conv_insert(migrated_url, conv)
+    _msg_insert(migrated_url, conv, uuid.uuid4(), 1, "")
+    _msg_insert(migrated_url, conv, uuid.uuid4(), 2, "nonempty")
+
+    page = await aread_conversation_content(
+        factory, conv, server_id=SERVER_A, max_chars=100
+    )
+    assert len(page.items) == 2
+    assert page.items[0].content == ""
+    assert page.items[1].content == "nonempty"
+    assert page.has_more is False
+
+
+@pytest.mark.anyio
+async def test_conversation_content_redaction_preserved(
+    factory, migrated_url
+) -> None:
+    """Redacted flag and content_ref are preserved verbatim."""
+    conv = uuid.uuid4()
+    msg = uuid.uuid4()
+    _conv_insert(migrated_url, conv)
+    _msg_insert(
+        migrated_url, conv, msg, 1, "secret",
+        redacted=True, content_ref="vault://abc123",
+    )
+
+    page = await aread_conversation_content(
+        factory, conv, server_id=SERVER_A, max_chars=100
+    )
+    assert page.items[0].redacted is True
+    assert page.items[0].content_ref == "vault://abc123"
+
+
+@pytest.mark.anyio
+async def test_conversation_content_scope_isolation(factory, migrated_url) -> None:
+    """Cross-server conversation read fails closed."""
+    conv = uuid.uuid4()
+    _conv_insert(migrated_url, conv, server_id=SERVER_B)
+    _msg_insert(migrated_url, conv, uuid.uuid4(), 1, "private")
+
+    with pytest.raises(ValueError, match="not found"):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A, max_chars=100
+        )
+
+
+@pytest.mark.anyio
+async def test_conversation_content_invalid_bounds(factory, migrated_url) -> None:
+    """Invalid offset/char_cursor/max_chars fail closed."""
+    conv = uuid.uuid4()
+    msg = uuid.uuid4()
+    _conv_insert(migrated_url, conv)
+    _msg_insert(migrated_url, conv, msg, 1, "abc")
+
+    with pytest.raises(ValueError):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A, max_chars=0
+        )
+    with pytest.raises(ValueError):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A, offset=-1
+        )
+    with pytest.raises(ValueError):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A, char_cursor=-1
+        )
+    with pytest.raises(ValueError):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A, char_cursor=100
         )
