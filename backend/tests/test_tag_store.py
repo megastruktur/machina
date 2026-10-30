@@ -44,9 +44,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mai.database import create_app_engine
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
+    SYSTEM_ASSIGNMENT_SOURCE,
     EntityTagPreview,
     TagErrorCode,
     TagStoreError,
+    aclassify_terminal_job,
     acreate_tag,
     adelete_tag,
     aassign_conversation_tag,
@@ -702,3 +704,143 @@ async def test_concurrent_force_delete_vs_remover_typed_last_tag(
     )
     assert len(remaining) == 1
     assert remaining[0][0] in (keeper.tag_id, doomed.tag_id)
+
+
+# ---------------------------------------------------------------------------
+# terminal classification (W5A4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_terminal_replaces_system_unclassified(
+    factory, migrated_url
+) -> None:
+    _insert_job(migrated_url, JOB_A)  # system-sourced unclassified default
+    terminal = await acreate_tag(factory, name="deploy ops")
+    result = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    assert result.classified is True
+    assert result.reason == "classified"
+    assert result.tag_id == terminal.tag_id
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert [row[0] for row in rows] == [terminal.tag_id]
+
+
+@pytest.mark.anyio
+async def test_terminal_repeat_is_idempotent(factory, migrated_url) -> None:
+    _insert_job(migrated_url, JOB_A)
+    terminal = await acreate_tag(factory, name="deploy ops")
+    first = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    second = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    assert first.classified is True and first.reason == "classified"
+    assert second.classified is False
+    assert second.reason == "already_classified"
+    assert second.tag_id == terminal.tag_id
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert [row[0] for row in rows] == [terminal.tag_id]  # no duplicate insert
+
+
+@pytest.mark.anyio
+async def test_terminal_noop_when_meaningful_tags_present(
+    factory, migrated_url
+) -> None:
+    _insert_job(migrated_url, JOB_A)
+    ops = await acreate_tag(factory, name="ops")
+    terminal = await acreate_tag(factory, name="deploy ops")
+    await aassign_job_tag(factory, JOB_A, ops.tag_id, server_id=SERVER_A)
+    result = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    assert result.classified is False
+    assert result.reason == "meaningful_tags_present"
+    assert result.tag_id == terminal.tag_id
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert {row[0] for row in rows} == {
+        uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+        ops.tag_id,
+    }
+
+
+@pytest.mark.anyio
+async def test_terminal_removes_leftover_system_unclassified(
+    factory, migrated_url
+) -> None:
+    _insert_job(migrated_url, JOB_A)
+    terminal = await acreate_tag(factory, name="deploy ops")
+    await aassign_job_tag(factory, JOB_A, terminal.tag_id, server_id=SERVER_A)
+    result = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    assert result.classified is True
+    assert result.reason == "removed_system_unclassified"
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert [row[0] for row in rows] == [terminal.tag_id]
+
+
+@pytest.mark.anyio
+async def test_user_unclassified_row_is_preserved(factory, migrated_url) -> None:
+    _insert_job(migrated_url, JOB_A)
+    with psycopg.connect(migrated_url) as conn:
+        conn.execute(
+            "UPDATE job_tags SET assignment_source = 'user' WHERE job_id = %s",
+            (JOB_A,),
+        )
+        conn.commit()
+    terminal = await acreate_tag(factory, name="deploy ops")
+    result = await aclassify_terminal_job(
+        factory, JOB_A, server_id=SERVER_A, terminal_tag_name="deploy ops"
+    )
+    assert result.classified is True
+    assert result.reason == "classified"
+    rows = _rows(
+        migrated_url,
+        "SELECT tag_id, assignment_source FROM job_tags WHERE job_id = %s",
+        (JOB_A,),
+    )
+    assert {(row[0], row[1]) for row in rows} == {
+        (terminal.tag_id, SYSTEM_ASSIGNMENT_SOURCE),
+        (uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID), "user"),
+    }
+
+
+@pytest.mark.anyio
+async def test_unknown_terminal_tag_is_refused(factory, migrated_url) -> None:
+    _insert_job(migrated_url, JOB_A)
+    with pytest.raises(TagStoreError) as excinfo:
+        await aclassify_terminal_job(
+            factory, JOB_A, server_id=SERVER_A, terminal_tag_name="ghost ops"
+        )
+    assert excinfo.value.code is TagErrorCode.TAG_NOT_FOUND
+    assert excinfo.value.field == "terminal_tag_name"
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert [row[0] for row in rows] == [uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)]
+
+
+@pytest.mark.anyio
+async def test_terminal_classify_is_server_scoped(factory, migrated_url) -> None:
+    _insert_job(migrated_url, JOB_A, SERVER_A)
+    await acreate_tag(factory, name="deploy ops")
+    with pytest.raises(TagStoreError) as excinfo:
+        await aclassify_terminal_job(
+            factory, JOB_A, server_id=SERVER_B, terminal_tag_name="deploy ops"
+        )
+    assert excinfo.value.code is TagErrorCode.ENTITY_NOT_FOUND
+    rows = _rows(
+        migrated_url, "SELECT tag_id FROM job_tags WHERE job_id = %s", (JOB_A,)
+    )
+    assert [row[0] for row in rows] == [uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)]
