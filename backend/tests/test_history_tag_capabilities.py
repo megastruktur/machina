@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import uuid
 
+import psycopg
 import pytest
 
 from pydantic import ValidationError
@@ -39,6 +40,12 @@ from mai.capabilities.internal_api import (
     assert_agent_ready_descriptor,
 )
 from mai.policy.evaluate import ExecutionContext, PolicyMode
+from mai.tag_store import (
+    RESERVED_UNCLASSIFIED_TAG_ID,
+    acreate_tag,
+    atags_for_conversation,
+    atags_for_job,
+)
 
 # Reused disposable-Postgres harness/fixtures (session-scoped migrated
 # database + per-test cleaned sessions). Imported unused-on-purpose: the
@@ -241,8 +248,8 @@ class TestPayloadRuntimeContract:
 
 
 # ---------------------------------------------------------------------------
-# AC 2 — W4A1 executors are honest placeholders: every operation call is
-# refused ``unavailable``, with or without a valid store available
+# AC 2 — fail-closed surfaces: no factory refuses everything; the wired
+# store refuses only ``tags.list_for`` (the honest W4A3 placeholder)
 # ---------------------------------------------------------------------------
 
 
@@ -259,18 +266,18 @@ class TestUnavailableExecutors:
             assert document["status"] == "refused"
             assert document["code"] == "unavailable"
 
-    async def test_refuses_unavailable_even_with_store_available(
-        self, sessions
-    ) -> None:
+    async def test_list_for_stays_unavailable_until_w4a3(self, sessions) -> None:
         composition = build_history_tag_capabilities(session_factory=sessions)
         context = _context(SERVER_A, uuid.uuid4())
-        for capability_id, payload in _minimal_payloads().items():
-            result, document = await _execute(
-                composition, capability_id, payload, context
-            )
-            assert result.ok is False  # type: ignore[attr-defined]
-            assert document["status"] == "refused"
-            assert document["code"] == "unavailable"
+        result, document = await _execute(
+            composition,
+            TAGS_LIST_FOR_CAPABILITY,
+            _minimal_payloads()[TAGS_LIST_FOR_CAPABILITY],
+            context,
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -351,3 +358,262 @@ class TestResolveCurrentTarget:
                 sessions, _context(SERVER_C, uuid.uuid4()), "conversation"
             )
         assert excinfo.value.code == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# AC 4 — W4A2 store wiring: real job + active-conversation assign/remove
+# (replacement/final-tag, scope invisibility, typed refusals, idempotence)
+# ---------------------------------------------------------------------------
+
+
+def _insert_job(
+    url: str, job_id: uuid.UUID, server_id: uuid.UUID = uuid.UUID(SERVER_A)
+) -> None:
+    """One real job_runs row seeded with the reserved unclassified tag."""
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            """
+            INSERT INTO job_runs
+                (run_id, server_id, depth, profile_revision, prompt_revision,
+                 model_profile, requested_grants)
+            VALUES (%s, %s, 0, 1, 1, 'profile', '[]'::jsonb)
+            """,
+            (job_id, server_id),
+        )
+        conn.execute(
+            "INSERT INTO job_tags (job_id, tag_id) VALUES (%s, %s)",
+            (job_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+@pytest.mark.anyio
+class TestAssignRemoveWired:
+    async def test_job_assign_persists_agent_principal_and_is_idempotent(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)
+        tag = await acreate_tag(sessions, name=f"w4a2-job-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+        payload = {"target": "job", "tag_id": str(tag.tag_id)}
+
+        result, document = await _execute(
+            composition, TAGS_ASSIGN_CAPABILITY, payload, context
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document == {
+            "status": "ok",
+            "ok": True,
+            "target": "job",
+            "entity_id": str(run_id),
+            "tag_id": str(tag.tag_id),
+        }
+
+        rows, total = await atags_for_job(
+            sessions, run_id, server_id=uuid.UUID(SERVER_A)
+        )
+        assert total == 2  # reserved seed + the agent assignment
+        assigned = [row for row in rows if row.tag_id == tag.tag_id]
+        assert len(assigned) == 1
+        assert assigned[0].assigned_by == "principal"
+        assert assigned[0].assignment_source == "agent"
+
+        # Re-assignment is an idempotent no-op with the same page.
+        result, _ = await _execute(
+            composition, TAGS_ASSIGN_CAPABILITY, payload, context
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        _, total_again = await atags_for_job(
+            sessions, run_id, server_id=uuid.UUID(SERVER_A)
+        )
+        assert total_again == 2
+
+    async def test_conversation_assign_targets_the_active_link(
+        self, sessions
+    ) -> None:
+        conversation = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_A)
+        )
+        run_id = uuid.uuid4()
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_A),
+            run_id=run_id,
+        )
+        tag = await acreate_tag(sessions, name=f"w4a2-conv-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "conversation", "tag_id": str(tag.tag_id)},
+            _context(SERVER_A, run_id),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["entity_id"] == str(conversation.conversation_id)
+        assert document["target"] == "conversation"
+
+        rows, total = await atags_for_conversation(
+            sessions,
+            conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_A),
+        )
+        assert total >= 1
+        assigned = [row for row in rows if row.tag_id == tag.tag_id]
+        assert len(assigned) == 1
+        assert assigned[0].assignment_source == "agent"
+
+    async def test_remove_swaps_final_tag_with_atomic_replacement(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)  # exactly one tag: reserved seed
+        replacement = await acreate_tag(sessions, name=f"w4a2-repl-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+
+        result, document = await _execute(
+            composition,
+            TAGS_REMOVE_CAPABILITY,
+            {
+                "target": "job",
+                "tag_id": RESERVED_UNCLASSIFIED_TAG_ID,
+                "replacement_tag_id": str(replacement.tag_id),
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document == {
+            "status": "ok",
+            "ok": True,
+            "target": "job",
+            "entity_id": str(run_id),
+            "tag_id": RESERVED_UNCLASSIFIED_TAG_ID,
+            "replacement_tag_id": str(replacement.tag_id),
+        }
+        rows, total = await atags_for_job(
+            sessions, run_id, server_id=uuid.UUID(SERVER_A)
+        )
+        assert total == 1
+        assert rows[0].tag_id == replacement.tag_id
+
+        # Final-tag removal without replacement is refused typed, not raw.
+        result, document = await _execute(
+            composition,
+            TAGS_REMOVE_CAPABILITY,
+            {"target": "job", "tag_id": str(replacement.tag_id)},
+            context,
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "conflict"
+
+    async def test_remove_absent_association_is_idempotent_noop(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)
+        tag = await acreate_tag(sessions, name=f"w4a2-absent-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        payload = {"target": "job", "tag_id": str(tag.tag_id)}
+        context = _context(SERVER_A, run_id)
+
+        for _ in range(2):
+            result, document = await _execute(
+                composition, TAGS_REMOVE_CAPABILITY, payload, context
+            )
+            assert result.ok is True  # type: ignore[attr-defined]
+            assert document["replacement_tag_id"] is None
+        _, total = await atags_for_job(
+            sessions, run_id, server_id=uuid.UUID(SERVER_A)
+        )
+        assert total == 1  # untouched reserved seed
+
+    async def test_cross_server_job_is_invisible(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)  # lives on SERVER_A
+        tag = await acreate_tag(sessions, name=f"w4a2-scope-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "job", "tag_id": str(tag.tag_id)},
+            _context(SERVER_B, run_id),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "not_found"
+
+    async def test_unknown_tag_refuses_typed_not_found(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "job", "tag_id": str(uuid.uuid4())},
+            _context(SERVER_A, run_id),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "not_found"
+
+    async def test_cross_server_conversation_assign_is_refused(
+        self, sessions
+    ) -> None:
+        conversation = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_B)
+        )
+        run_id = uuid.uuid4()
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_B),
+            run_id=run_id,
+        )
+        tag = await acreate_tag(sessions, name=f"w4a2-xconv-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "conversation", "tag_id": str(tag.tag_id)},
+            _context(SERVER_A, run_id),  # intruding from another server
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "not_found"
+
+    async def test_conversation_remove_is_idempotent(self, sessions) -> None:
+        conversation = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_A)
+        )
+        run_id = uuid.uuid4()
+        await aattach_run(
+            sessions,
+            conversation_id=conversation.conversation_id,
+            server_id=uuid.UUID(SERVER_A),
+            run_id=run_id,
+        )
+        tag = await acreate_tag(sessions, name=f"w4a2-convrm-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+        await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "conversation", "tag_id": str(tag.tag_id)},
+            context,
+        )
+        payload = {"target": "conversation", "tag_id": str(tag.tag_id)}
+        for _ in range(2):
+            result, document = await _execute(
+                composition, TAGS_REMOVE_CAPABILITY, payload, context
+            )
+            assert result.ok is True  # type: ignore[attr-defined]
+            assert document["entity_id"] == str(conversation.conversation_id)
+            assert document["replacement_tag_id"] is None

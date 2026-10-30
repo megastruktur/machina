@@ -1,13 +1,13 @@
-"""History-tag capability surface for the chat agent (W4A1 scaffold).
+"""History-tag capability surface for the chat agent (W4A2 store wiring).
 
-W4A1 scope ONLY: the three public ``tags.*`` capability declarations
-(``tags.assign``, ``tags.remove``, ``tags.list_for``) with agent-ready,
-bounded payload contracts, the fail-closed composition builder, and the
-current-target resolver shared by the later store wiring. Every operation
-executor is an honest placeholder: each call is refused ``unavailable``
-until the tag-store wiring lands (W4A2+), regardless of store
-availability. No ``tag_store`` access, no registration, and no
-catalog/history/UI surface belong to this card.
+W4A2 scope: ``tags.assign`` and ``tags.remove`` are wired to the typed
+tag store — the current target is resolved per execution (the run itself
+for ``job``; the ONE active same-server conversation link for
+``conversation``), every classified store failure is projected onto a
+value-free refused envelope, and both operations stay idempotent with
+atomic replacement support on remove. ``tags.list_for`` remains an
+honest ``unavailable`` placeholder until W4A3. No registration,
+catalog, or history/UI surface belongs to this card.
 """
 
 from __future__ import annotations
@@ -32,6 +32,14 @@ from mai.capabilities.internal_api import (
 )
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
+from mai.tag_store import (
+    TagErrorCode,
+    TagStoreError,
+    aassign_conversation_tag,
+    aassign_job_tag,
+    aremove_conversation_tag,
+    aremove_job_tag,
+)
 
 TAGS_ASSIGN_CAPABILITY: Final[str] = "tags.assign"
 TAGS_REMOVE_CAPABILITY: Final[str] = "tags.remove"
@@ -127,7 +135,29 @@ class TagsListForPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Current-target resolution (shared by the later store wiring)
+# Typed store failures → value-free wire refusals (W4A2)
+# ---------------------------------------------------------------------------
+
+
+#: Frozen mapping: every classified store failure has exactly one wire code.
+_TAG_STORE_WIRE_CODES: Final[Mapping[TagErrorCode, str]] = {
+    TagErrorCode.VALIDATION: "invalid_request",
+    TagErrorCode.TAG_NOT_FOUND: "not_found",
+    TagErrorCode.ENTITY_NOT_FOUND: "not_found",
+    TagErrorCode.LAST_TAG: "conflict",
+    TagErrorCode.TAG_IN_USE: "conflict",
+    TagErrorCode.RESERVED_TAG: "conflict",
+    TagErrorCode.INVARIANT_VIOLATION: "conflict",
+}
+
+
+def _tags_refusal(exc: TagStoreError) -> InternalApiError:
+    """Project one classified store failure onto the refused envelope."""
+    return InternalApiError(_TAG_STORE_WIRE_CODES[exc.code], str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Current-target resolution (shared by assign/remove/list_for wiring)
 # ---------------------------------------------------------------------------
 
 
@@ -179,13 +209,14 @@ def build_history_tag_capabilities(
     *,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> InternalApiComposition:
-    """Build the ``tags.*`` descriptors + executors (W4A1 scaffold).
+    """Build the ``tags.*`` descriptors + executors (W4A2 wiring).
 
-    ``session_factory`` is accepted for the later store wiring and is
-    deliberately unused here: every operation executor refuses with
-    ``unavailable`` regardless of store availability (the fail-closed
-    scaffold contract). Descriptors are validated fail-closed at build
-    time (``assert_agent_ready_descriptor`` via :func:`build_descriptor`).
+    ``tags.assign`` and ``tags.remove`` resolve the current target and
+    write through the typed tag store (idempotent, scope-checked); they
+    refuse ``unavailable`` only when no ``session_factory`` is wired.
+    ``tags.list_for`` remains an honest ``unavailable`` placeholder
+    until W4A3. Descriptors are validated fail-closed at build time
+    (``assert_agent_ready_descriptor`` via :func:`build_descriptor`).
     """
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
 
@@ -209,7 +240,42 @@ def build_history_tag_capabilities(
     async def _tags_assign(
         call: CapabilityCall, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        raise InternalApiError("unavailable", "not implemented in W4A1")
+        if session_factory is None:
+            raise InternalApiError("unavailable", "tag store is not configured")
+        target: Literal["job", "conversation"] = (
+            "job" if payload["target"] == "job" else "conversation"
+        )
+        tag_id = uuid.UUID(str(payload["tag_id"]))
+        try:
+            entity_id = await _aresolve_current_target(
+                session_factory, call.context, target
+            )
+            if target == "job":
+                await aassign_job_tag(
+                    session_factory,
+                    entity_id,
+                    tag_id,
+                    server_id=call.context.server_id,
+                    assigned_by=call.context.principal,
+                    assignment_source="agent",
+                )
+            else:
+                await aassign_conversation_tag(
+                    session_factory,
+                    entity_id,
+                    tag_id,
+                    server_id=call.context.server_id,
+                    assigned_by=call.context.principal,
+                    assignment_source="agent",
+                )
+        except TagStoreError as exc:
+            raise _tags_refusal(exc) from exc
+        return {
+            "ok": True,
+            "target": target,
+            "entity_id": str(entity_id),
+            "tag_id": str(tag_id),
+        }
 
     operations.append(_tags_assign)
 
@@ -234,7 +300,47 @@ def build_history_tag_capabilities(
     async def _tags_remove(
         call: CapabilityCall, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        raise InternalApiError("unavailable", "not implemented in W4A1")
+        if session_factory is None:
+            raise InternalApiError("unavailable", "tag store is not configured")
+        target: Literal["job", "conversation"] = (
+            "job" if payload["target"] == "job" else "conversation"
+        )
+        tag_id = uuid.UUID(str(payload["tag_id"]))
+        raw_replacement = payload.get("replacement_tag_id")
+        replacement_tag_id = (
+            uuid.UUID(str(raw_replacement)) if raw_replacement is not None else None
+        )
+        try:
+            entity_id = await _aresolve_current_target(
+                session_factory, call.context, target
+            )
+            if target == "job":
+                await aremove_job_tag(
+                    session_factory,
+                    entity_id,
+                    tag_id,
+                    server_id=call.context.server_id,
+                    replacement_tag_id=replacement_tag_id,
+                )
+            else:
+                await aremove_conversation_tag(
+                    session_factory,
+                    entity_id,
+                    tag_id,
+                    server_id=call.context.server_id,
+                    replacement_tag_id=replacement_tag_id,
+                )
+        except TagStoreError as exc:
+            raise _tags_refusal(exc) from exc
+        return {
+            "ok": True,
+            "target": target,
+            "entity_id": str(entity_id),
+            "tag_id": str(tag_id),
+            "replacement_tag_id": (
+                str(replacement_tag_id) if replacement_tag_id is not None else None
+            ),
+        }
 
     operations.append(_tags_remove)
 
@@ -258,7 +364,7 @@ def build_history_tag_capabilities(
     async def _tags_list_for(
         call: CapabilityCall, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        raise InternalApiError("unavailable", "not implemented in W4A1")
+        raise InternalApiError("unavailable", "not implemented until W4A3")
 
     operations.append(_tags_list_for)
 
