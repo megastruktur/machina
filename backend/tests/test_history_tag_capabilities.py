@@ -10,6 +10,7 @@ linear Alembic chain from zero); without it those tests skip.
 
 from __future__ import annotations
 
+import inspect
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -2666,3 +2667,72 @@ class TestReadJobContent:
             assert result.ok is False  # type: ignore[attr-defined]
             assert document["status"] == "refused"
             assert document["code"] == "invalid_request"
+
+
+# ---------------------------------------------------------------------------
+# W4D — composition registration (builder identity + source wiring)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+class TestW4DCompositionRegistration:
+    def test_builder_maps_exactly_the_ten_unique_tag_ids(self) -> None:
+        """The builder surface is exactly the 10 unique ``tags.*`` IDs."""
+        composition = _composition()
+        assert len(TAGS_CAPABILITY_IDS) == 10
+        assert len(set(TAGS_CAPABILITY_IDS)) == 10
+        assert len(composition.descriptors) == 10
+        by_id = {d.identifier: d for d in composition.descriptors}
+        assert set(by_id) == set(TAGS_CAPABILITY_IDS)
+        assert set(composition.executors) == set(TAGS_CAPABILITY_IDS)
+        for capability_id in TAGS_CAPABILITY_IDS:
+            assert by_id[capability_id].identifier == capability_id
+            assert callable(composition.executors[capability_id])
+
+    def test_api_merges_history_tags_into_the_same_composition(self) -> None:
+        """create_app builds with app.state.session_factory and merges the
+        tags descriptors/executors into the ONE InternalApiComposition
+        alongside internal_api/task_state (source policy; no runtime)."""
+        from mai.api import app as app_module
+
+        src = inspect.getsource(app_module._lifespan)
+        assert (
+            "_history_tags = build_history_tag_capabilities(\n"
+            "            session_factory=app.state.session_factory,\n"
+            "        )"
+        ) in src
+        assert (
+            "descriptors=(\n"
+            "                *app.state.internal_api.descriptors,\n"
+            "                *_task_state.descriptors,\n"
+            "                *_history_tags.descriptors,\n"
+            "            ),"
+        ) in src
+        assert (
+            "executors={\n"
+            "                **app.state.internal_api.executors,\n"
+            "                **_task_state.executors,\n"
+            "                **_history_tags.executors,\n"
+            "            },"
+        ) in src
+
+    def test_worker_registers_executes_and_grants_history_tags(self) -> None:
+        """_configure_default_agent_runtime builds with sessions, registers
+        every descriptor, merges every executor, and auto-grants the tags
+        IDs to enrolled_servers incl. UUID-zero General Consult."""
+        from mai.jobs import worker as worker_module
+
+        src = inspect.getsource(
+            worker_module._configure_default_agent_runtime
+        )
+        assert (
+            "history_tags = "
+            "build_history_tag_capabilities(session_factory=sessions)"
+        ) in src
+        assert "for desc in history_tags.descriptors:" in src
+        assert "registry.register(desc)" in src
+        assert "**history_tags.executors," in src
+        assert "*TAGS_CAPABILITY_IDS," in src
+        assert (
+            "grants.setdefault(cap_id, set()).update(enrolled_servers)"
+        ) in src

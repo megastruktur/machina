@@ -132,6 +132,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         INTERNAL_API_CAPABILITY_IDS,
         build_internal_api_capabilities,
     )
+    from mai.capabilities.history_tags import (
+        TAGS_CAPABILITY_IDS,
+        build_history_tag_capabilities,
+    )
     from mai.capabilities.task_state import (
         TASK_STATE_CAPABILITY_IDS,
         build_task_state_capabilities,
@@ -353,6 +357,15 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     for desc in task_state.descriptors:
         registry.register(desc)
 
+    # History-tag agent tools (W4D): the SAME composition seam the API
+    # process uses (``app.state.internal_api``) — descriptors registered
+    # fail-closed at build time, executors merged into the one dispatch
+    # map. ``sessions`` is always composed here (the worker owns the
+    # database), so the unavailable fallback never applies.
+    history_tags = build_history_tag_capabilities(session_factory=sessions)
+    for desc in history_tags.descriptors:
+        registry.register(desc)
+
     async def _upsert_map_cap(call: CapabilityCall) -> ExecutorResult:
         if service_map_store is None:
             return ExecutorResult(
@@ -378,6 +391,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
         **task_state.executors,
+        **history_tags.executors,
     }
     plugin_executors: dict[str, object] = {}
     # Capability identifier → owning loaded NativePlugin (built-ins are
@@ -603,13 +617,15 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
         # app.delete_map_entry, chat.read_session), the task-state agent
         # tools (run-identity scoped: another conversation's task is
-        # invisible, no arbitrary cross-task selection) and
+        # invisible, no arbitrary cross-task selection), the history-tag
+        # tools (tags.*: run-identity scoped like the task tools) and
         # controller-side web research capabilities (web.search,
         # web.read) to every enrolled server and General Consult so they
         # work out of the box.
         for cap_id in (
             *INTERNAL_API_CAPABILITY_IDS,
             *TASK_STATE_CAPABILITY_IDS,
+            *TAGS_CAPABILITY_IDS,
             "web.search",
             "web.read",
         ):
