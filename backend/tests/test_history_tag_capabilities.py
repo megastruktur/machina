@@ -2137,6 +2137,41 @@ class TestReadConversationContent:
         assert len({document["message"] for document in documents}) == 1
         assert documents[0]["message"] == "conversation not found"
 
+    async def test_char_cursor_beyond_message_is_invalid_request(
+        self, sessions, migrated_url
+    ) -> None:
+        """Same-server cursor past message length refuses invalid_request,
+        while cross-server/missing conversations stay not_found."""
+        conv, msg = uuid.uuid4(), uuid.uuid4()
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _msg_insert(migrated_url, conv, msg, 1, "short")
+
+        result, document = await _read(
+            sessions,
+            {"conversation_id": str(conv), "char_cursor": 100},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_request"
+        assert document["message"] == (
+            "char_cursor is beyond the stored message content; "
+            "retry with a returned continuation cursor"
+        )
+
+        conv_b = uuid.uuid4()
+        _conv_insert(migrated_url, conv_b, uuid.UUID(SERVER_B))
+        for other_id in (conv_b, uuid.uuid4()):
+            result, document = await _read(
+                sessions,
+                {"conversation_id": str(other_id), "char_cursor": 100},
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "not_found"
+            assert document["message"] == "conversation not found"
+
     async def test_invalid_bounds_refuse_invalid_request(
         self, sessions
     ) -> None:

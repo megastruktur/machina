@@ -876,6 +876,14 @@ def build_history_tag_capabilities(
                 max_chars=max_chars,
             )
         except ValueError as exc:
+            if "beyond stored message length" in str(exc):
+                # A stale/explicit char_cursor past the stored message
+                # content is a caller error, not a missing conversation.
+                raise InternalApiError(
+                    "invalid_request",
+                    "char_cursor is beyond the stored message content; "
+                    "retry with a returned continuation cursor",
+                ) from exc
             # One fixed value-free refusal: a missing and another
             # server's conversation are indistinguishable on the wire.
             raise InternalApiError(
