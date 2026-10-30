@@ -68,6 +68,8 @@ from mai.jobs.resource_locks import (
 )
 from mai.policy.approvals import ApprovalRequest, ApprovalStore
 from mai.policy.evaluate import ExecutionContext, PolicyMode
+from mai.tag_store import acreate_tag
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -402,11 +404,21 @@ def _drop_app_tables(url: str) -> None:
     """
     with psycopg.connect(url) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
+            "DROP TABLE IF EXISTS tags, job_tags, job_resource_locks, "
+            "job_schedule_fires, job_schedules, job_events, job_steps, "
+            "job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "admin_credential, notification_alerts, observation_findings, "
+            "server_observations, knowledge_doc_chunks, knowledge_documents, "
+            "application_projection_journal, application_projection, "
+            "conversation_steering, conversation_runs, conversation_tags, "
+            "conversation_messages, conversations, "
+            "agent_task_completions, agent_task_revisions, "
+            "agent_task_evidence, agent_task_criteria, "
+            "agent_task_constraints, agent_task_steps, agent_tasks, "
+            "alembic_version"
         )
+        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -501,6 +513,29 @@ def _seed_step(
             ),
         )
         conn.commit()
+
+
+TERMINAL_TAG_NAMES = ("succeeded", "failed", "cancelled")
+
+
+def _seed_terminal_catalog(factory, names=TERMINAL_TAG_NAMES) -> None:
+    """Idempotently create the terminal catalog tags (sync seam)."""
+    async def _seed() -> None:
+        for name in names:
+            await acreate_tag(factory, name=name)
+
+    asyncio.run(_seed())
+
+
+def _read_job_tag_names(url: str, run_id: str) -> list[str]:
+    """The run's assigned tag names, ordered (assertion seam)."""
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT t.name FROM job_tags jt JOIN tags t ON t.tag_id = jt.tag_id "
+            "WHERE jt.job_id = %s ORDER BY t.name",
+            (uuid.UUID(run_id),),
+        ).fetchall()
+    return [row["name"] for row in rows]
 
 
 def _anchor_running(factory, insert_run, run_id: str) -> RunLifecycle:
@@ -612,6 +647,7 @@ def factory(recovery_url: str) -> async_sessionmaker:
                 "job_schedule_fires",
                 "job_steps",
                 "job_events",
+                "job_tags",
                 "job_schedules",
                 "job_runs",
                 "approvals",
@@ -634,6 +670,8 @@ def factory(recovery_url: str) -> async_sessionmaker:
 def insert_run(factory):
     async def _insert(run_id: str) -> None:
         async with factory() as session:
+            # Production submit shape: the run row AND its system
+            # ``unclassified`` assignment land in the SAME transaction.
             await session.execute(
                 text(
                     """
@@ -647,6 +685,21 @@ def insert_run(factory):
                     """
                 ),
                 {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID)},
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO job_tags (job_id, tag_id, assigned_by,
+                                          assignment_source)
+                    VALUES (:j, :t, '', :src)
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "j": uuid.UUID(run_id),
+                    "t": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                    "src": SYSTEM_ASSIGNMENT_SOURCE,
+                },
             )
             await session.commit()
 
@@ -828,6 +881,7 @@ class TestInspection:
     ) -> None:
         open_run = str(uuid.uuid4())
         done_run = str(uuid.uuid4())
+        _seed_terminal_catalog(factory)
         _anchor_running(factory, insert_run, open_run)
         _seed_step(recovery_url, open_run, 1, "outcome_unknown", {"v": 1})
         lifecycle = _anchor_running(factory, insert_run, done_run)
@@ -1049,6 +1103,9 @@ class TestCertifyAndPark:
         _seed_step(recovery_url, run_id, 2, "outcome_unknown", {"v": 1})
         inspection = _run(wired.apark_uncertain(run_id))
         assert inspection.run_state is RunState.RECONCILING
+        # RECONCILING is non-terminal: the system unclassified tag stays
+        # and no terminal tag appears.
+        assert _read_job_tag_names(recovery_url, run_id) == ["unclassified"]
         rows = _read_step_rows(recovery_url, run_id)
         assert [r["state"] for r in rows] == ["outcome_unknown", "outcome_unknown"]
         events = _read_events(recovery_url, run_id)
@@ -1062,6 +1119,8 @@ class TestCertifyAndPark:
         assert again.run_state is RunState.RECONCILING
         events = _read_events(recovery_url, run_id)
         assert len([e for e in events if e["type"] == "run.recovery_parked"]) == 1
+        # The second park leaves the tag assignment unchanged.
+        assert _read_job_tag_names(recovery_url, run_id) == ["unclassified"]
 
     def test_park_on_terminal_run_is_a_no_op(
         self, recovery_url, factory, insert_run, wired
@@ -1069,11 +1128,15 @@ class TestCertifyAndPark:
         run_id = str(uuid.uuid4())
         lifecycle = _anchor_running(factory, insert_run, run_id)
         _seed_step(recovery_url, run_id, 1, "outcome_unknown", {"v": 1})
+        _seed_terminal_catalog(factory)
         _run(lifecycle.record_transition(run_id, RunState.CANCELLED))
+        assert _read_job_tag_names(recovery_url, run_id) == ["cancelled"]
         inspection = _run(wired.apark_uncertain(run_id))
         assert inspection.run_state is RunState.CANCELLED
         row = _read_step_row(recovery_url, run_id, 1)
         assert row["state"] == "outcome_unknown"  # terminal stays immutable
+        # The orphan park is a no-op: cancelled stays the exact terminal tag.
+        assert _read_job_tag_names(recovery_url, run_id) == ["cancelled"]
 
 
 # ---------------------------------------------------------------------------
@@ -1135,9 +1198,12 @@ class TestEngineOutcome:
                 RUN_TIMEOUT,
                 "engine success",
             )
+            _seed_terminal_catalog(factory)
             applied = _run(wired.aapply_engine_outcome(run_id))
             assert applied is RunState.SUCCEEDED
             assert _run(_current_state(factory, run_id)) == "succeeded"
+            # The lag repair swapped unclassified for the exact terminal tag.
+            assert _read_job_tag_names(recovery_url, run_id) == ["succeeded"]
             # Idempotent: terminal is immutable, the second apply no-ops.
             assert _run(wired.aapply_engine_outcome(run_id)) is RunState.SUCCEEDED
         finally:
@@ -1154,6 +1220,7 @@ class TestEngineOutcome:
         try:
             worker = _spawn_worker(recovery_url, scenario / "handlers", scenario, "w1")
             _run(insert_run(run_id))
+            _seed_terminal_catalog(factory)
             lifecycle = RunLifecycle(factory)
             _run(lifecycle.record_transition(run_id, RunState.QUEUED))
             _run(lifecycle.record_transition(run_id, RunState.RUNNING))
@@ -1163,9 +1230,12 @@ class TestEngineOutcome:
                 RUN_TIMEOUT,
                 "engine failure",
             )
+            _seed_terminal_catalog(factory)
             applied = _run(wired.aapply_engine_outcome(run_id))
             assert applied is RunState.FAILED
             assert _run(_current_state(factory, run_id)) == "failed"
+            # The lag repair swapped unclassified for the exact terminal tag.
+            assert _read_job_tag_names(recovery_url, run_id) == ["failed"]
         finally:
             if worker is not None:
                 _stop(worker)
@@ -1193,6 +1263,7 @@ class TestEngineOutcome:
                 RUN_TIMEOUT,
                 "engine cancel",
             )
+            _seed_terminal_catalog(factory)
             applied = _run(wired.aapply_engine_outcome(run_id))
             assert applied is RunState.CANCELLED
             assert _run(_current_state(factory, run_id)) == "cancelled"
@@ -1263,6 +1334,7 @@ class TestCancelSafety:
             worker = _spawn_worker(recovery_url, scenario / "handlers", scenario, "w1")
             gate = scenario / "gates" / "cancel-gate"
             _run(insert_run(run_id))
+            _seed_terminal_catalog(factory)
             lifecycle = RunLifecycle(factory)
             _run(lifecycle.record_transition(run_id, RunState.QUEUED))
             _run(lifecycle.record_transition(run_id, RunState.RUNNING))
@@ -1397,6 +1469,7 @@ class TestCancelDuringApprovalWait:
         try:
             worker = _spawn_worker(recovery_url, scenario / "handlers", scenario, "w1")
             _run(insert_run(run_id))
+            _seed_terminal_catalog(factory)
             client.enqueue_run(run_id, steps.HANDLER_NAME, _canonical(document))
             _wait_until(
                 lambda: _run(_current_state(factory, run_id)) == "waiting_approval",
