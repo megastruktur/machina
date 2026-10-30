@@ -67,6 +67,8 @@ from mai.contracts.conversations import (
     MessageSourceKind,
     SteerAction,
 )
+from mai.tag_store import aassign_conversation_tag, acreate_tag
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -546,6 +548,19 @@ async def _seed_legacy_conversation(
             ),
             {"rid": run_id, "sid": server_id},
         )
+        # 0011 mandatory-tag invariant: the reserved classification rides
+        # the SAME transaction as the run row, exactly like the real
+        # submit writer (a bare run insert cannot commit).
+        await session.execute(
+            text(
+                "INSERT INTO job_tags (job_id, tag_id, assignment_source) "
+                "VALUES (:rid, :tid, 'system')"
+            ),
+            {
+                "rid": run_id,
+                "tid": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+            },
+        )
     async with factory() as session, session.begin():
         await _record_chat_submission(
             session,
@@ -682,6 +697,7 @@ async def test_list_scoped_paginated_deterministic(
         "message_count",
         "active_task_id",
         "active_run_id",
+        "tag_preview",
     }
     assert summary["server_id"] == str(server_a)
     assert summary["message_count"] == 1
@@ -715,6 +731,100 @@ async def test_list_scoped_paginated_deterministic(
     assert other_page.status == 200
     assert other_page.json()["total"] == 1
     assert other_page.json()["items"][0]["server_id"] == str(SERVER_B)
+
+
+# ---------------------------------------------------------------------------
+# bounded tag previews (HT-W6A)
+# ---------------------------------------------------------------------------
+
+
+async def _attach_conversation_tags(
+    app: FastAPI,
+    conversation_id: uuid.UUID,
+    server_id: uuid.UUID,
+    count: int,
+) -> list[str]:
+    """Attach ``count`` uniquely-named tags through the real tag store.
+
+    The reserved ``unclassified`` seed rides along from creation, so the
+    honest full name set is the sorted ``count + 1`` names (deterministic
+    name order is exactly Python's sort here: hex prefixes sort before
+    ``"unclassified"``).
+    """
+    factory = app.state.session_factory
+    prefix = uuid.uuid4().hex[:8]
+    names = [f"{prefix}-{index}" for index in range(count)]
+    for name in names:
+        tag = await acreate_tag(factory, name=name)
+        await aassign_conversation_tag(
+            factory,
+            conversation_id=conversation_id,
+            tag_id=tag.tag_id,
+            server_id=server_id,
+            assigned_by="fixture",
+        )
+    return sorted([*names, "unclassified"])
+
+
+async def test_list_tag_preview_is_bounded_and_honest(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    seeded = await _seed_canonical_conversation(history_app, server_a, title="tagged")
+    all_names = await _attach_conversation_tags(
+        history_app, seeded.conversation_id, server_a, count=4
+    )
+    page = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}",
+        cookies=jar,
+    )
+    assert page.status == 200, page.body
+    summary = page.json()["items"][0]
+    assert set(summary["tag_preview"]) == {"preview", "total"}
+    # Exactly the first 3 names in deterministic name order...
+    assert summary["tag_preview"]["preview"] == all_names[:3]
+    assert len(summary["tag_preview"]["preview"]) == 3
+    # ...plus the honest total (4 assigned + the reserved seed).
+    assert summary["tag_preview"]["total"] == len(all_names)
+
+
+async def test_detail_tag_preview_is_bounded_and_honest(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    seeded = await _seed_canonical_conversation(history_app, server_a, title="tagged")
+    all_names = await _attach_conversation_tags(
+        history_app, seeded.conversation_id, server_a, count=4
+    )
+    response = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations/{seeded.conversation_id}?server_id={server_a}",
+        cookies=jar,
+    )
+    assert response.status == 200, response.body
+    detail = response.json()
+    assert detail["tag_preview"]["preview"] == all_names[:3]
+    assert len(detail["tag_preview"]["preview"]) == 3
+    assert detail["tag_preview"]["total"] == len(all_names)
+
+
+async def test_list_empty_page_stays_honest_without_preview_rows(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    """An offset beyond ``total`` is a clean empty page: no preview rows,
+    no DB errors, and the envelope stays honest."""
+    page = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&offset=50",
+        cookies=jar,
+    )
+    assert page.status == 200, page.body
+    document = page.json()
+    assert document["items"] == []
+    assert document["total"] == 0
+    assert document["has_more"] is False
 
 
 async def test_detail_complete_and_active_references(

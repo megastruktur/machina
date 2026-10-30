@@ -53,7 +53,7 @@ from fastapi import FastAPI
 
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
-from mai.contracts.jobs import RunState
+from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState
 from mai.jobs.engine import EngineClient
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -581,7 +581,12 @@ def _drop_app_tables(url: str) -> None:
             "admin_sessions, admin_credential, alembic_version, "
             "notification_alerts, observation_findings, server_observations, "
             "knowledge_doc_chunks, knowledge_documents, "
-            "application_projection_journal, application_projection, tags"
+            "application_projection_journal, application_projection, "
+            "conversation_steering, conversation_runs, conversation_tags, "
+            "conversation_messages, conversations, "
+            "agent_task_completions, agent_task_revisions, agent_task_evidence, "
+            "agent_task_criteria, agent_task_constraints, agent_task_steps, "
+            "agent_tasks, tags"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
@@ -1193,6 +1198,122 @@ class TestListAndGet:
 
 
 # ---------------------------------------------------------------------------
+# bounded tag previews (HT-W6A)
+# ---------------------------------------------------------------------------
+
+
+def _attach_job_tags(url: str, run_id: uuid.UUID, count: int) -> list[str]:
+    """Attach ``count`` uniquely-named tags to one run through direct SQL.
+
+    The reserved ``unclassified`` seed rides along from submit, so the
+    honest full name set is the sorted ``count + 1`` names (hex prefixes
+    sort before ``"unclassified"``, matching the store's name order).
+    """
+    prefix = uuid.uuid4().hex[:8]
+    names = [f"{prefix}-{index}" for index in range(count)]
+    with psycopg.connect(url) as conn:
+        for name in names:
+            tag_id = uuid.uuid4()
+            conn.execute(
+                "INSERT INTO tags (tag_id, name, description) VALUES (%s, %s, %s)",
+                (tag_id, name, "HT-W6A fixture tag"),
+            )
+            conn.execute(
+                "INSERT INTO job_tags (job_id, tag_id, assigned_by, "
+                "assignment_source) VALUES (%s, %s, 'fixture', 'system')",
+                (run_id, tag_id),
+            )
+        conn.commit()
+    return sorted([*names, "unclassified"])
+
+
+class TestTagPreviews:
+    async def _submit(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> uuid.UUID:
+        run_id = uuid.uuid4()
+        response = await call_app(
+            jobs_app,
+            "POST",
+            "/api/v1/jobs/runs",
+            json_body=_submit_body(run_id, server_a, (READ_CAP, "m1")),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert response.status == 201, response.body
+        return run_id
+
+    async def test_submit_preview_is_the_reserved_classification(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(jobs_app, jar, server_a)
+        listed = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}",
+            cookies=jar,
+        )
+        assert listed.status == 200, listed.body
+        row = listed.json()["runs"][0]
+        assert row["run_id"] == str(run_id)
+        assert row["tag_preview"] == {"preview": ["unclassified"], "total": 1}
+
+    async def test_list_run_tag_preview_is_bounded_and_honest(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(jobs_app, jar, server_a)
+        all_names = _attach_job_tags(os.environ[LIVE_URL_VAR], run_id, count=4)
+        page = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}",
+            cookies=jar,
+        )
+        assert page.status == 200, page.body
+        row = next(
+            run
+            for run in page.json()["runs"]
+            if run["run_id"] == str(run_id)
+        )
+        assert set(row["tag_preview"]) == {"preview", "total"}
+        # Exactly the first 3 names in deterministic name order...
+        assert row["tag_preview"]["preview"] == all_names[:3]
+        assert len(row["tag_preview"]["preview"]) == 3
+        # ...plus the honest total (4 assigned + the reserved seed).
+        assert row["tag_preview"]["total"] == len(all_names)
+
+    async def test_get_run_tag_preview_is_bounded_and_honest(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(jobs_app, jar, server_a)
+        all_names = _attach_job_tags(os.environ[LIVE_URL_VAR], run_id, count=4)
+        detail = await call_app(
+            jobs_app, "GET", f"/api/v1/jobs/runs/{run_id}", cookies=jar
+        )
+        assert detail.status == 200, detail.body
+        body = detail.json()
+        assert body["tag_preview"]["preview"] == all_names[:3]
+        assert len(body["tag_preview"]["preview"]) == 3
+        assert body["tag_preview"]["total"] == len(all_names)
+
+    async def test_list_empty_page_stays_honest_without_preview_rows(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        """An offset beyond ``total`` is a clean empty page: no preview
+        rows, no DB errors, and the envelope stays honest."""
+        page = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&offset=50",
+            cookies=jar,
+        )
+        assert page.status == 200, page.body
+        body = page.json()
+        assert body["runs"] == []
+        assert body["total"] == 0
+
+
+# ---------------------------------------------------------------------------
 # list filters: q text search + date range, applied BEFORE pagination (W1)
 # ---------------------------------------------------------------------------
 
@@ -1371,6 +1492,24 @@ class TestListFilters:
 # ---------------------------------------------------------------------------
 
 
+def _seed_terminal_catalog(url: str) -> None:
+    """Seed the terminal catalog tags the worker's transitions swap into.
+
+    A terminal ``record_transition`` atomically swaps the reserved
+    ``unclassified`` assignment for a catalog tag named after the target
+    state (W5B1); a fresh 0011 catalog only seeds ``unclassified``, so
+    the live engine scenarios seed the terminal rows (idempotent).
+    """
+    with psycopg.connect(url) as conn:
+        for state in TERMINAL_RUN_STATES:
+            conn.execute(
+                "INSERT INTO tags (tag_id, name, description) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (uuid.uuid4(), state.value, "terminal run classification"),
+            )
+        conn.commit()
+
+
 class TestLiveScenario:
     async def test_stream_replay_disconnect_and_completion(
         self,
@@ -1393,6 +1532,7 @@ class TestLiveScenario:
         (scenario / "behavior.json").write_text(
             json.dumps({f"{READ_CAP}:m1": "gate"}), encoding="utf-8"
         )
+        _seed_terminal_catalog(bootstrapped_url)
         # The worker's grant scope must name the MINTED server id.
         _write_policy_files(
             scenario, grants=[{READ_CAP: True, MUTATE_CAP: True}], server=server_a
@@ -1529,6 +1669,7 @@ class TestLiveScenario:
         _write_policy_files(
             scenario, grants=[{READ_CAP: True, MUTATE_CAP: True}], server=server_a
         )
+        _seed_terminal_catalog(bootstrapped_url)
         response = await call_app(
             jobs_app,
             "POST",

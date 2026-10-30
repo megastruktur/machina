@@ -108,6 +108,7 @@ from mai.api.auth import (
     render_error_envelope,
 )
 from mai.auth.sessions import hash_token
+from mai.contracts.conversations import EntityTagPreviewView
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
     TERMINAL_RUN_STATES,
@@ -133,9 +134,23 @@ from mai.jobs.recovery import (
 )
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
 from mai.profiles.files import FileStoreErrorCode, ProfileFileError, StoredProfile
+from mai.tag_store import EntityTagPreview, apreview_job_tags
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 __all__ = ["register_jobs"]
+
+#: Honest empty projection for ids the preview helper could not see
+#: (unknown or cross-server): the field is always present, never null.
+_EMPTY_TAG_PREVIEW: Final[EntityTagPreviewView] = EntityTagPreviewView(
+    preview=[], total=0
+)
+
+
+def _preview_view(found: EntityTagPreview | None) -> EntityTagPreviewView:
+    """Project the store's preview dataclass; absent id → honest empty."""
+    if found is None:
+        return _EMPTY_TAG_PREVIEW
+    return EntityTagPreviewView(preview=list(found.preview), total=found.total)
 
 # ---------------------------------------------------------------------------
 # Transport/facade bounds (module-owned policy, all explicitly bounded)
@@ -243,6 +258,7 @@ class RunView(BaseModel):
     cancel_requested_at: str | None
     submitted_at: str
     updated_at: str
+    tag_preview: EntityTagPreviewView
 
 
 class RunDetail(RunView):
@@ -434,7 +450,11 @@ _RUN_COLUMNS: Final[str] = """
 """
 
 
-def _run_view(row: Mapping[str, object], state: str | None) -> RunView:
+def _run_view(
+    row: Mapping[str, object],
+    state: str | None,
+    tag_preview: EntityTagPreviewView,
+) -> RunView:
     """Type one projected row + replayed state into the wire view."""
     return RunView(
         run_id=str(row["run_id"]),
@@ -456,6 +476,7 @@ def _run_view(row: Mapping[str, object], state: str | None) -> RunView:
         ),
         submitted_at=_wire_ts(row["submitted_at"]),  # type: ignore[arg-type]
         updated_at=_wire_ts(row["updated_at"]),  # type: ignore[arg-type]
+        tag_preview=tag_preview,
     )
 
 
@@ -783,7 +804,19 @@ async def submit_run(request: Request, payload: RunSubmitBody) -> Response:
         row = await _load_run_row(session, run_id)
     assert row is not None  # committed above; absence is a bug
     state = await _replayed_state(lifecycle, run_id)
-    created_view = RunCreated(run=_run_view(row, state), deduplicated=not created)
+    previews = await apreview_job_tags(
+        factory,
+        [uuid.UUID(run_id)],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
+    created_view = RunCreated(
+        run=_run_view(
+            row,
+            state,
+            tag_preview=_preview_view(previews.get(uuid.UUID(run_id))),
+        ),
+        deduplicated=not created,
+    )
     if created:
         return created_view  # the route's 201
     # Duplicate attach: same intent, SAME run — 200, never a second 201.
@@ -916,8 +949,22 @@ async def list_runs(
             "conflict",
             f"persisted run state requires recovery ({exc.code.value})",
         )
+    previews = await apreview_job_tags(
+        factory,
+        [uuid.UUID(r) for r in run_ids],
+        server_id=server_id,
+    )
     return RunPage(
-        runs=[_run_view(row, states[str(row["run_id"])]) for row in rows],
+        runs=[
+            _run_view(
+                row,
+                states[str(row["run_id"])],
+                tag_preview=_preview_view(
+                    previews.get(uuid.UUID(str(row["run_id"])))
+                ),
+            )
+            for row in rows
+        ],
         limit=limit,
         offset=offset,
         total=total,
@@ -968,8 +1015,15 @@ async def read_run(request: Request, run_id: uuid.UUID) -> Response:
             .all()
         )
     state = await _replayed_state(lifecycle, identity)
+    previews = await apreview_job_tags(
+        factory,
+        [run_id],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
     return RunDetail(
-        **_run_view(row, state).model_dump(),
+        **_run_view(
+            row, state, tag_preview=_preview_view(previews.get(run_id))
+        ).model_dump(),
         steps=[
             StepView(
                 seq=int(step_row["seq"]),

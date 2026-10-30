@@ -75,11 +75,26 @@ from mai.contracts.conversations import (
     ConversationErrorCode,
     ConversationSummary,
     ConversationTranscriptPage,
+    EntityTagPreviewView,
     HistoryCompleteness,
     compute_has_more,
 )
+from mai.tag_store import EntityTagPreview, apreview_conversation_tags
 
 __all__ = ["register_conversations"]
+
+#: Honest empty projection for ids the preview helper could not see
+#: (unknown or cross-server): the field is always present, never null.
+_EMPTY_TAG_PREVIEW: Final[EntityTagPreviewView] = EntityTagPreviewView(
+    preview=[], total=0
+)
+
+
+def _preview_view(found: EntityTagPreview | None) -> EntityTagPreviewView:
+    """Project the store's preview dataclass; absent id → honest empty."""
+    if found is None:
+        return _EMPTY_TAG_PREVIEW
+    return EntityTagPreviewView(preview=list(found.preview), total=found.total)
 
 #: Upper bound on the proven-but-unrecoverable submission count (the same
 #: bounded metadata cap ``mai.agents.conversation_context`` uses: the
@@ -486,6 +501,12 @@ async def list_canonical_conversations(
     items, total = await alist_conversations(
         factory, server_id=server_id, limit=limit, offset=offset
     )
+    previews = await apreview_conversation_tags(
+        factory,
+        [row.conversation_id for row in items],
+        server_id=server_id,
+        preview_limit=3,
+    )
     return ConversationListPage(
         limit=limit,
         offset=offset,
@@ -501,6 +522,7 @@ async def list_canonical_conversations(
                 message_count=row.message_count,
                 active_task_id=row.active_task_id,
                 active_run_id=row.active_run_id,
+                tag_preview=_preview_view(previews.get(row.conversation_id)),
             )
             for row in items
         ],
@@ -550,6 +572,12 @@ async def read_canonical_conversation(
                 session, conversation.conversation_id
             )
         gaps = _legacy_gaps(conversation, unrecoverable)
+    previews = await apreview_conversation_tags(
+        _sessions(request),
+        [conversation.conversation_id],
+        server_id=server_id,
+        preview_limit=3,
+    )
     return ConversationDetailView(
         conversation_id=conversation.conversation_id,
         server_id=conversation.server_id,
@@ -559,6 +587,9 @@ async def read_canonical_conversation(
         message_count=await _amessage_count(request, conversation.conversation_id),
         active_task_id=conversation.active_task_id,
         active_run_id=conversation.active_run_id,
+        tag_preview=_preview_view(
+            previews.get(conversation.conversation_id)
+        ),
         history_completeness=conversation.history_completeness,
         missing_range=conversation.missing_range,
         legacy_gaps=gaps,

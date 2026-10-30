@@ -3327,6 +3327,8 @@ export interface components {
              * @description Current durable run, when one is attached (§1)
              */
             active_run_id?: string | null;
+            /** @description Bounded tag name preview plus honest total */
+            tag_preview: components["schemas"]["EntityTagPreviewView"];
             /** @description complete, partial or unavailable; never fabricated (§4) */
             history_completeness: components["schemas"]["HistoryCompleteness"];
             /** @description Missing transcript range when completeness is not complete */
@@ -3562,6 +3564,8 @@ export interface components {
              * @description Current durable run, when one is attached (§1)
              */
             active_run_id?: string | null;
+            /** @description Bounded tag name preview plus honest total */
+            tag_preview: components["schemas"]["EntityTagPreviewView"];
         };
         /**
          * ConversationTranscriptPage
@@ -3717,6 +3721,7 @@ export interface components {
             submitted_at: string;
             /** Updated At */
             updated_at: string;
+            tag_preview: components["schemas"]["EntityTagPreviewView"];
             /** Attachments */
             attachments?: components["schemas"]["AttachmentView"][];
             /** Children */
@@ -3848,6 +3853,22 @@ export interface components {
          * @enum {string}
          */
         DocumentNamespace: "docs" | "runbooks";
+        /**
+         * EntityTagPreviewView
+         * @description Bounded listing projection of tag names plus honest total count.
+         */
+        EntityTagPreviewView: {
+            /**
+             * Preview
+             * @description First ≤3 tag names (deterministic name order)
+             */
+            preview: string[];
+            /**
+             * Total
+             * @description Honest total number of tags attached (including beyond preview)
+             */
+            total: number;
+        };
         /**
          * ErrorBody
          * @description C01 stable error fields (browser-safe; never secret material).
@@ -5470,6 +5491,7 @@ export interface components {
             submitted_at: string;
             /** Updated At */
             updated_at: string;
+            tag_preview: components["schemas"]["EntityTagPreviewView"];
             /** Steps */
             steps: components["schemas"]["StepView"][];
         };
@@ -5570,6 +5592,7 @@ export interface components {
             submitted_at: string;
             /** Updated At */
             updated_at: string;
+            tag_preview: components["schemas"]["EntityTagPreviewView"];
         };
         /**
          * RunbookCatalogPage
