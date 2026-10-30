@@ -3865,7 +3865,7 @@ export interface components {
             preview: string[];
             /**
              * Total
-             * @description Honest total number of tags attached (including beyond preview)
+             * @description Honest total number of tags attached (including beyond preview); at least one tag is mandatory, so 0 is never valid
              */
             total: number;
         };

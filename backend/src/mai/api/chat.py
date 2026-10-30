@@ -157,6 +157,7 @@ from mai.api.jobs import (
     _jobs_services,
     _load_run_row,
     _not_found_run,
+    _preview_view,
     _record_submit_intent,
     _replayed_state,
     _run_view,
@@ -202,6 +203,7 @@ from mai.jobs.recovery import (
     RecoveryErrorCode,
 )
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
+from mai.tag_store import apreview_job_tags
 
 __all__ = ["register_chat", "resolve_artifacts_root"]
 
@@ -1743,6 +1745,13 @@ async def _conversation_view(
         )
         title = await _resolve_chat_title(session, identity, submission_data)
     child_states = await _child_states(factory, children_rows)
+    parent_run_id = uuid.UUID(identity)
+    child_run_ids = [uuid.UUID(str(child["run_id"])) for child in children_rows]
+    previews = await apreview_job_tags(
+        factory,
+        [parent_run_id, *child_run_ids],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
     session_run_id: str | None = None
@@ -1764,10 +1773,20 @@ async def _conversation_view(
         if isinstance(raw_session_run, str) and raw_session_run:
             session_run_id = raw_session_run
     return ConversationView(
-        **_run_view(row, state).model_dump(),
+        **_run_view(
+            row,
+            state,
+            tag_preview=_preview_view(previews.get(parent_run_id)),
+        ).model_dump(),
         attachments=attachments,
         children=[
-            _run_view(child, child_states.get(str(child["run_id"])))
+            _run_view(
+                child,
+                child_states.get(str(child["run_id"])),
+                tag_preview=_preview_view(
+                    previews.get(uuid.UUID(str(child["run_id"])))
+                ),
+            )
             for child in children_rows
         ],
         service_tags=service_tags,

@@ -83,17 +83,18 @@ from mai.tag_store import EntityTagPreview, apreview_conversation_tags
 
 __all__ = ["register_conversations"]
 
-#: Honest empty projection for ids the preview helper could not see
-#: (unknown or cross-server): the field is always present, never null.
-_EMPTY_TAG_PREVIEW: Final[EntityTagPreviewView] = EntityTagPreviewView(
-    preview=[], total=0
-)
-
-
 def _preview_view(found: EntityTagPreview | None) -> EntityTagPreviewView:
-    """Project the store's preview dataclass; absent id → honest empty."""
+    """Project the store's preview dataclass onto the wire view.
+
+    Every in-scope conversation carries at least one tag (the mandatory
+    unclassified seed), so a missing preview after a successful scoped
+    read is a bug — it fails loudly instead of fabricating an empty
+    projection (``total=0`` is contract-invalid).
+    """
     if found is None:
-        return _EMPTY_TAG_PREVIEW
+        raise RuntimeError(
+            "mandatory tag preview missing after a successful scoped read"
+        )
     return EntityTagPreviewView(preview=list(found.preview), total=found.total)
 
 #: Upper bound on the proven-but-unrecoverable submission count (the same

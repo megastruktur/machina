@@ -51,6 +51,7 @@ from alembic.config import Config as AlembicConfig
 from psycopg.rows import dict_row
 from fastapi import FastAPI
 
+from mai.api import jobs as jobs_api
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState
@@ -1311,6 +1312,31 @@ class TestTagPreviews:
         body = page.json()
         assert body["runs"] == []
         assert body["total"] == 0
+
+    async def test_get_run_resolves_the_actual_mandatory_preview(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        """The singleton endpoint converts the REAL store preview: a
+        freshly submitted run carries exactly the reserved unclassified
+        seed (never a fabricated empty projection)."""
+        run_id = await self._submit(jobs_app, jar, server_a)
+        detail = await call_app(
+            jobs_app, "GET", f"/api/v1/jobs/runs/{run_id}", cookies=jar
+        )
+        assert detail.status == 200, detail.body
+        assert detail.json()["tag_preview"] == {
+            "preview": ["unclassified"],
+            "total": 1,
+        }
+
+    def test_missing_mandatory_preview_is_never_an_empty_projection(
+        self,
+    ) -> None:
+        """A successfully scoped read without its mandatory preview is a
+        bug: the projection helper raises instead of converting ``None``
+        to ``{preview: [], total: 0}``."""
+        with pytest.raises(RuntimeError, match="mandatory tag preview"):
+            jobs_api._preview_view(None)
 
 
 # ---------------------------------------------------------------------------

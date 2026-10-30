@@ -451,8 +451,9 @@ class EntityTagPreviewView(BaseModel):
         description="First ≤3 tag names (deterministic name order)",
     )
     total: int = Field(
-        ge=0,
-        description="Honest total number of tags attached (including beyond preview)",
+        ge=1,
+        description="Honest total number of tags attached (including beyond "
+        "preview); at least one tag is mandatory, so 0 is never valid",
     )
 
 

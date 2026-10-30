@@ -48,6 +48,7 @@ import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from mai.agents.conversation_store import (
@@ -57,10 +58,12 @@ from mai.agents.conversation_store import (
     aenqueue_steering,
     asubmit_turn,
 )
+from mai.api import conversations as conversations_api
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.api.chat import _record_chat_submission
 from mai.contracts.conversations import (
+    EntityTagPreviewView,
     HistoryCompleteness,
     MessageRange,
     MessageRole,
@@ -826,6 +829,47 @@ async def test_list_empty_page_stays_honest_without_preview_rows(
     assert document["total"] == 0
     assert document["has_more"] is False
 
+
+def test_preview_view_contract_rejects_total_zero() -> None:
+    """The mandatory-tag schema makes ``total=0`` contract-invalid: the
+    wire projection fails closed on it (HT-W6A fix1; no fabricated empty
+    previews may exist anywhere)."""
+    with pytest.raises(ValidationError):
+        EntityTagPreviewView(preview=[], total=0)
+    with pytest.raises(ValidationError):
+        EntityTagPreviewView(preview=["unclassified"], total=0)
+    # One attached tag is the minimum valid projection.
+    assert EntityTagPreviewView(preview=["unclassified"], total=1).total == 1
+
+
+def test_missing_mandatory_preview_is_never_an_empty_projection() -> None:
+    """A successfully scoped read without its mandatory preview is a bug:
+    the projection helper raises instead of converting ``None`` to
+    ``{preview: [], total: 0}``."""
+    with pytest.raises(RuntimeError, match="mandatory tag preview"):
+        conversations_api._preview_view(None)
+
+
+async def test_detail_resolves_the_actual_mandatory_preview(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    """The endpoint converts the REAL store preview: a freshly seeded
+    conversation carries exactly the reserved unclassified seed (never a
+    fabricated empty projection)."""
+    seeded = await _seed_canonical_conversation(
+        history_app, server_a, title="mandatory"
+    )
+    response = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations/{seeded.conversation_id}?server_id={server_a}",
+        cookies=jar,
+    )
+    assert response.status == 200, response.body
+    assert response.json()["tag_preview"] == {
+        "preview": ["unclassified"],
+        "total": 1,
+    }
 
 async def test_detail_complete_and_active_references(
     history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID

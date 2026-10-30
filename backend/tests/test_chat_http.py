@@ -1153,6 +1153,19 @@ async def test_submit_creates_durable_agent_job_with_recorded_references(
     assert submitted.data["submission_sha256"]
 
 
+async def test_submit_view_carries_the_mandatory_tag_preview(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """The RunView ``tag_preview`` is required on the REAL submit path
+    (HT-W6A fix1): the response carries the actual reserved
+    classification preview — never a fabricated empty projection
+    (``total=0`` is contract-invalid)."""
+    response = await submit_chat(chat_app, jar, uuid.uuid4(), server_a)
+    assert response.status == 201, response.body
+    view = response.json()["conversation"]
+    assert view["tag_preview"] == {"preview": ["unclassified"], "total": 1}
+
+
 async def test_submit_auto_resolves_default_capabilities(
     chat_app, jar, server_a, bootstrapped_url
 ) -> None:
@@ -1893,6 +1906,9 @@ async def test_live_conversation_executes_streams_and_reconnects(
     assert detail.status == 200
     view = detail.json()
     assert view["state"] == "succeeded"
+    # The mandatory preview rides the detail view: the terminal swap left
+    # exactly the succeeded state tag (total=0 is contract-invalid).
+    assert view["tag_preview"] == {"preview": ["succeeded"], "total": 1}
     assert len(view["attachments"]) == 1
     assert view["children"] == []
 
@@ -1977,8 +1993,16 @@ async def test_live_delegation_tree_parent_and_child_events(
     assert detail.status == 200
     view = detail.json()
     assert view["state"] == "succeeded"
+    # The batched mandatory previews cover parent AND children: the
+    # terminal swap left exactly the succeeded state tag on each (the
+    # preview batch is resolved per parent server scope, total ≥ 1).
+    assert view["tag_preview"] == {"preview": ["succeeded"], "total": 1}
     assert sorted(child["run_id"] for child in view["children"]) == sorted(child_ids)
     assert all(child["state"] == "succeeded" for child in view["children"])
+    assert all(
+        child["tag_preview"] == {"preview": ["succeeded"], "total": 1}
+        for child in view["children"]
+    )
     assert all(child["depth"] == 1 for child in view["children"])
     assert all(child["parent_run_id"] == str(run_id) for child in view["children"])
 
