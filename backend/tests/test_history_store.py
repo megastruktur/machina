@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.database import create_app_engine
 from mai.history_store import (
+    MAX_CONTENT_CHARS,
     ConversationSearchRow,
     JobSearchRow,
     asearch_conversations_by_tags,
@@ -721,3 +722,58 @@ async def test_conversation_content_invalid_bounds(factory, migrated_url) -> Non
         await aread_conversation_content(
             factory, conv, server_id=SERVER_A, char_cursor=100
         )
+
+
+@pytest.mark.anyio
+async def test_conversation_content_limit_one_continuation(
+    factory, migrated_url
+) -> None:
+    """limit=1: item-bound pages continue via next_offset and reconstruct."""
+    conv = uuid.uuid4()
+    msgs = [
+        (uuid.uuid4(), 1, "alpha"),
+        (uuid.uuid4(), 4, "beta"),
+        (uuid.uuid4(), 9, "gamma"),
+    ]
+    _conv_insert(migrated_url, conv)
+    for mid, seq, content in msgs:
+        _msg_insert(migrated_url, conv, mid, seq, content)
+
+    collected: list[str] = []
+    offset, cursor = 0, 0
+    pages = 0
+    while True:
+        page = await aread_conversation_content(
+            factory, conv, server_id=SERVER_A,
+            offset=offset, char_cursor=cursor, limit=1, max_chars=1000,
+        )
+        assert len(page.items) <= 1
+        assert page.total == 3
+        collected.extend(w.content for w in page.items)
+        pages += 1
+        if not page.has_more:
+            break
+        offset, cursor = page.next_offset, page.next_char_cursor
+    assert pages == 3
+    assert collected == ["alpha", "beta", "gamma"]
+
+
+@pytest.mark.anyio
+async def test_conversation_content_max_chars_cap_fail_closed(
+    factory, migrated_url
+) -> None:
+    """max_chars above MAX_CONTENT_CHARS fails closed; the cap itself works."""
+    conv = uuid.uuid4()
+    _conv_insert(migrated_url, conv)
+    _msg_insert(migrated_url, conv, uuid.uuid4(), 1, "abc")
+
+    with pytest.raises(ValueError, match="max_chars"):
+        await aread_conversation_content(
+            factory, conv, server_id=SERVER_A,
+            max_chars=MAX_CONTENT_CHARS + 1,
+        )
+    page = await aread_conversation_content(
+        factory, conv, server_id=SERVER_A, max_chars=MAX_CONTENT_CHARS
+    )
+    assert page.items[0].content == "abc"
+    assert page.has_more is False

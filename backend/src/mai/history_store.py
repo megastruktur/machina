@@ -63,6 +63,7 @@ __all__ = [
     "MAX_PAGE_LIMIT",
     "ConversationSearchRow",
     "JobSearchRow",
+    "MAX_CONTENT_CHARS",
     "ConversationContentPage",
     "ConversationContentWindow",
     "asearch_conversations_by_tags",
@@ -349,14 +350,26 @@ async def asearch_conversations_by_tags(
 # conversation content reader (W3B-CONV)
 # ---------------------------------------------------------------------------
 
+#: Hard upper bound for one page's accumulated character budget
+#: (fail closed, never clamp; one stored message is at most 20k chars).
+MAX_CONTENT_CHARS: Final[int] = 20_000
 
-def _check_content_bounds(max_chars: int, offset: int, char_cursor: int) -> None:
-    """Fail-closed validation for char-paginated reader bounds."""
-    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
-        raise ValueError("max_chars must be a positive integer")
-    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-        raise ValueError("offset must be an integer >= 0")
-    if not isinstance(char_cursor, int) or isinstance(char_cursor, bool) or char_cursor < 0:
+
+def _check_content_bounds(max_chars: int, char_cursor: int) -> None:
+    """Fail-closed validation for the char-paginated reader's own bounds."""
+    if (
+        not isinstance(max_chars, int)
+        or isinstance(max_chars, bool)
+        or not 1 <= max_chars <= MAX_CONTENT_CHARS
+    ):
+        raise ValueError(
+            f"max_chars must be an integer in [1, {MAX_CONTENT_CHARS}]"
+        )
+    if (
+        not isinstance(char_cursor, int)
+        or isinstance(char_cursor, bool)
+        or char_cursor < 0
+    ):
         raise ValueError("char_cursor must be an integer >= 0")
 
 
@@ -367,14 +380,16 @@ async def aread_conversation_content(
     server_id: uuid.UUID,
     offset: int = 0,
     char_cursor: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
     max_chars: int = 4096,
 ) -> ConversationContentPage:
     """Read a bounded, char-paginated slice of conversation content.
 
     Messages are ordered by ``(seq, message_id)`` ascending.  The page
     starts at message index ``offset`` and character position ``char_cursor``
-    inside that message.  At most ``max_chars`` characters of content are
-    returned across all messages in the page.
+    inside that message.  At most ``limit`` messages (validated by
+    ``_check_page_bounds``) and ``max_chars`` characters (at most
+    ``MAX_CONTENT_CHARS``) of content are returned across the page.
 
     The conversation must belong to ``server_id``; otherwise a
     ``ValueError`` is raised (fail-closed scope check).
@@ -384,7 +399,8 @@ async def aread_conversation_content(
     concatenation of stored message contents with no skipped or repeated
     characters.  Empty messages and ``seq`` gaps are handled naturally.
     """
-    _check_content_bounds(max_chars, offset, char_cursor)
+    _check_page_bounds(limit, offset)
+    _check_content_bounds(max_chars, char_cursor)
 
     async with sessions() as session:
         # Scope check: conversation must exist and belong to server_id.
@@ -436,7 +452,7 @@ async def aread_conversation_content(
                     "ORDER BY seq, message_id "
                     "LIMIT :l OFFSET :o"
                 ),
-                {"cid": conversation_id, "l": total - offset, "o": offset},
+                {"cid": conversation_id, "l": limit, "o": offset},
             )
         ).mappings().all()
 
