@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg
 import pytest
@@ -35,10 +35,16 @@ from mai.capabilities.history_tags import (
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
+    TAGS_SEARCH_DEFAULT_LIMIT,
+    TAGS_SEARCH_JOBS_CAPABILITY,
+    TAGS_SEARCH_MAX_LIMIT,
+    TAGS_SEARCH_MAX_TAG_IDS,
+    TAGS_NAME_MAX_LENGTH,
     TagsAssignPayload,
     TagsCreatePayload,
     TagsListCatalogPayload,
     TagsRemovePayload,
+    TagsSearchJobsPayload,
     _aresolve_current_target,
     build_history_tag_capabilities,
 )
@@ -135,6 +141,7 @@ def _minimal_payloads() -> dict[str, dict[str, object]]:
         TAGS_CREATE_CAPABILITY: {"name": f"w4b-min-{uuid.uuid4()}"},
         TAGS_LIST_CATALOG_CAPABILITY: {},
         TAGS_DELETE_CAPABILITY: {"tag_id": tag},
+        TAGS_SEARCH_JOBS_CAPABILITY: {"tag_ids": [tag]},
     }
 
 
@@ -151,6 +158,7 @@ class TestDescriptors:
         assert by_id[TAGS_ASSIGN_CAPABILITY].effect_class == "mutate"
         assert by_id[TAGS_REMOVE_CAPABILITY].effect_class == "mutate"
         assert by_id[TAGS_LIST_FOR_CAPABILITY].effect_class == "read"
+        assert by_id[TAGS_SEARCH_JOBS_CAPABILITY].effect_class == "read"
         for descriptor in composition.descriptors:
             assert_agent_ready_descriptor(descriptor)
             assert len(str(descriptor.input_schema["description"])) >= 30
@@ -202,6 +210,7 @@ class TestDescriptors:
             TAGS_CREATE_CAPABILITY,
             TAGS_LIST_CATALOG_CAPABILITY,
             TAGS_DELETE_CAPABILITY,
+            TAGS_SEARCH_JOBS_CAPABILITY,
         ):
             props = by_id[capability_id].input_schema["properties"]
             assert "replacement_tag_id" not in props
@@ -246,6 +255,20 @@ class TestDescriptors:
         assert props["limit"]["minimum"] == 1
         assert props["limit"]["maximum"] == TAGS_LIST_MAX_LIMIT
         assert props["offset"]["minimum"] == 0
+
+    def test_search_jobs_declares_bounded_contract(self) -> None:
+        composition = _composition()
+        by_id = {d.identifier: d for d in composition.descriptors}
+        assert by_id[TAGS_SEARCH_JOBS_CAPABILITY].effect_class == "read"
+        search = by_id[TAGS_SEARCH_JOBS_CAPABILITY].input_schema
+        assert search["required"] == ["tag_ids"]
+        tag_ids = search["properties"]["tag_ids"]
+        assert tag_ids["minItems"] == 1
+        assert tag_ids["maxItems"] == TAGS_SEARCH_MAX_TAG_IDS
+        assert search["properties"]["match"]["enum"] == ["any", "all"]
+        assert search["properties"]["limit"]["minimum"] == 1
+        assert search["properties"]["limit"]["maximum"] == TAGS_SEARCH_MAX_LIMIT
+        assert search["properties"]["offset"]["minimum"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +356,45 @@ class TestCreatePayloadContract:
     def test_rejects_non_canonical_names(self, raw_name: str, reason: str) -> None:
         with pytest.raises(ValidationError):
             TagsCreatePayload.model_validate({"name": raw_name})
+
+
+class TestSearchJobsPayloadContract:
+    def test_defaults_and_uuid_coercion(self) -> None:
+        tag = str(uuid.uuid4())
+        payload = TagsSearchJobsPayload.model_validate({"tag_ids": [tag]})
+        assert payload.tag_ids == [uuid.UUID(tag)]
+        assert isinstance(payload.tag_ids[0], uuid.UUID)
+        assert payload.match == "any"
+        assert payload.limit == TAGS_SEARCH_DEFAULT_LIMIT
+        assert payload.offset == 0
+
+    def test_accepts_the_maximal_request(self) -> None:
+        tags = [str(uuid.uuid4()) for _ in range(TAGS_SEARCH_MAX_TAG_IDS)]
+        payload = TagsSearchJobsPayload.model_validate(
+            {"tag_ids": tags, "match": "all", "limit": TAGS_SEARCH_MAX_LIMIT,
+             "offset": 25}
+        )
+        assert payload.match == "all"
+        assert len(payload.tag_ids) == TAGS_SEARCH_MAX_TAG_IDS
+        assert payload.limit == TAGS_SEARCH_MAX_LIMIT
+        assert payload.offset == 25
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"tag_ids": []},
+            {"tag_ids": [str(uuid.uuid4())] * 51},
+            {"tag_ids": ["not-a-uuid"]},
+            {"tag_ids": [str(uuid.uuid4())], "match": "some"},
+            {"tag_ids": [str(uuid.uuid4())], "limit": 0},
+            {"tag_ids": [str(uuid.uuid4())], "limit": 51},
+            {"tag_ids": [str(uuid.uuid4())], "offset": -1},
+        ],
+    )
+    def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
+        with pytest.raises(ValidationError):
+            TagsSearchJobsPayload.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +503,10 @@ class TestResolveCurrentTarget:
 
 
 def _insert_job(
-    url: str, job_id: uuid.UUID, server_id: uuid.UUID = uuid.UUID(SERVER_A)
+    url: str,
+    job_id: uuid.UUID,
+    server_id: uuid.UUID = uuid.UUID(SERVER_A),
+    submitted_at: datetime | None = None,
 ) -> None:
     """One real job_runs row seeded with the reserved unclassified tag."""
     with psycopg.connect(url) as conn:
@@ -449,10 +514,11 @@ def _insert_job(
             """
             INSERT INTO job_runs
                 (run_id, server_id, depth, profile_revision, prompt_revision,
-                 model_profile, requested_grants)
-            VALUES (%s, %s, 0, 1, 1, 'profile', '[]'::jsonb)
+                 model_profile, requested_grants, submitted_at)
+            VALUES (%s, %s, 0, 1, 1, 'profile', '[]'::jsonb,
+                    COALESCE(%s, now()))
             """,
-            (job_id, server_id),
+            (job_id, server_id, submitted_at),
         )
         conn.execute(
             "INSERT INTO job_tags (job_id, tag_id) VALUES (%s, %s)",
@@ -1107,4 +1173,237 @@ class TestCatalogWired:
         assert len(document["items"]) == TAGS_LIST_MAX_LIMIT
         assert document["has_more"] is True
         assert document["next_offset"] == TAGS_LIST_MAX_LIMIT
+        assert len(json.dumps(document, sort_keys=True)) < 60000
+
+
+# ---------------------------------------------------------------------------
+# W4C — tags.search_jobs: same-server tag search (real Postgres)
+# ---------------------------------------------------------------------------
+
+
+async def _assign_tag_to_job(
+    sessions: object, job_id: uuid.UUID, tag_id: uuid.UUID
+) -> None:
+    await aassign_job_tag(
+        sessions,  # type: ignore[arg-type]
+        job_id,
+        tag_id,
+        server_id=uuid.UUID(SERVER_A),
+        assigned_by="principal",
+        assignment_source="agent",
+    )
+
+
+@pytest.mark.anyio
+class TestSearchJobsWired:
+    async def test_any_and_all_match_same_server_newest_first(
+        self, sessions, migrated_url
+    ) -> None:
+        base = datetime(2026, 10, 30, 12, 0, 0)
+        j1, j2, j3 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        _insert_job(migrated_url, j1, submitted_at=base)
+        _insert_job(migrated_url, j2, submitted_at=base + timedelta(minutes=1))
+        _insert_job(migrated_url, j3, submitted_at=base + timedelta(minutes=2))
+        tag_a = await acreate_tag(sessions, name=f"w4c-a-{uuid.uuid4()}")
+        tag_b = await acreate_tag(sessions, name=f"w4c-b-{uuid.uuid4()}")
+        tag_c = await acreate_tag(sessions, name=f"w4c-c-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        for job_id, tag_id in (
+            (j1, tag_a.tag_id),
+            (j2, tag_a.tag_id),
+            (j2, tag_b.tag_id),
+            (j3, tag_b.tag_id),
+        ):
+            await _assign_tag_to_job(sessions, job_id, tag_id)
+        # Another server's run carrying tag_a is invisible to this search.
+        foreign = uuid.uuid4()
+        _insert_job(
+            migrated_url,
+            foreign,
+            server_id=uuid.UUID(SERVER_B),
+            submitted_at=base + timedelta(minutes=3),
+        )
+        await aassign_job_tag(
+            sessions,
+            foreign,
+            tag_a.tag_id,
+            server_id=uuid.UUID(SERVER_B),
+            assigned_by="principal",
+            assignment_source="agent",
+        )
+
+        result, any_doc = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": [str(tag_a.tag_id), str(tag_b.tag_id)]},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert any_doc["status"] == "ok" and any_doc["ok"] is True
+        assert any_doc["match"] == "any"
+        assert any_doc["total"] == 3
+        assert [item["run_id"] for item in any_doc["items"]] == [
+            str(j3),
+            str(j2),
+            str(j1),
+        ]
+        assert any_doc["limit"] == TAGS_SEARCH_DEFAULT_LIMIT
+        assert any_doc["offset"] == 0
+        assert any_doc["has_more"] is False and any_doc["next_offset"] is None
+        row = any_doc["items"][0]
+        assert set(row) == {"run_id", "submitted_at", "tag_preview"}
+        assert str(uuid.UUID(row["run_id"])) == row["run_id"]
+        datetime.fromisoformat(row["submitted_at"])
+        assert set(row["tag_preview"]) == {"preview", "total"}
+        assert row["tag_preview"]["total"] == 2  # tag_b + reserved seed
+        assert set(row["tag_preview"]["preview"]) == {tag_b.name, "unclassified"}
+        j2_row = any_doc["items"][1]
+        assert j2_row["tag_preview"]["total"] == 3
+        assert set(j2_row["tag_preview"]["preview"]) == {
+            tag_a.name,
+            tag_b.name,
+            "unclassified",
+        }
+
+        result, all_doc = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {
+                "tag_ids": [str(tag_a.tag_id), str(tag_b.tag_id)],
+                "match": "all",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert all_doc["match"] == "all"
+        assert all_doc["total"] == 1
+        assert [item["run_id"] for item in all_doc["items"]] == [str(j2)]
+
+        # No run carries both a and c: an honest empty page, not a refusal.
+        result, empty = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {
+                "tag_ids": [str(tag_a.tag_id), str(tag_c.tag_id)],
+                "match": "all",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert empty["items"] == [] and empty["total"] == 0
+        assert empty["has_more"] is False and empty["next_offset"] is None
+
+    async def test_pagination_slices_newest_first_with_honest_meta(
+        self, sessions, migrated_url
+    ) -> None:
+        base = datetime(2026, 10, 30, 13, 0, 0)
+        jobs = [uuid.uuid4() for _ in range(4)]
+        for index, job_id in enumerate(jobs):
+            _insert_job(
+                migrated_url, job_id,
+                submitted_at=base + timedelta(minutes=index),
+            )
+        tag = await acreate_tag(sessions, name=f"w4c-page-{uuid.uuid4()}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        for job_id in jobs:
+            await _assign_tag_to_job(sessions, job_id, tag.tag_id)
+        newest_first = [str(job_id) for job_id in reversed(jobs)]
+
+        result, first = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 0},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert first["total"] == 4
+        assert [item["run_id"] for item in first["items"]] == newest_first[:2]
+        assert first["limit"] == 2 and first["offset"] == 0
+        assert first["has_more"] is True and first["next_offset"] == 2
+
+        _, second = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 2},
+            context,
+        )
+        assert [item["run_id"] for item in second["items"]] == newest_first[2:]
+        assert second["total"] == 4
+        assert second["has_more"] is False and second["next_offset"] is None
+
+        _, beyond = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": [str(tag.tag_id)], "limit": 2, "offset": 99},
+            context,
+        )
+        assert beyond["items"] == [] and beyond["total"] == 4
+        assert beyond["has_more"] is False and beyond["next_offset"] is None
+
+    async def test_invalid_payloads_refuse_fail_closed(self, sessions) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        tag = str(uuid.uuid4())
+        for payload in (
+            {},
+            {"tag_ids": []},
+            {"tag_ids": [tag] * 51},
+            {"tag_ids": ["not-a-uuid"]},
+            {"tag_ids": [tag], "match": "some"},
+            {"tag_ids": [tag], "limit": 0},
+            {"tag_ids": [tag], "limit": 51},
+            {"tag_ids": [tag], "offset": -1},
+        ):
+            result, document = await _execute(
+                composition, TAGS_SEARCH_JOBS_CAPABILITY, payload, context
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "invalid_request"
+
+    async def test_maximal_page_envelope_stays_under_60000_bytes(
+        self, sessions, migrated_url
+    ) -> None:
+        stem = f"w4c-{uuid.uuid4().hex[:8]}"
+        tag_ids: list[str] = []
+        for index in range(50):
+            base = f"{stem}-{index:02d}-"
+            name = base + "x" * (TAGS_NAME_MAX_LENGTH - len(base))
+            assert len(name) == 64
+            tag = await acreate_tag(sessions, name=name)
+            tag_ids.append(str(tag.tag_id))
+        for index, tag_id in enumerate(tag_ids):
+            job_id = uuid.uuid4()
+            _insert_job(
+                migrated_url, job_id,
+                submitted_at=datetime(2026, 10, 30, 14, index % 60, index // 60),
+            )
+            await aassign_job_tag(
+                sessions,
+                job_id,
+                uuid.UUID(tag_id),
+                server_id=uuid.UUID(SERVER_A),
+                assigned_by="principal",
+                assignment_source="agent",
+            )
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_SEARCH_JOBS_CAPABILITY,
+            {"tag_ids": tag_ids},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["match"] == "any"
+        assert document["total"] == 50
+        assert len(document["items"]) == 50
+        assert document["limit"] == TAGS_SEARCH_DEFAULT_LIMIT == 50
+        assert document["offset"] == 0
+        assert document["has_more"] is False and document["next_offset"] is None
+        for item in document["items"]:
+            preview = item["tag_preview"]
+            assert preview["total"] == 2  # the maximal 64-char name + reserved
+            assert len(preview["preview"]) == 2
         assert len(json.dumps(document, sort_keys=True)) < 60000

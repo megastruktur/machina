@@ -13,8 +13,10 @@ The catalog operations (``tags.create``, ``tags.list_catalog``,
 ``tags.delete``) manage the global tag vocabulary through the store's
 reviewed catalog functions: canonical idempotent create, deterministic
 bounded listing, and used/reserved-refusing delete whose forced path
-still preserves every record's final tag. No registration, UI,
-search, or history-read surface belongs to this module.
+still preserves every record's final tag. The ``tags.search_jobs``
+read pages this server's job runs by their tags through the
+read-only history store. No conversation search, registration, UI,
+or other history-read surface belongs to this module.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from mai.capabilities.internal_api import (
     build_executor,
     internal_api_tool,
 )
+from mai.history_store import asearch_jobs_by_tags
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
 from mai.tag_store import (
@@ -60,9 +63,10 @@ TAGS_LIST_FOR_CAPABILITY: Final[str] = "tags.list_for"
 TAGS_CREATE_CAPABILITY: Final[str] = "tags.create"
 TAGS_LIST_CATALOG_CAPABILITY: Final[str] = "tags.list_catalog"
 TAGS_DELETE_CAPABILITY: Final[str] = "tags.delete"
+TAGS_SEARCH_JOBS_CAPABILITY: Final[str] = "tags.search_jobs"
 
-#: The public ``tags.*`` vocabulary: the W4A1 current-target scaffold plus
-#: the W4B catalog tools.
+#: The public ``tags.*`` vocabulary: the W4A1 current-target scaffold,
+#: the W4B catalog tools, and the W4C job-search read.
 TAGS_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     TAGS_ASSIGN_CAPABILITY,
     TAGS_REMOVE_CAPABILITY,
@@ -70,11 +74,17 @@ TAGS_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     TAGS_CREATE_CAPABILITY,
     TAGS_LIST_CATALOG_CAPABILITY,
     TAGS_DELETE_CAPABILITY,
+    TAGS_SEARCH_JOBS_CAPABILITY,
 )
 
 #: Bounded pagination vocabulary for ``tags.list_for`` (AGENTS.md §1).
 TAGS_LIST_DEFAULT_LIMIT: Final[int] = 10
 TAGS_LIST_MAX_LIMIT: Final[int] = 100
+
+#: Bounded search vocabulary for ``tags.search_jobs`` (AGENTS.md §1).
+TAGS_SEARCH_DEFAULT_LIMIT: Final[int] = 50
+TAGS_SEARCH_MAX_LIMIT: Final[int] = 50
+TAGS_SEARCH_MAX_TAG_IDS: Final[int] = 50
 
 #: Bounded catalog vocabulary (AGENTS.md §1), mirroring the tag store's
 #: own canonical-name and description validation.
@@ -158,6 +168,46 @@ class TagsListForPayload(BaseModel):
         ge=0,
         description=(
             "Number of matching tag records to skip before this page "
+            "starts."
+        ),
+    )
+
+
+class TagsSearchJobsPayload(BaseModel):
+    """Search this server's job runs by their history tags."""
+
+    tag_ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=TAGS_SEARCH_MAX_TAG_IDS,
+        description=(
+            "1-50 canonical UUIDs of the existing history tags the "
+            "matched job runs must carry; the match mode decides "
+            "whether any one of them or every one of them must be "
+            "attached to a run for it to match."
+        ),
+    )
+    match: Literal["any", "all"] = Field(
+        default="any",
+        description=(
+            "Whether a job run matches when it carries at least one "
+            "of the requested tags ('any', the default) or every "
+            "requested tag ('all')."
+        ),
+    )
+    limit: int = Field(
+        default=TAGS_SEARCH_DEFAULT_LIMIT,
+        ge=1,
+        le=TAGS_SEARCH_MAX_LIMIT,
+        description=(
+            "Maximum number of matched job runs returned in this "
+            "bounded page (1-50)."
+        ),
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of matching job runs to skip before this page "
             "starts."
         ),
     )
@@ -544,6 +594,71 @@ def build_history_tag_capabilities(
 
     operations.append(_tags_list_for)
 
+    # -- tags.search_jobs ------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=TAGS_SEARCH_JOBS_CAPABILITY,
+        version="0.1.0",
+        effect_class="read",
+        resource_scope=["history_tags"],
+        environments=["controller"],
+        payload_model=TagsSearchJobsPayload,
+        description=(
+            "Search this server's job runs by their history tags: "
+            "give 1-50 catalog tag UUIDs and whether any one of them "
+            "or all of them must be attached. Returns one bounded "
+            "newest-first page of matching runs with the pre-slice "
+            "total plus has_more/next_offset, and a per-run preview "
+            "of attached tag names; other servers' runs are "
+            "invisible."
+        ),
+    )
+    async def _tags_search_jobs(
+        call: CapabilityCall, payload: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        if session_factory is None:
+            raise InternalApiError("unavailable", "tag store is not configured")
+        limit = int(payload.get("limit", TAGS_SEARCH_DEFAULT_LIMIT))
+        offset = int(payload.get("offset", 0))
+        match: Literal["any", "all"] = (
+            "all" if payload.get("match") == "all" else "any"
+        )
+        tag_ids = [uuid.UUID(str(item)) for item in payload["tag_ids"]]
+        try:
+            rows, total = await asearch_jobs_by_tags(
+                session_factory,
+                tag_ids,
+                server_id=call.context.server_id,
+                match=match,
+                limit=limit,
+                offset=offset,
+            )
+        except TagStoreError as exc:
+            raise _tags_refusal(exc) from exc
+        has_more = offset + len(rows) < total
+        return {
+            "ok": True,
+            "match": match,
+            "items": [
+                {
+                    "run_id": str(row.run_id),
+                    "submitted_at": row.submitted_at.isoformat(),
+                    "tag_preview": {
+                        "preview": list(row.tag_preview.preview),
+                        "total": row.tag_preview.total,
+                    },
+                }
+                for row in rows
+            ],
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+            "has_more": has_more,
+            "next_offset": offset + len(rows) if has_more else None,
+        }
+
+    operations.append(_tags_search_jobs)
+
     # -- tags.create ---------------------------------------------------------
 
     @internal_api_tool(
@@ -707,11 +822,13 @@ __all__ = [
     "TAGS_LIST_CATALOG_CAPABILITY",
     "TAGS_LIST_FOR_CAPABILITY",
     "TAGS_REMOVE_CAPABILITY",
+    "TAGS_SEARCH_JOBS_CAPABILITY",
     "TagsAssignPayload",
     "TagsCreatePayload",
     "TagsDeletePayload",
     "TagsListCatalogPayload",
     "TagsListForPayload",
     "TagsRemovePayload",
+    "TagsSearchJobsPayload",
     "build_history_tag_capabilities",
 ]
