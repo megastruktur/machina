@@ -32,7 +32,11 @@ This module adds no status/cursor filters and no schema. W3A search
 projects references only; W3B adds exactly one content reader,
 :func:`aread_conversation_content`: bounded ``(seq, message_id)``-ordered
 transcript pages over a single server-scoped conversation, continuable by
-a message-index + character cursor. There is deliberately no job reader.
+a message-index + character cursor — and W3B-JOB adds the job reader,
+:func:`aread_job_content`: one server-scoped job run's content row
+(parentage, frozen label, replayed lifecycle state, error/evidence
+references), the newest non-null task binding across all of its
+conversation links, and one bounded page of those same-server links.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.conversation_store import StoredMessage
 from mai.contracts.conversations import MessageRole, MessageSourceKind
+from mai.jobs.lifecycle import RunLifecycle
 from mai.tag_store import (
     DEFAULT_PAGE_LIMIT,
     EntityTagPreview,
@@ -66,9 +71,13 @@ __all__ = [
     "MAX_CONTENT_CHARS",
     "ConversationContentPage",
     "ConversationContentWindow",
+    "JobContent",
+    "JobConversationLink",
+    "LinkPage",
     "asearch_conversations_by_tags",
     "asearch_jobs_by_tags",
     "aread_conversation_content",
+    "aread_job_content",
 ]
 
 # Re-exported for callers composing the wire envelope next to the rows.
@@ -517,4 +526,174 @@ async def aread_conversation_content(
         has_more=has_more,
         next_offset=next_offset,
         next_char_cursor=next_char_cursor,
+    )
+
+
+# ---------------------------------------------------------------------------
+# job content reader (W3B-JOB)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class JobConversationLink:
+    """One same-server conversation↔run binding, verbatim from the row.
+
+    ``released_at IS NULL`` means this link currently holds the
+    conversation's one writer/executor lease; a set ``released_at`` is a
+    historical (released) binding.
+    """
+
+    conversation_id: uuid.UUID
+    run_id: uuid.UUID
+    task_id: uuid.UUID | None
+    created_at: datetime
+    released_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class LinkPage:
+    """One bounded page of same-server conversation links.
+
+    ``items`` are ordered by ``created_at DESC, conversation_id``;
+    ``total`` is the pre-slice count under the identical scope predicate.
+    """
+
+    items: list[JobConversationLink]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class JobContent:
+    """One server-scoped job run's content row plus its link page.
+
+    ``task_id`` is the newest non-null binding across ALL of the run's
+    same-server links (released links included), not just the returned
+    page. ``label`` is the frozen-at-submit run label (honestly ``None``
+    when absent). ``state`` is the lifecycle state replayed from the
+    run's persisted event stream (``None`` before the submit edge).
+    """
+
+    run_id: uuid.UUID
+    parent_run_id: uuid.UUID | None
+    task_id: uuid.UUID | None
+    label: str | None
+    state: str | None
+    submitted_at: datetime
+    updated_at: datetime
+    error_ref: str | None
+    evidence_ref: str | None
+    links: LinkPage
+
+
+async def aread_job_content(
+    sessions: async_sessionmaker[AsyncSession],
+    run_id: uuid.UUID,
+    *,
+    server_id: uuid.UUID,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
+) -> JobContent:
+    """Read one job run's content plus a bounded page of its links.
+
+    The run must belong to ``server_id``; otherwise a ``ValueError`` is
+    raised (fail-closed scope check, mirroring
+    :func:`aread_conversation_content`). Links join ``conversations`` on
+    the same server — a cross-server conversation never leaks, not even
+    into ``total`` or the ``task_id`` binding. The lifecycle state is
+    replayed from the persisted event stream via
+    ``RunLifecycle(sessions).current_state``; no raw events are exposed.
+    """
+    _check_page_bounds(limit, offset)
+
+    async with sessions() as session:
+        run_row = (
+            await session.execute(
+                text(
+                    "SELECT parent_run_id, label, error_ref, evidence_ref, "
+                    "submitted_at, updated_at FROM job_runs "
+                    "WHERE run_id = :rid AND server_id = :sid"
+                ),
+                {"rid": run_id, "sid": server_id},
+            )
+        ).first()
+        if run_row is None:
+            raise ValueError(f"job run {run_id} not found in server {server_id}")
+
+        # Same-server links only: the JOIN is the scope predicate for the
+        # items AND the honest total (and the task binding below).
+        link_scope = (
+            "FROM conversation_runs cr "
+            "JOIN conversations c ON c.conversation_id = cr.conversation_id "
+            "WHERE cr.run_id = :rid AND c.server_id = :sid"
+        )
+        link_params: dict[str, object] = {"rid": run_id, "sid": server_id}
+
+        total = int(
+            (
+                await session.execute(
+                    text(f"SELECT count(*) {link_scope}"), link_params
+                )
+            ).scalar_one()
+        )
+
+        # Newest non-null task binding across ALL links (released ones
+        # included); deterministic tiebreak on conversation_id.
+        task_id = (
+            await session.execute(
+                text(
+                    f"SELECT cr.task_id {link_scope} "
+                    "AND cr.task_id IS NOT NULL "
+                    "ORDER BY cr.created_at DESC, cr.conversation_id "
+                    "LIMIT 1"
+                ),
+                link_params,
+            )
+        ).scalar()
+
+        items: list[JobConversationLink] = []
+        if total > 0 and offset < total:
+            link_rows = (
+                await session.execute(
+                    text(
+                        "SELECT cr.conversation_id, cr.run_id, cr.task_id, "
+                        "cr.created_at, cr.released_at "
+                        f"{link_scope} "
+                        "ORDER BY cr.created_at DESC, cr.conversation_id "
+                        "LIMIT :l OFFSET :o"
+                    ),
+                    {**link_params, "l": limit, "o": offset},
+                )
+            ).all()
+            items = [
+                JobConversationLink(
+                    conversation_id=row[0],
+                    run_id=row[1],
+                    task_id=row[2],
+                    created_at=row[3],
+                    released_at=row[4],
+                )
+                for row in link_rows
+            ]
+
+    lifecycle_state = await RunLifecycle(sessions).current_state(str(run_id))
+    return JobContent(
+        run_id=run_id,
+        parent_run_id=run_row.parent_run_id,
+        task_id=task_id,
+        label=run_row.label or None,
+        state=None if lifecycle_state is None else lifecycle_state.value,
+        submitted_at=run_row.submitted_at,
+        updated_at=run_row.updated_at,
+        error_ref=run_row.error_ref,
+        evidence_ref=run_row.evidence_ref,
+        links=LinkPage(
+            items=items,
+            limit=limit,
+            offset=offset,
+            total=total,
+            has_more=offset + len(items) < total,
+        ),
     )

@@ -21,8 +21,10 @@ Every claim runs against a real disposable PostgreSQL fixture
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -30,15 +32,22 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.contracts.jobs import RunState
 from mai.database import create_app_engine
 from mai.history_store import (
     MAX_CONTENT_CHARS,
+    MAX_PAGE_LIMIT,
     ConversationSearchRow,
+    JobContent,
+    JobConversationLink,
     JobSearchRow,
+    LinkPage,
     asearch_conversations_by_tags,
     asearch_jobs_by_tags,
     aread_conversation_content,
+    aread_job_content,
 )
+from mai.jobs.lifecycle import RunLifecycle
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
     acreate_tag,
@@ -777,3 +786,291 @@ async def test_conversation_content_max_chars_cap_fail_closed(
     )
     assert page.items[0].content == "abc"
     assert page.has_more is False
+
+
+# ---------------------------------------------------------------------------
+# W3B-JOB: aread_job_content
+# ---------------------------------------------------------------------------
+
+
+def _insert_job_full(
+    url: str,
+    job_id: uuid.UUID,
+    server_id: uuid.UUID = SERVER_A,
+    *,
+    parent_run_id: uuid.UUID | None = None,
+    label: str | None = None,
+    error_ref: str | None = None,
+    evidence_ref: str | None = None,
+) -> None:
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            """
+            INSERT INTO job_runs
+                (run_id, server_id, parent_run_id, depth, profile_revision,
+                 prompt_revision, model_profile, requested_grants,
+                 error_ref, evidence_ref, label)
+            VALUES (%s, %s, %s, %s, 1, 1, 'profile', '[]'::jsonb, %s, %s, COALESCE(%s, ''))
+            """,
+            (
+                job_id,
+                server_id,
+                parent_run_id,
+                1 if parent_run_id is not None else 0,
+                error_ref,
+                evidence_ref,
+                label,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO job_tags (job_id, tag_id) VALUES (%s, %s)",
+            (job_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+def _insert_link(
+    url: str,
+    conversation_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    server_id: uuid.UUID = SERVER_A,
+    task_id: uuid.UUID | None = None,
+    created_at: datetime,
+    released_at: datetime | None = None,
+) -> None:
+    _insert_conversation(url, conversation_id, server_id)
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_runs
+                (conversation_id, run_id, task_id, created_at, released_at)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (conversation_id, run_id, task_id, created_at, released_at),
+        )
+        conn.commit()
+
+
+@pytest.mark.anyio
+async def test_job_content_fields_state_and_honest_nones(
+    factory, migrated_url
+) -> None:
+    """Frozen content row: identity, parentage, label, refs; honest Nones.
+
+    ``state`` is ``None`` before any lifecycle event and replays from the
+    persisted event stream afterwards; ``label`` is honestly ``None`` for
+    a run submitted without one; an unborn link page is empty and honest.
+    """
+    parent = uuid.uuid4()
+    child = uuid.uuid4()
+    _insert_job_full(migrated_url, parent)
+    _insert_job_full(
+        migrated_url,
+        child,
+        parent_run_id=parent,
+        label="deploy checkout",
+        error_ref="err://logs/1",
+        evidence_ref="ev://trace/1",
+    )
+
+    content = await aread_job_content(factory, child, server_id=SERVER_A)
+
+    assert isinstance(content, JobContent)
+    assert isinstance(content.links, LinkPage)
+    assert content.run_id == child
+    assert content.parent_run_id == parent
+    assert content.label == "deploy checkout"
+    assert content.error_ref == "err://logs/1"
+    assert content.evidence_ref == "ev://trace/1"
+    assert content.task_id is None  # no links yet
+    assert content.state is None  # no lifecycle events yet
+    assert isinstance(content.submitted_at, datetime)
+    assert isinstance(content.updated_at, datetime)
+    assert content.links.items == []
+    assert content.links.total == 0
+    assert content.links.has_more is False
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        content.label = "mutated"  # type: ignore[misc]
+
+    # Lifecycle state replays from the persisted event stream (str value).
+    lifecycle = RunLifecycle(factory)
+    await lifecycle.record_transition(str(child), RunState.QUEUED)
+    await lifecycle.record_transition(str(child), RunState.RUNNING)
+    await lifecycle.record_transition(str(child), RunState.FAILED)
+    content = await aread_job_content(factory, child, server_id=SERVER_A)
+    assert content.state == "failed"
+
+    # Honest None label when the run was submitted without one.
+    plain = uuid.uuid4()
+    _insert_job_full(migrated_url, plain)
+    bare = await aread_job_content(factory, plain, server_id=SERVER_A)
+    assert bare.label is None
+    assert bare.state is None
+
+
+@pytest.mark.anyio
+async def test_job_content_scope_isolation(factory, migrated_url) -> None:
+    """Cross-server runs and conversation links never leak.
+
+    A run outside ``server_id`` is a fail-closed ``ValueError``; a
+    cross-server conversation link is invisible in items, total, AND the
+    task binding — even when it is the newest non-null binding overall.
+    """
+    job_a = uuid.uuid4()
+    _insert_job_full(migrated_url, job_a, server_id=SERVER_A)
+    job_b = uuid.uuid4()
+    _insert_job_full(migrated_url, job_b, server_id=SERVER_B)
+
+    with pytest.raises(ValueError, match="not found in server"):
+        await aread_job_content(factory, job_b, server_id=SERVER_A)
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    task_same = uuid.uuid4()
+    task_other = uuid.uuid4()
+    conv_same = uuid.uuid4()
+    conv_other = uuid.uuid4()
+    _insert_link(
+        migrated_url, conv_same, job_a, task_id=task_same, created_at=base
+    )
+    _insert_link(
+        migrated_url,
+        conv_other,
+        job_a,
+        server_id=SERVER_B,
+        task_id=task_other,  # newest non-null binding overall
+        created_at=base + timedelta(hours=1),
+    )
+
+    content = await aread_job_content(factory, job_a, server_id=SERVER_A)
+    assert content.links.total == 1
+    assert [lnk.conversation_id for lnk in content.links.items] == [conv_same]
+    assert content.task_id == task_same
+    assert content.task_id != task_other
+
+
+@pytest.mark.anyio
+async def test_job_content_link_pagination_ordering_and_released(
+    factory, migrated_url
+) -> None:
+    """Links page newest-first with honest totals, released_at verbatim.
+
+    Ordering is ``created_at DESC, conversation_id``; slices carry
+    ``limit``/``offset``/``total`` echoes; ``has_more`` turns False on the
+    final page; offset beyond total yields an empty honest page.
+    """
+    job = uuid.uuid4()
+    _insert_job_full(migrated_url, job)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    convs = [uuid.uuid4() for _ in range(3)]
+    _insert_link(migrated_url, convs[0], job, created_at=base)
+    _insert_link(
+        migrated_url,
+        convs[1],
+        job,
+        created_at=base + timedelta(hours=1),
+        released_at=base + timedelta(hours=5),
+    )
+    _insert_link(
+        migrated_url, convs[2], job, created_at=base + timedelta(hours=2)
+    )
+
+    page1 = await aread_job_content(
+        factory, job, server_id=SERVER_A, limit=2
+    )
+    assert page1.links.limit == 2
+    assert page1.links.offset == 0
+    assert page1.links.total == 3
+    assert [lnk.conversation_id for lnk in page1.links.items] == [
+        convs[2],
+        convs[1],
+    ]
+    assert page1.links.has_more is True
+    newest, released = page1.links.items
+    assert isinstance(released, JobConversationLink)
+    assert newest.released_at is None
+    assert released.released_at == base + timedelta(hours=5)
+
+    page2 = await aread_job_content(
+        factory, job, server_id=SERVER_A, limit=2, offset=2
+    )
+    assert [lnk.conversation_id for lnk in page2.links.items] == [convs[0]]
+    assert page2.links.offset == 2
+    assert page2.links.total == 3
+    assert page2.links.has_more is False
+
+    # Deterministic tiebreak: identical created_at orders conversation_id ASC.
+    job_tie = uuid.uuid4()
+    _insert_job_full(migrated_url, job_tie, label="tie")
+    tie_a, tie_b = uuid.uuid4(), uuid.uuid4()
+    same_ts = datetime(2026, 2, 2, tzinfo=timezone.utc)
+    _insert_link(migrated_url, tie_a, job_tie, created_at=same_ts)
+    _insert_link(migrated_url, tie_b, job_tie, created_at=same_ts)
+    tie = await aread_job_content(factory, job_tie, server_id=SERVER_A)
+    assert [lnk.conversation_id for lnk in tie.links.items] == sorted(
+        [tie_a, tie_b]
+    )
+
+    # Offset beyond total: empty page, honest pre-slice total, no has_more.
+    beyond = await aread_job_content(
+        factory, job_tie, server_id=SERVER_A, offset=5
+    )
+    assert beyond.links.items == []
+    assert beyond.links.total == 2
+    assert beyond.links.has_more is False
+
+
+@pytest.mark.anyio
+async def test_job_content_task_binding_newest_non_null_across_all_links(
+    factory, migrated_url
+) -> None:
+    """``task_id`` is the newest NON-NULL binding over ALL same-server links.
+
+    A newer link with a NULL task must not shadow an older non-null
+    binding; released links still count toward the binding.
+    """
+    job = uuid.uuid4()
+    _insert_job_full(migrated_url, job)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    task_old = uuid.uuid4()
+    task_new = uuid.uuid4()
+
+    _insert_link(
+        migrated_url, uuid.uuid4(), job, task_id=task_old, created_at=base
+    )
+    _insert_link(
+        migrated_url,
+        uuid.uuid4(),
+        job,
+        task_id=task_new,
+        created_at=base + timedelta(hours=1),
+        released_at=base + timedelta(hours=9),  # released still counts
+    )
+    # Newest link overall carries a NULL task; must not shadow task_new.
+    _insert_link(
+        migrated_url,
+        uuid.uuid4(),
+        job,
+        task_id=None,
+        created_at=base + timedelta(hours=2),
+    )
+
+    content = await aread_job_content(factory, job, server_id=SERVER_A)
+    assert content.task_id == task_new
+    assert content.task_id != task_old
+    assert content.links.total == 3
+
+
+@pytest.mark.anyio
+async def test_job_content_bounds_fail_closed(factory, migrated_url) -> None:
+    """Link-page bounds fail closed via ``_check_page_bounds``."""
+    job = uuid.uuid4()
+    _insert_job_full(migrated_url, job)
+    with pytest.raises(ValueError):
+        await aread_job_content(factory, job, server_id=SERVER_A, limit=0)
+    with pytest.raises(ValueError):
+        await aread_job_content(
+            factory, job, server_id=SERVER_A, limit=MAX_PAGE_LIMIT + 1
+        )
+    with pytest.raises(ValueError):
+        await aread_job_content(factory, job, server_id=SERVER_A, offset=-1)
