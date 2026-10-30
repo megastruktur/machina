@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -37,6 +37,7 @@ from mai.capabilities.history_tags import (
     TAGS_READ_CONVERSATION_CAPABILITY,
     TAGS_READ_DEFAULT_LIMIT,
     TAGS_READ_DEFAULT_MAX_CHARS,
+    TAGS_READ_JOB_CAPABILITY,
     TAGS_READ_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
     TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
@@ -49,6 +50,7 @@ from mai.capabilities.history_tags import (
     TagsCreatePayload,
     TagsListCatalogPayload,
     TagsReadConversationPayload,
+    TagsReadJobPayload,
     TagsRemovePayload,
     TagsSearchConversationsPayload,
     TagsSearchJobsPayload,
@@ -61,6 +63,7 @@ from mai.capabilities.internal_api import (
     assert_agent_ready_descriptor,
 )
 from mai.history_store import MAX_CONTENT_CHARS
+from mai.jobs.lifecycle import RunLifecycle, RunState
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
@@ -155,6 +158,7 @@ def _minimal_payloads() -> dict[str, dict[str, object]]:
         TAGS_READ_CONVERSATION_CAPABILITY: {
             "conversation_id": str(uuid.uuid4())
         },
+        TAGS_READ_JOB_CAPABILITY: {"run_id": str(uuid.uuid4())},
     }
 
 
@@ -174,6 +178,7 @@ class TestDescriptors:
         assert by_id[TAGS_SEARCH_JOBS_CAPABILITY].effect_class == "read"
         assert by_id[TAGS_SEARCH_CONVERSATIONS_CAPABILITY].effect_class == "read"
         assert by_id[TAGS_READ_CONVERSATION_CAPABILITY].effect_class == "read"
+        assert by_id[TAGS_READ_JOB_CAPABILITY].effect_class == "read"
         for descriptor in composition.descriptors:
             assert_agent_ready_descriptor(descriptor)
             assert len(str(descriptor.input_schema["description"])) >= 30
@@ -185,14 +190,19 @@ class TestDescriptors:
         for descriptor in composition.descriptors:
             props = descriptor.input_schema["properties"]
             assert "server_id" not in props
-            assert "run_id" not in props
             assert "job_id" not in props
+            if descriptor.identifier == TAGS_READ_JOB_CAPABILITY:
+                # The one tags tool that legitimately names the run:
+                # the run_id of a same-server read result.
+                assert "run_id" in props
+            else:
+                assert "run_id" not in props
             if descriptor.identifier == TAGS_READ_CONVERSATION_CAPABILITY:
                 # The one tags tool that legitimately names its subject:
                 # the conversation_id of a same-server read result.
                 assert "conversation_id" in props
-                continue
-            assert "conversation_id" not in props
+            else:
+                assert "conversation_id" not in props
 
     def test_target_is_the_job_or_conversation_literal(self) -> None:
         composition = _composition()
@@ -370,6 +380,51 @@ class TestReadConversationPayloadContract:
     def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
         with pytest.raises(ValidationError):
             TagsReadConversationPayload.model_validate(payload)
+
+
+class TestReadJobPayloadContract:
+    def test_descriptor_declares_bounded_link_contract(self) -> None:
+        composition = _composition()
+        by_id = {d.identifier: d for d in composition.descriptors}
+        read = by_id[TAGS_READ_JOB_CAPABILITY].input_schema
+        assert read["required"] == ["run_id"]
+        props = read["properties"]
+        assert "server_id" not in props
+        assert props["limit"]["minimum"] == 1
+        assert props["limit"]["maximum"] == TAGS_READ_MAX_LIMIT == 50
+        assert props["offset"]["minimum"] == 0
+
+    def test_defaults_and_uuid_coercion(self) -> None:
+        run = str(uuid.uuid4())
+        payload = TagsReadJobPayload.model_validate({"run_id": run})
+        assert payload.run_id == uuid.UUID(run)
+        assert payload.limit == TAGS_READ_DEFAULT_LIMIT == 50
+        assert payload.offset == 0
+
+    def test_accepts_the_maximal_request(self) -> None:
+        payload = TagsReadJobPayload.model_validate(
+            {
+                "run_id": str(uuid.uuid4()),
+                "limit": TAGS_READ_MAX_LIMIT,
+                "offset": 7,
+            }
+        )
+        assert payload.limit == TAGS_READ_MAX_LIMIT
+        assert payload.offset == 7
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"run_id": "not-a-uuid"},
+            {"run_id": str(uuid.uuid4()), "limit": 0},
+            {"run_id": str(uuid.uuid4()), "limit": 51},
+            {"run_id": str(uuid.uuid4()), "offset": -1},
+        ],
+    )
+    def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
+        with pytest.raises(ValidationError):
+            TagsReadJobPayload.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -2236,3 +2291,378 @@ class TestReadConversationContent:
         assert document["code"] == "invalid_request"
         # No silent clamping and no content leak through the refusal.
         assert "items" not in document
+
+
+# ---------------------------------------------------------------------------
+# W4C2-JOB — tags.read_job over the reviewed job content reader
+# ---------------------------------------------------------------------------
+
+_TS_A = datetime(2026, 3, 1, 12, 0, 0, 111111, tzinfo=timezone.utc)
+_TS_B = datetime(2026, 3, 2, 12, 0, 0, 222222, tzinfo=timezone.utc)
+_TS_C = datetime(2026, 3, 3, 12, 0, 0, 333333, tzinfo=timezone.utc)
+
+
+def _job_row_insert(
+    url: str,
+    job_id: uuid.UUID,
+    server_id: uuid.UUID = uuid.UUID(SERVER_A),
+    *,
+    parent_run_id: uuid.UUID | None = None,
+    label: str = "",
+    error_ref: str | None = None,
+    evidence_ref: str | None = None,
+    submitted_at: datetime | None = None,
+) -> None:
+    """One real job_runs row with explicit content columns."""
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            """
+            INSERT INTO job_runs
+                (run_id, server_id, parent_run_id, depth, profile_revision,
+                 prompt_revision, model_profile, requested_grants, label,
+                 error_ref, evidence_ref, submitted_at)
+            VALUES (%s, %s, %s, %s, 1, 1, 'profile', '[]'::jsonb,
+                    COALESCE(%s, ''), %s, %s, COALESCE(%s, now()))
+            """,
+            (
+                job_id,
+                server_id,
+                parent_run_id,
+                1 if parent_run_id is not None else 0,
+                label,
+                error_ref,
+                evidence_ref,
+                submitted_at,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO job_tags (job_id, tag_id) VALUES (%s, %s)",
+            (job_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+def _link_insert(
+    url: str,
+    conv_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    task_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
+    released_at: datetime | None = None,
+) -> None:
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_runs
+                (conversation_id, run_id, task_id, created_at, released_at)
+            VALUES (%s, %s, %s, COALESCE(%s, now()), %s)
+            """,
+            (conv_id, run_id, task_id, created_at, released_at),
+        )
+
+
+async def _record(
+    sessions: object, run_id: uuid.UUID, *targets: RunState
+) -> None:
+    lifecycle = RunLifecycle(sessions)  # type: ignore[arg-type]
+    for target in targets:
+        await lifecycle.record_transition(str(run_id), target)
+
+
+def _read_job(
+    sessions: object,
+    payload: dict[str, object],
+    context: ExecutionContext,
+) -> tuple[object, dict[str, object]]:
+    return _execute(
+        build_history_tag_capabilities(session_factory=sessions),  # type: ignore[arg-type]
+        TAGS_READ_JOB_CAPABILITY,
+        payload,
+        context,
+    )
+
+
+@pytest.mark.anyio
+class TestReadJobContent:
+    async def test_scalar_fields_are_returned_verbatim(
+        self, sessions, migrated_url
+    ) -> None:
+        parent, job = uuid.uuid4(), uuid.uuid4()
+        _job_row_insert(migrated_url, parent)
+        _job_row_insert(
+            migrated_url,
+            job,
+            parent_run_id=parent,
+            label="w4c2 job label",
+            error_ref="runs/abc/error",
+            evidence_ref="runs/abc/evidence",
+            submitted_at=_TS_B,
+        )
+
+        result, page = await _read_job(
+            sessions, {"run_id": str(job)}, _context(SERVER_A, uuid.uuid4())
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert page["status"] == "ok"
+        assert page["run_id"] == str(job)
+        assert page["parent_run_id"] == str(parent)
+        assert page["label"] == "w4c2 job label"
+        assert page["error_ref"] == "runs/abc/error"
+        assert page["evidence_ref"] == "runs/abc/evidence"
+        assert page["state"] is None  # no recorded transitions yet
+        assert page["task_id"] is None  # no links yet
+        assert datetime.fromisoformat(page["submitted_at"]) == _TS_B
+        assert datetime.fromisoformat(page["updated_at"]).tzinfo is not None
+        # The accepted envelope verbatim: nothing invented, no raw events.
+        assert set(page) == {
+            "ok",
+            "status",
+            "run_id",
+            "parent_run_id",
+            "task_id",
+            "label",
+            "state",
+            "submitted_at",
+            "updated_at",
+            "error_ref",
+            "evidence_ref",
+            "links",
+        }
+        assert page["links"] == {
+            "items": [],
+            "limit": TAGS_READ_DEFAULT_LIMIT,
+            "offset": 0,
+            "total": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    async def test_lifecycle_state_replays_without_raw_events(
+        self, sessions, migrated_url
+    ) -> None:
+        quiet, done = uuid.uuid4(), uuid.uuid4()
+        _job_row_insert(migrated_url, quiet)
+        _job_row_insert(migrated_url, done)
+        await _record(
+            sessions, done, RunState.QUEUED, RunState.RUNNING,
+            RunState.SUCCEEDED,
+        )
+
+        result, page = await _read_job(
+            sessions, {"run_id": str(done)}, _context(SERVER_A, uuid.uuid4())
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert page["state"] == "succeeded"
+        assert "events" not in page
+
+        _, pre_submit = await _read_job(
+            sessions, {"run_id": str(quiet)}, _context(SERVER_A, uuid.uuid4())
+        )
+        assert pre_submit["state"] is None
+
+    async def test_link_pages_walk_exactly_newest_first(
+        self, sessions, migrated_url
+    ) -> None:
+        job = uuid.uuid4()
+        _job_row_insert(migrated_url, job)
+        convs = [uuid.uuid4() for _ in range(3)]
+        bound_task = uuid.uuid4()
+        for conv, ts in zip(convs, (_TS_A, _TS_B, _TS_C), strict=True):
+            _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _link_insert(
+            migrated_url, convs[0], job, task_id=bound_task, created_at=_TS_A
+        )
+        _link_insert(migrated_url, convs[1], job, created_at=_TS_B)
+        _link_insert(
+            migrated_url, convs[2], job, created_at=_TS_C, released_at=_TS_C
+        )
+
+        collected: list[uuid.UUID] = []
+        offset, pages = 0, 0
+        while True:
+            result, page = await _read_job(
+                sessions,
+                {"run_id": str(job), "limit": 2, "offset": offset},
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            assert result.ok is True  # type: ignore[attr-defined]
+            assert len(page["links"]["items"]) <= 2
+            assert set(page["links"]) == {
+                "items",
+                "limit",
+                "offset",
+                "total",
+                "has_more",
+                "next_offset",
+            }
+            for link in page["links"]["items"]:
+                assert set(link) == {
+                    "conversation_id",
+                    "run_id",
+                    "task_id",
+                    "created_at",
+                    "released_at",
+                }
+                collected.append(uuid.UUID(link["conversation_id"]))
+            pages += 1
+            if not page["links"]["has_more"]:
+                assert page["links"]["next_offset"] is None
+                break
+            assert page["links"]["next_offset"] == offset + len(
+                page["links"]["items"]
+            )
+            offset = page["links"]["next_offset"]
+        assert pages > 1
+        assert page["links"]["total"] == 3
+        # Newest link first; the released link still pages, verbatim.
+        assert collected == [convs[2], convs[1], convs[0]]
+        result, page = await _read_job(
+            sessions,
+            {"run_id": str(job), "limit": 2},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        newest = page["links"]["items"][0]
+        assert newest["run_id"] == str(job)
+        assert newest["task_id"] is None
+        assert datetime.fromisoformat(newest["created_at"]) == _TS_C
+        assert datetime.fromisoformat(newest["released_at"]) == _TS_C
+
+    async def test_task_binding_is_newest_across_all_links_not_just_page(
+        self, sessions, migrated_url
+    ) -> None:
+        job = uuid.uuid4()
+        _job_row_insert(migrated_url, job)
+        conv_old, conv_new = uuid.uuid4(), uuid.uuid4()
+        _conv_insert(migrated_url, conv_old, uuid.UUID(SERVER_A))
+        _conv_insert(migrated_url, conv_new, uuid.UUID(SERVER_A))
+        bound_task = uuid.uuid4()
+        _link_insert(
+            migrated_url,
+            conv_old,
+            job,
+            task_id=bound_task,
+            created_at=_TS_A,
+            released_at=_TS_B,
+        )
+        # Newest link carries NO task binding and is the only page item.
+        _link_insert(migrated_url, conv_new, job, created_at=_TS_C)
+
+        result, page = await _read_job(
+            sessions,
+            {"run_id": str(job), "limit": 1},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert [
+            link["conversation_id"] for link in page["links"]["items"]
+        ] == [str(conv_new)]
+        # The binding is the newest NON-NULL task across ALL links —
+        # released ones included — independent of the returned page.
+        assert page["task_id"] == str(bound_task)
+        assert page["links"]["total"] == 2
+
+    async def test_released_links_still_page_with_verbatim_release(
+        self, sessions, migrated_url
+    ) -> None:
+        job = uuid.uuid4()
+        _job_row_insert(migrated_url, job)
+        conv = uuid.uuid4()
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _link_insert(
+            migrated_url, conv, job, created_at=_TS_A, released_at=_TS_B
+        )
+
+        result, page = await _read_job(
+            sessions, {"run_id": str(job)}, _context(SERVER_A, uuid.uuid4())
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        link = page["links"]["items"][0]
+        assert link["conversation_id"] == str(conv)
+        assert link["run_id"] == str(job)
+        assert link["task_id"] is None
+        assert datetime.fromisoformat(link["created_at"]) == _TS_A
+        assert datetime.fromisoformat(link["released_at"]) == _TS_B
+        assert page["links"]["total"] == 1
+        assert page["links"]["has_more"] is False
+
+    async def test_empty_label_is_verbatim_not_null(
+        self, sessions, migrated_url
+    ) -> None:
+        job = uuid.uuid4()
+        _job_row_insert(migrated_url, job, label="")
+
+        result, page = await _read_job(
+            sessions, {"run_id": str(job)}, _context(SERVER_A, uuid.uuid4())
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert isinstance(page["label"], str)
+        assert page["label"] == ""
+
+    async def test_cross_server_and_missing_are_identically_not_found(
+        self, sessions, migrated_url
+    ) -> None:
+        job_b = uuid.uuid4()
+        _job_row_insert(migrated_url, job_b, server_id=uuid.UUID(SERVER_B))
+
+        documents = []
+        for run_id in (job_b, uuid.uuid4()):
+            result, document = await _read_job(
+                sessions,
+                {"run_id": str(run_id)},
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            documents.append(document)
+        assert all(document["code"] == "not_found" for document in documents)
+        # A real other-server run and a missing one are indistinguishable.
+        assert len({document["message"] for document in documents}) == 1
+        assert documents[0]["message"] == "job not found"
+
+    async def test_cross_server_links_never_leak(
+        self, sessions, migrated_url
+    ) -> None:
+        job = uuid.uuid4()
+        _job_row_insert(migrated_url, job)
+        conv_a, conv_b = uuid.uuid4(), uuid.uuid4()
+        _conv_insert(migrated_url, conv_a, uuid.UUID(SERVER_A))
+        _conv_insert(migrated_url, conv_b, uuid.UUID(SERVER_B))
+        bound_task = uuid.uuid4()
+        _link_insert(
+            migrated_url, conv_a, job, task_id=bound_task, created_at=_TS_A
+        )
+        # Newer link, but to another server's conversation: invisible to
+        # the page, the total, AND the task binding.
+        foreign_task = uuid.uuid4()
+        _link_insert(
+            migrated_url, conv_b, job, task_id=foreign_task, created_at=_TS_C
+        )
+        assert foreign_task != bound_task
+
+        result, page = await _read_job(
+            sessions,
+            {"run_id": str(job), "limit": 1},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert page["links"]["total"] == 1
+        assert [
+            link["conversation_id"] for link in page["links"]["items"]
+        ] == [str(conv_a)]
+        assert page["task_id"] == str(bound_task)
+
+    async def test_invalid_bounds_refuse_invalid_request(
+        self, sessions
+    ) -> None:
+        context = _context(SERVER_A, uuid.uuid4())
+        for payload in (
+            {"run_id": str(uuid.uuid4()), "limit": 51},
+            {"run_id": str(uuid.uuid4()), "limit": 0},
+            {"run_id": str(uuid.uuid4()), "offset": -1},
+            {"run_id": "not-a-uuid"},
+        ):
+            result, document = await _read_job(sessions, payload, context)
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "invalid_request"

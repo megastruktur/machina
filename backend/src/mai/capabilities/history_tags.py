@@ -47,6 +47,7 @@ from mai.capabilities.internal_api import (
 from mai.history_store import (
     MAX_CONTENT_CHARS,
     aread_conversation_content,
+    aread_job_content,
     asearch_conversations_by_tags,
     asearch_jobs_by_tags,
 )
@@ -75,6 +76,7 @@ TAGS_DELETE_CAPABILITY: Final[str] = "tags.delete"
 TAGS_SEARCH_JOBS_CAPABILITY: Final[str] = "tags.search_jobs"
 TAGS_SEARCH_CONVERSATIONS_CAPABILITY: Final[str] = "tags.search_conversations"
 TAGS_READ_CONVERSATION_CAPABILITY: Final[str] = "tags.read_conversation"
+TAGS_READ_JOB_CAPABILITY: Final[str] = "tags.read_job"
 
 #: The public ``tags.*`` vocabulary: the W4A1 current-target scaffold,
 #: the W4B catalog tools, and the W4C tag-search and content reads.
@@ -88,6 +90,7 @@ TAGS_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     TAGS_SEARCH_JOBS_CAPABILITY,
     TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
     TAGS_READ_CONVERSATION_CAPABILITY,
+    TAGS_READ_JOB_CAPABILITY,
 )
 
 #: Bounded pagination vocabulary for ``tags.list_for`` (AGENTS.md §1).
@@ -99,9 +102,9 @@ TAGS_SEARCH_DEFAULT_LIMIT: Final[int] = 50
 TAGS_SEARCH_MAX_LIMIT: Final[int] = 50
 TAGS_SEARCH_MAX_TAG_IDS: Final[int] = 50
 
-#: Bounded content-read vocabulary for ``tags.read_conversation``
-#: (AGENTS.md §1); the char ceiling is the store reader's own
-#: ``MAX_CONTENT_CHARS``.
+#: Bounded content-read vocabulary for ``tags.read_conversation`` and
+#: ``tags.read_job`` (AGENTS.md §1); the char ceiling is the store
+#: reader's own ``MAX_CONTENT_CHARS``.
 TAGS_READ_DEFAULT_LIMIT: Final[int] = 50
 TAGS_READ_MAX_LIMIT: Final[int] = 50
 TAGS_READ_DEFAULT_MAX_CHARS: Final[int] = 4096
@@ -318,6 +321,36 @@ class TagsReadConversationPayload(BaseModel):
         description=(
             "Maximum number of stored content characters returned "
             "across the whole page (1-20000)."
+        ),
+    )
+
+
+class TagsReadJobPayload(BaseModel):
+    """Read one job run's content and a bounded page of its links."""
+
+    run_id: uuid.UUID = Field(
+        description=(
+            "Canonical UUID of the job run to read; only runs stored "
+            "on this server are visible and another server's run is "
+            "indistinguishable from a missing one."
+        ),
+    )
+    limit: int = Field(
+        default=TAGS_READ_DEFAULT_LIMIT,
+        ge=1,
+        le=TAGS_READ_MAX_LIMIT,
+        description=(
+            "Maximum number of conversation links returned in this "
+            "bounded page (1-50)."
+        ),
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Zero-based link index this page starts at, ordered "
+            "newest first; use the previous page's next_offset to "
+            "continue exactly."
         ),
     )
 
@@ -929,6 +962,97 @@ def build_history_tag_capabilities(
 
     operations.append(_tags_read_conversation)
 
+    # -- tags.read_job -------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=TAGS_READ_JOB_CAPABILITY,
+        version="0.1.0",
+        effect_class="read",
+        resource_scope=["history_tags"],
+        environments=["controller"],
+        payload_model=TagsReadJobPayload,
+        description=(
+            "Read one job run's stored content on this server: "
+            "parentage, the frozen submit label, the replayed "
+            "lifecycle state, error/evidence references, and one "
+            "bounded page of its same-server conversation links with "
+            "the newest task binding across all links; no raw events "
+            "are exposed and another server's run is "
+            "indistinguishable from a missing one."
+        ),
+    )
+    async def _tags_read_job(
+        call: CapabilityCall, payload: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        if session_factory is None:
+            raise InternalApiError(
+                "unavailable", "history store is not configured"
+            )
+        run_id = uuid.UUID(str(payload["run_id"]))
+        limit = int(payload.get("limit", TAGS_READ_DEFAULT_LIMIT))
+        offset = int(payload.get("offset", 0))
+        try:
+            job = await aread_job_content(
+                session_factory,
+                run_id,
+                server_id=call.context.server_id,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            # One fixed value-free refusal: a missing and another
+            # server's run are indistinguishable on the wire.
+            raise InternalApiError("not_found", "job not found") from exc
+        return {
+            "ok": True,
+            "run_id": str(job.run_id),
+            "parent_run_id": (
+                str(job.parent_run_id)
+                if job.parent_run_id is not None
+                else None
+            ),
+            "task_id": (
+                str(job.task_id) if job.task_id is not None else None
+            ),
+            "label": job.label,
+            "state": job.state,
+            "submitted_at": job.submitted_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+            "error_ref": job.error_ref,
+            "evidence_ref": job.evidence_ref,
+            "links": {
+                "items": [
+                    {
+                        "conversation_id": str(link.conversation_id),
+                        "run_id": str(link.run_id),
+                        "task_id": (
+                            str(link.task_id)
+                            if link.task_id is not None
+                            else None
+                        ),
+                        "created_at": link.created_at.isoformat(),
+                        "released_at": (
+                            link.released_at.isoformat()
+                            if link.released_at is not None
+                            else None
+                        ),
+                    }
+                    for link in job.links.items
+                ],
+                "limit": job.links.limit,
+                "offset": job.links.offset,
+                "total": job.links.total,
+                "has_more": job.links.has_more,
+                "next_offset": (
+                    job.links.offset + len(job.links.items)
+                    if job.links.has_more
+                    else None
+                ),
+            },
+        }
+
+    operations.append(_tags_read_job)
+
     # -- tags.create ---------------------------------------------------------
 
     @internal_api_tool(
@@ -1095,6 +1219,7 @@ __all__ = [
     "TAGS_READ_DEFAULT_LIMIT",
     "TAGS_READ_MAX_LIMIT",
     "TAGS_READ_DEFAULT_MAX_CHARS",
+    "TAGS_READ_JOB_CAPABILITY",
     "TAGS_REMOVE_CAPABILITY",
     "TAGS_SEARCH_CONVERSATIONS_CAPABILITY",
     "TAGS_SEARCH_JOBS_CAPABILITY",
@@ -1104,6 +1229,7 @@ __all__ = [
     "TagsListCatalogPayload",
     "TagsListForPayload",
     "TagsReadConversationPayload",
+    "TagsReadJobPayload",
     "TagsRemovePayload",
     "TagsSearchConversationsPayload",
     "TagsSearchJobsPayload",
