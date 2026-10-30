@@ -1,9 +1,10 @@
-"""Focused tests for the ``tags.*`` capability scaffold (card W4A1).
+"""Focused tests for the ``tags.*`` capability surface (W4A1..W4B).
 
-Descriptor/contract claims are pure build-time tests (no database). The
-current-target resolver claims reuse the disposable real-Postgres
-harness of ``test_task_capabilities.py``: set ``MAI_TEST_DATABASE_URL``
-to a fresh disposable pgvector/pg18 database (the harness applies the
+Descriptor/contract claims are pure build-time tests (no database).
+Store-backed claims (current-target wiring and the W4B catalog tools
+create/list_catalog/delete) reuse the disposable real-Postgres harness
+of ``test_task_capabilities.py``: set ``MAI_TEST_DATABASE_URL`` to a
+fresh disposable pgvector/pg18 database (the harness applies the
 linear Alembic chain from zero); without it those tests skip.
 """
 
@@ -27,11 +28,16 @@ from mai.capabilities.dispatch import CapabilityCall
 from mai.capabilities.history_tags import (
     TAGS_ASSIGN_CAPABILITY,
     TAGS_CAPABILITY_IDS,
+    TAGS_CREATE_CAPABILITY,
+    TAGS_DELETE_CAPABILITY,
+    TAGS_LIST_CATALOG_CAPABILITY,
     TAGS_LIST_DEFAULT_LIMIT,
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
     TagsAssignPayload,
+    TagsCreatePayload,
+    TagsListCatalogPayload,
     TagsRemovePayload,
     _aresolve_current_target,
     build_history_tag_capabilities,
@@ -46,6 +52,7 @@ from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
     aassign_job_tag,
     acreate_tag,
+    alist_tags,
     atags_for_conversation,
     atags_for_job,
 )
@@ -125,6 +132,9 @@ def _minimal_payloads() -> dict[str, dict[str, object]]:
         TAGS_ASSIGN_CAPABILITY: {"target": "job", "tag_id": tag},
         TAGS_REMOVE_CAPABILITY: {"target": "job", "tag_id": tag},
         TAGS_LIST_FOR_CAPABILITY: {"target": "conversation"},
+        TAGS_CREATE_CAPABILITY: {"name": f"w4b-min-{uuid.uuid4()}"},
+        TAGS_LIST_CATALOG_CAPABILITY: {},
+        TAGS_DELETE_CAPABILITY: {"tag_id": tag},
     }
 
 
@@ -157,7 +167,14 @@ class TestDescriptors:
 
     def test_target_is_the_job_or_conversation_literal(self) -> None:
         composition = _composition()
-        for descriptor in composition.descriptors:
+        for capability_id in (
+            TAGS_ASSIGN_CAPABILITY,
+            TAGS_REMOVE_CAPABILITY,
+            TAGS_LIST_FOR_CAPABILITY,
+        ):
+            descriptor = {
+                d.identifier: d for d in composition.descriptors
+            }[capability_id]
             target = descriptor.input_schema["properties"]["target"]
             assert target["enum"] == ["job", "conversation"]
             assert "target" in descriptor.input_schema["required"]
@@ -182,9 +199,45 @@ class TestDescriptors:
         for capability_id in (
             TAGS_ASSIGN_CAPABILITY,
             TAGS_LIST_FOR_CAPABILITY,
+            TAGS_CREATE_CAPABILITY,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            TAGS_DELETE_CAPABILITY,
         ):
             props = by_id[capability_id].input_schema["properties"]
             assert "replacement_tag_id" not in props
+
+    def test_catalog_tools_declare_bounded_contracts(self) -> None:
+        composition = _composition()
+        by_id = {d.identifier: d for d in composition.descriptors}
+        assert by_id[TAGS_CREATE_CAPABILITY].effect_class == "mutate"
+        assert by_id[TAGS_LIST_CATALOG_CAPABILITY].effect_class == "read"
+        assert by_id[TAGS_DELETE_CAPABILITY].effect_class == "mutate"
+
+        create = by_id[TAGS_CREATE_CAPABILITY].input_schema
+        assert create["required"] == ["name"]
+        assert (
+            TagsCreatePayload(name="w4b", description="x" * 500).description
+            == "x" * 500
+        )
+        with pytest.raises(ValidationError):
+            TagsCreatePayload(name="w4b", description="x" * 501)
+        assert "minLength" not in create["properties"]["description"]
+
+        catalog = by_id[TAGS_LIST_CATALOG_CAPABILITY].input_schema
+        assert "q" not in catalog["required"]
+        assert "type" in catalog["properties"]["q"]
+        assert TagsListCatalogPayload(q="x" * 64).q == "x" * 64
+        with pytest.raises(ValidationError):
+            TagsListCatalogPayload(q="x" * 65)
+        with pytest.raises(ValidationError):
+            TagsListCatalogPayload(q="")
+        assert catalog["properties"]["limit"]["minimum"] == 1
+        assert catalog["properties"]["limit"]["maximum"] == TAGS_LIST_MAX_LIMIT
+        assert catalog["properties"]["offset"]["minimum"] == 0
+
+        delete = by_id[TAGS_DELETE_CAPABILITY].input_schema
+        assert delete["required"] == ["tag_id"]
+        assert "force" not in delete["required"]
 
     def test_list_for_declares_bounded_pagination(self) -> None:
         composition = _composition()
@@ -248,6 +301,38 @@ class TestPayloadRuntimeContract:
                 payload_model.model_validate(
                     {"target": "job", "tag_id": tag_id}
                 )
+
+
+class TestCreatePayloadContract:
+    def test_name_is_canonicalized_like_the_store(self) -> None:
+        payload = TagsCreatePayload.model_validate(
+            {"name": "  W4B   Alpha  "}
+        )
+        assert payload.name == "W4B Alpha"
+        assert payload.description is None
+
+    def test_description_is_optional_and_bounded(self) -> None:
+        payload = TagsCreatePayload.model_validate(
+            {"name": "w4b", "description": "d" * 500}
+        )
+        assert payload.description == "d" * 500
+        with pytest.raises(ValidationError):
+            TagsCreatePayload.model_validate(
+                {"name": "w4b", "description": "d" * 501}
+            )
+
+    @pytest.mark.parametrize(
+        ("raw_name", "reason"),
+        [
+            ("   ", "whitespace-only"),
+            ("line1\nline2", "control character"),
+            ("a" * 65, "over the canonical length"),
+            ("\x1f hidden", "control character"),
+        ],
+    )
+    def test_rejects_non_canonical_names(self, raw_name: str, reason: str) -> None:
+        with pytest.raises(ValidationError):
+            TagsCreatePayload.model_validate({"name": raw_name})
 
 
 # ---------------------------------------------------------------------------
@@ -767,3 +852,259 @@ class TestListForWired:
         assert result.ok is False  # type: ignore[attr-defined]
         assert document["status"] == "refused"
         assert document["code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# W4B — catalog tools: create / list_catalog / delete (real Postgres)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_prefix() -> str:
+    return f"w4b-cat-{uuid.uuid4().hex[:8]}-"
+
+
+@pytest.mark.anyio
+class TestCatalogWired:
+    async def test_create_persists_one_canonical_typed_row(
+        self, sessions
+    ) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+
+        result, document = await _execute(
+            composition,
+            TAGS_CREATE_CAPABILITY,
+            {
+                "name": f"  {_catalog_prefix()}Alpha   Beta  ",
+                "description": "created by the W4B capability test",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["status"] == "ok" and document["ok"] is True
+        canonical = document["name"]
+        assert canonical.startswith("w4b-cat-") and canonical.endswith("Alpha Beta")
+        assert document["description"] == "created by the W4B capability test"
+        assert str(uuid.UUID(document["tag_id"])) == document["tag_id"]
+        datetime.fromisoformat(document["created_at"])
+        datetime.fromisoformat(document["updated_at"])
+
+        rows, total = await alist_tags(
+            sessions, name_filter=canonical.removeprefix("w4b-cat-")
+        )
+        assert total == 1
+        assert rows[0].tag_id == uuid.UUID(document["tag_id"])
+        assert rows[0].name == canonical  # the stored name IS the canonical form
+
+    async def test_create_duplicate_canonical_name_returns_existing_row(
+        self, sessions
+    ) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        original_name = f"{_catalog_prefix()}Dup Case"
+
+        _, first = await _execute(
+            composition,
+            TAGS_CREATE_CAPABILITY,
+            {"name": original_name, "description": "the original purpose"},
+            context,
+        )
+        assert first["status"] == "ok"
+
+        # Same canonical name (case + whitespace differ), different
+        # description: idempotent re-create returns the winner's row
+        # untouched — the stored description is never overwritten.
+        result, second = await _execute(
+            composition,
+            TAGS_CREATE_CAPABILITY,
+            {
+                "name": f"  {original_name.upper()}  ",
+                "description": "a different purpose that must be ignored",
+            },
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert second["tag_id"] == first["tag_id"]
+        assert second["name"] == first["name"]
+        assert second["description"] == "the original purpose"
+
+    async def test_create_refuses_invalid_names_fail_closed(
+        self, sessions
+    ) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        # Catalog rows from sibling tests are never truncated, so the
+        # "nothing was created" claim is a delta, not an absolute count.
+        _, total_before = await alist_tags(sessions, limit=1)
+        for raw_name in ("   ", "line1\nline2", "a" * 65):
+            result, document = await _execute(
+                composition,
+                TAGS_CREATE_CAPABILITY,
+                {"name": raw_name},
+                context,
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "invalid_request"
+        _, total_after = await alist_tags(sessions, limit=1)
+        assert total_after == total_before
+
+    async def test_list_catalog_pages_deterministically_with_q_filter(
+        self, sessions
+    ) -> None:
+        prefix = _catalog_prefix()
+        names = [f"{prefix}b-row", f"{prefix}a-row", f"{prefix}c-row"]
+        for name in names:
+            await acreate_tag(sessions, name=name)
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, uuid.uuid4())
+        expected_order = sorted(names, key=str.lower)
+
+        result, first = await _execute(
+            composition,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            {"q": prefix, "limit": 2, "offset": 0},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert first["status"] == "ok" and first["ok"] is True
+        assert first["total"] == 3  # pre-slice count under the same filter
+        assert first["limit"] == 2 and first["offset"] == 0
+        assert first["has_more"] is True and first["next_offset"] == 2
+        assert [item["name"] for item in first["items"]] == expected_order[:2]
+        row = first["items"][0]
+        assert set(row) == {
+            "tag_id",
+            "name",
+            "description",
+            "created_at",
+            "updated_at",
+        }
+        assert str(uuid.UUID(row["tag_id"])) == row["tag_id"]
+        datetime.fromisoformat(row["created_at"])
+        datetime.fromisoformat(row["updated_at"])
+
+        # Final page ends the sequence: has_more False, next_offset None.
+        _, final = await _execute(
+            composition,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            {"q": prefix, "limit": 2, "offset": first["next_offset"]},
+            context,
+        )
+        assert [item["name"] for item in final["items"]] == expected_order[2:]
+        assert final["total"] == 3
+        assert final["has_more"] is False and final["next_offset"] is None
+
+        # The filter is a case-insensitive substring on the tag name.
+        _, narrowed = await _execute(
+            composition,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            {"q": prefix.upper() + "B-ROW"},
+            context,
+        )
+        assert narrowed["total"] == 1
+        assert narrowed["items"][0]["name"] == f"{prefix}b-row"
+
+        # A filter matching nothing is an honest empty page, not a refusal.
+        _, absent = await _execute(
+            composition,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            {"q": f"{prefix}absent"},
+            context,
+        )
+        assert absent["items"] == [] and absent["total"] == 0
+        assert absent["has_more"] is False and absent["next_offset"] is None
+
+    async def test_delete_refuses_used_tag_until_forced_and_keeps_final_tag(
+        self, sessions, migrated_url
+    ) -> None:
+        run_id = uuid.uuid4()
+        _insert_job(migrated_url, run_id)  # seeds the reserved unclassified tag
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        context = _context(SERVER_A, run_id)
+        _, created = await _execute(
+            composition,
+            TAGS_CREATE_CAPABILITY,
+            {"name": f"{_catalog_prefix()}used-tag"},
+            context,
+        )
+        tag_id = created["tag_id"]
+        result, _ = await _execute(
+            composition,
+            TAGS_ASSIGN_CAPABILITY,
+            {"target": "job", "tag_id": tag_id},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+
+        # Default refusal: the tag is used, force is absent (False).
+        result, refused = await _execute(
+            composition,
+            TAGS_DELETE_CAPABILITY,
+            {"tag_id": tag_id},
+            context,
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert refused["status"] == "refused"
+        assert refused["code"] == "conflict"
+        _, total = await alist_tags(sessions, name_filter="used-tag")
+        assert total == 1  # the refused delete changed nothing
+
+        # Forced delete succeeds only because the job keeps its final
+        # (reserved) tag; the association row is removed with the tag.
+        result, forced = await _execute(
+            composition,
+            TAGS_DELETE_CAPABILITY,
+            {"tag_id": tag_id, "force": True},
+            context,
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert forced["status"] == "ok"
+        assert forced["tag_id"] == tag_id
+        assert forced["force"] is True
+        assert forced["removed_associations"] == 1
+
+        _, total_after = await alist_tags(sessions, name_filter="used-tag")
+        assert total_after == 0
+        remaining, remaining_total = await atags_for_job(
+            sessions, run_id, server_id=uuid.UUID(SERVER_A)
+        )
+        assert remaining_total == 1  # final-tag preservation
+        assert remaining[0].name == "unclassified"
+
+    async def test_delete_reserved_tag_refused_even_forced(self, sessions) -> None:
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_DELETE_CAPABILITY,
+            {
+                "tag_id": str(uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+                "force": True,
+            },
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "conflict"
+        _, total = await alist_tags(sessions, name_filter="unclassified")
+        assert total == 1
+
+    async def test_full_catalog_page_envelope_stays_under_60000_bytes(
+        self, sessions
+    ) -> None:
+        prefix = _catalog_prefix()
+        for index in range(105):
+            await acreate_tag(sessions, name=f"{prefix}{index:03d}")
+        composition = build_history_tag_capabilities(session_factory=sessions)
+        result, document = await _execute(
+            composition,
+            TAGS_LIST_CATALOG_CAPABILITY,
+            {"q": prefix, "limit": TAGS_LIST_MAX_LIMIT, "offset": 0},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert document["total"] == 105
+        assert len(document["items"]) == TAGS_LIST_MAX_LIMIT
+        assert document["has_more"] is True
+        assert document["next_offset"] == TAGS_LIST_MAX_LIMIT
+        assert len(json.dumps(document, sort_keys=True)) < 60000
