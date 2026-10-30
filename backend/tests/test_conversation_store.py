@@ -100,7 +100,8 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009")
 
 # The exact public application schema at the 0009 tip: the 0008 set plus
-# the seven agent-task domain tables (09-agent-tasks) — nothing else, in
+# the seven agent-task domain tables (09-agent-tasks), and (from the 0011
+# tip onward) the three history-tag tables (W1) — nothing else, in
 # particular no engine-shadowing run-state table and no ``dbos`` schema
 # before engine launch.
 EXPECTED_APP_TABLES = frozenset(
@@ -134,6 +135,9 @@ EXPECTED_APP_TABLES = frozenset(
         "agent_task_evidence",
         "agent_task_revisions",
         "agent_task_completions",
+        "tags",
+        "job_tags",
+        "conversation_tags",
     }
 )
 
@@ -174,25 +178,27 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
-        # Full app set at the chain tip — the 04-conversation-store tables
-        # AND the 09-agent-task tables (which hold the
-        # fk_agent_tasks_conversation dependency on conversations) are
-        # listed here (chain-tip reconciliation) so the zero-to-head
-        # fixture stays order-independent after revision 0009 and after
-        # sibling suites ran on the same shared database.
+        # Full app set at the chain tip — the 04-conversation-store tables,
+        # the 09-agent-task tables (which hold the
+        # fk_agent_tasks_conversation dependency on conversations) and the
+        # 0011 history-tag tables (which hold the job_tags/conversation_tags
+        # dependencies on conversations, job_runs and tags) are listed here
+        # (chain-tip reconciliation) so the zero-to-head fixture stays
+        # order-independent after revision 0009, 0011 and after sibling
+        # suites ran on the same shared database.
         conn.execute(
             "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
-            "conversation_messages, conversations, notification_alerts, "
-            "observation_findings, server_observations, "
-            "application_projection_journal, application_projection, "
-            "knowledge_doc_chunks, knowledge_documents, job_resource_locks, "
+            "conversation_messages, conversations, conversation_tags, "
+            "notification_alerts, observation_findings, "
+            "server_observations, application_projection_journal, "
+            "application_projection, knowledge_doc_chunks, knowledge_documents, job_resource_locks, "
             "job_schedule_fires, job_schedules, job_events, job_steps, "
-            "job_runs, approvals, profile_projection_journal, "
+            "job_runs, job_tags, approvals, profile_projection_journal, "
             "profile_projection, admin_sessions, admin_credential, "
             "agent_task_completions, agent_task_revisions, "
             "agent_task_evidence, agent_task_criteria, "
             "agent_task_constraints, agent_task_steps, agent_tasks, "
-            "alembic_version"
+            "tags, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()

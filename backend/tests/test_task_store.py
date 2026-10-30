@@ -110,7 +110,8 @@ REVISION_IDS = (
 )
 
 # The exact public application schema at the 0009 tip: the 0008 set plus
-# the seven task-domain tables — nothing else.
+# the seven task-domain tables, and (from the 0011 tip onward) the three
+# history-tag tables (W1) — nothing else.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -142,6 +143,9 @@ EXPECTED_APP_TABLES = frozenset(
         "agent_task_evidence",
         "agent_task_revisions",
         "agent_task_completions",
+        "tags",
+        "job_tags",
+        "conversation_tags",
     }
 )
 
@@ -172,13 +176,14 @@ def _drop_app_tables(url: str) -> None:
             "agent_task_criteria, agent_task_constraints, "
             "agent_task_steps, agent_tasks, conversation_steering, "
             "conversation_runs, conversation_messages, conversations, "
+            "conversation_tags, "
             "notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, "
             "knowledge_documents, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
+            "job_events, job_steps, job_runs, job_tags, approvals, "
             "profile_projection_journal, profile_projection, "
-            "admin_sessions, admin_credential, alembic_version"
+            "admin_sessions, admin_credential, tags, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()

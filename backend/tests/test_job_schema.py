@@ -80,19 +80,34 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # Chain-tip reconciliation (card 10-observation-schema, exclusive
 # migration-chain owner): revision 0007 appends the bounded observation +
 # notification persistence, revision 0008 the conversation domain,
-# revision 0009 the agent-task domain and revision 0010 the job_runs run
-# label (W1); the tip constants are advanced here so this file's head
-# assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010")
+# revision 0009 the agent-task domain, revision 0010 the job_runs run
+# label and revision 0011 the global tag catalog + mandatory
+# job/conversation classification (history-tags W1); the tip constants
+# are advanced here so this file's head assertions stay true.
+REVISION_IDS = (
+    "0001",
+    "0002",
+    "0003",
+    "0004",
+    "0005",
+    "0006",
+    "0007",
+    "0008",
+    "0009",
+    "0010",
+    "0011",
+)
 
-# The exact public application schema after 0009 — nothing else, in
+# The exact public application schema at the tip — nothing else, in
 # particular no engine-shadowing run-state table (C05 rule 1).
 # ``alembic_version`` is the chain's own bookkeeping table (since 0001).
 # The knowledge tables belong to 07-vector-schema (0005), the application
 # tables to 08-adoption (0006), the observation tables to
 # 10-observation-schema (0007), the conversation tables to
-# 04-conversation-store (0008) and the agent-task tables to 09-agent-tasks
-# (0009); they are part of the exact app set this file pins at the tip.
+# 04-conversation-store (0008), the agent-task tables to 09-agent-tasks
+# (0009) and the history-tag tables (``tags``, ``job_tags``,
+# ``conversation_tags``) to 0011 (history-tags W1); they are part of the
+# exact app set this file pins at the tip.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -124,11 +139,18 @@ EXPECTED_APP_TABLES = frozenset(
         "agent_task_evidence",
         "agent_task_revisions",
         "agent_task_completions",
+        "tags",
+        "job_tags",
+        "conversation_tags",
     }
 )
 
 # Frozen fixture identities (canonical lowercase UUID strings).
 SERVER_ID = "5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60"
+# Reserved ``unclassified`` tag seeded by revision 0011
+# (migrations/versions/0011_history_tags.py): seeded runs must reference it
+# in the same statement as their job_runs insert (mandatory-tag invariant).
+RESERVED_UNCLASSIFIED_TAG_ID = "6a1e9d3c-5b4f-4c2a-9e8d-7f0a1b2c3d4e"
 ROOT_RUN_ID = "7e6c1a34-9a2b-4c3d-8e5f-1029384756af"
 CHILD_RUN_ID = "3f2e9a10-5b6c-4d7e-8f90-1a2b3c4d5e6f"
 STEP_ID = "12a5f7c8-3d94-4e2b-8a60-5f7e9d0c1b23"
@@ -249,6 +271,10 @@ async def _exec(sessions, sql: str, **params: object) -> None:
 async def _insert_root_run(
     sessions, run_id: str = ROOT_RUN_ID, **overrides: object
 ) -> None:
+    # 0011 mandatory-tag invariant: the seeded run carries the reserved
+    # unclassified classification in the SAME statement — out-of-band bare
+    # entity inserts cannot commit (the real store assigns the tag at
+    # creation; migrations/versions/0011_history_tags.py).
     columns = {
         "run_id": run_id,
         "server_id": SERVER_ID,
@@ -262,10 +288,16 @@ async def _insert_root_run(
     await _exec(
         sessions,
         f"""
-        INSERT INTO job_runs
-            ({", ".join(columns)}, submitted_at, updated_at)
-        VALUES
-            ({", ".join(f":{name}" for name in columns)}, now(), now())
+        WITH new_run AS (
+            INSERT INTO job_runs
+                ({", ".join(columns)}, submitted_at, updated_at)
+            VALUES
+                ({", ".join(f":{name}" for name in columns)}, now(), now())
+            RETURNING run_id
+        )
+        INSERT INTO job_tags (job_id, tag_id)
+        SELECT run_id, '{RESERVED_UNCLASSIFIED_TAG_ID}'
+        FROM new_run
         """,
         **columns,
     )
