@@ -565,9 +565,13 @@ def test_unused_tag_deletes_and_used_tag_is_refused(migrated_url: str) -> None:
     _insert_job_run(migrated_url, JOB_F)
     _assign_job_tag(migrated_url, JOB_F, TAG_USED)
     with psycopg.connect(migrated_url) as conn:
-        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with pytest.raises(psycopg.errors.IntegrityError) as excinfo:
             conn.execute("DELETE FROM tags WHERE tag_id = %s", (TAG_USED,))
         conn.rollback()
+    # ON DELETE RESTRICT reports 23001 (restrict_violation) on some server
+    # versions and 23503 (foreign_key_violation) on others; either way the
+    # used tag's deletion is refused at the integrity layer.
+    assert excinfo.value.sqlstate in {"23001", "23503"}
     # The later store/API "force" path works through the same schema: remove
     # the association first (the entity keeps the reserved tag), then delete.
     with psycopg.connect(migrated_url) as conn:

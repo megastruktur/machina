@@ -191,25 +191,28 @@ def _database_url(url: str, database: str) -> str:
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         # Full app set at the chain tip — the 07-vector-schema,
-        # 08-adoption, 10-observation-schema tables AND the conversation
-        # (0008) / agent-task (0009) domains are listed here (chain-tip
-        # reconciliation, the ``test_agent_task_run`` DOMAIN_TABLES
-        # convention) so the zero-to-head fixture stays order-independent
-        # after sibling suites ran on the same shared database: a partial
-        # list would leave ``agent_tasks`` rows behind and break the next
-        # suite's conversation-domain DELETE teardown.
+        # 08-adoption, 10-observation-schema tables, the conversation
+        # (0008) / agent-task (0009) domains AND the history-tag tables
+        # (0011) are listed here (chain-tip reconciliation, the
+        # ``test_agent_task_run`` DOMAIN_TABLES convention) so the
+        # zero-to-head fixture stays order-independent after sibling
+        # suites ran on the same shared database: a partial list would
+        # leave ``agent_tasks`` rows behind and break the next suite's
+        # conversation-domain DELETE teardown. The 0011 association tables
+        # drop before their job_runs/conversations/tags parents so the
+        # reset stays FK-safe on a schema-bearing database.
         conn.execute(
             "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, knowledge_documents, "
             "job_resource_locks, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
+            "job_events, job_steps, job_tags, job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
             "admin_credential, conversation_steering, conversation_runs, "
-            "conversation_messages, conversations, agent_task_completions, "
-            "agent_task_revisions, agent_task_evidence, "
+            "conversation_messages, conversation_tags, conversations, "
+            "agent_task_completions, agent_task_revisions, agent_task_evidence, "
             "agent_task_criteria, agent_task_constraints, "
-            "agent_task_steps, agent_tasks, alembic_version"
+            "agent_task_steps, agent_tasks, tags, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         # Engine-owned shadow state: a sibling suite's engine launch on
