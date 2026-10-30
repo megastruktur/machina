@@ -247,11 +247,12 @@ class TagsDeletePayload(BaseModel):
         default=False,
         description=(
             "Whether a tag that is still attached to history records "
-            "may be deleted. With the default False a used tag (and "
-            "the reserved 'unclassified' tag) is refused; with True "
-            "the delete proceeds only while every affected record "
-            "keeps another tag, so the final tag of a record is "
-            "always preserved."
+            "may be force-deleted. With the default False a used tag "
+            "is refused; set True to force the delete. The reserved "
+            "'unclassified' tag is always refused, with or without "
+            "force. A forced delete proceeds only while every "
+            "affected record keeps another tag, so the final tag of "
+            "a record is always preserved."
         ),
     )
 
@@ -654,9 +655,10 @@ def build_history_tag_capabilities(
         payload_model=TagsDeletePayload,
         description=(
             "Delete one history tag from the global catalog. A tag "
-            "that is still attached to history records, and the "
-            "reserved 'unclassified' tag, are refused unless force is "
-            "set; even a forced delete proceeds only while every "
+            "that is still attached to history records is refused by "
+            "default and may be deleted with force; the reserved "
+            "'unclassified' tag is always refused, with or without "
+            "force. A forced delete proceeds only while every "
             "affected record keeps another tag, so final tags are "
             "always preserved."
         ),
