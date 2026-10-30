@@ -34,6 +34,10 @@ from mai.capabilities.history_tags import (
     TAGS_LIST_DEFAULT_LIMIT,
     TAGS_LIST_FOR_CAPABILITY,
     TAGS_LIST_MAX_LIMIT,
+    TAGS_READ_CONVERSATION_CAPABILITY,
+    TAGS_READ_DEFAULT_LIMIT,
+    TAGS_READ_DEFAULT_MAX_CHARS,
+    TAGS_READ_MAX_LIMIT,
     TAGS_REMOVE_CAPABILITY,
     TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
     TAGS_SEARCH_DEFAULT_LIMIT,
@@ -44,6 +48,7 @@ from mai.capabilities.history_tags import (
     TagsAssignPayload,
     TagsCreatePayload,
     TagsListCatalogPayload,
+    TagsReadConversationPayload,
     TagsRemovePayload,
     TagsSearchConversationsPayload,
     TagsSearchJobsPayload,
@@ -55,6 +60,7 @@ from mai.capabilities.internal_api import (
     InternalApiError,
     assert_agent_ready_descriptor,
 )
+from mai.history_store import MAX_CONTENT_CHARS
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.tag_store import (
     RESERVED_UNCLASSIFIED_TAG_ID,
@@ -146,6 +152,9 @@ def _minimal_payloads() -> dict[str, dict[str, object]]:
         TAGS_DELETE_CAPABILITY: {"tag_id": tag},
         TAGS_SEARCH_JOBS_CAPABILITY: {"tag_ids": [tag]},
         TAGS_SEARCH_CONVERSATIONS_CAPABILITY: {"tag_ids": [tag]},
+        TAGS_READ_CONVERSATION_CAPABILITY: {
+            "conversation_id": str(uuid.uuid4())
+        },
     }
 
 
@@ -164,6 +173,7 @@ class TestDescriptors:
         assert by_id[TAGS_LIST_FOR_CAPABILITY].effect_class == "read"
         assert by_id[TAGS_SEARCH_JOBS_CAPABILITY].effect_class == "read"
         assert by_id[TAGS_SEARCH_CONVERSATIONS_CAPABILITY].effect_class == "read"
+        assert by_id[TAGS_READ_CONVERSATION_CAPABILITY].effect_class == "read"
         for descriptor in composition.descriptors:
             assert_agent_ready_descriptor(descriptor)
             assert len(str(descriptor.input_schema["description"])) >= 30
@@ -175,8 +185,14 @@ class TestDescriptors:
         for descriptor in composition.descriptors:
             props = descriptor.input_schema["properties"]
             assert "server_id" not in props
-            assert "conversation_id" not in props
             assert "run_id" not in props
+            assert "job_id" not in props
+            if descriptor.identifier == TAGS_READ_CONVERSATION_CAPABILITY:
+                # The one tags tool that legitimately names its subject:
+                # the conversation_id of a same-server read result.
+                assert "conversation_id" in props
+                continue
+            assert "conversation_id" not in props
 
     def test_target_is_the_job_or_conversation_literal(self) -> None:
         composition = _composition()
@@ -292,6 +308,68 @@ class TestDescriptors:
         assert TagsSearchConversationsPayload(
             tag_ids=[uuid.uuid4()]
         ).match == "any"
+
+
+class TestReadConversationPayloadContract:
+    def test_descriptor_declares_bounded_content_contract(self) -> None:
+        composition = _composition()
+        by_id = {d.identifier: d for d in composition.descriptors}
+        read = by_id[TAGS_READ_CONVERSATION_CAPABILITY].input_schema
+        assert read["required"] == ["conversation_id"]
+        props = read["properties"]
+        assert "server_id" not in props
+        assert props["limit"]["minimum"] == 1
+        assert props["limit"]["maximum"] == TAGS_READ_MAX_LIMIT == 50
+        assert props["offset"]["minimum"] == 0
+        assert props["char_cursor"]["minimum"] == 0
+        assert props["max_chars"]["minimum"] == 1
+        assert props["max_chars"]["maximum"] == MAX_CONTENT_CHARS == 20_000
+
+    def test_defaults_and_uuid_coercion(self) -> None:
+        conv = str(uuid.uuid4())
+        payload = TagsReadConversationPayload.model_validate(
+            {"conversation_id": conv}
+        )
+        assert payload.conversation_id == uuid.UUID(conv)
+        assert payload.limit == TAGS_READ_DEFAULT_LIMIT == 50
+        assert payload.offset == 0
+        assert payload.char_cursor == 0
+        assert payload.max_chars == TAGS_READ_DEFAULT_MAX_CHARS == 4096
+
+    def test_accepts_the_maximal_request(self) -> None:
+        payload = TagsReadConversationPayload.model_validate(
+            {
+                "conversation_id": str(uuid.uuid4()),
+                "limit": TAGS_READ_MAX_LIMIT,
+                "offset": 7,
+                "char_cursor": 12,
+                "max_chars": MAX_CONTENT_CHARS,
+            }
+        )
+        assert payload.limit == TAGS_READ_MAX_LIMIT
+        assert payload.offset == 7
+        assert payload.char_cursor == 12
+        assert payload.max_chars == MAX_CONTENT_CHARS
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"conversation_id": "not-a-uuid"},
+            {"conversation_id": str(uuid.uuid4()), "limit": 0},
+            {"conversation_id": str(uuid.uuid4()), "limit": 51},
+            {"conversation_id": str(uuid.uuid4()), "offset": -1},
+            {"conversation_id": str(uuid.uuid4()), "char_cursor": -1},
+            {"conversation_id": str(uuid.uuid4()), "max_chars": 0},
+            {
+                "conversation_id": str(uuid.uuid4()),
+                "max_chars": MAX_CONTENT_CHARS + 1,
+            },
+        ],
+    )
+    def test_rejects_out_of_contract_payloads(self, payload: dict) -> None:
+        with pytest.raises(ValidationError):
+            TagsReadConversationPayload.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1802,3 +1880,324 @@ class TestSearchConversationsWired:
             assert preview["total"] == 2  # the maximal 64-char name + reserved
             assert len(preview["preview"]) == 2
         assert len(json.dumps(document, sort_keys=True)) < 60000
+
+
+# ---------------------------------------------------------------------------
+# W4C2-CONV — tags.read_conversation over the reviewed content reader
+# ---------------------------------------------------------------------------
+
+
+def _conv_insert(
+    url: str,
+    conv_id: uuid.UUID,
+    server_id: uuid.UUID,
+    title: str = "test conv",
+) -> None:
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "INSERT INTO conversations (conversation_id, server_id, title) "
+            "VALUES (%s, %s, %s)",
+            (conv_id, server_id, title),
+        )
+        conn.execute(
+            "INSERT INTO conversation_tags (conversation_id, tag_id) "
+            "VALUES (%s, %s)",
+            (conv_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
+        )
+        conn.commit()
+
+
+def _msg_insert(
+    url: str,
+    conv_id: uuid.UUID,
+    msg_id: uuid.UUID,
+    seq: int,
+    content: str,
+    role: str = "user",
+    source_kind: str = "browser",
+    redacted: bool = False,
+    content_ref: str | None = None,
+) -> None:
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(message_id, conversation_id, seq, role, source_kind, content, "
+            "content_fingerprint, redacted, content_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                msg_id,
+                conv_id,
+                seq,
+                role,
+                source_kind,
+                content,
+                "x" * 64,
+                redacted,
+                content_ref,
+            ),
+        )
+
+
+def _read(
+    sessions: object,
+    payload: dict[str, object],
+    context: ExecutionContext,
+) -> tuple[object, dict[str, object]]:
+    return _execute(
+        build_history_tag_capabilities(session_factory=sessions),  # type: ignore[arg-type]
+        TAGS_READ_CONVERSATION_CAPABILITY,
+        payload,
+        context,
+    )
+
+
+@pytest.mark.anyio
+class TestReadConversationContent:
+    async def test_exact_continuation_within_one_message(
+        self, sessions, migrated_url
+    ) -> None:
+        conv, msg = uuid.uuid4(), uuid.uuid4()
+        text = "Hello 世界 🌍 " * 40
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _msg_insert(migrated_url, conv, msg, 1, text)
+
+        collected: list[str] = []
+        offset, cursor, pages = 0, 0, 0
+        while True:
+            result, page = await _read(
+                sessions,
+                {
+                    "conversation_id": str(conv),
+                    "max_chars": 7,
+                    "offset": offset,
+                    "char_cursor": cursor,
+                },
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            assert result.ok is True  # type: ignore[attr-defined]
+            assert page["conversation_id"] == str(conv)
+            assert page["max_chars"] == 7
+            collected.extend(window["content"] for window in page["items"])
+            pages += 1
+            if not page["has_more"]:
+                assert page["next_offset"] is None
+                assert page["next_char_cursor"] is None
+                break
+            offset, cursor = page["next_offset"], page["next_char_cursor"]
+        assert pages > 1
+        assert page["total"] == 1
+        assert "".join(collected) == text
+
+    async def test_exact_continuation_across_messages(
+        self, sessions, migrated_url
+    ) -> None:
+        conv = uuid.uuid4()
+        texts = ["alpha-0123456789", "", "beta-" + "x" * 30, "gamma"]
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        for index, text in enumerate(texts, start=1):
+            _msg_insert(migrated_url, conv, uuid.uuid4(), index * 3, text)
+
+        result, full = await _read(
+            sessions,
+            {"conversation_id": str(conv)},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert [window["content"] for window in full["items"]] == texts
+        assert full["total"] == 4
+        assert full["has_more"] is False
+        assert full["next_offset"] is None
+        assert full["next_char_cursor"] is None
+
+        collected: list[str] = []
+        visited: list[uuid.UUID] = []
+        offset, cursor, pages = 0, 0, 0
+        while True:
+            _, page = await _read(
+                sessions,
+                {
+                    "conversation_id": str(conv),
+                    "limit": 2,
+                    "max_chars": 10,
+                    "offset": offset,
+                    "char_cursor": cursor,
+                },
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            collected.extend(window["content"] for window in page["items"])
+            visited.extend(
+                uuid.UUID(window["message_id"]) for window in page["items"]
+            )
+            # Each page stays within the requested message bound.
+            assert len(page["items"]) <= 2
+            pages += 1
+            if not page["has_more"]:
+                break
+            offset, cursor = page["next_offset"], page["next_char_cursor"]
+        assert "".join(collected) == "".join(texts)
+        assert pages > 1
+        # The walk touches every stored message and nothing else (the
+        # empty message surfaces as its own zero-char window, per the
+        # reader contract); a message split by a page boundary recurs
+        # on the resuming page, so set equality — not list equality —
+        # is the no-skip/no-foreign-id invariant.
+        with psycopg.connect(migrated_url) as conn:
+            stored_ids = [
+                row[0]
+                for row in conn.cursor()
+                .execute(
+                    "SELECT message_id FROM conversation_messages "
+                    "WHERE conversation_id = %s ORDER BY seq, message_id",
+                    (conv,),
+                )
+                .fetchall()
+            ]
+        assert set(visited) == set(stored_ids)
+
+    async def test_redacted_and_content_ref_preserved_verbatim(
+        self, sessions, migrated_url
+    ) -> None:
+        conv, msg = uuid.uuid4(), uuid.uuid4()
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _msg_insert(
+            migrated_url,
+            conv,
+            msg,
+            1,
+            "[redacted] s3cret",
+            role="assistant",
+            source_kind="api",
+            redacted=True,
+            content_ref="runs/abc/turn-1",
+        )
+
+        result, page = await _read(
+            sessions,
+            {"conversation_id": str(conv)},
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        window = page["items"][0]
+        assert window["message_id"] == str(msg)
+        assert window["seq"] == 1
+        assert window["role"] == "assistant"
+        assert window["source_kind"] == "api"
+        assert window["content"] == "[redacted] s3cret"
+        assert window["redacted"] is True
+        assert window["content_ref"] == "runs/abc/turn-1"
+        # The accepted page model verbatim: nothing invented.
+        assert "char_cursor" not in window
+        assert "created_at" not in window
+        assert "client_request_id" not in window
+
+    async def test_zero_uuid_server_reads_its_real_conversation(
+        self, sessions, migrated_url
+    ) -> None:
+        zero = uuid.UUID(int=0)
+        conv = uuid.uuid4()
+        _conv_insert(migrated_url, conv, zero, title="General Consult")
+        _msg_insert(migrated_url, conv, uuid.uuid4(), 1, "consult body")
+
+        result, page = await _read(
+            sessions,
+            {"conversation_id": str(conv)},
+            _context(str(zero), uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert page["conversation_id"] == str(conv)
+        assert page["items"][0]["content"] == "consult body"
+        assert page["total"] == 1
+        assert page["has_more"] is False
+
+    async def test_cross_server_and_missing_are_identically_not_found(
+        self, sessions, migrated_url
+    ) -> None:
+        conv_b = uuid.uuid4()
+        _conv_insert(
+            migrated_url, conv_b, uuid.UUID(SERVER_B), title="other server"
+        )
+        conv_zero = uuid.uuid4()
+        _conv_insert(
+            migrated_url, conv_zero, uuid.UUID(int=0), title="General Consult"
+        )
+
+        documents = []
+        for conversation_id in (conv_b, conv_zero, uuid.uuid4()):
+            result, document = await _read(
+                sessions,
+                {"conversation_id": str(conversation_id)},
+                _context(SERVER_A, uuid.uuid4()),
+            )
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            documents.append(document)
+        assert all(document["code"] == "not_found" for document in documents)
+        # A real other-server conversation and a missing one are
+        # indistinguishable on the wire.
+        assert len({document["message"] for document in documents}) == 1
+        assert documents[0]["message"] == "conversation not found"
+
+    async def test_invalid_bounds_refuse_invalid_request(
+        self, sessions
+    ) -> None:
+        context = _context(SERVER_A, uuid.uuid4())
+        for payload in (
+            {"conversation_id": str(uuid.uuid4()), "limit": 51},
+            {"conversation_id": str(uuid.uuid4()), "limit": 0},
+            {"conversation_id": str(uuid.uuid4()), "offset": -1},
+            {"conversation_id": str(uuid.uuid4()), "char_cursor": -1},
+            {"conversation_id": str(uuid.uuid4()), "max_chars": 0},
+            {
+                "conversation_id": str(uuid.uuid4()),
+                "max_chars": MAX_CONTENT_CHARS + 1,
+            },
+            {"conversation_id": "not-a-uuid"},
+        ):
+            result, document = await _read(sessions, payload, context)
+            assert result.ok is False  # type: ignore[attr-defined]
+            assert document["status"] == "refused"
+            assert document["code"] == "invalid_request"
+
+    async def test_max_size_ascii_page_stays_under_envelope_budget(
+        self, sessions, migrated_url
+    ) -> None:
+        conv = uuid.uuid4()
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _msg_insert(
+            migrated_url, conv, uuid.uuid4(), 1, "a" * MAX_CONTENT_CHARS
+        )
+
+        result, page = await _read(
+            sessions,
+            {
+                "conversation_id": str(conv),
+                "max_chars": MAX_CONTENT_CHARS,
+            },
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is True  # type: ignore[attr-defined]
+        assert page["items"][0]["content"] == "a" * MAX_CONTENT_CHARS
+        assert len(result.output.encode("utf-8")) < 60_000  # type: ignore[attr-defined]
+
+    async def test_oversize_unicode_page_refuses_typed_not_clamped(
+        self, sessions, migrated_url
+    ) -> None:
+        conv = uuid.uuid4()
+        _conv_insert(migrated_url, conv, uuid.UUID(SERVER_A))
+        _msg_insert(
+            migrated_url, conv, uuid.uuid4(), 1, "🌍" * MAX_CONTENT_CHARS
+        )
+
+        result, document = await _read(
+            sessions,
+            {
+                "conversation_id": str(conv),
+                "max_chars": MAX_CONTENT_CHARS,
+            },
+            _context(SERVER_A, uuid.uuid4()),
+        )
+        assert result.ok is False  # type: ignore[attr-defined]
+        assert document["status"] == "refused"
+        assert document["code"] == "invalid_request"
+        # No silent clamping and no content leak through the refusal.
+        assert "items" not in document

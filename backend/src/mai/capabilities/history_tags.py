@@ -16,12 +16,15 @@ bounded listing, and used/reserved-refusing delete whose forced path
 still preserves every record's final tag. The ``tags.search_jobs``
 and ``tags.search_conversations`` reads page this server's job runs
 and conversations by their tags through the read-only history
-store. No registration, UI, or other history-read surface belongs
-to this module.
+store. The ``tags.read_conversation`` read pages one same-server
+conversation's stored (already-redacted) transcript through the
+reviewed char-paginated content reader. No registration, UI, or
+job reader belongs to this module.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -42,6 +45,8 @@ from mai.capabilities.internal_api import (
     internal_api_tool,
 )
 from mai.history_store import (
+    MAX_CONTENT_CHARS,
+    aread_conversation_content,
     asearch_conversations_by_tags,
     asearch_jobs_by_tags,
 )
@@ -69,9 +74,10 @@ TAGS_LIST_CATALOG_CAPABILITY: Final[str] = "tags.list_catalog"
 TAGS_DELETE_CAPABILITY: Final[str] = "tags.delete"
 TAGS_SEARCH_JOBS_CAPABILITY: Final[str] = "tags.search_jobs"
 TAGS_SEARCH_CONVERSATIONS_CAPABILITY: Final[str] = "tags.search_conversations"
+TAGS_READ_CONVERSATION_CAPABILITY: Final[str] = "tags.read_conversation"
 
 #: The public ``tags.*`` vocabulary: the W4A1 current-target scaffold,
-#: the W4B catalog tools, and the W4C tag-search reads.
+#: the W4B catalog tools, and the W4C tag-search and content reads.
 TAGS_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     TAGS_ASSIGN_CAPABILITY,
     TAGS_REMOVE_CAPABILITY,
@@ -81,6 +87,7 @@ TAGS_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     TAGS_DELETE_CAPABILITY,
     TAGS_SEARCH_JOBS_CAPABILITY,
     TAGS_SEARCH_CONVERSATIONS_CAPABILITY,
+    TAGS_READ_CONVERSATION_CAPABILITY,
 )
 
 #: Bounded pagination vocabulary for ``tags.list_for`` (AGENTS.md §1).
@@ -91,6 +98,13 @@ TAGS_LIST_MAX_LIMIT: Final[int] = 100
 TAGS_SEARCH_DEFAULT_LIMIT: Final[int] = 50
 TAGS_SEARCH_MAX_LIMIT: Final[int] = 50
 TAGS_SEARCH_MAX_TAG_IDS: Final[int] = 50
+
+#: Bounded content-read vocabulary for ``tags.read_conversation``
+#: (AGENTS.md §1); the char ceiling is the store reader's own
+#: ``MAX_CONTENT_CHARS``.
+TAGS_READ_DEFAULT_LIMIT: Final[int] = 50
+TAGS_READ_MAX_LIMIT: Final[int] = 50
+TAGS_READ_DEFAULT_MAX_CHARS: Final[int] = 4096
 
 #: Bounded catalog vocabulary (AGENTS.md §1), mirroring the tag store's
 #: own canonical-name and description validation.
@@ -255,6 +269,55 @@ class TagsSearchConversationsPayload(BaseModel):
         description=(
             "Number of matching conversations to skip before this "
             "page starts."
+        ),
+    )
+
+
+class TagsReadConversationPayload(BaseModel):
+    """Read one bounded, char-paginated slice of a conversation transcript."""
+
+    conversation_id: uuid.UUID = Field(
+        description=(
+            "Canonical UUID of the conversation to read; only "
+            "conversations stored on this server are visible and "
+            "another server's conversation is indistinguishable "
+            "from a missing one."
+        ),
+    )
+    limit: int = Field(
+        default=TAGS_READ_DEFAULT_LIMIT,
+        ge=1,
+        le=TAGS_READ_MAX_LIMIT,
+        description=(
+            "Maximum number of stored messages returned in this "
+            "bounded page (1-50)."
+        ),
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Zero-based message index this page starts at, ordered "
+            "by stored sequence; use the previous page's "
+            "next_offset to continue exactly."
+        ),
+    )
+    char_cursor: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Zero-based character position inside the message at "
+            "offset where this page starts; use the previous "
+            "page's next_char_cursor to continue exactly."
+        ),
+    )
+    max_chars: int = Field(
+        default=TAGS_READ_DEFAULT_MAX_CHARS,
+        ge=1,
+        le=MAX_CONTENT_CHARS,
+        description=(
+            "Maximum number of stored content characters returned "
+            "across the whole page (1-20000)."
         ),
     )
 
@@ -770,6 +833,94 @@ def build_history_tag_capabilities(
 
     operations.append(_tags_search_conversations)
 
+    # -- tags.read_conversation ----------------------------------------------
+
+    @internal_api_tool(
+        capability_id=TAGS_READ_CONVERSATION_CAPABILITY,
+        version="0.1.0",
+        effect_class="read",
+        resource_scope=["history_tags"],
+        environments=["controller"],
+        payload_model=TagsReadConversationPayload,
+        description=(
+            "Read one bounded page of a conversation's stored "
+            "transcript on this server, ordered by message sequence: "
+            "at most limit messages and max_chars characters of "
+            "already-redacted content per page, with the pre-slice "
+            "message total plus has_more and the exact "
+            "next_offset/next_char_cursor continuation cursors; "
+            "another server's conversation is indistinguishable "
+            "from a missing one."
+        ),
+    )
+    async def _tags_read_conversation(
+        call: CapabilityCall, payload: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        if session_factory is None:
+            raise InternalApiError(
+                "unavailable", "history store is not configured"
+            )
+        conversation_id = uuid.UUID(str(payload["conversation_id"]))
+        limit = int(payload.get("limit", TAGS_READ_DEFAULT_LIMIT))
+        offset = int(payload.get("offset", 0))
+        char_cursor = int(payload.get("char_cursor", 0))
+        max_chars = int(payload.get("max_chars", TAGS_READ_DEFAULT_MAX_CHARS))
+        try:
+            page = await aread_conversation_content(
+                session_factory,
+                conversation_id,
+                server_id=call.context.server_id,
+                limit=limit,
+                offset=offset,
+                char_cursor=char_cursor,
+                max_chars=max_chars,
+            )
+        except ValueError as exc:
+            # One fixed value-free refusal: a missing and another
+            # server's conversation are indistinguishable on the wire.
+            raise InternalApiError(
+                "not_found", "conversation not found"
+            ) from exc
+        envelope = {
+            "ok": True,
+            "conversation_id": str(page.conversation_id),
+            "items": [
+                {
+                    "message_id": str(window.message_id),
+                    "seq": window.seq,
+                    "role": window.role,
+                    "source_kind": window.source_kind,
+                    "content": window.content,
+                    "redacted": window.redacted,
+                    "content_ref": window.content_ref,
+                }
+                for window in page.items
+            ],
+            "limit": limit,
+            "offset": offset,
+            "char_cursor": char_cursor,
+            "max_chars": max_chars,
+            "total": page.total,
+            "has_more": page.has_more,
+            "next_offset": page.next_offset,
+            "next_char_cursor": page.next_char_cursor,
+        }
+        # Char-bounded content is not byte-bounded: a max_chars page of
+        # multi-byte text can serialize past the wire budget. Fail
+        # closed instead of clamping stored content.
+        if (
+            len(json.dumps(envelope, sort_keys=True).encode("utf-8"))
+            > 60_000
+        ):
+            raise InternalApiError(
+                "invalid_request",
+                "response exceeds 60000 bytes; retry with smaller "
+                "max_chars or limit",
+            )
+        return envelope
+
+    operations.append(_tags_read_conversation)
+
     # -- tags.create ---------------------------------------------------------
 
     @internal_api_tool(
@@ -932,6 +1083,10 @@ __all__ = [
     "TAGS_DELETE_CAPABILITY",
     "TAGS_LIST_CATALOG_CAPABILITY",
     "TAGS_LIST_FOR_CAPABILITY",
+    "TAGS_READ_CONVERSATION_CAPABILITY",
+    "TAGS_READ_DEFAULT_LIMIT",
+    "TAGS_READ_MAX_LIMIT",
+    "TAGS_READ_DEFAULT_MAX_CHARS",
     "TAGS_REMOVE_CAPABILITY",
     "TAGS_SEARCH_CONVERSATIONS_CAPABILITY",
     "TAGS_SEARCH_JOBS_CAPABILITY",
@@ -940,6 +1095,7 @@ __all__ = [
     "TagsDeletePayload",
     "TagsListCatalogPayload",
     "TagsListForPayload",
+    "TagsReadConversationPayload",
     "TagsRemovePayload",
     "TagsSearchConversationsPayload",
     "TagsSearchJobsPayload",
