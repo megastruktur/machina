@@ -12,8 +12,8 @@ of entity references carrying a requested set of catalog tags.
 - **EXISTS semantics**: each entity appears at most once, regardless of
   how many of the requested tags it carries (semi-join predicate, never a
   counted join).
-- **Match modes**: ``match_all=False`` (default) matches entities carrying
-  ANY requested tag; ``match_all=True`` matches only entities carrying
+- **Match modes**: ``match="any"`` (default) matches entities carrying
+  ANY requested tag; ``match="all"`` matches only entities carrying
   EVERY distinct requested tag.
 - **Tag ids**: deduplicated and validated fail-closed — the set must be
   non-empty and every member a ``uuid.UUID``. Unknown catalog ids are not
@@ -55,8 +55,8 @@ from mai.tag_store import (
 __all__ = [
     "DEFAULT_PAGE_LIMIT",
     "MAX_PAGE_LIMIT",
-    "ConversationTagSearchRow",
-    "JobTagSearchRow",
+    "ConversationSearchRow",
+    "JobSearchRow",
     "asearch_conversations_by_tags",
     "asearch_jobs_by_tags",
 ]
@@ -71,21 +71,21 @@ from mai.tag_store import MAX_PAGE_LIMIT  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
-class JobTagSearchRow:
+class JobSearchRow:
     """One matched job run: identity, newest-first sort key, tag preview."""
 
     run_id: uuid.UUID
     submitted_at: datetime
-    tags: EntityTagPreview
+    tag_preview: EntityTagPreview
 
 
 @dataclass(frozen=True, slots=True)
-class ConversationTagSearchRow:
+class ConversationSearchRow:
     """One matched conversation: identity, sort key, tag preview."""
 
     conversation_id: uuid.UUID
     updated_at: datetime
-    tags: EntityTagPreview
+    tag_preview: EntityTagPreview
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +110,14 @@ def _validated_search_tag_ids(tag_ids: Sequence[uuid.UUID]) -> list[uuid.UUID]:
             "tag_ids",
         )
     return ids
+
+
+def _validated_match_mode(match: str) -> bool:
+    """``match="any"|"all"`` validated fail-closed; returns ``match_all``."""
+    match_all = {"any": False, "all": True}.get(match)
+    if match_all is None:
+        raise ValueError(f"match must be 'any' or 'all', got {match!r}")
+    return match_all
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +160,6 @@ async def _asearch_entities_by_tags(
     order_first: str,
     association: str,
     entity_column: str,
-    preview,
 ) -> tuple[list[tuple[uuid.UUID, datetime]], int]:
     """Shared bounded page: (entity_id, sort timestamp) + honest total.
 
@@ -204,17 +211,18 @@ async def asearch_jobs_by_tags(
     tag_ids: Sequence[uuid.UUID],
     *,
     server_id: uuid.UUID,
-    match_all: bool = False,
+    match: str = "any",
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
-) -> tuple[list[JobTagSearchRow], int]:
+) -> tuple[list[JobSearchRow], int]:
     """Bounded newest-first page of job runs carrying the requested tags.
 
-    Only runs inside ``server_id`` count (items and total). ``match_all``
-    requires every distinct requested tag; the default matches any. The
-    per-row preview reuses the W2 batch helper: one grouped query for the
-    whole page, never per-row queries.
+    Only runs inside ``server_id`` count (items and total). ``match="all"``
+    requires every distinct requested tag; the default ``"any"`` matches
+    any. The per-row preview reuses the W2 batch helper: one grouped query
+    for the whole page, never per-row queries.
     """
+    match_all = _validated_match_mode(match)
     matches, total = await _asearch_entities_by_tags(
         sessions,
         tag_ids,
@@ -227,17 +235,16 @@ async def asearch_jobs_by_tags(
         order_first="submitted_at",
         association="job_tags",
         entity_column="job_id",
-        preview=apreview_job_tags,
     )
     previews = await apreview_job_tags(
         sessions, [entity_id for entity_id, _ in matches], server_id=server_id
     )
     empty = EntityTagPreview(preview=(), total=0)
     return [
-        JobTagSearchRow(
+        JobSearchRow(
             run_id=entity_id,
             submitted_at=sort_at,
-            tags=previews.get(entity_id, empty),
+            tag_preview=previews.get(entity_id, empty),
         )
         for entity_id, sort_at in matches
     ], total
@@ -248,15 +255,16 @@ async def asearch_conversations_by_tags(
     tag_ids: Sequence[uuid.UUID],
     *,
     server_id: uuid.UUID,
-    match_all: bool = False,
+    match: str = "any",
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
-) -> tuple[list[ConversationTagSearchRow], int]:
+) -> tuple[list[ConversationSearchRow], int]:
     """Bounded newest-first page of conversations carrying the tags.
 
     Mirrors :func:`asearch_jobs_by_tags` with the conversation ordering
     contract (``updated_at DESC, conversation_id``).
     """
+    match_all = _validated_match_mode(match)
     matches, total = await _asearch_entities_by_tags(
         sessions,
         tag_ids,
@@ -269,17 +277,16 @@ async def asearch_conversations_by_tags(
         order_first="updated_at",
         association="conversation_tags",
         entity_column="conversation_id",
-        preview=apreview_conversation_tags,
     )
     previews = await apreview_conversation_tags(
         sessions, [entity_id for entity_id, _ in matches], server_id=server_id
     )
     empty = EntityTagPreview(preview=(), total=0)
     return [
-        ConversationTagSearchRow(
+        ConversationSearchRow(
             conversation_id=entity_id,
             updated_at=sort_at,
-            tags=previews.get(entity_id, empty),
+            tag_preview=previews.get(entity_id, empty),
         )
         for entity_id, sort_at in matches
     ], total
