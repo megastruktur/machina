@@ -65,7 +65,7 @@ from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.logs import write_evidence_artifact
-from mai.contracts.jobs import RunState, parse_job_event
+from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState, parse_job_event
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -626,6 +626,25 @@ def migrated_url() -> str:
     return url
 
 
+def _seed_terminal_catalog(url: str) -> None:
+    """Seed the terminal catalog tags the workers' transitions swap into.
+
+    A terminal ``record_transition`` atomically swaps the reserved
+    ``unclassified`` assignment for a catalog tag named after the target
+    state (W5B1); a fresh 0011 catalog only seeds ``unclassified``, so
+    the live scenarios seed the terminal rows (idempotent) — the same
+    harness contract the jobs suite's live scenarios use.
+    """
+    with psycopg.connect(url) as conn:
+        for state in TERMINAL_RUN_STATES:
+            conn.execute(
+                "INSERT INTO tags (tag_id, name, description) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (uuid.uuid4(), state.value, "terminal run classification"),
+            )
+        conn.commit()
+
+
 @pytest.fixture(scope="session")
 def bootstrapped_url(migrated_url: str) -> str:
     """Create the engine-owned ``dbos`` schema the way production does."""
@@ -633,6 +652,7 @@ def bootstrapped_url(migrated_url: str) -> str:
 
     jobs_engine.launch_worker(migrated_url)
     jobs_engine.shutdown()
+    _seed_terminal_catalog(migrated_url)
     return migrated_url
 
 
