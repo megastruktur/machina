@@ -175,6 +175,41 @@ class TerminalClassification:
     tag_id: uuid.UUID
     reason: str
 
+async def _aclassify_terminal_job_locked(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    server_id: uuid.UUID,
+    terminal_tag_name: str,
+) -> TerminalClassification:
+    """Whole terminal classification inside a caller-held transaction.
+
+    Exact body of the public helper minus the session open/begin: the
+    caller owns the session and the transaction, so this can compose with
+    other writers (e.g. the run-lifecycle terminal event) atomically.
+    """
+    name = anormalize_tag_name(terminal_tag_name)
+    if name.lower() == "unclassified":
+        raise TagStoreError(TagErrorCode.RESERVED_TAG, "terminal tag must not be unclassified", "terminal_tag_name")
+    reserved = uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+    try:
+        await aresolve_job_server(session, job_id, server_id=server_id)
+        terminal_id = (await session.execute(text("SELECT tag_id FROM tags WHERE lower(name) = lower(:n) FOR UPDATE"), {"n": name})).scalar()
+        if terminal_id is None:
+            raise TagStoreError(TagErrorCode.TAG_NOT_FOUND, "no such terminal tag", "terminal_tag_name")
+        rows = (await session.execute(text("SELECT tag_id, assignment_source FROM job_tags WHERE job_id = :j FOR UPDATE"), {"j": job_id})).all()
+        has_terminal = any(row[0] == terminal_id for row in rows)
+        if not has_terminal and any(row[0] != reserved for row in rows):
+            return TerminalClassification(False, terminal_id, "meaningful_tags_present")
+        if not has_terminal:
+            await session.execute(text("INSERT INTO job_tags (job_id, tag_id, assigned_by, assignment_source) VALUES (:j, :t, :by, :src) ON CONFLICT DO NOTHING"), {"j": job_id, "t": terminal_id, "by": "", "src": SYSTEM_ASSIGNMENT_SOURCE})
+        deleted = await session.execute(text("DELETE FROM job_tags WHERE job_id = :j AND tag_id = :t AND assignment_source = :src"), {"j": job_id, "t": reserved, "src": SYSTEM_ASSIGNMENT_SOURCE})
+        removed = deleted.rowcount > 0
+        return TerminalClassification(not has_terminal or removed, terminal_id, "classified" if not has_terminal else ("removed_system_unclassified" if removed else "already_classified"))
+    except DBAPIError as exc:
+        raise aclassify_integrity_error(exc) from exc
+
+
 async def aclassify_terminal_job(
     sessions: async_sessionmaker[AsyncSession],
     job_id: uuid.UUID,
@@ -182,27 +217,10 @@ async def aclassify_terminal_job(
     server_id: uuid.UUID,
     terminal_tag_name: str,
 ) -> TerminalClassification:
-    name = anormalize_tag_name(terminal_tag_name)
-    if name.lower() == "unclassified":
-        raise TagStoreError(TagErrorCode.RESERVED_TAG, "terminal tag must not be unclassified", "terminal_tag_name")
-    reserved = uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
-    try:
-        async with sessions() as session, session.begin():
-            await aresolve_job_server(session, job_id, server_id=server_id)
-            terminal_id = (await session.execute(text("SELECT tag_id FROM tags WHERE lower(name) = lower(:n) FOR UPDATE"), {"n": name})).scalar()
-            if terminal_id is None:
-                raise TagStoreError(TagErrorCode.TAG_NOT_FOUND, "no such terminal tag", "terminal_tag_name")
-            rows = (await session.execute(text("SELECT tag_id, assignment_source FROM job_tags WHERE job_id = :j FOR UPDATE"), {"j": job_id})).all()
-            has_terminal = any(row[0] == terminal_id for row in rows)
-            if not has_terminal and any(row[0] != reserved for row in rows):
-                return TerminalClassification(False, terminal_id, "meaningful_tags_present")
-            if not has_terminal:
-                await session.execute(text("INSERT INTO job_tags (job_id, tag_id, assigned_by, assignment_source) VALUES (:j, :t, :by, :src) ON CONFLICT DO NOTHING"), {"j": job_id, "t": terminal_id, "by": "", "src": SYSTEM_ASSIGNMENT_SOURCE})
-            deleted = await session.execute(text("DELETE FROM job_tags WHERE job_id = :j AND tag_id = :t AND assignment_source = :src"), {"j": job_id, "t": reserved, "src": SYSTEM_ASSIGNMENT_SOURCE})
-            removed = deleted.rowcount > 0
-            return TerminalClassification(not has_terminal or removed, terminal_id, "classified" if not has_terminal else ("removed_system_unclassified" if removed else "already_classified"))
-    except DBAPIError as exc:
-        raise aclassify_integrity_error(exc) from exc
+    async with sessions() as session, session.begin():
+        return await _aclassify_terminal_job_locked(
+            session, job_id, server_id=server_id, terminal_tag_name=terminal_tag_name
+        )
 
 
 def _validated_description(description: str | None) -> str | None:
