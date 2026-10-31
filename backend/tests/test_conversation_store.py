@@ -85,6 +85,7 @@ from mai.contracts.conversations import (
     content_fingerprint,
 )
 from mai.database import create_app_engine
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALEMBIC_INI = os.path.join(BACKEND_ROOT, "alembic.ini")
@@ -95,14 +96,28 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # assertions target the chain TIP; the tuple tracks the full chain.
 # Chain-tip reconciliation (card 04-conversation-store, exclusive
 # migration-chain owner): revision 0008 appends the conversation-domain
-# tables and revision 0009 appends the agent-task domain; the tip
-# constants are advanced here so this file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009")
+# tables, revision 0009 appends the agent-task domain and revision 0011
+# appends the history-tag domain (W1); the tip constants are advanced
+# here so this file's head assertions stay true.
+REVISION_IDS = (
+    "0001",
+    "0002",
+    "0003",
+    "0004",
+    "0005",
+    "0006",
+    "0007",
+    "0008",
+    "0009",
+    "0010",
+    "0011",
+)
 
-# The exact public application schema at the 0009 tip: the 0008 set plus
-# the seven agent-task domain tables (09-agent-tasks) — nothing else, in
-# particular no engine-shadowing run-state table and no ``dbos`` schema
-# before engine launch.
+# The exact public application schema at the tip: the 0008 set plus the
+# seven agent-task domain tables (09-agent-tasks) and the three
+# history-tag tables (0011, W1) — nothing else, in particular no
+# engine-shadowing run-state table and no ``dbos`` schema before engine
+# launch.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -134,6 +149,9 @@ EXPECTED_APP_TABLES = frozenset(
         "agent_task_evidence",
         "agent_task_revisions",
         "agent_task_completions",
+        "tags",
+        "job_tags",
+        "conversation_tags",
     }
 )
 
@@ -174,25 +192,27 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
-        # Full app set at the chain tip — the 04-conversation-store tables
-        # AND the 09-agent-task tables (which hold the
-        # fk_agent_tasks_conversation dependency on conversations) are
-        # listed here (chain-tip reconciliation) so the zero-to-head
-        # fixture stays order-independent after revision 0009 and after
-        # sibling suites ran on the same shared database.
+        # Full app set at the chain tip — the 04-conversation-store tables,
+        # the 09-agent-task tables (which hold the
+        # fk_agent_tasks_conversation dependency on conversations) and the
+        # 0011 history-tag tables (which hold the job_tags/conversation_tags
+        # dependencies on conversations, job_runs and tags) are listed here
+        # (chain-tip reconciliation) so the zero-to-head fixture stays
+        # order-independent after revision 0009, 0011 and after sibling
+        # suites ran on the same shared database.
         conn.execute(
             "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
-            "conversation_messages, conversations, notification_alerts, "
-            "observation_findings, server_observations, "
-            "application_projection_journal, application_projection, "
-            "knowledge_doc_chunks, knowledge_documents, job_resource_locks, "
+            "conversation_messages, conversations, conversation_tags, "
+            "notification_alerts, observation_findings, "
+            "server_observations, application_projection_journal, "
+            "application_projection, knowledge_doc_chunks, knowledge_documents, job_resource_locks, "
             "job_schedule_fires, job_schedules, job_events, job_steps, "
-            "job_runs, approvals, profile_projection_journal, "
+            "job_runs, job_tags, approvals, profile_projection_journal, "
             "profile_projection, admin_sessions, admin_credential, "
             "agent_task_completions, agent_task_revisions, "
             "agent_task_evidence, agent_task_criteria, "
             "agent_task_constraints, agent_task_steps, agent_tasks, "
-            "alembic_version"
+            "tags, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()
@@ -225,8 +245,10 @@ async def sessions(migrated_url: str):
     engine, factory = create_app_engine(migrated_url)
     yield factory
     # Each data test starts from an empty conversation domain (session-
-    # scoped fixture database): delete children before parents.
+    # scoped fixture database): delete children before parents — the 0011
+    # classification associations first (mandatory-tag schema).
     async with factory() as session:
+        await session.execute(text("DELETE FROM conversation_tags"))
         await session.execute(text("DELETE FROM conversation_steering"))
         await session.execute(text("DELETE FROM conversation_runs"))
         await session.execute(text("DELETE FROM conversation_messages"))
@@ -291,7 +313,7 @@ class TestMigrationChain:
         assert module.revision == "0008"
         assert module.down_revision == "0007"
 
-    def test_head_is_0009_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
+    def test_head_is_0011_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
         # Sync on purpose: alembic's env.py drives its async engine with
         # asyncio.run(), which must not nest inside a test event loop.
         previous = os.environ.get("MAI_DATABASE_URL")
@@ -529,6 +551,30 @@ class TestConversationIdentity:
             sessions, uuid.UUID(CONV_A), server_id=uuid.UUID(SERVER_A)
         )
         assert fetched == created
+
+    @pytest.mark.anyio
+    async def test_created_conversation_carries_reserved_classification(
+        self, sessions
+    ) -> None:
+        """0011 mandatory-tag invariant: creation classifies atomically."""
+        created = await acreate_conversation(
+            sessions, server_id=uuid.UUID(SERVER_A)
+        )
+        rows = await _fetchall(
+            sessions,
+            """
+            SELECT tag_id, assignment_source, assigned_by
+            FROM conversation_tags WHERE conversation_id = :cid
+            """,
+            cid=created.conversation_id,
+        )
+        assert rows == [
+            (
+                uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                "system",
+                "",
+            )
+        ]
 
     @pytest.mark.anyio
     async def test_legacy_conversation_declares_its_missing_range(

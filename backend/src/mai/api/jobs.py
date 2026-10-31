@@ -79,7 +79,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from dbos import error as dbos_error
 from fastapi import APIRouter, FastAPI, Query, Request, Response
@@ -108,6 +108,7 @@ from mai.api.auth import (
     render_error_envelope,
 )
 from mai.auth.sessions import hash_token
+from mai.contracts.conversations import EntityTagPreviewView
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
     TERMINAL_RUN_STATES,
@@ -133,8 +134,25 @@ from mai.jobs.recovery import (
 )
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
 from mai.profiles.files import FileStoreErrorCode, ProfileFileError, StoredProfile
+from mai.tag_store import EntityTagPreview, apreview_job_tags
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 __all__ = ["register_jobs"]
+
+def _preview_view(found: EntityTagPreview | None) -> EntityTagPreviewView:
+    """Project the store's preview dataclass onto the wire view.
+
+    Every in-scope run carries at least one tag (the mandatory
+    unclassified seed, swapped for the terminal tag on completion), so a
+    missing preview after a successful scoped read is a bug — it fails
+    loudly instead of fabricating an empty projection (``total=0`` is
+    contract-invalid).
+    """
+    if found is None:
+        raise RuntimeError(
+            "mandatory tag preview missing after a successful scoped read"
+        )
+    return EntityTagPreviewView(preview=list(found.preview), total=found.total)
 
 # ---------------------------------------------------------------------------
 # Transport/facade bounds (module-owned policy, all explicitly bounded)
@@ -242,6 +260,7 @@ class RunView(BaseModel):
     cancel_requested_at: str | None
     submitted_at: str
     updated_at: str
+    tag_preview: EntityTagPreviewView
 
 
 class RunDetail(RunView):
@@ -433,7 +452,11 @@ _RUN_COLUMNS: Final[str] = """
 """
 
 
-def _run_view(row: Mapping[str, object], state: str | None) -> RunView:
+def _run_view(
+    row: Mapping[str, object],
+    state: str | None,
+    tag_preview: EntityTagPreviewView,
+) -> RunView:
     """Type one projected row + replayed state into the wire view."""
     return RunView(
         run_id=str(row["run_id"]),
@@ -455,6 +478,7 @@ def _run_view(row: Mapping[str, object], state: str | None) -> RunView:
         ),
         submitted_at=_wire_ts(row["submitted_at"]),  # type: ignore[arg-type]
         updated_at=_wire_ts(row["updated_at"]),  # type: ignore[arg-type]
+        tag_preview=tag_preview,
     )
 
 
@@ -569,6 +593,22 @@ async def _record_submit_intent(
     ).scalar()
     if inserted is None:
         return False
+    # 0011 mandatory-tag invariant: THIS transaction created the run, so the
+    # classification commits with the same transaction (history-tags
+    # W1-FIX1); the dedup replay path above returns unchanged.
+    await session.execute(
+        text(
+            """
+            INSERT INTO job_tags (job_id, tag_id, assignment_source)
+            VALUES (:run_id, :tag, :source)
+            """
+        ),
+        {
+            "run_id": uuid.UUID(run_id),
+            "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+            "source": SYSTEM_ASSIGNMENT_SOURCE,
+        },
+    )
     seq = (
         await session.execute(
             text("SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE run_id = :r"),
@@ -766,7 +806,19 @@ async def submit_run(request: Request, payload: RunSubmitBody) -> Response:
         row = await _load_run_row(session, run_id)
     assert row is not None  # committed above; absence is a bug
     state = await _replayed_state(lifecycle, run_id)
-    created_view = RunCreated(run=_run_view(row, state), deduplicated=not created)
+    previews = await apreview_job_tags(
+        factory,
+        [uuid.UUID(run_id)],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
+    created_view = RunCreated(
+        run=_run_view(
+            row,
+            state,
+            tag_preview=_preview_view(previews.get(uuid.UUID(run_id))),
+        ),
+        deduplicated=not created,
+    )
     if created:
         return created_view  # the route's 201
     # Duplicate attach: same intent, SAME run — 200, never a second 201.
@@ -801,6 +853,8 @@ async def list_runs(
     q: str | None = Query(default=None, max_length=200),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
+    tag_id: list[uuid.UUID] | None = Query(default=None, max_length=50),
+    tag_match: Literal["any", "all"] = Query(default="any"),
 ) -> Response:
     """One bounded page of one server's runs (C01 rules 5 and 7).
 
@@ -810,9 +864,12 @@ async def list_runs(
     transition events of exactly this page's runs.
 
     Filters (``q`` case-insensitive substring over run_id, label and
-    model_profile; ``date_from``/``date_to`` over ``submitted_at``) apply
-    BEFORE pagination: the same predicate drives both the page query and
-    the pre-slice ``COUNT(*)``, so ``total`` is the filtered total.
+    model_profile; ``date_from``/``date_to`` over ``submitted_at``;
+    ``tag_id`` repeated UUID, at most 50, matched ``any``/``all`` per
+    ``tag_match``) apply BEFORE pagination: the same predicate drives
+    both the page query and the pre-slice ``COUNT(*)``, so ``total`` is
+    the filtered total. Omitting ``tag_id`` preserves the unfiltered
+    behavior; malformed or oversized tag sets fail closed (422).
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)
@@ -833,6 +890,27 @@ async def list_runs(
     if date_to is not None:
         predicates.append("submitted_at <= :date_to")
         params["date_to"] = date_to.astimezone(timezone.utc)
+    if tag_id:
+        # Tag filter (HT-W6B): match ANY (at least one) or ALL (every) of
+        # the bounded tag set. The SAME predicate drives the page query
+        # and the pre-slice COUNT below, so ``total`` stays the filtered
+        # total; the ``server_id`` predicate above keeps the match
+        # same-server only.
+        tag_ids = sorted({*tag_id})
+        if tag_match == "any":
+            predicates.append(
+                "EXISTS (SELECT 1 FROM job_tags jt "
+                "WHERE jt.job_id = job_runs.run_id "
+                "AND jt.tag_id = ANY(:tag_ids))"
+            )
+        else:
+            predicates.append(
+                "(SELECT count(DISTINCT jt.tag_id) FROM job_tags jt "
+                "WHERE jt.job_id = job_runs.run_id "
+                "AND jt.tag_id = ANY(:tag_ids)) = :tag_count"
+            )
+        params["tag_ids"] = tag_ids
+        params["tag_count"] = len(tag_ids)
     where = " AND ".join(predicates)
     async with factory() as session:
         rows = (
@@ -899,8 +977,22 @@ async def list_runs(
             "conflict",
             f"persisted run state requires recovery ({exc.code.value})",
         )
+    previews = await apreview_job_tags(
+        factory,
+        [uuid.UUID(r) for r in run_ids],
+        server_id=server_id,
+    )
     return RunPage(
-        runs=[_run_view(row, states[str(row["run_id"])]) for row in rows],
+        runs=[
+            _run_view(
+                row,
+                states[str(row["run_id"])],
+                tag_preview=_preview_view(
+                    previews.get(uuid.UUID(str(row["run_id"])))
+                ),
+            )
+            for row in rows
+        ],
         limit=limit,
         offset=offset,
         total=total,
@@ -951,8 +1043,15 @@ async def read_run(request: Request, run_id: uuid.UUID) -> Response:
             .all()
         )
     state = await _replayed_state(lifecycle, identity)
+    previews = await apreview_job_tags(
+        factory,
+        [run_id],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
     return RunDetail(
-        **_run_view(row, state).model_dump(),
+        **_run_view(
+            row, state, tag_preview=_preview_view(previews.get(run_id))
+        ).model_dump(),
         steps=[
             StepView(
                 seq=int(step_row["seq"]),

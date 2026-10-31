@@ -62,9 +62,10 @@ from mai.agents.budgets import (
 )
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.logs import write_evidence_artifact
-from mai.contracts.jobs import RunState, parse_job_event
+from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState, parse_job_event
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -406,7 +407,7 @@ import os
 import time
 import uuid
 
-from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -522,7 +523,25 @@ def _script_model():
             raise AssertionError("model script exhausted")
         return _entry_payload(script[index])
 
-    return FunctionModel(_model_fn)
+    async def _stream_fn(messages, info):
+        # The real observers always consume streamed requests; replay the
+        # exact same deterministic script as ONE complete chunk per
+        # response (a valid FunctionModel stream shape): the full text for
+        # text entries, or one DeltaToolCalls mapping for tool calls.
+        response = _model_fn(messages, info)
+        for part in response.parts:
+            if isinstance(part, TextPart):
+                yield part.content
+            else:
+                yield {
+                    0: DeltaToolCall(
+                        name=part.tool_name,
+                        json_args=json.dumps(part.args_as_dict()),
+                        tool_call_id=part.tool_call_id,
+                    )
+                }
+
+    return FunctionModel(_model_fn, stream_function=_stream_fn)
 
 
 def _build():
@@ -625,6 +644,25 @@ def migrated_url() -> str:
     return url
 
 
+def _seed_terminal_catalog(url: str) -> None:
+    """Seed the terminal catalog tags the workers' transitions swap into.
+
+    A terminal ``record_transition`` atomically swaps the reserved
+    ``unclassified`` assignment for a catalog tag named after the target
+    state (W5B1); a fresh 0011 catalog only seeds ``unclassified``, so
+    the live scenarios seed the terminal rows (idempotent) — the same
+    harness contract the jobs suite's live scenarios use.
+    """
+    with psycopg.connect(url) as conn:
+        for state in TERMINAL_RUN_STATES:
+            conn.execute(
+                "INSERT INTO tags (tag_id, name, description) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (uuid.uuid4(), state.value, "terminal run classification"),
+            )
+        conn.commit()
+
+
 @pytest.fixture(scope="session")
 def bootstrapped_url(migrated_url: str) -> str:
     """Create the engine-owned ``dbos`` schema the way production does."""
@@ -632,6 +670,7 @@ def bootstrapped_url(migrated_url: str) -> str:
 
     jobs_engine.launch_worker(migrated_url)
     jobs_engine.shutdown()
+    _seed_terminal_catalog(migrated_url)
     return migrated_url
 
 
@@ -1152,6 +1191,19 @@ async def test_submit_creates_durable_agent_job_with_recorded_references(
     assert submitted.data["submission_sha256"]
 
 
+async def test_submit_view_carries_the_mandatory_tag_preview(
+    chat_app, jar, server_a, bootstrapped_url
+) -> None:
+    """The RunView ``tag_preview`` is required on the REAL submit path
+    (HT-W6A fix1): the response carries the actual reserved
+    classification preview — never a fabricated empty projection
+    (``total=0`` is contract-invalid)."""
+    response = await submit_chat(chat_app, jar, uuid.uuid4(), server_a)
+    assert response.status == 201, response.body
+    view = response.json()["conversation"]
+    assert view["tag_preview"] == {"preview": ["unclassified"], "total": 1}
+
+
 async def test_submit_auto_resolves_default_capabilities(
     chat_app, jar, server_a, bootstrapped_url
 ) -> None:
@@ -1232,13 +1284,27 @@ async def test_submit_read_only_strips_mutation_capabilities(
     """``read_only=True`` strips the non-read vocabulary and pins the
     read fallbacks; the flag participates in the whole-submission
     digest (a flipped flag for the same key is a DIFFERENT submission)."""
+    tag_mutations = ["tags.assign", "tags.remove", "tags.create", "tags.delete"]
+    tag_reads = [
+        "tags.list_for",
+        "tags.list_catalog",
+        "tags.search_jobs",
+        "tags.search_conversations",
+        "tags.read_conversation",
+        "tags.read_job",
+    ]
     run_id = uuid.uuid4()
     created = await submit_chat(
         chat_app,
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=True,
     )
     assert created.status == 201, created.body
@@ -1250,6 +1316,9 @@ async def test_submit_read_only_strips_mutation_capabilities(
     assert "app.upsert_map_entry" not in grants
     assert "app.delete_map_entry" not in grants
     assert "secret.store" not in grants
+    # The four tags mutations are stripped; the six tags reads survive.
+    assert all(mutation not in grants for mutation in tag_mutations)
+    assert all(read in grants for read in tag_reads)
     # Read capabilities (explicit and internal) survive; the read
     # fallbacks are always ensured so the context tuple is non-empty.
     assert READ_CAP in grants
@@ -1263,7 +1332,12 @@ async def test_submit_read_only_strips_mutation_capabilities(
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=True,
     )
     assert duplicate.status == 200, duplicate.body
@@ -1273,11 +1347,39 @@ async def test_submit_read_only_strips_mutation_capabilities(
         jar,
         run_id,
         server_a,
-        allowed_capabilities=[READ_CAP, PRIV_CAP, "host.shell"],
+        allowed_capabilities=[
+            READ_CAP,
+            PRIV_CAP,
+            "host.shell",
+            *TAGS_CAPABILITY_IDS,
+        ],
         read_only=False,
     )
     assert writable.status == 409
     assert _error(writable)["code"] == "conflict"
+
+
+async def test_submit_explicit_tag_read_subset_is_not_broadened(
+    chat_app, jar, server_a
+) -> None:
+    """An explicit ``allowed_capabilities`` subset carries exactly the
+    requested ``tags.*`` reads: no built-in vocabulary joins and no
+    ``tags.*`` mutation is silently added."""
+    created = await submit_chat(
+        chat_app,
+        jar,
+        uuid.uuid4(),
+        server_a,
+        allowed_capabilities=["tags.list_for", "tags.read_job"],
+    )
+    assert created.status == 201, created.body
+    grants = set(created.json()["conversation"]["requested_grants"])
+    # The explicit subset is preserved: the two requested reads are in
+    # and every other ``tags.*`` id (mutations included) stays out; the
+    # existing internal/web/plugins union is NOT tags-broadened.
+    requested = {"tags.list_for", "tags.read_job"}
+    assert requested <= grants
+    assert (set(TAGS_CAPABILITY_IDS) - requested).isdisjoint(grants)
 
 
 async def test_submit_read_only_filters_registry_effect_classes(
@@ -1842,6 +1944,9 @@ async def test_live_conversation_executes_streams_and_reconnects(
     assert detail.status == 200
     view = detail.json()
     assert view["state"] == "succeeded"
+    # The mandatory preview rides the detail view: the terminal swap left
+    # exactly the succeeded state tag (total=0 is contract-invalid).
+    assert view["tag_preview"] == {"preview": ["succeeded"], "total": 1}
     assert len(view["attachments"]) == 1
     assert view["children"] == []
 
@@ -1926,8 +2031,16 @@ async def test_live_delegation_tree_parent_and_child_events(
     assert detail.status == 200
     view = detail.json()
     assert view["state"] == "succeeded"
+    # The batched mandatory previews cover parent AND children: the
+    # terminal swap left exactly the succeeded state tag on each (the
+    # preview batch is resolved per parent server scope, total ≥ 1).
+    assert view["tag_preview"] == {"preview": ["succeeded"], "total": 1}
     assert sorted(child["run_id"] for child in view["children"]) == sorted(child_ids)
     assert all(child["state"] == "succeeded" for child in view["children"])
+    assert all(
+        child["tag_preview"] == {"preview": ["succeeded"], "total": 1}
+        for child in view["children"]
+    )
     assert all(child["depth"] == 1 for child in view["children"])
     assert all(child["parent_run_id"] == str(run_id) for child in view["children"])
 

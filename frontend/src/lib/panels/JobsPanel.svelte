@@ -52,17 +52,22 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { CalendarClock, ListTree, RadioTower, ScrollText, ServerCog } from 'lucide-svelte';
+	import { CalendarClock, ListTree, RadioTower, ScrollText, ServerCog, Tags } from 'lucide-svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
+	import HistoryTags, { type TagPageLoader } from '../ui/HistoryTags.svelte';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		CancelView,
-		JobsApi,
+		EntityTagView,
+		JobsPanelApi,
+		JobTagsPage,
 		RunDetail,
 		RunView,
-		ScheduleView
+		ScheduleView,
+		TagPage,
+		TagView
 	} from '../workspace/entries/05-web-jobs.js';
 
 	let { panel }: { panel: PanelContext } = $props();
@@ -70,8 +75,8 @@
 	// --- explicit inputs (fail closed when incomplete) -----------------------
 
 	/** Runtime narrowing of the opaque services bag; absent api ⇒ safe state. */
-	function readApi(services: PanelServices): JobsApi | null {
-		const candidate = services.api as Partial<JobsApi> | undefined;
+	function readApi(services: PanelServices): JobsPanelApi | null {
+		const candidate = services.api as Partial<JobsPanelApi> | undefined;
 		if (typeof candidate !== 'object' || candidate === null) return null;
 		for (
 			const name of [
@@ -82,12 +87,16 @@
 				'createSchedule',
 				'updateSchedule',
 				'deleteSchedule',
-				'streamRunEvents'
+				'streamRunEvents',
+				'listTags',
+				'listRunTags',
+				'assignRunTag',
+				'removeRunTag'
 			] as const
 		) {
 			if (typeof candidate[name] !== 'function') return null;
 		}
-		return candidate as JobsApi;
+		return candidate as JobsPanelApi;
 	}
 
 	const api = $derived(readApi(panel.services));
@@ -345,10 +354,12 @@
 		const q = qInput.trim();
 		const dateFrom = dateFromInput.trim();
 		const dateTo = dateToInput.trim();
+		const ids = selectedFilterIds();
 		runsFilter = {
 			...(q !== '' ? { q } : {}),
 			...(dateFrom !== '' ? { date_from: dateFrom } : {}),
-			...(dateTo !== '' ? { date_to: dateTo } : {})
+			...(dateTo !== '' ? { date_to: dateTo } : {}),
+			...(ids.length > 0 ? { tagIds: ids, tagMatch: tagMatchInput } : {})
 		};
 		void loadRuns();
 	}
@@ -367,8 +378,151 @@
 		qInput = '';
 		dateFromInput = '';
 		dateToInput = '';
+		tagPickerOpen = false;
+		tagPickerName = '';
+		selectedFilterTags = [];
+		tagMatchInput = 'any';
 		runsFilter = {};
 		void loadRuns();
+	}
+
+	// --- HT-W6B catalog-backed any/all tag filter (bounded, capped at 50) -----
+
+	/** The reviewed wire cap: at most 50 tag ids ride one runs query. */
+	const MAX_TAG_FILTER = 50;
+	/** Bounded catalog page size (AGENTS.md §1); the producer clamps the max. */
+	const TAG_PAGE_LIMIT = 10;
+
+	/** Picker visibility; opening it lazily loads the first bounded page. */
+	let tagPickerOpen = $state(false);
+	/** Case-insensitive name substring for the NEXT catalog query. */
+	let tagPickerName = $state('');
+	/** Applied picker name (what the loaded pages were queried with). */
+	let loadedCatalogName = $state('');
+	/** The one bounded catalog view, shared by the picker and assign select. */
+	let catalogItems = $state<TagView[]>([]);
+	let catalogTotal = $state(0);
+	let catalogLoading = $state(false);
+	let catalogLoadingMore = $state(false);
+	let catalogError = $state<{ code: string; message: string } | null>(null);
+	const catalogHasMore = $derived(catalogError === null && catalogItems.length < catalogTotal);
+	/** Selected filter tags (bounded by MAX_TAG_FILTER, kept with names for chips). */
+	let selectedFilterTags = $state<TagView[]>([]);
+	/** Draft match mode; applied onto the wire only with Apply filters. */
+	let tagMatchInput = $state<'any' | 'all'>('any');
+	const filterCapReached = $derived(selectedFilterTags.length >= MAX_TAG_FILTER);
+
+	/** Adopt one bounded catalog page: append deduplicated by tag_id. */
+	function adoptCatalogPage(page: { items?: TagView[]; total: number }): void {
+		const seen = new Set(catalogItems.map((tag) => tag.tag_id));
+		catalogItems = [...catalogItems, ...(page.items ?? []).filter((tag) => !seen.has(tag.tag_id))];
+		catalogTotal = page.total;
+	}
+
+	async function loadCatalog(): Promise<void> {
+		if (api === null || catalogLoading) return;
+		catalogLoading = true;
+		catalogError = null;
+		const name = tagPickerName.trim();
+		try {
+			const page = await api.listTags({ limit: TAG_PAGE_LIMIT, offset: 0, ...(name === '' ? {} : { nameFilter: name }) });
+			if (disposed) return;
+			loadedCatalogName = name;
+			catalogItems = [];
+			adoptCatalogPage(page);
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			catalogError = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'The tag catalog could not be loaded.')
+			};
+		} finally {
+			if (!disposed) catalogLoading = false;
+		}
+	}
+
+	async function loadMoreCatalog(): Promise<void> {
+		if (api === null || catalogLoadingMore || !catalogHasMore) return;
+		catalogLoadingMore = true;
+		catalogError = null;
+		try {
+			const page = await api.listTags({
+				limit: TAG_PAGE_LIMIT,
+				offset: catalogItems.length,
+				...(loadedCatalogName === '' ? {} : { nameFilter: loadedCatalogName })
+			});
+			if (disposed) return;
+			adoptCatalogPage(page);
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			catalogError = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More tags could not be loaded.')
+			};
+		} finally {
+			if (!disposed) catalogLoadingMore = false;
+		}
+	}
+
+	/** Opens the picker: first open loads the bounded catalog page zero. */
+	function toggleTagPicker(): void {
+		tagPickerOpen = !tagPickerOpen;
+		if (tagPickerOpen && catalogItems.length === 0 && catalogError === null) void loadCatalog();
+	}
+
+	/**
+	 * Toggles one catalog tag into the selection — never past 50 (the wire
+	 * cap). The honest cap note explains the refusal; nothing is truncated
+	 * silently.
+	 */
+	function toggleFilterTag(tag: TagView): void {
+		const index = selectedFilterTags.findIndex((selected) => selected.tag_id === tag.tag_id);
+		if (index !== -1) {
+			selectedFilterTags = selectedFilterTags.filter((_, at) => at !== index);
+			return;
+		}
+		if (selectedFilterTags.length >= MAX_TAG_FILTER) return;
+		selectedFilterTags = [...selectedFilterTags, tag];
+	}
+
+	function selectedFilterIds(): string[] {
+		return selectedFilterTags.map((tag) => tag.tag_id);
+	}
+
+	/**
+	 * The accepted popup's full-list page is typed as the catalog `TagPage`,
+	 * but it consumes ONLY `tag_id` and `name` per row (dedup, key, title,
+	 * chip text). The job tag route returns association rows (`EntityTagView`)
+	 * — projected here with their REAL identity/name values; no value is
+	 * invented for the fields the popup never reads. If the popup ever grows
+	 * past `{tag_id, name}`, this projection must become a shared wire shape.
+	 */
+	function popupPageOf(page: JobTagsPage): TagPage {
+		return {
+			limit: page.limit,
+			offset: page.offset,
+			total: page.total,
+			has_more: page.has_more,
+			items: (page.items ?? []).map((row) => ({
+				tag_id: row.tag_id,
+				name: row.name
+			})) as TagPage['items']
+		};
+	}
+
+	/**
+	 * One run's bounded tag-page adapter for its HistoryTags popup (the real
+	 * job tag route, explicit same-server scope, PAGE_LIMIT-bounded).
+	 */
+	function runTagsLoader(runId: string): TagPageLoader {
+		return async (offset, limit) => {
+			if (api === null || serverScope === null) {
+				throw new Error('The jobs service is unavailable.');
+			}
+			return popupPageOf(await api.listRunTags(runId, serverScope, { limit, offset }));
+		};
 	}
 
 	async function loadRuns(): Promise<void> {
@@ -477,12 +631,19 @@
 			if (row.run_id !== detail.run_id) return row;
 			if (
 				row.state === detail.state &&
-				row.cancel_requested_at === detail.cancel_requested_at
+				row.cancel_requested_at === detail.cancel_requested_at &&
+				row.tag_preview.total === detail.tag_preview.total &&
+				row.tag_preview.preview.join('\u0000') === detail.tag_preview.preview.join('\u0000')
 			) {
 				return row;
 			}
 			changed = true;
-			return { ...row, state: detail.state, cancel_requested_at: detail.cancel_requested_at };
+			return {
+				...row,
+				state: detail.state,
+				cancel_requested_at: detail.cancel_requested_at,
+				tag_preview: detail.tag_preview
+			};
 		});
 		if (changed) runs = next;
 	}
@@ -604,9 +765,18 @@
 		cancelError = null;
 		streamProblem = null;
 		streamStatus = 'connecting';
+		// HT-W6B: the tag surfaces rebind to the newly selected run.
+		watchTags = [];
+		watchTagsTotal = 0;
+		watchTagsState = { status: 'loading' };
+		tagActionError = null;
+		refusedRemoval = null;
+		replacementTagId = '';
+		assignTagId = '';
 		const controller = new AbortController();
 		streamAbort = controller;
 		void loadWatched();
+		void loadWatchTags();
 		void streamLoop(runId, controller);
 	}
 
@@ -631,6 +801,162 @@
 		} finally {
 			if (!disposed) cancelBusy = false;
 		}
+	}
+
+	// --- watched-run tags (HT-W6B: assign/remove via the job tag routes) ------
+
+	/** The watched run's association page state (bounded; AGENTS.md §1). */
+	let watchTags = $state<EntityTagView[]>([]);
+	let watchTagsTotal = $state(0);
+	let watchTagsLoadingMore = $state(false);
+	let watchTagsState = $state<ListState>({ status: 'loading' });
+	const watchTagsHasMore = $derived(
+		watchTagsState.status === 'ready' && watchTags.length < watchTagsTotal
+	);
+
+	/** Catalog ids already attached to the watched run (assign select hides them). */
+	const attachedTagIds = $derived(new Set(watchTags.map((row) => row.tag_id)));
+	/** Catalog rows not yet attached (the assign select's options). */
+	const assignableTags = $derived(catalogItems.filter((tag) => !attachedTagIds.has(tag.tag_id)));
+	let assignTagId = $state('');
+	let tagActionError = $state<{ code: string; message: string } | null>(null);
+	let tagActionBusy = $state(false);
+	/**
+	 * Final-tag refusal (409 `last_tag`): the removal that was refused stays
+	 * visible together with the replacement re-classification offer until the
+	 * user retries or dismisses. No removal is ever claimed as done.
+	 */
+	let refusedRemoval = $state<EntityTagView | null>(null);
+	let replacementTagId = $state('');
+
+	/** Load page zero of the watched run's tags (same-server scope). */
+	async function loadWatchTags(): Promise<void> {
+		if (api === null || serverScope === null || watchedRunId === '') return;
+		watchTagsState = { status: 'loading' };
+		watchTagsLoadingMore = false;
+		try {
+			const page = await api.listRunTags(watchedRunId, serverScope, { limit: TAG_PAGE_LIMIT });
+			if (disposed || page.run_id !== watchedRunId) return;
+			watchTags = page.items ?? [];
+			watchTagsTotal = page.total;
+			watchTagsState = { status: 'ready' };
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			watchTagsState = {
+				status: 'error',
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'The run tags could not be loaded.')
+			};
+		}
+	}
+
+	async function loadMoreWatchTags(): Promise<void> {
+		if (api === null || serverScope === null || watchTagsLoadingMore || !watchTagsHasMore) return;
+		watchTagsLoadingMore = true;
+		try {
+			const page = await api.listRunTags(watchedRunId, serverScope, {
+				limit: TAG_PAGE_LIMIT,
+				offset: watchTags.length
+			});
+			if (disposed || page.run_id !== watchedRunId) return;
+			const seen = new Set(watchTags.map((row) => row.tag_id));
+			watchTags = [...watchTags, ...(page.items ?? []).filter((row) => !seen.has(row.tag_id))];
+			watchTagsTotal = page.total;
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			tagActionError = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'More run tags could not be loaded.')
+			};
+		} finally {
+			if (!disposed) watchTagsLoadingMore = false;
+		}
+	}
+
+	/**
+	 * One durable-projection refresh after a tag mutation: the watched run's
+	 * replayed detail (its `tag_preview` is durable) plus the association
+	 * page. The runs-list row follows via `noteRowState`.
+	 */
+	async function refreshTagProjections(): Promise<void> {
+		await Promise.all([refreshWatched(), loadWatchTags()]);
+	}
+
+	/** Assign the selected catalog tag; idempotent 204, then refresh truth. */
+	async function assignWatchTag(): Promise<void> {
+		if (api === null || serverScope === null || watchedRunId === '' || tagActionBusy) return;
+		if (assignTagId === '') return;
+		tagActionBusy = true;
+		tagActionError = null;
+		refusedRemoval = null;
+		try {
+			await api.assignRunTag(watchedRunId, {
+				tag_id: assignTagId,
+				server_id: serverScope
+			});
+			if (disposed) return;
+			assignTagId = '';
+			await refreshTagProjections();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			tagActionError = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'The tag could not be assigned.')
+			};
+		} finally {
+			if (!disposed) tagActionBusy = false;
+		}
+	}
+
+	/**
+	 * Remove one association (idempotent). A final-tag refusal (409
+	 * `last_tag`) keeps the row and offers the same-transaction replacement;
+	 * nothing pretends to have removed anything.
+	 */
+	async function removeWatchTag(row: EntityTagView, replacement?: string): Promise<void> {
+		if (api === null || serverScope === null || watchedRunId === '' || tagActionBusy) return;
+		tagActionBusy = true;
+		tagActionError = null;
+		try {
+			await api.removeRunTag(watchedRunId, row.tag_id, {
+				serverId: serverScope,
+				...(replacement !== undefined && replacement !== '' ? { replacementTagId: replacement } : {})
+			});
+			if (disposed) return;
+			refusedRemoval = null;
+			replacementTagId = '';
+			await refreshTagProjections();
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			if (code === 'last_tag') {
+				// The mandatory-tag invariant refused the removal; offer the
+				// reviewed re-classification path instead of a dead end.
+				refusedRemoval = row;
+				tagActionError = {
+					code,
+					message:
+						'This is the run’s final tag — it cannot be removed without a replacement.'
+				};
+			} else {
+				tagActionError = {
+					code,
+					message: friendlyText(code, messageOf(error) ?? 'The tag could not be removed.')
+				};
+			}
+		} finally {
+			if (!disposed) tagActionBusy = false;
+		}
+	}
+
+	/** Dismisses the final-tag refusal offer without changing anything. */
+	function dismissRefusal(): void {
+		refusedRemoval = null;
+		replacementTagId = '';
+		tagActionError = null;
 	}
 
 	// --- schedules (explicit server scope; pause/resume is the only update) ---
@@ -878,6 +1204,114 @@
 									data-testid="runs-date-to-input"
 								/>
 							</div>
+							<div class="mai-jobs__tagfilter">
+								<Button
+									variant="secondary"
+									size="sm"
+									aria-expanded={tagPickerOpen}
+									onclick={toggleTagPicker}
+									data-testid="runs-tag-picker-toggle"
+								>
+									<span class="mai-jobs__section-icon"><Tags size={13} aria-hidden="true" /></span>
+									Tag filters{selectedFilterTags.length > 0 ? ` (${selectedFilterTags.length})` : ''}
+								</Button>
+								{#if selectedFilterTags.length > 0}
+									<ul class="mai-jobs__chips" data-testid="tag-filter-selected">
+										{#each selectedFilterTags as tag (tag.tag_id)}
+											<li class="mai-jobs__chip" data-testid="tag-filter-chip" data-tag-id={tag.tag_id}>
+												{tag.name}
+												<button
+													type="button"
+													class="mai-jobs__chip-x"
+													aria-label={'Remove ' + tag.name + ' from the tag filter'}
+													onclick={() => toggleFilterTag(tag)}
+													data-testid="tag-filter-chip-x"
+												>
+													×
+												</button>
+											</li>
+										{/each}
+									</ul>
+									<label class="mai-jobs__meta">
+										Match
+										<select bind:value={tagMatchInput} data-testid="tag-match-select">
+											<option value="any">any (at least one)</option>
+											<option value="all">all (every)</option>
+										</select>
+									</label>
+								{/if}
+								{#if tagPickerOpen}
+									<div class="mai-jobs__picker" data-testid="tag-filter-picker">
+										<div class="mai-jobs__picker-head">
+											<Field
+												label="Filter catalog by name"
+												bind:value={tagPickerName}
+												placeholder="infra"
+												data-testid="tag-filter-name-input"
+											/>
+											<Button variant="secondary" size="sm" onclick={loadCatalog} data-testid="tag-filter-name-apply">
+												Search
+											</Button>
+										</div>
+										{#if catalogError !== null}
+											<p
+												class="mai-jobs__row-note mai-jobs__row-note--error"
+												role="alert"
+												data-testid="tag-catalog-error"
+												data-error-code={catalogError.code}
+											>
+												{catalogError.message}
+												<Button variant="secondary" size="sm" onclick={loadCatalog} data-testid="tag-catalog-retry">
+													Retry
+												</Button>
+											</p>
+										{:else if catalogLoading}
+											<p class="mai-jobs__meta" role="status" data-testid="tag-catalog-loading">Loading tag catalog…</p>
+										{:else if catalogItems.length === 0}
+											<p class="mai-jobs__meta" role="status" data-testid="tag-catalog-empty">
+												No catalog tags match this name filter.
+											</p>
+										{:else}
+											<ul class="mai-jobs__picker-list" data-testid="tag-filter-options">
+												{#each catalogItems as tag (tag.tag_id)}
+													<li>
+														<button
+															type="button"
+															class="mai-jobs__picker-option"
+															aria-pressed={selectedFilterTags.some((selected) => selected.tag_id === tag.tag_id)}
+															disabled={!selectedFilterTags.some((selected) => selected.tag_id === tag.tag_id) && filterCapReached}
+															onclick={() => toggleFilterTag(tag)}
+															data-testid="tag-filter-option"
+															data-tag-id={tag.tag_id}
+														>
+															{tag.name}
+														</button>
+													</li>
+												{/each}
+											</ul>
+											<p class="mai-jobs__meta" data-testid="tag-catalog-total">
+								Showing {catalogItems.length} of {catalogTotal} catalog tags.
+											</p>
+											{#if filterCapReached}
+												<p class="mai-jobs__row-note" role="status" data-testid="tag-filter-cap">
+													At most {MAX_TAG_FILTER} tags can be matched — deselect others first.
+												</p>
+											{/if}
+											{#if catalogHasMore}
+												<Button
+													variant="secondary"
+													size="sm"
+													loading={catalogLoadingMore}
+													onclick={loadMoreCatalog}
+													data-testid="tag-catalog-load-more"
+												>
+													Load more tags ({catalogItems.length} of {catalogTotal})
+												</Button>
+											{/if}
+										{/if}
+									</div>
+								{/if}
+							</div>
 							<div class="mai-jobs__form-actions">
 								<Button variant="secondary" size="sm" onclick={applyRunFilters} data-testid="runs-apply-filters">
 									Apply filters
@@ -943,6 +1377,14 @@
 													Cancellation requested
 												</span>
 											{/if}
+											<div class="mai-jobs__row-tags">
+												<HistoryTags
+													tag_preview={row.tag_preview}
+													loadMore={runTagsLoader(row.run_id)}
+													label={'Tags of run ' + (row.label !== '' ? row.label : shortId(row.run_id))}
+													testId="run-tags"
+												/>
+											</div>
 										</div>
 										<div class="mai-jobs__row-actions">
 											<Button
@@ -1021,6 +1463,172 @@
 								prompt revision <span class="mai-jobs__mono">{watchedRun.prompt_revision}</span> ·
 								grants {watchedRun.requested_grants.join(', ')}
 							</p>
+
+							<!-- HT-W6B tag surface: bounded preview + accessible full list,
+							     then assign/remove through the job tag routes with honest
+							     final-tag and error states (no fabricated success). -->
+							<div class="mai-jobs__watch-tags" data-testid="watch-tags-block">
+								<p class="mai-jobs__workbench-title">
+									<span class="mai-jobs__section-icon"><Tags size={13} aria-hidden="true" /></span>
+									Tags
+								</p>
+								<HistoryTags
+									tag_preview={watchedRun.tag_preview}
+									loadMore={runTagsLoader(watchedRunId)}
+									label={'Tags of the watched run'}
+									testId="watch-tags"
+								/>
+
+								<div class="mai-jobs__assign">
+									{#if catalogItems.length === 0 && catalogError === null && !catalogLoading}
+										<Button
+											variant="secondary"
+											size="sm"
+											onclick={loadCatalog}
+											data-testid="watch-tag-catalog-load"
+										>
+											Load tag catalog
+										</Button>
+									{:else if assignableTags.length > 0}
+										<label class="mai-jobs__meta">
+											Assign a catalog tag
+											<select bind:value={assignTagId} data-testid="watch-tag-assign-select">
+												<option value="" disabled selected>Select a tag…</option>
+												{#each assignableTags as tag (tag.tag_id)}
+													<option value={tag.tag_id}>{tag.name}</option>
+												{/each}
+											</select>
+										</label>
+										<Button
+											variant="secondary"
+											size="sm"
+											loading={tagActionBusy}
+											disabled={assignTagId === ''}
+											onclick={assignWatchTag}
+											data-testid="watch-tag-assign"
+										>
+											Assign
+										</Button>
+										{#if catalogHasMore}
+											<Button
+												variant="secondary"
+												size="sm"
+												loading={catalogLoadingMore}
+												onclick={loadMoreCatalog}
+												data-testid="watch-tag-catalog-more"
+											>
+												More catalog tags ({catalogItems.length} of {catalogTotal})
+											</Button>
+										{/if}
+									{:else if catalogLoading}
+										<span class="mai-jobs__meta" role="status" data-testid="watch-tag-catalog-loading">
+											Loading tag catalog…
+										</span>
+									{:else}
+										<span class="mai-jobs__meta" role="status" data-testid="watch-tag-catalog-empty">
+											No unassigned catalog tags are loaded.
+										</span>
+									{/if}
+								</div>
+
+								{#if watchTagsState.status === 'loading'}
+									<p class="mai-jobs__meta" role="status" data-testid="watch-tags-loading">Loading run tags…</p>
+								{:else if watchTagsState.status === 'error'}
+									<div
+										class="mai-jobs__state mai-jobs__state--error"
+										role="alert"
+										data-testid="watch-tags-error"
+										data-error-code={watchTagsState.code}
+									>
+										<p>{watchTagsState.message}</p>
+										<Button variant="secondary" size="sm" onclick={loadWatchTags} data-testid="watch-tags-retry">
+											Retry
+										</Button>
+									</div>
+								{:else if watchTags.length === 0}
+									<p class="mai-jobs__meta" role="status" data-testid="watch-tags-empty">
+										No tags are recorded for this run.
+									</p>
+								{:else}
+									<ul class="mai-jobs__rows" data-testid="watch-tag-list">
+										{#each watchTags as tagRow (tagRow.tag_id)}
+											<li class="mai-jobs__row" data-testid="watch-tag-row" data-tag-id={tagRow.tag_id}>
+												<div class="mai-jobs__row-main">
+													<span class="mai-jobs__row-id" data-testid="watch-tag-name">{tagRow.name}</span>
+													<span class="mai-jobs__meta" data-testid="watch-tag-source">
+														{tagRow.assignment_source}{tagRow.assigned_by !== '' ? ` · ${tagRow.assigned_by}` : ''}
+													</span>
+												</div>
+												<div class="mai-jobs__row-actions">
+													<Button
+														variant="danger"
+														size="sm"
+														loading={tagActionBusy}
+														onclick={() => removeWatchTag(tagRow)}
+														data-testid="watch-tag-remove"
+													>
+														Remove
+													</Button>
+												</div>
+											</li>
+										{/each}
+									</ul>
+									<p class="mai-jobs__meta" data-testid="watch-tags-total">
+										Showing {watchTags.length} of {watchTagsTotal} attached tags.
+									</p>
+									{#if watchTagsHasMore}
+										<Button
+											variant="secondary"
+											size="sm"
+											loading={watchTagsLoadingMore}
+											onclick={loadMoreWatchTags}
+											data-testid="watch-tags-load-more"
+										>
+											Load more tags ({watchTags.length} of {watchTagsTotal})
+										</Button>
+									{/if}
+								{/if}
+
+								{#if tagActionError !== null}
+									<p
+										class="mai-jobs__row-note mai-jobs__row-note--error"
+										role="alert"
+										data-testid="watch-tag-error"
+										data-error-code={tagActionError.code}
+									>
+										{tagActionError.message}
+									</p>
+								{/if}
+								{#if refusedRemoval !== null}
+									<div class="mai-jobs__refusal" data-testid="watch-tag-refusal">
+										<p class="mai-jobs__meta">
+											Re-classify “{refusedRemoval.name}” to keep the mandatory tag:
+										</p>
+										<label class="mai-jobs__meta">
+											Replacement tag
+											<select bind:value={replacementTagId} data-testid="watch-tag-replacement-select">
+												<option value="" disabled selected>Select a replacement…</option>
+												{#each catalogItems.filter((candidate) => candidate.tag_id !== refusedRemoval?.tag_id) as tag (tag.tag_id)}
+													<option value={tag.tag_id}>{tag.name}</option>
+												{/each}
+											</select>
+										</label>
+										<Button
+											variant="danger"
+											size="sm"
+											loading={tagActionBusy}
+											disabled={replacementTagId === ''}
+											onclick={() => refusedRemoval && removeWatchTag(refusedRemoval, replacementTagId)}
+											data-testid="watch-tag-replace-remove"
+										>
+											Remove with replacement
+										</Button>
+										<Button variant="secondary" size="sm" onclick={dismissRefusal} data-testid="watch-tag-refusal-dismiss">
+											Keep the tag
+										</Button>
+									</div>
+								{/if}
+							</div>
 
 							<div class="mai-jobs__cancel">
 								{#if watchedTerminal}
@@ -1694,5 +2302,119 @@
 	.mai-jobs__form-actions {
 		display: flex;
 		justify-content: flex-start;
+	}
+
+	/* HT-W6B tag surfaces: bounded picker, chips, row previews, assign/refusal. */
+	.mai-jobs__tagfilter {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-jobs__chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-1);
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+
+	.mai-jobs__chip {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1);
+		padding: 2px var(--mai-space-2);
+		border: 1px solid var(--mai-border);
+		border-radius: 999px;
+		font-size: var(--mai-text-sm);
+		max-width: 100%;
+	}
+
+	.mai-jobs__chip-x {
+		border: none;
+		background: none;
+		color: var(--mai-fg-muted);
+		cursor: pointer;
+		font-size: var(--mai-text-sm);
+		line-height: 1;
+		padding: 0;
+	}
+
+	.mai-jobs__picker {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		border: 1px solid var(--mai-border);
+		border-radius: var(--mai-radius-sm, 6px);
+		padding: var(--mai-space-2);
+		max-height: 240px;
+		overflow-y: auto;
+	}
+
+	.mai-jobs__picker-head {
+		display: flex;
+		align-items: flex-end;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-jobs__picker-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+
+	.mai-jobs__picker-option {
+		border: 1px solid var(--mai-border);
+		border-radius: var(--mai-radius-sm, 6px);
+		background: none;
+		color: inherit;
+		cursor: pointer;
+		font: inherit;
+		font-size: var(--mai-text-sm);
+		padding: 2px var(--mai-space-2);
+		text-align: left;
+	}
+
+	.mai-jobs__picker-option[aria-pressed='true'] {
+		border-color: var(--mai-accent, var(--mai-border));
+		font-weight: 600;
+	}
+
+	.mai-jobs__picker-option:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+
+	.mai-jobs__row-tags {
+		margin-top: var(--mai-space-1);
+	}
+
+	.mai-jobs__watch-tags {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		border: 1px solid var(--mai-border);
+		border-radius: var(--mai-radius-sm, 6px);
+		padding: var(--mai-space-2);
+	}
+
+	.mai-jobs__assign {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-jobs__refusal {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+		border: 1px solid var(--mai-border);
+		border-radius: var(--mai-radius-sm, 6px);
+		padding: var(--mai-space-2);
 	}
 </style>

@@ -96,7 +96,8 @@ ALEMBIC_INI = os.path.join(BACKEND_ROOT, "alembic.ini")
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain; tip reconciliation (card 11-task-store): the
-# revision 0009 task-domain tables append to the 0008 set.
+# revision 0009 task-domain tables append to the 0008 set and revision
+# 0011 appends the history-tag domain (W1).
 REVISION_IDS = (
     "0001",
     "0002",
@@ -107,10 +108,13 @@ REVISION_IDS = (
     "0007",
     "0008",
     "0009",
+    "0010",
+    "0011",
 )
 
-# The exact public application schema at the 0009 tip: the 0008 set plus
-# the seven task-domain tables — nothing else.
+# The exact public application schema at the tip: the 0008 set plus the
+# seven task-domain tables (09-agent-tasks) and the three history-tag
+# tables (0011, W1) — nothing else.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -142,6 +146,9 @@ EXPECTED_APP_TABLES = frozenset(
         "agent_task_evidence",
         "agent_task_revisions",
         "agent_task_completions",
+        "tags",
+        "job_tags",
+        "conversation_tags",
     }
 )
 
@@ -172,13 +179,14 @@ def _drop_app_tables(url: str) -> None:
             "agent_task_criteria, agent_task_constraints, "
             "agent_task_steps, agent_tasks, conversation_steering, "
             "conversation_runs, conversation_messages, conversations, "
+            "conversation_tags, "
             "notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, "
             "knowledge_documents, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
+            "job_events, job_steps, job_runs, job_tags, approvals, "
             "profile_projection_journal, profile_projection, "
-            "admin_sessions, admin_credential, alembic_version"
+            "admin_sessions, admin_credential, tags, alembic_version"
         )
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()
@@ -463,7 +471,7 @@ class TestMigrationChain:
         assert module.revision == "0009"
         assert module.down_revision == "0008"
 
-    def test_head_is_0009_and_upgrade_is_idempotent(
+    def test_head_is_0011_and_upgrade_is_idempotent(
         self, migrated_url: str
     ) -> None:
         previous = os.environ.get("MAI_DATABASE_URL")

@@ -92,6 +92,7 @@ __all__ = [
     "ConversationTurnSubmitRequest",
     "ConversationTurnSubmitResponse",
     "DISPOSITION_HTTP_STATUS",
+    "EntityTagPreviewView",
     "FORBIDDEN_AUTHORITY_FIELDS",
     "HistoryCompleteness",
     "MessageRange",
@@ -440,6 +441,22 @@ class MessageRange(BaseModel):
         return self
 
 
+class EntityTagPreviewView(BaseModel):
+    """Bounded listing projection of tag names plus honest total count."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    preview: list[str] = Field(
+        max_length=3,
+        description="First ≤3 tag names (deterministic name order)",
+    )
+    total: int = Field(
+        ge=1,
+        description="Honest total number of tags attached (including beyond "
+        "preview); at least one tag is mandatory, so 0 is never valid",
+    )
+
+
 class ConversationSummary(BaseModel):
     """Safe metadata row of one conversation (§3 ``GET`` list page item).
 
@@ -465,6 +482,9 @@ class ConversationSummary(BaseModel):
     active_run_id: uuid.UUID | None = Field(
         default=None,
         description="Current durable run, when one is attached (§1)",
+    )
+    tag_preview: EntityTagPreviewView = Field(
+        description="Bounded tag name preview plus honest total",
     )
 
 

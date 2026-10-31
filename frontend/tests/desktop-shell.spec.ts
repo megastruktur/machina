@@ -2229,3 +2229,306 @@ test('live dock Global journey (24a D-1): unpin → Global history → submit �
 		).toBe(true);
 	}
 });
+
+// ---------------------------------------------------------------------------
+// Drawer history tags (history-tags W7A completion, narrow scope): the
+// COMPOSED left drawer's history rows render the BOUNDED preview carried by
+// the canonical list page and load the full tag page ONLY when a row popup
+// opens — through the real production client and the real DesktopShell →
+// ChatDrawerSection composition, on the row's RECORDED server scope, over
+// the canonical conversation tag route (never the legacy job route).
+// ---------------------------------------------------------------------------
+
+/** The one tagged Global conversation of the drawer world. */
+const DRAWER_TAGGED_ID = 'cd000000-1111-4222-8333-444455556666';
+const DRAWER_TAG_TS = '2026-10-25T16:00:00Z';
+/** Twelve deterministic tags: preview shows 3 chips + "+9". */
+const DRAWER_TAGS: Array<{ tag_id: string; name: string }> = [
+	'alpha',
+	'beach',
+	'crate',
+	'delta',
+	'ember',
+	'flint',
+	'grove',
+	'haven',
+	'icing',
+	'jade',
+	'kelp',
+	'larch'
+].map((name, index) => ({
+	tag_id: `d0000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+	name
+}));
+
+test.describe('drawer history tags — real composed client', () => {
+	// The popup interaction proofs include a touch tap; the default context
+	// has no touchscreen, so this describe enables it (AC4 keyboard/tap).
+	test.use({ hasTouch: true });
+
+	test('drawer rows show bounded preview +N, load full pages on demand in the row scope, and stay keyboard/tap/Escape-bounded at 360x640', async ({
+		page
+	}) => {
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await page.context().addCookies([
+			{ name: CSRF_COOKIE, value: 'playwright-csrf', url: 'http://127.0.0.1:4173' }
+		]);
+
+		const jsonHeaders = { 'content-type': 'application/json' };
+		const fulfillJson = (route: Route, status: number, body: unknown) =>
+			route.fulfill({ status, headers: jsonHeaders, body: JSON.stringify(body) });
+		const entityRows = () =>
+			[...DRAWER_TAGS]
+				.sort((a, b) => a.name.localeCompare(b.name))
+				.map((one) => ({
+					tag_id: one.tag_id,
+					name: one.name,
+					assigned_by: 'fixture-user',
+					assignment_source: 'user',
+					created_at: DRAWER_TAG_TS
+				}));
+
+		/** Every canonical tag read; `opened` marks post-first-popup-open reads. */
+		const tagReads: Array<{ path: string; serverId: string | null; status: number; opened: boolean }> = [];
+		/** Any job-route read at all — drawer rows must never ride it. */
+		const jobReads: string[] = [];
+		let popupOpened = false;
+
+		// The live attach pair (identical to the 24a world): one real server
+		// profile + the model profile the dock's live select renders.
+		await page.route('**/api/v1/servers', (route) =>
+			fulfillJson(route, 200, {
+				servers: [
+					{
+						schema_version: 1,
+						server_id: LIVE_SERVER_ID,
+						name: 'megaserver',
+						prompt_revision: 1,
+						prompt_text: 'fixture',
+						environment: 'linux_ssh',
+						ssh: { host: 'megaserver', port: 22, user: 'mai', host_key: '', credential_ref: 'fixture-credential' },
+						privilege: 'sudo',
+						capabilities: [],
+						revision: 1,
+						sha256: 'ab'.repeat(32),
+						projection: { revision: 1, stale: false }
+					}
+				]
+			})
+		);
+		await page.route('**/api/v1/models/profiles', (route) =>
+			fulfillJson(route, 200, {
+				profiles: [
+					{ schema_version: 1, name: 'glm53flash', connection: 'litellm', model: 'z-ai-coding/glm-5.3-flash' }
+				]
+			})
+		);
+		await page.route('**/api/v1/models/selection', (route) =>
+			fulfillJson(route, 200, { schema_version: 1, connection: 'litellm', profile: 'glm53flash' })
+		);
+
+		// One scope-checked canonical surface: the Global list carries the
+		// bounded tag_preview; the tag collection serves bounded pages in the
+		// requesting scope (a foreign scope is the SAME scope-blind 404).
+		await page.route('**/api/v1/chat/conversations**', async (route) => {
+			const request = route.request();
+			const url = new URL(request.url());
+			const parts = url.pathname.split('/').filter((part) => part !== '');
+			const serverId = url.searchParams.get('server_id');
+			const conversationId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : null;
+			const tail = parts[5] ?? null;
+			if (conversationId === null) {
+				if (request.method() !== 'GET' || serverId !== GLOBAL_SENTINEL) {
+					return fulfillJson(route, 404, { detail: { code: 'not_found', message: 'scope' } });
+				}
+				return fulfillJson(route, 200, {
+					limit: Number(url.searchParams.get('limit') ?? 10),
+					offset: Number(url.searchParams.get('offset') ?? 0),
+					total: 1,
+					has_more: false,
+					items: [
+						{
+							conversation_id: DRAWER_TAGGED_ID,
+							server_id: GLOBAL_SENTINEL,
+							title: 'Tagged drawer row',
+							created_at: DRAWER_TAG_TS,
+							updated_at: DRAWER_TAG_TS,
+							message_count: 2,
+							active_task_id: null,
+							active_run_id: null,
+							// The bounded list-page preview: first ≤3 names + the
+							// honest total (3 chips + "+9" in the drawer row).
+							tag_preview: {
+								preview: DRAWER_TAGS.slice(0, 3).map((one) => one.name),
+								total: DRAWER_TAGS.length
+							}
+						}
+					]
+				});
+			}
+			if (conversationId === DRAWER_TAGGED_ID && tail === 'tags' && parts.length === 6 && request.method() === 'GET') {
+				if (serverId !== GLOBAL_SENTINEL) {
+					tagReads.push({ path: url.pathname + url.search, serverId, status: 404, opened: popupOpened });
+					return fulfillJson(route, 404, { detail: { code: 'not_found', message: 'scope' } });
+				}
+				tagReads.push({ path: url.pathname + url.search, serverId, status: 200, opened: popupOpened });
+				const limit = Number(url.searchParams.get('limit') ?? 10);
+				const offset = Number(url.searchParams.get('offset') ?? 0);
+				const rows = entityRows();
+				const sliced = rows.slice(offset, offset + limit);
+				return fulfillJson(route, 200, {
+					conversation_id: DRAWER_TAGGED_ID,
+					limit,
+					offset,
+					total: rows.length,
+					has_more: offset + sliced.length < rows.length,
+					items: sliced
+				});
+			}
+			return fulfillJson(route, 404, { detail: { code: 'not_found', message: 'no such canonical surface in scope' } });
+		});
+
+		// Identity guard: ANY job-route read from a drawer conversation row is
+		// recorded as the conflation defect this coverage exists to catch.
+		await page.route('**/api/v1/jobs/runs/**', async (route) => {
+			jobReads.push(new URL(route.request().url()).pathname + new URL(route.request().url()).search);
+			return fulfillJson(route, 404, { detail: { code: 'not_found', message: 'job route must never serve a drawer conversation row' } });
+		});
+
+		const dock = page.getByTestId('bottom-chat-dock');
+		const drawer = page.getByTestId('drawer-chat-section');
+
+		// --- 1280 leg: bounded preview +N, on-demand bounded full pages ------
+		await page.goto('/');
+		await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+		await dock.getByTestId('chat-server-chip-remove').click();
+		await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+		await drawer.getByTestId('drawer-history-toggle').click();
+		await drawer.getByTestId('drawer-history-toggle').click();
+
+		const row = drawer.locator('.mai-chat-drawer__item-row').filter({ hasText: 'Tagged drawer row' });
+		await expect(row.getByTestId('drawer-history-item')).toHaveCount(1);
+
+		// The bounded preview honestly truncates: 3 chips + "+9" from the
+		// LIST page's tag_preview — no popup fetch has happened yet.
+		const rowTags = row.getByTestId('drawer-history-row-tags');
+		await expect(rowTags.getByTestId('drawer-history-row-tags-chip')).toHaveCount(3);
+		await expect(rowTags.getByTestId('drawer-history-row-tags-more')).toHaveText('+9');
+		expect(jobReads, 'no eager job-route read').toEqual([]);
+		expect(tagReads, 'no eager full tag load — the preview comes from the list page').toEqual([]);
+
+		// Keyboard: focus opens; the full list arrives as ONE bounded page on
+		// the row's RECORDED sentinel scope over the canonical route.
+		const trigger = rowTags.getByTestId('drawer-history-row-tags-trigger');
+		const pop = rowTags.getByTestId('drawer-history-row-tags-pop');
+		popupOpened = true;
+		await trigger.focus();
+		await expect(pop).toBeVisible();
+		await expect(pop.getByTestId('drawer-history-row-tags-row')).toHaveCount(10);
+		await expect(pop.getByTestId('drawer-history-row-tags-count')).toHaveText('Showing 10 of 12');
+		const pageOne = `/api/v1/chat/conversations/${DRAWER_TAGGED_ID}/tags?server_id=${GLOBAL_SENTINEL}&limit=10&offset=0`;
+		await expect
+			.poll(() => tagReads.filter((one) => one.path === pageOne).length, { timeout: 15000 })
+			.toBeGreaterThanOrEqual(1);
+		expect(tagReads.find((one) => one.path === pageOne)!.status).toBe(200);
+
+		// The remaining rows load on demand as the next bounded page.
+		await pop.getByTestId('drawer-history-row-tags-load-more').click();
+		await expect(pop.getByTestId('drawer-history-row-tags-row')).toHaveCount(12);
+		await expect(pop.getByTestId('drawer-history-row-tags-count')).toHaveText('Showing 12 of 12');
+		await expect(pop.getByTestId('drawer-history-row-tags-load-more')).toHaveCount(0);
+		const pageTwo = `/api/v1/chat/conversations/${DRAWER_TAGGED_ID}/tags?server_id=${GLOBAL_SENTINEL}&limit=10&offset=10`;
+		await expect
+			.poll(() => tagReads.filter((one) => one.path === pageTwo).length, { timeout: 15000 })
+			.toBeGreaterThanOrEqual(1);
+
+		// Escape closes and restores the trigger focus (the Load-more click
+		// re-rendered its own button, dropping focus to body — re-enter the
+		// widget first, exactly the declared focus-open contract); Enter
+		// toggles; an outside pointerdown closes a keyboard-opened popup.
+		await trigger.focus();
+		await page.keyboard.press('Escape');
+		await expect(pop).toBeHidden();
+		await expect(trigger).toBeFocused();
+		await page.keyboard.press('Enter');
+		await expect(pop).toBeVisible();
+		await page.keyboard.press('Enter');
+		await expect(pop).toBeHidden();
+		await page.keyboard.press(' ');
+		await expect(pop).toBeVisible();
+		// The drawer brand title is a plain inert element OUTSIDE the popup
+		// root — its pointerdown is the outside-close path.
+		await page.locator('.mai-desktop-shell__drawer-title').click();
+		await expect(pop).toBeHidden();
+
+		// Identity non-conflation: the drawer row NEVER rode the job route.
+		expect(jobReads, 'drawer conversation rows never read job tag routes').toEqual([]);
+
+		// --- 360x640 leg: tap toggle, viewport-bounded popup, no overflow ---
+		await page.setViewportSize({ width: 360, height: 640 });
+		await page.reload();
+		await expect(page.getByTestId('server-tree-nav')).toContainText('megaserver');
+		// Pocket overlay UX: the expanded drawer overlays the dock, so unpin
+		// happens drawer-collapsed and the row pick happens drawer-expanded.
+		await page.getByTestId('side-drawer-toggle').click();
+		await dock.getByTestId('chat-server-chip-remove').click();
+		await expect(dock.getByTestId('chat-general-consult-badge')).toBeVisible();
+		await page.getByTestId('side-drawer-toggle').click();
+		await drawer.getByTestId('drawer-history-toggle').click();
+		await drawer.getByTestId('drawer-history-toggle').click();
+
+		const pocketRow = drawer.locator('.mai-chat-drawer__item-row').filter({ hasText: 'Tagged drawer row' });
+		await expect(pocketRow.getByTestId('drawer-history-item')).toHaveCount(1);
+		const pocketTrigger = pocketRow.getByTestId('drawer-history-row-tags-trigger');
+		const pocketPop = pocketRow.getByTestId('drawer-history-row-tags-pop');
+
+		// A touch tap toggles open (the tap's own focus-open is not undone by
+		// its click); the popup stays inside the 360px viewport and the
+		// document gains no horizontal overflow.
+		const tapCenter = async () => {
+			const box = await pocketTrigger.boundingBox();
+			expect(box, 'pocket trigger box').not.toBeNull();
+			return { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 };
+		};
+		{
+			const center = await tapCenter();
+			await page.touchscreen.tap(center.x, center.y);
+		}
+		await expect(pocketPop).toBeVisible();
+		await expect(pocketPop.getByTestId('drawer-history-row-tags-row').first()).toBeVisible();
+		expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+		const pocketBox = await pocketPop.boundingBox();
+		expect(pocketBox, 'pocket popup box').not.toBeNull();
+		expect(pocketBox!.x).toBeGreaterThanOrEqual(0);
+		expect(pocketBox!.x + pocketBox!.width).toBeLessThanOrEqual(360);
+		{
+			const center = await tapCenter();
+			await page.touchscreen.tap(center.x, center.y);
+		}
+		await expect(pocketPop).toBeHidden();
+
+		// Keyboard on the pocket surface too: focus opens, Escape closes and
+		// restores the trigger focus. The tap-close left the trigger focused,
+		// so blur first — the genuine leave-then-keyboard-focus re-entry the
+		// HistoryTags contract describes.
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		await pocketTrigger.focus();
+		await expect(pocketPop).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(pocketPop).toBeHidden();
+		await expect(pocketTrigger).toBeFocused();
+		expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+
+		// Scope/identity audit across both legs: every canonical tag read
+		// rode the row's recorded sentinel scope and succeeded; every read
+		// happened only AFTER a popup opened (never eager).
+		expect(tagReads.length, 'bounded reads recorded').toBeGreaterThanOrEqual(3);
+		for (const one of tagReads) {
+			expect(one.opened, `no eager tag read: ${one.path}`).toBe(true);
+			expect(one.serverId, one.path).toBe(GLOBAL_SENTINEL);
+			expect(one.status, one.path).toBe(200);
+			expect(one.path, one.path).toMatch(new RegExp(`^/api/v1/chat/conversations/${DRAWER_TAGGED_ID}/tags\\?server_id=${GLOBAL_SENTINEL}&limit=10&offset=(0|10)$`));
+		}
+		expect(jobReads, 'no job-route read in any leg').toEqual([]);
+	});
+});

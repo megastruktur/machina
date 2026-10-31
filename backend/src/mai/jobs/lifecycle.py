@@ -64,6 +64,7 @@ from mai.contracts.jobs import (
     parse_job_event,
 )
 from mai.jobs.engine import EngineError, validate_run_id
+from mai.tag_store import _aclassify_terminal_job_locked
 
 #: The event type this module owns in the shared per-run stream. Other
 #: producers (steps, schedules) append their own types; replay filters by
@@ -288,7 +289,10 @@ class RunLifecycle:
         Atomic per run: the ``job_runs`` row is locked ``FOR UPDATE`` (the
         per-run writer serializer), the current state is replayed from the
         persisted log, the transition validated, and the event appended with
-        the next whole-stream ``seq`` — all in one transaction. Two
+        the next whole-stream ``seq`` — all in one transaction. A terminal
+        target additionally swaps the system ``unclassified`` job tag for the
+        matching terminal tag in that same transaction; a missing terminal
+        tag aborts the whole transition atomically. Two
         concurrent transitions of one run therefore serialize: the loser
         replays the winner's committed state and is rejected by the frozen
         table (a terminal race ends with the FIRST terminal value stuck —
@@ -313,11 +317,12 @@ class RunLifecycle:
                 locked = (
                     await session.execute(
                         text(
-                            "SELECT run_id FROM job_runs WHERE run_id = :r FOR UPDATE"
+                            "SELECT run_id, server_id FROM job_runs "
+                            "WHERE run_id = :r FOR UPDATE"
                         ),
                         {"r": uuid.UUID(run_id)},
                     )
-                ).scalar()
+                ).first()
                 if locked is None:
                     raise RunLifecycleError(
                         RunLifecycleErrorCode.RUN_NOT_FOUND,
@@ -359,6 +364,13 @@ class RunLifecycle:
                         ),
                     },
                 )
+                if target in TERMINAL_RUN_STATES:
+                    await _aclassify_terminal_job_locked(
+                        session,
+                        uuid.UUID(run_id),
+                        server_id=locked[1],
+                        terminal_tag_name=target.value,
+                    )
         return event
 
     async def event_stream(self, run_id: str) -> tuple[JobEvent, ...]:

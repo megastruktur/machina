@@ -54,6 +54,13 @@ from mai.contracts.jobs import (
 from mai.database import create_app_engine
 from mai.jobs import engine
 from mai.jobs.engine import EngineClient
+from mai.tag_store import (
+    RESERVED_UNCLASSIFIED_TAG_ID,
+    SYSTEM_ASSIGNMENT_SOURCE,
+    TagErrorCode,
+    TagStoreError,
+    acreate_tag,
+)
 from mai.jobs.lifecycle import (
     LEGAL_RUN_TRANSITIONS,
     TRANSITION_EVENT_TYPE,
@@ -244,14 +251,16 @@ def _drop_app_tables(url: str) -> None:
     """
     with psycopg.connect(url) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
+            "DROP TABLE IF EXISTS tags, job_tags, job_resource_locks, "
+            "job_schedule_fires, job_schedules, job_events, job_steps, "
+            "job_runs, approvals, "
             "profile_projection_journal, profile_projection, admin_sessions, "
             "admin_credential, notification_alerts, observation_findings, "
             "server_observations, knowledge_doc_chunks, knowledge_documents, "
             "application_projection_journal, application_projection, "
-            "conversation_steering, conversation_runs, conversation_messages, "
-            "conversations, agent_task_completions, agent_task_revisions, "
+            "conversation_steering, conversation_runs, conversation_tags, "
+            "conversation_messages, conversations, "
+            "agent_task_completions, agent_task_revisions, "
             "agent_task_evidence, agent_task_criteria, "
             "agent_task_constraints, agent_task_steps, agent_tasks, "
             "alembic_version"
@@ -335,6 +344,24 @@ async def insert_run(factory: async_sessionmaker[AsyncSession]):
                     """
                 ),
                 {"run_id": uuid.UUID(run_id), "server_id": uuid.UUID(SERVER_ID)},
+            )
+            # The 0011 mandatory-tag invariant requires the classification
+            # in the SAME transaction as the run row (history-tags W5B1):
+            # seed the reserved unclassified tag like the real submit writer.
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO job_tags
+                        (job_id, tag_id, assigned_by, assignment_source)
+                    VALUES (:run_id, :reserved, :assigned_by, :source)
+                    """
+                ),
+                {
+                    "run_id": uuid.UUID(run_id),
+                    "reserved": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                    "assigned_by": "",
+                    "source": "system",
+                },
             )
             await session.commit()
 
@@ -983,3 +1010,165 @@ class TestLiveRunLifecycle:
             assert client.run_state(run_id) is RunState.CANCELLED
         finally:
             _kill9(worker)
+
+
+# ---------------------------------------------------------------------------
+# HT-W5B1: terminal transitions swap the job tag atomically
+# ---------------------------------------------------------------------------
+
+
+async def _job_tag_rows(
+    factory: async_sessionmaker[AsyncSession], job_id: uuid.UUID
+) -> list[tuple[uuid.UUID, str]]:
+    """The run's job_tags rows as ``(tag_id, assignment_source)``."""
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT tag_id, assignment_source FROM job_tags "
+                    "WHERE job_id = :j ORDER BY tag_id"
+                ),
+                {"j": job_id},
+            )
+        ).all()
+    return [(row[0], row[1]) for row in rows]
+
+
+TERMINAL_TAG_NAMES = ["succeeded", "failed", "cancelled"]
+
+
+@pytest.fixture(autouse=True)
+def _terminal_catalog_tags(request: pytest.FixtureRequest) -> None:
+    """Seed the per-test terminal catalog tags for the terminal tag swap.
+
+    Only anyio-driven tests reach terminal transitions, so sync tests skip
+    the seeding; the missing-terminal regression requires the terminal
+    names to be absent, and the session-shared catalog may hold tags left
+    by earlier tests, so it purges them instead. Seeding goes through a
+    throwaway engine because a sync autouse fixture cannot depend on the
+    async ``factory`` fixture.
+    """
+    if request.node.get_closest_marker("anyio") is None:
+        return
+    url = os.environ.get(LIVE_URL_VAR)
+    if not url:
+        return  # factory skips the test on the missing fixture URL anyway
+    if request.node.originalname == "test_missing_terminal_tag_rolls_back_atomically":
+        # Session-shared catalog: earlier tests leave terminal tags behind,
+        # and this regression requires the terminal names to be absent.
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                "DELETE FROM job_tags WHERE tag_id IN "
+                "(SELECT tag_id FROM tags WHERE lower(name) = ANY(%(names)s))",
+                {"names": TERMINAL_TAG_NAMES},
+            )
+            conn.execute(
+                "DELETE FROM conversation_tags WHERE tag_id IN "
+                "(SELECT tag_id FROM tags WHERE lower(name) = ANY(%(names)s))",
+                {"names": TERMINAL_TAG_NAMES},
+            )
+            conn.execute(
+                "DELETE FROM tags WHERE lower(name) = ANY(%(names)s)",
+                {"names": TERMINAL_TAG_NAMES},
+            )
+            conn.commit()
+        return
+
+    async def _seed() -> None:
+        eng, sessions = create_app_engine(url)
+        try:
+            for name in TERMINAL_TAG_NAMES:
+                await acreate_tag(sessions, name=name)
+        finally:
+            await eng.dispose()
+
+    asyncio.run(_seed())
+
+
+class TestTerminalTagSwap:
+    """HT-W5B1: terminal transitions drive the job-tag swap in the same tx."""
+
+    @pytest.mark.anyio
+    async def test_each_terminal_state_replaces_unclassified(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        """succeeded/failed/cancelled each swap unclassified for their tag."""
+        tag_ids = {
+            target: (await acreate_tag(factory, name=target.value)).tag_id
+            for target in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED)
+        }
+        for target in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED):
+            run_id = uuid.uuid4()
+            await insert_run(str(run_id))
+            lifecycle = RunLifecycle(factory)
+            await lifecycle.record_transition(str(run_id), RunState.QUEUED)
+            await lifecycle.record_transition(str(run_id), RunState.RUNNING)
+            await lifecycle.record_transition(str(run_id), target)
+            assert await lifecycle.replay_states(str(run_id)) == (
+                RunState.QUEUED,
+                RunState.RUNNING,
+                target,
+            )
+            assert await _job_tag_rows(factory, run_id) == [
+                (tag_ids[target], SYSTEM_ASSIGNMENT_SOURCE)
+            ]
+
+    @pytest.mark.anyio
+    async def test_meaningful_tags_present_is_a_noop(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        """A run with meaningful tags keeps them; the terminal swap no-ops."""
+        tag = await acreate_tag(factory, name="prod")
+        run_id = uuid.uuid4()
+        await insert_run(str(run_id))
+        async with factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO job_tags (job_id, tag_id, assigned_by, "
+                    "assignment_source) VALUES (:j, :t, :by, :src)"
+                ),
+                {"j": run_id, "t": tag.tag_id, "by": "tester", "src": "user"},
+            )
+            await session.commit()
+        lifecycle = RunLifecycle(factory)
+        await lifecycle.record_transition(str(run_id), RunState.QUEUED)
+        await lifecycle.record_transition(str(run_id), RunState.RUNNING)
+        await lifecycle.record_transition(str(run_id), RunState.FAILED)
+        assert await lifecycle.replay_states(str(run_id)) == (
+            RunState.QUEUED,
+            RunState.RUNNING,
+            RunState.FAILED,
+        )
+        assert await _job_tag_rows(factory, run_id) == sorted(
+            [
+                (uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID), SYSTEM_ASSIGNMENT_SOURCE),
+                (tag.tag_id, "user"),
+            ],
+            key=lambda row: row[0],
+        )
+
+    @pytest.mark.anyio
+    async def test_missing_terminal_tag_rolls_back_atomically(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        """No catalog terminal tag: the whole transition aborts atomically."""
+        run_id = uuid.uuid4()
+        await insert_run(str(run_id))
+        lifecycle = RunLifecycle(factory)
+        await lifecycle.record_transition(str(run_id), RunState.QUEUED)
+        await lifecycle.record_transition(str(run_id), RunState.RUNNING)
+        before = await lifecycle.event_stream(str(run_id))
+        with pytest.raises(TagStoreError) as excinfo:
+            await lifecycle.record_transition(str(run_id), RunState.SUCCEEDED)
+        assert excinfo.value.code is TagErrorCode.TAG_NOT_FOUND
+        assert await lifecycle.event_stream(str(run_id)) == before
+        assert await lifecycle.current_state(str(run_id)) is RunState.RUNNING
+        assert await _job_tag_rows(factory, run_id) == [
+            (uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID), SYSTEM_ASSIGNMENT_SOURCE)
+        ]

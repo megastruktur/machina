@@ -73,6 +73,7 @@
 	import ModelProfileSelect from '../ui/ModelProfileSelect.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 	import DetailsDisclosure from '../ui/DetailsDisclosure.svelte';
+	import HistoryTags, { type TagPageLoader } from '../ui/HistoryTags.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
 	import TaskEvidence from './chat/TaskEvidence.svelte';
 	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
@@ -83,6 +84,13 @@
 	import { ListTodo } from 'lucide-svelte';
 	import { taskServices, type TaskApi, type TaskServices, type TaskView } from '../workspace/entries/07-web-tasks.js';
 	import { readMaiEvent, type MaiRunEvent } from '../api/client.js';
+	import type {
+		ConversationTagsPage,
+		EntityTagView,
+		JobTagsPage,
+		TagPage,
+		TagView
+	} from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import {
@@ -95,6 +103,7 @@
 		type ChatServiceOption,
 		type ChatServices,
 		type ChatSubmitBody,
+		type ChatTagApi,
 		type CanonicalConversationDetail,
 		type CanonicalConversationPage,
 		type CanonicalConversationSummary,
@@ -106,6 +115,9 @@
 		type RunDetail,
 		type TurnDisposition
 	} from '../workspace/entries/06-web-chat.js';
+
+	/** Durable wire preview shape (schema-verbatim; no client alias needed). */
+	type EntityTagPreviewView = components['schemas']['EntityTagPreviewView'];
 
 	export type ChatHistoryMeta = {
 		total: number;
@@ -830,6 +842,412 @@
 		controlNote = null;
 	}
 
+	// --- History-tag surface (history-tags W6B/W7A) ---------------------------
+	// Identity is THE contract: a canonical conversation's tags are read and
+	// edited through the CONVERSATION tag routes (its bound run never becomes
+	// the tag target — the job and conversation association sets are
+	// independent), a legacy open run reads the JOB tag routes, and the
+	// General Consult (zero-UUID) scope only ever exists on the conversation
+	// routes. Every read/mutation carries the open surface's recorded scope.
+
+	/** Bounded tag page size (AGENTS.md §1; mirrors the accepted popup). */
+	const TAG_PAGE_LIMIT = 10;
+
+	/** The optional tag slice, present only when EVERY method exists. */
+	function readTagApi(candidate: unknown): ChatTagApi | null {
+		if (typeof candidate !== 'object' || candidate === null) return null;
+		const record = candidate as Record<string, unknown>;
+		for (
+			const name of [
+				'listTags',
+				'createTag',
+				'listRunTags',
+				'assignRunTag',
+				'removeRunTag',
+				'listConversationTags',
+				'assignConversationTag',
+				'removeConversationTag'
+			] as const
+		) {
+			if (typeof record[name] !== 'function') return null;
+		}
+		return candidate as ChatTagApi;
+	}
+	const tagApi = $derived(readTagApi(panel.services.tags));
+
+	/** The tag identity/scope triple of the currently open surface. */
+	type TagTarget = { kind: 'run' | 'conversation'; id: string; scope: string };
+	const tagsTarget = $derived.by<TagTarget | null>(() => {
+		if (tagApi === null) return null;
+		if (canonicalMode) {
+			if (canonicalId === null || canonicalScope === null) return null;
+			return { kind: 'conversation', id: canonicalId, scope: canonicalScope };
+		}
+		if (display !== null && serverScope !== null) {
+			return { kind: 'run', id: display.run_id, scope: serverScope };
+		}
+		return null;
+	});
+
+	/** Durable wire preview of the open surface (`null` while unread/absent). */
+	const tagsPreview = $derived.by<EntityTagPreviewView | null>(() => {
+		const target = tagsTarget;
+		if (target === null) return null;
+		if (target.kind === 'conversation') return canonicalDetail?.tag_preview ?? null;
+		return display?.tag_preview ?? null;
+	});
+
+	/** The open surface's bounded tag-page adapter (the popup's loader). */
+	const tagsTargetLoader = $derived.by<TagPageLoader | null>(() => {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		if (target === null || tagRef === null) return null;
+		if (target.kind === 'conversation') {
+			return async (offset, limit) =>
+				popupPageOf(await tagRef.listConversationTags(target.id, target.scope, { limit, offset }));
+		}
+		return async (offset, limit) =>
+			popupPageOf(await tagRef.listRunTags(target.id, target.scope, { limit, offset }));
+	});
+
+	/**
+	 * The accepted popup's full-list page is typed as the catalog `TagPage`,
+	 * but it consumes ONLY `tag_id` and `name` per row. Association rows are
+	 * projected here with their REAL identity/name values — no invented
+	 * fields (same reviewed projection the jobs panel uses).
+	 */
+	function popupPageOf(page: JobTagsPage | ConversationTagsPage): TagPage {
+		return {
+			limit: page.limit,
+			offset: page.offset,
+			total: page.total,
+			has_more: page.has_more,
+			items: (page.items ?? []).map((row) => ({
+				tag_id: row.tag_id,
+				name: row.name
+			})) as TagPage['items']
+		};
+	}
+
+	/**
+	 * One history row's bounded tag-page adapter: canonical rows (the
+	 * conversation id is the pinned list identity) read the conversation
+	 * route; legacy run rows read the job route — always with the ROW's
+	 * recorded server scope, never a hidden global.
+	 */
+	function historyRowTagsLoader(row: ChatHistoryRow): TagPageLoader | null {
+		const tagRef = tagApi;
+		if (tagRef === null) return null;
+		const conversationId =
+			typeof row.conversation_id === 'string' && row.conversation_id !== ''
+				? row.conversation_id
+				: null;
+		if (conversationId !== null) {
+			return async (offset, limit) =>
+				popupPageOf(
+					await tagRef.listConversationTags(conversationId, row.server_id, { limit, offset })
+				);
+		}
+		return async (offset, limit) =>
+			popupPageOf(await tagRef.listRunTags(row.run_id, row.server_id, { limit, offset }));
+	}
+
+	// Editor state (bounded pages; every load user-initiated, every row
+	// deduplicated by `tag_id`; honest loading/error/busy/refusal states).
+	let tagEditorOpen = $state(false);
+	/** The `${kind}:${id}` identity the open editor is bound to. */
+	let tagEditorForId = $state<string | null>(null);
+	let tagRows = $state<EntityTagView[]>([]);
+	let tagRowsTotal = $state(0);
+	let tagRowsLoading = $state(false);
+	let tagRowsLoadingMore = $state(false);
+	let tagRowsError = $state<string | null>(null);
+	let catalogItems = $state<TagView[]>([]);
+	let catalogTotal = $state(0);
+	let catalogLoading = $state(false);
+	let catalogLoadingMore = $state(false);
+	let catalogError = $state<string | null>(null);
+	let assignTagId = $state('');
+	let createTagName = $state('');
+	let tagBusy = $state(false);
+	let tagActionError = $state<{ code: string; message: string } | null>(null);
+	/**
+	 * Final-tag refusal (409 `last_tag`): the refused row stays visible with
+	 * the replacement re-classification offer until retried or dismissed.
+	 * Nothing is ever claimed as removed.
+	 */
+	let refusedRemoval = $state<EntityTagView | null>(null);
+	let replacementTagId = $state('');
+
+	const tagRowsHasMore = $derived(tagRows.length < tagRowsTotal);
+	const catalogHasMore = $derived(catalogItems.length < catalogTotal);
+	const assignableTags = $derived(
+		catalogItems.filter((tag) => !tagRows.some((row) => row.tag_id === tag.tag_id))
+	);
+	const tagsScopeText = $derived.by(() => {
+		const target = tagsTarget;
+		if (target === null) return '';
+		return target.scope === GLOBAL_CONSULT_SERVER_ID
+			? 'General Consult · global scope'
+			: `Server ${shortId(target.scope)} · Pinned scope`;
+	});
+
+	/** A target switch/reset closes the editor — state never crosses identities. */
+	$effect(() => {
+		if (tagEditorForId === null) return;
+		const target = tagsTarget;
+		if (target === null || `${target.kind}:${target.id}` !== tagEditorForId) closeTagEditor();
+	});
+
+	function closeTagEditor(): void {
+		tagEditorOpen = false;
+		tagEditorForId = null;
+		tagRows = [];
+		tagRowsTotal = 0;
+		tagRowsError = null;
+		catalogItems = [];
+		catalogTotal = 0;
+		catalogError = null;
+		assignTagId = '';
+		createTagName = '';
+		tagActionError = null;
+		refusedRemoval = null;
+		replacementTagId = '';
+	}
+
+	function dismissRefusal(): void {
+		refusedRemoval = null;
+		replacementTagId = '';
+		if (tagActionError !== null && tagActionError.code === 'last_tag') tagActionError = null;
+	}
+
+	/** One bounded association page (ordered, deduplicated by `tag_id`). */
+	async function fetchTagRows(offset: number, append: boolean): Promise<void> {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		if (target === null || tagRef === null) return;
+		if (append) tagRowsLoadingMore = true;
+		else tagRowsLoading = true;
+		tagRowsError = null;
+		try {
+			const page =
+				target.kind === 'conversation'
+					? await tagRef.listConversationTags(target.id, target.scope, {
+							limit: TAG_PAGE_LIMIT,
+							offset
+						})
+					: await tagRef.listRunTags(target.id, target.scope, { limit: TAG_PAGE_LIMIT, offset });
+			if (tagsTarget === null || `${target.kind}:${target.id}` !== tagEditorForId) return;
+			// Deduplication is an APPEND-page concern only: a page-zero refresh
+			// REPLACES the visible rows — filtering it against the previous
+			// rows would drop every already-shown tag after a mutation.
+			if (append) {
+				const seen = new Set(tagRows.map((row) => row.tag_id));
+				tagRows = [...tagRows, ...(page.items ?? []).filter((row) => !seen.has(row.tag_id))];
+			} else {
+				tagRows = page.items ?? [];
+			}
+			tagRowsTotal = page.total;
+		} catch (error) {
+			if (tagsTarget === null || `${target.kind}:${target.id}` !== tagEditorForId) return;
+			tagRowsError = messageOf(error) ?? 'The tag list could not be loaded.';
+		} finally {
+			if (append) tagRowsLoadingMore = false;
+			else tagRowsLoading = false;
+		}
+	}
+
+	/** One bounded catalog page (the assign select's options). */
+	async function fetchCatalogPage(offset: number, append: boolean): Promise<void> {
+		const tagRef = tagApi;
+		if (tagRef === null) return;
+		if (append) catalogLoadingMore = true;
+		else catalogLoading = true;
+		catalogError = null;
+		try {
+			const page = await tagRef.listTags({ limit: TAG_PAGE_LIMIT, offset });
+			if (tagApi === null) return;
+			// Deduplication is an APPEND-page concern only (see fetchTagRows):
+			// a page-zero refresh replaces the visible catalog rows.
+			if (append) {
+				const seen = new Set(catalogItems.map((tag) => tag.tag_id));
+				catalogItems = [...catalogItems, ...(page.items ?? []).filter((tag) => !seen.has(tag.tag_id))];
+			} else {
+				catalogItems = page.items ?? [];
+			}
+			catalogTotal = page.total;
+		} catch (error) {
+			if (tagApi === null) return;
+			catalogError = messageOf(error) ?? 'The tag catalog could not be loaded.';
+		} finally {
+			if (append) catalogLoadingMore = false;
+			else catalogLoading = false;
+		}
+	}
+
+	/** Opens the editor: first open loads BOTH bounded page zeros. */
+	function toggleTagEditor(): void {
+		if (tagEditorOpen) {
+			closeTagEditor();
+			return;
+		}
+		const target = tagsTarget;
+		if (target === null) return;
+		tagEditorOpen = true;
+		tagEditorForId = `${target.kind}:${target.id}`;
+		void fetchTagRows(0, false);
+		void fetchCatalogPage(0, false);
+	}
+
+	/**
+	 * One durable-projection refresh after a tag mutation: the open
+	 * surface's replayed view (its `tag_preview` is durable) plus the open
+	 * editor's pages. The history rows (and through them the drawer mirror)
+	 * follow by patching the matching row.
+	 */
+	async function refreshTagProjections(): Promise<void> {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		if (target === null || tagRef === null) return;
+		if (target.kind === 'conversation') {
+			if (canonicalApi === null) return;
+			const detail = await canonicalApi.getConversation(target.id, target.scope);
+			if (disposed || canonicalId !== target.id || canonicalScope !== target.scope) return;
+			canonicalDetail = detail;
+			patchHistoryRowPreview(target.id, detail.tag_preview);
+		} else {
+			if (api === null) return;
+			const view = await api.readConversation(target.id);
+			if (disposed) return;
+			if (conversation !== null && conversation.run_id === target.id) conversation = view;
+			if (refreshed !== null && refreshed.run_id === target.id) refreshed = view;
+			patchHistoryRowPreview(target.id, view.tag_preview);
+		}
+	}
+
+	/** Patches one history row's durable preview (drawer mirror follows). */
+	function patchHistoryRowPreview(id: string, preview: EntityTagPreviewView): void {
+		historyRows = historyRows.map((row) =>
+			row.run_id === id || row.conversation_id === id ? { ...row, tag_preview: preview } : row
+		);
+	}
+
+	/** Assign one catalog tag to the open target (idempotent 204). */
+	async function assignTag(tagId: string): Promise<boolean> {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		if (target === null || tagRef === null || tagBusy || tagId === '') return false;
+		tagBusy = true;
+		tagActionError = null;
+		try {
+			if (target.kind === 'conversation') {
+				await tagRef.assignConversationTag(target.id, { tag_id: tagId, server_id: target.scope });
+			} else {
+				await tagRef.assignRunTag(target.id, { tag_id: tagId, server_id: target.scope });
+			}
+			if (disposed) return false;
+			await refreshTagProjections();
+			await fetchTagRows(0, false);
+			return true;
+		} catch (error) {
+			if (disposed) return false;
+			tagActionError = {
+				code: codeOf(error) ?? 'unavailable',
+				message: friendlyText(codeOf(error) ?? 'unavailable', messageOf(error) ?? 'The tag could not be assigned.')
+			};
+			return false;
+		} finally {
+			tagBusy = false;
+		}
+	}
+
+	async function assignSelectedTag(): Promise<void> {
+		if (await assignTag(assignTagId)) assignTagId = '';
+	}
+
+	/** Create a catalog tag, then assign it to the open target. */
+	async function createAndAssignTag(): Promise<void> {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		const name = createTagName.trim();
+		if (target === null || tagRef === null || tagBusy || name === '') return;
+		tagBusy = true;
+		tagActionError = null;
+		try {
+			const created = await tagRef.createTag({ name });
+			if (disposed) return;
+			createTagName = '';
+			tagBusy = false;
+			if (!(await assignTag(created.tag_id))) return;
+			await fetchCatalogPage(0, false);
+		} catch (error) {
+			if (disposed) return;
+			tagActionError = {
+				code: codeOf(error) ?? 'unavailable',
+				message: friendlyText(
+					codeOf(error) ?? 'unavailable',
+					messageOf(error) ?? 'The tag could not be created.'
+				)
+			};
+			tagBusy = false;
+		}
+	}
+
+	/**
+	 * Remove one association (idempotent). A final-tag refusal (409
+	 * `last_tag`) keeps the row and offers the same-transaction replacement;
+	 * nothing pretends to have removed anything.
+	 */
+	async function removeTagRow(row: EntityTagView, replacement?: string): Promise<void> {
+		const target = tagsTarget;
+		const tagRef = tagApi;
+		if (target === null || tagRef === null || tagBusy) return;
+		tagBusy = true;
+		tagActionError = null;
+		try {
+			if (target.kind === 'conversation') {
+				await tagRef.removeConversationTag(target.id, row.tag_id, {
+					serverId: target.scope,
+					...(replacement !== undefined && replacement !== ''
+						? { replacementTagId: replacement }
+						: {})
+				});
+			} else {
+				await tagRef.removeRunTag(target.id, row.tag_id, {
+					serverId: target.scope,
+					...(replacement !== undefined && replacement !== ''
+						? { replacementTagId: replacement }
+						: {})
+				});
+			}
+			if (disposed) return;
+			refusedRemoval = null;
+			replacementTagId = '';
+			await refreshTagProjections();
+			await fetchTagRows(0, false);
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			if (code === 'last_tag') {
+				// The mandatory-tag invariant refused the removal; offer the
+				// reviewed re-classification path instead of a dead end.
+				refusedRemoval = row;
+				tagActionError = {
+					code,
+					message:
+						'This is the final tag — it cannot be removed without a replacement.'
+				};
+			} else {
+				tagActionError = {
+					code,
+					message: friendlyText(code, messageOf(error) ?? 'The tag could not be removed.')
+				};
+			}
+		} finally {
+			tagBusy = false;
+		}
+	}
+
 	/** Canonical row → the drawer-compatible history row (identity pinned). */
 	function canonicalHistoryRow(row: CanonicalConversationSummary): ChatHistoryRow {
 		return {
@@ -846,6 +1264,7 @@
 			cancel_requested_at: null,
 			submitted_at: row.created_at,
 			updated_at: row.updated_at,
+			tag_preview: row.tag_preview,
 			title: row.title ?? null,
 			conversation_id: row.conversation_id,
 			message_count: row.message_count,
@@ -3424,9 +3843,19 @@
 									<span class="mai-chat__meta">{row.model_profile}</span>
 									<span class="mai-chat__meta">{row.submitted_at}</span>
 								{/if}
-								<span class="mai-chat__badge">{row.server_id === GLOBAL_CONSULT_SERVER_ID ? 'General Consult' : serverLabelFor(row.server_id)}</span>
-								{#each row.service_tags ?? [] as tag (tag)}<span class="mai-chat__badge">@{tag}</span>{/each}
+							<span class="mai-chat__badge">{row.server_id === GLOBAL_CONSULT_SERVER_ID ? 'General Consult' : serverLabelFor(row.server_id)}</span>
+							{#each row.service_tags ?? [] as tag (tag)}<span class="mai-chat__badge">@{tag}</span>{/each}
 							</div>
+							{#if row.tag_preview !== undefined}
+								<span class="mai-chat__row-tags" data-testid="history-row-tags">
+									<HistoryTags
+										tag_preview={row.tag_preview}
+										loadMore={historyRowTagsLoader(row)}
+										label={'Tags of ' + (row.title && row.title.trim() !== '' ? row.title.trim() : shortId(row.run_id))}
+										testId="history-row-tags"
+									/>
+								</span>
+							{/if}
 							<span data-testid="history-open">Open</span>
 							</button>
 						</li>
@@ -4262,6 +4691,190 @@
 					<p class="mai-chat__meta" data-testid="conversation-target">
 						Server {shortId(display.server_id)} · profile {display.model_profile} · grants {grantsText}
 					</p>
+					{/if}
+					{#if tagsTarget !== null}
+						<!-- history-tags W6B/W7A: bounded preview + accessible full
+						     list of the ACTUAL open identity, then bounded editing
+						     (assign/create/remove) through the matching tag routes
+						     with the explicit scope; honest final-tag and error
+						     states — no optimistic fabricated success. -->
+						<div class="mai-chat__tags" data-testid="chat-tags">
+							<h5>History tags</h5>
+							{#if tagsPreview !== null}
+								<HistoryTags
+									tag_preview={tagsPreview}
+									loadMore={tagsTargetLoader}
+									label={tagsTarget.kind === 'conversation' ? 'Tags of this conversation' : 'Tags of this run'}
+									testId="chat-tags-preview"
+								/>
+							{/if}
+							<p class="mai-chat__meta" data-testid="chat-tags-scope">{tagsScopeText}</p>
+							{#if tagActionError !== null}
+								<p
+									class="mai-chat__note mai-chat__note--error"
+									role="alert"
+									data-testid="chat-tags-error"
+									data-error-code={tagActionError.code}
+								>
+									{tagActionError.message}
+								</p>
+							{/if}
+							{#if refusedRemoval !== null}
+								<div class="mai-chat__tags-refusal" data-testid="chat-tags-refusal">
+									<p class="mai-chat__meta">
+										“{refusedRemoval.name}” is the final tag — it cannot be removed without a replacement.
+									</p>
+									<div class="mai-chat__tags-refusal-row">
+										<select
+											bind:value={replacementTagId}
+											data-testid="chat-tags-replacement-select"
+											aria-label="Replacement tag"
+										>
+											<option value="" disabled selected>Select a replacement…</option>
+											{#each catalogItems.filter((tag) => tag.tag_id !== refusedRemoval?.tag_id) as tag (tag.tag_id)}
+												<option value={tag.tag_id}>{tag.name}</option>
+											{/each}
+										</select>
+										<Button
+											variant="secondary"
+											size="sm"
+											loading={tagBusy}
+											disabled={replacementTagId === ''}
+											onclick={() => refusedRemoval && removeTagRow(refusedRemoval, replacementTagId)}
+											data-testid="chat-tags-replacement-confirm"
+										>
+											Replace &amp; remove
+										</Button>
+										<Button variant="ghost" size="sm" onclick={dismissRefusal} data-testid="chat-tags-refusal-dismiss">
+											Dismiss
+										</Button>
+									</div>
+								</div>
+							{/if}
+							<Button size="sm" variant="secondary" onclick={toggleTagEditor} data-testid="chat-tags-edit">
+								{tagEditorOpen ? 'Close tag editor' : 'Edit tags'}
+							</Button>
+							{#if tagEditorOpen}
+								<div class="mai-chat__tags-editor" data-testid="chat-tags-editor">
+									<div class="mai-chat__tags-editor-row">
+										{#if assignableTags.length > 0}
+											<select
+												bind:value={assignTagId}
+												data-testid="chat-tags-assign-select"
+												aria-label="Assign a catalog tag"
+											>
+												<option value="" disabled selected>Select a tag…</option>
+												{#each assignableTags as tag (tag.tag_id)}
+													<option value={tag.tag_id}>{tag.name}</option>
+												{/each}
+											</select>
+											<Button
+												variant="secondary"
+												size="sm"
+												loading={tagBusy}
+												disabled={assignTagId === ''}
+												onclick={assignSelectedTag}
+												data-testid="chat-tags-assign"
+											>
+												Assign
+											</Button>
+										{:else if catalogLoading}
+											<span class="mai-chat__meta" role="status" data-testid="chat-tags-catalog-loading">
+												Loading tag catalog…
+											</span>
+										{:else}
+											<span class="mai-chat__meta" role="status" data-testid="chat-tags-catalog-empty">
+												No unassigned catalog tags are loaded.
+											</span>
+										{/if}
+										{#if catalogError !== null}
+											<span class="mai-chat__meta" role="status" data-testid="chat-tags-catalog-error">
+												{catalogError}
+											</span>
+										{/if}
+										{#if catalogHasMore}
+											<Button
+												variant="secondary"
+												size="sm"
+												loading={catalogLoadingMore}
+												onclick={() => void fetchCatalogPage(catalogItems.length, true)}
+												data-testid="chat-tags-catalog-more"
+											>
+												More catalog tags ({catalogItems.length} of {catalogTotal})
+											</Button>
+										{/if}
+									</div>
+									<div class="mai-chat__tags-editor-row">
+										<input
+											type="text"
+											bind:value={createTagName}
+											maxlength={64}
+											placeholder="New tag name"
+											aria-label="New tag name"
+											data-testid="chat-tags-create-input"
+											onkeydown={(event) => {
+												if (event.key === 'Enter') {
+													event.preventDefault();
+													void createAndAssignTag();
+												}
+											}}
+										/>
+										<Button
+											variant="secondary"
+											size="sm"
+											loading={tagBusy}
+											disabled={createTagName.trim() === ''}
+											onclick={() => void createAndAssignTag()}
+											data-testid="chat-tags-create"
+										>
+											Create &amp; assign
+										</Button>
+									</div>
+									{#if tagRowsLoading}
+										<p class="mai-chat__meta" role="status" data-testid="chat-tags-loading">Loading tags…</p>
+									{:else if tagRowsError !== null}
+										<p class="mai-chat__note mai-chat__note--error" role="alert" data-testid="chat-tags-list-error">
+											{tagRowsError}
+										</p>
+									{:else if tagRows.length === 0}
+										<p class="mai-chat__meta" role="status" data-testid="chat-tags-empty">
+											No tags are recorded for this {tagsTarget.kind === 'conversation' ? 'conversation' : 'run'}.
+										</p>
+									{:else}
+										<ul class="mai-chat__tags-rows" data-testid="chat-tags-list">
+											{#each tagRows as tagRow (tagRow.tag_id)}
+												<li class="mai-chat__tags-row" data-testid="chat-tags-row" data-tag-id={tagRow.tag_id}>
+													<span data-testid="chat-tags-row-name">{tagRow.name}</span>
+													<Button
+														variant="danger"
+														size="sm"
+														loading={tagBusy}
+														onclick={() => void removeTagRow(tagRow)}
+														data-testid="chat-tags-remove"
+													>
+														Remove
+													</Button>
+												</li>
+											{/each}
+										</ul>
+										<p class="mai-chat__meta" data-testid="chat-tags-total">
+											Showing {tagRows.length} of {tagRowsTotal} attached tags.
+										</p>
+										{#if tagRowsHasMore}
+											<Button
+												variant="secondary"
+												size="sm"
+												loading={tagRowsLoadingMore}
+												onclick={() => void fetchTagRows(tagRows.length, true)}
+												data-testid="chat-tags-more"
+											>
+												Load more tags ({tagRows.length} of {tagRowsTotal})
+											</Button>
+										{/if}
+									{/if}
+								</div>
+							{/if}
+						</div>
 					{/if}
 					{#if cancelRequested && rootTerminal}
 						<p class="mai-chat__meta" data-testid="conversation-cancel-note">Cancellation requested</p>
@@ -5697,5 +6310,82 @@
 	.mai-chat__history-item:focus-visible {
 		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
 		outline-offset: calc(-1 * var(--mai-focus-ring-width));
+	}
+
+	/* --- History-tag surface (history-tags W6B/W7A) --- */
+	.mai-chat__row-tags {
+		display: inline-flex;
+		min-width: 0;
+		max-width: 100%;
+		flex-shrink: 1;
+	}
+	.mai-chat__tags {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2, 0.5rem);
+		margin-block: var(--mai-space-2, 0.5rem);
+		min-width: 0;
+	}
+	.mai-chat__tags h5 {
+		margin: 0;
+		font-size: 0.85rem;
+	}
+	.mai-chat__tags-editor {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2, 0.5rem);
+		padding: var(--mai-space-2, 0.5rem);
+		border: 1px solid var(--mai-color-border, var(--border, #8884));
+		border-radius: 6px;
+		min-width: 0;
+	}
+	.mai-chat__tags-editor-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+		min-width: 0;
+	}
+	.mai-chat__tags-editor-row input,
+	.mai-chat__tags-editor-row select {
+		max-width: 100%;
+		min-width: 0;
+		flex: 1 1 10rem;
+	}
+	.mai-chat__tags-rows {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1, 0.25rem);
+		max-height: 12rem;
+		overflow-y: auto;
+	}
+	.mai-chat__tags-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--mai-space-2, 0.5rem);
+		min-width: 0;
+	}
+	.mai-chat__tags-refusal {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1, 0.25rem);
+		padding: var(--mai-space-2, 0.5rem);
+		border: 1px solid var(--mai-color-warning, var(--warning, #b80));
+		border-radius: 6px;
+	}
+	.mai-chat__tags-refusal-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+	}
+	.mai-chat__tags-refusal-row select {
+		max-width: 100%;
+		min-width: 0;
+		flex: 1 1 10rem;
 	}
 </style>

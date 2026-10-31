@@ -80,6 +80,7 @@ from mai.jobs.resource_locks import ResourceLockService
 from mai.plugins.registry import CapabilityRegistry, parse_descriptor
 from mai.policy.approvals import ApprovalStore
 from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -691,13 +692,19 @@ def _alembic_config() -> Config:
 
 
 def _drop_app_tables(url: str) -> None:
-    """Reset the fixture database to pre-bootstrap state (engine schema too)."""
+    """Reset the fixture database to pre-bootstrap state (engine schema too).
+
+    The 0011 tag associations drop before their ``job_runs``/``tags``
+    parents so the reset stays FK-safe on a schema-bearing database
+    (history-tags W1-FIX1).
+    """
     with psycopg.connect(url) as conn:
         conn.execute(
             "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
+            "job_schedules, job_events, job_steps, job_tags, job_runs, "
+            "approvals, profile_projection_journal, profile_projection, "
+            "admin_sessions, admin_credential, alembic_version, "
+            "conversation_tags, tags"
         )
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
@@ -741,6 +748,7 @@ def factory(delegate_url: str) -> async_sessionmaker[AsyncSession]:
                 "job_steps",
                 "job_events",
                 "job_schedules",
+                "job_tags",
                 "job_runs",
                 "approvals",
             ):
@@ -760,7 +768,12 @@ def factory(delegate_url: str) -> async_sessionmaker[AsyncSession]:
 
 @pytest.fixture
 def insert_run(factory: async_sessionmaker[AsyncSession]):
-    """Insert a root ``job_runs`` row (the submit owner's row, by SQL)."""
+    """Insert a root ``job_runs`` row (the submit owner's row, by SQL).
+
+    The 0011 mandatory-tag invariant requires the classification in the
+    SAME transaction as the row (history-tags W1-FIX1): the fixture seeds
+    the reserved unclassified tag exactly like the real submit writer.
+    """
 
     async def _insert(
         run_id: str, root_budget: dict[str, object] | None = None
@@ -784,6 +797,19 @@ def insert_run(factory: async_sessionmaker[AsyncSession]):
                     "root_budget": (
                         json.dumps(root_budget) if root_budget is not None else None
                     ),
+                },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                    VALUES (:run_id, :tag, :source)
+                    """
+                ),
+                {
+                    "run_id": uuid.UUID(run_id),
+                    "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                    "source": SYSTEM_ASSIGNMENT_SOURCE,
                 },
             )
             await session.commit()
@@ -1323,6 +1349,29 @@ def _failure_reasons(url: str, run_id: str) -> list[str]:
 
 
 class TestDelegatingParents:
+    def test_seeded_run_carries_reserved_classification(
+        self, factory: async_sessionmaker[AsyncSession], insert_run
+    ) -> None:
+        """0011 invariant: the raw fixture seeds the tag transactionally."""
+        run_id = str(uuid.uuid4())
+        _run(insert_run(run_id))
+
+        async def _associations():
+            async with factory() as session:
+                return (
+                    await session.execute(
+                        text(
+                            "SELECT tag_id, assignment_source FROM job_tags "
+                            "WHERE job_id = :job_id"
+                        ),
+                        {"job_id": uuid.UUID(run_id)},
+                    )
+                ).fetchall()
+
+        assert _run(_associations()) == [
+            (uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID), SYSTEM_ASSIGNMENT_SOURCE)
+        ]
+
     def test_parent_delegates_parallel_children_and_yields_with_full_queue(
         self, delegate_url, factory, insert_run, scenario, composition
     ) -> None:

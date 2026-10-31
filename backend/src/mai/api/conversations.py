@@ -75,11 +75,27 @@ from mai.contracts.conversations import (
     ConversationErrorCode,
     ConversationSummary,
     ConversationTranscriptPage,
+    EntityTagPreviewView,
     HistoryCompleteness,
     compute_has_more,
 )
+from mai.tag_store import EntityTagPreview, apreview_conversation_tags
 
 __all__ = ["register_conversations"]
+
+def _preview_view(found: EntityTagPreview | None) -> EntityTagPreviewView:
+    """Project the store's preview dataclass onto the wire view.
+
+    Every in-scope conversation carries at least one tag (the mandatory
+    unclassified seed), so a missing preview after a successful scoped
+    read is a bug — it fails loudly instead of fabricating an empty
+    projection (``total=0`` is contract-invalid).
+    """
+    if found is None:
+        raise RuntimeError(
+            "mandatory tag preview missing after a successful scoped read"
+        )
+    return EntityTagPreviewView(preview=list(found.preview), total=found.total)
 
 #: Upper bound on the proven-but-unrecoverable submission count (the same
 #: bounded metadata cap ``mai.agents.conversation_context`` uses: the
@@ -472,19 +488,36 @@ async def list_canonical_conversations(
     server_id: Annotated[uuid.UUID, _SERVER_ID_QUERY],
     limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(default=0, ge=0),
+    tag_id: list[uuid.UUID] | None = Query(default=None, max_length=50),
+    tag_match: Literal["any", "all"] = Query(default="any"),
 ) -> ConversationListPage:
     """One bounded page of safe conversation metadata (§3 ``GET`` list).
 
     The page is exactly the requested server's scope; ordering and the
     same-filter total are the storage owner's deterministic contract
     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
-    transcript content ever rides a list page.
+    transcript content ever rides a list page. ``tag_id`` (repeated
+    UUID, at most 50, matched ``any``/``all`` per ``tag_match``) filters
+    BEFORE pagination through the store's matching predicate for both
+    slice and total; omitting it preserves the unfiltered behavior and
+    malformed/oversized sets fail closed (422).
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)  # fail closed when absent
     factory = _sessions(request)
     items, total = await alist_conversations(
-        factory, server_id=server_id, limit=limit, offset=offset
+        factory,
+        server_id=server_id,
+        limit=limit,
+        offset=offset,
+        tag_ids=tag_id,
+        tag_match=tag_match,
+    )
+    previews = await apreview_conversation_tags(
+        factory,
+        [row.conversation_id for row in items],
+        server_id=server_id,
+        preview_limit=3,
     )
     return ConversationListPage(
         limit=limit,
@@ -501,6 +534,7 @@ async def list_canonical_conversations(
                 message_count=row.message_count,
                 active_task_id=row.active_task_id,
                 active_run_id=row.active_run_id,
+                tag_preview=_preview_view(previews.get(row.conversation_id)),
             )
             for row in items
         ],
@@ -550,6 +584,12 @@ async def read_canonical_conversation(
                 session, conversation.conversation_id
             )
         gaps = _legacy_gaps(conversation, unrecoverable)
+    previews = await apreview_conversation_tags(
+        _sessions(request),
+        [conversation.conversation_id],
+        server_id=server_id,
+        preview_limit=3,
+    )
     return ConversationDetailView(
         conversation_id=conversation.conversation_id,
         server_id=conversation.server_id,
@@ -559,6 +599,9 @@ async def read_canonical_conversation(
         message_count=await _amessage_count(request, conversation.conversation_id),
         active_task_id=conversation.active_task_id,
         active_run_id=conversation.active_run_id,
+        tag_preview=_preview_view(
+            previews.get(conversation.conversation_id)
+        ),
         history_completeness=conversation.history_completeness,
         missing_range=conversation.missing_range,
         legacy_gaps=gaps,

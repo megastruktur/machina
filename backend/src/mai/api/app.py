@@ -77,6 +77,7 @@ from mai.api.documents import (
     register_documents,
 )
 from mai.api.grants import register_grants
+from mai.api.history_tags import register_history_tags
 from mai.api.jobs import register_jobs
 from mai.api.knowledge_models import (
     MEMORY_BASE_URL_VAR,
@@ -104,10 +105,10 @@ from mai.memory.hindsight import (
     parse_shared_banks,
 )
 from mai.capabilities.internal_api import (
-    INTERNAL_API_CAPABILITY_IDS,
     InternalApiComposition,
     build_internal_api_capabilities,
 )
+from mai.capabilities.history_tags import build_history_tag_capabilities
 from mai.capabilities.task_state import build_task_state_capabilities
 from mai.applications.adopt import (
     ApplicationAdoption,
@@ -120,7 +121,6 @@ from mai.auth.sessions import AuthError, SessionStore
 from mai.capabilities.dispatch import CapabilityDispatcher
 from mai.credentials.env import (
     EnvFileError,
-    EnvResolver,
     build_runtime_env_resolver,
 )
 from mai.database import (
@@ -370,14 +370,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         _task_state = build_task_state_capabilities(
             session_factory=app.state.session_factory,
         )
+        # History-tag tools (W4D): the SAME composition seam — the
+        # ``tags.*`` surface joins the one ``app.state.internal_api``
+        # descriptor→executor mapping alongside the internal-API and
+        # task-state tools, so every consumer sees one surface.
+        _history_tags = build_history_tag_capabilities(
+            session_factory=app.state.session_factory,
+        )
         app.state.internal_api = InternalApiComposition(
             descriptors=(
                 *app.state.internal_api.descriptors,
                 *_task_state.descriptors,
+                *_history_tags.descriptors,
             ),
             executors={
                 **app.state.internal_api.executors,
                 **_task_state.executors,
+                **_history_tags.executors,
             },
         )
         # Model configuration store (C03 rule 6/C06 rule 1): the confined
@@ -549,6 +558,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # labels (partial/unavailable) instead of invented turns. Read-only:
     # writes stay on the reviewed chat submit/steer seam.
     register_conversations(app)
+    # The history-tag management surface (history-tags HT-W6B): the
+    # global tag catalog CRUD plus same-server job-run and canonical
+    # conversation tag assignments over the ONE tag store — idempotent
+    # user-sourced writes, the used/unused deletion policy and the
+    # reserved unclassified semantics preserved verbatim; the legacy
+    # chat list stays unfiltered (owned by the chat surface's own slice).
+    register_history_tags(app)
     # The task read/correction/decision surface (act_CONTRACTS §6/§8): the
     # compact header view for the conversation's ONE active episode, the
     # explicitly server-scoped paginated items/constraints/evidence/

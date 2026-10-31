@@ -520,10 +520,11 @@
 			}
 			submittedRunId = created.run.run_id;
 			deduplicated = created.deduplicated === true;
-			await adoptRunDetail(created.run.run_id, epoch, {
-				state: created.run.state,
-				cancelRequestedAt: created.run.cancel_requested_at
-			});
+			// Seed the watched run from the ACTUAL submit answer (RunView is
+			// RunDetail minus steps): a later read failure keeps this genuine
+			// accepted state visible instead of a fabricated view.
+			run = { ...created.run, steps: [] };
+			await adoptRunDetail(created.run.run_id, epoch);
 		} catch (error) {
 			if (disposed || epoch !== runEpoch) return;
 			const problem = problemOf(error, 'The intent could not be submitted.');
@@ -540,11 +541,7 @@
 	 * against the pinned scope AND the submitted run id before anything paints
 	 * (C01 rule 2; a foreign run is refused, never rendered).
 	 */
-	async function adoptRunDetail(
-		runId: string,
-		epoch: number,
-		fallback: { state: string | null; cancelRequestedAt: string | null }
-	): Promise<void> {
+	async function adoptRunDetail(runId: string, epoch: number): Promise<void> {
 		const client = readApi(api);
 		if (client === null) return;
 		try {
@@ -565,23 +562,9 @@
 			else stopPolling();
 		} catch (error) {
 			if (disposed || epoch !== runEpoch) return;
-			// The submit DID create a durable intent; only the view is stale.
-			run = {
-				run_id: runId,
-				server_id: serverId,
-				parent_run_id: null,
-				depth: 0,
-				profile_revision: 0,
-				prompt_revision: 0,
-				model_profile: '',
-				requested_grants: [],
-				label: '',
-				state: fallback.state,
-				cancel_requested_at: fallback.cancelRequestedAt,
-				submitted_at: '',
-				updated_at: '',
-				steps: []
-			};
+			// The submit DID create a durable intent; only the view read is
+			// stale — the last genuinely received run stays on screen, never
+			// a fabricated one.
 			const problem = problemOf(error, 'The run state could not be read.');
 			runProblem = problem.code
 				? `${problem.message} (code: ${problem.code}) — retry below; the intent is durable.`
@@ -597,10 +580,7 @@
 		const epoch = ++runEpoch;
 		if (submittedRunId === null) return;
 		runProblem = null;
-		await adoptRunDetail(submittedRunId, epoch, {
-			state: run?.state ?? null,
-			cancelRequestedAt: run?.cancel_requested_at ?? null
-		});
+		await adoptRunDetail(submittedRunId, epoch);
 	}
 
 	function armPolling(runId: string, epoch: number): void {
@@ -610,10 +590,7 @@
 				stopPolling();
 				return;
 			}
-			void adoptRunDetail(runId, epoch, {
-				state: run?.state ?? null,
-				cancelRequestedAt: run?.cancel_requested_at ?? null
-			});
+			void adoptRunDetail(runId, epoch);
 		}, POLL_MS);
 	}
 

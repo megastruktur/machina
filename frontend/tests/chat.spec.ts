@@ -165,6 +165,15 @@ declare global {
 		 * D-2 — the same slice the composed desktop binds from the real
 		 * client). Without it the panel must fail closed honestly. */
 		__maiChatTasks?: boolean;
+		/** Set by a test init script: the bag's api IS the REAL composed
+		 * client (`createMaiApiClient()`) and the optional history-tag slice
+		 * rides `services.tags` — every panel call leaves as actual HTTP
+		 * through the production transport (history-tags W6B/W7A). */
+		__maiChatProdClient?: boolean;
+		/** Set by a test init script: the REAL client WITHOUT the canonical
+		 * slice — the pre-canonical legacy host shape, so the panel's legacy
+		 * surface (job tag routes) is the production path under test. */
+		__maiChatProdLegacy?: boolean;
 	}
 }
 
@@ -199,8 +208,8 @@ const APP_SOURCE = `
 	import ComponentHost from '${HOST}';
 	import { createPanelRegistry } from '${REGISTRY}';
 	import { createRawSnippet } from 'svelte';
-	import { ApiError, subscribeEvents } from '${CLIENT}';
-	import { chatEntry, chatServices } from '${ENTRY}';
+	import { ApiError, createMaiApiClient, subscribeEvents } from '${CLIENT}';
+	import { chatEntry, chatServices, browserChatEventStream } from '${ENTRY}';
 
 	const SERVER_A = '${SERVER_A}';
 	const SERVER_B = '${SERVER_B}';
@@ -1171,8 +1180,53 @@ const APP_SOURCE = `
 	// the required api slice — the composed desktop passes the same shape.
 	// 'live' mirrors DesktopShell: only a live session's slice marks the
 	// panel free to fetch the configured model profiles.
+	// History-tags prod modes (W6B/W7A): PROD swaps the bag's api to the REAL
+	// composed client and binds the optional 'tags' slice from the SAME
+	// client — every panel call leaves as actual HTTP. PROD_LEGACY keeps the
+	// real client but withholds the canonical slice (the pre-canonical host
+	// shape), so the panel's legacy surface reads the JOB tag routes.
+	const PROD = window.__maiChatProdClient === true;
+	const PROD_LEGACY = window.__maiChatProdLegacy === true;
+	let bagApi = api;
+	let bagTags;
+	if (PROD || PROD_LEGACY) {
+		const client = createMaiApiClient();
+		// The composed desktop's exact chat slice (DesktopShell chatApi): a
+		// copy of the real client's methods plus the browser SSE adapter —
+		// the raw client has NO streamConversationEvents of its own, and the
+		// panel's readApi guard fails closed without it (a1 mount failure).
+		// The copy also keeps PROD_LEGACY's canonical deletions off the
+		// client itself. "listProfiles" is the live-transport marker only.
+		bagApi = Object.assign({}, client, {
+			streamConversationEvents: browserChatEventStream,
+			listProfiles: async () => []
+		});
+		bagTags = {
+			listTags: client.listTags,
+			createTag: client.createTag,
+			listRunTags: client.listRunTags,
+			assignRunTag: client.assignRunTag,
+			removeRunTag: client.removeRunTag,
+			listConversationTags: client.listConversationTags,
+			assignConversationTag: client.assignConversationTag,
+			removeConversationTag: client.removeConversationTag
+		};
+		if (PROD_LEGACY) {
+			for (const key of [
+				'listCanonicalConversations',
+				'getConversation',
+				'listConversationMessages',
+				'listConversationEvents',
+				'createConversation',
+				'submitConversationMessage',
+				'steerConversation'
+			]) {
+				delete bagApi[key];
+			}
+		}
+	}
 	const services = {
-		...chatServices(api),
+		...chatServices(bagApi, bagTags),
 		live: window.__maiChatLive === true,
 		serverOptions: [
 			{ id: SERVER_A, label: 'Server Alpha' },
@@ -1745,7 +1799,7 @@ test.beforeEach(async ({ page }) => {
 async function openFixture(
 	page: Page,
 	scenario: Scenario,
-	opts?: { tasks?: boolean }
+	opts?: { tasks?: boolean; prod?: boolean; prodLegacy?: boolean }
 ): Promise<Page> {
 	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
 	await page.addInitScript(
@@ -1753,8 +1807,15 @@ async function openFixture(
 			window.__maiChatScenario = value.scenario;
 			window.__maiChatCanonical = value.scenario === 'canonical';
 			window.__maiChatTasks = value.tasks === true;
+			window.__maiChatProdClient = value.prod === true;
+			window.__maiChatProdLegacy = value.prodLegacy === true;
 		},
-		{ scenario, tasks: opts?.tasks === true }
+		{
+			scenario,
+			tasks: opts?.tasks === true,
+			prod: opts?.prod === true,
+			prodLegacy: opts?.prodLegacy === true
+		}
 	);
 	await page.goto(FIXTURE_URL);
 	await expect(page.getByTestId('host-main').getByTestId('chat-root')).toBeVisible();
@@ -4226,5 +4287,952 @@ test.describe('terminal canonical reopen visibility (24c D-3)', () => {
 		expect(problem24d.width, '404 problem width').toBeGreaterThanOrEqual(200);
 		expect(problem24d.textWidth, '404 problem text width').toBeGreaterThan(100);
 		expect(problem24d.height, '404 problem height').toBeLessThanOrEqual(200);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// History tags — production client (history-tags W6B/W7A)
+//
+// The bag's `tags` slice and api ARE the REAL composed client; every panel
+// call leaves as actual HTTP against Node-side truth. Recorded requests
+// (method + full path + query + body) are the identity/scope evidence:
+// legacy run rows read `/api/v1/jobs/runs/{id}/tags?server_id=…`, canonical
+// conversation rows read `/api/v1/chat/conversations/{id}/tags?server_id=…`
+// (the ONLY route a General Consult zero-UUID scope ever uses), and the two
+// route families are never conflated — not even when a canonical
+// conversation has a bound run with its own tags.
+// ---------------------------------------------------------------------------
+
+/** Deterministic tag fixtures (opaque UUID identities, honest names). */
+const TAG_ALPHA = '41000000-0000-4000-8000-000000000001';
+const TAG_BETA = '42000000-0000-4000-8000-000000000002';
+const TAG_GAMMA = '43000000-0000-4000-8000-000000000003';
+const TAG_DELTA = '44000000-0000-4000-8000-000000000004';
+const CANON_TAGGED = 'ca000000-1111-4222-8333-444455556666';
+const CANON_CONSULT = 'cb000000-1111-4222-8333-444455556666';
+const BOUND_RUN = 'cc000000-1111-4222-8333-444455556666';
+const TAG_TS = '2026-10-16T08:00:00Z';
+
+interface TagRow {
+	tag_id: string;
+	name: string;
+}
+
+interface TagWorldConv {
+	serverId: string;
+	title: string | null;
+	messages: Array<{
+		conversation_id: string;
+		message_id: string;
+		sequence: number;
+		role: 'user' | 'assistant';
+		source_kind: string;
+		created_at: string;
+		content: string;
+		redacted: boolean;
+		content_ref: string | null;
+	}>;
+	activeRunId: string | null;
+	tags: TagRow[];
+}
+
+interface TagWorldRun {
+	serverId: string;
+	tags: TagRow[];
+}
+
+interface TagWorld {
+	conversations: Map<string, TagWorldConv>;
+	runs: Map<string, TagWorldRun>;
+	catalog: Map<string, TagRow & { created_at: string }>;
+	requests: Array<{ method: string; path: string; serverId: string | null; body: unknown; status: number }>;
+}
+
+function newTagWorld(): TagWorld {
+	return { conversations: new Map(), runs: new Map(), catalog: new Map(), requests: [] };
+}
+
+function tag(tagId: string, name: string): TagRow {
+	return { tag_id: tagId, name };
+}
+
+function seedCatalog(world: TagWorld, rows: Array<[string, string]>): void {
+	for (const [tagId, name] of rows) world.catalog.set(tagId, { tag_id: tagId, name, created_at: TAG_TS });
+}
+
+function previewOf(tags: TagRow[]): { preview: string[]; total: number } {
+	return { preview: tags.map((one) => one.name).slice(0, 3), total: tags.length };
+}
+
+function entityRowsOf(tags: TagRow[]): Array<Record<string, unknown>> {
+	return [...tags]
+		.sort((a, b) => a.name.localeCompare(b.name))
+		.map((one) => ({
+			tag_id: one.tag_id,
+			name: one.name,
+			assigned_by: 'fixture-user',
+			assignment_source: 'user',
+			created_at: TAG_TS
+		}));
+}
+
+function canonMessages(conversationId: string): TagWorldConv['messages'] {
+	return [
+		{
+			conversation_id: conversationId,
+			message_id: 'e1000000-0000-4000-8000-000000000001',
+			sequence: 1,
+			role: 'user',
+			source_kind: 'api',
+			created_at: TAG_TS,
+			content: 'Recorded user question.',
+			redacted: false,
+			content_ref: null
+		},
+		{
+			conversation_id: conversationId,
+			message_id: 'e1000000-0000-4000-8000-000000000002',
+			sequence: 2,
+			role: 'assistant',
+			source_kind: 'system',
+			created_at: '2026-10-16T08:01:00Z',
+			content: 'Recorded server-side answer.',
+			redacted: false,
+			content_ref: null
+		}
+	];
+}
+
+function scopeBlind404(route: Route): Promise<void> {
+	return route.fulfill({
+		status: 404,
+		contentType: 'application/json',
+		body: JSON.stringify({ error: { code: 'not_found', message: 'no such entity in the requesting server scope' } })
+	});
+}
+
+/**
+ * Shared tag collection/item handlers over ONE owned tag array — the exact
+ * accepted routes, scope-checked like the backend (C8: a foreign scope is
+ * the SAME scope-blind 404), bounded pages, idempotent assign (204),
+ * removal with the structured 409 `last_tag` refusal unless the
+ * `replacement_tag_id` re-classification rides the same call.
+ */
+async function handleTagsGet(
+	world: TagWorld,
+	route: Route,
+	url: URL,
+	ownerKey: string,
+	ownerId: string,
+	tags: TagRow[]
+): Promise<void> {
+	const limit = Number(url.searchParams.get('limit') ?? 10);
+	const offset = Number(url.searchParams.get('offset') ?? 0);
+	const rows = entityRowsOf(tags);
+	const sliced = rows.slice(offset, offset + limit);
+	world.requests.push({
+		method: 'GET',
+		path: url.pathname + url.search,
+		serverId: url.searchParams.get('server_id'),
+		body: null,
+		status: 200
+	});
+	await route.fulfill({
+		status: 200,
+		contentType: 'application/json',
+		body: JSON.stringify({
+			[ownerKey]: ownerId,
+			limit,
+			offset,
+			total: rows.length,
+			has_more: offset + sliced.length < rows.length,
+			items: sliced
+		})
+	});
+}
+
+async function handleTagsAssign(
+	world: TagWorld,
+	route: Route,
+	url: URL,
+	request: { method: string; postDataJSON: () => Record<string, unknown> },
+	tags: TagRow[]
+): Promise<void> {
+	const body = request.postDataJSON();
+	world.requests.push({
+		method: 'POST',
+		path: url.pathname,
+		serverId: typeof body.server_id === 'string' ? body.server_id : null,
+		body,
+		status: 0
+	});
+	const catalogRow = world.catalog.get(String(body.tag_id));
+	if (
+		catalogRow === undefined ||
+		typeof body.server_id !== 'string' ||
+		!/^[0-9a-f-]{36}$/.test(String(body.server_id))
+	) {
+		world.requests[world.requests.length - 1]!.status = 404;
+		await scopeBlind404(route);
+		return;
+	}
+	if (!tags.some((one) => one.tag_id === catalogRow.tag_id)) tags.push({ ...catalogRow });
+	world.requests[world.requests.length - 1]!.status = 204;
+	await route.fulfill({ status: 204, contentType: 'application/json', body: '' });
+}
+
+async function handleTagsRemove(
+	world: TagWorld,
+	route: Route,
+	url: URL,
+	ownedTags: TagRow[]
+): Promise<void> {
+	const parts = url.pathname.split('/').filter((part) => part !== '');
+	const tagId = decodeURIComponent(parts[parts.length - 1] ?? '');
+	const serverId = url.searchParams.get('server_id');
+	const replacement = url.searchParams.get('replacement_tag_id');
+	const ownerScope = serverId ?? '';
+	world.requests.push({ method: 'DELETE', path: url.pathname + url.search, serverId, body: null, status: 0 });
+	if (ownerScope === '' || !/^[0-9a-f-]{36}$/.test(ownerScope)) {
+		world.requests[world.requests.length - 1]!.status = 404;
+		await scopeBlind404(route);
+		return;
+	}
+	const index = ownedTags.findIndex((one) => one.tag_id === tagId);
+	if (index === -1) {
+		world.requests[world.requests.length - 1]!.status = 404;
+		await scopeBlind404(route);
+		return;
+	}
+	if (ownedTags.length <= 1 && replacement === null) {
+		world.requests[world.requests.length - 1]!.status = 409;
+		await route.fulfill({
+			status: 409,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				error: {
+					code: 'last_tag',
+					message: 'the final tag cannot be removed without a replacement'
+				}
+			})
+		});
+		return;
+	}
+	ownedTags.splice(index, 1);
+	if (replacement !== null) {
+		const row = world.catalog.get(replacement);
+		if (row !== undefined && !ownedTags.some((one) => one.tag_id === row.tag_id)) {
+			ownedTags.push({ tag_id: row.tag_id, name: row.name });
+		}
+	}
+	world.requests[world.requests.length - 1]!.status = 204;
+	await route.fulfill({ status: 204, contentType: 'application/json', body: '' });
+}
+
+/**
+ * The four route families of the tag world. `page.clock` is NOT touched
+ * here; every handler records the exact outgoing request before answering.
+ */
+async function installTagWorld(page: Page, world: TagWorld): Promise<void> {
+	// Global tag catalog: bounded page + idempotent create.
+	await page.route('**/api/v1/tags?*', async (route) => {
+		const url = new URL(route.request().url());
+		world.requests.push({ method: 'GET', path: url.pathname + url.search, serverId: null, body: null, status: 200 });
+		const limit = Number(url.searchParams.get('limit') ?? 10);
+		const offset = Number(url.searchParams.get('offset') ?? 0);
+		const rows = [...world.catalog.values()].sort((a, b) => a.name.localeCompare(b.name));
+		const sliced = rows.slice(offset, offset + limit);
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				limit,
+				offset,
+				total: rows.length,
+				has_more: offset + sliced.length < rows.length,
+				items: sliced.map((one) => ({ ...one, description: null, updated_at: TAG_TS }))
+			})
+		});
+	});
+	await page.route('**/api/v1/tags', async (route) => {
+		const request = route.request();
+		if (request.method() === 'POST') {
+			const body = request.postDataJSON() as Record<string, unknown>;
+			world.requests.push({ method: 'POST', path: new URL(request.url()).pathname, serverId: null, body, status: 200 });
+			const name = String(body.name ?? '').trim();
+			if (name === '') {
+				world.requests[world.requests.length - 1]!.status = 422;
+				await route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: { code: 'validation_failed', message: 'name must not be blank' } }) });
+				return;
+			}
+			const existing = [...world.catalog.values()].find((one) => one.name.toLowerCase() === name.toLowerCase());
+			if (existing !== undefined) {
+				await route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({ ...existing, description: null, updated_at: TAG_TS })
+				});
+				return;
+			}
+			const tagId = 'f0000000-0000-4000-8000-' + String(world.catalog.size + 1).padStart(12, '0');
+			const row = { tag_id: tagId, name, created_at: TAG_TS };
+			world.catalog.set(tagId, row);
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ ...row, description: null, updated_at: TAG_TS })
+			});
+			return;
+		}
+		const url = new URL(request.url());
+		world.requests.push({ method: 'GET', path: url.pathname + url.search, serverId: null, body: null, status: 200 });
+		const rows = [...world.catalog.values()].sort((a, b) => a.name.localeCompare(b.name));
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ limit: 10, offset: 0, total: rows.length, has_more: false, items: rows.map((one) => ({ ...one, description: null, updated_at: TAG_TS })) })
+		});
+	});
+
+	// Canonical conversation surface (+ its tag routes; the ONLY tag routes a
+	// General Consult zero-UUID scope ever uses).
+	await page.route('**/api/v1/chat/conversations**', async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const serverId = url.searchParams.get('server_id');
+		const tail = parts[5] ?? null;
+		const conversationId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : null;
+		// A create POST is refused (this world pre-seeds rows), but the tag
+		// ASSIGN POST rides .../tags and must reach its handler.
+		if (request.method() === 'POST' && !(tail === 'tags' && parts.length === 6)) {
+			await scopeBlind404(route);
+			return;
+		}
+		if (conversationId === null) {
+			const limit = Number(url.searchParams.get('limit') ?? 10);
+			const offset = Number(url.searchParams.get('offset') ?? 0);
+			const rows = [...world.conversations.entries()]
+				.filter(([, row]) => row.serverId === serverId)
+				.sort((a, b) => b[1].messages[1]!.created_at.localeCompare(a[1].messages[1]!.created_at));
+			const sliced = rows.slice(offset, offset + limit);
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					limit,
+					offset,
+					total: rows.length,
+					has_more: offset + sliced.length < rows.length,
+					items: sliced.map(([id, row]) => ({
+						conversation_id: id,
+						server_id: row.serverId,
+						title: row.title,
+						created_at: TAG_TS,
+						updated_at: row.messages[1]!.created_at,
+						message_count: row.messages.length,
+						active_task_id: null,
+						active_run_id: row.activeRunId,
+						tag_preview: previewOf(row.tags)
+					}))
+				})
+			});
+			return;
+		}
+		const row = world.conversations.get(conversationId);
+		// The tag ASSIGN POST carries its explicit scope in the BODY (never a
+		// query), so its scope check reads the body's server_id — the query
+		// guard would wrongly 404 it (C8: entity resolved inside the body's
+		// scope, exactly like the backend handler).
+		const tagAssignPost = tail === 'tags' && parts.length === 6 && request.method() === 'POST';
+		if (tagAssignPost) {
+			const body = request.postDataJSON() as Record<string, unknown>;
+			if (row === undefined || row.serverId !== body.server_id) {
+				await scopeBlind404(route);
+				return;
+			}
+			await handleTagsAssign(
+				world,
+				route,
+				url,
+				{ method: 'POST', postDataJSON: () => body },
+				row.tags
+			);
+			return;
+		}
+		if (row === undefined || row.serverId !== serverId) {
+			await scopeBlind404(route);
+			return;
+		}
+		if (tail === 'tags' && parts.length === 6) {
+			if (request.method() === 'GET') {
+				await handleTagsGet(world, route, url, 'conversation_id', conversationId, row.tags);
+				return;
+			}
+			await scopeBlind404(route);
+			return;
+		}
+		if (tail === 'tags' && parts.length === 7 && request.method() === 'DELETE') {
+			await handleTagsRemove(world, route, url, row.tags);
+			return;
+		}
+		if (tail === 'messages') {
+			const limit = Number(url.searchParams.get('limit') ?? 10);
+			const offset = Number(url.searchParams.get('offset') ?? 0);
+			const sliced = row.messages.slice(offset, offset + limit);
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					limit,
+					offset,
+					total: row.messages.length,
+					has_more: offset + sliced.length < row.messages.length,
+					conversation_id: conversationId,
+					history_completeness: 'complete',
+					items: sliced
+				})
+			});
+			return;
+		}
+		if (tail === 'events') {
+			const afterSeq = Number(url.searchParams.get('after_seq') ?? 0);
+			const events = row.messages
+				.filter((message) => message.sequence > afterSeq)
+				.map((message) => ({
+					seq: message.sequence,
+					kind: 'transcript.appended',
+					message_id: message.message_id,
+					role: message.role,
+					source_kind: message.source_kind,
+					redacted: false,
+					has_content_ref: false,
+					created_at: message.created_at
+				}));
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					conversation_id: conversationId,
+					limit: 50,
+					offset: 0,
+					total: events.length,
+					has_more: false,
+					after_seq: afterSeq,
+					events,
+					current: {
+						latest_seq: row.messages.length,
+						history_completeness: 'complete',
+						active_run_id: row.activeRunId,
+						active_task_id: null,
+						pending_steering: 0
+					}
+				})
+			});
+			return;
+		}
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				conversation_id: conversationId,
+				server_id: row.serverId,
+				title: row.title,
+				created_at: TAG_TS,
+				updated_at: row.messages[1]!.created_at,
+				message_count: row.messages.length,
+				active_task_id: null,
+				active_run_id: row.activeRunId,
+				tag_preview: previewOf(row.tags),
+				history_completeness: 'complete',
+				missing_range: null,
+				legacy_gaps: []
+			})
+		});
+	});
+
+	// The chat run facade (legacy list/read + its SSE route).
+	await page.route('**/api/v1/chat/runs**', async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const runId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : null;
+		if (runId === null) {
+			const serverId = url.searchParams.get('server_id');
+			const limit = Number(url.searchParams.get('limit') ?? 10);
+			const offset = Number(url.searchParams.get('offset') ?? 0);
+			const rows = [...world.runs.entries()]
+				.filter(([, row]) => row.serverId === serverId)
+				.map(([id]) => runFacade(world, id));
+			const sliced = rows.slice(offset, offset + limit);
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ conversations: sliced, limit, offset, total: rows.length })
+			});
+			return;
+		}
+		if (parts[5] === 'events') {
+			await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+			return;
+		}
+		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(runFacade(world, runId)) });
+	});
+
+	// The job surface: run facade reads (readRun) + the JOB tag routes.
+	await page.route('**/api/v1/jobs/runs/**', async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		const parts = url.pathname.split('/').filter((part) => part !== '');
+		const runId = parts[4] !== undefined ? decodeURIComponent(parts[4]) : null;
+		const row = runId !== null ? world.runs.get(runId) : undefined;
+		if (runId === null || row === undefined) {
+			await scopeBlind404(route);
+			return;
+		}
+		if (parts[5] === 'tags' && parts.length === 6) {
+			if (request.method() === 'GET') {
+				await handleTagsGet(world, route, url, 'run_id', runId, row.tags);
+				return;
+			}
+			if (request.method() === 'POST') {
+				await handleTagsAssign(world, route, url, { method: request.method(), postDataJSON: () => request.postDataJSON() as Record<string, unknown> }, row.tags);
+				return;
+			}
+			await scopeBlind404(route);
+			return;
+		}
+		if (parts[5] === 'tags' && parts.length === 7 && request.method() === 'DELETE') {
+			await handleTagsRemove(world, route, url, row.tags);
+			return;
+		}
+		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...runFacade(world, runId), steps: [] }) });
+	});
+}
+
+/** The shared durable run facade row (schema ConversationView + preview). */
+function runFacade(world: TagWorld, runId: string): Record<string, unknown> {
+	const run = world.runs.get(runId);
+	const conv = [...world.conversations.entries()].find(([, row]) => row.activeRunId === runId);
+	const serverId = run?.serverId ?? conv?.[1].serverId ?? '00000000-0000-0000-0000-000000000000';
+	const tags = run?.tags ?? [];
+	return {
+		run_id: runId,
+		server_id: serverId,
+		parent_run_id: null,
+		depth: 0,
+		profile_revision: 1,
+		prompt_revision: 1,
+		model_profile: 'glm53flash',
+		requested_grants: [],
+		state: 'running',
+		cancel_requested_at: null,
+		submitted_at: TAG_TS,
+		updated_at: TAG_TS,
+		tag_preview: previewOf(tags)
+	};
+}
+
+/** Arms the double-submit CSRF cookie the mutation client requires. */
+async function armCsrf(page: Page): Promise<void> {
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'prod-tag-fixture-token', url: 'http://127.0.0.1:4173/' }
+	]);
+}
+
+function tagGets(world: TagWorld, pathPrefix: string): Array<{ method: string; path: string; serverId: string | null; body: unknown; status: number }> {
+	return world.requests.filter((one) => one.method === 'GET' && one.path.startsWith(pathPrefix));
+}
+
+test.describe('history tags — production client', () => {
+	// The popup interaction proofs include a touch tap; the default context
+	// has no touchscreen, so this describe enables it (AC4 keyboard/tap).
+	test.use({ hasTouch: true });
+
+	test('legacy run rows read the job tag route in the pinned scope', async ({ page }) => {
+		const world = newTagWorld();
+		world.runs.set(HISTORY_RUN, {
+			serverId: SERVER_A,
+			tags: [tag(TAG_ALPHA, 'anchor'), tag(TAG_BETA, 'beacon'), tag(TAG_GAMMA, 'crate'), tag(TAG_DELTA, 'drift')]
+		});
+		seedCatalog(world, [[TAG_ALPHA, 'anchor'], [TAG_BETA, 'beacon'], [TAG_GAMMA, 'crate'], [TAG_DELTA, 'drift']]);
+		await installTagWorld(page, world);
+		await armCsrf(page);
+		await openFixture(page, 'compose', { prodLegacy: true });
+		const main = page.getByTestId('host-main');
+
+		// The mount already loaded the legacy page; the disclosure starts
+		// closed — open it to reveal the history rows.
+		await main.getByTestId('chat-history-toggle').click();
+
+		// The history row shows the bounded preview honestly: 3 names + "+1".
+		const rowTags = main.getByTestId('history-row').getByTestId('history-row-tags');
+		await expect(rowTags.getByTestId('history-row-tags-chip')).toHaveCount(3);
+		await expect(rowTags.getByTestId('history-row-tags-more')).toHaveText('+1');
+
+		// Open the legacy run; Details shows the run-target tag surface.
+		await main.getByTestId('history-row').getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('chat-tags')).toBeVisible();
+		await expect(main.getByTestId('chat-tags-scope')).toHaveText(
+			`Server ${SERVER_A.slice(0, 8)} · Pinned scope`
+		);
+
+		// The popup's full list loads ONLY on open, as a real job-tag page.
+		await main.getByTestId('chat-tags-preview-trigger').click();
+		const pop = main.getByTestId('chat-tags-preview-pop');
+		await expect(pop.getByTestId('chat-tags-preview-row')).toHaveCount(4);
+		await expect(pop.getByTestId('chat-tags-preview-count')).toContainText('4');
+
+		// Exact outgoing HTTP: the job route, the pinned scope, the bounded page.
+		await expect
+			.poll(() => tagGets(world, `/api/v1/jobs/runs/${HISTORY_RUN}/tags`).length, { timeout: 15000 })
+			.toBeGreaterThanOrEqual(1);
+		const list = tagGets(world, `/api/v1/jobs/runs/${HISTORY_RUN}/tags`);
+		expect(list[0]!.path).toBe(`/api/v1/jobs/runs/${HISTORY_RUN}/tags?server_id=${SERVER_A}&limit=10&offset=0`);
+		expect(list[0]!.status).toBe(200);
+		// Legacy surface never touches conversation tag routes.
+		expect(world.requests.some((one) => one.path.startsWith('/api/v1/chat/conversations/'))).toBe(false);
+	});
+
+	test('a canonical conversation reads ONLY conversation tag routes — even with a bound run', async ({
+		page
+	}) => {
+		const world = newTagWorld();
+		world.conversations.set(CANON_TAGGED, {
+			serverId: SERVER_A,
+			title: 'Scoped work',
+			messages: canonMessages(CANON_TAGGED),
+			activeRunId: BOUND_RUN,
+			tags: [tag(TAG_ALPHA, 'ledger'), tag(TAG_BETA, 'manifest')]
+		});
+		world.runs.set(BOUND_RUN, { serverId: SERVER_A, tags: [tag(TAG_GAMMA, 'run-only')] });
+		seedCatalog(world, [[TAG_ALPHA, 'ledger'], [TAG_BETA, 'manifest'], [TAG_GAMMA, 'run-only']]);
+		await installTagWorld(page, world);
+		await armCsrf(page);
+		await openFixture(page, 'compose', { prod: true });
+		const main = page.getByTestId('host-main');
+
+		// The disclosure starts closed — open it to reveal the history rows.
+		await main.getByTestId('chat-history-toggle').click();
+
+		// The history row's chips come from the CONVERSATION preview.
+		const rowTags = main.getByTestId('history-row').getByTestId('history-row-tags');
+		await expect(rowTags.getByTestId('history-row-tags-chip')).toHaveCount(2);
+		await expect(rowTags.getByTestId('history-row-tags-more')).toHaveCount(0);
+
+		// Restore the conversation; the bound run attaches its live fold.
+		await main.getByTestId('history-row').getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('chat-tags')).toBeVisible();
+
+		// Details preview shows the CONVERSATION tags (never the run's).
+		const preview = main.getByTestId('chat-tags-preview');
+		await expect(preview.getByTestId('chat-tags-preview-chip')).toHaveCount(2);
+		await expect(preview.getByTestId('chat-tags-preview-chip').first()).toContainText('ledger');
+
+		// Open the popup: the full list loads over the conversation route.
+		await preview.getByTestId('chat-tags-preview-trigger').click();
+		const pop = main.getByTestId('chat-tags-preview-pop');
+		await expect(pop.getByTestId('chat-tags-preview-row')).toHaveCount(2);
+		await expect(pop.getByTestId('chat-tags-preview-row').first()).toContainText('ledger');
+
+		await expect
+			.poll(
+				() => tagGets(world, `/api/v1/chat/conversations/${CANON_TAGGED}/tags`).length,
+				{ timeout: 15000 }
+			)
+			.toBeGreaterThanOrEqual(1);
+		const list = tagGets(world, `/api/v1/chat/conversations/${CANON_TAGGED}/tags`);
+		expect(list[0]!.path).toBe(
+			`/api/v1/chat/conversations/${CANON_TAGGED}/tags?server_id=${SERVER_A}&limit=10&offset=0`
+		);
+		// Identity non-conflation: the bound run's OWN tags are never read.
+		expect(world.requests.some((one) => one.path.includes(`/api/v1/jobs/runs/${BOUND_RUN}/tags`))).toBe(false);
+	});
+
+	test('General Consult zero-UUID scope rides only canonical conversation routes', async ({ page }) => {
+		const world = newTagWorld();
+		world.conversations.set(CANON_CONSULT, {
+			serverId: GLOBAL_CONSULT_SERVER_ID,
+			title: null,
+			messages: canonMessages(CANON_CONSULT),
+			activeRunId: null,
+			tags: [tag(TAG_ALPHA, 'consult')]
+		});
+		seedCatalog(world, [[TAG_ALPHA, 'consult']]);
+		await installTagWorld(page, world);
+		await armCsrf(page);
+		await openFixture(page, 'compose', { prod: true });
+		const main = page.getByTestId('host-main');
+
+		// Drop the pinned server chip: the draft and history re-scope to the
+		// General Consult sentinel and the consult conversation appears.
+		await main.getByTestId('chat-server-chip-remove').click();
+		await expect(main.getByTestId('chat-general-consult-badge')).toHaveText(
+			'General Consult — No Server Pinned'
+		);
+		// The unpin re-scoped the draft to the sentinel: open the disclosure
+		// and refresh so the list reloads on the GLOBAL scope (the D-1 rule).
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		const row = main.getByTestId('history-row').filter({ hasText: 'Consult' });
+		await expect(row).toHaveCount(1);
+		await row.getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('chat-tags-scope')).toHaveText('General Consult · global scope');
+
+		await main.getByTestId('chat-tags-preview-trigger').click();
+		const pop = main.getByTestId('chat-tags-preview-pop');
+		await expect(pop.getByTestId('chat-tags-preview-row')).toHaveCount(1);
+
+		await expect
+			.poll(
+				() => tagGets(world, `/api/v1/chat/conversations/${CANON_CONSULT}/tags`).length,
+				{ timeout: 15000 }
+			)
+			.toBeGreaterThanOrEqual(1);
+		const list = tagGets(world, `/api/v1/chat/conversations/${CANON_CONSULT}/tags`);
+		expect(list[0]!.path).toBe(
+			`/api/v1/chat/conversations/${CANON_CONSULT}/tags?server_id=${GLOBAL_CONSULT_SERVER_ID}&limit=10&offset=0`
+		);
+		// The zero-UUID scope NEVER touches the job tag routes.
+		expect(world.requests.some((one) => one.path.startsWith('/api/v1/jobs/runs/'))).toBe(false);
+	});
+
+	test('editing assign/create/remove rides the exact identity + scope with honest final-tag refusal', async ({
+		page
+	}) => {
+		const world = newTagWorld();
+		world.conversations.set(CANON_TAGGED, {
+			serverId: SERVER_A,
+			title: 'Tag edits',
+			messages: canonMessages(CANON_TAGGED),
+			activeRunId: null,
+			tags: [tag(TAG_ALPHA, 'solo')]
+		});
+		seedCatalog(world, [[TAG_BETA, 'beta'], [TAG_GAMMA, 'gamma']]);
+		await installTagWorld(page, world);
+		await armCsrf(page);
+		await openFixture(page, 'compose', { prod: true });
+		const main = page.getByTestId('host-main');
+
+		// The disclosure starts closed — open it to reveal the history rows.
+		await main.getByTestId('chat-history-toggle').click();
+
+		await main.getByTestId('history-row').getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('chat-tags')).toBeVisible();
+
+		// Editor open: BOTH bounded page zeros load (associations + catalog).
+		await main.getByTestId('chat-tags-edit').click();
+		const editor = main.getByTestId('chat-tags-editor');
+		await expect(editor.getByTestId('chat-tags-row')).toHaveCount(1);
+		await expect
+			.poll(() => world.requests.filter((one) => one.path === '/api/v1/tags?limit=10&offset=0').length, { timeout: 15000 })
+			.toBeGreaterThanOrEqual(1);
+
+		// ASSIGN: POST body carries the catalog id AND the explicit scope.
+		await editor.getByTestId('chat-tags-assign-select').selectOption({ label: 'beta' });
+		await editor.getByTestId('chat-tags-assign').click();
+		await expect(editor.getByTestId('chat-tags-row')).toHaveCount(2);
+		{
+			const assigns = world.requests.filter(
+				(one) => one.method === 'POST' && one.path === `/api/v1/chat/conversations/${CANON_TAGGED}/tags`
+			);
+			await expect.poll(() => assigns.length, { timeout: 15000 }).toBeGreaterThanOrEqual(1);
+			expect(assigns[0]!.body).toEqual({ tag_id: TAG_BETA, server_id: SERVER_A });
+			expect(assigns[0]!.status).toBe(204);
+		}
+
+		// CREATE & assign: POST /api/v1/tags {name} then assign the new id.
+		await editor.getByTestId('chat-tags-create-input').fill('delta-new');
+		await editor.getByTestId('chat-tags-create').click();
+		await expect(editor.getByTestId('chat-tags-row')).toHaveCount(3);
+		{
+			const creates = world.requests.filter(
+				(one) => one.method === 'POST' && one.path === '/api/v1/tags'
+			);
+			await expect.poll(() => creates.length, { timeout: 15000 }).toBeGreaterThanOrEqual(1);
+			expect(creates[0]!.body).toEqual({ name: 'delta-new' });
+			const createdId = [...world.catalog.values()].find((one) => one.name === 'delta-new')!.tag_id;
+			const assigns = world.requests.filter(
+				(one) => one.method === 'POST' && one.path === `/api/v1/chat/conversations/${CANON_TAGGED}/tags`
+			);
+			expect(assigns.some((one) => (one.body as Record<string, unknown>).tag_id === createdId)).toBe(true);
+		}
+
+		// REMOVE non-final tags first (plain DELETE with the scope query):
+		// 'delta-new', then 'beta', leaving 'solo' as the entity's final tag.
+		for (const [tagName, tagId] of [
+			['delta-new', ''],
+			['beta', TAG_BETA]
+		] as const) {
+			await editor
+				.getByTestId('chat-tags-row')
+				.filter({ hasText: tagName })
+				.getByTestId('chat-tags-remove')
+				.click();
+			await expect(
+				editor.getByTestId('chat-tags-row').filter({ hasText: tagName })
+			).toHaveCount(0);
+			if (tagId !== '') {
+				const removals = world.requests.filter(
+					(one) =>
+						one.method === 'DELETE' &&
+						one.path === `/api/v1/chat/conversations/${CANON_TAGGED}/tags/${tagId}?server_id=${SERVER_A}`
+				);
+				expect(removals.length).toBe(1);
+				expect(removals[0]!.status).toBe(204);
+			}
+		}
+
+		// FINAL-TAG refusal: removing 'solo' returns 409 last_tag; the offer
+		// stays visible with the replacement select — nothing was removed.
+		await editor
+			.getByTestId('chat-tags-row')
+			.filter({ hasText: 'solo' })
+			.getByTestId('chat-tags-remove')
+			.click();
+		await expect(main.getByTestId('chat-tags-refusal')).toBeVisible();
+		await expect(main.getByTestId('chat-tags-error')).toContainText('final tag');
+		{
+			const removals = world.requests.filter((one) => one.method === 'DELETE' && one.path.includes(TAG_ALPHA));
+			expect(removals.length).toBe(1);
+			expect(removals[0]!.status).toBe(409);
+		}
+
+		// Replacement re-classification: the same-transaction swap succeeds.
+		await main.getByTestId('chat-tags-replacement-select').selectOption({ label: 'gamma' });
+		await main.getByTestId('chat-tags-replacement-confirm').click();
+		await expect(main.getByTestId('chat-tags-refusal')).toHaveCount(0);
+		await expect(main.getByTestId('chat-tags-preview-chip').first()).toContainText('gamma');
+		{
+			const removals = world.requests.filter((one) => one.method === 'DELETE' && one.path.includes(TAG_ALPHA));
+			expect(removals.length).toBe(2);
+			expect(removals[1]!.path).toBe(
+				`/api/v1/chat/conversations/${CANON_TAGGED}/tags/${TAG_ALPHA}?server_id=${SERVER_A}&replacement_tag_id=${TAG_GAMMA}`
+			);
+			expect(removals[1]!.status).toBe(204);
+		}
+
+		// Durable projections: the history row's preview follows the mutation
+		// (opening a row closed the disclosure — reopen it first).
+		await main.getByTestId('chat-history-toggle').click();
+		const rowTags = main.getByTestId('history-row').getByTestId('history-row-tags');
+		await expect(rowTags.getByTestId('history-row-tags-chip').first()).toContainText('gamma');
+	});
+
+	test('popup keyboard/tap/Escape and 360x640 stay bounded in Details and history rows', async ({ page }) => {
+		const world = newTagWorld();
+		world.conversations.set(CANON_TAGGED, {
+			serverId: SERVER_A,
+			title: 'Scoped work',
+			messages: canonMessages(CANON_TAGGED),
+			activeRunId: null,
+			tags: [tag(TAG_ALPHA, 'ledger'), tag(TAG_BETA, 'manifest')]
+		});
+		seedCatalog(world, [[TAG_ALPHA, 'ledger'], [TAG_BETA, 'manifest']]);
+		await installTagWorld(page, world);
+		await armCsrf(page);
+		await openFixture(page, 'compose', { prod: true });
+		const main = page.getByTestId('host-main');
+
+		// The disclosure starts closed — open it to reveal the history rows.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-row').getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		const trigger = main.getByTestId('chat-tags-preview-trigger');
+		const pop = main.getByTestId('chat-tags-preview-pop');
+
+		// Keyboard: focus opens; Escape closes and restores the trigger focus.
+		await trigger.focus();
+		await expect(pop).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(pop).toBeHidden();
+		await expect(trigger).toBeFocused();
+
+		// Keyboard toggle: the Escape-close left the trigger focused, so Enter
+		// toggles the closed popup OPEN again (keydown snapshot + click
+		// toggle — the reviewed HistoryTags contract); the second Enter
+		// closes it.
+		await page.keyboard.press('Enter');
+		await expect(pop).toBeVisible();
+		await page.keyboard.press('Enter');
+		await expect(pop).toBeHidden();
+
+		// An outside pointerdown closes a keyboard-opened popup.
+		await page.keyboard.press(' ');
+		await expect(pop).toBeVisible();
+		await main.getByTestId('chat-scope').click();
+		await expect(pop).toBeHidden();
+
+		// 360x640: a FRESH mount of the existing UNFRAMED full-width fixture
+		// mode (the layout tests' standalone host) — the AC4 surface. A
+		// post-goto addInitScript never re-runs, so the unframed mode must be
+		// armed BEFORE the navigation openFixture performs.
+		await page.addInitScript((value) => {
+			window.__maiChatFramed = value;
+		}, false);
+		await page.setViewportSize({ width: 360, height: 640 });
+		await openFixture(page, 'compose', { prod: true });
+		await page.addStyleTag({
+			content:
+				'body { margin: 0; } #app > section:not([data-testid="host-main"]) { display:none; }'
+		});
+		await expect(main.getByTestId('chat-root')).toBeVisible();
+
+		// History row surface: focus opens the row popup; Escape closes it.
+		await main.getByTestId('chat-history-toggle').click();
+		const rowTags = main.getByTestId('history-row').getByTestId('history-row-tags');
+		await expect(rowTags.getByTestId('history-row-tags-chip')).toHaveCount(2);
+		const rowTrigger = rowTags.getByTestId('history-row-tags-trigger');
+		const rowPop = rowTags.getByTestId('history-row-tags-pop');
+		await rowTrigger.focus();
+		await expect(rowPop).toBeVisible();
+		const overflow = await page.evaluate(() => document.documentElement.scrollWidth);
+		expect(overflow).toBeLessThanOrEqual(360);
+		const rowBox = await rowPop.boundingBox();
+		expect(rowBox).not.toBeNull();
+		expect(rowBox!.x).toBeGreaterThanOrEqual(0);
+		expect(rowBox!.x + rowBox!.width).toBeLessThanOrEqual(360);
+		await page.keyboard.press('Escape');
+		await expect(rowPop).toBeHidden();
+		await expect(rowTrigger).toBeFocused();
+
+		// Restore the conversation (the row trigger's tap would bubble to the
+		// row item's own activation — the tap proof below runs on the
+		// Details surface, whose trigger stands alone); open Details.
+		await main.getByTestId('history-row').getByTestId('chat-history-item').click();
+		await main.getByTestId('chat-details-trigger').click();
+		await expect(main.getByTestId('chat-tags-preview-pop')).toBeHidden();
+
+		// Touch tap toggles the Details popup open (the tap's own focus-open
+		// is not undone by its click), then closed; it stays viewport-bounded
+		// with no document horizontal overflow (AC4 tap + 360x640).
+		await trigger.scrollIntoViewIfNeeded();
+		const triggerBox = await trigger.boundingBox();
+		expect(triggerBox).not.toBeNull();
+		const tapCenter = () => ({
+			x: triggerBox!.x + triggerBox!.width / 2,
+			y: triggerBox!.y + triggerBox!.height / 2
+		});
+		await page.touchscreen.tap(tapCenter().x, tapCenter().y);
+		await expect(pop).toBeVisible();
+		expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+		const box = await pop.boundingBox();
+		expect(box).not.toBeNull();
+		expect(box!.x).toBeGreaterThanOrEqual(0);
+		expect(box!.x + box!.width).toBeLessThanOrEqual(360);
+		await page.touchscreen.tap(tapCenter().x, tapCenter().y);
+		await expect(pop).toBeHidden();
+
+		// Space re-opens from the keyboard (the trigger kept focus through the
+		// tap-close) and Escape restores it.
+		await page.keyboard.press(' ');
+		await expect(pop).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(pop).toBeHidden();
+		await expect(trigger).toBeFocused();
 	});
 });

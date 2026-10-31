@@ -134,6 +134,7 @@ from mai.api.auth import (
     _require_csrf,
     _require_session,
 )
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
 from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.capabilities.task_state import (
     TASK_PROPOSE_UPDATE_CAPABILITY,
@@ -156,6 +157,7 @@ from mai.api.jobs import (
     _jobs_services,
     _load_run_row,
     _not_found_run,
+    _preview_view,
     _record_submit_intent,
     _replayed_state,
     _run_view,
@@ -201,6 +203,7 @@ from mai.jobs.recovery import (
     RecoveryErrorCode,
 )
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
+from mai.tag_store import apreview_job_tags
 
 __all__ = ["register_chat", "resolve_artifacts_root"]
 
@@ -274,9 +277,11 @@ SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
 
 #: Built-in controller-side defaults of the auto-resolved chat grant
 #: set (alongside ``INTERNAL_API_CAPABILITY_IDS``): document retrieval,
-#: web research, the HTTP service probe, the host journal reader and the
+#: web research, the HTTP service probe, the host journal reader, the
 #: task-state agent tools (run-identity scoped: the model can only see
-#: and update the task bound to its own conversation — §7).
+#: and update the task bound to its own conversation — §7) and the
+#: ``tags.*`` history vocabulary (mutations stripped again by the
+#: read-only exclusion set below).
 BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "docs.retrieve",
     "web.search",
@@ -284,11 +289,14 @@ BUILTIN_CHAT_CAPABILITIES: Final[tuple[str, ...]] = (
     "service.http",
     "host.logs",
     *TASK_STATE_CAPABILITY_IDS,
+    *TAGS_CAPABILITY_IDS,
 )
 
 #: Capabilities a read-only conversation strips even without a
-#: registry descriptor: raw shell and every internal-API mutation plus
-#: the task mutation lane (``task.read`` is read-class and survives).
+#: registry descriptor: raw shell, every internal-API mutation, the
+#: ``tags.*`` mutations and the task mutation lane (``task.read`` is
+#: read-class and survives). Registered descriptors with a non-read
+#: effect are excluded on top by the registry pass.
 READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
     {
         "host.shell",
@@ -299,6 +307,10 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "app.upsert_catalog_runbook",
         "app.delete_catalog_runbook",
         "secret.store",
+        "tags.assign",
+        "tags.remove",
+        "tags.create",
+        "tags.delete",
         TASK_PROPOSE_UPDATE_CAPABILITY,
         TASK_UPDATE_ITEM_CAPABILITY,
     }
@@ -1733,6 +1745,13 @@ async def _conversation_view(
         )
         title = await _resolve_chat_title(session, identity, submission_data)
     child_states = await _child_states(factory, children_rows)
+    parent_run_id = uuid.UUID(identity)
+    child_run_ids = [uuid.UUID(str(child["run_id"])) for child in children_rows]
+    previews = await apreview_job_tags(
+        factory,
+        [parent_run_id, *child_run_ids],
+        server_id=uuid.UUID(str(row["server_id"])),
+    )
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
     session_run_id: str | None = None
@@ -1754,10 +1773,20 @@ async def _conversation_view(
         if isinstance(raw_session_run, str) and raw_session_run:
             session_run_id = raw_session_run
     return ConversationView(
-        **_run_view(row, state).model_dump(),
+        **_run_view(
+            row,
+            state,
+            tag_preview=_preview_view(previews.get(parent_run_id)),
+        ).model_dump(),
         attachments=attachments,
         children=[
-            _run_view(child, child_states.get(str(child["run_id"])))
+            _run_view(
+                child,
+                child_states.get(str(child["run_id"])),
+                tag_preview=_preview_view(
+                    previews.get(uuid.UUID(str(child["run_id"])))
+                ),
+            )
             for child in children_rows
         ],
         service_tags=service_tags,
