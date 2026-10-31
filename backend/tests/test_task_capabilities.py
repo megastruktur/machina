@@ -84,22 +84,16 @@ def _alembic_config() -> AlembicConfig:
 
 
 def _drop_app_tables(url: str) -> None:
+    """Reset the fixture database to pre-bootstrap state (whole schema)."""
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS agent_task_completions, "
-            "agent_task_revisions, agent_task_evidence, "
-            "agent_task_criteria, agent_task_constraints, "
-            "agent_task_steps, agent_tasks, conversation_steering, "
-            "conversation_runs, conversation_messages, conversations, "
-            "notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, "
-            "knowledge_documents, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, "
-            "admin_sessions, admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (the sibling suites' approach): the
+        # enumerated-drop list went stale across migrations —
+        # 0011_history_tags added job_tags/conversation_tags/tags whose
+        # FKs block dropping job_runs and conversations; the schema drop
+        # is FK-safe and immune to future migrations.
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 

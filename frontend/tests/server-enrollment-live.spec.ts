@@ -142,6 +142,31 @@ const BACKEND_ROOT = nodePath.resolve(nodeUrl.fileURLToPath(new URL('.', import.
 const ADMIN_PASSWORD = `so04-live-${nodeCrypto.randomUUID()}`; // synthetic, disposable, never printed
 const FALLBACK_REF = 'MAI_SSH_KEY_MAI';
 
+/**
+ * The REAL backend project interpreter, resolved without assuming a
+ * checked-in venv (isolated worktrees have no backend/.venv):
+ * MAI_BACKEND_PYTHON override, then the uv project environment
+ * ($UV_PROJECT_ENVIRONMENT), then uv's default in-project venv.
+ * Fails closed naming every candidate tried.
+ */
+function backendPython(): string {
+	const candidates: Array<string | undefined> = [
+		process.env.MAI_BACKEND_PYTHON,
+		process.env.UV_PROJECT_ENVIRONMENT
+			? nodePath.join(process.env.UV_PROJECT_ENVIRONMENT, 'bin', 'python')
+			: undefined,
+		nodePath.join(BACKEND_ROOT, '.venv', 'bin', 'python')
+	];
+	for (const candidate of candidates) {
+		if (candidate && fs.existsSync(candidate)) return candidate;
+	}
+	throw new Error(
+		`no backend interpreter for the live fixture; tried: ${candidates
+			.map((candidate) => candidate ?? '<unset>')
+			.join(', ')}`
+	);
+}
+
 // Fixture-name refusal guard: every docker command in this file only ever
 // addresses containers matching this pattern, and the database URL handed to
 // uvicorn/alembic is constructed here — never read from the ambient
@@ -383,7 +408,7 @@ test.describe('live full-stack guided onboarding (real uvicorn + postgres + open
 		// child env carries no ambient MAI_* values.
 		const migrateEnv = { PATH: process.env.PATH!, HOME: process.env.HOME!, MAI_DATABASE_URL: live.pgUrl };
 		const migrated = await run(
-			nodePath.join(BACKEND_ROOT, '.venv', 'bin', 'python'),
+			backendPython(),
 			['-m', 'alembic', '-c', 'alembic.ini', 'upgrade', 'head'],
 			{ cwd: BACKEND_ROOT, env: migrateEnv, timeout: 180_000 }
 		);
@@ -465,7 +490,7 @@ test.describe('live full-stack guided onboarding (real uvicorn + postgres + open
 		const uvicornLog = nodePath.join(SCRATCH, 'uvicorn.log');
 		const logFd = fs.openSync(uvicornLog, 'a');
 		const uviproc = cp.spawn(
-			nodePath.join(BACKEND_ROOT, '.venv', 'bin', 'python'),
+			backendPython(),
 			['-m', 'uvicorn', 'mai.api.app:create_app', '--factory', '--host', '127.0.0.1', '--port', String(backendPort)],
 			{ cwd: BACKEND_ROOT, env: uvicornEnv, stdio: ['ignore', logFd, logFd] }
 		);
@@ -764,7 +789,7 @@ test.describe('live full-stack guided onboarding (real uvicorn + postgres + open
 			'print(json.dumps({"kernel_name": observed.kernel_name, "os_id": observed.os_id, "hostname": observed.hostname, "boot_id_present": bool(observed.boot_id)}))'
 		].join('\n');
 		const probe = await run(
-			nodePath.join(BACKEND_ROOT, '.venv', 'bin', 'python'),
+			backendPython(),
 			['-c', probeScript],
 			{
 				cwd: BACKEND_ROOT,

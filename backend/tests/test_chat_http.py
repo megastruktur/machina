@@ -407,7 +407,7 @@ import os
 import time
 import uuid
 
-from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -523,7 +523,25 @@ def _script_model():
             raise AssertionError("model script exhausted")
         return _entry_payload(script[index])
 
-    return FunctionModel(_model_fn)
+    async def _stream_fn(messages, info):
+        # The real observers always consume streamed requests; replay the
+        # exact same deterministic script as ONE complete chunk per
+        # response (a valid FunctionModel stream shape): the full text for
+        # text entries, or one DeltaToolCalls mapping for tool calls.
+        response = _model_fn(messages, info)
+        for part in response.parts:
+            if isinstance(part, TextPart):
+                yield part.content
+            else:
+                yield {
+                    0: DeltaToolCall(
+                        name=part.tool_name,
+                        json_args=json.dumps(part.args_as_dict()),
+                        tool_call_id=part.tool_call_id,
+                    )
+                }
+
+    return FunctionModel(_model_fn, stream_function=_stream_fn)
 
 
 def _build():

@@ -32,7 +32,7 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mai.contracts.jobs import RunState
+from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState
 from mai.database import create_app_engine
 from mai.history_store import (
     MAX_CONTENT_CHARS,
@@ -125,6 +125,26 @@ def clean_domain(migrated_url: str):
 def factory(migrated_url: str) -> async_sessionmaker[AsyncSession]:
     _, sessions = create_app_engine(migrated_url)
     return sessions
+
+
+def _seed_terminal_tags(url: str) -> None:
+    """Seed the terminal run-state catalog tags (idempotent).
+
+    A terminal ``record_transition`` atomically swaps the reserved
+    ``unclassified`` assignment for a catalog tag named after the target
+    state; a fresh 0011 catalog only seeds ``unclassified``, so tests
+    replaying terminal transitions seed these rows first — the same
+    harness contract as ``test_chat_http._seed_terminal_catalog`` and the
+    jobs suite's live scenarios.
+    """
+    with psycopg.connect(url) as conn:
+        for state in TERMINAL_RUN_STATES:
+            conn.execute(
+                "INSERT INTO tags (tag_id, name, description) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (uuid.uuid4(), state.value, "terminal run classification"),
+            )
+        conn.commit()
 
 
 def _insert_job(
@@ -895,7 +915,10 @@ async def test_job_content_fields_state_and_honest_nones(
         content.label = "mutated"  # type: ignore[misc]
 
     # Lifecycle state replays from the persisted event stream (str value).
+    # Terminal transitions swap to catalog tags named after the state, so
+    # seed them idempotently first (fresh 0011 catalog lacks them).
     lifecycle = RunLifecycle(factory)
+    _seed_terminal_tags(migrated_url)
     await lifecycle.record_transition(str(child), RunState.QUEUED)
     await lifecycle.record_transition(str(child), RunState.RUNNING)
     await lifecycle.record_transition(str(child), RunState.FAILED)

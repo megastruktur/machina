@@ -20,6 +20,8 @@ import pytest
 
 from pydantic import ValidationError
 
+from sqlalchemy import text
+
 from mai.agents.conversation_store import (
     aattach_run,
     acreate_conversation,
@@ -63,6 +65,7 @@ from mai.capabilities.internal_api import (
     InternalApiError,
     assert_agent_ready_descriptor,
 )
+from mai.contracts.jobs import TERMINAL_RUN_STATES
 from mai.history_store import MAX_CONTENT_CHARS
 from mai.jobs.lifecycle import RunLifecycle, RunState
 from mai.policy.evaluate import ExecutionContext, PolicyMode
@@ -2366,6 +2369,21 @@ def _link_insert(
 async def _record(
     sessions: object, run_id: uuid.UUID, *targets: RunState
 ) -> None:
+    # Terminal transitions swap to catalog tags named after the target
+    # state; a fresh 0011 catalog only seeds ``unclassified``, so seed the
+    # terminal rows first (idempotent — the same harness contract as
+    # ``test_chat_http._seed_terminal_catalog``).
+    async with sessions() as session:  # type: ignore[union-attr]
+        for state in TERMINAL_RUN_STATES:
+            await session.execute(
+                text(
+                    "INSERT INTO tags (tag_id, name, description) "
+                    "VALUES (:tag_id, :name, 'terminal run classification') "
+                    "ON CONFLICT DO NOTHING"
+                ),
+                {"tag_id": uuid.uuid4(), "name": state.value},
+            )
+        await session.commit()
     lifecycle = RunLifecycle(sessions)  # type: ignore[arg-type]
     for target in targets:
         await lifecycle.record_transition(str(run_id), target)
