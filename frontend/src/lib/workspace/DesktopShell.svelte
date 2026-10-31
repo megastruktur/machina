@@ -237,7 +237,8 @@
 	// Live transport: one client per shell instance (ADR §5 — instances share
 	// nothing). The feature entries name the per-panel contracts; the slices
 	// below map this ONE client onto each panel's exact interface.
-	import { ApiError, createMaiApiClient, CSRF_COOKIE, type ProfileResponse } from '$lib/api/client.js';
+	import { ApiError, createMaiApiClient, CSRF_COOKIE, type ProfileResponse, type TagPage } from '$lib/api/client.js';
+	import type { TagPageLoader } from '$lib/ui/HistoryTags.svelte';
 	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
 	import {
@@ -247,6 +248,7 @@
 		chatServices,
 		type ChatApi,
 		type ChatServiceOption,
+		type ChatTagApi,
 		type ConversationView,
 		type RunDetail
 	} from './entries/06-web-chat.js';
@@ -623,6 +625,64 @@
 		listProfiles: async () => []
 	};
 
+	/**
+	 * The OPTIONAL history-tag slice (history-tags W6B/W7A): the REAL
+	 * client's tag methods under the bag's `tags` field — legacy run rows
+	 * read the job tag routes, canonical conversation rows the conversation
+	 * routes (the catalog is global; every assignment carries its explicit
+	 * server scope). The OFFLINE memory dock omits it and fails closed.
+	 */
+	const chatTagApi: ChatTagApi = {
+		listTags: api.listTags,
+		createTag: api.createTag,
+		listRunTags: api.listRunTags,
+		assignRunTag: api.assignRunTag,
+		removeRunTag: api.removeRunTag,
+		listConversationTags: api.listConversationTags,
+		assignConversationTag: api.assignConversationTag,
+		removeConversationTag: api.removeConversationTag
+	};
+
+	/**
+	 * One drawer row's bounded tag-page adapter (history-tags W7A). Route
+	 * choice is IDENTITY-driven: rows pinned to a canonical conversation id
+	 * read the conversation tag route (the only route a General Consult
+	 * zero-UUID scope ever uses); legacy run rows read the job tag route.
+	 * The scope is always the ROW's recorded `server_id` — never a hidden
+	 * global. A row without an adapter method stays honestly preview-only.
+	 */
+	function chatRowTagsLoader(row: ConversationView): TagPageLoader | null {
+		const rowConversationId = (row as { conversation_id?: string }).conversation_id;
+		const conversationId =
+			typeof rowConversationId === 'string' && rowConversationId !== '' ? rowConversationId : null;
+		if (conversationId !== null) {
+			const listConversationTags = api.listConversationTags;
+			if (typeof listConversationTags !== 'function') return null;
+			return async (offset, limit) => {
+				const page = await listConversationTags(conversationId, row.server_id, { limit, offset });
+				return {
+					limit: page.limit,
+					offset: page.offset,
+					total: page.total,
+					has_more: page.has_more,
+					items: (page.items ?? []).map((one) => ({ tag_id: one.tag_id, name: one.name }))
+				} as TagPage;
+			};
+		}
+		const listRunTags = api.listRunTags;
+		if (typeof listRunTags !== 'function') return null;
+		return async (offset, limit) => {
+			const page = await listRunTags(row.run_id, row.server_id, { limit, offset });
+			return {
+				limit: page.limit,
+				offset: page.offset,
+				total: page.total,
+				has_more: page.has_more,
+				items: (page.items ?? []).map((one) => ({ tag_id: one.tag_id, name: one.name }))
+			} as TagPage;
+		};
+	}
+
 	const jobsApi: JobsApi = {
 		listRuns: api.listRuns,
 		readRun: api.readRun,
@@ -817,6 +877,9 @@
 		scope: { kind: 'server', server_id: selectedServerId },
 		services: {
 			api: dockChatApi,
+			// The optional history-tag slice rides ONLY the live transport (the
+			// offline memory dock has no tag methods and fails closed).
+			...(live ? { tags: chatTagApi } : {}),
 			serverOptions,
 			availableServices: DOCK_AVAILABLE_SERVICES
 		},
@@ -921,7 +984,7 @@
 			case JOBS_PANEL_KIND:
 				return asBag(jobsServices(jobsApi));
 			case CHAT_PANEL_KIND:
-				return asBag(chatServices(chatApi));
+				return asBag(chatServices(chatApi, chatTagApi));
 			case MODEL_SETTINGS_PANEL_KIND:
 				return asBag(modelSettingsServices(modelSettingsApi));
 			case DOCS_PANEL_KIND:
@@ -1135,6 +1198,7 @@
 			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
 			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
 			onrenameconversation={(runId, title) => dockChatPanel?.triggerRenameRun(runId, title)}
+			tagLoader={chatRowTagsLoader}
 		/>
 
 		<ServerTreeNav

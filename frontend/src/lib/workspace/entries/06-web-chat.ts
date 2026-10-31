@@ -40,6 +40,11 @@ import type {
 	ConversationSteerRequest,
 	ConversationSteerView,
 	SubscribeEventsOptions,
+	TagAssignBody,
+	TagCatalogQuery,
+	TagCreateBody,
+	TagEntityTagsQuery,
+	TagRemovalOptions,
 	TaskCollectionQuery,
 	TaskConstraintsPage,
 	TaskCorrectionBody,
@@ -48,7 +53,11 @@ import type {
 	TaskMutationOutcome,
 	TaskRevisionsPage,
 	TaskStepsPage,
-	TaskView
+	TaskView,
+	JobTagsPage,
+	ConversationTagsPage,
+	TagPage,
+	TagView
 } from '../../api/client.js';
 import { subscribeEvents } from '../../api/client.js';
 import type { PanelEntryInput } from '../registry.js';
@@ -294,6 +303,52 @@ export interface ChatApi {
 	submitTaskDecision?(taskId: string, payload: TaskDecisionBody): Promise<TaskMutationOutcome>;
 }
 
+/**
+ * The OPTIONAL history-tag slice of the services bag (history-tags W6B/W7A).
+ * Deliberately NOT part of `ChatApi`: existing hosts/composition fixtures
+ * built against the accepted `ChatApi` stay byte-compatible, and a bag
+ * without `tags` fails closed exactly like the canonical slice — honest
+ * absence of every tag surface, zero tag traffic, nothing fabricated.
+ *
+ * Identity is THE contract: legacy run rows read the JOB tag routes (the
+ * run IS the job entity); canonical conversation rows read the CONVERSATION
+ * tag routes — the two association sets are independent and never conflate
+ * identities. The catalog is global (server-agnostic); every assignment
+ * read/mutation carries the explicit per-entity server scope (C01 rule 2).
+ */
+export interface ChatTagApi {
+	/** GET /api/v1/tags — bounded catalog page with the name filter. */
+	listTags(query?: TagCatalogQuery): Promise<TagPage>;
+	/** POST /api/v1/tags — idempotent canonical create (same row back). */
+	createTag(payload: TagCreateBody): Promise<TagView>;
+	/** GET /api/v1/jobs/runs/{run_id}/tags?server_id=… — bounded run page. */
+	listRunTags(runId: string, serverId: string, page?: TagEntityTagsQuery): Promise<JobTagsPage>;
+	/** POST /api/v1/jobs/runs/{run_id}/tags — idempotent user assignment. */
+	assignRunTag(runId: string, payload: TagAssignBody): Promise<void>;
+	/** DELETE /api/v1/jobs/runs/{run_id}/tags/{tag_id}?server_id=… — removal. */
+	removeRunTag(runId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
+	/**
+	 * GET /api/v1/chat/conversations/{id}/tags?server_id=… — bounded page;
+	 * the ONLY tag route of a General Consult (zero-UUID scope) conversation.
+	 */
+	listConversationTags(
+		conversationId: string,
+		serverId: string,
+		page?: TagEntityTagsQuery
+	): Promise<ConversationTagsPage>;
+	/** POST /api/v1/chat/conversations/{id}/tags — idempotent user assignment. */
+	assignConversationTag(conversationId: string, payload: TagAssignBody): Promise<void>;
+	/**
+	 * DELETE /api/v1/chat/conversations/{id}/tags/{tag_id}?server_id=… —
+	 * removal (final-tag refusal is the structured 409 `last_tag`).
+	 */
+	removeConversationTag(
+		conversationId: string,
+		tagId: string,
+		options: TagRemovalOptions
+	): Promise<void>;
+}
+
 /** One server option offered by the draft-mode server picker. */
 export interface ChatServerOption {
 	readonly id: string;
@@ -315,6 +370,12 @@ export interface ChatServiceOption {
  */
 export interface ChatServices {
 	readonly api: ChatApi;
+	/**
+	 * Optional history-tag slice (history-tags W6B/W7A): the real composed
+	 * desktop binds it from the same client; a host without it keeps every
+	 * tag surface honestly absent (fail closed, zero tag traffic).
+	 */
+	readonly tags?: ChatTagApi;
 	/** Available servers for the draft-mode Server Chip / picker. */
 	readonly serverOptions?: readonly ChatServerOption[];
 	/** Mapped/discovered services for the draft-mode `@service` autocomplete. */
@@ -369,10 +430,11 @@ export function chatEntry(): PanelEntryInput {
 /**
  * Typed services bag factory for openers (the composed desktop passes
  * `chatServices({ …baseClientChatMethods, streamConversationEvents:
- * browserChatEventStream })` into its panel hosts). Freezing keeps the bag
- * read-only from the panel's side; the panel still fails closed if the bag
- * is missing or incomplete.
+ * browserChatEventStream })` into its panel hosts). `tags` is the optional
+ * history-tag slice — pass it only when the composed client carries the tag
+ * methods; freezing keeps the bag read-only from the panel's side; the panel
+ * still fails closed if the bag is missing or incomplete.
  */
-export function chatServices(api: ChatApi): ChatServices {
-	return Object.freeze({ api });
+export function chatServices(api: ChatApi, tags?: ChatTagApi): ChatServices {
+	return Object.freeze(tags === undefined ? { api } : { api, tags });
 }

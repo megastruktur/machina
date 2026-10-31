@@ -8,6 +8,7 @@
 	 */
 	import AccordionGroup from '$lib/ui/AccordionGroup.svelte';
 	import Button from '$lib/ui/Button.svelte';
+	import HistoryTags, { type TagPageLoader } from '$lib/ui/HistoryTags.svelte';
 	import NavItem from '$lib/ui/NavItem.svelte';
 	import type { ConversationView } from './entries/06-web-chat.js';
 
@@ -32,6 +33,14 @@
 		onloadmorehistory?: () => void;
 		/** Rename a specific conversation in history. */
 		onrenameconversation?: (runId: string, title: string) => Promise<void> | void;
+		/**
+		 * One row's bounded tag-page adapter (history-tags W7A): the composer
+		 * decides the correct route (legacy run rows read the job tag routes,
+		 * canonical conversation rows the conversation tag routes) with the
+		 * row's recorded server scope. Returning `null` keeps the row honest
+		 * preview-only. Absent rows (`tag_preview` missing) render no chips.
+		 */
+		tagLoader?: (row: ConversationView) => TagPageLoader | null;
 	};
 
 	let {
@@ -44,7 +53,8 @@
 		onselectconversation,
 		onrefreshhistory,
 		onloadmorehistory,
-		onrenameconversation
+		onrenameconversation,
+		tagLoader
 	}: Props = $props();
 
 	let historyExpanded = $state(true);
@@ -183,6 +193,16 @@
 								data-testid="drawer-history-item"
 								onclick={() => onselectconversation(row.run_id)}
 							/>
+							{#if row.tag_preview !== undefined && tagLoader !== undefined}
+								<span class="mai-chat-drawer__row-tags" data-testid="drawer-history-row-tags">
+									<HistoryTags
+										tag_preview={row.tag_preview}
+										loadMore={tagLoader(row)}
+										label={'Tags of ' + formatConversationLabel(row)}
+										testId="drawer-history-row-tags"
+									/>
+								</span>
+							{/if}
 							{#if onrenameconversation}
 								<button
 									type="button"
@@ -249,6 +269,13 @@
 	.mai-chat-drawer__item-row :global(.mai-nav-item) {
 		flex: 1 1 auto;
 		min-width: 0;
+	}
+
+	.mai-chat-drawer__row-tags {
+		flex: 0 1 auto;
+		display: inline-flex;
+		min-width: 0;
+		max-width: 9rem;
 	}
 
 	.mai-chat-drawer__rename-btn,
