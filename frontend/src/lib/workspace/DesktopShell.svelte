@@ -678,7 +678,8 @@
 			state: 'running',
 			cancel_requested_at: null,
 			submitted_at: stamp(),
-			updated_at: stamp()
+			updated_at: stamp(),
+			tag_preview: { preview: ['unclassified'], total: 1 }
 		});
 		return {
 			async submitMessage(payload) {

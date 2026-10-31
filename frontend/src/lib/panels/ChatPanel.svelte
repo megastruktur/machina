@@ -846,6 +846,7 @@
 			cancel_requested_at: null,
 			submitted_at: row.created_at,
 			updated_at: row.updated_at,
+			tag_preview: row.tag_preview,
 			title: row.title ?? null,
 			conversation_id: row.conversation_id,
 			message_count: row.message_count,
