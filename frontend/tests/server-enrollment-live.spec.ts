@@ -394,24 +394,27 @@ test.describe('live full-stack guided onboarding (real uvicorn + postgres + open
 			'pgvector/pgvector:0.8.1-pg18'
 		);
 		expect(pgRun.code, `disposable postgres failed to start: ${pgRun.stderr}`).toBe(0);
-		let pgReady = false;
-		for (let attempt = 0; attempt < 60; attempt += 1) {
-			const ready = await docker('exec', PG_CONTAINER, 'pg_isready', '-U', 'postgres', '-d', PG_DB);
-			if (ready.code === 0 && ready.stdout.includes('accepting connections')) {
-				pgReady = true;
-				break;
-			}
-			await delay(500);
-		}
-		expect(pgReady, 'disposable postgres never became ready').toBe(true);
-		// Migrate the disposable DB with the repository chain. The fixture-only
-		// child env carries no ambient MAI_* values.
+		// Readiness is the real migration command itself at the published host
+		// endpoint (127.0.0.1:<pgPort>). The former `docker exec pg_isready`
+		// answered on the container-local unix socket, which the image's
+		// init-phase temporary server serves BEFORE the final TCP listener
+		// exists (and a bare host TCP connect false-positives on docker
+		// proxy's accept-then-close): both produced alembic's "server closed
+		// the connection unexpectedly". So: same interpreter, env, options and
+		// exact final assertion; bounded retry (60 attempts, the removed
+		// readiness loop's bound) ONLY of the classified startup failure
+		// `migration aborted: health=unreachable` while the fresh DB
+		// initializes — never a second successful migration, no sleeps.
 		const migrateEnv = { PATH: process.env.PATH!, HOME: process.env.HOME!, MAI_DATABASE_URL: live.pgUrl };
-		const migrated = await run(
-			backendPython(),
-			['-m', 'alembic', '-c', 'alembic.ini', 'upgrade', 'head'],
-			{ cwd: BACKEND_ROOT, env: migrateEnv, timeout: 180_000 }
-		);
+		let migrated: Awaited<ReturnType<typeof run>>;
+		for (let attempt = 0; ; attempt += 1) {
+			migrated = await run(
+				backendPython(),
+				['-m', 'alembic', '-c', 'alembic.ini', 'upgrade', 'head'],
+				{ cwd: BACKEND_ROOT, env: migrateEnv, timeout: 180_000 }
+			);
+			if (migrated.code === 0 || attempt >= 59 || !migrated.stderr.startsWith('migration aborted: health=unreachable')) break;
+		}
 		expect(migrated.code, `alembic upgrade head failed: ${migrated.stderr.slice(-800)}`).toBe(0);
 
 		// -- disposable Arch sshd with EMPTY root authorized_keys --------------
