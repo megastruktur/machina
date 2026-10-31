@@ -56,6 +56,7 @@ from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState
 from mai.jobs.engine import EngineClient
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1340,6 +1341,239 @@ class TestTagPreviews:
 
 
 # ---------------------------------------------------------------------------
+# run-tag routes + list tag filters (HT-W6B)
+# ---------------------------------------------------------------------------
+
+
+async def _create_catalog_tag(
+    jobs_app: FastAPI, jar: dict[str, str], name: str
+) -> uuid.UUID:
+    """Create one catalog tag through the real HTTP surface."""
+    response = await call_app(
+        jobs_app,
+        "POST",
+        "/api/v1/tags",
+        json_body={"name": name},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert response.status == 201, response.body
+    return uuid.UUID(response.json()["tag_id"])
+
+
+async def _assign_run_tag(
+    jobs_app: FastAPI,
+    jar: dict[str, str],
+    run_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    server_id: uuid.UUID,
+) -> HttpResponse:
+    """POST one run-tag assignment through the real HTTP surface."""
+    return await call_app(
+        jobs_app,
+        "POST",
+        f"/api/v1/jobs/runs/{run_id}/tags",
+        json_body={"tag_id": str(tag_id), "server_id": str(server_id)},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+
+
+async def _submit_run_intent(
+    jobs_app: FastAPI, jar: dict[str, str], server_id: uuid.UUID
+) -> uuid.UUID:
+    """One durable run intent through the real submit seam (stays QUEUED)."""
+    run_id = uuid.uuid4()
+    response = await call_app(
+        jobs_app,
+        "POST",
+        "/api/v1/jobs/runs",
+        json_body=_submit_body(run_id, server_id, (READ_CAP, "m1")),
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert response.status == 201, response.body
+    return run_id
+
+
+class TestRunTagRoutes:
+    async def test_add_list_remove_cycle_records_the_user_actor(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        tag_id = await _create_catalog_tag(jobs_app, jar, "hotfix")
+        path = f"/api/v1/jobs/runs/{run_id}/tags"
+
+        assigned = await _assign_run_tag(jobs_app, jar, run_id, tag_id, server_a)
+        assert assigned.status == 204
+        assert assigned.body == b""
+
+        listed = await call_app(
+            jobs_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+        )
+        assert listed.status == 200, listed.body
+        body = listed.json()
+        assert body["run_id"] == str(run_id)
+        assert body["total"] == 2  # the reserved seed + the user assignment
+        row = next(item for item in body["items"] if item["tag_id"] == str(tag_id))
+        assert row["name"] == "hotfix"
+        assert row["assignment_source"] == "user"
+        # Bounded non-secret actor: the validated session's token hash.
+        assert len(row["assigned_by"]) == 64
+        assert all(c in "0123456789abcdef" for c in row["assigned_by"])
+
+        removed = await call_app(
+            jobs_app,
+            "DELETE",
+            f"{path}/{tag_id}?server_id={server_a}",
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert removed.status == 204
+        relisted = await call_app(
+            jobs_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+        )
+        assert relisted.json()["total"] == 1
+
+    async def test_assignment_is_idempotent(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        tag_id = await _create_catalog_tag(jobs_app, jar, "once")
+        for _ in range(2):
+            assigned = await _assign_run_tag(jobs_app, jar, run_id, tag_id, server_a)
+            assert assigned.status == 204
+        listed = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs/{run_id}/tags?server_id={server_a}",
+            cookies=jar,
+        )
+        assert listed.json()["total"] == 2
+
+    async def test_unknown_tag_is_404_and_absent_association_is_a_no_op(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        path = f"/api/v1/jobs/runs/{run_id}/tags"
+
+        unknown = await _assign_run_tag(
+            jobs_app, jar, run_id, uuid.uuid4(), server_a
+        )
+        assert unknown.status == 404
+        assert _error(unknown)["code"] == "tag_not_found"
+
+        unassigned = await _create_catalog_tag(jobs_app, jar, "never-bound")
+        no_op = await call_app(
+            jobs_app,
+            "DELETE",
+            f"{path}/{unassigned}?server_id={server_a}",
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert no_op.status == 204  # absent association: idempotent no-op
+
+    async def test_scope_blind_404_for_missing_and_foreign(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        path = f"/api/v1/jobs/runs/{run_id}/tags"
+
+        foreign = await call_app(
+            jobs_app, "GET", f"{path}?server_id={SERVER_B}", cookies=jar
+        )
+        missing = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs/{uuid.uuid4()}/tags?server_id={SERVER_B}",
+            cookies=jar,
+        )
+        assert foreign.status == 404 and missing.status == 404
+        # Missing ≡ foreign: the SAME closed envelope, no cross-server leak.
+        assert _scope_blind_envelope(foreign) == _scope_blind_envelope(missing)
+        assert _scope_blind_envelope(foreign)["code"] == "not_found"
+
+        tag_id = await _create_catalog_tag(jobs_app, jar, "foreign")
+        foreign_assign = await _assign_run_tag(
+            jobs_app, jar, run_id, tag_id, SERVER_B
+        )
+        assert foreign_assign.status == 404
+        foreign_delete = await call_app(
+            jobs_app,
+            "DELETE",
+            f"{path}/{tag_id}?server_id={SERVER_B}",
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert foreign_delete.status == 404
+
+    async def test_zero_uuid_is_not_a_job_scope(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        zero = uuid.UUID(int=0)
+        response = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs/{run_id}/tags?server_id={zero}",
+            cookies=jar,
+        )
+        assert response.status == 404
+        assert _error(response)["code"] == "not_found"
+
+    async def test_final_tag_removal_requires_replacement(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await _submit_run_intent(jobs_app, jar, server_a)
+        path = f"/api/v1/jobs/runs/{run_id}/tags"
+        reserved = uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+
+        refused = await call_app(
+            jobs_app,
+            "DELETE",
+            f"{path}/{reserved}?server_id={server_a}",
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert refused.status == 409
+        assert _error(refused)["code"] == "last_tag"
+
+        replacement = await _create_catalog_tag(jobs_app, jar, "completed")
+        swapped = await call_app(
+            jobs_app,
+            "DELETE",
+            f"{path}/{reserved}?server_id={server_a}"
+            f"&replacement_tag_id={replacement}",
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert swapped.status == 204
+        listed = await call_app(
+            jobs_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+        )
+        body = listed.json()
+        assert body["total"] == 1
+        assert body["items"][0]["tag_id"] == str(replacement)
+
+    async def test_routes_require_session(
+        self, jobs_app: FastAPI, server_a: uuid.UUID
+    ) -> None:
+        response = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs/{uuid.uuid4()}/tags?server_id={server_a}",
+        )
+        assert response.status == 401
+        assert _error(response)["code"] == "unauthenticated"
+
+
+def _scope_blind_envelope(response: HttpResponse) -> dict[str, str]:
+    """The comparable scope-blind envelope: code + message, no request_id."""
+    body = _error(response)
+    return {"code": body["code"], "message": body["message"]}
+
+
+# ---------------------------------------------------------------------------
 # list filters: q text search + date range, applied BEFORE pagination (W1)
 # ---------------------------------------------------------------------------
 
@@ -1511,6 +1745,157 @@ class TestListFilters:
         assert page["offset"] == 1
         # submitted_at DESC order: offset 1 lands on the OLDER alpha run.
         assert [str(first)] == [run["run_id"] for run in page["runs"]]
+
+    async def _assign(
+        self,
+        jobs_app: FastAPI,
+        jar: dict[str, str],
+        run_id: uuid.UUID,
+        tag_id: uuid.UUID,
+        server: uuid.UUID,
+    ) -> None:
+        assigned = await _assign_run_tag(jobs_app, jar, run_id, tag_id, server)
+        assert assigned.status == 204, assigned.body
+
+    async def test_tag_filter_any_and_all(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        tagged = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}]
+        )
+        other = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m2"}}]
+        )
+        tag_a = await _create_catalog_tag(jobs_app, jar, "filter-alpha")
+        tag_b = await _create_catalog_tag(jobs_app, jar, "filter-beta")
+        tag_c = await _create_catalog_tag(jobs_app, jar, "filter-gamma")
+        await self._assign(jobs_app, jar, tagged, tag_a, server_a)
+        await self._assign(jobs_app, jar, tagged, tag_b, server_a)
+        await self._assign(jobs_app, jar, other, tag_c, server_a)
+
+        # ANY: at least one of the set.
+        single = await self._list(
+            jobs_app, jar, f"server_id={server_a}&tag_id={tag_a}"
+        )
+        assert single["total"] == 1
+        assert [str(tagged)] == [run["run_id"] for run in single["runs"]]
+        spread = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&tag_id={tag_a}&tag_id={tag_c}&tag_match=any",
+        )
+        assert spread["total"] == 2
+
+        # ALL: every id of the set must be present.
+        both = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&tag_id={tag_a}&tag_id={tag_b}&tag_match=all",
+        )
+        assert both["total"] == 1
+        assert [str(tagged)] == [run["run_id"] for run in both["runs"]]
+        impossible = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&tag_id={tag_a}&tag_id={tag_c}&tag_match=all",
+        )
+        assert impossible["total"] == 0
+        assert impossible["runs"] == []
+
+    async def test_tag_filter_omitted_preserves_behavior(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_id = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}]
+        )
+        plain = await self._list(jobs_app, jar, f"server_id={server_a}")
+        match_default = await self._list(
+            jobs_app, jar, f"server_id={server_a}&tag_match=all"
+        )
+        assert match_default == plain  # no tag_id: match mode is inert
+        assert plain["total"] == 1
+        assert [str(run_id)] == [run["run_id"] for run in plain["runs"]]
+
+    async def test_tag_filter_applies_before_pagination(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        first = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}]
+        )
+        second = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m2"}}]
+        )
+        await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m3"}}]
+        )
+        tag = await _create_catalog_tag(jobs_app, jar, "page-filter")
+        await self._assign(jobs_app, jar, first, tag, server_a)
+        await self._assign(jobs_app, jar, second, tag, server_a)
+
+        page = await self._list(
+            jobs_app,
+            jar,
+            f"server_id={server_a}&tag_id={tag}&limit=1&offset=1",
+        )
+        # The FILTERED total (2), not the scope total (3); submitted_at DESC
+        # order puts the OLDER matching run at offset 1.
+        assert page["total"] == 2
+        assert page["limit"] == 1 and page["offset"] == 1
+        assert [str(first)] == [run["run_id"] for run in page["runs"]]
+
+    async def test_tag_filter_validates_malformed_and_oversized_sets(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        malformed = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&tag_id=not-a-uuid",
+            cookies=jar,
+        )
+        assert malformed.status == 422, malformed.body
+        assert _error(malformed)["code"] == "validation_failed"
+
+        bad_match = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&tag_match=some",
+            cookies=jar,
+        )
+        assert bad_match.status == 422
+
+        fifty = "&".join(f"tag_id={uuid.uuid4()}" for _ in range(50))
+        boundary = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&{fifty}",
+            cookies=jar,
+        )
+        assert boundary.status == 200, boundary.body  # the documented bound
+        assert boundary.json()["total"] == 0
+
+        fifty_one = "&".join(f"tag_id={uuid.uuid4()}" for _ in range(51))
+        oversized = await call_app(
+            jobs_app,
+            "GET",
+            f"/api/v1/jobs/runs?server_id={server_a}&{fifty_one}",
+            cookies=jar,
+        )
+        assert oversized.status == 422, oversized.body
+
+    async def test_tag_filter_is_same_server_only(
+        self, jobs_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        run_a = await self._submit(
+            jobs_app, jar, server_a, steps=[{"capability_id": READ_CAP, "payload": {"marker": "m1"}}]
+        )
+        tag = await _create_catalog_tag(jobs_app, jar, "scoped-tag")
+        await self._assign(jobs_app, jar, run_a, tag, server_a)
+        page = await self._list(
+            jobs_app, jar, f"server_id={SERVER_B}&tag_id={tag}"
+        )
+        # Other servers' runs are invisible; the tag itself never leaks rows.
+        assert page["total"] == 0
+        assert page["runs"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -79,7 +79,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from dbos import error as dbos_error
 from fastapi import APIRouter, FastAPI, Query, Request, Response
@@ -853,6 +853,8 @@ async def list_runs(
     q: str | None = Query(default=None, max_length=200),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
+    tag_id: list[uuid.UUID] | None = Query(default=None, max_length=50),
+    tag_match: Literal["any", "all"] = Query(default="any"),
 ) -> Response:
     """One bounded page of one server's runs (C01 rules 5 and 7).
 
@@ -862,9 +864,12 @@ async def list_runs(
     transition events of exactly this page's runs.
 
     Filters (``q`` case-insensitive substring over run_id, label and
-    model_profile; ``date_from``/``date_to`` over ``submitted_at``) apply
-    BEFORE pagination: the same predicate drives both the page query and
-    the pre-slice ``COUNT(*)``, so ``total`` is the filtered total.
+    model_profile; ``date_from``/``date_to`` over ``submitted_at``;
+    ``tag_id`` repeated UUID, at most 50, matched ``any``/``all`` per
+    ``tag_match``) apply BEFORE pagination: the same predicate drives
+    both the page query and the pre-slice ``COUNT(*)``, so ``total`` is
+    the filtered total. Omitting ``tag_id`` preserves the unfiltered
+    behavior; malformed or oversized tag sets fail closed (422).
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)
@@ -885,6 +890,27 @@ async def list_runs(
     if date_to is not None:
         predicates.append("submitted_at <= :date_to")
         params["date_to"] = date_to.astimezone(timezone.utc)
+    if tag_id:
+        # Tag filter (HT-W6B): match ANY (at least one) or ALL (every) of
+        # the bounded tag set. The SAME predicate drives the page query
+        # and the pre-slice COUNT below, so ``total`` stays the filtered
+        # total; the ``server_id`` predicate above keeps the match
+        # same-server only.
+        tag_ids = sorted({*tag_id})
+        if tag_match == "any":
+            predicates.append(
+                "EXISTS (SELECT 1 FROM job_tags jt "
+                "WHERE jt.job_id = job_runs.run_id "
+                "AND jt.tag_id = ANY(:tag_ids))"
+            )
+        else:
+            predicates.append(
+                "(SELECT count(DISTINCT jt.tag_id) FROM job_tags jt "
+                "WHERE jt.job_id = job_runs.run_id "
+                "AND jt.tag_id = ANY(:tag_ids)) = :tag_count"
+            )
+        params["tag_ids"] = tag_ids
+        params["tag_count"] = len(tag_ids)
     where = " AND ".join(predicates)
     async with factory() as session:
         rows = (

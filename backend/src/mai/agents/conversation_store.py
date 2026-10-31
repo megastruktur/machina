@@ -43,6 +43,7 @@ accepted on ``user`` rows only.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final, Mapping
@@ -469,27 +470,57 @@ async def alist_conversations(
     server_id: uuid.UUID,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
+    tag_ids: Sequence[uuid.UUID] | None = None,
+    tag_match: str = "any",
 ) -> tuple[list[MessagePageRow], int]:
     """Server-scoped bounded conversation list page (§3 ``GET`` list).
 
     Deterministic ``ORDER BY updated_at DESC, conversation_id`` with the
     ``COUNT(*)`` computed under the identical ``server_id`` predicate.
     Returns ``(items, total)``.
+
+    ``tag_ids`` (HT-W6B) is an optional bounded tag filter matched
+    ``any`` (at least one) or ``all`` (every) per ``tag_match``; the SAME
+    predicate is appended to the page query and the pre-slice
+    ``COUNT(*)``, so ``total`` is the filtered total. Omitted ``tag_ids``
+    preserves the unfiltered behavior; an unusable ``tag_match`` with a
+    supplied ``tag_ids`` set fails closed.
     """
     _check_page_bounds(limit, offset)
+    predicate = "c.server_id = :sid"
+    params: dict[str, object] = {"sid": server_id, "l": limit, "o": offset}
+    if tag_ids:
+        ids = sorted({*tag_ids})
+        if tag_match == "any":
+            predicate += (
+                " AND EXISTS (SELECT 1 FROM conversation_tags ct "
+                "WHERE ct.conversation_id = c.conversation_id "
+                "AND ct.tag_id = ANY(:tag_ids))"
+            )
+        elif tag_match == "all":
+            predicate += (
+                " AND (SELECT count(DISTINCT ct.tag_id) "
+                "FROM conversation_tags ct "
+                "WHERE ct.conversation_id = c.conversation_id "
+                "AND ct.tag_id = ANY(:tag_ids)) = :tag_count"
+            )
+        else:
+            raise ValueError("tag_match must be one of: any, all")
+        params["tag_ids"] = ids
+        params["tag_count"] = len(ids)
     async with sessions() as session:
         total = int(
             (
                 await session.execute(
-                    text("SELECT COUNT(*) FROM conversations WHERE server_id = :sid"),
-                    {"sid": server_id},
+                    text(f"SELECT COUNT(*) FROM conversations c WHERE {predicate}"),
+                    params,
                 )
             ).scalar_one()
         )
         rows = (
             await session.execute(
                 text(
-                    """
+                    f"""
                     SELECT c.conversation_id, c.server_id, c.title,
                            c.created_at, c.updated_at,
                            (SELECT COUNT(*) FROM conversation_messages m
@@ -497,12 +528,12 @@ async def alist_conversations(
                                AS message_count,
                            c.active_task_id, c.active_run_id
                     FROM conversations c
-                    WHERE c.server_id = :sid
+                    WHERE {predicate}
                     ORDER BY c.updated_at DESC, c.conversation_id
                     LIMIT :l OFFSET :o
                     """
                 ),
-                {"sid": server_id, "l": limit, "o": offset},
+                params,
             )
         ).mappings().all()
     items = [

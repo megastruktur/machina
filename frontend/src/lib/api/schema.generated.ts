@@ -403,9 +403,12 @@ export interface paths {
          *     transition events of exactly this page's runs.
          *
          *     Filters (``q`` case-insensitive substring over run_id, label and
-         *     model_profile; ``date_from``/``date_to`` over ``submitted_at``) apply
-         *     BEFORE pagination: the same predicate drives both the page query and
-         *     the pre-slice ``COUNT(*)``, so ``total`` is the filtered total.
+         *     model_profile; ``date_from``/``date_to`` over ``submitted_at``;
+         *     ``tag_id`` repeated UUID, at most 50, matched ``any``/``all`` per
+         *     ``tag_match``) apply BEFORE pagination: the same predicate drives
+         *     both the page query and the pre-slice ``COUNT(*)``, so ``total`` is
+         *     the filtered total. Omitting ``tag_id`` preserves the unfiltered
+         *     behavior; malformed or oversized tag sets fail closed (422).
          */
         get: operations["list_runs_api_v1_jobs_runs_get"];
         put?: never;
@@ -646,7 +649,11 @@ export interface paths {
          *     The page is exactly the requested server's scope; ordering and the
          *     same-filter total are the storage owner's deterministic contract
          *     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
-         *     transcript content ever rides a list page.
+         *     transcript content ever rides a list page. ``tag_id`` (repeated
+         *     UUID, at most 50, matched ``any``/``all`` per ``tag_match``) filters
+         *     BEFORE pagination through the store's matching predicate for both
+         *     slice and total; omitting it preserves the unfiltered behavior and
+         *     malformed/oversized sets fail closed (422).
          */
         get: operations["list_canonical_conversations_api_v1_chat_conversations_get"];
         put?: never;
@@ -926,6 +933,184 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded page of the global tag catalog
+         * @description One bounded catalog page (safe read: session layer only).
+         *
+         *     Ordering and the same-filter total are the store's deterministic
+         *     contract (``ORDER BY lower(name), tag_id``; ``COUNT(*)`` under the
+         *     identical predicate).
+         */
+        get: operations["list_tags_api_v1_tags_get"];
+        put?: never;
+        /**
+         * Create one catalog tag (idempotent on the canonical name)
+         * @description Create (or canonically return) one catalog tag.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The store normalizes the name and returns an existing canonical
+         *     match untouched — a re-create is idempotent and never overwrites the
+         *     stored description; the response is the canonical row either way.
+         */
+        post: operations["create_tag_api_v1_tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete one catalog tag under the used/unused policy
+         * @description Delete one catalog tag; the store owns the used/unused policy.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Unused tags delete directly; used tags refuse without ``force``; a
+         *     forced delete proceeds only when every affected entity keeps another
+         *     tag or receives ``replacement_tag_id`` inside the store's single
+         *     transaction. The reserved ``unclassified`` tag can never be deleted.
+         */
+        delete: operations["delete_tag_api_v1_tags__tag_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/runs/{run_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded tag page for one job run (explicit server scope)
+         * @description The run's bounded tag page (safe read: session layer only).
+         *
+         *     The store resolves the run inside the requesting ``server_id`` scope;
+         *     a missing and a cross-server run are the SAME closed 404 envelope as
+         *     the run surface's, so existence never leaks across scopes.
+         */
+        get: operations["list_job_tags_api_v1_jobs_runs__run_id__tags_get"];
+        put?: never;
+        /**
+         * Assign one tag to a job run (idempotent, user-sourced)
+         * @description Assign one catalog tag to one run (re-assignment is a no-op).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The assignment is user-originated: ``assignment_source='user'`` and
+         *     the bounded non-secret actor is the validated session's token hash —
+         *     never client-supplied input.
+         */
+        post: operations["assign_job_tag_api_v1_jobs_runs__run_id__tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/runs/{run_id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove one job-run tag (idempotent, final-tag protected)
+         * @description Remove one run-tag association (removing an absent one is a no-op).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Removing the run's final ordinary tag requires ``replacement_tag_id``:
+         *     removal and replacement commit together, so the mandatory-tag
+         *     invariant never drops below one tag.
+         */
+        delete: operations["remove_job_tag_api_v1_jobs_runs__run_id__tags__tag_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded tag page for one canonical conversation
+         * @description The conversation's bounded tag page (safe read; session only).
+         *
+         *     The store resolves the conversation inside the requesting
+         *     ``server_id`` scope; a missing and a cross-server conversation are
+         *     the SAME scope-blind 404 envelope as the conversation read surface.
+         *     The zero UUID server scope (General Consult) is valid HERE ONLY.
+         */
+        get: operations["list_conversation_tags_api_v1_chat_conversations__conversation_id__tags_get"];
+        put?: never;
+        /**
+         * Assign one tag to a conversation (idempotent, user-sourced)
+         * @description Assign one catalog tag to one conversation (re-assignment: no-op).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     The assignment is user-originated: ``assignment_source='user'`` and
+         *     the bounded non-secret actor is the validated session's token hash —
+         *     never client-supplied input. The zero UUID server scope (General
+         *     Consult) is valid HERE ONLY.
+         */
+        post: operations["assign_conversation_tag_api_v1_chat_conversations__conversation_id__tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove one conversation tag (idempotent, final-tag protected)
+         * @description Remove one conversation-tag association (absent removal: no-op).
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
+         *     Removing the conversation's final ordinary tag requires
+         *     ``replacement_tag_id``: removal and replacement commit together, so
+         *     the mandatory-tag invariant never drops below one tag. The zero UUID
+         *     server scope (General Consult) is valid HERE ONLY.
+         */
+        delete: operations["remove_conversation_tag_api_v1_chat_conversations__conversation_id__tags__tag_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3568,6 +3753,43 @@ export interface components {
             tag_preview: components["schemas"]["EntityTagPreviewView"];
         };
         /**
+         * ConversationTagsPage
+         * @description One bounded tag page for one canonical conversation (same-server).
+         */
+        ConversationTagsPage: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice count for this conversation
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Association rows in deterministic name order
+             */
+            items?: components["schemas"]["EntityTagView"][];
+        };
+        /**
          * ConversationTranscriptPage
          * @description One role-preserving sanitized message page (§3), ordered by
          *     ``(sequence, message_id)`` with the same-filter ``total``.
@@ -3868,6 +4090,38 @@ export interface components {
              * @description Honest total number of tags attached (including beyond preview); at least one tag is mandatory, so 0 is never valid
              */
             total: number;
+        };
+        /**
+         * EntityTagView
+         * @description One association row as seen from its owning entity.
+         */
+        EntityTagView: {
+            /**
+             * Tag Id
+             * Format: uuid
+             * @description Assigned catalog tag identity
+             */
+            tag_id: string;
+            /**
+             * Name
+             * @description Canonical tag display name
+             */
+            name: string;
+            /**
+             * Assigned By
+             * @description Bounded actor reference (empty for system writers)
+             */
+            assigned_by: string;
+            /**
+             * Assignment Source
+             * @description Writer vocabulary: agent, user or system
+             */
+            assignment_source: string;
+            /**
+             * Created At
+             * @description RFC3339 UTC assignment timestamp
+             */
+            created_at: string;
         };
         /**
          * ErrorBody
@@ -4190,6 +4444,42 @@ export interface components {
             config_schema?: {
                 [key: string]: unknown;
             } | null;
+        };
+        /**
+         * JobTagsPage
+         * @description One bounded tag page for one job run (same-server scope).
+         */
+        JobTagsPage: {
+            /**
+             * Run Id
+             * @description The owning job run identity
+             */
+            run_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice count for this run
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Association rows in deterministic name order
+             */
+            items?: components["schemas"]["EntityTagView"][];
         };
         /**
          * LaneView
@@ -6048,6 +6338,107 @@ export interface components {
             description: string | null;
         };
         /**
+         * TagAssignBody
+         * @description Assign body (strict): the tag plus the explicit server scope.
+         */
+        TagAssignBody: {
+            /**
+             * Tag Id
+             * Format: uuid
+             * @description Catalog tag to assign
+             */
+            tag_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (C01 rule 2); the entity is resolved inside exactly this scope
+             */
+            server_id: string;
+        };
+        /**
+         * TagCreateBody
+         * @description Create body (strict: unknown fields are rejected, value-free 422).
+         *
+         *     Bounds mirror the store's canonical limits (name ≤ 64, description
+         *     ≤ 500); normalization truth is the store — the stored name is the
+         *     canonical form of the submitted one.
+         */
+        TagCreateBody: {
+            /**
+             * Name
+             * @description Tag display name; stored whitespace-normalized and canonically unique case-insensitively
+             */
+            name: string;
+            /**
+             * Description
+             * @description Optional free-form description of the tag's meaning
+             */
+            description?: string | null;
+        };
+        /**
+         * TagPage
+         * @description One bounded catalog page (AGENTS.md §1 pagination invariant).
+         */
+        TagPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count under the identical filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Catalog rows in deterministic lower(name) order
+             */
+            items?: components["schemas"]["TagView"][];
+        };
+        /**
+         * TagView
+         * @description One catalog row: the normalized display name IS the stored name.
+         */
+        TagView: {
+            /**
+             * Tag Id
+             * Format: uuid
+             * @description Opaque stable tag identity
+             */
+            tag_id: string;
+            /**
+             * Name
+             * @description Canonical stored display name
+             */
+            name: string;
+            /**
+             * Description
+             * @description Optional free-form description, when set
+             */
+            description: string | null;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-update timestamp
+             */
+            updated_at: string;
+        };
+        /**
          * TaskConstraintView
          * @description One constraint row with its source anchors (§5/§6).
          *
@@ -7854,6 +8245,8 @@ export interface operations {
                 q?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;
+                tag_id?: string[] | null;
+                tag_match?: "any" | "all";
             };
             header?: never;
             path?: never;
@@ -8597,6 +8990,8 @@ export interface operations {
                 server_id: string;
                 limit?: number;
                 offset?: number;
+                tag_id?: string[] | null;
+                tag_match?: "any" | "all";
             };
             header?: never;
             path?: never;
@@ -9369,6 +9764,540 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_tags_api_v1_tags_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                /** @description Case-insensitive substring filter over tag names */
+                name_filter?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_tag_api_v1_tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_tag_api_v1_tags__tag_id__delete: {
+        parameters: {
+            query?: {
+                /** @description Required to delete a tag that still has associations */
+                force?: boolean;
+                /** @description Re-classification target for entities whose ONLY tag is the deleted one (same-transaction swap) */
+                replacement_tag_id?: string | null;
+            };
+            header?: never;
+            path: {
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No such tag */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Tag in use without force, reserved, or an entity would lose its final tag */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_job_tags_api_v1_jobs_runs__run_id__tags_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobTagsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    assign_job_tag_api_v1_jobs_runs__run_id__tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagAssignBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run or no tag in the requesting scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    remove_job_tag_api_v1_jobs_runs__run_id__tags__tag_id__delete: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
+                server_id: string;
+                /** @description Re-classification target committed in the same transaction when this is the run's final tag */
+                replacement_tag_id?: string | null;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No run or no tag in the requesting scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The run's final tag cannot be removed without a replacement */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_conversation_tags_api_v1_chat_conversations__conversation_id__tags_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTagsPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    assign_conversation_tag_api_v1_chat_conversations__conversation_id__tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagAssignBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation or no tag in the requesting scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    remove_conversation_tag_api_v1_chat_conversations__conversation_id__tags__tag_id__delete: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
+                server_id: string;
+                /** @description Re-classification target committed in the same transaction when this is the conversation's final tag */
+                replacement_tag_id?: string | null;
+            };
+            header?: never;
+            path: {
+                conversation_id: string;
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation or no tag in the requesting scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The conversation's final tag cannot be removed without a replacement */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

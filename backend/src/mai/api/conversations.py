@@ -488,19 +488,30 @@ async def list_canonical_conversations(
     server_id: Annotated[uuid.UUID, _SERVER_ID_QUERY],
     limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(default=0, ge=0),
+    tag_id: list[uuid.UUID] | None = Query(default=None, max_length=50),
+    tag_match: Literal["any", "all"] = Query(default="any"),
 ) -> ConversationListPage:
     """One bounded page of safe conversation metadata (§3 ``GET`` list).
 
     The page is exactly the requested server's scope; ordering and the
     same-filter total are the storage owner's deterministic contract
     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
-    transcript content ever rides a list page.
+    transcript content ever rides a list page. ``tag_id`` (repeated
+    UUID, at most 50, matched ``any``/``all`` per ``tag_match``) filters
+    BEFORE pagination through the store's matching predicate for both
+    slice and total; omitting it preserves the unfiltered behavior and
+    malformed/oversized sets fail closed (422).
     """
     await _require_session(request)
     _lifecycle, _recovery = _jobs_services(request)  # fail closed when absent
     factory = _sessions(request)
     items, total = await alist_conversations(
-        factory, server_id=server_id, limit=limit, offset=offset
+        factory,
+        server_id=server_id,
+        limit=limit,
+        offset=offset,
+        tag_ids=tag_id,
+        tag_match=tag_match,
     )
     previews = await apreview_conversation_tags(
         factory,

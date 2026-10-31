@@ -239,6 +239,20 @@ export type TaskPlanPatch = components['schemas']['TaskPlanPatch'];
 export type TaskPlanStep = components['schemas']['TaskPlanStep'];
 export type TaskStepOperation = components['schemas']['TaskStepOperation'];
 export type ConstraintProposal = components['schemas']['ConstraintProposal'];
+
+/**
+ * History-tag management surface (history-tags W6B). Types come verbatim
+ * from the generated schema; these aliases only give the methods and their
+ * consumers stable names. The catalog is global (server-agnostic); the
+ * assignment pages are explicitly server-scoped per entity.
+ */
+export type TagView = components['schemas']['TagView'];
+export type TagPage = components['schemas']['TagPage'];
+export type TagCreateBody = components['schemas']['TagCreateBody'];
+export type TagAssignBody = components['schemas']['TagAssignBody'];
+export type EntityTagView = components['schemas']['EntityTagView'];
+export type JobTagsPage = components['schemas']['JobTagsPage'];
+export type ConversationTagsPage = components['schemas']['ConversationTagsPage'];
 export type EvidenceRef = components['schemas']['EvidenceRef'];
 
 /**
@@ -267,6 +281,60 @@ export interface ConversationEventsQuery {
 	afterSeq?: number;
 	/** Page size; server default and maximum are producer-owned bounds. */
 	limit?: number;
+}
+
+/** Query of the global tag catalog page (HT-W6B): bounded page + filter. */
+export interface TagCatalogQuery {
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+	/** Case-insensitive substring filter over tag names. */
+	nameFilter?: string;
+}
+
+/** Query of one entity's tag page (HT-W6B): the bounded page only. */
+export interface TagEntityTagsQuery {
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+}
+
+/** Options of the catalog DELETE: the store's used/unused policy knobs. */
+export interface TagDeleteOptions {
+	/** Required to delete a tag that still has associations. */
+	force?: boolean;
+	/** Re-classification target for entities whose ONLY tag is deleted. */
+	replacementTagId?: string;
+}
+
+/** Options of an association DELETE: explicit scope + optional replacement. */
+export interface TagRemovalOptions {
+	/** Explicit server scope (C01 rule 2). */
+	serverId: string;
+	/** Replacement committed in the same transaction on final-tag removal. */
+	replacementTagId?: string;
+}
+
+/** Runs-list query (HT-W6B): the reviewed page + the bounded tag filter. */
+export interface TaggedRunsPageQuery extends PageQuery {
+	/** Repeated catalog tag ids; at most 50, matched per `tagMatch`. */
+	tagIds?: string[];
+	/** `any` (at least one, default) or `all` (every). */
+	tagMatch?: 'any' | 'all';
+}
+
+/** Canonical conversations-list query (HT-W6B): bounded page + tag filter. */
+export interface TaggedConversationsPageQuery {
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+	/** Repeated catalog tag ids; at most 50, matched per `tagMatch`. */
+	tagIds?: string[];
+	/** `any` (at least one, default) or `all` (every). */
+	tagMatch?: 'any' | 'all';
 }
 
 /**
@@ -621,7 +689,7 @@ export interface MaiApiClient {
 	/** POST /api/v1/jobs/runs/{run_id}/cancel — records the request once. */
 	cancelRun(runId: string, payload: CancelBody): Promise<CancelView>;
 	/** GET /api/v1/jobs/runs?server_id=… — explicit scope, never unfiltered. */
-	listRuns(serverId: string, page?: PageQuery): Promise<RunPage>;
+	listRuns(serverId: string, page?: TaggedRunsPageQuery): Promise<RunPage>;
 	/** POST /api/v1/password-challenges — spends one decision, one secret. */
 	submitChallenge(payload: ChallengeBody): Promise<ChallengeOutcomeView>;
 	/** GET /api/v1/servers/{server_id}/terminal/info — terminal attach view. */
@@ -661,7 +729,7 @@ export interface MaiApiClient {
 	 */
 	listCanonicalConversations(
 		serverId: string,
-		page?: PageQuery
+		page?: TaggedConversationsPageQuery
 	): Promise<CanonicalConversationPage>;
 	/** GET /api/v1/chat/conversations/{id}?server_id=… — safe header + gap honesty. */
 	getConversation(conversationId: string, serverId: string): Promise<CanonicalConversationDetail>;
@@ -707,6 +775,42 @@ export interface MaiApiClient {
 		conversationId: string,
 		payload: ConversationSteerRequest
 	): Promise<ConversationSteerView>;
+
+	// History-tag management surface (W6B). The catalog is global; entity
+	// reads/mutations take their explicit `server_id` (C01 rule 2), and the
+	// zero-UUID General Consult scope is valid on the conversation routes
+	// ONLY. Assignments are idempotent 204s; the deletion routes speak the
+	// store's used/unused policy (force + same-transaction replacement).
+	/** GET /api/v1/tags — bounded catalog page with the name filter. */
+	listTags(query?: TagCatalogQuery): Promise<TagPage>;
+	/** POST /api/v1/tags — idempotent canonical create (same row back). */
+	createTag(payload: TagCreateBody): Promise<TagView>;
+	/** DELETE /api/v1/tags/{tag_id} — used tags need force (+ replacement). */
+	deleteTag(tagId: string, options?: TagDeleteOptions): Promise<void>;
+	/** GET /api/v1/jobs/runs/{run_id}/tags?server_id=… — bounded run page. */
+	listRunTags(
+		runId: string,
+		serverId: string,
+		page?: TagEntityTagsQuery
+	): Promise<JobTagsPage>;
+	/** POST /api/v1/jobs/runs/{run_id}/tags — idempotent user assignment. */
+	assignRunTag(runId: string, payload: TagAssignBody): Promise<void>;
+	/** DELETE /api/v1/jobs/runs/{run_id}/tags/{tag_id}?server_id=… — removal. */
+	removeRunTag(runId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
+	/** GET /api/v1/chat/conversations/{id}/tags?server_id=… — bounded page. */
+	listConversationTags(
+		conversationId: string,
+		serverId: string,
+		page?: TagEntityTagsQuery
+	): Promise<ConversationTagsPage>;
+	/** POST /api/v1/chat/conversations/{id}/tags — idempotent user assignment. */
+	assignConversationTag(conversationId: string, payload: TagAssignBody): Promise<void>;
+	/** DELETE /api/v1/chat/conversations/{id}/tags/{tag_id}?server_id=… — removal. */
+	removeConversationTag(
+		conversationId: string,
+		tagId: string,
+		options: TagRemovalOptions
+	): Promise<void>;
 
 	// Task surface (§8; 15-task-api). Every method takes its explicit
 	// `server_id` (C01 rule 2); every collection read is a bounded page
@@ -1032,8 +1136,9 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				`/api/v1/jobs/runs/${encodeURIComponent(runId)}/cancel`,
 				payload
 			),
-		// Runs list (W1 filters ride the reviewed endpoint; URLSearchParams
-		// keeps the encoding of q and the explicit ISO date bounds honest).
+		// Runs list (W1 filters + the W6B bounded tag filter ride the
+		// reviewed endpoint; URLSearchParams keeps the encoding of q, the
+		// explicit ISO date bounds and the repeated tag_id list honest).
 		listRuns: (serverId, page) => {
 			const params = new URLSearchParams({ server_id: serverId });
 			if (page?.limit !== undefined) params.set('limit', String(page.limit));
@@ -1043,6 +1148,8 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				params.set('date_from', page.date_from);
 			if (page?.date_to !== undefined && page.date_to !== '')
 				params.set('date_to', page.date_to);
+			for (const tagId of page?.tagIds ?? []) params.append('tag_id', tagId);
+			if (page?.tagMatch !== undefined) params.set('tag_match', page.tagMatch);
 			return requestJson<RunPage>('GET', `/api/v1/jobs/runs?${params.toString()}`);
 		},
 		submitChallenge: (payload) =>
@@ -1104,11 +1211,94 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 		// Canonical conversation surface (§3; 09-client-continuity). Same
 		// transport as every other method: C01 envelope errors through
 		// `ApiError`, session cookies + CSRF double-submit on mutations.
-		listCanonicalConversations: (serverId, page) =>
-			requestJson<CanonicalConversationPage>(
+		// The W6B tag filter rides the reviewed endpoint; the repeated
+		// tag_id list is appended before the page suffix so both encodings
+		// stay honest.
+		listCanonicalConversations: (serverId, page) => {
+			const tagFilter = new URLSearchParams();
+			for (const tagId of page?.tagIds ?? []) tagFilter.append('tag_id', tagId);
+			if (page?.tagMatch !== undefined) tagFilter.set('tag_match', page.tagMatch);
+			const rendered = tagFilter.toString();
+			return requestJson<CanonicalConversationPage>(
 				'GET',
-				`/api/v1/chat/conversations?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+				`/api/v1/chat/conversations?server_id=${encodeURIComponent(serverId)}${rendered === '' ? '' : `&${rendered}`}${pageSuffix(page)}`
+			);
+		},
+		// History-tag management surface (W6B). Same transport as every
+		// other method: C01 envelope errors through `ApiError`, session
+		// cookies + CSRF double-submit on mutations.
+		listTags: (query) => {
+			const params = new URLSearchParams();
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			if (query?.offset !== undefined) params.set('offset', String(query.offset));
+			if (query?.nameFilter !== undefined && query.nameFilter !== '')
+				params.set('name_filter', query.nameFilter);
+			const rendered = params.toString();
+			return requestJson<TagPage>(
+				'GET',
+				`/api/v1/tags${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		createTag: (payload) => requestJson<TagView>('POST', '/api/v1/tags', payload),
+		deleteTag: (tagId, options) => {
+			const params = new URLSearchParams();
+			if (options?.force !== undefined) params.set('force', String(options.force));
+			if (options?.replacementTagId !== undefined && options.replacementTagId !== '')
+				params.set('replacement_tag_id', options.replacementTagId);
+			const rendered = params.toString();
+			return requestVoid(
+				'DELETE',
+				`/api/v1/tags/${encodeURIComponent(tagId)}${rendered === '' ? '' : `?${rendered}`}`,
+				undefined,
+				204
+			);
+		},
+		listRunTags: (runId, serverId, page) =>
+			requestJson<JobTagsPage>(
+				'GET',
+				`/api/v1/jobs/runs/${encodeURIComponent(runId)}/tags?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
 			),
+		assignRunTag: (runId, payload) =>
+			requestVoid(
+				'POST',
+				`/api/v1/jobs/runs/${encodeURIComponent(runId)}/tags`,
+				payload,
+				204
+			),
+		removeRunTag: (runId, tagId, options) => {
+			const params = new URLSearchParams({ server_id: options.serverId });
+			if (options.replacementTagId !== undefined && options.replacementTagId !== '')
+				params.set('replacement_tag_id', options.replacementTagId);
+			return requestVoid(
+				'DELETE',
+				`/api/v1/jobs/runs/${encodeURIComponent(runId)}/tags/${encodeURIComponent(tagId)}?${params.toString()}`,
+				undefined,
+				204
+			);
+		},
+		listConversationTags: (conversationId, serverId, page) =>
+			requestJson<ConversationTagsPage>(
+				'GET',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		assignConversationTag: (conversationId, payload) =>
+			requestVoid(
+				'POST',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags`,
+				payload,
+				204
+			),
+		removeConversationTag: (conversationId, tagId, options) => {
+			const params = new URLSearchParams({ server_id: options.serverId });
+			if (options.replacementTagId !== undefined && options.replacementTagId !== '')
+				params.set('replacement_tag_id', options.replacementTagId);
+			return requestVoid(
+				'DELETE',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags/${encodeURIComponent(tagId)}?${params.toString()}`,
+				undefined,
+				204
+			);
+		},
 		getConversation: (conversationId, serverId) =>
 			requestJson<CanonicalConversationDetail>(
 				'GET',

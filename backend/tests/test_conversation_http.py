@@ -1259,3 +1259,371 @@ async def test_legacy_gaps_labeled_not_fabricated(
         f"/api/v1/chat/conversations/{legacy.conversation_id}?server_id={server_a}",
     )
     assert anonymous.status == 401
+
+
+# ---------------------------------------------------------------------------
+# HT-W6B: conversation tag routes + the list tag_id filter
+# ---------------------------------------------------------------------------
+
+
+async def _create_catalog_tag(
+    history_app: FastAPI, jar: dict[str, str], name: str
+) -> uuid.UUID:
+    """Create one catalog tag through the real HTTP surface."""
+    response = await call_app(
+        history_app,
+        "POST",
+        "/api/v1/tags",
+        json_body={"name": name},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert response.status == 201, response.body
+    return uuid.UUID(response.json()["tag_id"])
+
+
+async def _assign_conversation_tag_http(
+    history_app: FastAPI,
+    jar: dict[str, str],
+    conversation_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    server_id: uuid.UUID,
+) -> HttpResponse:
+    """POST one conversation-tag assignment through the real HTTP surface."""
+    return await call_app(
+        history_app,
+        "POST",
+        f"/api/v1/chat/conversations/{conversation_id}/tags",
+        json_body={"tag_id": str(tag_id), "server_id": str(server_id)},
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+
+
+async def test_conversation_tag_routes_add_list_remove_cycle(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    conversation = await _seed_canonical_conversation(history_app, server_a)
+    tag_id = await _create_catalog_tag(history_app, jar, "w6b-cycle")
+    path = f"/api/v1/chat/conversations/{conversation.conversation_id}/tags"
+
+    assigned = await _assign_conversation_tag_http(
+        history_app, jar, conversation.conversation_id, tag_id, server_a
+    )
+    assert assigned.status == 204
+    assert assigned.body == b""
+
+    listed = await call_app(
+        history_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+    )
+    assert listed.status == 200, listed.body
+    body = listed.json()
+    assert body["conversation_id"] == str(conversation.conversation_id)
+    assert body["total"] == 2  # the reserved seed + the user assignment
+    row = next(item for item in body["items"] if item["tag_id"] == str(tag_id))
+    assert row["assignment_source"] == "user"
+    # Bounded non-secret actor: the validated session's token hash.
+    assert len(row["assigned_by"]) == 64
+    assert all(c in "0123456789abcdef" for c in row["assigned_by"])
+
+    removed = await call_app(
+        history_app,
+        "DELETE",
+        f"{path}/{tag_id}?server_id={server_a}",
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert removed.status == 204
+    relisted = await call_app(
+        history_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+    )
+    assert relisted.json()["total"] == 1
+
+
+async def test_conversation_tag_routes_cross_server_scope_blind(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    conversation = await _seed_canonical_conversation(history_app, server_a)
+    path = f"/api/v1/chat/conversations/{conversation.conversation_id}/tags"
+    foreign = f"?server_id={SERVER_B}"
+
+    foreign_get = await call_app(
+        history_app, "GET", f"{path}{foreign}", cookies=jar
+    )
+    missing_get = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations/{uuid.uuid4()}/tags{foreign}",
+        cookies=jar,
+    )
+    assert foreign_get.status == 404 and missing_get.status == 404
+    # Missing ≡ foreign: identical closed envelopes, existence never leaks.
+    for response in (foreign_get, missing_get):
+        assert _error(response)["code"] == "conversation_not_found"
+    assert _error(foreign_get)["message"] == _error(missing_get)["message"]
+
+    tag_id = await _create_catalog_tag(history_app, jar, "w6b-foreign")
+    foreign_assign = await _assign_conversation_tag_http(
+        history_app, jar, conversation.conversation_id, tag_id, SERVER_B
+    )
+    assert foreign_assign.status == 404
+    assert _error(foreign_assign)["code"] == "conversation_not_found"
+
+    foreign_delete = await call_app(
+        history_app,
+        "DELETE",
+        f"{path}/{tag_id}{foreign}",
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert foreign_delete.status == 404
+
+
+async def test_conversation_tag_routes_zero_uuid_general_consult(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    zero = uuid.UUID(int=0)
+    conversation = await _seed_canonical_conversation(history_app, zero)
+    conversation_id = conversation.conversation_id
+    tag_id = await _create_catalog_tag(history_app, jar, "w6b-consult")
+    path = f"/api/v1/chat/conversations/{conversation_id}/tags"
+
+    assigned = await _assign_conversation_tag_http(
+        history_app, jar, conversation_id, tag_id, zero
+    )
+    assert assigned.status == 204
+
+    listed = await call_app(
+        history_app, "GET", f"{path}?server_id={zero}", cookies=jar
+    )
+    assert listed.status == 200, listed.body
+    assert listed.json()["total"] == 2
+
+    other_scope = await call_app(
+        history_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+    )
+    assert other_scope.status == 404  # same entity, different scope: closed
+
+    removed = await call_app(
+        history_app,
+        "DELETE",
+        f"{path}/{tag_id}?server_id={zero}",
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert removed.status == 204
+
+
+async def test_conversation_tag_final_tag_protection(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    conversation = await _seed_canonical_conversation(history_app, server_a)
+    conversation_id = conversation.conversation_id
+    reserved = uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+    path = f"/api/v1/chat/conversations/{conversation_id}/tags"
+
+    refused = await call_app(
+        history_app,
+        "DELETE",
+        f"{path}/{reserved}?server_id={server_a}",
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert refused.status == 409
+    assert _error(refused)["code"] == "last_tag"
+
+    replacement = await _create_catalog_tag(history_app, jar, "w6b-replacement")
+    swapped = await call_app(
+        history_app,
+        "DELETE",
+        f"{path}/{reserved}?server_id={server_a}&replacement_tag_id={replacement}",
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert swapped.status == 204
+    listed = await call_app(
+        history_app, "GET", f"{path}?server_id={server_a}", cookies=jar
+    )
+    body = listed.json()
+    assert body["total"] == 1
+    assert body["items"][0]["tag_id"] == str(replacement)
+
+
+async def test_conversation_list_tag_filter_any_and_all(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    tagged = await _seed_canonical_conversation(history_app, server_a, title="tagged")
+    other = await _seed_canonical_conversation(history_app, server_a, title="other")
+    tag_a = await _create_catalog_tag(history_app, jar, "list-alpha")
+    tag_b = await _create_catalog_tag(history_app, jar, "list-beta")
+    tag_c = await _create_catalog_tag(history_app, jar, "list-gamma")
+    assert (
+        await _assign_conversation_tag_http(
+            history_app, jar, tagged.conversation_id, tag_a, server_a
+        )
+    ).status == 204
+    assert (
+        await _assign_conversation_tag_http(
+            history_app, jar, tagged.conversation_id, tag_b, server_a
+        )
+    ).status == 204
+    assert (
+        await _assign_conversation_tag_http(
+            history_app, jar, other.conversation_id, tag_c, server_a
+        )
+    ).status == 204
+
+    # ANY: at least one of the set.
+    single = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&tag_id={tag_a}",
+        cookies=jar,
+    )
+    assert single.status == 200
+    assert single.json()["total"] == 1
+    assert [str(tagged.conversation_id)] == [
+        item["conversation_id"] for item in single.json()["items"]
+    ]
+    spread = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}"
+        f"&tag_id={tag_a}&tag_id={tag_c}&tag_match=any",
+        cookies=jar,
+    )
+    assert spread.json()["total"] == 2
+
+    # ALL: every id of the set must be present.
+    both = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}"
+        f"&tag_id={tag_a}&tag_id={tag_b}&tag_match=all",
+        cookies=jar,
+    )
+    assert both.json()["total"] == 1
+    assert [str(tagged.conversation_id)] == [
+        item["conversation_id"] for item in both.json()["items"]
+    ]
+    impossible = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}"
+        f"&tag_id={tag_a}&tag_id={tag_c}&tag_match=all",
+        cookies=jar,
+    )
+    assert impossible.json()["total"] == 0
+    assert impossible.json()["items"] == []
+
+
+async def test_conversation_list_tag_filter_before_pagination(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    first = await _seed_canonical_conversation(history_app, server_a, title="pf-one")
+    second = await _seed_canonical_conversation(history_app, server_a, title="pf-two")
+    await _seed_canonical_conversation(history_app, server_a, title="pf-untagged")
+    tag = await _create_catalog_tag(history_app, jar, "list-page")
+    for conversation in (first, second):
+        assert (
+            await _assign_conversation_tag_http(
+                history_app, jar, conversation.conversation_id, tag, server_a
+            )
+        ).status == 204
+
+    unfiltered = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}",
+        cookies=jar,
+    )
+    assert unfiltered.json()["total"] == 3  # omitted filter preserves behavior
+    match_inert = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&tag_match=all",
+        cookies=jar,
+    )
+    assert match_inert.json()["total"] == 3  # match mode without tag_id: inert
+
+    page = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}"
+        f"&tag_id={tag}&limit=1&offset=1",
+        cookies=jar,
+    )
+    assert page.status == 200
+    body = page.json()
+    # The FILTERED total (2), not the scope total (3).
+    assert body["total"] == 2
+    assert body["limit"] == 1 and body["offset"] == 1
+    assert body["has_more"] is False
+    assert len(body["items"]) == 1
+    assert body["items"][0]["conversation_id"] in {
+        str(first.conversation_id),
+        str(second.conversation_id),
+    }
+
+
+async def test_conversation_list_tag_filter_validation(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    malformed = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&tag_id=not-a-uuid",
+        cookies=jar,
+    )
+    assert malformed.status == 422
+    assert _error(malformed)["code"] == "validation_failed"
+
+    bad_match = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&tag_match=some",
+        cookies=jar,
+    )
+    assert bad_match.status == 422
+
+    fifty = "&".join(f"tag_id={uuid.uuid4()}" for _ in range(50))
+    boundary = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&{fifty}",
+        cookies=jar,
+    )
+    assert boundary.status == 200, boundary.body  # the documented bound
+    assert boundary.json()["total"] == 0
+
+    fifty_one = "&".join(f"tag_id={uuid.uuid4()}" for _ in range(51))
+    oversized = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={server_a}&{fifty_one}",
+        cookies=jar,
+    )
+    assert oversized.status == 422
+
+
+async def test_conversation_list_tag_filter_is_same_server_only(
+    history_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+) -> None:
+    conversation = await _seed_canonical_conversation(history_app, server_a)
+    tag = await _create_catalog_tag(history_app, jar, "scope-only")
+    assert (
+        await _assign_conversation_tag_http(
+            history_app, jar, conversation.conversation_id, tag, server_a
+        )
+    ).status == 204
+
+    page = await call_app(
+        history_app,
+        "GET",
+        f"/api/v1/chat/conversations?server_id={SERVER_B}&tag_id={tag}",
+        cookies=jar,
+    )
+    # Other servers' conversations are invisible; the tag never leaks rows.
+    assert page.status == 200
+    assert page.json()["total"] == 0
+    assert page.json()["items"] == []
