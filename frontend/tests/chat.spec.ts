@@ -2247,6 +2247,60 @@ test('live model thinking and every tool call stream with scrubbed args and resu
 	await expect(main.getByTestId('assistant-tool-card')).toContainText('SUCCEEDED');
 });
 
+test('stream events never autoscroll a reader who scrolled up (pure manual scroll)', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	const main = page.getByTestId('host-main');
+	await submitFromHost(page, 'host-main', 'Inspect the live operation');
+	queueStreamPair({ frames: [
+		frame(1, 'agent.output_delta', { round: 0, kind: 'thinking', part_index: 0, delta: 'I should inspect the runbook.' })
+	] });
+	await expect(main.getByTestId('assistant-model-thinking')).toHaveText(
+		'I should inspect the runbook.'
+	);
+
+	// Bound the transcript height so it definitely overflows, then the
+	// reader scrolls UP and stays there while more parts arrive.
+	await page.addStyleTag({
+		content: '.mai-chat__conversation-scroll { max-height: 140px !important; }'
+	});
+	const scroll = main.locator('.mai-chat__conversation-scroll');
+	const scrollable = await scroll.evaluate(
+		(el) => {
+			el.scrollTop = el.scrollHeight;
+			return el.scrollHeight > el.clientHeight;
+		}
+	);
+	expect(scrollable, 'transcript is scrollable').toBe(true);
+	await scroll.evaluate((el) => {
+		el.scrollTop = 0;
+	});
+
+	// tool request → result → streamed text → final round → completion, all
+	// folded while the reader is parked at the top of the transcript.
+	queueStreamPair({ frames: [
+		frame(2, 'agent.tool_requested', {
+			tool_call_id: 'live-call', capability_id: 'app.list_catalog',
+			args: { limit: 10 }, args_partial: false, args_valid: true
+		}),
+		frame(3, 'agent.tool_result', {
+			tool_call_id: 'live-call', capability_id: 'app.list_catalog', step_seq: 1,
+			state: 'succeeded', result: { items: ['kb'], total: 1 }
+		}),
+		frame(4, 'agent.output_delta', { round: 1, kind: 'text', part_index: 0, delta: 'Catalog inspected.' }),
+		frame(5, 'agent.model_round', { round: 1, status: 'final', output_chars: 18 }),
+		frame(6, 'agent.completed', { rounds: 1, tool_calls: 1, output_chars: 18 })
+	] });
+	await expect(main.getByTestId('assistant-tool-card')).toContainText('SUCCEEDED');
+	await expect(main.getByTestId('assistant-reply-text')).toContainText('Catalog inspected.');
+
+	// Every part landed, and the scroll position never moved.
+	await expect
+		.poll(() => scroll.evaluate((el) => el.scrollTop), { timeout: 5000 })
+		.toBe(0);
+});
+
 test('Details defaults closed and preserves draft, transcript, scope and subscriptions', async ({ page }) => {
 	await openFixture(page, 'compose');
 	const main = page.getByTestId('host-main');

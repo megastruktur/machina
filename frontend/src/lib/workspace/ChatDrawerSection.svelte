@@ -185,15 +185,29 @@
 						</div>
 					{:else}
 						<div class="mai-chat-drawer__item-row">
-							<NavItem
-								icon="💬"
-								label={formatConversationLabel(row)}
-								meta={row.state ?? ''}
-								active={activeRunId === row.run_id}
-								data-testid="drawer-history-item"
-								onclick={() => onselectconversation(row.run_id)}
-							/>
-							{#if row.tag_preview !== undefined && tagLoader !== undefined}
+							<div class="mai-chat-drawer__item-head">
+								<NavItem
+									icon="💬"
+									label={formatConversationLabel(row)}
+									meta={row.state ?? ''}
+									active={activeRunId === row.run_id}
+									data-testid="drawer-history-item"
+									onclick={() => onselectconversation(row.run_id)}
+								/>
+								{#if onrenameconversation}
+									<button
+										type="button"
+										class="mai-chat-drawer__rename-btn"
+										aria-label="Rename chat {formatConversationLabel(row)}"
+										title="Rename chat"
+										data-testid="drawer-history-rename"
+										onclick={(e) => startRename(row, e)}
+									>
+										✎
+									</button>
+								{/if}
+							</div>
+							{#if row.tag_preview !== undefined && tagLoader !== undefined && row.tag_preview.total > 0}
 								<span class="mai-chat-drawer__row-tags" data-testid="drawer-history-row-tags">
 									<HistoryTags
 										tag_preview={row.tag_preview}
@@ -202,18 +216,6 @@
 										testId="drawer-history-row-tags"
 									/>
 								</span>
-							{/if}
-							{#if onrenameconversation}
-								<button
-									type="button"
-									class="mai-chat-drawer__rename-btn"
-									aria-label="Rename chat {formatConversationLabel(row)}"
-									title="Rename chat"
-									data-testid="drawer-history-rename"
-									onclick={(e) => startRename(row, e)}
-								>
-									✎
-								</button>
 							{/if}
 						</div>
 					{/if}
@@ -253,29 +255,46 @@
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		max-height: 15.5rem;
+		max-height: min(22rem, 42dvh);
+		overflow-x: hidden;
 		overflow-y: auto;
 		overscroll-behavior: contain;
 		scrollbar-gutter: stable;
 	}
 
+	/* Two-line row: head (nav + rename) on top, tag preview underneath.
+	 * Column layout with min-width 0 keeps long titles wrapping/ellipsizing
+	 * inside the drawer — the row never forces the list to scroll sideways. */
 	.mai-chat-drawer__item-row {
 		position: relative;
 		display: flex;
-		align-items: center;
+		flex-direction: column;
+		align-items: stretch;
 		gap: 2px;
+		min-width: 0;
+		max-width: 100%;
 	}
 
-	.mai-chat-drawer__item-row :global(.mai-nav-item) {
+	.mai-chat-drawer__item-head {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		min-width: 0;
+		max-width: 100%;
+	}
+
+	.mai-chat-drawer__item-head :global(.mai-nav-item) {
 		flex: 1 1 auto;
 		min-width: 0;
 	}
 
 	.mai-chat-drawer__row-tags {
-		flex: 0 1 auto;
 		display: inline-flex;
 		min-width: 0;
-		max-width: 9rem;
+		max-width: 100%;
+		overflow: hidden;
+		/* Indented under the head row's icon so tags read as row metadata. */
+		padding-left: 1.5rem;
 	}
 
 	.mai-chat-drawer__rename-btn,

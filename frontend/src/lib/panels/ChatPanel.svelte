@@ -1358,18 +1358,24 @@
 	 * Apply one transcript page as the visible window (ascending order).
 	 * The window is the bounded LAST page on restore; the server truth
 	 * replaces everything local, so no optimistic residue survives.
+	 * Scrolls to the bottom ONLY on explicit request (restore / fresh
+	 * submit) — polls and catch-up reads never yank a reading position.
 	 */
-	function applyCanonicalPage(page: CanonicalTranscriptPage, start: number): void {
+	function applyCanonicalPage(
+		page: CanonicalTranscriptPage,
+		start: number,
+		scrollToBottom = false
+	): void {
 		canonicalMessages = page.items ?? [];
 		canonicalTotal = page.total;
 		canonicalOffset = start;
 		canonicalHasMore = start > 0;
 		canonicalCompleteness = page.history_completeness;
-		queueMicrotask(scrollToConversationBottom);
+		if (scrollToBottom) queueMicrotask(scrollToConversationBottom);
 	}
 
 	/** Restore the bounded transcript window (latest PAGE_LIMIT rows). */
-	async function loadCanonicalMessages(): Promise<void> {
+	async function loadCanonicalMessages(scrollToBottom = false): Promise<void> {
 		const canonicalRef = canonicalApi;
 		const id = canonicalId;
 		const scope = canonicalScope;
@@ -1381,7 +1387,7 @@
 		if (disposed || canonicalId !== id || scope !== canonicalScope) return;
 		const start = Math.max(0, head.total - PAGE_LIMIT);
 		if (start === 0) {
-			applyCanonicalPage(head, 0);
+			applyCanonicalPage(head, 0, scrollToBottom);
 			return;
 		}
 		const tail = await canonicalRef.listConversationMessages(id, scope, {
@@ -1389,7 +1395,7 @@
 			offset: start
 		});
 		if (disposed || canonicalId !== id || scope !== canonicalScope) return;
-		applyCanonicalPage(tail, start);
+		applyCanonicalPage(tail, start, scrollToBottom);
 	}
 
 	/** `Load earlier`: prepend the preceding deduplicated page. */
@@ -1582,6 +1588,10 @@
 				intakePending = true;
 			}
 			composeMessage = '';
+			// The user just submitted this turn: jump to the bottom ONCE
+			// before any streaming starts. The tail refresh below and the
+			// poll cadence stay strictly manual from here on.
+			scrollToConversationBottom();
 			// The admitted turn is durable before the response: refresh the
 			// tail immediately, then the history list (message_count moved).
 			await refreshCanonicalTail();
@@ -1721,7 +1731,9 @@
 				detail.server_id === GLOBAL_CONSULT_SERVER_ID ? null : detail.server_id;
 			selectedServiceTags = [];
 			composeProfile = 'default';
-			await loadCanonicalMessages();
+			// Restoring a conversation anchors the reader at its end ONCE;
+			// the follow-up tail read and every later poll stay manual.
+			await loadCanonicalMessages(true);
 			if (disposed || canonicalId !== conversationId) return;
 			// A live writer lease resumes its stream; otherwise the bounded
 			// events read settles the honest state block.
@@ -2493,14 +2505,12 @@
 		let pos = Math.min(stepChars, totalLen);
 		streamedReply = fullText.slice(0, pos);
 		if (pos >= totalLen) {
-			scrollToConversationBottom();
 			return;
 		}
 		isStreamingReply = true;
 		streamRevealTimer = setInterval(() => {
 			pos = Math.min(pos + stepChars, totalLen);
 			streamedReply = fullText.slice(0, pos);
-			scrollToConversationBottom();
 			if (pos >= totalLen) {
 				stopStreamReveal();
 			}
@@ -2516,7 +2526,6 @@
 				thinkingSteps = [...thinkingSteps, trimmed];
 			}
 		}
-		queueMicrotask(scrollToConversationBottom);
 	}
 	/** Watermark of the applied stream events (C08 rule 7 dedup). */
 	let lastSeq = $state(0);
@@ -2543,7 +2552,6 @@
 	function pushEntry(entry: TranscriptEntry): void {
 		if (transcript.length >= MAX_RENDERED_EVENTS) transcript = transcript.slice(1);
 		transcript = [...transcript, entry];
-		queueMicrotask(scrollToConversationBottom);
 	}
 
 	function rowOf(data: unknown, key: string): string {
@@ -2588,7 +2596,6 @@
 		visibleToolCalls = current
 			? visibleToolCalls.map((one) => one.id === current.id ? observed : one)
 			: [...visibleToolCalls, observed];
-		queueMicrotask(scrollToConversationBottom);
 	}
 
 	function foldEvent(event: MaiRunEvent): void {
@@ -2621,7 +2628,6 @@
 						delta
 					);
 				}
-				queueMicrotask(scrollToConversationBottom);
 				break;
 			}
 			case 'agent.tool_requested':
@@ -5891,9 +5897,10 @@
 		top: 100%;
 		right: 0;
 		z-index: 30;
-		width: min(24rem, 100%);
-		max-height: 18rem;
-		overflow: auto;
+		width: min(28rem, 100%);
+		max-height: min(26rem, 60dvh);
+		overflow-x: hidden;
+		overflow-y: auto;
 		padding: var(--mai-space-2, 0.5rem);
 		background: var(--surface-raised, var(--mai-color-surface, inherit));
 		border: 1px solid var(--border-strong, currentColor);

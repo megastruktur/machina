@@ -936,6 +936,18 @@ test('drawer Chat History limits to 10 chats, scrolls internally, and loads more
 	await expect(list).toBeVisible();
 	const overflowY = await list.evaluate((el) => getComputedStyle(el).overflowY);
 	expect(overflowY).toBe('auto');
+	// The list is tall enough to be useful (>= 280px) and never scrolls
+	// sideways: the two-line row layout keeps every row inside the content
+	// box even with long titles and wrapped tag previews.
+	const listStats = await list.evaluate((el) => ({
+		maxHeight: parseInt(getComputedStyle(el).maxHeight, 10),
+		scrollWidth: el.scrollWidth,
+		clientWidth: el.clientWidth
+	}));
+	expect(listStats.maxHeight, 'drawer history list max-height').toBeGreaterThanOrEqual(280);
+	expect(listStats.scrollWidth, 'drawer history list horizontal overflow').toBeLessThanOrEqual(
+		listStats.clientWidth
+	);
 
 	const loadMore = drawerSection.getByTestId('drawer-history-load-more');
 	await expect(loadMore).toBeVisible();

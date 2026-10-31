@@ -85,8 +85,12 @@
 	const popId = `mai-history-tags-pop-${uid}`;
 
 	let root = $state<HTMLElement | null>(null);
+	/** The popup dialog itself; its rendered height feeds the flip clamp. */
+	let popEl = $state<HTMLElement | null>(null);
 	let open = $state(false);
-	let flipped = $state(false);
+	/** Viewport-clamped fixed placement for the popup (updated in syncFlip). */
+	let popTop = $state(0);
+	let popLeft = $state(0);
 	let items = $state<TagView[]>([]);
 	let total = $state<number | null>(null);
 	let hasMore = $state(false);
@@ -160,12 +164,35 @@
 		// No loaders: honest preview-only mode; the popup says so.
 	}
 
+	/**
+	 * Viewport-clamped fixed placement. The popup is `position: fixed`, so
+	 * opening it inside a scrolled list (`.mai-chat-drawer__list`,
+	 * `overflow-y: auto`) or a clipped accordion (`.mai-accordion`,
+	 * `overflow: hidden`) never creates scrollbars on that parent and never
+	 * gets clipped by it. Horizontally `left` clamps to
+	 * [VIEWPORT_MARGIN, innerWidth − width − VIEWPORT_MARGIN]; vertically it
+	 * opens below the trigger when that fits inside
+	 * innerHeight − VIEWPORT_MARGIN, above when only above fits, and clamps
+	 * inside the viewport when neither side fits.
+	 */
 	function syncFlip() {
 		if (!root || typeof window === 'undefined') return;
 		const rect = root.getBoundingClientRect();
 		const available = Math.max(0, window.innerWidth - VIEWPORT_MARGIN * 2);
 		const width = Math.min(POP_MAX_WIDTH, available);
-		flipped = rect.left + width > window.innerWidth - VIEWPORT_MARGIN;
+		popLeft = Math.min(
+			Math.max(rect.left, VIEWPORT_MARGIN),
+			Math.max(VIEWPORT_MARGIN, window.innerWidth - width - VIEWPORT_MARGIN)
+		);
+		const popHeight = popEl?.offsetHeight ?? 0;
+		const gap = 4; // --mai-space-1
+		const below = rect.bottom + gap;
+		const maxTop = Math.max(VIEWPORT_MARGIN, window.innerHeight - VIEWPORT_MARGIN - popHeight);
+		const above = rect.top - gap - popHeight;
+		popTop =
+			below + popHeight <= window.innerHeight - VIEWPORT_MARGIN || above < VIEWPORT_MARGIN
+				? Math.min(below, maxTop)
+				: above;
 	}
 
 	function openPopover() {
@@ -175,6 +202,15 @@
 		ensureLoaded();
 		syncFlip();
 	}
+
+	// The popup's real height is only measurable once it renders (its
+	// `hidden` display flips to flex); re-measure after the open flush and
+	// whenever the loaded row count changes that height.
+	$effect(() => {
+		if (!open) return;
+		void items.length;
+		syncFlip();
+	});
 
 	let suppressFocusOpen = false;
 
@@ -262,6 +298,12 @@
 	function handleWindowResize() {
 		if (open) syncFlip();
 	}
+
+	/** Any scroll anywhere (capture phase): a fixed popup must follow its
+	 * trigger's viewport position while open, so re-clamp on every scroll. */
+	function handleWindowScroll() {
+		if (open) syncFlip();
+	}
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions:
@@ -276,7 +318,6 @@
 	role="group"
 	aria-label={label}
 	class="mai-history-tags"
-	class:mai-history-tags--flip={flipped}
 	data-testid={testId}
 	onkeydown={handleRootKeydown}
 	onfocusout={handleRootFocusOut}
@@ -317,8 +358,11 @@
 
 	<div
 		id={popId}
+		bind:this={popEl}
 		role="dialog"
 		class="mai-history-tags__pop"
+		style:top="{popTop}px"
+		style:left="{popLeft}px"
 		style:z-index={open ? 30 + (zSeed % 100_000) : undefined}
 		aria-label={`${label} — all tags`}
 		aria-busy={loading || loadingMore}
@@ -390,7 +434,11 @@
 	</div>
 </div>
 
-<svelte:window onpointerdown={handleWindowPointerDown} onresize={handleWindowResize} />
+<svelte:window
+	onpointerdown={handleWindowPointerDown}
+	onresize={handleWindowResize}
+	onscrollcapture={handleWindowScroll}
+/>
 
 <style>
 	.mai-history-tags {
@@ -403,10 +451,12 @@
 	/* ---- Trigger ---- */
 	.mai-history-tags__trigger {
 		display: inline-flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--mai-space-1, 4px);
 		min-width: 0;
 		max-width: 100%;
+		overflow: hidden;
 		min-height: var(--mai-target-min, 32px);
 		padding: var(--mai-space-1, 4px) var(--mai-space-2, 8px);
 		background: transparent;
@@ -426,10 +476,14 @@
 		outline-offset: var(--mai-focus-ring-offset, 2px);
 	}
 
-	/* Compact/truncated preview chips (Chip renders its own content span). */
+	/* Compact/truncated preview chips (Chip renders its own content span).
+	 * The hard 9rem cap keeps the popup's intrinsic (max-content) width
+	 * small; `flex: 0 1 auto` + `min-width: 0` still shrink a chip below it
+	 * when its flex line is narrower — narrow containers never overflow. */
 	.mai-history-tags :global(.mai-history-tags__chip) {
-		max-width: 9rem;
+		flex: 0 1 auto;
 		min-width: 0;
+		max-width: 9rem;
 	}
 
 	.mai-history-tags :global(.mai-history-tags__chip .mai-chip__content) {
@@ -449,9 +503,11 @@
 	}
 
 	/* ---- Popup dialog ---- */
+	/* position: fixed + inline top/left (viewport-clamped in syncFlip) keeps
+	 * the popup out of every ancestor scroll/clip context. */
 	.mai-history-tags__pop {
-		position: absolute;
-		top: calc(100% + var(--mai-space-1, 4px));
+		position: fixed;
+		top: 0;
 		left: 0;
 		z-index: 30;
 		width: max-content;
@@ -462,11 +518,6 @@
 		background: var(--mai-color-surface);
 		color: var(--mai-color-text);
 		box-shadow: var(--mai-shadow-pop, 0 4px 16px rgb(0 0 0 / 0.25));
-	}
-
-	.mai-history-tags--flip .mai-history-tags__pop {
-		left: auto;
-		right: 0;
 	}
 
 	.mai-history-tags__pop:not([hidden]) {
