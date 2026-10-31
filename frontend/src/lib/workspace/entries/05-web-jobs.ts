@@ -23,8 +23,14 @@
  */
 
 import type { components } from '../../api/schema.generated.js';
-import type { SubscribeEventsOptions } from '../../api/client.js';
-import { subscribeEvents } from '../../api/client.js';
+import type {
+	SubscribeEventsOptions,
+	TagAssignBody,
+	TagCatalogQuery,
+	TagEntityTagsQuery,
+	TagRemovalOptions
+} from '../../api/client.js';
+import { createMaiApiClient, subscribeEvents } from '../../api/client.js';
 import type { PanelEntryInput } from '../registry.js';
 
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
@@ -48,6 +54,14 @@ export type ScheduleCreateBody = components['schemas']['ScheduleCreateBody'];
 export type ScheduleUpdateBody = components['schemas']['ScheduleUpdateBody'];
 /** Generated wire shape: one bounded schedule page. */
 export type SchedulePage = components['schemas']['SchedulePage'];
+/** Generated wire shape: one bounded global tag catalog page (HT-W6B). */
+export type TagPage = components['schemas']['TagPage'];
+/** Generated wire shape: one catalog row (the stored name IS the identity). */
+export type TagView = components['schemas']['TagView'];
+/** Generated wire shape: one run-tag association row as seen from the run. */
+export type EntityTagView = components['schemas']['EntityTagView'];
+/** Generated wire shape: one bounded tag page of one job run (HT-W6B). */
+export type JobTagsPage = components['schemas']['JobTagsPage'];
 
 /**
  * Optional bounded-page query shared by the list routes (C01 rule 5). The
@@ -72,6 +86,14 @@ export interface PageQuery {
 	date_from?: string;
 	/** Runs list only: inclusive upper `submitted_at` bound (ISO instant). */
 	date_to?: string;
+	/**
+	 * Runs list only (HT-W6B): repeated catalog tag ids, at most 50, matched
+	 * per `tagMatch` BEFORE rows+COUNT and pagination. The client never sends
+	 * more than 50; the server rejects a longer list.
+	 */
+	tagIds?: string[];
+	/** Runs list only (HT-W6B): `any` (at least one, default) or `all` (every). */
+	tagMatch?: 'any' | 'all';
 }
 
 /**
@@ -122,7 +144,41 @@ export interface JobsApi {
 	 * nothing (windowed ADR §7).
 	 */
 	streamRunEvents(runId: string, options: RunEventStreamOptions): Promise<void>;
+	/**
+	 * HT-W6B tag surface. OPTIONAL on the narrow opener bag (existing
+	 * compositions keep typechecking); `jobsServices` ALWAYS materializes
+	 * all four from the reviewed base client before the panel sees the bag,
+	 * so the panel's runtime contract (`JobsPanelApi`) requires them and
+	 * fails closed when a bag was not composed through this entry.
+	 */
+	/** GET /api/v1/tags — bounded global catalog page with the name filter (HT-W6B). */
+	listTags?(query?: TagCatalogQuery): Promise<TagPage>;
+	/**
+	 * GET /api/v1/jobs/runs/{run_id}/tags?server_id=… — the run's bounded tag
+	 * page; the explicit scope must name the run's own server (C01 rule 2).
+	 */
+	listRunTags?(
+		runId: string,
+		serverId: string,
+		page?: TagEntityTagsQuery
+	): Promise<JobTagsPage>;
+	/** POST /api/v1/jobs/runs/{run_id}/tags — idempotent user assignment (strict body scope). */
+	assignRunTag?(runId: string, payload: TagAssignBody): Promise<void>;
+	/**
+	 * DELETE /api/v1/jobs/runs/{run_id}/tags/{tag_id}?server_id=… — idempotent
+	 * removal; the run's final tag refuses (409 `last_tag`) unless the
+	 * same-transaction `replacementTagId` re-classifies it.
+	 */
+	removeRunTag?(runId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
 }
+
+/**
+ * The panel-facing jobs API: the opener bag with the HT-W6B tag methods
+ * REQUIRED (every composition through `jobsServices` provides them, from
+ * the opener or from the reviewed base client).
+ */
+export type JobsPanelApi = JobsApi &
+	Required<Pick<JobsApi, 'listTags' | 'listRunTags' | 'assignRunTag' | 'removeRunTag'>>;
 
 /** Typed services bag the jobs panel requires from its opener. */
 export interface JobsServices {
@@ -169,7 +225,23 @@ export function jobsEntry(): PanelEntryInput {
  * `jobsServices({ …baseClientJobsMethods, streamRunEvents: browserRunEventStream })`
  * into its panel hosts). Freezing keeps the bag read-only from the panel's
  * side; the panel still fails closed if the bag is missing or incomplete.
+ *
+ * HT-W6B: the tag methods MAY be omitted by a narrow opener composition;
+ * when absent they are materialized here from the reviewed base client
+ * (same transport, same C01 envelope/CSRF semantics — a per-composition
+ * client instance, no module-level state), so every panel sees the full
+ * `JobsPanelApi` and never a partial tag surface.
  */
 export function jobsServices(api: JobsApi): JobsServices {
-	return Object.freeze({ api });
+	const base = createMaiApiClient();
+	const tagSurface: Pick<
+		JobsPanelApi,
+		'listTags' | 'listRunTags' | 'assignRunTag' | 'removeRunTag'
+	> = {
+		listTags: api.listTags ?? base.listTags,
+		listRunTags: api.listRunTags ?? base.listRunTags,
+		assignRunTag: api.assignRunTag ?? base.assignRunTag,
+		removeRunTag: api.removeRunTag ?? base.removeRunTag
+	};
+	return Object.freeze({ api: Object.assign({}, api, tagSurface) as JobsPanelApi });
 }
