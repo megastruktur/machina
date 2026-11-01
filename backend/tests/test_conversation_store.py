@@ -97,9 +97,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # Chain-tip reconciliation (card 04-conversation-store, exclusive
 # migration-chain owner): revision 0008 appends the conversation-domain
 # tables, revision 0009 appends the agent-task domain, revision 0011
-# appends the history-tag domain (W1) and revision 0012 seeds the
-# terminal-state catalog tags; the tip constants are advanced here so
-# this file's head assertions stay true.
+# appends the history-tag domain (W1), revision 0012 seeds the
+# terminal-state catalog tags and revision 0013 appends the runtime-v2
+# objective/journal domain (journal-store slice); the tip constants are
+# advanced here so this file's head assertions stay true.
 REVISION_IDS = (
     "0001",
     "0002",
@@ -113,6 +114,7 @@ REVISION_IDS = (
     "0010",
     "0011",
     "0012",
+    "0013",
 )
 
 # The exact public application schema at the tip: the 0008 set plus the
@@ -154,6 +156,12 @@ EXPECTED_APP_TABLES = frozenset(
         "tags",
         "job_tags",
         "conversation_tags",
+        "objectives",
+        "objective_servers",
+        "objective_runs",
+        "objective_events",
+        "objective_checklists",
+        "objective_journal",
     }
 )
 
@@ -203,7 +211,10 @@ def _drop_app_tables(url: str) -> None:
         # order-independent after revision 0009, 0011 and after sibling
         # suites ran on the same shared database.
         conn.execute(
-            "DROP TABLE IF EXISTS conversation_steering, conversation_runs, "
+            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
+            "objective_events, objective_runs, objective_servers, "
+            "objectives, "
+            "conversation_steering, conversation_runs, "
             "conversation_messages, conversations, conversation_tags, "
             "notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
@@ -315,7 +326,7 @@ class TestMigrationChain:
         assert module.revision == "0008"
         assert module.down_revision == "0007"
 
-    def test_head_is_0012_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
+    def test_head_is_0013_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
         # Sync on purpose: alembic's env.py drives its async engine with
         # asyncio.run(), which must not nest inside a test event loop.
         previous = os.environ.get("MAI_DATABASE_URL")

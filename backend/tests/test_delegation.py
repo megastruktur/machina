@@ -700,7 +700,10 @@ def _drop_app_tables(url: str) -> None:
     """
     with psycopg.connect(url) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
+            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
+            "objective_events, objective_runs, objective_servers, "
+            "objectives, "
+            "job_resource_locks, job_schedule_fires, "
             "job_schedules, job_events, job_steps, job_tags, job_runs, "
             "approvals, profile_projection_journal, profile_projection, "
             "admin_sessions, admin_credential, alembic_version, "
