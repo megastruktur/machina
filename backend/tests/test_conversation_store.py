@@ -96,9 +96,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # assertions target the chain TIP; the tuple tracks the full chain.
 # Chain-tip reconciliation (card 04-conversation-store, exclusive
 # migration-chain owner): revision 0008 appends the conversation-domain
-# tables, revision 0009 appends the agent-task domain and revision 0011
-# appends the history-tag domain (W1); the tip constants are advanced
-# here so this file's head assertions stay true.
+# tables, revision 0009 appends the agent-task domain, revision 0011
+# appends the history-tag domain (W1) and revision 0012 seeds the
+# terminal-state catalog tags; the tip constants are advanced here so
+# this file's head assertions stay true.
 REVISION_IDS = (
     "0001",
     "0002",
@@ -111,6 +112,7 @@ REVISION_IDS = (
     "0009",
     "0010",
     "0011",
+    "0012",
 )
 
 # The exact public application schema at the tip: the 0008 set plus the
@@ -313,7 +315,7 @@ class TestMigrationChain:
         assert module.revision == "0008"
         assert module.down_revision == "0007"
 
-    def test_head_is_0011_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
+    def test_head_is_0012_and_upgrade_is_idempotent(self, migrated_url: str) -> None:
         # Sync on purpose: alembic's env.py drives its async engine with
         # asyncio.run(), which must not nest inside a test event loop.
         previous = os.environ.get("MAI_DATABASE_URL")

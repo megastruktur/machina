@@ -282,7 +282,7 @@ def test_fresh_upgrade_seeds_reserved_and_backfills_existing_entities(
         _insert_bare_job_run(url, JOB_B)
         _insert_bare_conversation(url, CONV_A)
 
-        command.upgrade(_alembic_config(), "head")
+        command.upgrade(_alembic_config(), "0011")
 
         rows = _fetchall(url, "SELECT tag_id, name, description FROM tags")
         assert len(rows) == 1
@@ -621,7 +621,7 @@ def test_reserved_unclassified_cannot_be_deleted(migrated_url: str) -> None:
 def test_downgrade_then_reupgrade_rebuilds_seed_backfill_and_invariant(
     migrated_url: str,
 ) -> None:
-    with _isolated_database(migrated_url, "mai_fxt_w1_tags_down", "head") as url:
+    with _isolated_database(migrated_url, "mai_fxt_w1_tags_down", "0011") as url:
         _insert_job_run(url, JOB_A)
         _insert_conversation(url, CONV_A)
         _insert_tag(url, "keeper", TAG_KEEPER)
@@ -647,7 +647,7 @@ def test_downgrade_then_reupgrade_rebuilds_seed_backfill_and_invariant(
         assert _fetchall(url, "SELECT count(*) FROM job_runs") == [(1,)]
         assert _fetchall(url, "SELECT count(*) FROM conversations") == [(1,)]
 
-        command.upgrade(_alembic_config(), "head")
+        command.upgrade(_alembic_config(), "0011")
 
         # Reserved row is re-seeded; the 'keeper' catalog row is gone with the
         # dropped table; both entities are re-backfilled.

@@ -81,9 +81,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # migration-chain owner): revision 0007 appends the bounded observation +
 # notification persistence, revision 0008 the conversation domain,
 # revision 0009 the agent-task domain, revision 0010 the job_runs run
-# label and revision 0011 the global tag catalog + mandatory
-# job/conversation classification (history-tags W1); the tip constants
-# are advanced here so this file's head assertions stay true.
+# label, revision 0011 the global tag catalog + mandatory
+# job/conversation classification (history-tags W1) and revision 0012
+# seeds the terminal-state catalog tags; the tip constants are advanced
+# here so this file's head assertions stay true.
 REVISION_IDS = (
     "0001",
     "0002",
@@ -96,6 +97,7 @@ REVISION_IDS = (
     "0009",
     "0010",
     "0011",
+    "0012",
 )
 
 # The exact public application schema at the tip — nothing else, in
