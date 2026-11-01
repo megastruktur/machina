@@ -157,6 +157,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         HostLogsCapability,
         descriptor as host_logs_descriptor,
     )
+    from mai.capabilities.host_file_read import (
+        HostFileReadCapability,
+        descriptor as host_file_read_descriptor,
+    )
     from mai.capabilities.service_http import (
         HttpServiceProvider,
         ServiceHttpCapability,
@@ -246,6 +250,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         known_hosts=_known_hosts_for,
         artifacts_root=artifacts_dir,
     )
+    host_file_read_cap = HostFileReadCapability(
+        profiles=_load_profile,
+        known_hosts=_known_hosts_for,
+    )
     chat_read_cap = ChatReadSessionCapability(sessions)
 
     class _DynamicEmbedder:
@@ -302,6 +310,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     for desc in (
         host_shell_descriptor(),
         host_logs_descriptor(),
+        host_file_read_descriptor(),
         chat_read_descriptor(),
         docs_retrieve_descriptor(),
         service_http_descriptor(),
@@ -383,6 +392,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     executors = {
         "host.shell": host_shell_cap,
         "host.logs": host_logs_cap,
+        "host.file_read": host_file_read_cap,
         "chat.read_session": chat_read_cap,
         "docs.retrieve": docs_retrieve_cap,
         "service.http": _service_http_cap,
@@ -589,6 +599,8 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                             grants.setdefault("host.shell", set()).add(sid)
                         if "journald_logs" in prof.capabilities or "host.logs" in prof.capabilities:
                             grants.setdefault("host.logs", set()).add(sid)
+                        if "file_read" in prof.capabilities or "host.file_read" in prof.capabilities:
+                            grants.setdefault("host.file_read", set()).add(sid)
                     except Exception:
                         continue
         except Exception:
