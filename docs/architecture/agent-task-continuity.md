@@ -223,3 +223,31 @@ route/model producer before its slice completes. The frozen P00 sections
 (C01–C11) keep their own change control; changes to THIS addendum follow the
 campaign reconciliation rule (act_CONTRACTS §11–§12): central rename, briefs
 updated, no sibling redesigns, material findings pause for reconciliation.
+
+## 11. Runtime v2 compatibility (rv campaign, 2026-11-01)
+
+The authoritative Runtime v2 contract is
+[docs/architecture/runtime-v2.md](runtime-v2.md). Sections 1–10 above remain
+binding for legacy conversations and for everything not superseded there. What
+changes for **v2 conversations only**:
+
+1. **Structured intake is legacy-only.** The §4 `TurnInterpretation` planner
+   union and its one-repair loop run ONLY inside the frozen legacy
+   `agent.run` handler. A v2 conversation submission goes directly to the
+   working model (no intake call, no mandatory todo); the §4 authority
+   boundary (no writable approval/grant fields, model proposals never
+   supersede USER constraints) carries over as design discipline for every
+   v2 model-facing surface.
+2. **Progress projection.** The §6 task vocabulary stays authoritative for
+   legacy conversations and evidence-bound completion; v2 conversations
+   project progress through the work journal with an OPTIONAL advisory
+   checklist (runtime-v2.md §8). `TaskCompletionVerdict` semantics
+   (`completion_missing_evidence`) are reused by v2 unchanged.
+3. **Objectives instead of one-task-per-conversation.** §1's
+   "one active task per conversation" rule is superseded for v2 by explicit
+   objective episodes with operator-owned server scope (runtime-v2.md §3);
+   legacy conversations keep §1 semantics read-only.
+4. **Identity, lease, privacy, pagination unchanged.** §1 identity/lease
+   rules, §2 privacy resolution, §3 submission/steering dispositions and the
+   §7 pagination contract (50/200, `has_more` derived) bind v2 verbatim.
+   State-specific resume semantics for v2 are frozen in runtime-v2.md §9.
