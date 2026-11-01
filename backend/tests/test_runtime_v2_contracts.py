@@ -326,11 +326,21 @@ def test_v2_handler_name_fits_the_frozen_grammar() -> None:
     )
     assert engine.RUN_WORKFLOW_NAME == "run_workflow"
     assert engine.APPLICATION_VERSION == "mai-1"
-    # The v2 name must NOT already be registered by this docs-only slice.
-    assert "agent.run_v2" not in engine._RUN_HANDLERS, (
-        "no implementation belongs to the contracts slice; agent.run_v2 is a "
-        "design target for the action-runtime slice"
+    # The action-runtime slice: importing the v2 runtime module registers
+    # the handler through the ONE registration seam, while the legacy
+    # handlers stay registered beside it (drain window, §10).
+    run_v2 = importlib.import_module("mai.agents.run_v2")
+    assert run_v2.HANDLER_NAME == "agent.run_v2"
+    assert run_v2.RUN_PAYLOAD_VERSION_V2 == 2
+    registered = engine._RUN_HANDLERS
+    assert isinstance(registered, dict), "engine handler registry shape changed"
+    assert "agent.run_v2" in registered, (
+        "importing mai.agents.run_v2 must register agent.run_v2 via "
+        "mai.jobs.engine.register_job_handler (runtime-v2.md §2)"
     )
+    assert registered["agent.run_v2"] is run_v2.run_agent_conversation_v2
+    # Legacy handlers remain registered for frozen replay/drain (§10).
+    assert "agent.run" in registered and "agent.delegate" in registered
 
 
 # ---------------------------------------------------------------------------
