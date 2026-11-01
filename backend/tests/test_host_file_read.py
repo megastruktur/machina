@@ -28,6 +28,7 @@ import pytest
 from mai.capabilities import host_file_read as module
 from mai.capabilities.dispatch import CapabilityCall
 from mai.capabilities.host_file_read import (
+    _HELPER_PROGRAM,
     CAPABILITY_ID,
     DEFAULT_LIMIT,
     DISPLAY_LABEL,
@@ -37,7 +38,6 @@ from mai.capabilities.host_file_read import (
     FileReadError,
     FileReadErrorCode,
     HostFileReadCapability,
-    _HELPER_PROGRAM,
     compose_read_argv,
     descriptor,
     read_query_from_payload,
@@ -1175,7 +1175,7 @@ class TestReadComposition:
             "next_offset": 2,
             "oversized_line": False,
         }
-        (identity, request, key_path, known_hosts) = harness.transport.calls[0]
+        (_identity_ref, request, key_path, known_hosts) = harness.transport.calls[0]
         query = read_query_from_payload(GOOD_PAYLOAD, file_read_roots=(ALLOWED_ROOT,))
         assert request.argv == compose_read_argv(query)
         assert request.display == DISPLAY_LABEL

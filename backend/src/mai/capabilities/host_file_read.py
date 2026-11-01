@@ -108,8 +108,8 @@ from mai.execution.commands import (
     CommandStatus,
     execute_command,
 )
-from mai.policy.evaluate import ExecutionContext
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
+from mai.policy.evaluate import ExecutionContext
 
 __all__ = [
     "CAPABILITY_ID",
@@ -720,7 +720,7 @@ class HostFileReadCapability:
             profile = self._profiles(server_id)
         except FileReadError:
             raise
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - provider failures refuse fail-closed
             raise _reject(
                 FileReadErrorCode.PROFILE_UNAVAILABLE,
                 f"profile provider failed ({type(error).__name__})",
@@ -768,7 +768,7 @@ class HostFileReadCapability:
             path = Path(os.fspath(self._known_hosts(server_id)))
         except FileReadError:
             raise
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - provider failures refuse fail-closed
             raise _reject(
                 FileReadErrorCode.HOST_KEY_UNENROLLED,
                 f"known-hosts provider failed ({type(error).__name__})",
