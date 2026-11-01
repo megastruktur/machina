@@ -103,7 +103,6 @@ from mai.contracts.server import (
 from mai.credentials.env import SecretValue
 from mai.execution.commands import (
     MAX_COMMAND_TIMEOUT_SECONDS,
-    CommandOutcome,
     CommandRequest,
     CommandStatus,
     execute_command,
@@ -510,7 +509,7 @@ def descriptor() -> CapabilityDescriptor:
     return parse_descriptor(
         {
             "identifier": CAPABILITY_ID,
-            "version": "1.1.0",
+            "version": "1.2.0",
             "config_schema": None,
             "input_schema": {
                 "type": "object",
@@ -552,6 +551,7 @@ def descriptor() -> CapabilityDescriptor:
                 "type": "object",
                 "required": [
                     "path",
+                    "status",
                     "content",
                     "offset",
                     "limit",
@@ -596,8 +596,26 @@ def descriptor() -> CapabilityDescriptor:
                             "content stays 0 lines in that case."
                         ),
                     },
-                    "status": {"type": "string"},
-                    "code": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["ok", "refused", "unavailable"],
+                        "description": (
+                            "Common result envelope: ok (page follows), "
+                            "refused (intentional, stable code), "
+                            "unavailable (transport/timeout/untrustworthy "
+                            "answer, stable code)."
+                        ),
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Stable machine-readable reason for refused "
+                            "(path_denied, path_not_found, "
+                            "not_regular_file, decode_error) or "
+                            "unavailable (transport_failed, "
+                            "outcome_unknown, unreadable_response)."
+                        ),
+                    },
                     "exit_code": {"type": ["integer", "null"]},
                 },
             },
@@ -814,18 +832,29 @@ class HostFileReadCapability:
                 error = failed_response.get("error")
                 if error in _REMOTE_REJECTION_CODES:
                     return _refusal_result(query, str(error))
+                # The helper answered in its rejection protocol but with
+                # a code outside the shared vocabulary: untrustworthy
+                # answer, not a transport failure.
+                return _unavailable_result(
+                    query, "unreadable_response", outcome.exit_code
+                )
+            return _unavailable_result(
+                query, "transport_failed", outcome.exit_code
+            )
         if outcome.status is not CommandStatus.SUCCEEDED:
-            return _failure_result(outcome, query, None)
+            # Timeout / client death / cancelled: the read is unproven.
+            return _unavailable_result(query, "outcome_unknown", outcome.exit_code)
         try:
             response = json.loads(outcome.stdout)
         except ValueError:
-            return _failure_result(outcome, query, None)
+            return _unavailable_result(query, "unreadable_response", outcome.exit_code)
         if not isinstance(response, dict):
-            return _failure_result(outcome, query, None)
+            return _unavailable_result(query, "unreadable_response", outcome.exit_code)
         error = response.get("error")
         if error is not None:
-            code = error if error in _REMOTE_REJECTION_CODES else None
-            return _failure_result(outcome, query, code)
+            if error in _REMOTE_REJECTION_CODES:
+                return _refusal_result(query, str(error))
+            return _unavailable_result(query, "unreadable_response", outcome.exit_code)
         content = response.get("content")
         total = response.get("total")
         returned = response.get("returned")
@@ -847,9 +876,10 @@ class HostFileReadCapability:
             # was oversized. Anything else is an untrustworthy helper.
             or next_offset != query.offset + returned + (1 if oversized_line else 0)
         ):
-            return _failure_result(outcome, query, None)
+            return _unavailable_result(query, "unreadable_response", outcome.exit_code)
         document: dict[str, object] = {
             "path": query.path,
+            "status": "ok",
             "content": content,
             "offset": query.offset,
             "limit": query.limit,
@@ -863,7 +893,7 @@ class HostFileReadCapability:
 
 
 def _refusal_result(query: FileReadQuery, code: str) -> ExecutorResult:
-    """One structured helper rejection: stable code, honest status."""
+    """One intentional refusal: stable code, common envelope status."""
     document: dict[str, object] = {
         "path": query.path,
         "status": "refused",
@@ -872,17 +902,18 @@ def _refusal_result(query: FileReadQuery, code: str) -> ExecutorResult:
     return ExecutorResult(ok=False, error_code=code, output=json.dumps(document))
 
 
-def _failure_result(
-    outcome: CommandOutcome,
+def _unavailable_result(
     query: FileReadQuery,
-    code: str | None,
+    code: str,
+    exit_code: int | None,
 ) -> ExecutorResult:
-    """One honest non-success answer: status, bounded code, no content."""
+    """The read could not be completed (transport, timeout or an
+    untrustworthy helper answer): common-envelope ``unavailable`` with a
+    stable code, no content, nothing fabricated."""
     document: dict[str, object] = {
         "path": query.path,
-        "status": outcome.status.value,
-        "exit_code": outcome.exit_code,
+        "status": "unavailable",
+        "code": code,
+        "exit_code": exit_code,
     }
-    if code is not None:
-        document["code"] = code
     return ExecutorResult(ok=False, error_code=code, output=json.dumps(document))

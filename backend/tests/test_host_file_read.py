@@ -21,12 +21,18 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from mai.capabilities import host_file_read as module
-from mai.capabilities.dispatch import CapabilityCall
+from mai.capabilities.dispatch import (
+    EFFECT_EXECUTED,
+    BoundedOutput,
+    CapabilityCall,
+    DispatchOutcome,
+)
 from mai.capabilities.host_file_read import (
     _HELPER_PROGRAM,
     CAPABILITY_ID,
@@ -57,6 +63,7 @@ from mai.execution.commands import (
     CommandStatus,
     compose_remote_command,
 )
+from mai.jobs.steps import StepState, _translate_outcome
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.evaluate import (
     DecisionReason,
@@ -302,7 +309,7 @@ class TestDescriptor:
         registry = CapabilityRegistry()
         stored = registry.register(descriptor())
         assert stored.identifier == CAPABILITY_ID
-        assert stored.version == "1.1.0"
+        assert stored.version == "1.2.0"
         assert stored.effect_class == "read"
         assert stored.execution_environments == ("linux_ssh",)
         assert stored.resource_scope == ()
@@ -314,6 +321,7 @@ class TestDescriptor:
         output = descriptor().to_json()["output_schema"]
         assert output["required"] == [
             "path",
+            "status",
             "content",
             "offset",
             "limit",
@@ -322,6 +330,11 @@ class TestDescriptor:
             "returned",
             "next_offset",
             "oversized_line",
+        ]
+        assert output["properties"]["status"]["enum"] == [
+            "ok",
+            "refused",
+            "unavailable",
         ]
 
     def test_read_class_needs_no_approval_in_either_mode(self) -> None:
@@ -1166,6 +1179,7 @@ class TestReadComposition:
         document = json.loads(result.output)
         assert document == {
             "path": "/srv/data/notes.txt",
+            "status": "ok",
             "content": "alpha\nbeta\n",
             "offset": 0,
             "limit": DEFAULT_LIMIT,
@@ -1254,7 +1268,7 @@ class TestReadComposition:
         ]
         result = harness.run()
         assert result.ok is False
-        assert result.error_code is None
+        assert result.error_code == "unreadable_response"
         assert "content" not in json.loads(result.output)
 
     def test_structured_remote_rejection_maps_onto_the_vocabulary(
@@ -1287,9 +1301,29 @@ class TestReadComposition:
         ]
         result = harness.run()
         assert result.ok is False
-        assert result.error_code is None
+        assert result.error_code == "outcome_unknown"
         document = json.loads(result.output)
-        assert document["status"] == "outcome_unknown"
+        assert document["status"] == "unavailable"
+        assert document["code"] == "outcome_unknown"
+        assert "content" not in document
+
+    def test_transport_failure_without_structured_body_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        harness = _Harness(monkeypatch, tmp_path)
+        harness.transport.script = [
+            _outcome(status=CommandStatus.FAILED, exit_code=1, stderr="boom")
+        ]
+        result = harness.run()
+        assert result.ok is False
+        assert result.error_code == "transport_failed"
+        document = json.loads(result.output)
+        assert document == {
+            "path": "/srv/data/notes.txt",
+            "status": "unavailable",
+            "code": "transport_failed",
+            "exit_code": 1,
+        }
 
     def test_unreadable_helper_response_fails_without_content(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1298,10 +1332,13 @@ class TestReadComposition:
         harness.transport.script = [_outcome(stdout="not json at all")]
         result = harness.run()
         assert result.ok is False
-        assert result.error_code is None
-        assert "content" not in json.loads(result.output)
+        assert result.error_code == "unreadable_response"
+        document = json.loads(result.output)
+        assert document["status"] == "unavailable"
+        assert document["code"] == "unreadable_response"
+        assert "content" not in document
 
-    def test_unknown_helper_error_code_fails_honestly(
+    def test_unknown_helper_error_code_is_unavailable(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         harness = _Harness(monkeypatch, tmp_path)
@@ -1314,8 +1351,10 @@ class TestReadComposition:
         ]
         result = harness.run()
         assert result.ok is False
-        assert result.error_code is None
-        assert json.loads(result.output)["status"] == "failed"
+        assert result.error_code == "unreadable_response"
+        document = json.loads(result.output)
+        assert document["status"] == "unavailable"
+        assert document["code"] == "unreadable_response"
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1423,107 @@ class TestProfileFileReadRootsSchema:
         with pytest.raises(ProfileValidationError) as excinfo:
             parse_server_profile(_profile_doc(file_read_allowlist=["/srv/data"]))
         assert excinfo.value.fields.get("file_read_allowlist") == "unknown_field"
+
+
+# ---------------------------------------------------------------------------
+# Live job-step translation: the common envelope drives the real mapper
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_outcome(
+    *,
+    executor_ok: bool | None,
+    output_json: str | None,
+) -> DispatchOutcome:
+    """One REAL dispatch receipt (allowed, executed, read class) whose
+    bounded output carries an executor document — the exact shape
+    ``mai.jobs.steps`` consumes in production."""
+    return DispatchOutcome(
+        op_id=uuid.uuid4(),
+        ts=datetime.now(timezone.utc),
+        capability_id=CAPABILITY_ID,
+        server_id=SERVER_A,
+        run_id=RUN_1,
+        principal=PRINCIPAL,
+        mode=PolicyMode.DELEGATED.value,
+        allowed=True,
+        reason=DecisionReason.ALLOWED.value,
+        policy_revision=1,
+        effect_class="read",
+        payload_hash="0" * 64,
+        effect=EFFECT_EXECUTED,
+        approval_id=None,
+        approval_spent=False,
+        approval_code=None,
+        executor_ok=executor_ok,
+        output=None
+        if output_json is None
+        else BoundedOutput(text=output_json, truncated=False, omitted_bytes=0),
+        error_type=None,
+        credential_references=(),
+    )
+
+
+class TestStepsTranslation:
+    """The capability documents feed the REAL job-step mapper: a
+    ``status:"ok"`` page finalizes SUCCEEDED, an intentional refusal
+    finalizes FAILED with the stable code as reason — the mapper never
+    has to fall back to outcome_unknown."""
+
+    def test_ok_page_maps_onto_succeeded_step(self) -> None:
+        document = {
+            "path": "/srv/data/notes.txt",
+            "status": "ok",
+            "content": "alpha\nbeta\n",
+            "offset": 0,
+            "limit": DEFAULT_LIMIT,
+            "total": 5,
+            "has_more": True,
+            "returned": 2,
+            "next_offset": 2,
+            "oversized_line": False,
+        }
+        state, reason, receipt = _translate_outcome(
+            _dispatch_outcome(
+                executor_ok=True, output_json=json.dumps(document, sort_keys=True)
+            )
+        )
+        assert state == StepState.SUCCEEDED.value
+        assert reason is None
+        assert receipt["status"] == "ok"
+        assert receipt["executor_ok"] is True
+
+    def test_refused_document_maps_onto_failed_step_with_code(self) -> None:
+        document = {
+            "path": "/etc/passwd",
+            "status": "refused",
+            "code": "path_denied",
+        }
+        state, reason, receipt = _translate_outcome(
+            _dispatch_outcome(
+                executor_ok=False, output_json=json.dumps(document, sort_keys=True)
+            )
+        )
+        assert state == StepState.FAILED.value
+        assert reason == "path_denied"
+        assert receipt["status"] == "refused"
+        assert receipt["reason"] == "path_denied"
+
+    def test_unavailable_document_maps_onto_failed_step_with_code(self) -> None:
+        document = {
+            "path": "/srv/data/notes.txt",
+            "status": "unavailable",
+            "code": "transport_failed",
+            "exit_code": 1,
+        }
+        state, reason, receipt = _translate_outcome(
+            _dispatch_outcome(
+                executor_ok=False, output_json=json.dumps(document, sort_keys=True)
+            )
+        )
+        assert state == StepState.FAILED.value
+        assert reason == "transport_failed"
+        assert receipt["status"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------
