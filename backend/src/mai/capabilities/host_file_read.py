@@ -44,16 +44,26 @@ reconstructs identical argv without interpreting metacharacters. The
 helper is Python stdlib only and performs the target-side safety
 checks in ONE remote roundtrip:
 
-- component-wise ``lstat`` walk of the absolute path: every component
-  must exist, NONE may be a symlink (symlink escapes fail closed), the
-  final component must be a regular file;
-- containment: the canonical (``normpath``) target must equal an
-  allowed root or live below ``root + "/"`` (sibling-prefix escapes
-  such as ``/srv/datax`` under root ``/srv/data`` are refused);
-- the page is read line-wise: at most ``limit`` lines and at most
-  ``MAX_CONTENT_BYTES`` retained bytes are returned; ``total`` counts
-  ALL lines of the file (the remainder is streamed and discarded,
-  never retained), so ``has_more`` is computed exactly controller-side;
+- fd-pinned traversal (no TOCTOU): the walk opens every intermediate
+  component ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` relative to the
+  previous dirfd and the final component ``O_NOFOLLOW`` relative to the
+  last pinned dirfd; the file is ``fstat``-checked (regular file) and
+  read ONLY through that fd, so a concurrent symlink or directory swap
+  can only fail the walk (ELOOP → ``path_denied``), never redirect it.
+  Path components are lexically normalized before the walk, and the
+  allowlist containment verdict (equal to a root or below
+  ``root + "/"`` — sibling-prefix escapes such as ``/srv/datax`` under
+  root ``/srv/data`` are refused) applies to exactly that normalized
+  path;
+- the page is read line-wise from the pinned fd: at most ``limit``
+  lines and at most ``MAX_CONTENT_BYTES`` retained bytes are returned;
+  ``total`` counts ALL lines of the file (the remainder is streamed and
+  discarded, never retained), so ``has_more`` is computed exactly
+  controller-side. A line that alone exceeds the byte budget is never
+  truncated: when it is the page's FIRST candidate it is skipped and
+  explicitly labeled (``oversized_line``, with ``next_offset`` moved
+  past that single line) so the caller can progress; later oversized
+  lines simply end the page (``has_more`` stays true);
 - retained bytes are strictly UTF-8-decoded; invalid UTF-8 is a
   structured ``decode_error`` rejection, never replacement text.
 
@@ -327,12 +337,39 @@ def read_query_from_payload(
 #: structured rejection ``{"error": code}``. Any other exit is a
 #: helper crash and fails the call honestly.
 _HELPER_PROGRAM = """\
-import json, os, stat, sys
+import errno, json, os, stat, sys
 
 
 def _fail(code):
     sys.stdout.write(json.dumps({"error": code}, sort_keys=True) + "\\n")
     sys.exit(3)
+
+
+def _open_final(parts):
+    \"\"\"Open the final component relative to a chain of pinned dirfds.
+
+    Every intermediate component is opened O_DIRECTORY|O_NOFOLLOW
+    relative to the previous fd, the final component O_NOFOLLOW relative
+    to the last pinned dirfd; the returned fd IS the file (fstat- and
+    read-only), so a concurrent symlink or directory swap can only fail
+    the walk (ELOOP) — it can never redirect it. Returns the fd, with
+    the caller owning every close.
+    \"\"\"
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in parts[:-1]:
+            parent = fd
+            fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            os.close(parent)
+        return os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd
+        )
+    finally:
+        os.close(fd)
 
 
 def main():
@@ -365,56 +402,77 @@ def main():
         or len(path) > 4096
     ):
         _fail("invalid_request")
-    # Component-wise lstat walk: every component must exist, none may
-    # be a symlink, the final one must be a regular file.
-    st = None
-    current = ""
-    for part in path.split("/")[1:]:
-        if not part:
-            continue
-        current += "/" + part
-        try:
-            st = os.lstat(current)
-        except OSError:
-            _fail("path_not_found")
-        if stat.S_ISLNK(st.st_mode):
-            _fail("path_denied")
-    if st is None or not stat.S_ISREG(st.st_mode):
+    # Lexical normalization before the walk: no "."/".." component is
+    # ever opened, and the containment verdict below is the exact path
+    # the dirfd chain then descends.
+    resolved = os.path.normpath(path)
+    parts = [part for part in resolved.split("/") if part]
+    if not parts:
         _fail("not_regular_file")
-    resolved = os.path.normpath(current)
     if not any(
         resolved == root or resolved.startswith(root + "/")
         for root in (os.path.normpath(root) for root in roots)
     ):
         _fail("path_denied")
+    try:
+        fd = _open_final(parts)
+    except (FileNotFoundError, NotADirectoryError):
+        _fail("path_not_found")
+    except OSError as open_error:
+        if open_error.errno == errno.ELOOP:
+            # A component raced to a symlink mid-walk: O_NOFOLLOW
+            # refused it — fail closed, never follow.
+            _fail("path_denied")
+        raise
     total = 0
     kept = []
     kept_bytes = 0
     index = 0
     retaining = True
+    oversized = False
     try:
-        with open(resolved, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            _fail("not_regular_file")
+        handle = os.fdopen(fd, "rb")
+        fd = -1  # ownership moved to the handle (closed by the with)
+        with handle:
             for raw_line in handle:
                 total += 1
                 if index < offset:
                     index += 1
                     continue
                 if retaining:
-                    if len(kept) >= limit or kept_bytes + len(raw_line) > budget:
+                    if len(kept) >= limit:
                         retaining = False
+                    elif kept_bytes + len(raw_line) > budget:
+                        retaining = False
+                        if not kept:
+                            # The FIRST candidate line alone exceeds the
+                            # byte budget: it is skipped and explicitly
+                            # labeled (oversized_line), never returned
+                            # truncated and never swallowed.
+                            oversized = True
                     else:
                         kept.append(raw_line)
                         kept_bytes += len(raw_line)
                 index += 1
-    except OSError:
-        _fail("path_not_found")
+    finally:
+        if fd >= 0:
+            os.close(fd)
     try:
         text = b"".join(kept).decode("utf-8")
     except UnicodeDecodeError:
         _fail("decode_error")
+    returned = len(kept)
     sys.stdout.write(
         json.dumps(
-            {"content": text, "total": total, "returned": len(kept)},
+            {
+                "content": text,
+                "total": total,
+                "returned": returned,
+                "next_offset": offset + returned + (1 if oversized else 0),
+                "oversized_line": oversized,
+            },
             sort_keys=True,
         )
         + "\\n"
@@ -452,7 +510,7 @@ def descriptor() -> CapabilityDescriptor:
     return parse_descriptor(
         {
             "identifier": CAPABILITY_ID,
-            "version": "1.0.0",
+            "version": "1.1.0",
             "config_schema": None,
             "input_schema": {
                 "type": "object",
@@ -492,7 +550,17 @@ def descriptor() -> CapabilityDescriptor:
             },
             "output_schema": {
                 "type": "object",
-                "required": ["path", "content", "offset", "limit", "total", "has_more"],
+                "required": [
+                    "path",
+                    "content",
+                    "offset",
+                    "limit",
+                    "total",
+                    "has_more",
+                    "returned",
+                    "next_offset",
+                    "oversized_line",
+                ],
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
@@ -500,6 +568,34 @@ def descriptor() -> CapabilityDescriptor:
                     "limit": {"type": "integer", "minimum": 1},
                     "total": {"type": "integer", "minimum": 0},
                     "has_more": {"type": "boolean"},
+                    "returned": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Lines actually contained in this page's "
+                            "content (0..limit); a page is never padded "
+                            "or cut mid-line."
+                        ),
+                    },
+                    "next_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Resume offset for the next page: the window "
+                            "end, plus one when the first candidate line "
+                            "was oversized (labeled by oversized_line) so "
+                            "the caller can skip that single line."
+                        ),
+                    },
+                    "oversized_line": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the first candidate line alone "
+                            "exceeded the byte budget: it was skipped, "
+                            "never truncated and never fabricated; page "
+                            "content stays 0 lines in that case."
+                        ),
+                    },
                     "status": {"type": "string"},
                     "code": {"type": "string"},
                     "exit_code": {"type": ["integer", "null"]},
@@ -733,6 +829,8 @@ class HostFileReadCapability:
         content = response.get("content")
         total = response.get("total")
         returned = response.get("returned")
+        next_offset = response.get("next_offset")
+        oversized_line = response.get("oversized_line")
         if (
             not isinstance(content, str)
             or isinstance(total, bool)
@@ -741,6 +839,13 @@ class HostFileReadCapability:
             or isinstance(returned, bool)
             or not isinstance(returned, int)
             or not 0 <= returned <= query.limit
+            or not isinstance(oversized_line, bool)
+            or isinstance(next_offset, bool)
+            or not isinstance(next_offset, int)
+            # next_offset is the honest resume point: the window end,
+            # plus exactly one skipped line when the first candidate
+            # was oversized. Anything else is an untrustworthy helper.
+            or next_offset != query.offset + returned + (1 if oversized_line else 0)
         ):
             return _failure_result(outcome, query, None)
         document: dict[str, object] = {
@@ -749,7 +854,10 @@ class HostFileReadCapability:
             "offset": query.offset,
             "limit": query.limit,
             "total": total,
-            "has_more": total > query.offset + returned,
+            "has_more": total > next_offset,
+            "returned": returned,
+            "next_offset": next_offset,
+            "oversized_line": oversized_line,
         }
         return ExecutorResult(ok=True, output=json.dumps(document, sort_keys=True))
 

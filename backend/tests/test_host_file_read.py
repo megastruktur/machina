@@ -17,7 +17,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -299,7 +302,7 @@ class TestDescriptor:
         registry = CapabilityRegistry()
         stored = registry.register(descriptor())
         assert stored.identifier == CAPABILITY_ID
-        assert stored.version == "1.0.0"
+        assert stored.version == "1.1.0"
         assert stored.effect_class == "read"
         assert stored.execution_environments == ("linux_ssh",)
         assert stored.resource_scope == ()
@@ -308,6 +311,18 @@ class TestDescriptor:
         assert schema["additionalProperties"] is False
         assert schema["required"] == ["path"]
         assert sorted(schema["properties"]) == ["limit", "offset", "path"]
+        output = descriptor().to_json()["output_schema"]
+        assert output["required"] == [
+            "path",
+            "content",
+            "offset",
+            "limit",
+            "total",
+            "has_more",
+            "returned",
+            "next_offset",
+            "oversized_line",
+        ]
 
     def test_read_class_needs_no_approval_in_either_mode(self) -> None:
         for mode in (PolicyMode.ASK, PolicyMode.DELEGATED):
@@ -523,7 +538,13 @@ class TestHelperProgram:
             str(target), json.dumps([str(tmp_path)]), "0", "3", str(MAX_CONTENT_BYTES)
         )
         document = _ok_payload(result)
-        assert document == {"content": "one\ntwo\nthree\n", "total": 5, "returned": 3}
+        assert document == {
+            "content": "one\ntwo\nthree\n",
+            "total": 5,
+            "returned": 3,
+            "next_offset": 3,
+            "oversized_line": False,
+        }
 
     def test_second_page_starts_at_the_offset(self, tmp_path: Path) -> None:
         target = tmp_path / "notes.txt"
@@ -537,7 +558,13 @@ class TestHelperProgram:
                 str(MAX_CONTENT_BYTES),
             )
         )
-        assert document == {"content": "four\nfive\n", "total": 5, "returned": 2}
+        assert document == {
+            "content": "four\nfive\n",
+            "total": 5,
+            "returned": 2,
+            "next_offset": 5,
+            "oversized_line": False,
+        }
 
     def test_offset_past_eof_is_an_honest_empty_page(self, tmp_path: Path) -> None:
         target = tmp_path / "notes.txt"
@@ -551,7 +578,13 @@ class TestHelperProgram:
                 str(MAX_CONTENT_BYTES),
             )
         )
-        assert document == {"content": "", "total": 2, "returned": 0}
+        assert document == {
+            "content": "",
+            "total": 2,
+            "returned": 0,
+            "next_offset": 9,
+            "oversized_line": False,
+        }
 
     def test_empty_file_is_an_empty_page(self, tmp_path: Path) -> None:
         target = tmp_path / "empty.txt"
@@ -565,7 +598,13 @@ class TestHelperProgram:
                 str(MAX_CONTENT_BYTES),
             )
         )
-        assert document == {"content": "", "total": 0, "returned": 0}
+        assert document == {
+            "content": "",
+            "total": 0,
+            "returned": 0,
+            "next_offset": 0,
+            "oversized_line": False,
+        }
 
     def test_final_line_without_newline_is_returned(self, tmp_path: Path) -> None:
         target = tmp_path / "notes.txt"
@@ -579,7 +618,13 @@ class TestHelperProgram:
                 str(MAX_CONTENT_BYTES),
             )
         )
-        assert document == {"content": "three", "total": 3, "returned": 1}
+        assert document == {
+            "content": "three",
+            "total": 3,
+            "returned": 1,
+            "next_offset": 3,
+            "oversized_line": False,
+        }
 
     def test_byte_budget_cuts_the_page_at_a_line_boundary(
         self, tmp_path: Path
@@ -589,8 +634,88 @@ class TestHelperProgram:
         document = _ok_payload(
             _run_helper(str(target), json.dumps([str(tmp_path)]), "0", "10", "6")
         )
-        # "aaa\n" fits (4 bytes); "bbbb\n" would exceed the 6-byte budget.
-        assert document == {"content": "aaa\n", "total": 3, "returned": 1}
+        # "aaa\n" fits (4 bytes); "bbbb\n" would exceed the 6-byte budget,
+        # so the page ends honestly and resumes at the window end.
+        assert document == {
+            "content": "aaa\n",
+            "total": 3,
+            "returned": 1,
+            "next_offset": 1,
+            "oversized_line": False,
+        }
+
+    def test_oversized_first_candidate_line_is_labeled_and_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "notes.txt"
+        target.write_text("abcdef\nok\n", encoding="utf-8")
+        document = _ok_payload(
+            _run_helper(str(target), json.dumps([str(tmp_path)]), "0", "10", "4")
+        )
+        # The first candidate line (7 bytes) alone exceeds the budget:
+        # labeled, skipped by exactly one, content never truncated.
+        assert document == {
+            "content": "",
+            "total": 2,
+            "returned": 0,
+            "next_offset": 1,
+            "oversized_line": True,
+        }
+        resumed = _ok_payload(
+            _run_helper(str(target), json.dumps([str(tmp_path)]), "1", "10", "4")
+        )
+        assert resumed == {
+            "content": "ok\n",
+            "total": 2,
+            "returned": 1,
+            "next_offset": 2,
+            "oversized_line": False,
+        }
+
+    def test_oversized_line_at_a_nonzero_offset_is_labeled(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "notes.txt"
+        target.write_text("ok\nwaytoolongline\nlast\n", encoding="utf-8")
+        document = _ok_payload(
+            _run_helper(str(target), json.dumps([str(tmp_path)]), "1", "10", "4")
+        )
+        assert document == {
+            "content": "",
+            "total": 3,
+            "returned": 0,
+            "next_offset": 2,
+            "oversized_line": True,
+        }
+
+    def test_paging_chain_covers_every_line_exactly_once(
+        self, tmp_path: Path
+    ) -> None:
+        lines = "".join(f"line-{i:02d}-xxxxxxxx\n" for i in range(40))
+        target = tmp_path / "notes.txt"
+        target.write_text(lines, encoding="utf-8")
+        seen: list[str] = []
+        offset = 0
+        for _ in range(100):
+            document = _ok_payload(
+                _run_helper(
+                    str(target), json.dumps([str(tmp_path)]), str(offset), "5", "60"
+                )
+            )
+            returned = int(document["returned"])  # type: ignore[arg-type]
+            next_offset = int(document["next_offset"])  # type: ignore[arg-type]
+            assert str(document["oversized_line"]) == "False" or returned == 0
+            if returned:
+                seen.extend(
+                    document["content"].splitlines(keepends=True)  # type: ignore[union-attr]
+                )
+            if not int(document["total"]) > next_offset:  # type: ignore[arg-type]
+                break
+            assert next_offset > offset or document["oversized_line"] is True
+            offset = next_offset
+        else:
+            raise AssertionError("paging did not terminate")
+        assert seen == lines.splitlines(keepends=True)
 
     def test_invalid_utf8_in_the_page_is_a_structured_rejection(
         self, tmp_path: Path
@@ -622,7 +747,13 @@ class TestHelperProgram:
                 str(MAX_CONTENT_BYTES),
             )
         )
-        assert document == {"content": "ok\n", "total": 2, "returned": 1}
+        assert document == {
+            "content": "ok\n",
+            "total": 2,
+            "returned": 1,
+            "next_offset": 1,
+            "oversized_line": False,
+        }
 
     def test_missing_file_is_not_found(self, tmp_path: Path) -> None:
         _refused(
@@ -680,16 +811,18 @@ class TestHelperProgram:
         root = tmp_path / "root"
         root.mkdir()
         (root / "esc").symlink_to(outside)
-        _refused(
-            _run_helper(
-                str(root / "esc" / "secret.txt"),
-                json.dumps([str(root)]),
-                "0",
-                "3",
-                str(MAX_CONTENT_BYTES),
-            ),
-            "path_denied",
+        # The symlink is an INTERMEDIATE component here: O_DIRECTORY|
+        # O_NOFOLLOW refuses it with ENOTDIR (kernel vocabulary), which
+        # maps to the honest path_not_found refusal — either way the
+        # walk fails closed and the outside file is never opened.
+        result = _run_helper(
+            str(root / "esc" / "secret.txt"),
+            json.dumps([str(root)]),
+            "0",
+            "3",
+            str(MAX_CONTENT_BYTES),
         )
+        _refused(result, "path_not_found")
 
     def test_sibling_prefix_root_boundary_is_enforced(self, tmp_path: Path) -> None:
         (tmp_path / "data").mkdir()
@@ -779,7 +912,130 @@ class TestHelperProgram:
             check=False,
         )
         document = _ok_payload(result)
-        assert document == {"content": "metachars\n", "total": 1, "returned": 1}
+        assert document == {
+            "content": "metachars\n",
+            "total": 1,
+            "returned": 1,
+            "next_offset": 1,
+            "oversized_line": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Race honesty: swapping symlinks/dirs mid-walk can never escape
+# ---------------------------------------------------------------------------
+
+_RACE_RUNS = 25
+_OUTSIDE_MARK = "OUTSIDE-SECRET-7f3a"
+#: Dwell per swapped state (seconds): without it the hot swapper never
+#: leaves the regular file in place long enough for a subprocess to
+#: serve it, and the fixture would prove nothing.
+_SWAP_DWELL_SECONDS = 0.002
+
+
+def _swap_until(stop: threading.Event, toggle: Callable[[], None]) -> None:
+    """Hammer ``toggle`` until stopped; missing-path moments are fine."""
+    while not stop.is_set():
+        try:
+            toggle()
+        except FileNotFoundError:
+            pass
+        time.sleep(_SWAP_DWELL_SECONDS)
+
+
+class TestRaceHonesty:
+    """fd-pinned traversal: a component swapped to a symlink while the
+    walk runs fails the walk (ELOOP) — the outside content can never be
+    returned. Every outcome is a success over INSIDE content or a
+    structured path_denied / path_not_found refusal."""
+
+    def _runs(self, tmp_path: Path, root: Path, target: Path) -> list[dict[str, object]]:
+        outcomes: list[dict[str, object]] = []
+        for _ in range(_RACE_RUNS):
+            result = _run_helper(
+                str(target), json.dumps([str(root)]), "0", "10", str(MAX_CONTENT_BYTES)
+            )
+            if result.returncode == 0:
+                document = json.loads(result.stdout.decode("utf-8"))
+                assert "error" not in document
+                assert document["content"] == "INSIDE\n"
+                outcomes.append(document)
+            else:
+                assert result.returncode == 3, result
+                document = json.loads(result.stdout.decode("utf-8"))
+                assert document["error"] in {"path_denied", "path_not_found"}
+                outcomes.append(document)
+            assert _OUTSIDE_MARK not in result.stdout.decode("utf-8", "replace")
+        assert any("content" in document for document in outcomes), (
+            "the race never once served the real file; the fixture is dead"
+        )
+        assert any(document.get("error") for document in outcomes), (
+            "the swapper never won a single round; the race is not exercised"
+        )
+        return outcomes
+
+    def test_final_file_symlink_swap_never_escapes(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text(f"{_OUTSIDE_MARK}\n", encoding="utf-8")
+        root = tmp_path / "root"
+        root.mkdir()
+        target = root / "notes.txt"
+        real = root / "notes.real"
+        real.write_text("INSIDE\n", encoding="utf-8")
+        # Start mid-cycle (symlink in place): the swapper then flips
+        # between the symlink and the real file; a missing gate moment
+        # is a harmless path_not_found.
+        os.symlink(str(outside / "secret.txt"), target)
+        stop = threading.Event()
+
+        def _toggle() -> None:
+            if target.is_symlink():
+                os.unlink(target)
+                os.rename(real, target)
+            else:
+                os.rename(target, real)
+                os.symlink(str(outside / "secret.txt"), target)
+
+        swapper = threading.Thread(target=_swap_until, args=(stop, _toggle), daemon=True)
+        swapper.start()
+        try:
+            self._runs(tmp_path, root, target)
+        finally:
+            stop.set()
+            swapper.join(timeout=10)
+
+    def test_parent_directory_symlink_swap_never_escapes(
+        self, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "f.txt").write_text(f"{_OUTSIDE_MARK}\n", encoding="utf-8")
+        root = tmp_path / "root"
+        root.mkdir()
+        real_dir = root / "gate.real"
+        real_dir.mkdir()
+        (real_dir / "f.txt").write_text("INSIDE\n", encoding="utf-8")
+        gate = root / "gate"
+        os.rename(real_dir, gate)
+        target = gate / "f.txt"
+        stop = threading.Event()
+
+        def _toggle() -> None:
+            if gate.is_symlink():
+                os.unlink(gate)
+                os.rename(real_dir, gate)
+            else:
+                os.rename(gate, real_dir)
+                os.symlink(str(outside), gate)
+
+        swapper = threading.Thread(target=_swap_until, args=(stop, _toggle), daemon=True)
+        swapper.start()
+        try:
+            self._runs(tmp_path, root, target)
+        finally:
+            stop.set()
+            swapper.join(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +1150,13 @@ class TestReadComposition:
         harness.transport.script = [
             _outcome(
                 stdout=json.dumps(
-                    {"content": "alpha\nbeta\n", "total": 5, "returned": 2}
+                    {
+                        "content": "alpha\nbeta\n",
+                        "total": 5,
+                        "returned": 2,
+                        "next_offset": 2,
+                        "oversized_line": False,
+                    }
                 )
             )
         ]
@@ -909,6 +1171,9 @@ class TestReadComposition:
             "limit": DEFAULT_LIMIT,
             "total": 5,
             "has_more": True,
+            "returned": 2,
+            "next_offset": 2,
+            "oversized_line": False,
         }
         (identity, request, key_path, known_hosts) = harness.transport.calls[0]
         query = read_query_from_payload(GOOD_PAYLOAD, file_read_roots=(ALLOWED_ROOT,))
@@ -927,7 +1192,13 @@ class TestReadComposition:
         harness.transport.script = [
             _outcome(
                 stdout=json.dumps(
-                    {"content": "four\nfive\n", "total": 5, "returned": 2}
+                    {
+                        "content": "four\nfive\n",
+                        "total": 5,
+                        "returned": 2,
+                        "next_offset": 5,
+                        "oversized_line": False,
+                    }
                 )
             )
         ]
@@ -936,6 +1207,55 @@ class TestReadComposition:
         assert document["offset"] == 3
         assert document["total"] == 5
         assert document["has_more"] is False
+        assert document["next_offset"] == 5
+
+    def test_oversized_skip_page_is_reported_honestly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        harness = _Harness(monkeypatch, tmp_path)
+        harness.transport.script = [
+            _outcome(
+                stdout=json.dumps(
+                    {
+                        "content": "",
+                        "total": 3,
+                        "returned": 0,
+                        "next_offset": 4,
+                        "oversized_line": True,
+                    }
+                )
+            )
+        ]
+        result = harness.run({"path": "/srv/data/notes.txt", "offset": 3})
+        assert result.ok is True
+        document = json.loads(result.output)
+        assert document["oversized_line"] is True
+        assert document["content"] == ""
+        assert document["next_offset"] == 4
+        # The skipped line was the file's last one: nothing follows it.
+        assert document["has_more"] is False
+
+    def test_inconsistent_next_offset_fails_without_content(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        harness = _Harness(monkeypatch, tmp_path)
+        harness.transport.script = [
+            _outcome(
+                stdout=json.dumps(
+                    {
+                        "content": "alpha\n",
+                        "total": 5,
+                        "returned": 1,
+                        "next_offset": 99,
+                        "oversized_line": False,
+                    }
+                )
+            )
+        ]
+        result = harness.run()
+        assert result.ok is False
+        assert result.error_code is None
+        assert "content" not in json.loads(result.output)
 
     def test_structured_remote_rejection_maps_onto_the_vocabulary(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
