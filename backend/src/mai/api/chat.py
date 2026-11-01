@@ -273,6 +273,8 @@ SERVER_PROFILE_CAPABILITY_MAP: Final[dict[str, str]] = {
     "host.shell": "host.shell",
     "journald_logs": "host.logs",
     "host.logs": "host.logs",
+    "file_read": "host.file_read",
+    "host.file_read": "host.file_read",
 }
 
 #: Built-in controller-side defaults of the auto-resolved chat grant

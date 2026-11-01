@@ -50,6 +50,7 @@ least one document rejected / 2 usage or IO error)::
 from __future__ import annotations
 
 import ipaddress
+import posixpath
 import re
 import sys
 import uuid
@@ -72,6 +73,7 @@ TOP_LEVEL_FIELDS = frozenset(
         "ssh",
         "privilege",
         "capabilities",
+        "file_read_roots",
     }
 )
 SSH_FIELDS = frozenset({"host", "port", "user", "host_key", "credential_ref"})
@@ -110,6 +112,14 @@ _SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9_])?$")
 
 _MAX_NAME_CHARS = 200
+
+# Optional per-server read-scope allowlist for the ``host.file_read``
+# capability: absolute, normalized target-side directory prefixes.
+# Absent/empty means every read is denied (fail closed). The filesystem
+# root "/" is rejected as a root: it would silently allowlist the
+# whole host.
+MAX_FILE_READ_ROOTS = 64
+_MAX_ROOT_CHARS = 4096
 
 
 class ExecutionEnvironment(StrEnum):
@@ -195,6 +205,7 @@ class ServerProfile:
     ssh: SshIdentity
     privilege: PrivilegeMode
     capabilities: tuple[str, ...]
+    file_read_roots: tuple[str, ...] = ()
 
 
 def canonical_relative_path(server_id: uuid.UUID) -> str:
@@ -497,6 +508,45 @@ def parse_server_profile(document: object) -> ServerProfile:
         if not bad_refs and len(set(raw_capabilities)) == len(raw_capabilities):
             capabilities = tuple(raw_capabilities)
 
+    raw_roots = document.get("file_read_roots")
+    file_read_roots: tuple[str, ...] = ()
+    if raw_roots is not None:
+        roots_error = ProfileFieldError(
+            ProfileErrorCode.INVALID_FIELD,
+            "file_read_roots",
+            "must be a list of at most "
+            f"{MAX_FILE_READ_ROOTS} absolute normalized directory paths "
+            "(printable single line, no NUL, never '/', no duplicates)",
+        )
+        if not isinstance(raw_roots, list) or not all(
+            isinstance(item, str) for item in raw_roots
+        ):
+            errors.append(roots_error)
+        elif len(raw_roots) > MAX_FILE_READ_ROOTS:
+            errors.append(roots_error)
+        else:
+            valid_roots: list[str] = []
+            for item in raw_roots:
+                if (
+                    not item
+                    or len(item) > _MAX_ROOT_CHARS
+                    or not item.startswith("/")
+                    or item == "/"
+                    or not item.isprintable()
+                    or "\x00" in item
+                    or "\n" in item
+                    or "\r" in item
+                    or posixpath.normpath(item) != item
+                ):
+                    errors.append(roots_error)
+                    break
+                if item in valid_roots:
+                    errors.append(roots_error)
+                    break
+                valid_roots.append(item)
+            else:
+                file_read_roots = tuple(raw_roots)
+
     ssh: SshIdentity | None = _validate_ssh(document, errors)
 
     if errors:
@@ -512,6 +562,7 @@ def parse_server_profile(document: object) -> ServerProfile:
         ssh=ssh,
         privilege=PrivilegeMode(raw_privilege),
         capabilities=capabilities,
+        file_read_roots=file_read_roots,
     )
 
 
