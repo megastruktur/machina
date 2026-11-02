@@ -462,6 +462,82 @@ async def test_active_episode_reuse_and_terminal_rollover(
     # The §10.3 read probe lists bindings in objective-id order.
     assert detail["objective_ids"] == sorted([str(episode_a), str(new_id)])
 
+    # Per-conversation ACTIVE episode: after the rollover, the conversation's
+    # LIVE episode is the one reused — the earliest (terminal) binding must
+    # never hijack selection into re-rolling a fresh episode per turn.
+    _settle(bootstrapped_url, key3)
+    key4 = uuid.uuid4()
+    fourth = await _submit_followup(
+        app, jar, server_a, crid, key4, message="Continue the live episode."
+    )
+    assert fourth.status == 201, fourth.body
+    assert _submitted_handler(bootstrapped_url, key4) == "agent.run_v2"
+    objectives = _objective_rows(bootstrapped_url)
+    assert len(objectives) == 2, "the live episode is reused, not re-rolled"
+    assert [(b["objective_id"], b["run_id"]) for b in _bindings(bootstrapped_url)] == [
+        (str(episode_a), str(crid)),
+        (str(episode_a), str(key2)),
+        (str(new_id), str(key3)),
+        (str(new_id), str(key4)),
+    ]
+
+
+async def test_replay_after_rollover_replays_run_binding(
+    app, jar, server_a, bootstrapped_url
+) -> None:
+    """A retransmission reconstructs its OWN run's binding — exact under
+    any rollover history (the digest must match the RECORDED admission),
+    never a false conflict."""
+    crid = uuid.uuid4()
+    created = await _submit_create(app, jar, server_a, crid)
+    assert created.status == 201, created.body
+    episode_a = _objective_rows(bootstrapped_url)[0]["objective_id"]
+
+    _settle(bootstrapped_url, crid)
+    key2 = uuid.uuid4()
+    followup = await _submit_followup(
+        app, jar, server_a, crid, key2, message="Second turn."
+    )
+    assert followup.status == 201, followup.body
+    _settle(bootstrapped_url, key2)
+
+    async def _cancel() -> None:
+        from mai.agents.objective_store import achange_status
+
+        engine, sessions = create_app_engine(bootstrapped_url)
+        try:
+            await achange_status(
+                sessions,
+                uuid.UUID(str(episode_a)),
+                server_id=server_a,
+                expected_revision=1,
+                to_status=ObjectiveStatus.CANCELLED,
+                actor_kind=ActorKind.OPERATOR,
+            )
+        finally:
+            await engine.dispose()
+
+    harness._run(_cancel())
+
+    key3 = uuid.uuid4()
+    rollover = await _submit_followup(
+        app, jar, server_a, crid, key3, message="Rollover turn."
+    )
+    assert rollover.status == 201, rollover.body
+    assert len(_objective_rows(bootstrapped_url)) == 2
+    # Replay the ROLLOVER turn itself under the same key: the recorded
+    # digest named the NEW episode (this run's own binding) — the replay
+    # must deduplicate, never falsely conflict and never re-roll.
+    replay = await _submit_followup(
+        app, jar, server_a, crid, key3, message="Rollover turn."
+    )
+    assert replay.status == 200, replay.body
+    assert replay.json()["disposition"] == "deduplicated"
+    assert len(_objective_rows(bootstrapped_url)) == 2
+    assert sorted(b["run_id"] for b in _bindings(bootstrapped_url)) == sorted(
+        [str(crid), str(key2), str(key3)]
+    )
+
 
 async def test_explicit_objective_rejections_unchanged(
     app, jar, server_a, bootstrapped_url

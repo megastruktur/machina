@@ -1423,8 +1423,14 @@ async def _resolve_turn_objective(
     requested_objective_id: uuid.UUID | None,
     *,
     is_create: bool,
+    client_request_id: uuid.UUID,
 ) -> tuple[uuid.UUID | None, bool]:
     """Resolve the turn's effective v2 objective binding (§3.3; AC1).
+
+    A RETRANSMISSION resolves first and exactly: the key's own run's
+    durable binding reconstructs its originally admitted document —
+    correct under any rollover history (the replay digest must match the
+    RECORDED admission, never the conversation's current episode).
 
     Explicit wins: a requested ``objective_id`` is scope-checked against
     the initiating server (a foreign-scope reference fails closed) and
@@ -1439,11 +1445,14 @@ async def _resolve_turn_objective(
     active binding runs v2 too. ``(turn_objective_id, auto_episode)``
     carries the decision — ``auto_episode`` marks that the admission
     must START a new episode inside its transaction (a fresh
-    create-route conversation, or a follow-up whose bound episode is
+    create-route conversation, or a follow-up whose current episode is
     terminal: the rollover keeps the old history untouched). A
     follow-up on an UNBOUND conversation stays legacy — historical
     legacy conversations and their drain/read semantics remain intact.
     """
+    bound_to_run = await _arun_bound_objective(factory, client_request_id)
+    if bound_to_run is not None:
+        return bound_to_run, False
     bound = await _abound_objective(factory, conversation_id)
     if requested_objective_id is not None:
         try:
@@ -1504,11 +1513,14 @@ async def _abound_objective(
     factory: async_sessionmaker[AsyncSession],
     conversation_id: uuid.UUID,
 ) -> tuple[uuid.UUID, ObjectiveStatus] | None:
-    """The objective episode this conversation's runs bind to, if any.
+    """The objective episode this conversation's runs CURRENTLY bind to.
 
-    The conversation's first-bound run wins (submit order); the
-    objective's CURRENT status rides along so the direct-agent default
-    can distinguish a live episode from a terminal one.
+    The conversation's LIVE episode wins: any active binding (the newest
+    one, submit order descending) — the earliest terminal bindings of
+    rolled-over episodes never hijack selection. With no active binding
+    the NEWEST binding rides along with its CURRENT status, so the
+    direct-agent default can distinguish a live episode from a terminal
+    one (the rollover decision).
     """
     async with factory() as session:
         row = (
@@ -1518,7 +1530,8 @@ async def _abound_objective(
                     "JOIN conversation_runs cr ON cr.run_id = r.run_id "
                     "JOIN objectives o ON o.objective_id = r.objective_id "
                     "WHERE cr.conversation_id = :cid "
-                    "ORDER BY cr.created_at, r.run_id LIMIT 1"
+                    "ORDER BY (o.status = 'active') DESC, "
+                    "cr.created_at DESC, r.run_id DESC LIMIT 1"
                 ),
                 {"cid": conversation_id},
             )
@@ -1526,6 +1539,31 @@ async def _abound_objective(
     if row is None:
         return None
     return uuid.UUID(str(row[0])), ObjectiveStatus(str(row[1]))
+
+
+async def _arun_bound_objective(
+    factory: async_sessionmaker[AsyncSession],
+    run_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """The objective THIS run bound at its admission (exact).
+
+    Rollover-proof retransmission identity: a replayed key rebuilds its
+    originally admitted v2 document from its own durable binding, never
+    from the conversation's current episode.
+    """
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT objective_id FROM objective_runs "
+                    "WHERE run_id = :rid"
+                ),
+                {"rid": run_id},
+            )
+        ).first()
+    if row is None:
+        return None
+    return uuid.UUID(str(row[0]))
 
 
 def _objective_turn_conflict(
@@ -1741,6 +1779,7 @@ async def _submit_canonical_turn(
             server_uuid,
             payload.objective_id,
             is_create=conversation_id is None,
+            client_request_id=client_request_id,
         )
     except ObjectiveTurnRejection as rejection:
         return _error(
@@ -1886,14 +1925,15 @@ async def _submit_canonical_turn(
                     turn_objective_id = episode.objective_id
                     objective_bound_here = True
                 else:
-                    # Retransmission of an originally v2 turn (its episode
-                    # may have settled in the meantime): the pre-lock
-                    # probe is stale by definition, so re-read the binding
-                    # under the admission lock and reconstruct the
-                    # originally admitted v2 document verbatim (C4).
-                    current = await _abound_objective(factory, target)
-                    if current is not None:
-                        turn_objective_id = current[0]
+                    # Retransmission (the pre-lock probes raced the original
+                    # commit): the key's OWN run binding reconstructs the
+                    # originally admitted v2 document verbatim — exact
+                    # under any rollover history (C4).
+                    run_bound = await _arun_bound_objective(
+                        factory, client_request_id
+                    )
+                    if run_bound is not None:
+                        turn_objective_id = run_bound
             if turn_objective_id is not None:
                 # Runtime v2 (§2/§3.3): the v2 intent selects the v2
                 # handler explicitly and carries the objective binding;
