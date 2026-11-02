@@ -469,9 +469,14 @@ async def create_objective(
 
     Operator authority only: the route runs behind the full session →
     origin → CSRF boundary and pins ``ActorKind.OPERATOR`` — there is no
-    agent-reachable create path. The ONE store persists the verbatim
-    request/constraints (projected for secret safety), the initial
-    scope, and the ``objective.created`` ledger event in ONE transaction.
+    agent-reachable create path. (The canonical chat admission also
+    starts an episode AUTOMATICALLY for a turn with no explicit or bound
+    objective — the direct-agent default — through the same store seams
+    and under the same submit-time operator authority; it never widens
+    scope or authority beyond the selected server.) The ONE store
+    persists the verbatim request/constraints (projected for secret
+    safety), the initial scope, and the ``objective.created`` ledger
+    event in ONE transaction.
     """
     _store, _token = await _require_session(request)  # layer 1
     _require_allowed_origin(request)  # layer 2

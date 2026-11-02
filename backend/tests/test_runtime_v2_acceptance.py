@@ -79,7 +79,7 @@ from test_conversation_api_v2_http import (  # sibling harness, imported not cop
     create_objective,
     create_profile,
     login_session,
-    submit_legacy_conversation,
+    seed_legacy_conversation,
     submit_v2_conversation,
 )
 from test_agent_run_v2 import (  # blocking preflight gateway (campaign-pinned)
@@ -2159,16 +2159,18 @@ class TestRV2Legacy:
         )
         assert v2.status == 201
 
-        # A legacy conversation on the SAME surface (no objective).
+        # A historical legacy conversation, seeded through the internal
+        # store seams and enqueued so the REAL frozen ``agent.run``
+        # worker replays it (no public legacy selector).
         legacy_key = uuid.uuid4()
-        legacy = await submit_legacy_conversation(
-            acc_app,
-            acc_jar,
+        legacy_run = await seed_legacy_conversation(
+            bootstrapped_url,
             server,
             client_request_id=legacy_key,
             message="mission=legacy Answer this legacy turn directly.",
+            enqueue=True,
         )
-        assert legacy.status == 201
+        assert legacy_run == str(legacy_key)
 
         v2_doc = (
             await call_app(
@@ -2221,7 +2223,7 @@ class TestRV2Legacy:
             source_row = conn.execute(
                 "SELECT message_id FROM conversation_messages "
                 "WHERE client_request_id = %s AND role = 'user' LIMIT 1",
-                (legacy.json()["run_id"],),
+                (legacy_key,),
             ).fetchone()
         assert source_row is not None, "the accepted turn must carry its message"
         acc_scenario.write_model_script(
@@ -2246,9 +2248,11 @@ class TestRV2Legacy:
             }
         )
         acc_scenario.spawn_worker(bootstrapped_url)
-        legacy_run = uuid.UUID(legacy.json()["run_id"])
-        _wait_state(bootstrapped_url, legacy_run, {"succeeded"}, FX_RUN_TIMEOUT)
-        legacy_events = await _read_run_events(acc_app, acc_jar, legacy_run)
+        legacy_run_id = uuid.UUID(legacy_run)
+        _wait_state(
+            bootstrapped_url, legacy_run_id, {"succeeded"}, FX_RUN_TIMEOUT
+        )
+        legacy_events = await _read_run_events(acc_app, acc_jar, legacy_run_id)
         legacy_types = [event["type"] for event in legacy_events]
         assert "chat.submitted" in legacy_types
         assert "agent.completed" in legacy_types

@@ -220,6 +220,8 @@ def _drop_app_tables(url: str) -> None:
             "agent_task_criteria, agent_task_constraints, "
             "agent_task_steps, agent_tasks, conversation_steering, "
             "conversation_runs, conversation_messages, conversations, "
+            "objective_checklists, objective_journal, objective_events, "
+            "objective_runs, objective_servers, objectives, "
             "notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, "
@@ -282,6 +284,14 @@ async def _truncate(url: str) -> None:
                 "agent_task_constraints",
                 "agent_task_steps",
                 "agent_tasks",
+                # v2 objective tables first: they reference job_runs and
+                # conversations (FK-safe order once the default runs v2).
+                "objective_checklists",
+                "objective_journal",
+                "objective_events",
+                "objective_runs",
+                "objective_servers",
+                "objectives",
                 "approvals",
                 "job_resource_locks",
                 "job_events",
