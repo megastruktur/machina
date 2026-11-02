@@ -89,10 +89,12 @@ __all__ = [
     "DEFAULT_PAGE_LIMIT",
     "V2_HANDLER_NAME",
     "abind_run",
+    "abind_run_tx",
     "achange_scope",
     "achange_status",
     "acomplete_objective",
     "acreate_objective",
+    "acreate_objective_tx",
     "aget_objective",
     "alist_objective_runs",
     "alist_objectives",
@@ -209,6 +211,48 @@ async def acreate_objective(
     silently cut. With ``client_request_id`` the creation is idempotent:
     same key + same projected content returns the SAME objective; same key
     + changed content is the stable ``client_request_conflict``.
+
+    The whole discipline lives in :func:`acreate_objective_tx` on the
+    caller's transaction; this wrapper only owns the session boundary.
+    """
+    async with sessions() as session, session.begin():
+        return await acreate_objective_tx(
+            session,
+            server_id=server_id,
+            original_request=original_request,
+            constraints=constraints,
+            scope_server_ids=scope_server_ids,
+            title=title,
+            budget=budget,
+            actor_kind=actor_kind,
+            client_request_id=client_request_id,
+            objective_id=objective_id,
+        )
+
+
+async def acreate_objective_tx(
+    session: AsyncSession,
+    *,
+    server_id: uuid.UUID,
+    original_request: str,
+    constraints: list[str] | tuple[str, ...] = (),
+    scope_server_ids: list[uuid.UUID] | tuple[uuid.UUID, ...],
+    title: str | None = None,
+    budget: ObjectiveBudget | None = None,
+    actor_kind: ActorKind = ActorKind.OPERATOR,
+    client_request_id: uuid.UUID | None = None,
+    objective_id: uuid.UUID | None = None,
+) -> ObjectiveDetail:
+    """The transaction-scoped creation seam (§3.1; AC1).
+
+    Exactly :func:`acreate_objective` — validation, projection,
+    ``(server_id, client_request_id)`` idempotency, the objective +
+    scope rows, the ``objective.created`` ledger event and the journal
+    cache seed — but on the CALLER'S already-open transaction instead of
+    a store-owned one. The canonical chat admission calls this so an
+    automatic episode commits (or rolls back) TOGETHER with its message
+    and run (C4: no half-recorded turn). The detail is read back inside
+    the same transaction; nothing here commits or rolls back.
     """
     if actor_kind is not ActorKind.OPERATOR:
         raise _single(
@@ -277,78 +321,85 @@ async def acreate_objective(
         actor_kind=ActorKind.OPERATOR,
         data=payload.model_dump(mode="json"),
     )
-    async with sessions() as session, session.begin():
-        if client_request_id is not None:
-            existing = (
-                await session.execute(
-                    text(
-                        f"SELECT {_OBJECTIVE_COLUMNS} FROM objectives "
-                        "WHERE server_id = :sid AND client_request_id = :crid"
-                    ),
-                    {"sid": server_id, "crid": client_request_id},
-                )
-            ).mappings().first()
-            if existing is not None:
-                if str(existing["content_fingerprint"]) != fingerprint:
-                    raise _single(
-                        ObjectiveErrorCode.CLIENT_REQUEST_CONFLICT,
-                        "client_request_id",
-                        "the same client request id was used with changed "
-                        "objective content",
-                    )
-                scope_rows = await ascope_server_rows(
-                    session, existing["objective_id"]  # type: ignore[arg-type]
-                )
-                return _row_to_detail(existing, scope_rows)
-        await session.execute(
-            text(
-                """
-                INSERT INTO objectives
-                    (objective_id, server_id, client_request_id,
-                     content_fingerprint, title, original_request,
-                     constraints, status, revision, budget)
-                VALUES
-                    (:oid, :sid, :crid, :fp, :title, :request,
-                     CAST(:constraints AS jsonb), 'active', 1,
-                     CAST(:budget AS jsonb))
-                """
-            ),
-            {
-                "oid": oid,
-                "sid": server_id,
-                "crid": client_request_id,
-                "fp": fingerprint,
-                "title": safe_title,
-                "request": safe_request,
-                "constraints": _json_dump(safe_constraints),
-                "budget": (
-                    _json_dump(budget.model_dump(mode="exclude_none=True"))
-                    if budget is not None
-                    else None
+    if client_request_id is not None:
+        existing = (
+            await session.execute(
+                text(
+                    f"SELECT {_OBJECTIVE_COLUMNS} FROM objectives "
+                    "WHERE server_id = :sid AND client_request_id = :crid"
                 ),
-            },
-        )
-        await session.execute(
-            text(
-                """
-                INSERT INTO objective_servers
-                    (objective_id, server_id, added_by_actor_kind)
-                SELECT :oid, sid, :actor
-                FROM unnest(CAST(:sids AS uuid[])) AS sid
-                """
+                {"sid": server_id, "crid": client_request_id},
+            )
+        ).mappings().first()
+        if existing is not None:
+            if str(existing["content_fingerprint"]) != fingerprint:
+                raise _single(
+                    ObjectiveErrorCode.CLIENT_REQUEST_CONFLICT,
+                    "client_request_id",
+                    "the same client request id was used with changed "
+                    "objective content",
+                )
+            scope_rows = await ascope_server_rows(
+                session, existing["objective_id"]  # type: ignore[arg-type]
+            )
+            return _row_to_detail(existing, scope_rows)
+    await session.execute(
+        text(
+            """
+            INSERT INTO objectives
+                (objective_id, server_id, client_request_id,
+                 content_fingerprint, title, original_request,
+                 constraints, status, revision, budget)
+            VALUES
+                (:oid, :sid, :crid, :fp, :title, :request,
+                 CAST(:constraints AS jsonb), 'active', 1,
+                 CAST(:budget AS jsonb))
+            """
+        ),
+        {
+            "oid": oid,
+            "sid": server_id,
+            "crid": client_request_id,
+            "fp": fingerprint,
+            "title": safe_title,
+            "request": safe_request,
+            "constraints": _json_dump(safe_constraints),
+            "budget": (
+                _json_dump(budget.model_dump(mode="exclude_none=True"))
+                if budget is not None
+                else None
             ),
-            {
-                "oid": oid,
-                "actor": ActorKind.OPERATOR.value,
-                "sids": [str(value) for value in scope_list],
-            },
+        },
+    )
+    await session.execute(
+        text(
+            """
+            INSERT INTO objective_servers
+                (objective_id, server_id, added_by_actor_kind)
+            SELECT :oid, sid, :actor
+            FROM unnest(CAST(:sids AS uuid[])) AS sid
+            """
+        ),
+        {
+            "oid": oid,
+            "actor": ActorKind.OPERATOR.value,
+            "sids": [str(value) for value in scope_list],
+        },
+    )
+    await aappend_events(session, oid, [draft])
+    # Seed the journal cache from the ledger itself (the cache is the
+    # fold through the created event's cursor — never hand-built).
+    seeded = await _areplay_from_zero(session, oid)
+    await _aupsert_cache(session, oid, seeded)
+    row = (
+        await session.execute(
+            text(f"SELECT {_OBJECTIVE_COLUMNS} FROM objectives "
+                 "WHERE objective_id = :oid"),
+            {"oid": oid},
         )
-        await aappend_events(session, oid, [draft])
-        # Seed the journal cache from the ledger itself (the cache is the
-        # fold through the created event's cursor — never hand-built).
-        seeded = await _areplay_from_zero(session, oid)
-        await _aupsert_cache(session, oid, seeded)
-    return await aget_objective(sessions, oid, server_id=server_id)
+    ).mappings().one()
+    scope_rows = await ascope_server_rows(session, oid)
+    return _row_to_detail(row, scope_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +826,40 @@ async def abind_run(
 ) -> ObjectiveRunLink:
     """Bind one durable v2 run to the objective (§3.3; AC1).
 
-    Guards, all fail-closed in ONE transaction:
+    The whole discipline lives in :func:`abind_run_tx` on the caller's
+    transaction; this wrapper only owns the session boundary.
+    """
+    async with sessions() as session, session.begin():
+        return await abind_run_tx(
+            session,
+            objective_id,
+            server_id=server_id,
+            run_id=run_id,
+            initiating_server_id=initiating_server_id,
+            actor_kind=actor_kind,
+            handler=handler,
+            parent_run_id=parent_run_id,
+        )
+
+
+async def abind_run_tx(
+    session: AsyncSession,
+    objective_id: uuid.UUID,
+    *,
+    server_id: uuid.UUID,
+    run_id: uuid.UUID,
+    initiating_server_id: uuid.UUID,
+    actor_kind: ActorKind,
+    handler: str = V2_HANDLER_NAME,
+    parent_run_id: uuid.UUID | None = None,
+) -> ObjectiveRunLink:
+    """The transaction-scoped binding seam (§3.3; AC1).
+
+    Exactly :func:`abind_run` on the CALLER'S already-open transaction
+    (nothing here commits or rolls back), so an automatic admission can
+    bind its run and its new objective atomically.
+
+    Guards, all fail-closed:
 
     - ``handler`` must be exactly ``agent.run_v2`` (the DB CHECK is the
       durable §10.2 backstop: an in-flight legacy run can never become
@@ -796,76 +880,75 @@ async def abind_run(
         )
     if actor_kind not in ACTOR_KINDS:
         raise ValueError("actor_kind must be an ActorKind value")
-    async with sessions() as session, session.begin():
-        row, scope_rows = await achecked_objective(
-            session, objective_id, server_id=server_id, for_update=True
+    row, scope_rows = await achecked_objective(
+        session, objective_id, server_id=server_id, for_update=True
+    )
+    del row
+    scope_ids = {
+        uuid.UUID(str(scope_row["server_id"])) for scope_row in scope_rows
+    }
+    if initiating_server_id not in scope_ids:
+        raise _single(
+            ObjectiveErrorCode.RUN_NOT_IN_SCOPE,
+            "initiating_server_id",
+            "the run's initiating server is not in the objective scope; "
+            "no agent may add a server — the operator expands the scope",
         )
-        del row
-        scope_ids = {
-            uuid.UUID(str(scope_row["server_id"])) for scope_row in scope_rows
-        }
-        if initiating_server_id not in scope_ids:
-            raise _single(
-                ObjectiveErrorCode.RUN_NOT_IN_SCOPE,
-                "initiating_server_id",
-                "the run's initiating server is not in the objective scope; "
-                "no agent may add a server — the operator expands the scope",
+    if parent_run_id is not None:
+        parent = (
+            await session.execute(
+                text(
+                    "SELECT objective_id FROM objective_runs "
+                    "WHERE run_id = :rid"
+                ),
+                {"rid": parent_run_id},
             )
-        if parent_run_id is not None:
-            parent = (
-                await session.execute(
-                    text(
-                        "SELECT objective_id FROM objective_runs "
-                        "WHERE run_id = :rid"
-                    ),
-                    {"rid": parent_run_id},
-                )
-            ).first()
-            if parent is None:
-                raise _single(
-                    ObjectiveErrorCode.INVALID_PAYLOAD,
-                    "parent_run_id",
-                    "the parent run is not bound to any objective",
-                )
-            if parent[0] != objective_id:
-                raise _single(
-                    ObjectiveErrorCode.INVALID_PAYLOAD,
-                    "parent_run_id",
-                    "delegation children bind to the parent's objective",
-                )
+        ).first()
+        if parent is None:
+            raise _single(
+                ObjectiveErrorCode.INVALID_PAYLOAD,
+                "parent_run_id",
+                "the parent run is not bound to any objective",
+            )
+        if parent[0] != objective_id:
+            raise _single(
+                ObjectiveErrorCode.INVALID_PAYLOAD,
+                "parent_run_id",
+                "delegation children bind to the parent's objective",
+            )
+    await session.execute(
+        text(
+            """
+            INSERT INTO objective_runs
+                (objective_id, run_id, parent_run_id,
+                 initiating_server_id, handler, actor_kind)
+            VALUES (:oid, :rid, :parent, :isid, :handler, :actor)
+            ON CONFLICT (objective_id, run_id) DO NOTHING
+            """
+        ),
+        {
+            "oid": objective_id,
+            "rid": run_id,
+            "parent": parent_run_id,
+            "isid": initiating_server_id,
+            "handler": handler,
+            "actor": actor_kind.value,
+        },
+    )
+    link = (
         await session.execute(
             text(
                 """
-                INSERT INTO objective_runs
-                    (objective_id, run_id, parent_run_id,
-                     initiating_server_id, handler, actor_kind)
-                VALUES (:oid, :rid, :parent, :isid, :handler, :actor)
-                ON CONFLICT (objective_id, run_id) DO NOTHING
+                SELECT objective_id, run_id, parent_run_id,
+                       initiating_server_id, handler, actor_kind,
+                       created_at
+                FROM objective_runs
+                WHERE objective_id = :oid AND run_id = :rid
                 """
             ),
-            {
-                "oid": objective_id,
-                "rid": run_id,
-                "parent": parent_run_id,
-                "isid": initiating_server_id,
-                "handler": handler,
-                "actor": actor_kind.value,
-            },
+            {"oid": objective_id, "rid": run_id},
         )
-        link = (
-            await session.execute(
-                text(
-                    """
-                    SELECT objective_id, run_id, parent_run_id,
-                           initiating_server_id, handler, actor_kind,
-                           created_at
-                    FROM objective_runs
-                    WHERE objective_id = :oid AND run_id = :rid
-                    """
-                ),
-                {"oid": objective_id, "rid": run_id},
-            )
-        ).mappings().one()
+    ).mappings().one()
     return ObjectiveRunLink(
         objective_id=link["objective_id"],  # type: ignore[arg-type]
         run_id=link["run_id"],  # type: ignore[arg-type]

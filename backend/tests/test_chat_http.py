@@ -727,6 +727,14 @@ async def _truncate(url: str) -> None:
     try:
         async with engine.begin() as conn:
             for table in (
+                # v2 objective tables first: they reference job_runs and
+                # conversations (the same FK-safe order as the v2 suite).
+                "objective_checklists",
+                "objective_journal",
+                "objective_events",
+                "objective_runs",
+                "objective_servers",
+                "objectives",
                 "job_resource_locks",
                 "job_schedule_fires",
                 "job_steps",
@@ -2467,7 +2475,21 @@ async def test_modern_create_admits_first_turn_atomically(
     submitted = next(e for e in events if e.type == "chat.submitted")
     assert submitted.data["conversation_id"] == str(crid)
     assert submitted.data["message_id"] == str(message_id)
-    assert submitted.data["handler"] == "agent.run"
+    # Direct-agent default: the canonical create runs agent.run_v2 with
+    # its own objective episode, bound before the engine enqueue.
+    assert submitted.data["handler"] == "agent.run_v2"
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        episode = conn.execute(
+            "SELECT o.objective_id, o.server_id, o.status, "
+            "o.original_request FROM objective_runs r "
+            "JOIN objectives o ON o.objective_id = r.objective_id "
+            "WHERE r.run_id = %s",
+            (crid,),
+        ).fetchone()
+    assert episode is not None
+    assert episode["server_id"] == server_a
+    assert episode["status"] == "active"
+    assert episode["original_request"] == "Plan only; do not change files"
     # The engine enqueue followed the commit: the engine HOLDS the run.
     assert await _current_state(bootstrapped_url, crid) == "queued"
 

@@ -284,6 +284,14 @@ async def _truncate(url: str) -> None:
     try:
         async with engine.begin() as conn:
             for table in (
+                # v2 objective tables first: they reference job_runs and
+                # conversations (FK-safe order once the default runs v2).
+                "objective_checklists",
+                "objective_journal",
+                "objective_events",
+                "objective_runs",
+                "objective_servers",
+                "objectives",
                 "job_resource_locks",
                 "job_schedule_fires",
                 "job_steps",

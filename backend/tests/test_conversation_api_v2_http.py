@@ -29,6 +29,7 @@ plumbing per C06 rule 6), no real SSH target, no browser.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -40,6 +41,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,8 @@ from fastapi import FastAPI
 
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.api.chat import _record_chat_submission
+from mai.api.jobs import _record_submit_intent
 from mai.contracts.jobs import TERMINAL_RUN_STATES, RunState
 from mai.database import create_app_engine
 from mai.jobs.lifecycle import RunLifecycle
@@ -1001,29 +1005,119 @@ async def submit_v2_conversation(
     )
 
 
-async def submit_legacy_conversation(
-    app: FastAPI,
-    jar: dict[str, str],
+async def seed_legacy_conversation(
+    url: str,
     server: uuid.UUID,
     *,
-    client_request_id: uuid.UUID | None = None,
+    client_request_id: uuid.UUID,
     message: str = "Legacy conversation turn.",
     profile: str = "fast",
-) -> HttpResponse:
-    body: dict[str, Any] = {
-        "server_id": str(server),
-        "client_request_id": str(client_request_id or uuid.uuid4()),
-        "message": message,
-        "profile": profile,
-    }
-    return await call_app(
-        app,
-        "POST",
-        "/api/v1/chat/conversations",
-        json_body=body,
-        headers=_mutation_headers(jar),
-        cookies=jar,
+    enqueue: bool = False,
+    allowed_capabilities: tuple[str, ...] = ("fixture.read",),
+) -> str:
+    """Seed ONE historical legacy conversation through the INTERNAL
+    store seams (runtime-v2 §10: history predating the direct-agent
+    default was never created by today's canonical surface, so fixtures
+    seed it the same way — there is deliberately NO public legacy
+    selector).
+
+    Real store writes only: the conversation row, the canonical message
+    (``asubmit_turn``), the facade intent + ``agent.run`` submission
+    record, the run link — and, with ``enqueue=True``, the frozen legacy
+    payload through the ONE engine adapter so the REAL ``agent.run``
+    worker can replay it. Returns the run id.
+    """
+    from mai.agents import run as agent_run
+    from mai.agents.conversation_store import (
+        MessageSourceKind,
+        aattach_run,
+        acreate_conversation,
+        asubmit_turn,
     )
+    from mai.api.chat import _canonical, _modern_turn_document
+    from mai.jobs.engine import EngineClient
+    from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+    engine, sessions = create_app_engine(url)
+    try:
+        await acreate_conversation(
+            sessions, server_id=server, conversation_id=client_request_id
+        )
+        turn = await asubmit_turn(
+            sessions,
+            conversation_id=client_request_id,
+            server_id=server,
+            client_request_id=client_request_id,
+            message=message,
+            source_kind=MessageSourceKind.API,
+        )
+        now = datetime.now(timezone.utc)
+        context = ExecutionContext(
+            principal="seed-legacy-fixture-not-a-secret",
+            server_id=server,
+            run_id=client_request_id,
+            parent_scope=None,
+            profile_revision="1",
+            prompt_revision="1",
+            credential_references=(),
+            allowed_capabilities=list(allowed_capabilities),
+            mode=PolicyMode.DELEGATED,
+        )
+        engine_document = _modern_turn_document(
+            run_id=str(client_request_id),
+            server_id=str(server),
+            context=context,
+            profile=profile,
+            task=turn.message.content,
+        )
+        agent_run.parse_agent_run_intent(_canonical(engine_document))
+        payload_json = _canonical(engine_document)
+        digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
+        async with sessions() as session, session.begin():
+            await _record_submit_intent(
+                session,
+                run_id=str(client_request_id),
+                server_id=str(server),
+                profile_revision=1,
+                prompt_revision=1,
+                model_profile=profile,
+                requested_grants=sorted(allowed_capabilities),
+                digest=digest,
+                label=next(iter(sorted(allowed_capabilities)), profile),
+                now=now,
+            )
+            await _record_chat_submission(
+                session,
+                run_id=str(client_request_id),
+                digest=digest,
+                handler="agent.run",
+                attachments=[],
+                child_count=0,
+                service_tags=[],
+                now=now,
+                conversation_id=client_request_id,
+                message_id=turn.message.message_id,
+            )
+        await aattach_run(
+            sessions,
+            conversation_id=client_request_id,
+            server_id=server,
+            run_id=client_request_id,
+        )
+    finally:
+        await engine.dispose()
+    if enqueue:
+        client = EngineClient(url)
+        try:
+            await asyncio.to_thread(
+                client.enqueue_run,
+                str(client_request_id),
+                "agent.run",
+                payload_json,
+            )
+        finally:
+            client.close()
+    return str(client_request_id)
 
 
 def _wait_state(url: str, run_id: uuid.UUID, states: set[str], timeout: float) -> str:
@@ -2117,10 +2211,10 @@ class TestStateSpecificControls:
         objective = await create_objective(v2_app, jar, server_a)
         oid = uuid.UUID(objective.json()["objective_id"])
         key = uuid.uuid4()
-        legacy = await submit_legacy_conversation(
-            v2_app, jar, server_a, client_request_id=key
+        created = await submit_v2_conversation(
+            v2_app, jar, server_a, oid, client_request_id=key
         )
-        assert legacy.status == 201
+        assert created.status == 201
         reconcile = await call_app(
             v2_app,
             "POST",
@@ -2288,12 +2382,15 @@ class TestLegacyReadAndDrain:
         )
         assert v2.status == 201
 
-        # A legacy conversation on the SAME surface (no objective).
+        # A historical legacy conversation, seeded through the internal
+        # store seams (pre-default runtime: no public legacy selector).
         legacy_key = uuid.uuid4()
-        legacy = await submit_legacy_conversation(
-            v2_app, jar, server_a, client_request_id=legacy_key
+        legacy_run = await seed_legacy_conversation(
+            bootstrapped_url,
+            server_a,
+            client_request_id=legacy_key,
         )
-        assert legacy.status == 201
+        assert legacy_run == str(legacy_key)
 
         v2_detail = await call_app(
             v2_app,
@@ -2342,7 +2439,7 @@ class TestLegacyReadAndDrain:
             lifecycle = RunLifecycle(sessions)
 
             async def _settle() -> None:
-                for run in (v2.json()["run_id"], legacy.json()["run_id"]):
+                for run in (v2.json()["run_id"], legacy_run):
                     await lifecycle.record_transition(run, RunState.CANCELLED)
 
             _run(_settle())

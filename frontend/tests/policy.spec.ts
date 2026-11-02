@@ -612,6 +612,12 @@ test('renders distinct enabled-tools and ask control groups; no secret material'
 	await expect(g.getByTestId('approvals-section')).toBeVisible();
 	await expect(g.getByTestId('mode-note')).toContainText('Ask/delegated');
 	await expect(g.getByTestId('mode-note')).toContainText('never approves an operation');
+	// The corrected mode semantics (no permission widening): delegated runs
+	// granted effects without prompting, ask runs require the decision for
+	// mutate/privileged, reads never require approval.
+	await expect(g.getByTestId('mode-note')).toContainText('without prompting');
+	await expect(g.getByTestId('mode-note')).toContainText('require an approval decision');
+	await expect(g.getByTestId('mode-note')).toContainText('never require approval');
 
 	// Enabled tools: one row per granted capability, servers as opaque UUIDs.
 	const rows = g.getByTestId('grant-row');

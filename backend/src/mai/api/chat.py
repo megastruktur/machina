@@ -118,6 +118,8 @@ from mai.agents.conversation_store import (
 )
 from mai.agents.objective_store import (
     abind_run,
+    abind_run_tx,
+    acreate_objective_tx,
     aget_objective as aget_objective_scope_checked,
 )
 from mai.agents.objective_store import alist_objective_runs
@@ -1419,8 +1421,16 @@ async def _resolve_turn_objective(
     conversation_id: uuid.UUID,
     server_uuid: uuid.UUID,
     requested_objective_id: uuid.UUID | None,
-) -> uuid.UUID | None:
+    *,
+    is_create: bool,
+    client_request_id: uuid.UUID,
+) -> tuple[uuid.UUID | None, bool]:
     """Resolve the turn's effective v2 objective binding (§3.3; AC1).
+
+    A RETRANSMISSION resolves first and exactly: the key's own run's
+    durable binding reconstructs its originally admitted document —
+    correct under any rollover history (the replay digest must match the
+    RECORDED admission, never the conversation's current episode).
 
     Explicit wins: a requested ``objective_id`` is scope-checked against
     the initiating server (a foreign-scope reference fails closed) and
@@ -1429,9 +1439,21 @@ async def _resolve_turn_objective(
     episode (an in-flight v2 conversation is never downgraded to a
     legacy run). An explicit request that disagrees with the
     conversation's bound episode, a settled episode, or a foreign-scope
-    reference raises :class:`ObjectiveTurnRejection` — one conversation
-    owns at most ONE objective episode.
+    reference raises :class:`ObjectiveTurnRejection`.
+
+    The DIRECT-AGENT DEFAULT: a canonical turn with NO explicit and NO
+    active binding runs v2 too. ``(turn_objective_id, auto_episode)``
+    carries the decision — ``auto_episode`` marks that the admission
+    must START a new episode inside its transaction (a fresh
+    create-route conversation, or a follow-up whose current episode is
+    terminal: the rollover keeps the old history untouched). A
+    follow-up on an UNBOUND conversation stays legacy — historical
+    legacy conversations and their drain/read semantics remain intact.
     """
+    bound_to_run = await _arun_bound_objective(factory, client_request_id)
+    if bound_to_run is not None:
+        return bound_to_run, False
+    bound = await _abound_objective(factory, conversation_id)
     if requested_objective_id is not None:
         try:
             detail = await aget_objective_scope_checked(
@@ -1465,40 +1487,83 @@ async def _resolve_turn_objective(
                     )
                 },
             )
-    bound = await _abound_objective(factory, conversation_id)
-    if bound is not None:
-        if (
-            requested_objective_id is not None
-            and bound != requested_objective_id
-        ):
+        if bound is not None and bound[0] != requested_objective_id:
             raise ObjectiveTurnRejection(
                 HTTP_409_CONFLICT,
                 ObjectiveErrorCode.INVALID_PAYLOAD.value,
                 "the conversation is bound to a different objective episode",
                 fields={"objective_id": ObjectiveErrorCode.INVALID_PAYLOAD.value},
             )
-        return bound
-    return requested_objective_id
+        return requested_objective_id, False
+    if bound is not None:
+        bound_id, bound_status = bound
+        if bound_status is ObjectiveStatus.ACTIVE:
+            return bound_id, False
+        # The bound episode is terminal: the conversation's next run
+        # rolls over into a NEW objective episode (old history unchanged).
+        return None, True
+    if is_create:
+        # A canonical NEW chat selects the v2 runtime by default; its
+        # episode is created inside the admission transaction.
+        return None, True
+    return None, False
 
 
 async def _abound_objective(
     factory: async_sessionmaker[AsyncSession],
     conversation_id: uuid.UUID,
-) -> uuid.UUID | None:
-    """The objective episode this conversation's runs bind to, if any."""
+) -> tuple[uuid.UUID, ObjectiveStatus] | None:
+    """The objective episode this conversation's runs CURRENTLY bind to.
+
+    The conversation's LIVE episode wins: any active binding (the newest
+    one, submit order descending) — the earliest terminal bindings of
+    rolled-over episodes never hijack selection. With no active binding
+    the NEWEST binding rides along with its CURRENT status, so the
+    direct-agent default can distinguish a live episode from a terminal
+    one (the rollover decision).
+    """
     async with factory() as session:
         row = (
             await session.execute(
                 text(
-                    "SELECT r.objective_id FROM objective_runs r "
+                    "SELECT r.objective_id, o.status FROM objective_runs r "
                     "JOIN conversation_runs cr ON cr.run_id = r.run_id "
+                    "JOIN objectives o ON o.objective_id = r.objective_id "
                     "WHERE cr.conversation_id = :cid "
-                    "ORDER BY cr.created_at, r.run_id LIMIT 1"
+                    "ORDER BY (o.status = 'active') DESC, "
+                    "cr.created_at DESC, r.run_id DESC LIMIT 1"
                 ),
                 {"cid": conversation_id},
             )
         ).first()
-    return None if row is None else uuid.UUID(str(row[0]))
+    if row is None:
+        return None
+    return uuid.UUID(str(row[0])), ObjectiveStatus(str(row[1]))
+
+
+async def _arun_bound_objective(
+    factory: async_sessionmaker[AsyncSession],
+    run_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """The objective THIS run bound at its admission (exact).
+
+    Rollover-proof retransmission identity: a replayed key rebuilds its
+    originally admitted v2 document from its own durable binding, never
+    from the conversation's current episode.
+    """
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT objective_id FROM objective_runs "
+                    "WHERE run_id = :rid"
+                ),
+                {"rid": run_id},
+            )
+        ).first()
+    if row is None:
+        return None
+    return uuid.UUID(str(row[0]))
 
 
 def _objective_turn_conflict(
@@ -1612,6 +1677,18 @@ async def _submit_canonical_turn(
     idempotently), never a half-recorded turn (C4). The model-facing
     task text is the PROJECTED store content, never the raw payload.
 
+    DIRECT-AGENT DEFAULT (runtime-v2 §3.3): a canonical turn with no
+    explicit and no actively bound objective runs ``agent.run_v2`` — the
+    admission starts its objective episode INSIDE this transaction
+    through the tx-scoped objective-store seams
+    (:func:`mai.agents.objective_store.acreate_objective_tx` /
+    ``abind_run_tx``), keyed by ``client_request_id`` and scoped exactly
+    to the selected server (the zero UUID for General Consult). A
+    conversation bound to a terminal episode rolls over into a new
+    episode on its next run; historical legacy conversations (no
+    binding) stay legacy. No second request, no intake planner, no
+    orphan on failure: the episode commits and rolls back with the run.
+
     ``conversation_id is None`` (the create route) derives the new
     conversation's identity from ``client_request_id`` — the idempotency
     key therefore names at most ONE conversation, and a retry after any
@@ -1688,16 +1765,21 @@ async def _submit_canonical_turn(
 
     factory = _sessions(request)
     now = datetime.now(timezone.utc)
-    # Runtime v2 (§3.3; AC1): resolve the turn's explicit objective
-    # binding BEFORE any store write — scope-checked, active-episode
-    # checked, conversation-stability checked. ``None`` = the legacy
-    # handler path; a resolved id selects ``agent.run_v2`` for THIS run.
+    # Runtime v2 (§3.3; AC1): resolve the turn's objective binding BEFORE
+    # any store write — scope-checked, active-episode checked,
+    # conversation-stability checked. ``None`` with ``auto_episode`` marks
+    # the DIRECT-AGENT DEFAULT: the admission starts a new v2 episode; a
+    # resolved id selects ``agent.run_v2`` for THIS run; ``None`` without
+    # an auto episode is the legacy handler path (historical legacy
+    # conversations stay legacy).
     try:
-        turn_objective_id = await _resolve_turn_objective(
+        turn_objective_id, auto_episode = await _resolve_turn_objective(
             factory,
             target,
             server_uuid,
             payload.objective_id,
+            is_create=conversation_id is None,
+            client_request_id=client_request_id,
         )
     except ObjectiveTurnRejection as rejection:
         return _error(
@@ -1808,6 +1890,50 @@ async def _submit_canonical_turn(
                         disposition=TurnDisposition.QUEUED_FOLLOWUP,
                     )
                 )
+            objective_bound_here = False
+            if turn_objective_id is None and auto_episode:
+                # Direct-agent default (runtime-v2 §3.3): this turn starts
+                # its own objective episode INSIDE the ONE admission
+                # transaction — the tx-scoped objective-store seams keep
+                # the reviewed validation, projection, (server_id,
+                # client_request_id) idempotency and objective.created
+                # event semantics, so a failure rolls the objective back
+                # TOGETHER with its run (no orphan, no second request,
+                # no intake planner). The original request is the
+                # PROJECTED persisted user content; the initial scope is
+                # exactly the selected server (the zero UUID for General
+                # Consult — no host authority expansion). Retransmissions
+                # never re-create: an existing job_runs row means the
+                # ORIGINAL submission already decided this run's runtime,
+                # so the digest below replays verbatim (the terminal-
+                # episode rollover keeps the old binding untouched — old
+                # history unchanged).
+                already_admitted = (
+                    await guard.execute(
+                        text("SELECT 1 FROM job_runs WHERE run_id = :rid"),
+                        {"rid": str(client_request_id)},
+                    )
+                ).first()
+                if already_admitted is None:
+                    episode = await acreate_objective_tx(
+                        guard,
+                        server_id=server_uuid,
+                        original_request=turn.message.content,
+                        scope_server_ids=[server_uuid],
+                        client_request_id=client_request_id,
+                    )
+                    turn_objective_id = episode.objective_id
+                    objective_bound_here = True
+                else:
+                    # Retransmission (the pre-lock probes raced the original
+                    # commit): the key's OWN run binding reconstructs the
+                    # originally admitted v2 document verbatim — exact
+                    # under any rollover history (C4).
+                    run_bound = await _arun_bound_objective(
+                        factory, client_request_id
+                    )
+                    if run_bound is not None:
+                        turn_objective_id = run_bound
             if turn_objective_id is not None:
                 # Runtime v2 (§2/§3.3): the v2 intent selects the v2
                 # handler explicitly and carries the objective binding;
@@ -1868,6 +1994,21 @@ async def _submit_canonical_turn(
                 label=next(iter(sorted(capabilities)), model_profile),
                 now=now,
             )
+            if objective_bound_here and turn_objective_id is not None:
+                # The automatic episode's durable run↔objective binding
+                # commits INSIDE the admission transaction (the job_runs
+                # row above satisfies the binding FK): a failure rolls
+                # the objective, its binding, the intent and the
+                # submission record back together — no orphan. The
+                # worker-side bind stays the idempotent backstop.
+                await abind_run_tx(
+                    guard,
+                    turn_objective_id,
+                    server_id=server_uuid,
+                    run_id=client_request_id,
+                    initiating_server_id=server_uuid,
+                    actor_kind=ActorKind.OPERATOR,
+                )
             if created:
                 # Legacy-surface compatibility (C1): follow-up runs chain
                 # to the conversation's FIRST run (which shares the
@@ -1900,7 +2041,13 @@ async def _submit_canonical_turn(
             )
     except ConversationContractError as exc:
         return _conversation_contract_error(request, exc)
-    if created and turn_objective_id is not None:
+    except ObjectiveContractError as exc:
+        # The automatic episode's tx-scoped create/bind failed closed:
+        # the admission transaction already rolled the objective, its
+        # binding, the run intent and the submission record back — map
+        # the rejection, never leave an orphan (C01 envelope).
+        return _objective_turn_conflict(request, exc)
+    if created and turn_objective_id is not None and not objective_bound_here:
         # §3.3 (AC1): the durable run↔objective binding lands at SUBMIT
         # under the operator's authority — the truthful marker for reads
         # and the drain inventory exists before the worker starts; the

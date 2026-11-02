@@ -563,10 +563,11 @@
 			</div>
 			<p class="mai-policy__note" data-testid="mode-note">
 				Ask/delegated prompting is chosen per run by the agent host (C03 rule 5) and is not
-				stored in this policy: privileged operations always ask for a decision, read-only
-				operations never ask, and other operations ask only in ask mode. A grant below is a
-				standing permission — it never approves an operation, and an approval decision never
-				grants a tool.
+				stored in this policy: delegated runs execute granted mutate/privileged effects
+				without prompting (privileged effects keep their OS containment advisory), ask runs
+				require an approval decision for mutate/privileged effects, and read-only effects
+				never require approval. A grant below is a standing permission — it never approves an
+				operation, and an approval decision never grants a tool.
 			</p>
 
 			{#if grants.length === 0}
