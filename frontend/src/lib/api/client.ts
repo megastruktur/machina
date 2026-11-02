@@ -214,6 +214,46 @@ export type ConversationSteerRequest = components['schemas']['ConversationSteerR
 export type ConversationSteerView = components['schemas']['ChatSteerView'];
 
 /**
+ * Runtime v2 objective surface (§11; activity-ui). Types come verbatim
+ * from the generated schema (`components`); these aliases only give the
+ * methods and their consumers stable names. Every read is explicitly
+ * server-scoped and every collection read is a bounded page envelope
+ * (C01 rule 2; AGENTS.md §1; runtime-v2.md §5.2).
+ */
+export type ObjectiveDetail = components['schemas']['ObjectiveDetail'];
+export type ObjectiveSummary = components['schemas']['ObjectiveSummary'];
+export type ObjectiveListPage = components['schemas']['ObjectiveListPage'];
+export type ObjectiveStatus = components['schemas']['ObjectiveStatus'];
+export type ObjectiveEvent = components['schemas']['ObjectiveEvent'];
+export type ObjectiveEventPage = components['schemas']['ObjectiveEventPage'];
+export type ObjectiveRunLink = components['schemas']['ObjectiveRunLink'];
+export type ObjectiveRunPage = components['schemas']['ObjectiveRunPage'];
+export type WorkJournal = components['schemas']['WorkJournal'];
+export type JournalActionApplied = components['schemas']['JournalActionApplied'];
+export type JournalReceiptRecorded = components['schemas']['JournalReceiptRecorded'];
+export type JournalUnknownNoted = components['schemas']['JournalUnknownNoted'];
+export type JournalChildLinked = components['schemas']['JournalChildLinked'];
+export type JournalVerificationRecorded = components['schemas']['JournalVerificationRecorded'];
+export type DrainStatusView = components['schemas']['DrainStatusView'];
+export type ConversationResumeBody = components['schemas']['ConversationResumeBody'];
+export type ConversationReconcileBody = components['schemas']['ConversationReconcileBody'];
+export type ConversationReconcileView = components['schemas']['ConversationReconcileView'];
+export type StepClassificationBody = components['schemas']['StepClassificationBody'];
+export type StepResolutionView = components['schemas']['StepResolutionView'];
+
+/** Query of the objective-ledger page: bounded page + the replay cursor. */
+export interface ObjectiveEventsQuery {
+	/** Page size; server default and maximum are producer-owned bounds. */
+	limit?: number;
+	/** Page offset within the ledger. */
+	offset?: number;
+	/** `objective.*` type filter (inside the family only). */
+	type?: string;
+	/** Replay cursor: strictly newer rows only (dedup by construction). */
+	afterSeq?: number;
+}
+
+/**
  * Task surface (§8; 15-task-api). Types come verbatim from the generated
  * schema (`operations`/`components`); these aliases only give the methods
  * and their consumers stable names. The header read is the compact §8 view
@@ -528,6 +568,67 @@ export function readMaiEvent(frame: SseFrame): MaiRunEvent | null {
 	};
 }
 
+/** Frozen `objective.*` ledger frame (§5; envelope at objective scope). */
+export interface ObjectiveEventFrame {
+	event_id: string;
+	objective_id: string;
+	sequence: number;
+	ts: string;
+	type: string;
+	actor_kind: string;
+	v: number;
+	data: Record<string, unknown>;
+	run_id: string | null;
+}
+
+/** Narrow a parsed SSE frame to the objective-ledger envelope, else null. */
+export function readObjectiveEvent(frame: SseFrame): ObjectiveEventFrame | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(frame.data);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== 'object' || parsed === null) return null;
+	const record = parsed as Record<string, unknown>;
+	if (
+		typeof record.event_id !== 'string' ||
+		typeof record.objective_id !== 'string' ||
+		typeof record.sequence !== 'number' ||
+		typeof record.ts !== 'string' ||
+		typeof record.type !== 'string' ||
+		typeof record.actor_kind !== 'string' ||
+		typeof record.v !== 'number' ||
+		typeof record.data !== 'object' ||
+		record.data === null
+	) {
+		return null;
+	}
+	return {
+		event_id: record.event_id,
+		objective_id: record.objective_id,
+		sequence: record.sequence,
+		ts: record.ts,
+		type: record.type,
+		actor_kind: record.actor_kind,
+		v: record.v,
+		data: record.data as Record<string, unknown>,
+		run_id: typeof record.run_id === 'string' ? record.run_id : null
+	};
+}
+
+/**
+ * The objective activity-ledger SSE URL (§11; C08 rule 7: transport = SSE,
+ * replay cursor = `Last-Event-ID`). The panel composes the concrete URL
+ * through this one builder — never a hand-typed path.
+ */
+export function objectiveEventsUrl(objectiveId: string, serverId: string): string {
+	return (
+		`/api/v1/objectives/${encodeURIComponent(objectiveId)}/events/stream` +
+		`?server_id=${encodeURIComponent(serverId)}`
+	);
+}
+
 export interface SubscribeEventsOptions {
 	/** Replay cursor to resume from; travels as the SSE `Last-Event-ID`. */
 	cursor?: string | null;
@@ -775,6 +876,56 @@ export interface MaiApiClient {
 		conversationId: string,
 		payload: ConversationSteerRequest
 	): Promise<ConversationSteerView>;
+
+	// Runtime v2 objective surface (§11; activity-ui). Every method takes
+	// its explicit `server_id` (C01 rule 2); collection reads are bounded
+	// pages (AGENTS.md §1); mutations cross the session→origin→CSRF
+	// boundary exactly like every other method here.
+	/** GET /api/v1/objectives?server_id=… — bounded page of safe summaries. */
+	listObjectives(
+		serverId: string,
+		page?: PageQuery & { status?: ObjectiveStatus }
+	): Promise<ObjectiveListPage>;
+	/** GET /api/v1/objectives/{id}?server_id=… — scope-checked detail. */
+	readObjective(objectiveId: string, serverId: string): Promise<ObjectiveDetail>;
+	/** GET /api/v1/objectives/{id}/journal?server_id=… — derived work journal. */
+	readObjectiveJournal(objectiveId: string, serverId: string): Promise<WorkJournal>;
+	/** GET /api/v1/objectives/{id}/events?server_id=… — bounded ledger page. */
+	listObjectiveEvents(
+		objectiveId: string,
+		serverId: string,
+		query?: ObjectiveEventsQuery
+	): Promise<ObjectiveEventPage>;
+	/** GET /api/v1/objectives/{id}/runs?server_id=… — bounded run-bindings page. */
+	listObjectiveRuns(
+		objectiveId: string,
+		serverId: string,
+		page?: PageQuery
+	): Promise<ObjectiveRunPage>;
+	/** GET /api/v1/objectives/{id}/checklist?server_id=… — 404 when never maintained. */
+	readObjectiveChecklist(objectiveId: string, serverId: string): Promise<unknown>;
+	/** POST /api/v1/objectives/{id}/scope — operator scope edit under CAS. */
+	changeObjectiveScope(objectiveId: string, payload: components['schemas']['ObjectiveScopeBody']): Promise<ObjectiveDetail>;
+	/** GET /api/v1/objectives/drain-status — legacy vs v2 drain inventory. */
+	readDrainStatus(): Promise<DrainStatusView>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/resume — state-specific resume
+	 * (§9): parked rejections arrive as structured 409 envelopes; a settled
+	 * conversation's resume is the next submitted turn (201/200).
+	 */
+	resumeConversation(
+		conversationId: string,
+		payload: ConversationResumeBody
+	): Promise<CanonicalTurnSubmitted>;
+	/**
+	 * POST /api/v1/chat/conversations/{id}/reconcile — operator
+	 * classification of open unknown effects; the ONLY path that closes an
+	 * `outcome_unknown` row from the HTTP surface (§9).
+	 */
+	reconcileConversation(
+		conversationId: string,
+		payload: ConversationReconcileBody
+	): Promise<ConversationReconcileView>;
 
 	// History-tag management surface (W6B). The catalog is global; entity
 	// reads/mutations take their explicit `server_id` (C01 rule 2), and the
@@ -1331,6 +1482,68 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<ConversationSteerView>(
 				'POST',
 				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/steer`,
+				payload
+			),
+
+		// Runtime v2 objective surface (§11). Same transport as every other
+		// method: C01 envelope errors through `ApiError`, session cookies +
+		// CSRF double-submit on the scope mutation, bounded pages with the
+		// explicit server scope.
+		listObjectives: (serverId, page) => {
+			const params = new URLSearchParams({ server_id: serverId });
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			if (page?.status !== undefined) params.set('status', page.status);
+			return requestJson<ObjectiveListPage>('GET', `/api/v1/objectives?${params.toString()}`);
+		},
+		readObjective: (objectiveId, serverId) =>
+			requestJson<ObjectiveDetail>(
+				'GET',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}?server_id=${encodeURIComponent(serverId)}`
+			),
+		readObjectiveJournal: (objectiveId, serverId) =>
+			requestJson<WorkJournal>(
+				'GET',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/journal?server_id=${encodeURIComponent(serverId)}`
+			),
+		listObjectiveEvents: (objectiveId, serverId, query) => {
+			const params = new URLSearchParams({ server_id: serverId });
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			if (query?.offset !== undefined) params.set('offset', String(query.offset));
+			if (query?.type !== undefined && query.type !== '') params.set('type', query.type);
+			if (query?.afterSeq !== undefined) params.set('after_seq', String(query.afterSeq));
+			return requestJson<ObjectiveEventPage>(
+				'GET',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/events?${params.toString()}`
+			);
+		},
+		listObjectiveRuns: (objectiveId, serverId, page) =>
+			requestJson<ObjectiveRunPage>(
+				'GET',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/runs?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		readObjectiveChecklist: (objectiveId, serverId) =>
+			requestJson<unknown>(
+				'GET',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/checklist?server_id=${encodeURIComponent(serverId)}`
+			),
+		changeObjectiveScope: (objectiveId, payload) =>
+			requestJson<ObjectiveDetail>(
+				'POST',
+				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/scope`,
+				payload
+			),
+		readDrainStatus: () => requestJson<DrainStatusView>('GET', '/api/v1/objectives/drain-status'),
+		resumeConversation: (conversationId, payload) =>
+			requestJson<CanonicalTurnSubmitted>(
+				'POST',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/resume`,
+				payload
+			),
+		reconcileConversation: (conversationId, payload) =>
+			requestJson<ConversationReconcileView>(
+				'POST',
+				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/reconcile`,
 				payload
 			),
 

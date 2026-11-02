@@ -69,7 +69,12 @@
 	 */
 	import { onDestroy, untrack } from 'svelte';
 	import Button from '../ui/Button.svelte';
-	import type { MaiRunEvent, SubscribeEventsOptions } from '../api/client.js';
+	import type {
+		JournalReceiptRecorded,
+		MaiRunEvent,
+		SubscribeEventsOptions,
+		WorkJournal
+	} from '../api/client.js';
 	import { readMaiEvent } from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 </script>
@@ -107,7 +112,10 @@
 		conversation,
 		api,
 		taskLabels,
-		showCancel = true
+		showCancel = true,
+		objectiveJournal = null,
+		serverLabels = {},
+		v2Runs = []
 	}: {
 		/** The replayed root conversation row the opener already holds. */
 		conversation: ConversationView;
@@ -122,6 +130,21 @@
 		 * one composer Stop control and adds no second one).
 		 */
 		showCancel?: boolean;
+		/**
+		 * OPTIONAL v2 objective journal (runtime-v2.md §7/§8): when present,
+		 * child rows carry their delegated `server_ids` subsets and the
+		 * parent's aggregated RECEIPTS become filterable below. Legacy
+		 * mounts omit it and render exactly the reviewed v1 tree.
+		 */
+		objectiveJournal?: WorkJournal | null;
+		/** OPTIONAL display labels per server id (v2 filters and rows). */
+		serverLabels?: Readonly<Record<string, string>>;
+		/**
+		 * OPTIONAL v2 run bindings (objective_runs links): a child's
+		 * explicit target set is its recorded initiating server pin (§3.3);
+		 * journal links (when present) win, bindings fill the rest.
+		 */
+		v2Runs?: ReadonlyArray<{ run_id: string; initiating_server_id: string }>;
 	} = $props();
 
 	// --- explicit inputs (fail closed when incomplete) -----------------------
@@ -271,7 +294,9 @@
 		const rows = displayRoot.children ?? [];
 		const nodes: ChildNode[] = rows.map((row) => ({
 			run_id: row.run_id,
-			state: row.state,
+			// A row without a replayed state takes the parent stream's recorded
+			// `agent.children_resolved` fact when one arrived (value-free).
+			state: row.state ?? eventChildren[row.run_id]?.state ?? null,
 			source: 'row' as const,
 			model_profile: row.model_profile,
 			server_id: row.server_id,
@@ -310,6 +335,85 @@
 			)
 	);
 	const cancellable = $derived(displayRoot.state !== null && !parentTerminal);
+
+	// --- v2 target/resource filter (additive; legacy mounts unaffected) ------
+
+	/** Filter: one explicit target server (`''` = no filter) + free resource text. */
+	let filterServerId = $state('');
+	let filterResource = $state('');
+
+	/** The delegated target set per child run id (recorded sources only:
+	 * journal links first, then the binding's initiating server pin). */
+	const childServerIds = $derived.by<Record<string, string[]>>(() => {
+		const map: Record<string, string[]> = {};
+		if (objectiveJournal !== null) {
+			for (const child of objectiveJournal.children ?? []) {
+				map[child.run_id] = [...child.server_ids];
+			}
+		}
+		for (const link of v2Runs) {
+			if (map[link.run_id] === undefined && link.initiating_server_id !== '') {
+				map[link.run_id] = [link.initiating_server_id];
+			}
+		}
+		return map;
+	});
+
+	const filterChoices = $derived.by<string[]>(() => {
+		const ids = new Set<string>();
+		if (objectiveJournal !== null) {
+			for (const child of objectiveJournal.children ?? [])
+				for (const id of child.server_ids) ids.add(id);
+			for (const receipt of objectiveJournal.receipts ?? []) ids.add(receipt.server_id);
+		}
+		for (const node of childNodes) if (node.server_id !== null) ids.add(node.server_id);
+		return [...ids].sort();
+	});
+
+	function serverLabelOf(id: string): string {
+		return serverLabels[id] ?? shortId(id);
+	}
+
+	function matchesResource(text: string): boolean {
+		const needle = filterResource.trim().toLowerCase();
+		if (needle === '') return true;
+		return text.toLowerCase().includes(needle);
+	}
+
+	/** Child rows pass the filter: explicit target subset + resource text. */
+	function childPassesFilter(child: ChildNode): boolean {
+		if (filterServerId !== '') {
+			const subset = childServerIds[child.run_id];
+			if (subset !== undefined) {
+				if (!subset.includes(filterServerId)) return false;
+			} else if (child.server_id !== filterServerId) {
+				return false;
+			}
+		}
+		if (filterResource.trim() === '') return true;
+		const haystack = [
+			taskLabelOf(child.run_id) ?? '',
+			child.grants.join(' '),
+			childServerIds[child.run_id]?.map(serverLabelOf).join(' ') ?? ''
+		].join(' ');
+		return matchesResource(haystack);
+	}
+
+	const visibleChildNodes = $derived(
+		objectiveJournal === null ? childNodes : childNodes.filter(childPassesFilter)
+	);
+
+	/** Aggregated child RECEIPTS (parent journal), filtered the same way. */
+	const visibleReceipts = $derived.by<JournalReceiptRecorded[]>(() => {
+		if (objectiveJournal === null) return [];
+		const all = objectiveJournal.receipts ?? [];
+		return all.filter(
+			(receipt) =>
+				(filterServerId === '' || receipt.server_id === filterServerId) &&
+				matchesResource(receipt.effect_class)
+		);
+	});
+
 
 	// --- event fold (defensive; a malformed payload is ignored, never thrown) --
 
@@ -658,6 +762,29 @@
 			</div>
 		{/if}
 
+		{#if objectiveJournal !== null}
+			<div class="mai-delg__filters" role="group" aria-label="Target and resource filters" data-testid="tree-filters">
+				<label class="mai-delg__filter">
+					<span>Target server</span>
+					<select bind:value={filterServerId} data-testid="tree-filter-server">
+						<option value="">All targets</option>
+						{#each filterChoices as serverId (serverId)}
+							<option value={serverId}>{serverLabelOf(serverId)}</option>
+						{/each}
+					</select>
+				</label>
+				<label class="mai-delg__filter">
+					<span>Resource / capability</span>
+					<input
+						type="text"
+						bind:value={filterResource}
+						placeholder="e.g. fixture.read"
+						data-testid="tree-filter-resource"
+					/>
+				</label>
+			</div>
+		{/if}
+
 		<ul class="mai-delg__tree" aria-label="Delegation tree">
 			<li class="mai-delg__node mai-delg__node--root" data-testid="root-node">
 				<p class="mai-delg__line">
@@ -698,12 +825,16 @@
 					</p>
 				{/if}
 			</li>
-			{#if childNodes.length === 0}
+			{#if visibleChildNodes.length === 0}
 				<li class="mai-delg__node" data-testid="children-none">
-					<p class="mai-delg__muted">No child runs recorded for this conversation.</p>
+					<p class="mai-delg__muted">
+						{objectiveJournal !== null && childNodes.length > 0
+							? 'No child runs match the current target/resource filter.'
+							: 'No child runs recorded for this conversation.'}
+					</p>
 				</li>
 			{:else}
-			{#each childNodes as child (child.run_id)}
+			{#each visibleChildNodes as child (child.run_id)}
 				<li
 					class="mai-delg__node mai-delg__node--child"
 					data-testid="child-row"
@@ -726,6 +857,11 @@
 							<span class="mai-delg__meta" data-testid="child-model">Model {child.model_profile}</span>
 						{/if}
 						<span class="mai-delg__meta" data-testid="child-target">Target {shortId(child.server_id)}</span>
+						{#if childServerIds[child.run_id] !== undefined}
+							<span class="mai-delg__meta" data-testid="child-servers">
+								Servers: {childServerIds[child.run_id].map(serverLabelOf).join(', ')}
+							</span>
+						{/if}
 						<span class="mai-delg__meta" data-testid="child-parent">
 							child of {shortId(child.parent_run_id)} · depth {child.depth ?? '?'}
 						</span>
@@ -747,6 +883,38 @@
 			{/each}
 			{/if}
 		</ul>
+
+		{#if objectiveJournal !== null}
+			<section class="mai-delg__section" aria-label="Child receipts" data-testid="receipts-section">
+				<h4 class="mai-delg__heading">
+					Child receipts ({visibleReceipts.length}
+					{objectiveJournal.receipts_truncated ? '+ (older rows truncated)' : ''})
+				</h4>
+				{#if visibleReceipts.length === 0}
+					<p class="mai-delg__muted" data-testid="receipts-none">
+						{#if (objectiveJournal.receipts ?? []).length === 0}
+							No dispatcher receipts are recorded for this objective yet.
+						{:else}
+							No receipts match the current target/resource filter.
+						{/if}
+					</p>
+				{:else}
+					<ul class="mai-delg__receipts" data-testid="receipts-list">
+						{#each visibleReceipts as receipt (receipt.operation_id)}
+							<li class="mai-delg__receipt" data-testid="child-receipt" data-op={receipt.operation_id}>
+								<span class="mai-delg__meta">op {shortId(receipt.operation_id)}</span>
+								<span class="mai-delg__badge" data-state={receipt.outcome}>{receipt.outcome}</span>
+								<span class="mai-delg__meta">effect {receipt.effect_class}</span>
+								<span class="mai-delg__meta">target {serverLabelOf(receipt.server_id)}</span>
+							</li>
+						{/each}
+					</ul>
+					<p class="mai-delg__note">
+						The parent aggregates child RECEIPTS, never child claims (§7.5).
+					</p>
+				{/if}
+			</section>
+		{/if}
 
 		<section class="mai-delg__section" aria-label="Budget consumption" data-testid="budget-section">
 			<h4 class="mai-delg__heading">Budget consumption</h4>
@@ -844,6 +1012,59 @@
 
 	.mai-delg__meta {
 		color: var(--mai-color-text-muted);
+	}
+
+	.mai-delg__filters {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-2) var(--mai-space-3);
+		align-items: end;
+	}
+
+	.mai-delg__filter {
+		display: flex;
+		flex-direction: column;
+		gap: calc(var(--mai-space-1) / 2);
+		font-size: var(--mai-text-sm);
+	}
+
+	.mai-delg__filter select,
+	.mai-delg__filter input {
+		font: inherit;
+		font-size: var(--mai-text-sm);
+		padding: calc(var(--mai-space-1) / 2) var(--mai-space-2);
+		border: 1px solid var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		background: var(--mai-color-surface);
+		color: inherit;
+		min-width: 8rem;
+	}
+
+	.mai-delg__filter select:focus-visible,
+	.mai-delg__filter input:focus-visible {
+		outline: 2px solid var(--mai-color-accent, var(--mai-color-text));
+		outline-offset: 1px;
+	}
+
+	.mai-delg__receipts {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-1);
+		max-height: 12rem;
+		overflow-y: auto;
+	}
+
+	.mai-delg__receipt {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-1) var(--mai-space-2);
+		align-items: center;
+		border: 1px dashed var(--mai-color-border);
+		border-radius: var(--mai-radius-sm);
+		padding: var(--mai-space-1) var(--mai-space-2);
 	}
 
 	.mai-delg__tree {
