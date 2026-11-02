@@ -41,11 +41,13 @@ exporter owned by the ``openapi-client`` resource.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Final
 
 from fastapi import APIRouter, FastAPI, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from starlette.status import (
     HTTP_200_OK,
     HTTP_401_UNAUTHORIZED,
@@ -64,6 +66,7 @@ from mai.api.auth import (
     _require_session,
 )
 from mai.auth.sessions import hash_token
+from mai.jobs.steps import RESUME_TOPIC
 from mai.policy.approvals import (
     Approval,
     ApprovalError,
@@ -85,7 +88,11 @@ class ApprovalView(BaseModel):
     ``status`` is persisted-state only (``pending``/``consumed``) — the
     store derives it without reading a clock, so the view is replayable
     audit material. ``payload_hash`` is the binding digest, never payload
-    bytes.
+    bytes. ``resume_wake_sent`` is set ONLY on the decision response: it
+    reports whether the durable resume message reached a parked
+    ``waiting_approval`` run (runtime-v2.md §9 — the decision wake is
+    best effort by contract; a lost wake degrades to the park's poll
+    cadence/deadline, never to a wrong outcome).
     """
 
     approval_id: uuid.UUID
@@ -99,6 +106,7 @@ class ApprovalView(BaseModel):
     expires_at: str
     consumed_by: str | None
     consumed_at: str | None
+    resume_wake_sent: bool | None = None
 
 
 class DecisionBody(BaseModel):
@@ -287,18 +295,61 @@ async def read_approval(request: Request, approval_id: uuid.UUID) -> ApprovalVie
 async def decide_approval(
     request: Request, approval_id: uuid.UUID, payload: DecisionBody
 ) -> ApprovalView:
-    """Spend the one-use decision atomically; return the audit receipt.
+    """Record the operator decision and resume the parked run (§9; AC4).
 
     Boundary first (ADR §5 order): session → origin → CSRF before any
-    state is touched, so an authentication failure can never consume a
-    decision. The store's conditional UPDATE is the authoritative gate —
-    duplicate, expired and mismatched presentations are stable-code
-    rejections that leave the row exactly as it was.
+    state is touched. The echoed binding is checked field-for-field; a
+    parked ``waiting_approval`` run is woken and spends the one-use
+    approval itself at the worker-side ``dispatch_once`` resume (the
+    dispatcher revalidates the full binding there), while a decision
+    with no parked waiter spends directly at the store.
     """
     _, token = await _require_session(request)  # layer 1
     _require_allowed_origin(request)  # layer 2
     _require_csrf(request)  # layer 3
     store = _store(request)
+    record = await store.get(approval_id)
+    if record is None:
+        raise BoundaryError(
+            HTTP_404_NOT_FOUND, "not_found", "no approval record for this id"
+        )
+    # Binding echo-check BEFORE any state change (C03 rule 4): the caller
+    # must present the previewed binding field-for-field. The same stable
+    # denial vocabulary the consume path reports applies here.
+    _assert_binding(record, payload)
+    # Runtime v2 (§9; AC4): a parked ``waiting_approval`` run presents the
+    # ONE payload-bound operation itself through
+    # ``dispatch_once(approval_id=…)`` — the worker-side one-shot resume
+    # bridge. The decision route therefore WAKES that run and lets the
+    # dispatcher spend the one-use approval at the resume (it revalidates
+    # capability/target/payload-hash/policy-revision there), so the
+    # approval is never double-spent and can never retarget its payload
+    # or bypass policy. With no parked waiter the route spends the
+    # decision directly (the declared-steps path).
+    factory = getattr(request.app.state, "session_factory", None)
+    waiter = await _afind_parked_run(factory, approval_id)
+    if waiter is not None:
+        run_id, _seq = waiter
+        recovery = getattr(request.app.state, "job_recovery", None)
+        wake_sent = False
+        if recovery is not None:
+            try:
+                await asyncio.to_thread(
+                    recovery.client.send_message,
+                    str(run_id),
+                    {
+                        "kind": "approval",
+                        "approval_id": str(approval_id),
+                        "decision": "approve",
+                    },
+                    topic=RESUME_TOPIC,
+                )
+                wake_sent = True
+            except Exception:
+                wake_sent = False
+        view = _view(record)
+        view.resume_wake_sent = wake_sent
+        return view
     try:
         record = await store.consume(
             approval_id,
@@ -311,7 +362,49 @@ async def decide_approval(
     except ApprovalError as exc:
         status, code, message = _DECISION_REJECTIONS[exc.code]
         raise BoundaryError(status, code, message) from None
-    return _view(record)
+    view = _view(record)
+    view.resume_wake_sent = False
+    return view
+
+
+def _assert_binding(record: Approval, payload: DecisionBody) -> None:
+    """Reject a decision whose echoed binding mismatches the record."""
+    rejections = (
+        (HTTP_409_CONFLICT, "capability_mismatch", "capability mismatch"),
+        (HTTP_409_CONFLICT, "target_mismatch", "target mismatch"),
+        (HTTP_409_CONFLICT, "payload_mismatch", "payload hash mismatch"),
+        (HTTP_409_CONFLICT, "revision_mismatch", "policy revision mismatch"),
+    )
+    checks = (
+        (record.capability_id == payload.capability_id, 0),
+        (record.server_id == payload.server_id, 1),
+        (record.payload_hash == payload.payload_hash, 2),
+        (record.policy_revision == payload.policy_revision, 3),
+    )
+    for matched, index in checks:
+        if not matched:
+            status, code, message = rejections[index]
+            raise BoundaryError(status, code, message) from None
+
+
+async def _afind_parked_run(factory, approval_id: uuid.UUID) -> tuple[str, int] | None:
+    """The parked ``waiting_approval`` run holding this approval, if any."""
+    if factory is None:
+        return None
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT run_id, seq FROM job_steps "
+                    "WHERE receipt->>'approval_id' = :aid "
+                    "ORDER BY run_id, seq DESC LIMIT 1"
+                ),
+                {"aid": str(approval_id)},
+            )
+        ).first()
+    if row is None:
+        return None
+    return str(row[0]), int(row[1])
 
 
 def register_approvals(app: FastAPI) -> None:

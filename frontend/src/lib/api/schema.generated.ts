@@ -310,13 +310,14 @@ export interface paths {
         put?: never;
         /**
          * Record the admin decision on a pending approval (one-use)
-         * @description Spend the one-use decision atomically; return the audit receipt.
+         * @description Record the operator decision and resume the parked run (§9; AC4).
          *
          *     Boundary first (ADR §5 order): session → origin → CSRF before any
-         *     state is touched, so an authentication failure can never consume a
-         *     decision. The store's conditional UPDATE is the authoritative gate —
-         *     duplicate, expired and mismatched presentations are stable-code
-         *     rejections that leave the row exactly as it was.
+         *     state is touched. The echoed binding is checked field-for-field; a
+         *     parked ``waiting_approval`` run is woken and spends the one-use
+         *     approval itself at the worker-side ``dispatch_once`` resume (the
+         *     dispatcher revalidates the full binding there), while a decision
+         *     with no parked waiter spends directly at the store.
          */
         post: operations["decide_approval_api_v1_approvals__approval_id__decision_post"];
         delete?: never;
@@ -745,6 +746,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/conversations/{conversation_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * State-specific operator resume (§9): only the valid resume per state
+         * @description State-specific resume (runtime-v2.md §9; AC4).
+         *
+         *     ONE gate over the frozen park vocabulary — never a generic replay
+         *     button:
+         *
+         *     - ``waiting_children`` → ``409 resume_rejected``: child completion is
+         *       the only producer that wakes the run (the delegation module's
+         *       settled-child seam); a manual force-resume would execute past
+         *       unproven children.
+         *     - ``reconciling`` → ``409 classification_required``: unknown effects
+         *       NEVER auto-resume into execution; the operator classifies each open
+         *       step first (the reconcile route below).
+         *     - ``waiting_approval`` → ``409 approval_decision_required``: the ONE
+         *       resume is the payload-bound approval decision
+         *       (``dispatch_once(approval_id=…)`` worker-side), never a generic wake.
+         *     - ``queued``/``running`` → ``409 resume_not_applicable``: the run is
+         *       executing; steering is the control.
+         *     - No active run (settled/paused): the operator resume from the last
+         *       settled checkpoint IS the next submitted turn — the checkpoint is
+         *       the canonical transcript plus the objective episode, and the new
+         *       run continues from exactly that state (v2 conversations stay v2).
+         *       With ``message`` the request delegates to the canonical follow-up
+         *       admission (created/``201``); without one, ``409
+         *       resume_not_applicable`` names the honest next action.
+         */
+        post: operations["resume_conversation_api_v1_chat_conversations__conversation_id__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/conversations/{conversation_id}/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Classify open unknown effects of a parked run (§9; AC4)
+         * @description Operator classification of unknown effects (§9; C04 rule 5/7).
+         *
+         *     The ONLY path that closes an ``outcome_unknown`` row from the HTTP
+         *     surface: each entry maps ``confirm_applied``/``confirm_not_applied``/
+         *     ``cancel`` onto the recovery owner's FINAL verdict classes and lands
+         *     through :meth:`RecoveryService.aresolve_step` — the guarded
+         *     single-owner writer that disposes the recorded lock and wakes the
+         *     parked run (best effort). The run is NEVER re-executed by this
+         *     route: a live parked workflow continues from its own durable loop,
+         *     and an engine-orphaned park stays settled history.
+         */
+        post: operations["reconcile_conversation_api_v1_chat_conversations__conversation_id__reconcile_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chat/runs": {
         parameters: {
             query?: never;
@@ -931,6 +1004,255 @@ export interface paths {
          */
         get: operations["list_canonical_events_api_v1_chat_conversations__conversation_id__events_get"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/drain-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Legacy drain inventory: unsettled legacy runs vs v2 runs (§10.2)
+         * @description The deployment-drain inventory (scenario RV2-DEPLOY-DRAIN).
+         *
+         *     Safe method: session layer only. The counters derive ONLY from
+         *     app-owned records (``job_runs``/``job_events``/``objective_runs``);
+         *     the legacy/v2 split is the ``objective_runs`` binding itself (the
+         *     DB CHECK admits only ``agent.run_v2``), so an unsettled legacy run
+         *     can never masquerade as drained.
+         */
+        get: operations["read_drain_status_api_v1_objectives_drain_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded page of in-scope objectives (AGENTS.md pagination)
+         * @description One bounded page of safe objective summaries (§3 ``GET`` list).
+         *
+         *     The page is exactly the requested server's scope (a page row's scope
+         *     contains ``server_id``); ordering is ``updated_at DESC,
+         *     objective_id`` with the same-filter ``COUNT(*)`` and derived
+         *     ``has_more``. Rows carry safe metadata only — no request text.
+         */
+        get: operations["list_objectives_api_v1_objectives_get"];
+        put?: never;
+        /**
+         * Create one objective episode (operator authority; §3.1)
+         * @description Create one objective episode (§3.1; AC1/AC2).
+         *
+         *     Operator authority only: the route runs behind the full session →
+         *     origin → CSRF boundary and pins ``ActorKind.OPERATOR`` — there is no
+         *     agent-reachable create path. The ONE store persists the verbatim
+         *     request/constraints (projected for secret safety), the initial
+         *     scope, and the ``objective.created`` ledger event in ONE transaction.
+         */
+        post: operations["create_objective_api_v1_objectives_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One scope-checked objective read (§3)
+         * @description The scope-checked singleton read (§3; C8 fail closed).
+         *
+         *     A foreign-scope reference is the scope-blind
+         *     ``404 objective_not_found`` — the verbatim episode (request,
+         *     constraints, scope membership) is visible only inside its scope.
+         */
+        get: operations["read_objective_api_v1_objectives__objective_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/journal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The derived work journal (§8.1; trusted records only)
+         * @description The bounded work-journal projection (§8.1).
+         *
+         *     A fixed-shape read of the ledger fold: verbatim goal/constraints,
+         *     action attempts, receipts, verification verdicts, unknown effects,
+         *     delegation links — with explicit truncation flags. The cache
+         *     catches up honestly over any ledger tail before answering (§8.4).
+         */
+        get: operations["read_journal_api_v1_objectives__objective_id__journal_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded objective-ledger page (§5.2 pagination)
+         * @description One deterministic ledger page (§5.2; AC3).
+         *
+         *     Ordered by ``sequence`` with the same-filter ``total``; ``type``
+         *     filters inside the ``objective.*`` family only; ``after_seq`` is the
+         *     replay cursor returning strictly-newer rows. Payloads are the
+         *     projected value-free documents (redaction and bounds applied at
+         *     WRITE; this read never re-bounds silently).
+         */
+        get: operations["list_objective_events_api_v1_objectives__objective_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/events/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to the objective activity ledger (SSE, replay cursor)
+         * @description SSE subscription over the ``objective.*`` ledger (§5.2; AC3).
+         *
+         *     The replay cursor is ``after_seq`` (query) or the standard SSE
+         *     ``Last-Event-ID`` header (the query wins when both are present);
+         *     absent means "from the beginning". Frames are strictly
+         *     cursor-exclusive and ordered by ``seq``, so a reconnect with the
+         *     last seen ``id`` deduplicates by construction. Authorization
+         *     completes BEFORE the response starts; the stream is read-only and
+         *     bounded — it self-closes once a settled episode is drained past the
+         *     cursor (a settled objective can never emit another event).
+         */
+        get: operations["stream_objective_events_api_v1_objectives__objective_id__events_stream_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded page of the objective's run bindings (§3.3)
+         * @description The objective's durable run/child bindings (§3.3; AC1).
+         *
+         *     Every binding names a run of the frozen ``agent.run_v2`` handler (the
+         *     DB CHECK is the §10 backstop), its initiating server and actor
+         *     provenance — the truth the dual-ownership guarantee reports against.
+         */
+        get: operations["list_objective_runs_api_v1_objectives__objective_id__runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/scope": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator scope edit under the expected-revision CAS (§3.2; AC2)
+         * @description Expand or shrink the objective scope (§3.2; AC2/AC5).
+         *
+         *     The ONLY scope-change authority surface: the authenticated operator
+         *     session pins ``ActorKind.OPERATOR`` — no agent, child or model call
+         *     can reach this route. The ONE store applies the delta under the row
+         *     lock + CAS and appends ``objective.scope_changed`` with the exact
+         *     effective delta in the SAME transaction; a rejected edit changes
+         *     nothing.
+         */
+        post: operations["change_objective_scope_api_v1_objectives__objective_id__scope_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/objectives/{objective_id}/checklist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The advisory checklist projection (§8.2)
+         * @description The bounded advisory checklist (§8.2; never authority).
+         *
+         *     A never-maintained checklist answers ``404 checklist_absent`` — the
+         *     honest absence marker, never a fabricated empty document.
+         */
+        get: operations["read_checklist_api_v1_objectives__objective_id__checklist_get"];
+        /**
+         * Replace the advisory checklist under its CAS revision (§8.2)
+         * @description CAS-replace the advisory checklist (§8.2; §11).
+         *
+         *     Operator authority only. The write appends
+         *     ``objective.checklist_updated`` and bumps the revision in ONE
+         *     transaction; a stale revision changes nothing (``409
+         *     revision_conflict``). The checklist stays advisory: no tick grants
+         *     authority or completes anything.
+         */
+        put: operations["put_checklist_api_v1_objectives__objective_id__checklist_put"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2630,6 +2952,12 @@ export interface components {
          */
         ActionRisk: "read_only" | "mutating" | "irreversible";
         /**
+         * ActorKind
+         * @description Actor provenance for audit records (§4; labels, never principals).
+         * @enum {string}
+         */
+        ActorKind: "operator" | "agent" | "child_agent" | "automation";
+        /**
          * AdoptBody
          * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
          *
@@ -2867,7 +3195,11 @@ export interface components {
          *     ``status`` is persisted-state only (``pending``/``consumed``) — the
          *     store derives it without reading a clock, so the view is replayable
          *     audit material. ``payload_hash`` is the binding digest, never payload
-         *     bytes.
+         *     bytes. ``resume_wake_sent`` is set ONLY on the decision response: it
+         *     reports whether the durable resume message reached a parked
+         *     ``waiting_approval`` run (runtime-v2.md §9 — the decision wake is
+         *     best effort by contract; a lost wake degrades to the park's poll
+         *     cadence/deadline, never to a wrong outcome).
          */
         ApprovalView: {
             /**
@@ -2898,6 +3230,8 @@ export interface components {
             consumed_by: string | null;
             /** Consumed At */
             consumed_at: string | null;
+            /** Resume Wake Sent */
+            resume_wake_sent?: boolean | null;
         };
         /**
          * AttachmentBody
@@ -3269,6 +3603,50 @@ export interface components {
             session_run_id?: string | null;
         };
         /**
+         * ChecklistItem
+         * @description One advisory checklist entry — never authority, never evidence.
+         */
+        ChecklistItem: {
+            /**
+             * Text
+             * @description Projected checklist item text (advisory)
+             */
+            text: string;
+            /**
+             * Done
+             * @description Advisory tick; grants no authority and completes nothing
+             * @default false
+             */
+            done: boolean;
+        };
+        /**
+         * ChecklistPutBody
+         * @description One advisory checklist replacement under its CAS revision (§8.2).
+         *
+         *     The checklist is ADVISORY: no tick grants authority, completes
+         *     anything, or gates a run. Revision ``0`` names the never-maintained
+         *     state (the initial CAS pin); every later write pins the read
+         *     revision.
+         */
+        ChecklistPutBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Requesting in-scope server identity (C8 scope check)
+             */
+            server_id: string;
+            /**
+             * Expected Revision
+             * @description Expected checklist revision (0 = never maintained)
+             */
+            expected_revision: number;
+            /**
+             * Items
+             * @description The full replacement advisory checklist
+             */
+            items: components["schemas"]["ChecklistItem"][];
+        };
+        /**
          * ChildBody
          * @description One explicitly scoped child task (the frozen ``ChildSpec`` words).
          *
@@ -3465,7 +3843,11 @@ export interface components {
          * @description Safe singleton header plus explicit legacy-gap metadata (§3/§4).
          *
          *     ``legacy_gaps`` is empty exactly when ``history_completeness`` is
-         *     ``complete``; otherwise it names every gap the store proved.
+         *     ``complete``; otherwise it names every gap the store proved. The
+         *     runtime markers (§10.3, AC5) are TRUTHFUL: ``is_legacy`` is derived
+         *     from the v2-only ``objective_runs`` linkage (a conversation none of
+         *     whose runs bind a v2 objective is legacy, ``handler_name
+         *     "agent.run"``) — never reinterpreted, never a fake v2 achievement.
          */
         ConversationDetailView: {
             /**
@@ -3523,6 +3905,22 @@ export interface components {
              * @description Honest legacy-gap metadata (§4); empty when complete
              */
             legacy_gaps?: components["schemas"]["LegacyHistoryGap"][];
+            /**
+             * Is Legacy
+             * @description True when no run of this conversation is v2-bound (runtime-v2.md §10.3 read-compatibility marker)
+             */
+            is_legacy: boolean;
+            /**
+             * Handler Name
+             * @description The durable handler family this conversation runs: 'agent.run' when legacy, 'agent.run_v2' when objective-bound
+             * @enum {string}
+             */
+            handler_name: "agent.run" | "agent.run_v2";
+            /**
+             * Objective Ids
+             * @description The v2 objective episodes this conversation's runs bind to (read-only probe; empty for legacy conversations)
+             */
+            objective_ids: string[];
         };
         /**
          * ConversationEvent
@@ -3660,6 +4058,75 @@ export interface components {
              * @description Conversation rows in deterministic updated_at order
              */
             items?: components["schemas"]["ConversationSummary"][];
+        };
+        /**
+         * ConversationReconcileBody
+         * @description One bounded classification batch for a parked ``reconciling`` run.
+         */
+        ConversationReconcileBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /**
+             * Classifications
+             * @description One entry per open ``outcome_unknown`` step (bounded)
+             */
+            classifications: components["schemas"]["StepClassificationBody"][];
+        };
+        /**
+         * ConversationReconcileView
+         * @description The honest reconcile outcome: per-step resolutions, never a guess.
+         */
+        ConversationReconcileView: {
+            /**
+             * Conversation Id
+             * Format: uuid
+             * @description Owning conversation identity
+             */
+            conversation_id: string;
+            /**
+             * Run Id
+             * Format: uuid
+             * @description The classified run's identity
+             */
+            run_id: string;
+            /**
+             * Run State
+             * @description The facade state replayed AFTER the classifications
+             */
+            run_state: string | null;
+            /**
+             * Results
+             * @description Per-step resolution outcomes in request order
+             */
+            results: components["schemas"]["StepResolutionView"][];
+        };
+        /**
+         * ConversationResumeBody
+         * @description One state-specific operator resume request (§9; AC4).
+         *
+         *     ``message`` is the operator's continuation instruction: the resumed
+         *     run starts FROM the conversation's last settled checkpoint (the
+         *     canonical transcript plus the objective episode context) — never a
+         *     generic replay of effects. Omitted, the request is a pure state
+         *     probe: it either names the exact structured refusal for the current
+         *     parked state or answers ``resume_not_applicable``.
+         */
+        ConversationResumeBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Explicit server scope (§1 rule 2)
+             */
+            server_id: string;
+            /**
+             * Message
+             * @description Continuation instruction for the resumed run
+             */
+            message?: string | null;
         };
         /**
          * ConversationSteerRequest
@@ -3872,6 +4339,16 @@ export interface components {
              * @description Explicit episode action: continue or start a new task (§1)
              */
             task_action?: ("continue" | "new_task") | null;
+            /**
+             * Objective Id
+             * @description Runtime v2 objective episode (runtime-v2.md §3.3): when set, the turn selects the v2 handler explicitly and binds this durable run to the operator-owned objective; the initiating server must be an explicit scope member at submit time
+             */
+            objective_id?: string | null;
+            /**
+             * Mode
+             * @description Prompting mode within grants (§C03 rule 5): 'ask' prompts for an approval decision on non-read effects; omitted pins 'delegated' (the mode never widens any check)
+             */
+            mode?: ("ask" | "delegated") | null;
         };
         /**
          * ConversationTurnSubmitResponse
@@ -3954,6 +4431,24 @@ export interface components {
             session_run_id?: string | null;
             /** Title */
             title?: string | null;
+        };
+        /**
+         * CriterionResult
+         * @description One requirement-result map entry (§9 ``task.propose_completion``).
+         */
+        CriterionResult: {
+            /**
+             * Criterion Id
+             * @description Acceptance criterion this result reports on
+             */
+            criterion_id: string;
+            /** @description passed, failed or unavailable; never not_checked in a verdict */
+            result: components["schemas"]["VerificationStatus-Output"];
+            /**
+             * Evidence Refs
+             * @description Evidence supporting this result
+             */
+            evidence_refs?: components["schemas"]["EvidenceRef"][];
         };
         /**
          * DecisionBody
@@ -4075,6 +4570,40 @@ export interface components {
          * @enum {string}
          */
         DocumentNamespace: "docs" | "runbooks";
+        /**
+         * DomainOutcome
+         * @description Domain-level outcome; ``unknown`` is honest for arbitrary shell work
+         *     (§9: no regex oracle claims semantic success).
+         * @enum {string}
+         */
+        DomainOutcome: "success" | "failure" | "unknown";
+        /**
+         * DrainStatusView
+         * @description The deployment-drain inventory (§10.2; scenario RV2-DEPLOY-DRAIN).
+         *
+         *     ``legacy`` counts every facade run NOT bound in the v2-only
+         *     ``objective_runs`` table (the legacy ``agent.run`` roots and their
+         *     ``agent.delegate`` subtrees share the drain window); ``v2`` counts
+         *     the bound runs. ``ready_to_retire_legacy`` is honest derived truth:
+         *     zero unsettled legacy runs — never a guess.
+         */
+        DrainStatusView: {
+            /** @description Legacy-runtime counters (agent.run family) */
+            legacy: components["schemas"]["RuntimeDrainCounters"];
+            /** @description Runtime v2 counters (agent.run_v2 bindings) */
+            v2: components["schemas"]["RuntimeDrainCounters"];
+            /**
+             * Ready To Retire Legacy
+             * @description True when no legacy run remains unsettled
+             */
+            ready_to_retire_legacy: boolean;
+        };
+        /**
+         * EffectCertainty
+         * @description How certain the effect evidence is (§9 ``effect_certainty``).
+         * @enum {string}
+         */
+        EffectCertainty: "certain" | "uncertain" | "unknown";
         /**
          * EntityTagPreviewView
          * @description Bounded listing projection of tag names plus honest total count.
@@ -4209,6 +4738,13 @@ export interface components {
          * @enum {string}
          */
         ExecutionEnvironment: "linux_ssh";
+        /**
+         * ExecutionStatus
+         * @description Compact technical execution status of the closing attempt (§9 receipt;
+         *     values subset the frozen C04 ``CommandOutcome`` vocabulary).
+         * @enum {string}
+         */
+        ExecutionStatus: "succeeded" | "failed" | "outcome_unknown" | "cancelled";
         /**
          * FindingPage
          * @description One bounded finding page for one explicitly named server.
@@ -4480,6 +5016,138 @@ export interface components {
              * @description Association rows in deterministic name order
              */
             items?: components["schemas"]["EntityTagView"][];
+        };
+        /**
+         * JournalActionApplied
+         * @description One trusted action attempt (§8.1): sanitized arguments summary,
+         *     dispatcher decision, operation reference.
+         */
+        JournalActionApplied: {
+            /**
+             * Action Id
+             * Format: uuid
+             * @description Opaque action-attempt identity
+             */
+            action_id: string;
+            /**
+             * Capability Id
+             * @description Dispatched capability identity
+             */
+            capability_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description The effect's exactly-one explicit target server
+             */
+            server_id: string;
+            /**
+             * Decision
+             * @description Dispatcher decision vocabulary value
+             */
+            decision: string;
+            /**
+             * Operation Id
+             * @description Operation reference when the effect was attempted
+             */
+            operation_id?: string | null;
+            /**
+             * Detail
+             * @description Projected sanitized argument summary when carried
+             */
+            detail?: string | null;
+        };
+        /**
+         * JournalChildLinked
+         * @description One delegation link (§8.1): parent/child linkage + bounded budget.
+         */
+        JournalChildLinked: {
+            /**
+             * Run Id
+             * Format: uuid
+             * @description Child run identity
+             */
+            run_id: string;
+            /**
+             * Parent Run Id
+             * Format: uuid
+             * @description Parent run identity
+             */
+            parent_run_id: string;
+            /**
+             * Server Ids
+             * @description The child's explicit server subset
+             */
+            server_ids: string[];
+            /** @description The child's bounded budget when set */
+            budget?: components["schemas"]["ObjectiveBudget"] | null;
+        };
+        /**
+         * JournalReceiptRecorded
+         * @description One trusted dispatcher receipt reference (§8.1).
+         */
+        JournalReceiptRecorded: {
+            /**
+             * Operation Id
+             * @description Operation identity the receipt closes
+             */
+            operation_id: string;
+            /**
+             * Outcome
+             * @description Receipt outcome vocabulary value
+             */
+            outcome: string;
+            /**
+             * Effect Class
+             * @description Effect class vocabulary value
+             */
+            effect_class: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description The effect's exactly-one explicit target server
+             */
+            server_id: string;
+        };
+        /**
+         * JournalUnknownNoted
+         * @description One unknown/unreconciled effect record (§9: unknowns stay explicit).
+         */
+        JournalUnknownNoted: {
+            /**
+             * Effect Ref
+             * @description Stable reference of the uncertain effect
+             */
+            effect_ref: string;
+            /**
+             * Server Id
+             * @description Target server when classified enough to name one
+             */
+            server_id?: string | null;
+            /**
+             * Detail
+             * @description Projected bounded detail when carried
+             */
+            detail?: string | null;
+            /**
+             * Reconciled
+             * @description True once explicit classification resolved the effect
+             * @default false
+             */
+            reconciled: boolean;
+        };
+        /**
+         * JournalVerificationRecorded
+         * @description One trusted verification record (§8.3): the evidence-bound verdict,
+         *     with the honest ``missing_evidence`` downgrade flag.
+         */
+        JournalVerificationRecorded: {
+            /** @description The evidence-bound completion verdict */
+            verdict: components["schemas"]["ObjectiveCompletionVerdict"];
+            /**
+             * Missing Evidence
+             * @description True when evidence discipline downgraded the claim
+             */
+            missing_evidence: boolean;
         };
         /**
          * LaneView
@@ -4961,6 +5629,491 @@ export interface components {
             schema_revision: number;
             /** Sha256 */
             sha256: string;
+        };
+        /**
+         * ObjectiveBudget
+         * @description Bounded objective budget caps (§3; the budget LEDGER vocabulary of
+         *     ``mai.agents.budgets`` stays the spend-tracking authority — these are
+         *     the operator-set caps stored with the objective).
+         */
+        ObjectiveBudget: {
+            /**
+             * Max Active Runs
+             * @description Aggregate active-slot cap (1..32, the ledger bound)
+             */
+            max_active_runs?: number | null;
+            /**
+             * Max Total Steps
+             * @description Aggregate durable-step cap (1..10000, the ledger bound)
+             */
+            max_total_steps?: number | null;
+            /**
+             * Max Total Tokens
+             * @description Aggregate model-token cap (1..10000000, the ledger bound)
+             */
+            max_total_tokens?: number | null;
+        };
+        /**
+         * ObjectiveCompletionVerdict
+         * @description Compact evidence-bound completion projection for one objective.
+         *
+         *     The legacy ``TaskCompletionVerdict`` discipline (runtime-v2.md §8.3):
+         *     ``verified`` can never be self-granted —
+         *     :func:`validate_objective_completion` requires passed criterion results
+         *     bound to evidence, else the structured
+         *     ``completion_missing_evidence``. ``domain_outcome`` stays honestly
+         *     ``unknown`` for arbitrary shell work; model prose never inflates
+         *     evidence.
+         */
+        ObjectiveCompletionVerdict: {
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Opaque stable objective identity this verdict closes
+             */
+            objective_id: string;
+            /**
+             * Base Revision
+             * @description Objective revision this verdict was produced against
+             */
+            base_revision: number;
+            /**
+             * Idempotency Key
+             * Format: uuid
+             * @description Caller key so retransmitted verdicts deduplicate
+             */
+            idempotency_key: string;
+            /** @description Domain outcome; verified requires evidence-bound coverage */
+            task_outcome: components["schemas"]["TaskOutcome"];
+            /** @description Technical status of the closing attempt */
+            execution_status: components["schemas"]["ExecutionStatus"];
+            /** @description Honest domain outcome; unknown stays unknown for shell work */
+            domain_outcome: components["schemas"]["DomainOutcome"];
+            /** @description Certainty of the observed effects */
+            effect_certainty: components["schemas"]["EffectCertainty"];
+            /**
+             * Error Code
+             * @description Stable machine-readable error code, when failed
+             */
+            error_code?: string | null;
+            /**
+             * Retry Hint
+             * @description Advice only; policy decides what may execute
+             */
+            retry_hint?: string | null;
+            /**
+             * Evidence Refs
+             * @description Aggregate evidence supporting the verdict
+             */
+            evidence_refs?: components["schemas"]["EvidenceRef"][];
+            /**
+             * Criterion Results
+             * @description Requirement-result map bound to evidence
+             */
+            criterion_results?: components["schemas"]["CriterionResult"][];
+        };
+        /**
+         * ObjectiveCreateBody
+         * @description One explicit operator objective episode (§3.1; AC1).
+         *
+         *     ``original_request``/``constraints`` persist VERBATIM (projected for
+         *     secret safety, never model-reworded); ``scope_server_ids`` is the
+         *     operator-owned initial authorized set and must contain the
+         *     initiating server. ``client_request_id`` makes the create idempotent:
+         *     same key + same projected content returns the SAME objective;
+         *     changed content is the structured conflict.
+         */
+        ObjectiveCreateBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Initiating (home) server identity
+             */
+            server_id: string;
+            /**
+             * Original Request
+             * @description Verbatim operator request (provenance-carrying)
+             */
+            original_request: string;
+            /**
+             * Constraints
+             * @description Verbatim operator constraints (bounded list)
+             */
+            constraints?: string[];
+            /**
+             * Scope Server Ids
+             * @description The explicit operator-owned initial server scope
+             */
+            scope_server_ids: string[];
+            /**
+             * Title
+             * @description Operator-assigned title when set
+             */
+            title?: string | null;
+            /** @description Bounded budget caps when set */
+            budget?: components["schemas"]["ObjectiveBudget"] | null;
+            /**
+             * Client Request Id
+             * @description Idempotency key deduplicating retransmitted creates
+             */
+            client_request_id?: string | null;
+        };
+        /**
+         * ObjectiveDetail
+         * @description One scope-checked objective read (§3 store truth).
+         */
+        ObjectiveDetail: {
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Opaque stable objective identity
+             */
+            objective_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Initiating (home) server identity
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description Operator-assigned title when set
+             */
+            title?: string | null;
+            /** @description Current objective status */
+            status: components["schemas"]["ObjectiveStatus"];
+            /**
+             * Revision
+             * @description Current CAS revision
+             */
+            revision: number;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: unknown;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-update timestamp
+             */
+            updated_at: unknown;
+            /**
+             * Original Request
+             * @description Verbatim operator request (projected; provenance-carrying)
+             */
+            original_request: string;
+            /**
+             * Constraints
+             * @description Verbatim operator constraints (never model-reworded)
+             */
+            constraints: string[];
+            /** @description Bounded budget caps when set */
+            budget?: components["schemas"]["ObjectiveBudget"] | null;
+            /**
+             * Scope
+             * @description The explicit operator-owned server scope
+             */
+            scope: components["schemas"]["ObjectiveScopeServer"][];
+        };
+        /**
+         * ObjectiveEvent
+         * @description One canonical ``objective.*`` ledger row (C05 rule 4 envelope shape
+         *     at objective scope, plus the §4 actor-kind provenance field).
+         */
+        ObjectiveEvent: {
+            /**
+             * Event Id
+             * Format: uuid
+             * @description Opaque stable event identity
+             */
+            event_id: string;
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Owning objective identity
+             */
+            objective_id: string;
+            /**
+             * Sequence
+             * @description Objective-local monotonic sequence number
+             */
+            sequence: number;
+            /**
+             * Ts
+             * @description RFC3339 UTC event timestamp
+             */
+            ts: unknown;
+            /**
+             * Type
+             * @description Dotted-slug event type inside the objective.* family
+             */
+            type: string;
+            /** @description Actor provenance (§4) */
+            actor_kind: components["schemas"]["ActorKind"];
+            /**
+             * V
+             * @description Payload schema version
+             */
+            v: number;
+            /**
+             * Data
+             * @description Value-free projected payload (never secrets, never prose)
+             */
+            data: {
+                [key: string]: unknown;
+            };
+            /**
+             * Run Id
+             * @description Producing run when the event originated inside a run
+             */
+            run_id?: string | null;
+        };
+        /**
+         * ObjectiveEventPage
+         * @description One deterministic ledger page ordered by ``sequence`` with the
+         *     same-filter ``total`` and derived ``has_more`` (§5.2).
+         */
+        ObjectiveEventPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Owning objective identity
+             */
+            objective_id: string;
+            /**
+             * Items
+             * @description Ledger rows in deterministic sequence order
+             */
+            items?: components["schemas"]["ObjectiveEvent"][];
+        };
+        /**
+         * ObjectiveListPage
+         * @description One deterministic objective list page (safe summaries only).
+         */
+        ObjectiveListPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Objective summaries in deterministic order
+             */
+            items?: components["schemas"]["ObjectiveSummary"][];
+        };
+        /**
+         * ObjectiveRunLink
+         * @description One run ↔ objective binding (§3.3; the v2-handler CHECK is the
+         *     durable 'no in-flight legacy run becomes v2' guard).
+         */
+        ObjectiveRunLink: {
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Owning objective identity
+             */
+            objective_id: string;
+            /**
+             * Run Id
+             * Format: uuid
+             * @description Bound durable run identity
+             */
+            run_id: string;
+            /**
+             * Parent Run Id
+             * @description Parent delegated run when this binding is a child
+             */
+            parent_run_id?: string | null;
+            /**
+             * Initiating Server Id
+             * Format: uuid
+             * @description The run's one initiating server (a scope member at submit)
+             */
+            initiating_server_id: string;
+            /**
+             * Handler
+             * @description The v2 run handler identity (legacy handlers are rejected)
+             * @constant
+             */
+            handler: "agent.run_v2";
+            /** @description Actor provenance of the binding */
+            actor_kind: components["schemas"]["ActorKind"];
+            /**
+             * Created At
+             * @description RFC3339 UTC binding timestamp
+             */
+            created_at: unknown;
+        };
+        /**
+         * ObjectiveRunPage
+         * @description One deterministic objective-run linkage page.
+         */
+        ObjectiveRunPage: {
+            /**
+             * Limit
+             * @description Page size used for this slice (1..200)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Owning objective identity
+             */
+            objective_id: string;
+            /**
+             * Items
+             * @description Run bindings in deterministic order
+             */
+            items?: components["schemas"]["ObjectiveRunLink"][];
+        };
+        /**
+         * ObjectiveScopeBody
+         * @description One operator scope edit under the expected-revision CAS (§3.2; AC2).
+         *
+         *     The route is the ONLY scope-change authority surface: it pins
+         *     ``actor_kind=operator``; agents and children have no path here.
+         *     ``add_server_ids``/``remove_server_ids`` are the explicit delta; the
+         *     home server is immortal and the result stays non-empty and bounded
+         *     (the ONE store's ``validate_scope_change`` decides, fail closed).
+         */
+        ObjectiveScopeBody: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Requesting in-scope server identity (C8 scope check)
+             */
+            server_id: string;
+            /**
+             * Expected Revision
+             * @description Expected objective revision; a stale value conflicts
+             */
+            expected_revision: number;
+            /**
+             * Add Server Ids
+             * @description Servers the operator admits into the scope
+             */
+            add_server_ids?: string[];
+            /**
+             * Remove Server Ids
+             * @description Servers the operator removes from the scope
+             */
+            remove_server_ids?: string[];
+        };
+        /**
+         * ObjectiveScopeServer
+         * @description One explicit in-scope server (§3.2; operator-owned set member).
+         */
+        ObjectiveScopeServer: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description In-scope server identity
+             */
+            server_id: string;
+            /** @description Actor provenance of the scope admission */
+            added_by_actor_kind: components["schemas"]["ActorKind"];
+            /**
+             * Added At
+             * @description RFC3339 UTC admission timestamp
+             */
+            added_at: unknown;
+        };
+        /**
+         * ObjectiveStatus
+         * @description Objective episode status (§3; terminal states are frozen).
+         * @enum {string}
+         */
+        ObjectiveStatus: "active" | "completed" | "failed" | "cancelled";
+        /**
+         * ObjectiveSummary
+         * @description One list-page objective row (safe metadata; no request text).
+         */
+        ObjectiveSummary: {
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Opaque stable objective identity
+             */
+            objective_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Initiating (home) server identity
+             */
+            server_id: string;
+            /**
+             * Title
+             * @description Operator-assigned title when set
+             */
+            title?: string | null;
+            /** @description Current objective status */
+            status: components["schemas"]["ObjectiveStatus"];
+            /**
+             * Revision
+             * @description Current CAS revision
+             */
+            revision: number;
+            /**
+             * Created At
+             * @description RFC3339 UTC creation timestamp
+             */
+            created_at: unknown;
+            /**
+             * Updated At
+             * @description RFC3339 UTC last-update timestamp
+             */
+            updated_at: unknown;
         };
         /**
          * ObservationPage
@@ -5996,6 +7149,33 @@ export interface components {
             custom_instructions: string;
         };
         /**
+         * RuntimeDrainCounters
+         * @description One runtime family's drain inventory (§10.2).
+         */
+        RuntimeDrainCounters: {
+            /**
+             * Runtime
+             * @description The runtime family the counters describe
+             * @enum {string}
+             */
+            runtime: "legacy" | "v2";
+            /**
+             * Handler
+             * @description The family's durable handler identity (value-free label)
+             */
+            handler: string;
+            /**
+             * Unsettled
+             * @description Runs of this family whose replayed state is non-terminal
+             */
+            unsettled: number;
+            /**
+             * Total
+             * @description Runs of this family recorded in the facade
+             */
+            total: number;
+        };
+        /**
          * ScheduleCreateBody
          * @description Create body (strict: unknown fields are rejected, value-free 422).
          *
@@ -6293,6 +7473,55 @@ export interface components {
             };
             /** Resource */
             resource?: string | null;
+        };
+        /**
+         * StepClassificationBody
+         * @description One operator classification of one open effect (§9; AC4).
+         *
+         *     The frozen vocabulary: ``confirm_applied`` (the effect IS on the
+         *     target), ``confirm_not_applied`` (it is NOT) or ``cancel`` (stop
+         *     without executing). Classification NEVER re-executes anything and
+         *     never fabricates a receipt — it closes one ``outcome_unknown`` row
+         *     from the host truth the operator attests.
+         */
+        StepClassificationBody: {
+            /**
+             * Seq
+             * @description The durable step row's sequence
+             */
+            seq: number;
+            /**
+             * Verdict
+             * @description The operator's classification of the uncertain effect
+             * @enum {string}
+             */
+            verdict: "confirm_applied" | "confirm_not_applied" | "cancel";
+        };
+        /**
+         * StepResolutionView
+         * @description One classification outcome exactly as the recovery owner landed it.
+         */
+        StepResolutionView: {
+            /**
+             * Seq
+             * @description The classified step row's sequence
+             */
+            seq: number;
+            /**
+             * State
+             * @description The durable step state AFTER the classification
+             */
+            state: string;
+            /**
+             * Verdict
+             * @description The applied classification vocabulary value
+             */
+            verdict: string;
+            /**
+             * Wake Sent
+             * @description Whether the parked run was woken (best effort by contract)
+             */
+            wake_sent: boolean;
         };
         /**
          * StepStatus
@@ -7290,6 +8519,115 @@ export interface components {
          * @enum {string}
          */
         "VerificationStatus-Output": "not_checked" | "passed" | "failed" | "unavailable";
+        /**
+         * WorkJournal
+         * @description The derived work-journal projection (§8.1): trusted records only —
+         *     verbatim goal/constraints live on the objective row and are referenced,
+         *     never re-owned here. ``derived_seq`` is the exact ledger cursor this
+         *     projection was derived at, so crash/restart catch-up is honest.
+         */
+        WorkJournal: {
+            /**
+             * Schema Version
+             * @description Projection document schema version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Objective Id
+             * Format: uuid
+             * @description Owning objective identity
+             */
+            objective_id: string;
+            /**
+             * Derived Seq
+             * @description Ledger sequence this projection was derived through
+             * @default 0
+             */
+            derived_seq: number;
+            /** @description Advisory checklist section */
+            checklist?: components["schemas"]["WorkJournalChecklist"];
+            /**
+             * Actions
+             * @description Action attempts, oldest first (bounded, drop-oldest)
+             */
+            actions?: components["schemas"]["JournalActionApplied"][];
+            /**
+             * Actions Truncated
+             * @description True when old action rows were dropped at the bound
+             * @default false
+             */
+            actions_truncated: boolean;
+            /**
+             * Receipts
+             * @description Receipts, oldest first (bounded, drop-oldest)
+             */
+            receipts?: components["schemas"]["JournalReceiptRecorded"][];
+            /**
+             * Receipts Truncated
+             * @description True when old receipt rows were dropped at the bound
+             * @default false
+             */
+            receipts_truncated: boolean;
+            /** @description Latest verification verdict when any */
+            verification?: components["schemas"]["JournalVerificationRecorded"] | null;
+            /**
+             * Unknowns
+             * @description Unknown/unreconciled effects (bounded, drop-oldest)
+             */
+            unknowns?: components["schemas"]["JournalUnknownNoted"][];
+            /**
+             * Unknowns Truncated
+             * @description True when old unknown rows were dropped at the bound
+             * @default false
+             */
+            unknowns_truncated: boolean;
+            /**
+             * Children
+             * @description Delegation links (bounded, drop-oldest)
+             */
+            children?: components["schemas"]["JournalChildLinked"][];
+            /**
+             * Children Truncated
+             * @description True when old child links were dropped at the bound
+             * @default false
+             */
+            children_truncated: boolean;
+            /**
+             * @description Objective status as derived from the ledger
+             * @default active
+             */
+            status: components["schemas"]["ObjectiveStatus"];
+        };
+        /**
+         * WorkJournalChecklist
+         * @description The checklist section of the derived journal (§8.2): advisory,
+         *     with an honest malformed marker that never erases other sections.
+         */
+        WorkJournalChecklist: {
+            /**
+             * Items
+             * @description The last valid advisory checklist seen
+             */
+            items?: components["schemas"]["ChecklistItem"][];
+            /**
+             * Revision
+             * @description Checklist revision of the last valid update
+             */
+            revision?: number | null;
+            /**
+             * Malformed
+             * @description True when a checklist update failed its typed parse
+             * @default false
+             */
+            malformed: boolean;
+            /**
+             * Detail
+             * @description Value-free reason when malformed
+             */
+            detail?: string | null;
+        };
         /**
          * VerificationStatus
          * @description Verification is separate from execution and bound to evidence (§7).
@@ -9311,6 +10649,166 @@ export interface operations {
             };
         };
     };
+    resume_conversation_api_v1_chat_conversations__conversation_id__resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationResumeBody"];
+            };
+        };
+        responses: {
+            /** @description Resume of a parked conversation was already expressed by an identical durable request (deduplicated) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The current run state has NO generic resume: ``waiting_children`` is child-driven, ``reconciling`` requires operator classification first, ``waiting_approval`` resumes only the payload-bound approval decision, and queued/running runs are already executing (steering is the control); a settled conversation resumes through the next submitted turn */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Model configuration or jobs engine unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    reconcile_conversation_api_v1_chat_conversations__conversation_id__reconcile_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationReconcileBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationReconcileView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No conversation in the requesting server scope, or a classified seq has no step row */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The run is not parked in ``reconciling``, or a classified row is not open for reconciliation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     list_conversations_api_v1_chat_runs_get: {
         parameters: {
             query?: {
@@ -9764,6 +11262,636 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_drain_status_api_v1_objectives_drain_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DrainStatusView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persistence unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_objectives_api_v1_objectives_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                status?: components["schemas"]["ObjectiveStatus"] | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveListPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    create_objective_api_v1_objectives_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ObjectiveCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Idempotent retransmission: the SAME objective returned for the same client request id and content */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveDetail"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveDetail"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The client request id was used with changed content, or the scope payload violates the frozen bounds */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Persistence unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_objective_api_v1_objectives__objective_id__get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveDetail"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_journal_api_v1_objectives__objective_id__journal_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkJournal"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_objective_events_api_v1_objectives__objective_id__events_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+                type?: string | null;
+                after_seq?: number | null;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveEventPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    stream_objective_events_api_v1_objectives__objective_id__events_stream_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+                after_seq?: number | null;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session (answered before any stream byte) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description An Origin header that is not allowlisted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Replay cursor is not a non-negative integer */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_objective_runs_api_v1_objectives__objective_id__runs_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveRunPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    change_objective_scope_api_v1_objectives__objective_id__scope_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ObjectiveScopeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectiveDetail"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A stale expected revision, a home-server removal, an add/remove overlap, or an empty/oversized result */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_checklist_api_v1_objectives__objective_id__checklist_get: {
+        parameters: {
+            query: {
+                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope, or the advisory checklist was never maintained */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_checklist_api_v1_objectives__objective_id__checklist_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                objective_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChecklistPutBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token missing/mismatched */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No objective in the requesting server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A stale expected checklist revision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request body failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

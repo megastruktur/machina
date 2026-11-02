@@ -168,7 +168,11 @@ class ConversationDetailView(ConversationDetail):
     """Safe singleton header plus explicit legacy-gap metadata (§3/§4).
 
     ``legacy_gaps`` is empty exactly when ``history_completeness`` is
-    ``complete``; otherwise it names every gap the store proved.
+    ``complete``; otherwise it names every gap the store proved. The
+    runtime markers (§10.3, AC5) are TRUTHFUL: ``is_legacy`` is derived
+    from the v2-only ``objective_runs`` linkage (a conversation none of
+    whose runs bind a v2 objective is legacy, ``handler_name
+    "agent.run"``) — never reinterpreted, never a fake v2 achievement.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -176,6 +180,18 @@ class ConversationDetailView(ConversationDetail):
     legacy_gaps: list[LegacyHistoryGap] = Field(
         default_factory=list,
         description="Honest legacy-gap metadata (§4); empty when complete",
+    )
+    is_legacy: bool = Field(
+        description="True when no run of this conversation is v2-bound "
+        "(runtime-v2.md §10.3 read-compatibility marker)",
+    )
+    handler_name: Literal["agent.run", "agent.run_v2"] = Field(
+        description="The durable handler family this conversation runs: "
+        "'agent.run' when legacy, 'agent.run_v2' when objective-bound",
+    )
+    objective_ids: list[uuid.UUID] = Field(
+        description="The v2 objective episodes this conversation's runs "
+        "bind to (read-only probe; empty for legacy conversations)",
     )
 
 
@@ -590,6 +606,9 @@ async def read_canonical_conversation(
         server_id=server_id,
         preview_limit=3,
     )
+    objective_ids = await _aobjective_ids_probe(
+        _sessions(request), conversation.conversation_id
+    )
     return ConversationDetailView(
         conversation_id=conversation.conversation_id,
         server_id=conversation.server_id,
@@ -605,7 +624,35 @@ async def read_canonical_conversation(
         history_completeness=conversation.history_completeness,
         missing_range=conversation.missing_range,
         legacy_gaps=gaps,
+        is_legacy=not objective_ids,
+        handler_name="agent.run_v2" if objective_ids else "agent.run",
+        objective_ids=list(objective_ids),
     )
+
+
+async def _aobjective_ids_probe(
+    factory, conversation_id: uuid.UUID
+) -> tuple[uuid.UUID, ...]:
+    """The read-only §10.3 probe: v2 objectives this conversation binds.
+
+    The ``objective_runs`` linkage table admits ONLY the frozen
+    ``agent.run_v2`` handler (DB CHECK), so a non-empty probe proves the
+    conversation runs v2 and names its episode; empty means legacy —
+    nothing is reinterpreted either way.
+    """
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT r.objective_id FROM objective_runs r "
+                    "JOIN conversation_runs cr ON cr.run_id = r.run_id "
+                    "WHERE cr.conversation_id = :cid "
+                    "ORDER BY r.objective_id"
+                ),
+                {"cid": conversation_id},
+            )
+        ).scalars().all()
+    return tuple(uuid.UUID(str(value)) for value in rows)
 
 
 async def _amessage_count(request: Request, conversation_id: uuid.UUID) -> int:

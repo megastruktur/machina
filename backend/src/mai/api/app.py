@@ -87,6 +87,7 @@ from mai.api.knowledge_models import (
 )
 from mai.api.models import register_models
 from mai.api.monitoring import register_monitoring
+from mai.api.objectives import register_objectives
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
@@ -558,6 +559,12 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # labels (partial/unavailable) instead of invented turns. Read-only:
     # writes stay on the reviewed chat submit/steer seam.
     register_conversations(app)
+    # The runtime-v2 objective surface (runtime-v2.md §3/§8/§10/§11):
+    # explicit operator-owned objective episodes over the ONE v2 stores —
+    # creation, scope CAS (operator authority only), journal/checklist
+    # projections, the bounded ``objective.*`` ledger pages, the
+    # cursor-exclusive activity SSE and the legacy drain inventory.
+    register_objectives(app)
     # The history-tag management surface (history-tags HT-W6B): the
     # global tag catalog CRUD plus same-server job-run and canonical
     # conversation tag assignments over the ONE tag store — idempotent
