@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from sqlalchemy import text as sql_text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dbos import DBOS
 from dbos import error as dbos_error
@@ -156,6 +157,7 @@ from mai.jobs.steps import (
     EXECUTION_TIMEOUT_REASON,
     RESUME_TOPIC,
     WAIT_FOR_APPROVAL,
+    StepsError,
     _translate_outcome,
 )
 from mai.policy.approvals import ApprovalError
@@ -231,6 +233,10 @@ class AgentRunIntentV2:
     reconcile_wait_seconds: float
     wait_poll_seconds: float
     approval_wait_seconds: float
+    #: The optional §7.2 child budget bounds (``max_steps`` /
+    #: ``max_total_tokens``, validated against the ledger's absolute
+    #: bounds); ``None`` = unbounded. A budget may only NARROW.
+    budget: dict[str, int] | None = None
 
     def legacy(self) -> AgentRunIntent:
         """The executor-facing intent (every executor seam's parameter)."""
@@ -280,6 +286,54 @@ def _bounded_rounds(value: object) -> int:
     return value
 
 
+def _budget_vocabulary():
+    """The aggregate budget vocabulary, imported at call time.
+
+    :mod:`mai.agents.budgets` imports the delegation module's bounds at
+    import time, so a module-level import here would order three agent
+    modules at once; both are fully loaded by the time any payload parses.
+    """
+    from mai.agents import budgets
+
+    return budgets
+
+
+def _bounded_budget(value: object) -> dict[str, int] | None:
+    """Validate one optional top-level budget-bounds document (§7.2).
+
+    The frozen child budget vocabulary (``max_steps`` /
+    ``max_total_tokens``, both required positive ints within the ledger's
+    absolute bounds); ``None`` = unbounded. Unknown and missing fields
+    reject (the ONE delegation module's discipline — a budget is a
+    narrowing request, never a partial guess).
+    """
+    if value is None:
+        return None
+    budgets = _budget_vocabulary()
+    if not isinstance(value, Mapping):
+        raise _reject_payload("budget must be a JSON object or null")
+    unknown = sorted(set(value) - {"max_steps", "max_total_tokens"})
+    if unknown:
+        raise _reject_payload(f"unknown budget field {unknown[0]!r}")
+    missing = {"max_steps", "max_total_tokens"} - set(value)
+    if missing:
+        raise _reject_payload(f"budget is missing {sorted(missing)[0]!r}")
+    bounds: dict[str, int] = {}
+    for field, maximum in (
+        ("max_steps", budgets.MAX_TOTAL_STEPS),
+        ("max_total_tokens", budgets.MAX_TOTAL_TOKENS),
+    ):
+        bound = value[field]
+        if isinstance(bound, bool) or not isinstance(bound, int) or bound < 1:
+            raise _reject_payload(f"budget {field} must be a positive integer")
+        if bound > maximum:
+            raise _reject_payload(
+                f"budget {field} outside its bounded range 1..{maximum}"
+            )
+        bounds[field] = bound
+    return bounds
+
+
 def parse_agent_run_intent_v2(payload_json: str) -> AgentRunIntentV2:
     """Validate one ``agent.run_v2`` payload; return it typed (fail closed).
 
@@ -311,6 +365,7 @@ def parse_agent_run_intent_v2(payload_json: str) -> AgentRunIntentV2:
         "reconcile_wait_seconds",
         "wait_poll_seconds",
         "approval_wait_seconds",
+        "budget",
     }
     unknown = sorted(set(document) - allowed)
     if unknown:
@@ -392,6 +447,7 @@ def parse_agent_run_intent_v2(payload_json: str) -> AgentRunIntentV2:
             DEFAULT_APPROVAL_WAIT_SECONDS,
             MAX_APPROVAL_WAIT_SECONDS,
         ),
+        budget=_bounded_budget(document.get("budget")),
     )
 
 
@@ -515,6 +571,92 @@ def _descriptor_effect_class(executor: Any, capability_id: str) -> str:
 # off the engine's persistent loop via asyncio.to_thread; every async seam
 # runs on the executor's one loop)
 # ---------------------------------------------------------------------------
+
+
+async def _abinding_objective(
+    sessions: async_sessionmaker[AsyncSession], run_id: str
+) -> str | None:
+    """The durable objective binding of one run (§3.3; fail closed).
+
+    The delegation planner commits every v2 child's ``objective_runs``
+    binding BEFORE dispatch, so the row is the child's authoritative
+    episode identity (the §7.2 envelope's frozen vocabulary has no
+    ``objective_id`` field).
+    """
+    async with sessions() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT objective_id FROM objective_runs "
+                    "WHERE run_id = :rid"
+                ),
+                {"rid": uuid.UUID(run_id)},
+            )
+        ).first()
+    return None if row is None else str(row[0])
+
+
+@DBOS.step(name="agents.v2_child_document")
+def _v2_child_document(payload_json: str) -> str:
+    """Resolve ONE §7.2 delegation child payload to the flat v2 document.
+
+    A direct v2 intent document (the canonical submission shape) passes
+    through byte-identical and reads nothing. The delegation module's
+    frozen v2 child envelope (``{"v": 2, "run": <agent-run document>,
+    "server_ids": [...], "budget": {...}|null}``) is validated by its ONE
+    producer parser, the durable objective binding the planner committed
+    BEFORE dispatch names the child's objective (fail closed when absent —
+    the child runs only inside its episode), and the canonical flat
+    document — the optional top-level ``budget`` riding along — is
+    returned. Checkpointed: recovery replays the recorded document, so
+    every downstream step re-parses exactly the SAME bytes.
+    """
+    try:
+        document = json.loads(payload_json)
+    except ValueError:
+        return payload_json  # the ONE v2 parser owns the rejection
+    from mai.agents import delegate as agent_delegate
+
+    if (
+        not isinstance(document, Mapping)
+        or set(document) != {"v", "run", "server_ids", "budget"}
+        or document["v"] != agent_delegate.DELEGATION_PAYLOAD_VERSION_V2
+    ):
+        return payload_json
+    try:
+        agent_delegate.parse_v2_child_payload(payload_json)
+    except agent_delegate.DelegationError as error:
+        raise _reject_payload(
+            f"delegation child payload rejected: {error.detail}"
+        ) from None
+    inner = document["run"]
+    run_id = _canonical_uuid_field(inner["run_id"], "run_id")
+    executor = agent_run._resolve_agent_run()
+    objective_id = executor.run(
+        _abinding_objective(executor._sessions, run_id)  # noqa: SLF001 - composed seam (mirrors _v2_objective_bound)
+    )
+    if objective_id is None:
+        raise AgentRunError(
+            AgentRunErrorCode.INVALID_WIRING,
+            "the delegation child names no durable objective binding",
+        )
+    return canonical_json(
+        {
+            "payload_version": RUN_PAYLOAD_VERSION_V2,
+            "run_id": run_id,
+            "server_id": _canonical_uuid_field(inner["server_id"], "server_id"),
+            "objective_id": objective_id,
+            "context": inner["context"],
+            "role": inner["role"],
+            "task": inner["task"],
+            "connection": inner.get("connection"),
+            "profile": inner.get("profile"),
+            "rounds": inner.get("rounds"),
+            "reconcile_wait_seconds": inner.get("reconcile_wait_seconds"),
+            "wait_poll_seconds": inner.get("wait_poll_seconds"),
+            "budget": document["budget"],
+        }
+    )
 
 
 @DBOS.step(name="agents.v2_run_started")
@@ -1639,15 +1781,23 @@ def _is_approval_wait_outcome(outcome: Mapping[str, object]) -> bool:
 async def run_agent_conversation_v2(payload_json: str) -> dict[str, object]:
     """Execute one durable v2 working-agent conversation (see module doc).
 
-    Registered as :data:`HANDLER_NAME` (module import) and driven on the
-    engine's persistent async-handler loop by the durable trampoline
-    workflow. The FIRST model call is the working agent: no intake planner,
-    no intake events, no mandatory todo. Classified stage failures record
-    ``failed`` and raise :class:`AgentRunFailed` (engine ERROR — both sides
-    agree); cancellation re-raises the engine's own exception after
-    recording ``cancelled``; integrity rejections from the steps machinery
-    propagate as-is. Success returns the safe conversation summary.
+    Registered as :data:`HANDLER_NAME` and driven on the engine's
+    persistent async-handler loop by the durable trampoline workflow. The
+    FIRST model call is the working agent: no intake planner, no intake
+    events, no mandatory todo. Classified stage failures record ``failed``
+    and raise :class:`AgentRunFailed` (engine ERROR — both sides agree);
+    cancellation re-raises the engine's own exception after recording
+    ``cancelled``; integrity rejections from the steps machinery propagate
+    as-is. Success returns the safe conversation summary.
+
+    One §7.2 seam: a delegation child arrives as the delegation module's
+    frozen v2 child envelope, and the ONE checkpointed
+    :func:`_v2_child_document` resolution turns it into the flat v2
+    document (the planner's durable binding names the objective) before
+    the strict parse — a direct submission document passes through
+    byte-identical.
     """
+    payload_json = _v2_child_document(payload_json)
     intent = parse_agent_run_intent_v2(payload_json)
     try:
         _v2_run_started(payload_json)
@@ -1718,7 +1868,14 @@ async def run_agent_conversation_v2(payload_json: str) -> dict[str, object]:
             existing_rows = int(
                 executor.run(executor.tool_row_count(intent.legacy()))
             )
-            if existing_rows + len(calls) > AGENT_TOOL_MAX_PER_RUN:
+            # A carried §7.2 child budget may only NARROW the frozen
+            # per-run durable-step budget (C05 rule 7); max_total_tokens
+            # stays the root ledger's charge accounting.
+            step_budget = AGENT_TOOL_MAX_PER_RUN
+            if intent.budget is not None:
+                bound = intent.budget["max_steps"]
+                step_budget = min(step_budget, bound)
+            if existing_rows + len(calls) > step_budget:
                 raise AgentStageError(TOOL_BUDGET_REASON)
             results: dict[str, str] = {}
             steering_interrupt = False
@@ -1835,7 +1992,7 @@ async def run_agent_conversation_v2(payload_json: str) -> dict[str, object]:
         _v2_run_failed(payload_json, stage.reason)
         _release_lease_quietly(intent.legacy())
         raise AgentRunFailed(stage.reason) from None
-    except dbos_error.StepsError:
+    except StepsError:
         _record_quietly(intent.legacy(), "fail")
         _release_lease_quietly(intent.legacy())
         raise

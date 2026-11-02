@@ -406,7 +406,9 @@ this document and its consumers.
   `mai.jobs.engine.register_job_handler`; module layout
   `backend/src/mai/agents/run_v2.py` proposed, exact module path owned by the
   producer).
-- Intent: v2 run payload with `payload_version` (starts `1`); strict
+- Intent: v2 run payload with `payload_version` `2` (reconciled N1: matches
+  `RUN_PAYLOAD_VERSION_V2 = 2` in `backend/src/mai/agents/run_v2.py`,
+  beside the `ChildSpecV2` delegation payload version `2`); strict
   unknown-field rejection.
 - Delegation: payload version `2` child specification `ChildSpecV2`
   (fields `server_ids`, `capabilities`, budget bounds) — emitted by v2 parents

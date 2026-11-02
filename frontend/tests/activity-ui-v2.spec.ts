@@ -1281,19 +1281,14 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 				{ timeout: 90_000, intervals: [1_000, 2_500, 5_000] }
 			)
 			.toBe(4);
-		// Wire probe: the children's persisted parent_run_id rows exist (the
-		// journal's delegation links project them). The facade read for an
-		// engine-seeded parent may fail loudly (the delegate child inserts
-		// carry no mandatory classification tag — a recorded cross-slice
-		// defect, OUTSIDE this task's allowlist); the UI falls back to the
-		// journal-link projection below either way.
+		// Wire probe (D2 remediated): the children's persisted parent_run_id
+		// rows exist, every row carries its mandatory classification tag,
+		// and the facade previews each row under its OWN server scope, so
+		// the read is clean — never a 500.
 		const parentView = await apiFetch('GET', `/api/v1/chat/runs/${parentRunId}`);
-		if (parentView.status === 200) {
-			const parentBody = (await parentView.json()) as { children?: unknown[] };
-			expect(parentBody.children?.length ?? 0).toBe(2);
-		} else {
-			expect(parentView.status).toBe(500);
-		}
+		expect(parentView.status).toBe(200);
+		const parentBody = (await parentView.json()) as { children?: unknown[] };
+		expect(parentBody.children?.length ?? 0).toBe(2);
 		// The tree: expand the runs section, then the parent's tree (the
 		// conversation's own run + the parent + 2 children).
 		await page().getByTestId('objective-runs').locator('summary').click();
@@ -1306,29 +1301,28 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		// v2 children carry their delegated server subsets (§7.2).
 		await expect(tree.getByTestId('child-row')).toHaveCount(2);
 		await expect(tree.getByTestId('child-servers').first()).toBeVisible();
-		// Children settle on their own durable runs; the tree's state chips
-		// replay from the read runs and the parent stream's recorded
-		// `agent.children_resolved` facts, so poll to a RECORDED terminal.
-		// KNOWN CROSS-SLICE DEFECT (recorded, outside this task's allowlist):
-		// the delegate's v2 child payload carries `budget` and the child
-		// dispatch rejects it (`unknown field 'budget'`), so engine-planned
-		// children land `failed` — the tree renders the recorded outcome.
+		// Children settle on their own durable runs (D1 remediated: the v2
+		// child dispatch resolves the §7.2 envelope through the real
+		// handler); the tree's state chips replay from the read runs and
+		// the parent stream's recorded `agent.children_resolved` facts, so
+		// poll to a RECORDED terminal: both delegated children ran their
+		// scripted read and Succeeded.
 		let observedChildStates: string[] = [];
 		await expect
 			.poll(
 				async () => {
 					observedChildStates = await tree.getByTestId('child-state').allTextContents();
 					return observedChildStates.filter((state) =>
-						/Succeeded|Failed/.test(state)
+						/Succeeded/.test(state)
 					).length;
 				},
 				{ timeout: 90_000, intervals: [1_000, 2_500, 5_000] }
 			)
 			.toBe(2);
 		console.log(`[acui-live] observed child states: ${JSON.stringify(observedChildStates)}`);
-		// Aggregated RECEIPTS of the objective (the conversation run's real
-		// effects journal here; with the recorded child defect above, failed
-		// children journal none — the section stays honest about it).
+		// Aggregated RECEIPTS of the objective: the conversation run's and
+		// both children's real effects journal here (each child ran one
+		// scripted read on its delegated target).
 		await expect(tree.getByTestId('receipts-section')).toBeVisible();
 		await expect(tree.getByTestId('child-receipt').first()).toBeVisible({ timeout: 60_000 });
 		// Target filter: pinning server B leaves only its child.
@@ -1336,10 +1330,10 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		expect(receiptsBefore).toBeGreaterThanOrEqual(1);
 		await tree.getByTestId('tree-filter-server').selectOption(live.serverB);
 		await expect(tree.getByTestId('child-row')).toHaveCount(1);
-		// The one receipt on this objective targeted server A (the
-		// conversation run's read): filtering to B leaves none, named
-		// honestly — never an empty-success.
-		await expect(tree.getByTestId('receipts-none')).toBeVisible();
+		// The B-pinned child's own read receipt targets server B, so the
+		// filtered receipts list shows it — never an empty-success.
+		await expect(tree.getByTestId('receipts-none')).toHaveCount(0);
+		await expect(tree.getByTestId('child-receipt').first()).toBeVisible();
 		await tree.getByTestId('tree-filter-server').selectOption('');
 		await expect(tree.getByTestId('child-row')).toHaveCount(2);
 		// Resource filter: a non-matching resource empties the tree honestly.

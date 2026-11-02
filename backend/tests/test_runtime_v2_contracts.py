@@ -425,8 +425,10 @@ def test_all_rv2_scenarios_have_producers_gates_and_fixtures() -> None:
             failures.append(f"{rid}: fixtures too thin: {fixtures!r}")
         if len(evidence) < 10:
             failures.append(f"{rid}: expected evidence too thin: {evidence!r}")
-        if status != "design-frozen":
-            failures.append(f"{rid}: status must be design-frozen, got {status!r}")
+        if status not in {"design-frozen", "measured"}:
+            failures.append(
+                f"{rid}: status must be design-frozen or measured, got {status!r}"
+            )
         if not scenario:
             failures.append(f"{rid}: empty definition")
     assert not failures, "RV2 registry ownership gaps:\n" + "\n".join(failures)

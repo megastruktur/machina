@@ -221,7 +221,7 @@ from mai.jobs.recovery import (
 )
 from mai.execution.reconcile import ReconciliationClass
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
-from mai.tag_store import apreview_job_tags
+from mai.tag_store import EntityTagPreview, apreview_job_tags
 
 __all__ = ["register_chat", "resolve_artifacts_root"]
 
@@ -2039,6 +2039,25 @@ async def _child_states(
     return states
 
 
+def _tag_preview_scopes(
+    row: Mapping[str, object],
+    children_rows: list[Mapping[str, object]],
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Group the runs to preview by each run's OWN server scope.
+
+    Every previewed row keeps its durable server pin (a v2 delegation
+    child carries its own initiating server, §7.2), so one parent-scoped
+    query would silently miss a cross-server child; the merge covers the
+    parent and every child with one grouped query per distinct server.
+    """
+    grouped: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for item in (row, *children_rows):
+        grouped.setdefault(uuid.UUID(str(item["server_id"])), []).append(
+            uuid.UUID(str(item["run_id"]))
+        )
+    return grouped
+
+
 async def _conversation_view(
     factory: async_sessionmaker[AsyncSession],
     row: Mapping[str, object],
@@ -2089,12 +2108,17 @@ async def _conversation_view(
         title = await _resolve_chat_title(session, identity, submission_data)
     child_states = await _child_states(factory, children_rows)
     parent_run_id = uuid.UUID(identity)
-    child_run_ids = [uuid.UUID(str(child["run_id"])) for child in children_rows]
-    previews = await apreview_job_tags(
-        factory,
-        [parent_run_id, *child_run_ids],
-        server_id=uuid.UUID(str(row["server_id"])),
-    )
+    # Tag previews are server-scoped reads: every run is previewed under
+    # its OWN server scope and the pages merged — a v2 delegation child is
+    # pinned to its own initiating server (§7.2), which may differ from
+    # the parent's, and one parent-scoped query would miss it.
+    previews: dict[uuid.UUID, EntityTagPreview] = {}
+    for scope_server_id, preview_ids in _tag_preview_scopes(
+        row, children_rows
+    ).items():
+        previews.update(
+            await apreview_job_tags(factory, preview_ids, server_id=scope_server_id)
+        )
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
     session_run_id: str | None = None
