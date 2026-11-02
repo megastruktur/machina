@@ -789,97 +789,8 @@
 
 	const objectiveApi = $derived(api === null ? null : readObjectiveApi(api));
 
-	/** Bounded draft objective page (the picker's options; AGENTS.md §1). */
-	const DRAFT_OBJECTIVE_LIMIT = 10;
-	/** Bumped by `New Chat`: the draft objective page re-reads (objectives
-	 * may have been created since the last draft). */
-	let draftObjectivesRevision = $state(0);
-	let draftObjectives = $state<ObjectiveSummary[]>([]);
-	let draftObjectivesTotal = $state(0);
-	let draftObjectivesLoadingMore = $state(false);
-	let draftObjectivesError = $state<string | null>(null);
-	/** The selected draft objective (`''` = legacy runtime, no objective). */
-	let draftObjectiveId = $state('');
 	/** Prompting mode: `ask` prompts approval decisions on non-read effects. */
 	let draftMode = $state<'delegated' | 'ask'>('delegated');
-
-	const draftObjectivesHasMore = $derived(draftObjectives.length < draftObjectivesTotal);
-
-	async function loadDraftObjectives(): Promise<void> {
-		const slice = objectiveApi;
-		const scope = effectiveServerId;
-		if (slice === null || scope === null || scope === GLOBAL_CONSULT_SERVER_ID) {
-			draftObjectives = [];
-			draftObjectivesTotal = 0;
-			draftObjectivesError = null;
-			return;
-		}
-		draftObjectivesError = null;
-		try {
-			const page = await slice.listObjectives(scope, {
-				limit: DRAFT_OBJECTIVE_LIMIT,
-				offset: 0
-			});
-			if (disposed || effectiveServerId !== scope) return;
-			draftObjectives = page.items ?? [];
-			draftObjectivesTotal = page.total;
-			// A selected id that fell off the (still bounded) first page stays
-			// selected only if it exists in the loaded set; otherwise reset.
-			if (draftObjectiveId !== '' && !draftObjectives.some((one) => one.objective_id === draftObjectiveId)) {
-				draftObjectiveId = '';
-			}
-		} catch (error) {
-			if (disposed) return;
-			draftObjectives = [];
-			draftObjectivesTotal = 0;
-			draftObjectivesError = messageOf(error) ?? 'The objective list could not be loaded.';
-		}
-	}
-
-	async function loadMoreDraftObjectives(): Promise<void> {
-		const slice = objectiveApi;
-		const scope = effectiveServerId;
-		if (slice === null || scope === null || draftObjectivesLoadingMore || !draftObjectivesHasMore)
-			return;
-		draftObjectivesLoadingMore = true;
-		try {
-			const page = await slice.listObjectives(scope, {
-				limit: DRAFT_OBJECTIVE_LIMIT,
-				offset: draftObjectives.length
-			});
-			if (disposed || effectiveServerId !== scope) return;
-			const seen = new Set(draftObjectives.map((one) => one.objective_id));
-			draftObjectives = [
-				...draftObjectives,
-				...(page.items ?? []).filter((one) => !seen.has(one.objective_id))
-			];
-			draftObjectivesTotal = page.total;
-		} catch (error) {
-			if (disposed) return;
-			draftObjectivesError = messageOf(error) ?? 'More objectives could not be loaded.';
-		} finally {
-			if (!disposed) draftObjectivesLoadingMore = false;
-		}
-	}
-
-	// A scope/draft change re-reads the bounded objective page; a locked
-	// (started) context or an absent slice never fetches. The scope read and
-	// the New-Chat revision below ARE the tracked dependencies: re-selecting
-	// a server or starting a fresh draft re-queries the page.
-	$effect(() => {
-		if (objectiveApi === null || chatContextLocked) return;
-		void effectiveServerId;
-		void draftObjectivesRevision;
-		void loadDraftObjectives();
-	});
-	$effect(() => {
-		if (objectiveApi === null || chatContextLocked) {
-			draftObjectives = [];
-			draftObjectivesTotal = 0;
-			draftObjectivesError = null;
-			draftObjectiveId = '';
-		}
-	});
 
 	/**
 	 * §8 Plan section services (act `18-plan-ui`): narrow the task slice off
@@ -1763,11 +1674,10 @@
 							profile: composeProfile.trim(),
 							requested_phase: recovery ? 'act' : readOnlyMode ? 'plan' : null,
 							task_action: 'continue',
-							// Runtime v2 (§3.3): an explicit objective selection
-							// binds this conversation's runs to the operator-owned
-							// episode and selects the v2 handler. Follow-ups omit
-							// it — the server's binding probe keeps the episode.
-							objective_id: draftObjectiveId === '' ? null : draftObjectiveId,
+							// Direct-agent default (runtime v2 §3.3): NO objective
+							// selection — the admission starts the episode itself
+							// and binds this conversation's runs to it; follow-ups
+							// ride the server's binding probe / rollover.
 							mode: draftMode
 						})
 					: await canonicalRef.submitConversationMessage(openId, {
@@ -2305,8 +2215,6 @@
 		composeMessage = '';
 		composeProfile = 'default';
 		readOnlyMode = false;
-		draftObjectiveId = '';
-		draftObjectivesRevision += 1;
 		draftMode = 'delegated';
 		composeAttachments = '';
 		composeFields = {};
@@ -4235,40 +4143,6 @@
 									{/if}
 								</Select>
 								{#if objectiveApi !== null && !generalConsultMode}
-									<label class="mai-sr-only" for="{uid}-objective">Runtime objective</label>
-									<select
-										id="{uid}-objective"
-										class="mai-chat__server-picker"
-										bind:value={draftObjectiveId}
-										data-testid="chat-objective-picker"
-									>
-										<option value="">Legacy runtime (no objective)</option>
-										{#each draftObjectives as objective (objective.objective_id)}
-											<option value={objective.objective_id}>
-												{objective.title && objective.title.trim() !== ''
-													? objective.title
-													: `Objective ${shortId(objective.objective_id)}`}
-												· {objective.status}
-											</option>
-										{/each}
-									</select>
-									{#if draftObjectivesError !== null}
-										<span class="mai-chat__meta" role="status" data-testid="chat-objectives-error">
-											{draftObjectivesError}
-										</span>
-									{/if}
-									{#if draftObjectivesHasMore}
-										<Button
-											size="sm"
-											pill
-											variant="secondary"
-											loading={draftObjectivesLoadingMore}
-											onclick={loadMoreDraftObjectives}
-											data-testid="chat-objectives-load-more"
-										>
-											More objectives ({draftObjectives.length} of {draftObjectivesTotal})
-										</Button>
-									{/if}
 									<label class="mai-sr-only" for="{uid}-mode">Prompting mode</label>
 									<select
 										id="{uid}-mode"

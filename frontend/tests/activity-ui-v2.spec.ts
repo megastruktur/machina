@@ -26,8 +26,10 @@ import { expect, test, type BrowserContext, type Page } from '@playwright/test';
  * backend bodies. No `route.fulfill` synthetic API responses exist here.
  *
  * Scenarios (rv_activity-ui.md "Real runtime testing"):
- *  1. live v2 submission (objective-bound) → header metrics + expandable
- *     timeline details + receipts/verification view; redaction honesty;
+ *  1. live v2 submission via New Chat with NO objective control (the
+ *     direct-agent default: the admission starts the episode) → header
+ *     metrics + expandable timeline details + receipts/verification view;
+ *     redaction honesty;
  *  2. bounded event pagination ("Load more" appends the next page without
  *     duplicates) + replay/reconnect dedup by the sequence watermark;
  *  3. multi-server delegation: real v2 delegate parent over two scoped
@@ -449,6 +451,152 @@ def _build():
 _build()
 `;
 
+/** Seeds the API process's own model store (connection + `default` profile
+ * + selection) — the deterministic choice for the live profile picker. */
+const SEED_API_MODEL_STORE_SOURCE = `
+"""Seed the API data root's model store only (no server profiles here:
+enrollment already wrote them)."""
+
+import json
+import sys
+
+from mai.agents.model_store import ModelConfigStore
+
+model_root = sys.argv[1]
+store = ModelConfigStore(model_root)
+connection = {
+    "schema_version": 1,
+    "name": "gateway",
+    "base_url": "http://127.0.0.1:9/v1",
+    "timeout_seconds": 5,
+    "capabilities": {"tool_calls": True},
+}
+store.write_connection("gateway", json.dumps(connection) + "\\n", expected_revision=0)
+profile = {
+    "schema_version": 1,
+    "name": "default",
+    "connection": "gateway",
+    "model": "fixture-model",
+    "max_tokens": 256,
+}
+store.write_profile("default", json.dumps(profile) + "\\n", expected_revision=0)
+store.set_selection("gateway", "default", expected_revision=0)
+print("api model store seeded")
+`;
+
+const SEED_LEGACY_SOURCE = `
+"""Seed ONE historical legacy conversation through the internal store
+seams (pre-default runtime) and enqueue it for the frozen agent.run
+worker. The direct-agent default means the canonical create route no
+longer produces legacy material — fixtures seed history the honest way."""
+
+import asyncio
+import hashlib
+import sys
+import uuid
+
+
+async def main() -> int:
+    url, run_id, server_id, message = sys.argv[1:5]
+    from datetime import datetime, timezone
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from mai.agents import run as agent_run
+    from mai.agents.conversation_store import (
+        MessageSourceKind,
+        aattach_run,
+        acreate_conversation,
+        asubmit_turn,
+    )
+    from mai.api.chat import (
+        _canonical,
+        _modern_turn_document,
+        _record_chat_submission,
+    )
+    from mai.api.jobs import _record_submit_intent
+    from mai.jobs.engine import EngineClient
+    from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+    key = uuid.UUID(run_id)
+    server = uuid.UUID(server_id)
+    engine = create_async_engine(url, poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await acreate_conversation(sessions, server_id=server, conversation_id=key)
+        turn = await asubmit_turn(
+            sessions,
+            conversation_id=key,
+            server_id=server,
+            client_request_id=key,
+            message=message,
+            source_kind=MessageSourceKind.API,
+        )
+        now = datetime.now(timezone.utc)
+        context = ExecutionContext(
+            principal="hash:acui-legacy-fixture",
+            server_id=server,
+            run_id=key,
+            parent_scope=None,
+            profile_revision="1",
+            prompt_revision="1",
+            credential_references=(),
+            allowed_capabilities=["fixture.read"],
+            mode=PolicyMode("delegated"),
+        )
+        document = _modern_turn_document(
+            run_id=run_id,
+            server_id=server_id,
+            context=context,
+            profile="default",
+            task=turn.message.content,
+        )
+        agent_run.parse_agent_run_intent(_canonical(document))
+        payload_json = _canonical(document)
+        digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
+        async with sessions() as session, session.begin():
+            await _record_submit_intent(
+                session,
+                run_id=run_id,
+                server_id=server_id,
+                profile_revision=1,
+                prompt_revision=1,
+                model_profile="default",
+                requested_grants=["fixture.read"],
+                digest=digest,
+                label="default",
+                now=now,
+            )
+            await _record_chat_submission(
+                session,
+                run_id=run_id,
+                digest=digest,
+                handler="agent.run",
+                attachments=[],
+                child_count=0,
+                service_tags=[],
+                now=now,
+                conversation_id=key,
+                message_id=turn.message.message_id,
+            )
+        await aattach_run(
+            sessions, conversation_id=key, server_id=server, run_id=key
+        )
+    finally:
+        await engine.dispose()
+    client = EngineClient(url)
+    try:
+        await asyncio.to_thread(client.enqueue_run, run_id, "agent.run", payload_json)
+    finally:
+        client.close()
+    print(run_id)
+    return 0
+
+
+raise SystemExit(asyncio.run(main()))
+`;
+
 /** Seeds one v2 delegating parent onto an existing objective through the
  * real store seams (job_runs row + objective binding + ONE engine enqueue). */
 const SEED_DELEGATE_SOURCE = `
@@ -856,6 +1004,9 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		fs.writeFileSync(nodePath.join(SCRATCH, 'acui_seed_delegate.py'), SEED_DELEGATE_SOURCE, {
 			mode: 0o600
 		});
+		fs.writeFileSync(nodePath.join(SCRATCH, 'acui_seed_legacy.py'), SEED_LEGACY_SOURCE, {
+			mode: 0o600
+		});
 		live.journalPath = nodePath.join(SCRATCH, 'journal.log');
 		// Worker-side root (env file now; grants/policy/prompts after the
 		// real profiles exist and their minted ids are known).
@@ -1022,6 +1173,28 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 			}
 		);
 		expect(seeded.code, `roots seed failed: ${seeded.stderr}`).toBe(0);
+		// The API process owns ITS OWN confined data root (MAI_DATA_ROOT):
+		// seed the SAME deterministic model store (gateway connection +
+		// `default` profile + selection) there, so the live profile picker
+		// has a real choice and the canonical submit pins a real canonical
+		// profile — never a failed-fetch fallback. Server profiles are NOT
+		// rewritten: enrollment already recorded them at their real CAS
+		// revisions.
+		fs.writeFileSync(
+			nodePath.join(SCRATCH, 'acui_seed_api_models.py'),
+			SEED_API_MODEL_STORE_SOURCE,
+			{ mode: 0o600 }
+		);
+		const seededApi = await run(
+			backendPython(),
+			[nodePath.join(SCRATCH, 'acui_seed_api_models.py'), dataRoot],
+			{
+				cwd: BACKEND_ROOT,
+				env: { PATH: process.env.PATH!, HOME: process.env.HOME! },
+				timeout: 60_000
+			}
+		);
+		expect(seededApi.code, `api model store seed failed: ${seededApi.stderr}`).toBe(0);
 
 		// -- browser context: production UI + the /api relay (no mocks) -------
 		const ctx = await browser.newContext({ baseURL: ORIGIN, viewport: { width: 1280, height: 800 } });
@@ -1068,22 +1241,29 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		await expect(page().getByTestId('component-host')).toBeVisible({ timeout: 30_000 });
 	}
 
-	/** Selects the fixture server + objective in the dock draft and submits. */
-	async function submitV2Turn(objectiveId: string, mode: 'delegated' | 'ask', message: string): Promise<void> {
+	/**
+	 * Submits one New Chat turn with NO objective control: the runtime/
+	 * objective dropdown is gone, the direct-agent default starts the v2
+	 * episode server-side and binds the conversation automatically
+	 * (runtime-v2 §3.3; the backend admission owns the episode).
+	 */
+	async function submitV2Turn(mode: 'delegated' | 'ask', message: string): Promise<void> {
 		if (!live.loggedIn) {
 			await loginThroughUi();
 			live.loggedIn = true;
 		}
 		const dock = page().getByTestId('bottom-chat-dock');
 		await expect(dock).toBeVisible();
-		// A started context locks the draft: every NEW objective-bound
-		// submission starts from a fresh unlocked draft.
+		// A started context locks the draft: every NEW submission starts
+		// from a fresh unlocked draft.
 		await page().getByTestId('drawer-new-chat').click();
 		await page().getByTestId('server-select').selectOption(live.serverA);
-		const picker = dock.getByTestId('chat-objective-picker');
-		await expect(picker).toBeVisible({ timeout: 20_000 });
-		await expect(picker.locator(`option[value="${objectiveId}"]`)).toHaveCount(1, { timeout: 20_000 });
-		await picker.selectOption(objectiveId);
+		// The runtime/objective selector is REMOVED (no picker, no load-more,
+		// no list error slot); the Ask/Delegated mode picker stays.
+		await expect(dock.getByTestId('chat-objective-picker')).toHaveCount(0);
+		await expect(dock.getByTestId('chat-objectives-load-more')).toHaveCount(0);
+		await expect(dock.getByTestId('chat-objectives-error')).toHaveCount(0);
+		await expect(dock.getByTestId('chat-mode-picker')).toBeVisible();
 		await dock.getByTestId('chat-mode-picker').selectOption(mode);
 		await dock.getByTestId('compose-message').fill(message);
 		await dock.getByTestId('chat-submit').click();
@@ -1105,6 +1285,23 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		}
 	}
 
+	/**
+	 * The server's most recently updated objective episode: for a fresh
+	 * New-Chat submission that IS the episode the admission just created
+	 * (objectives list order: `updated_at DESC`).
+	 */
+	async function latestObjectiveId(): Promise<string> {
+		const response = await apiFetch(
+			'GET',
+			`/api/v1/objectives?server_id=${live.serverA}&limit=1`
+		);
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { items?: Array<{ objective_id: string }> };
+		const id = body.items?.[0]?.objective_id ?? '';
+		expect(id, 'the automatic episode exists').not.toBe('');
+		return id;
+	}
+
 	async function openObjectiveSections(): Promise<void> {
 		const activity = page().getByTestId('objective-activity');
 		await expect(activity).toBeVisible({ timeout: 30_000 });
@@ -1115,18 +1312,24 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 			await loginThroughUi();
 			live.loggedIn = true;
 		}
-		const objectiveId = await createObjective(
-			'Journey objective',
-			[live.serverA],
-			'Read the fixture host, apply the bounded change, verify it.'
+		// New Chat with NO objective control: the direct-agent default starts
+		// the episode inside the admission (first submit = automatic v2).
+		await submitV2Turn(
+			'delegated',
+			'mission=journey Do the read, apply the bounded change, verify.'
 		);
-		await submitV2Turn(objectiveId, 'delegated', 'mission=journey Do the read, apply the bounded change, verify.');
 		// The accepted turn is durable: the activity section mounts from the
-		// server's own v2 markers (handler_name + objective_ids).
+		// server's own v2 markers (handler_name + objective_ids) — the
+		// AUTOMATIC episode the backend created for this conversation.
 		await openObjectiveSections();
+		const objectiveId = await latestObjectiveId();
 		const header = page().getByTestId('objective-header');
 		await expect(header).toBeVisible();
-		await expect(header.getByTestId('objective-title')).toContainText('Journey objective');
+		// An automatic episode carries no operator title: the header renders
+		// the honest short-id fallback (never a fabricated title).
+		await expect(header.getByTestId('objective-title')).toContainText(
+			/^Objective [0-9a-f]{6}/
+		);
 		await expect(header.getByTestId('objective-target')).toContainText('Target');
 		await expect(header.getByTestId('objective-model')).toContainText('Model default', {
 			timeout: 30_000
@@ -1225,28 +1428,69 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		await page().locator('[data-testid="objective-ledger"] > summary').click();
 		// The fresh section legitimately loads its FIRST page; the replay
 		// property under test is DEDUPLICATION (watermark + page merge), so
-		// every rendered sequence must appear exactly once.
+		// every rendered sequence must appear exactly once. Under the
+		// direct-agent default the follow-up above may have rolled the
+		// conversation into a NEW episode, and the reopened section mounts
+		// one of the conversation's episodes — the dedup invariant holds
+		// for whichever episode rendered.
 		await expect
 			.poll(
 				async () => (await page().getByTestId('objective-event').count()),
 				{ timeout: 30_000 }
 			)
-			.toBeGreaterThanOrEqual(Math.min(5, afterSeqs.length));
+			.toBeGreaterThanOrEqual(1);
 		const replaySeqs = await page().getByTestId('objective-event').evaluateAll((rows) =>
 			rows.map((row) => row.getAttribute('data-seq'))
 		);
+		expect(replaySeqs.length, 'the reopened ledger rendered rows').toBeGreaterThanOrEqual(1);
 		expect(new Set(replaySeqs).size).toBe(replaySeqs.length);
 	});
 
 	test('multi-server delegation: v2 tree server_ids, child receipts, target/resource filter', async () => {
+		// The delegation FIXTURE needs an episode scoped to BOTH servers up
+		// front (each child binds with its own initiating server in scope),
+		// while the automatic episode is scoped exactly to the initiating
+		// server. Meaningful scenario setup only: pre-create the operator
+		// objective and bind it at submit through the documented explicit
+		// wire path (the UI no longer carries an objective control).
 		const objectiveId = await createObjective(
 			'Delegation objective',
 			[live.serverA, live.serverB],
 			'Fan the scoped reads out across both fixture servers.'
 		);
-		// The conversation binds the objective FIRST (UI submission); the real
-		// v2 delegate parent is then seeded onto the SAME episode.
-		await submitV2Turn(objectiveId, 'delegated', 'mission=child Prepare the delegation episode.');
+		const conversationKey = nodeCrypto.randomUUID();
+		const bound = await apiFetch('POST', '/api/v1/chat/conversations', {
+			server_id: live.serverA,
+			client_request_id: conversationKey,
+			message: 'mission=child Prepare the delegation episode.',
+			profile: 'default',
+			objective_id: objectiveId
+		});
+		expect(
+			[200, 201],
+			`bound submit: ${await bound.text()}`
+		).toContain(bound.status);
+		// Open the bound conversation from the drawer (its run id IS the
+		// conversation id, so the history row labels it `Run <short id>`).
+		const dock = page().getByTestId('bottom-chat-dock');
+		await expect(dock).toBeVisible();
+		await page().getByTestId('server-select').selectOption(live.serverA);
+		await page().getByTestId('drawer-new-chat').click();
+		const historyToggle = page().getByTestId('drawer-history-toggle');
+		const expanded = await historyToggle.getAttribute('aria-expanded');
+		if (expanded !== 'true') await historyToggle.click();
+		else {
+			await historyToggle.click();
+			await historyToggle.click();
+		}
+		await page()
+			.getByTestId('drawer-history-item')
+			.filter({ hasText: conversationKey.slice(0, 8) })
+			.first()
+			.click();
+		await expect(page().getByTestId('objective-activity')).toBeVisible({
+			timeout: 30_000
+		});
 		await expect(page().getByTestId('objective-status')).toContainText('Succeeded', { timeout: 90_000 });
 		const parentRunId = nodeCrypto.randomUUID();
 		const seeded = await run(
@@ -1348,14 +1592,10 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		// approval wake plus the crash-window recovery (kill → reconcile →
 		// wake). Each involves real worker restarts — bounded, but long.
 		test.setTimeout(600_000);
-		// (a) ask mode: the non-read effect parks waiting_approval; the ONE
-		// payload-bound decision resumes it.
-		const approvalObjective = await createObjective(
-			'Approval objective',
-			[live.serverA],
-			'Apply the bounded change after the payload-bound approval.'
-		);
-		await submitV2Turn(approvalObjective, 'ask', 'mission=ask Apply the gated change.');
+		// (a) ask mode via New Chat (no objective control): the non-read
+		// effect parks waiting_approval; the ONE payload-bound decision
+		// resumes it.
+		await submitV2Turn('ask', 'mission=ask Apply the gated change.');
 		await expect(page().getByTestId('objective-wait')).toContainText(
 			'Waiting for approval decision',
 			{ timeout: 90_000 }
@@ -1372,14 +1612,10 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 		await approvalJournal.getByTestId('journal-verification').locator('summary').click();
 		await expect(page().getByTestId('journal-verification-verdict')).toBeVisible();
 
-		// (b) crash window: the gate behavior holds the effect; SIGKILL parks
-		// outcome_unknown + reconciling; blind resume is refused.
-		const crashObjective = await createObjective(
-			'Crash-window objective',
-			[live.serverA],
-			'Apply the crash-window change; classify any unproven outcome.'
-		);
-		await submitV2Turn(crashObjective, 'delegated', 'mission=crash Apply the crash-window change.');
+		// (b) crash window via New Chat: the gate behavior holds the effect;
+		// SIGKILL parks outcome_unknown + reconciling; blind resume is
+		// refused.
+		await submitV2Turn('delegated', 'mission=crash Apply the crash-window change.');
 		await waitUntil(
 			() => journalCount('begin:fixture.write:mcrash') >= 1,
 			90_000,
@@ -1422,19 +1658,24 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 			await loginThroughUi();
 			live.loggedIn = true;
 		}
-		// A LEGACY conversation: the canonical create route with NO
-		// objective_id selects the frozen `agent.run` handler and records a
-		// real `conversations` row (§10.3 read compatibility forever).
+		// A LEGACY conversation: the direct-agent default means the canonical
+		// create route NO LONGER produces legacy material, so this fixture
+		// seeds the historical row through the INTERNAL store seams (the
+		// discipline the backend slice pins) and enqueues it for the REAL
+		// frozen agent.run worker (§10.3 read compatibility forever).
 		const runId = nodeCrypto.randomUUID();
-		const submitted = await apiFetch('POST', '/api/v1/chat/conversations', {
-			client_request_id: runId,
-			server_id: live.serverA,
-			message: 'mission=legacy Plain legacy question.',
-			profile: 'default',
-			mode: 'delegated'
-		});
-		// 201 = created (200 = deduplicated retransmission).
-		expect([200, 201], await submitted.text()).toContain(submitted.status);
+		const seededLegacy = await run(
+			backendPython(),
+			[
+				nodePath.join(SCRATCH, 'acui_seed_legacy.py'),
+				live.pgUrl,
+				runId,
+				live.serverA,
+				'mission=legacy Plain legacy question.'
+			],
+			{ cwd: BACKEND_ROOT, env: { PATH: process.env.PATH!, HOME: process.env.HOME! }, timeout: 120_000 }
+		);
+		expect(seededLegacy.code, `legacy seed failed: ${seededLegacy.stderr.slice(-600)}`).toBe(0);
 		// The frozen legacy handler settles the scripted plain reply through
 		// its frozen checkpoint sequence: read-compatible history, never
 		// reinterpreted as v2. Wait for the RECORDED terminal run state AND
@@ -1504,13 +1745,7 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 			await loginThroughUi();
 			live.loggedIn = true;
 		}
-		const mobileObjective = await createObjective(
-			'Mobile objective',
-			[live.serverA],
-			'A quick scoped read for the mobile accessibility pass.'
-		);
 		await submitV2Turn(
-			mobileObjective,
 			'delegated',
 			'mission=child Prepare the mobile accessibility pass.'
 		);
@@ -1518,6 +1753,7 @@ test.describe('activity-ui v2 live (real uvicorn + pg18 + workers + production U
 			timeout: 120_000
 		});
 		// The mobile episode's conversation run id (the drawer row label).
+		const mobileObjective = await latestObjectiveId();
 		const mobileRuns = await apiFetch(
 			'GET',
 			`/api/v1/objectives/${mobileObjective}/runs?server_id=${live.serverA}&limit=5`
