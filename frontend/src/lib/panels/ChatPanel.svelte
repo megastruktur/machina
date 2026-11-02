@@ -75,6 +75,8 @@
 	import DetailsDisclosure from '../ui/DetailsDisclosure.svelte';
 	import HistoryTags, { type TagPageLoader } from '../ui/HistoryTags.svelte';
 	import DelegationTree from '../components/DelegationTree.svelte';
+	import ObjectiveActivity from '../chat/ObjectiveActivity.svelte';
+	import type { ObjectiveSummary, ObjectiveStatus, WorkJournal } from '../api/client.js';
 	import TaskEvidence from './chat/TaskEvidence.svelte';
 	import type { TaskOutcomeCriterion, TaskOutcomeDocument } from './chat/TaskEvidence.svelte';
 	import TaskPlan from './chat/TaskPlan.svelte';
@@ -220,6 +222,13 @@
 	function serverLabelFor(id: string): string {
 		return serverOptions.find((one) => one.id === id)?.label ?? `Server ${shortId(id)}`;
 	}
+
+	/** Label map for v2 sections (objective activity, delegation tree). */
+	const serverLabelMap = $derived.by<Record<string, string>>(() => {
+		const map: Record<string, string> = {};
+		for (const one of serverOptions) map[one.id] = one.label;
+		return map;
+	});
 
 	// --- @service autocomplete (draft mode, server pinned) --------------------
 
@@ -714,6 +723,164 @@
 		return api as CanonicalChatApi;
 	});
 
+	// --- runtime v2 objective slice (§11; activity-ui) ------------------------
+	//
+	// Optional like every additive slice: present ONLY when EVERY v2 method
+	// exists on the bag. Legacy fixture bags (and any pre-v2 host) omit it
+	// and the panel renders exactly the reviewed surface — zero network
+	// calls, no fabricated sections (AGENTS.md wire honesty).
+
+	/** The structural v2 objective slice this panel consumes. */
+	type ObjectiveChatApi = {
+		listObjectives(
+			serverId: string,
+			page?: { limit?: number; offset?: number; status?: ObjectiveStatus }
+		): Promise<{
+			limit: number;
+			offset: number;
+			total: number;
+			has_more: boolean;
+			items?: ObjectiveSummary[];
+		}>;
+		readObjectiveJournal(
+			objectiveId: string,
+			serverId: string
+		): Promise<WorkJournal>;
+		listObjectiveEvents(
+			objectiveId: string,
+			serverId: string,
+			query?: { limit?: number; offset?: number; afterSeq?: number }
+		): Promise<unknown>;
+		listObjectiveRuns(
+			objectiveId: string,
+			serverId: string,
+			page?: { limit?: number; offset?: number }
+		): Promise<unknown>;
+		readRun(runId: string): Promise<unknown>;
+		resumeConversation(
+			conversationId: string,
+			payload: { server_id: string; message?: string | null }
+		): Promise<unknown>;
+		reconcileConversation(
+			conversationId: string,
+			payload: {
+				server_id: string;
+				classifications: Array<{ seq: number; verdict: 'confirm_applied' | 'confirm_not_applied' | 'cancel' }>;
+			}
+		): Promise<unknown>;
+	};
+
+	function readObjectiveApi(candidate: ChatApi): ObjectiveChatApi | null {
+		for (
+			const name of [
+				'listObjectives',
+				'readObjectiveJournal',
+				'listObjectiveEvents',
+				'listObjectiveRuns',
+				'readRun',
+				'resumeConversation',
+				'reconcileConversation'
+			] as const
+		) {
+			if (typeof (candidate as Partial<ObjectiveChatApi>)[name] !== 'function') return null;
+		}
+		return candidate as unknown as ObjectiveChatApi;
+	}
+
+	const objectiveApi = $derived(api === null ? null : readObjectiveApi(api));
+
+	/** Bounded draft objective page (the picker's options; AGENTS.md §1). */
+	const DRAFT_OBJECTIVE_LIMIT = 10;
+	/** Bumped by `New Chat`: the draft objective page re-reads (objectives
+	 * may have been created since the last draft). */
+	let draftObjectivesRevision = $state(0);
+	let draftObjectives = $state<ObjectiveSummary[]>([]);
+	let draftObjectivesTotal = $state(0);
+	let draftObjectivesLoadingMore = $state(false);
+	let draftObjectivesError = $state<string | null>(null);
+	/** The selected draft objective (`''` = legacy runtime, no objective). */
+	let draftObjectiveId = $state('');
+	/** Prompting mode: `ask` prompts approval decisions on non-read effects. */
+	let draftMode = $state<'delegated' | 'ask'>('delegated');
+
+	const draftObjectivesHasMore = $derived(draftObjectives.length < draftObjectivesTotal);
+
+	async function loadDraftObjectives(): Promise<void> {
+		const slice = objectiveApi;
+		const scope = effectiveServerId;
+		if (slice === null || scope === null || scope === GLOBAL_CONSULT_SERVER_ID) {
+			draftObjectives = [];
+			draftObjectivesTotal = 0;
+			draftObjectivesError = null;
+			return;
+		}
+		draftObjectivesError = null;
+		try {
+			const page = await slice.listObjectives(scope, {
+				limit: DRAFT_OBJECTIVE_LIMIT,
+				offset: 0
+			});
+			if (disposed || effectiveServerId !== scope) return;
+			draftObjectives = page.items ?? [];
+			draftObjectivesTotal = page.total;
+			// A selected id that fell off the (still bounded) first page stays
+			// selected only if it exists in the loaded set; otherwise reset.
+			if (draftObjectiveId !== '' && !draftObjectives.some((one) => one.objective_id === draftObjectiveId)) {
+				draftObjectiveId = '';
+			}
+		} catch (error) {
+			if (disposed) return;
+			draftObjectives = [];
+			draftObjectivesTotal = 0;
+			draftObjectivesError = messageOf(error) ?? 'The objective list could not be loaded.';
+		}
+	}
+
+	async function loadMoreDraftObjectives(): Promise<void> {
+		const slice = objectiveApi;
+		const scope = effectiveServerId;
+		if (slice === null || scope === null || draftObjectivesLoadingMore || !draftObjectivesHasMore)
+			return;
+		draftObjectivesLoadingMore = true;
+		try {
+			const page = await slice.listObjectives(scope, {
+				limit: DRAFT_OBJECTIVE_LIMIT,
+				offset: draftObjectives.length
+			});
+			if (disposed || effectiveServerId !== scope) return;
+			const seen = new Set(draftObjectives.map((one) => one.objective_id));
+			draftObjectives = [
+				...draftObjectives,
+				...(page.items ?? []).filter((one) => !seen.has(one.objective_id))
+			];
+			draftObjectivesTotal = page.total;
+		} catch (error) {
+			if (disposed) return;
+			draftObjectivesError = messageOf(error) ?? 'More objectives could not be loaded.';
+		} finally {
+			if (!disposed) draftObjectivesLoadingMore = false;
+		}
+	}
+
+	// A scope/draft change re-reads the bounded objective page; a locked
+	// (started) context or an absent slice never fetches. The scope read and
+	// the New-Chat revision below ARE the tracked dependencies: re-selecting
+	// a server or starting a fresh draft re-queries the page.
+	$effect(() => {
+		if (objectiveApi === null || chatContextLocked) return;
+		void effectiveServerId;
+		void draftObjectivesRevision;
+		void loadDraftObjectives();
+	});
+	$effect(() => {
+		if (objectiveApi === null || chatContextLocked) {
+			draftObjectives = [];
+			draftObjectivesTotal = 0;
+			draftObjectivesError = null;
+			draftObjectiveId = '';
+		}
+	});
+
 	/**
 	 * §8 Plan section services (act `18-plan-ui`): narrow the task slice off
 	 * the SAME composed client the panel already carries — a bag without the
@@ -770,6 +937,36 @@
 	let controlNote = $state<string | null>(null);
 
 	const canonicalMode = $derived(canonicalId !== null);
+
+	// --- runtime v2 markers (§10.3 read compatibility; AC5) -------------------
+
+	/**
+	 * The open conversation is v2: the server's TRUTHFUL `handler_name`
+	 * marker plus a bound objective episode. Legacy conversations never
+	 * fabricate v2 sections; v2 conversations never present the legacy
+	 * intake ladder as first-class progress (the pending label below).
+	 */
+	const v2Conversation = $derived(
+		canonicalDetail !== null &&
+			canonicalDetail.handler_name === 'agent.run_v2' &&
+			(canonicalDetail.objective_ids?.length ?? 0) > 0
+	);
+	/** The open conversation's bound objective episode (one per conversation). */
+	const openObjectiveId = $derived(
+		v2Conversation ? (canonicalDetail?.objective_ids[0] ?? null) : null
+	);
+	/** Honest legacy marker: the server-derived §10.3 flag. */
+	const legacyConversation = $derived(canonicalDetail !== null && canonicalDetail.is_legacy === true);
+	/**
+	 * The pending-turn label: v2 runs have NO intake planner — the first
+	 * model round IS the working loop — so the queued/running phase names
+	 * exactly that instead of the legacy intake ladder (AC5).
+	 */
+	const pendingIntakeLabel = $derived(
+		v2Conversation
+			? 'Run accepted — the first model round is the working loop'
+			: 'Understanding request & preparing task plan…'
+	);
 
 	/**
 	 * The newest recorded USER message of the canonical transcript: the
@@ -1458,6 +1655,21 @@
 			canonicalLatestSeq = page.current.latest_seq;
 			canonicalCompleteness = page.current.history_completeness;
 			canonicalPendingSteering = page.current.pending_steering;
+			// A FRESH submission has no detail read yet: the honest marker
+			// fields (is_legacy/handler_name/objective_ids) arrive from the
+			// singleton read, not from the tail's state block.
+			if (canonicalDetail === null) {
+				try {
+					const detail = await canonicalRef.getConversation(id, scope);
+					if (disposed || canonicalId !== id || scope !== canonicalScope) return;
+					canonicalDetail = detail;
+					canonicalCompleteness = detail.history_completeness;
+					canonicalGaps = detail.legacy_gaps ?? [];
+				} catch {
+					// The detail read failing keeps the transcript fold alive;
+					// the next poll re-reads it.
+				}
+			}
 			// A bound run's facade state moves independently of its stream
 			// (lease released, run finished): the debounced refresh keeps the
 			// recorded badge honest without waiting for stream frames.
@@ -1550,7 +1762,13 @@
 							message: rawUserPrompt,
 							profile: composeProfile.trim(),
 							requested_phase: recovery ? 'act' : readOnlyMode ? 'plan' : null,
-							task_action: 'continue'
+							task_action: 'continue',
+							// Runtime v2 (§3.3): an explicit objective selection
+							// binds this conversation's runs to the operator-owned
+							// episode and selects the v2 handler. Follow-ups omit
+							// it — the server's binding probe keeps the episode.
+							objective_id: draftObjectiveId === '' ? null : draftObjectiveId,
+							mode: draftMode
 						})
 					: await canonicalRef.submitConversationMessage(openId, {
 							server_id: serverId,
@@ -1560,7 +1778,8 @@
 								? recovery.expectedRevision
 								: lastRevision,
 							requested_phase: recovery ? 'act' : readOnlyMode ? 'plan' : null,
-							task_action: 'continue'
+							task_action: 'continue',
+							mode: draftMode
 						});
 			if (disposed) return;
 			canonicalId = submitted.conversation_id;
@@ -2086,6 +2305,9 @@
 		composeMessage = '';
 		composeProfile = 'default';
 		readOnlyMode = false;
+		draftObjectiveId = '';
+		draftObjectivesRevision += 1;
+		draftMode = 'delegated';
 		composeAttachments = '';
 		composeFields = {};
 		composeProblem = null;
@@ -3539,7 +3761,7 @@
 		// or the honest generic estimate), then context assembly, then the
 		// actual round/tool work. Historical 'Binding model…' /
 		// 'Context assembled' lines NEVER masquerade as the current stage.
-		if (intakePending) return 'Understanding request & preparing task plan…';
+		if (intakePending) return pendingIntakeLabel;
 		if (contextPending) return 'Assembling request context…';
 		const activeTool = [...visibleToolCalls]
 			.reverse()
@@ -3663,6 +3885,38 @@
 	const canStopRun = $derived(
 		api !== null && display !== null && jobInProgress && !cancelRequested && !stoppingRun
 	);
+
+	// --- v2 delegation-tree journal (drawer-scoped read; AC3) -----------------
+	//
+	// The Details drawer's tree carries the objective journal ONLY while it
+	// is open on a v2 conversation: one bounded read per open (AGENTS.md §1,
+	// user-initiated), honest absence on failure — legacy conversations and
+	// closed drawers never fetch.
+
+	let treeJournal = $state<WorkJournal | null>(null);
+
+	$effect(() => {
+		if (!detailsOpen || !v2Conversation || openObjectiveId === null || canonicalScope === null) {
+			treeJournal = null;
+			return;
+		}
+		const slice = objectiveApi;
+		const scope = canonicalScope;
+		const id = openObjectiveId;
+		if (slice === null) return;
+		let cancelled = false;
+		void slice
+			.readObjectiveJournal(id, scope)
+			.then((journal) => {
+				if (!cancelled && detailsOpen && openObjectiveId === id) treeJournal = journal;
+			})
+			.catch(() => {
+				if (!cancelled) treeJournal = null; // honest absence, never fabricated
+			});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	async function stopActiveConversation(): Promise<void> {
 		if (api === null || display === null || !jobInProgress || cancelRequested || stoppingRun) return;
@@ -3980,6 +4234,52 @@
 										<option value={effectiveServerId}>Server {shortId(effectiveServerId)}</option>
 									{/if}
 								</Select>
+								{#if objectiveApi !== null && !generalConsultMode}
+									<label class="mai-sr-only" for="{uid}-objective">Runtime objective</label>
+									<select
+										id="{uid}-objective"
+										class="mai-chat__server-picker"
+										bind:value={draftObjectiveId}
+										data-testid="chat-objective-picker"
+									>
+										<option value="">Legacy runtime (no objective)</option>
+										{#each draftObjectives as objective (objective.objective_id)}
+											<option value={objective.objective_id}>
+												{objective.title && objective.title.trim() !== ''
+													? objective.title
+													: `Objective ${shortId(objective.objective_id)}`}
+												· {objective.status}
+											</option>
+										{/each}
+									</select>
+									{#if draftObjectivesError !== null}
+										<span class="mai-chat__meta" role="status" data-testid="chat-objectives-error">
+											{draftObjectivesError}
+										</span>
+									{/if}
+									{#if draftObjectivesHasMore}
+										<Button
+											size="sm"
+											pill
+											variant="secondary"
+											loading={draftObjectivesLoadingMore}
+											onclick={loadMoreDraftObjectives}
+											data-testid="chat-objectives-load-more"
+										>
+											More objectives ({draftObjectives.length} of {draftObjectivesTotal})
+										</Button>
+									{/if}
+									<label class="mai-sr-only" for="{uid}-mode">Prompting mode</label>
+									<select
+										id="{uid}-mode"
+										class="mai-chat__server-picker"
+										bind:value={draftMode}
+										data-testid="chat-mode-picker"
+									>
+										<option value="delegated">Mode: delegated</option>
+										<option value="ask">Mode: ask (approve effects)</option>
+									</select>
+								{/if}
 								{#if !generalConsultMode && canonicalApi === null}
 									<Button
 										size="sm"
@@ -4127,6 +4427,15 @@
 						>
 							{canonicalStateText}
 						</span>
+						{#if legacyConversation}
+							<span
+								class="mai-chat__badge mai-chat__badge--neutral"
+								data-testid="legacy-runtime-marker"
+								title="This conversation runs the frozen legacy handler (agent.run); its history is rendered read-only and truthfully."
+							>
+								Legacy runtime (agent.run)
+							</span>
+						{/if}
 						{#if canonicalPendingSteering > 0}
 							<span class="mai-chat__note" data-testid="pending-steering-note" role="status">
 								Pending steering rows: {canonicalPendingSteering}
@@ -4183,6 +4492,19 @@
 				     blocks left this region for the Task Inspector drawer — the
 				     same grid-starvation rationale keeps the gap banner here.) -->
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
+				{#if v2Conversation && openObjectiveId !== null && canonicalId !== null && canonicalScope !== null}
+					<ObjectiveActivity
+						objectiveId={openObjectiveId}
+						serverId={canonicalScope}
+						conversationId={canonicalId}
+						api={api}
+						serverLabels={serverLabelMap}
+						elapsedSeconds={elapsedSeconds}
+						pendingSteering={canonicalPendingSteering}
+						liveRunId={activeRunId || null}
+					/>
+				{/if}
+
 					{#if canonicalMode && canonicalCompleteness !== 'complete'}
 						<div
 							class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
@@ -4293,14 +4615,14 @@
 											<p class="mai-chat__meta" data-testid="feed-event" data-seq={entry.seq} data-kind={entry.kind}>{entry.label}</p>
 										{/if}
 									{/each}
-									{#if live && intakePending}
-										<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
-											<span class="mai-chat__thinking-prefix">&gt;</span>
-											<span>Understanding request &amp; preparing task plan…</span>
-										</div>
-									{/if}
-									{#if live}
-										<div class="mai-chat__work-indicator" role="status" aria-live="polite" data-testid="turn-feed-working">
+								{#if live && intakePending}
+									<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
+										<span class="mai-chat__thinking-prefix">&gt;</span>
+										<span>{pendingIntakeLabel}</span>
+									</div>
+								{/if}
+								{#if live}
+									<div class="mai-chat__work-indicator" role="status" aria-live="polite" data-testid="turn-feed-working">
 											<div class="mai-chat__work-indicator-row">
 												<span class="mai-chat__cog-spin" aria-hidden="true">⚙</span>
 												<span class="mai-chat__work-indicator-label">{activeStepText}</span>
@@ -4521,7 +4843,7 @@
 										{#if intakePending}
 											<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
 												<span class="mai-chat__thinking-prefix">&gt;</span>
-												<span>Understanding request &amp; preparing task plan…</span>
+												<span>{pendingIntakeLabel}</span>
 											</div>
 										{/if}
 										{#if thinkingSteps.length === 0 && !intakePending}
@@ -5021,6 +5343,8 @@
 							api={api}
 							taskLabels={taskLabels}
 							showCancel={false}
+							objectiveJournal={v2Conversation ? treeJournal : null}
+							serverLabels={serverLabelMap}
 						/>
 					</div>
 				{/if}

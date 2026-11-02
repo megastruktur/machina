@@ -539,6 +539,23 @@ class ConversationTurnSubmitRequest(BaseModel):
         default=None,
         description="Explicit episode action: continue or start a new task (§1)",
     )
+    objective_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Runtime v2 objective episode (runtime-v2.md §3.3): when set, the "
+            "turn selects the v2 handler explicitly and binds this durable run "
+            "to the operator-owned objective; the initiating server must be an "
+            "explicit scope member at submit time"
+        ),
+    )
+    mode: PyLiteral["ask", "delegated"] | None = Field(
+        default=None,
+        description=(
+            "Prompting mode within grants (§C03 rule 5): 'ask' prompts for an "
+            "approval decision on non-read effects; omitted pins 'delegated' "
+            "(the mode never widens any check)"
+        ),
+    )
 
     @field_validator("message")
     @classmethod

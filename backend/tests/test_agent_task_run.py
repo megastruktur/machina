@@ -107,7 +107,16 @@ SERVER_UUID = uuid.UUID(SERVER_ID)
 
 #: Every app-owned table this card touches (complete drop/reset list, so
 #: this suite composes safely with the sibling suites in ONE session).
+#: The objective domain (0013, journal-store slice) leads the list: its
+#: FKs reference job_runs and conversations, so the DROP list must name
+#: the children first (chain-tip reconciliation).
 DOMAIN_TABLES = (
+    "objective_journal",
+    "objective_checklists",
+    "objective_events",
+    "objective_runs",
+    "objective_servers",
+    "objectives",
     "agent_task_completions",
     "agent_task_revisions",
     "agent_task_evidence",
@@ -148,6 +157,14 @@ def _drop_all(url: str) -> None:
         name
         for name in (
             *DOMAIN_TABLES,
+            # The 0011 history-tag domain: the associations block DROP of
+            # job_runs/conversations and the catalog blocks tags-only
+            # resets, so the full reset names them (the per-test truncate
+            # above deliberately keeps the catalog — CASCADE already
+            # clears the associations).
+            "job_tags",
+            "conversation_tags",
+            "tags",
             "profile_projection_journal",
             "profile_projection",
             "admin_sessions",

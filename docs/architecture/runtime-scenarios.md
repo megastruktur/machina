@@ -119,3 +119,51 @@ Registry assembled 2026-10-12 by `mai-00-contracts` from the six frozen P00 ADRs
 (`mai_TASKS.json`/card briefs); gates are the phase feature gates per
 `mai_EXECUTION.md` §4/§6. Author coverage/integrity checks:
 `mai_evidence/00-contracts/01-inputs-and-checks.md`.
+
+---
+
+## RV2 — runtime v2 live scenarios (rv campaign, 2026-11-01)
+
+Contract source: [runtime-v2.md](runtime-v2.md) §12 (campaign task `contracts`).
+The rows below were frozen as `design-frozen` (definitions + fixtures) and are
+now `measured` by the `acceptance` campaign gate: executed on the integrated
+campaign tip by `backend/tests/test_runtime_v2_acceptance.py` (real provider +
+real disposable Postgres 18 fixture + real disposable sshd target + real
+workers; scripted models only for labelled deterministic fault injection) with
+evidence under `plans/runtime-v2/rv_evidence/acceptance/` (journey metrics in
+`journey_metrics.json`, per-scenario verdicts in `verdict_matrix.json`,
+`summary.md`, `verification_receipt.json`). `RV2-UI-A11Y` is executed by the
+Playwright suites (`tests/activity-ui-v2.spec.ts tests/delegation.spec.ts
+tests/api-client.spec.ts`, one worker + bounded Node heap) and re-recorded by
+the same acceptance run. All fixtures follow runtime-environment ADR D1–D5
+(disposable targets, namespace `mai-fxt-…`, cleanup proof, no secrets in
+evidence). `RV2-DEPLOY-DRAIN` stays `design-frozen`: its verification gate is
+the deploy gate (`rv-deploy`), not the acceptance gate.
+
+| ID | Scenario (definition) | Producer (owns test/entrypoint) | Verification gate | Fixtures / prerequisites | Expected evidence | Status |
+|---|---|---|---|---|---|---|
+| RV2-JOURNEY | One disposable authorized request completes inspect → act → verify → report in ONE submission through the actual v2 chat API/UI with a real provider: no intake call, no second user turn, receipt-backed response | `acceptance` (journey runner); `conversation-api` (route); `action-runtime` (`agent.run_v2` handler) | campaign acceptance gate | blocking preflight-designated disposable mutation-capable target; real provider via configured gateway (credentials via `.env`); real persistence | journey transcript + receipts; zero intake events on the run | measured |
+| RV2-DENY | Research-only server: direct AND delegation-carried mutation attempts produce no effect; sanitized denial is journaled and visible | `policy-delegation` (policy projection); `acceptance` (negative journeys) | campaign acceptance gate | second disposable target configured `research_only` via `GrantConfigStore`; policy revision fixture | denial transcripts + sanitized decision events; zero effects | measured |
+| RV2-DELEGATE | Real parent/child v2 runs over TWO scoped targets: child target/capability/budget subsets hold; ordered activity; parent aggregates child receipts, not claims | `policy-delegation` (`ChildSpecV2` payload v2); `acceptance` (journey) | campaign acceptance gate | two disposable Compose/SSH targets; objective with operator-expanded scope | delegation tree events + child receipts + aggregate verification | measured |
+| RV2-APPROVAL-RESTART | Approval-deferred effect survives a real worker restart; the approved operation executes its EXACT payload exactly once via the payload-bound resume | `action-runtime` (resume seam) | campaign acceptance gate | disposable target; kill/restart harness; approval fixture bound to payload hash | restart + single-effect proof (receipt identities); no duplicate mutation | measured |
+| RV2-REPLAY | Crash/restart replay keeps v2 and legacy durability: settled checkpoints replay, parked waits re-park, no duplicate effects | `acceptance` (harness); `action-runtime` | campaign acceptance gate | disposable Postgres; seeded v2 + legacy runs | replay transcripts; event dedup on reconnect | measured |
+| RV2-UNKNOWN | An effect whose receipt is lost becomes `outcome_unknown`, pauses in `reconciling`, and NEVER auto-resumes into execution until classified | `action-runtime` + `mai.jobs.recovery` integration; `acceptance` | campaign acceptance gate | fixture target with induced lost receipt | reconciliation transcript; explicit unknown until classified | measured |
+| RV2-UI-A11Y | Real browser at 360×640 AND desktop, `prefers-reduced-motion: reduce`, keyboard-only: expand/collapse every event detail, steer, pause/cancel, approve, navigate the delegation tree; accessible names/roles, visible focus, no horizontal overflow, no focus theft during streamed events, no animation | `activity-ui` | activity-ui gate (`acceptance` re-runs journey-level) | built frontend + API; exclusive browser port; live v2 run fixture | a11y tree + interaction transcripts; overflow/focus assertions | measured |
+| RV2-LEGACY | Seed real legacy conversation/run/task fixtures; migrate, read, and drain: legacy history stays truthful and readable; unsettled legacy runs drain or replay by their FROZEN `agent.run` worker; never reinterpreted as v2 | `journal-store` (migrations); `acceptance` (seed/read/drain) | campaign acceptance gate | disposable migrated Postgres; real legacy row fixtures; drain inventory from preflight | read-compatibility transcripts + drain ledger; zero history rewrites | measured |
+| RV2-DEPLOY-DRAIN | Production deployment gates on a drained legacy active-run inventory; health/readiness checks, v2 smoke, legacy-read compatibility and a rehearsed rollback (application vs irreversible-migration scope distinguished) | `deploy` | deploy gate | production path per plan; pre-deploy backup where applicable; rollback rehearsal record | deploy receipt: revision, health, smoke, drain status, rollback trigger/result | design-frozen |
+
+### RV2 coverage statement (runtime-v2.md §12)
+
+Every acceptance scenario named in runtime-v2.md maps to a row above with a
+producer and fixtures: real provider journey (RV2-JOURNEY), research-only
+denial (RV2-DENY), multi-server delegation (RV2-DELEGATE), approval +
+restart (RV2-APPROVAL-RESTART), restart/replay durability (RV2-REPLAY),
+unknown effects (RV2-UNKNOWN), UI a11y at 360×640 + desktop (RV2-UI-A11Y),
+legacy seed/read/drain (RV2-LEGACY), deployment/drain (RV2-DEPLOY-DRAIN).
+Required kinds are covered: real provider (RV2-JOURNEY), disposable targets
+(RV2-JOURNEY, RV2-DENY, RV2-DELEGATE, RV2-APPROVAL-RESTART, RV2-UNKNOWN,
+RV2-LEGACY), browser/a11y (RV2-UI-A11Y), restart (RV2-APPROVAL-RESTART,
+RV2-REPLAY), unknown effects (RV2-UNKNOWN), deployment/drain
+(RV2-DEPLOY-DRAIN), delegation (RV2-DELEGATE), legacy compatibility
+(RV2-LEGACY). One producer test may cover several rows; the
+registry rules 1–4 above bind RV2 rows identically.

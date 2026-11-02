@@ -79,8 +79,9 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import asyncio
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -111,6 +112,8 @@ from mai.contracts.tasks import (
 )
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
+from mai.policy.exposure import ObjectiveExposure
+from mai.jobs.resource_locks import ResourceLockError, ResourceLockService
 
 __all__ = [
     "BridgeError",
@@ -221,6 +224,13 @@ class BridgeErrorCode(StrEnum):
     TOOL_NAME_COLLISION = "tool_name_collision"
     CAPABILITY_NOT_ENABLED = "capability_not_enabled"
     PAYLOAD_SCHEMA_MISMATCH = "payload_schema_mismatch"
+    #: v2 exposure: the call named a server outside the capability's
+    #: valid target set (a hidden target is never callable).
+    TARGET_NOT_IN_SCOPE = "target_not_in_scope"
+    #: v2: read fan-out was attempted for a non-read capability.
+    READ_FANOUT_UNSUPPORTED = "read_fanout_unsupported"
+    #: v2: mutation dispatch lost the declared resource lock.
+    LOCK_CONTENTION = "lock_contention"
 
 
 class BridgeError(ValueError):
@@ -850,6 +860,26 @@ def tool_name_for(capability_id: str) -> str:
     return _TOOL_NAME_UNSAFE.sub("_", capability_id)[:MAX_TOOL_NAME_CHARS]
 
 
+def _validated_target(
+    raw: object, valid_targets: tuple[uuid.UUID, ...]
+) -> uuid.UUID | None:
+    """One canonical-UUID target check against a valid set.
+
+    Returns the parsed target when ``raw`` names exactly one valid
+    target; ``None`` otherwise (a missing, malformed or out-of-set
+    target — the caller refuses visibly, never guesses).
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = uuid.UUID(raw)
+    except ValueError:
+        return None
+    if str(parsed) != raw or parsed not in valid_targets:
+        return None
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class _Binding:
     """One enabled capability's descriptor and its tool surface."""
@@ -876,6 +906,8 @@ class CapabilityToolBridge:
         registry: CapabilityRegistry,
         dispatcher: CapabilityDispatcher,
         context: ExecutionContext,
+        exposure: ObjectiveExposure | None = None,
+        locks: ResourceLockService | None = None,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise BridgeError(
@@ -892,9 +924,21 @@ class CapabilityToolBridge:
                 BridgeErrorCode.INVALID_WIRING,
                 "context must be an ExecutionContext",
             )
+        if exposure is not None and not isinstance(exposure, ObjectiveExposure):
+            raise BridgeError(
+                BridgeErrorCode.INVALID_WIRING,
+                "exposure must be an ObjectiveExposure or None",
+            )
+        if locks is not None and not isinstance(locks, ResourceLockService):
+            raise BridgeError(
+                BridgeErrorCode.INVALID_WIRING,
+                "locks must be a ResourceLockService or None",
+            )
         self._registry = registry
         self._dispatcher = dispatcher
         self._context = context
+        self._exposure = exposure
+        self._locks = locks
         bindings: dict[str, _Binding] = {}
         names: dict[str, str] = {}
         for capability_id in context.allowed_capabilities:
@@ -982,8 +1026,19 @@ class CapabilityToolBridge:
         function-argument schema; PydanticAI's schema-declared tools
         skip argument validation, which is exactly why the function
         re-validates against the same schema before dispatching.
+
+        With a multi-target exposure (§6) the published schema GAINS the
+        required ``server_id`` argument and the description names the
+        capability's valid target set — every tool descriptor identifies
+        its valid targets; no hidden global target selection. The
+        adapter strips ``server_id`` before schema validation and
+        dispatch, pinning the per-call context to the named target (the
+        ONE dispatcher revalidates it against the current grants).
         """
         bridge = self
+        targets = (
+            () if self._exposure is None else self._exposure.targets(capability_id)
+        )
         advisory = (
             "Every execution requires an approval decision through the "
             "durable approval path before the effect runs."
@@ -1004,6 +1059,34 @@ class CapabilityToolBridge:
             f"{', '.join(descriptor.execution_environments)}). {advisory} "
             "Arguments must match the declared input schema."
         )
+        schema = json.loads(json.dumps(descriptor.input_schema))
+        if targets:
+            target_list = ", ".join(str(t) for t in targets)
+            description += (
+                f" Valid targets (server_id): {target_list}. Every call "
+                "names exactly one target server."
+            )
+            properties = schema.get("properties")
+            required = schema.get("required")
+            if not isinstance(properties, dict) or not isinstance(required, list):
+                raise BridgeError(
+                    BridgeErrorCode.INVALID_WIRING,
+                    "a multi-target capability needs an object input schema "
+                    "with properties and required",
+                )
+            if "server_id" in properties:
+                raise BridgeError(
+                    BridgeErrorCode.INVALID_WIRING,
+                    "the exposure adapter reserves the server_id argument; "
+                    "the descriptor already declares it",
+                )
+            properties["server_id"] = {
+                "type": "string",
+                "description": (
+                    "Target server UUID; exactly one of: " + target_list
+                ),
+            }
+            required.append("server_id")
 
         async def invoke_bridge_tool(**payload: Any) -> str:
             return await bridge._invoke_model_facing(capability_id, payload)
@@ -1012,7 +1095,7 @@ class CapabilityToolBridge:
             invoke_bridge_tool,
             name=name,
             description=description,
-            json_schema=json.loads(json.dumps(descriptor.input_schema)),
+            json_schema=schema,
         )
 
     # -- the one seam --------------------------------------------------------
@@ -1032,8 +1115,35 @@ class CapabilityToolBridge:
                 error_detail="payload must be a JSON object (mapping)",
             ).to_json_str()
         try:
+            # Multi-target exposure (§6): the model names its target; the
+            # adapter pins the per-call context to it and strips the
+            # argument before descriptor validation. A target outside the
+            # capability's valid set is a visible refusal — a hidden
+            # target is never callable, and the ONE dispatcher STILL
+            # revalidates the pinned target against current grants.
+            dispatch_context = self._context
+            dispatch_payload: Mapping[str, Any] = payload
+            if self._exposure is not None:
+                work = dict(payload)
+                raw_target = work.pop("server_id", None)
+                valid_targets = self._exposure.targets(capability_id)
+                parsed_target = _validated_target(raw_target, valid_targets)
+                if parsed_target is None:
+                    return ToolResult.rejected(
+                        context=self._context,
+                        capability_id=capability_id,
+                        payload_hash=payload_hash,
+                        error_code=BridgeErrorCode.TARGET_NOT_IN_SCOPE.value,
+                        error_detail=(
+                            "server_id must be exactly one of the "
+                            "capability's valid targets: "
+                            + ", ".join(str(t) for t in valid_targets)
+                        ),
+                    ).to_json_str()
+                dispatch_context = replace(self._context, server_id=parsed_target)
+                dispatch_payload = work
             violation = _validate_payload(
-                payload, binding.descriptor.input_schema, path="$"
+                dispatch_payload, binding.descriptor.input_schema, path="$"
             )
             if violation is not None:
                 return ToolResult.rejected(
@@ -1044,9 +1154,9 @@ class CapabilityToolBridge:
                     error_detail=violation,
                 ).to_json_str()
             outcome = await self._dispatcher.dispatch(
-                context=self._context,
+                context=dispatch_context,
                 capability_id=capability_id,
-                payload=payload,
+                payload=dispatch_payload,
                 approval_id=None,
             )
             return ToolResult.from_outcome(outcome).to_json_str()
@@ -1109,6 +1219,116 @@ class CapabilityToolBridge:
             payload=payload,
             approval_id=approval_id,
         )
+
+    # -- v2 multi-target seams (§6/§7; exposure adapter) --------------------
+
+    async def fan_out_read(
+        self,
+        capability_id: str,
+        payload: Mapping[str, Any],
+        *,
+        targets: Sequence[uuid.UUID] | None = None,
+    ) -> list[DispatchOutcome]:
+        """Dispatch one READ capability across scoped targets concurrently.
+
+        Safe reads fan out (§7, AC4): one dispatch per target, each with
+        its OWN context pinned to that target, run concurrently — the
+        ONE dispatcher authorizes every target separately against
+        current grants, so a denied target is a denied outcome in the
+        result list, never a skipped entry. Only ``read``-effect
+        capabilities fan out (mutations never do); ``targets`` must be a
+        subset of the capability's valid exposure targets (order
+        preserved in the result).
+        """
+        binding = self._bindings.get(capability_id)
+        if binding is None:
+            raise BridgeError(
+                BridgeErrorCode.CAPABILITY_NOT_ENABLED,
+                f"{capability_id!r} is not enabled for this context",
+            )
+        if self._exposure is None:
+            raise BridgeError(
+                BridgeErrorCode.INVALID_WIRING,
+                "read fan-out requires a multi-target exposure",
+            )
+        if binding.descriptor.effect_class != "read":
+            raise BridgeError(
+                BridgeErrorCode.READ_FANOUT_UNSUPPORTED,
+                f"{capability_id!r} is a "
+                f"{binding.descriptor.effect_class} effect; only read "
+                "capabilities fan out across targets",
+            )
+        valid = self._exposure.targets(capability_id)
+        chosen = tuple(valid if targets is None else targets)
+        valid_set = set(valid)
+        for target in chosen:
+            if target not in valid_set:
+                raise BridgeError(
+                    BridgeErrorCode.TARGET_NOT_IN_SCOPE,
+                    f"{target} is not a valid target of {capability_id!r}",
+                )
+        coros = [
+            self._dispatcher.dispatch(
+                context=replace(self._context, server_id=target),
+                capability_id=capability_id,
+                payload=payload,
+                approval_id=None,
+            )
+            for target in chosen
+        ]
+        return list(await asyncio.gather(*coros))
+
+    async def dispatch_under_lock(
+        self,
+        capability_id: str,
+        payload: Mapping[str, Any],
+        *,
+        resource: str,
+        owner_ref: str = "",
+        ttl: float | None = None,
+    ) -> DispatchOutcome:
+        """Dispatch one mutation under its declared resource lock (AC4).
+
+        Overlapping mutations serialize through the declared
+        :class:`~mai.jobs.resource_locks.ResourceLockService` lease on
+        ``(server_id, resource)``: the effect runs ONLY inside the lease
+        (acquire → dispatch → release, released on every exit path). A
+        live competing lease raises the structured ``lock_contention``
+        :class:`BridgeError` — the lock service never waits, so the
+        caller (model surface or step) retries; effects never interleave.
+        """
+        binding = self._bindings.get(capability_id)
+        if binding is None:
+            raise BridgeError(
+                BridgeErrorCode.CAPABILITY_NOT_ENABLED,
+                f"{capability_id!r} is not enabled for this context",
+            )
+        if self._locks is None:
+            raise BridgeError(
+                BridgeErrorCode.INVALID_WIRING,
+                "lock-fenced dispatch requires a ResourceLockService",
+            )
+        try:
+            lease = self._locks.acquire(
+                str(self._context.server_id),
+                resource,
+                owner_ref=owner_ref,
+                ttl=ttl,
+            )
+        except ResourceLockError as error:
+            raise BridgeError(
+                BridgeErrorCode.LOCK_CONTENTION,
+                f"{error.code.value}: {error.detail}",
+            ) from None
+        try:
+            return await self._dispatcher.dispatch(
+                context=self._context,
+                capability_id=capability_id,
+                payload=payload,
+                approval_id=None,
+            )
+        finally:
+            self._locks.release(lease)
 
     def __repr__(self) -> str:
         return (

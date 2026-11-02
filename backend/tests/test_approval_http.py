@@ -428,6 +428,10 @@ async def test_safe_preview_shows_the_full_binding_and_pending_state(
         "created_by",
         "created_at",
         "expires_at",
+        # Runtime v2 (§9): the decision response reports whether the
+        # durable resume wake reached a parked waiting_approval run;
+        # None on the safe preview (decision-time only).
+        "resume_wake_sent",
         "consumed_by",
         "consumed_at",
     }

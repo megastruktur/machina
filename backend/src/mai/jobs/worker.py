@@ -102,7 +102,7 @@ def _build_web_read_capability(
 
 
 def _configure_default_agent_runtime(database_url: str) -> None:
-    """Wire ``agent.run`` and ``agent.delegate`` when ``MAI_DATA_ROOT`` is set."""
+    """Wire ``agent.run``, ``agent.run_v2`` and ``agent.delegate`` when ``MAI_DATA_ROOT`` is set."""
     data_root_raw = os.environ.get("MAI_DATA_ROOT", "").strip()
     if not data_root_raw:
         return
@@ -111,9 +111,17 @@ def _configure_default_agent_runtime(database_url: str) -> None:
 
     from mai.agents import delegate as agent_delegate
     from mai.agents import run as agent_run
+    from mai.agents import run_v2 as agent_run_v2
 
     if getattr(agent_run, "_EXECUTOR", None) is not None:
         return
+
+    # The v2 handler registers itself at import (the engine trampoline
+    # resolves ``agent.run_v2`` by name); it composes the SAME executor
+    # as the legacy handler below, so one configuration serves both
+    # runtime families (runtime-v2.md §2: default worker loads them
+    # alongside each other for the drain window).
+    del agent_run_v2
 
     from mai.agents.budgets import BudgetLedger
     from mai.agents.model_store import ModelConfigStore

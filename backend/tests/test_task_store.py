@@ -97,8 +97,9 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 
 # Linear migration chain; tip reconciliation (card 11-task-store): the
 # revision 0009 task-domain tables append to the 0008 set, revision 0011
-# appends the history-tag domain (W1) and revision 0012 seeds the
-# terminal-state catalog tags.
+# appends the history-tag domain (W1), revision 0012 seeds the
+# terminal-state catalog tags and revision 0013 appends the runtime-v2
+# objective/journal domain (journal-store slice).
 REVISION_IDS = (
     "0001",
     "0002",
@@ -112,6 +113,7 @@ REVISION_IDS = (
     "0010",
     "0011",
     "0012",
+    "0013",
 )
 
 # The exact public application schema at the tip: the 0008 set plus the
@@ -151,6 +153,12 @@ EXPECTED_APP_TABLES = frozenset(
         "tags",
         "job_tags",
         "conversation_tags",
+        "objectives",
+        "objective_servers",
+        "objective_runs",
+        "objective_events",
+        "objective_checklists",
+        "objective_journal",
     }
 )
 
@@ -176,7 +184,10 @@ def _alembic_config() -> AlembicConfig:
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS agent_task_completions, "
+            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
+            "objective_events, objective_runs, objective_servers, "
+            "objectives, "
+            "agent_task_completions, "
             "agent_task_revisions, agent_task_evidence, "
             "agent_task_criteria, agent_task_constraints, "
             "agent_task_steps, agent_tasks, conversation_steering, "

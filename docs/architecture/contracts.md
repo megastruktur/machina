@@ -581,3 +581,44 @@ here alters grants, approval checks or the frozen DBOS run lifecycle.
    `docs/architecture/agent-task-continuity.md`. Route writes stay with the
    named producer cards (05/07/08); migrations with 04/11; no sibling
    redefines these names (act_CONTRACTS §11).
+
+## Addendum — runtime v2 supersession (rv campaign, 2026-11-01)
+
+Narrow, explicitly reconciled addendum (campaign `runtime-v2`, task
+`contracts`). C01–C11 and items 1–4 above remain unchanged and binding. The
+complete Runtime v2 contract — handler identity, objectives/scopes, activity
+ledger, exposure, delegation v2, journal, resume semantics, legacy drain,
+route ownership and the machine-verified symbol pins — is
+[docs/architecture/runtime-v2.md](runtime-v2.md). This addendum only records
+which legacy rules are superseded FOR V2 CONVERSATIONS and confirms what is
+preserved.
+
+1. **Superseded for v2 conversations only** (legacy conversations and the
+   frozen `agent.run` handler keep every rule below):
+   - item 3 / agent-task-continuity.md §4 structured intake: a v2
+     conversation submission goes directly to the working model — no intake
+     planner call, no mandatory todo; `TurnInterpretation` is never run on a
+     v2 run.
+   - the single-server child-scope rule of the delegation module
+     (`ChildSpec` with no server field): v2 parents emit delegation payload
+     version 2 with explicit per-child `server_ids` subsets of the objective
+     scope, through the SAME `agent.delegate` engine (no alternate delegation
+     engine).
+   - the task/plan projection as the only first-class progress surface: the
+     v2 work journal projects trusted records, with an OPTIONAL advisory
+     checklist; evidence-bound completion semantics (C10 rule 5 discipline,
+     `TaskCompletionVerdict`, `completion_missing_evidence`) carry over.
+2. **Preserved verbatim for v2:** dispatcher-only authorization (C06 rule 4),
+   approval payload binding (C03 rule 4), child-grant intersection (C03 rule
+   3), the frozen C05 run lifecycle and guard rules, the C05 rule 4 event
+   envelope, single-admin authority (auth ADR; NO RBAC), pagination bounds
+   (50/200), secret projection, lock/fence semantics, one-writer lease and
+   identity rules (items 1–2 above).
+3. **Legacy freeze and drain:** the `agent.run` handler identity and its
+   checkpoint sequence are frozen until every unsettled legacy run is
+   drained/settled; legacy history stays read-only and truthful forever;
+   an in-flight legacy run is never converted to v2.
+4. **Consistency tests:** `backend/tests/test_runtime_v2_contracts.py`
+   executes the pins (files, symbols, frozen values, legacy registration) and
+   the scenario-registry ownership checks of
+   [runtime-scenarios.md](runtime-scenarios.md) §"RV2".

@@ -624,6 +624,23 @@
 		/** Live-transport marker read by ChatPanel.profilesLive (not on the wire). */
 		listProfiles: async () => []
 	};
+	// Runtime v2 objective surface (§11; activity-ui) — assigned past the
+	// literal so the frozen `ChatApi` vocabulary stays unchanged: ChatPanel
+	// narrows the slice structurally and renders the objective activity only
+	// when EVERY method exists. The OFFLINE memory dock below omits them and
+	// fails closed (no fabricated objective sections offline).
+	Object.assign(chatApi, {
+		listObjectives: api.listObjectives,
+		readObjective: api.readObjective,
+		readObjectiveJournal: api.readObjectiveJournal,
+		listObjectiveEvents: api.listObjectiveEvents,
+		listObjectiveRuns: api.listObjectiveRuns,
+		readObjectiveChecklist: api.readObjectiveChecklist,
+		changeObjectiveScope: api.changeObjectiveScope,
+		readDrainStatus: api.readDrainStatus,
+		resumeConversation: api.resumeConversation,
+		reconcileConversation: api.reconcileConversation
+	});
 
 	/**
 	 * The OPTIONAL history-tag slice (history-tags W6B/W7A): the REAL

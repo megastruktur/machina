@@ -82,9 +82,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # notification persistence, revision 0008 the conversation domain,
 # revision 0009 the agent-task domain, revision 0010 the job_runs run
 # label, revision 0011 the global tag catalog + mandatory
-# job/conversation classification (history-tags W1) and revision 0012
-# seeds the terminal-state catalog tags; the tip constants are advanced
-# here so this file's head assertions stay true.
+# job/conversation classification (history-tags W1), revision 0012
+# seeds the terminal-state catalog tags and revision 0013 appends the
+# runtime-v2 objective/journal domain (journal-store slice); the tip
+# constants are advanced here so this file's head assertions stay true.
 REVISION_IDS = (
     "0001",
     "0002",
@@ -98,6 +99,7 @@ REVISION_IDS = (
     "0010",
     "0011",
     "0012",
+    "0013",
 )
 
 # The exact public application schema at the tip — nothing else, in
@@ -144,6 +146,12 @@ EXPECTED_APP_TABLES = frozenset(
         "tags",
         "job_tags",
         "conversation_tags",
+        "objectives",
+        "objective_servers",
+        "objective_runs",
+        "objective_events",
+        "objective_checklists",
+        "objective_journal",
     }
 )
 
@@ -204,7 +212,10 @@ def _drop_app_tables(url: str) -> None:
         # drop before their job_runs/conversations/tags parents so the
         # reset stays FK-safe on a schema-bearing database.
         conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
+            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
+            "objective_events, objective_runs, objective_servers, "
+            "objectives, "
+            "notification_alerts, observation_findings, "
             "server_observations, application_projection_journal, "
             "application_projection, knowledge_doc_chunks, knowledge_documents, "
             "job_resource_locks, job_schedule_fires, job_schedules, "

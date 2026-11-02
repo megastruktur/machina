@@ -54,13 +54,16 @@ envelope/identity/scope; cards ``06-agent-run``, ``06-child-runs``,
 - **Resume semantics on the integrated foundation** are the C05 rule 5
   intent-level ones: re-submitting the identical submission attaches to
   the SAME run and re-arms a lost engine enqueue (the crash-gap heal) —
-  that IS the intent resume. Deeper resume forms are owned elsewhere by
-  design: parked waits (``reconciling``/``waiting_children``) resume
-  through the recovery/reconciliation producers, and the approval-bound
-  one-shot operation resume is the agent-run producer's
+  that IS the intent resume. The runtime-v2 controls (§9) are
+  state-specific and never generic replays: ``resume`` exposes only the
+  valid continuation per state (a settled conversation resumes through
+  the next submitted turn; ``waiting_children``/``reconciling``/
+  ``waiting_approval`` are structured refusals), ``reconcile``
+  classifies open unknown effects through the recovery owner (the ONLY
+  uncertain-edge writer — never re-execution), and the approval-bound
+  one-shot operation resume stays the agent-run producer's
   ``dispatch_once(approval_id=…)` bridge seam (worker-side; no HTTP may
-  dispatch effects). This surface deliberately ships no route that
-  would pretend otherwise.
+  dispatch effects).
 - **Failure mapping** is the C01 envelope everywhere; an unusable
   artifacts root or engine fails closed with ``503 unavailable``.
 
@@ -85,7 +88,7 @@ from typing import Annotated, Final, Literal
 from dbos import error as dbos_error
 from fastapi import APIRouter, FastAPI, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -103,6 +106,7 @@ from starlette.status import (
 
 from mai.agents import delegate as agent_delegate
 from mai.agents import run as agent_run
+from mai.agents import run_v2 as agent_run_v2
 from mai.agents.conversation_store import (
     aactive_run,
     aattach_run,
@@ -111,6 +115,17 @@ from mai.agents.conversation_store import (
     aget_conversation,
     arelease_run,
     asubmit_turn,
+)
+from mai.agents.objective_store import (
+    abind_run,
+    aget_objective as aget_objective_scope_checked,
+)
+from mai.agents.objective_store import alist_objective_runs
+from mai.contracts.objectives import (
+    ActorKind,
+    ObjectiveContractError,
+    ObjectiveErrorCode,
+    ObjectiveStatus,
 )
 from mai.agents.budgets import (
     BUDGET_PAYLOAD_VERSION,
@@ -173,6 +188,7 @@ from mai.applications.service_map import (
 )
 from mai.auth.sessions import hash_token
 from mai.contracts.conversations import (
+    MAX_MESSAGE_CHARS,
     ConversationContractError,
     ConversationErrorCode,
     ConversationSteerRequest,
@@ -188,6 +204,7 @@ from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
     JobEvent,
     RunState,
+    TERMINAL_RUN_STATES,
     parse_job_event,
 )
 from mai.contracts.server import parse_server_profile_text
@@ -202,8 +219,9 @@ from mai.jobs.recovery import (
     RecoveryError,
     RecoveryErrorCode,
 )
+from mai.execution.reconcile import ReconciliationClass
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
-from mai.tag_store import apreview_job_tags
+from mai.tag_store import EntityTagPreview, apreview_job_tags
 
 __all__ = ["register_chat", "resolve_artifacts_root"]
 
@@ -538,6 +556,96 @@ class ChatPage(BaseModel):
     limit: int
     offset: int
     total: int
+
+
+class ConversationResumeBody(BaseModel):
+    """One state-specific operator resume request (§9; AC4).
+
+    ``message`` is the operator's continuation instruction: the resumed
+    run starts FROM the conversation's last settled checkpoint (the
+    canonical transcript plus the objective episode context) — never a
+    generic replay of effects. Omitted, the request is a pure state
+    probe: it either names the exact structured refusal for the current
+    parked state or answers ``resume_not_applicable``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_id: uuid.UUID = Field(description="Explicit server scope (§1 rule 2)")
+    message: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_MESSAGE_CHARS,
+        description="Continuation instruction for the resumed run",
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _message_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("message must not be blank when set")
+        return value
+
+
+class StepClassificationBody(BaseModel):
+    """One operator classification of one open effect (§9; AC4).
+
+    The frozen vocabulary: ``confirm_applied`` (the effect IS on the
+    target), ``confirm_not_applied`` (it is NOT) or ``cancel`` (stop
+    without executing). Classification NEVER re-executes anything and
+    never fabricates a receipt — it closes one ``outcome_unknown`` row
+    from the host truth the operator attests.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int = Field(ge=1, description="The durable step row's sequence")
+    verdict: Literal["confirm_applied", "confirm_not_applied", "cancel"] = Field(
+        description="The operator's classification of the uncertain effect",
+    )
+
+
+class ConversationReconcileBody(BaseModel):
+    """One bounded classification batch for a parked ``reconciling`` run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_id: uuid.UUID = Field(description="Explicit server scope (§1 rule 2)")
+    classifications: list[StepClassificationBody] = Field(
+        min_length=1,
+        max_length=64,
+        description="One entry per open ``outcome_unknown`` step (bounded)",
+    )
+
+
+class StepResolutionView(BaseModel):
+    """One classification outcome exactly as the recovery owner landed it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int = Field(description="The classified step row's sequence")
+    state: str = Field(
+        description="The durable step state AFTER the classification",
+    )
+    verdict: str = Field(description="The applied classification vocabulary value")
+    wake_sent: bool = Field(
+        description="Whether the parked run was woken (best effort by contract)",
+    )
+
+
+class ConversationReconcileView(BaseModel):
+    """The honest reconcile outcome: per-step resolutions, never a guess."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: uuid.UUID = Field(description="Owning conversation identity")
+    run_id: uuid.UUID = Field(description="The classified run's identity")
+    run_state: str | None = Field(
+        description="The facade state replayed AFTER the classifications",
+    )
+    results: list[StepResolutionView] = Field(
+        description="Per-step resolution outcomes in request order",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1225,14 +1333,17 @@ def _modern_submission_document(
     profile: str,
     requested_phase: str | None,
     task_action: str | None,
+    objective_id: uuid.UUID | None = None,
+    mode: str | None = None,
 ) -> dict[str, object]:
     """The modern whole-submission digest input (the dedup identity).
 
     Covers everything the turn asked for: the canonical conversation and
     message identities, the PROJECTED content fingerprint, the pinned
-    profile and the advisory episode fields. A retransmission under the
-    same ``client_request_id`` must carry all of them identically (C4);
-    any difference fails closed as ``client_request_conflict``.
+    profile, the advisory episode fields and the v2 objective binding —
+    a retransmission under the same ``client_request_id`` must carry all
+    of them identically (C4); any difference fails closed as
+    ``client_request_conflict``.
     """
     return {
         "v": 1,
@@ -1242,7 +1353,175 @@ def _modern_submission_document(
         "profile": profile,
         "requested_phase": requested_phase,
         "task_action": task_action,
+        "mode": mode,
+        **(
+            {"objective_id": str(objective_id)}
+            if objective_id is not None
+            else {}
+        ),
     }
+
+
+def _v2_turn_document(
+    *,
+    run_id: str,
+    server_id: str,
+    objective_id: str,
+    context: ExecutionContext,
+    profile: str,
+    task: str,
+) -> dict[str, object]:
+    """The frozen ``agent.run_v2`` intent document for one canonical turn.
+
+    The runtime-v2.md §2/§14 shape the ONE producer validates strictly:
+    ``payload_version`` 2, the explicit ``objective_id`` binding (§3.3)
+    and the identity-matched execution context. ``task`` is the PROJECTED
+    transcript content (C2 ordering: raw-secret exclusion precedes
+    persistence and model forwarding).
+    """
+    return {
+        "payload_version": agent_run_v2.RUN_PAYLOAD_VERSION_V2,
+        "run_id": run_id,
+        "server_id": server_id,
+        "objective_id": objective_id,
+        "context": context.to_json(),
+        "role": DEFAULT_ROLE,
+        "task": task,
+        "connection": None,
+        "profile": profile,
+    }
+
+
+class ObjectiveTurnRejection(ValueError):
+    """One value-free objective-binding rejection (C01 envelope input).
+
+    ``status`` carries the HTTP class (404 scope-blind not-found /
+    409 conflict); ``code``/``fields``/``detail`` ride the envelope
+    verbatim. Nothing about another scope's identities leaks (C8).
+    """
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        detail: str,
+        fields: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.fields = fields
+
+
+async def _resolve_turn_objective(
+    factory: async_sessionmaker[AsyncSession],
+    conversation_id: uuid.UUID,
+    server_uuid: uuid.UUID,
+    requested_objective_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Resolve the turn's effective v2 objective binding (§3.3; AC1).
+
+    Explicit wins: a requested ``objective_id`` is scope-checked against
+    the initiating server (a foreign-scope reference fails closed) and
+    must be ``active``. A conversation ALREADY bound to an objective
+    stays v2: the binding probe keeps follow-up turns on the same
+    episode (an in-flight v2 conversation is never downgraded to a
+    legacy run). An explicit request that disagrees with the
+    conversation's bound episode, a settled episode, or a foreign-scope
+    reference raises :class:`ObjectiveTurnRejection` — one conversation
+    owns at most ONE objective episode.
+    """
+    if requested_objective_id is not None:
+        try:
+            detail = await aget_objective_scope_checked(
+                factory, requested_objective_id, server_id=server_uuid
+            )
+        except ObjectiveContractError as exc:
+            if (
+                ObjectiveErrorCode.OBJECTIVE_NOT_FOUND.value
+                in set(exc.fields.values())
+            ):
+                raise ObjectiveTurnRejection(
+                    HTTP_404_NOT_FOUND,
+                    ObjectiveErrorCode.OBJECTIVE_NOT_FOUND.value,
+                    "no objective in the requesting server scope",
+                ) from None
+            raise ObjectiveTurnRejection(
+                HTTP_409_CONFLICT,
+                ObjectiveErrorCode.INVALID_PAYLOAD.value,
+                "objective contract rejected",
+                fields=exc.fields,
+            ) from None
+        if detail.status is not ObjectiveStatus.ACTIVE:
+            raise ObjectiveTurnRejection(
+                HTTP_409_CONFLICT,
+                ObjectiveErrorCode.INVALID_STATUS_TRANSITION.value,
+                "the objective episode is settled; new runs bind active "
+                "objectives only",
+                fields={
+                    "objective_id": (
+                        ObjectiveErrorCode.INVALID_STATUS_TRANSITION.value
+                    )
+                },
+            )
+    bound = await _abound_objective(factory, conversation_id)
+    if bound is not None:
+        if (
+            requested_objective_id is not None
+            and bound != requested_objective_id
+        ):
+            raise ObjectiveTurnRejection(
+                HTTP_409_CONFLICT,
+                ObjectiveErrorCode.INVALID_PAYLOAD.value,
+                "the conversation is bound to a different objective episode",
+                fields={"objective_id": ObjectiveErrorCode.INVALID_PAYLOAD.value},
+            )
+        return bound
+    return requested_objective_id
+
+
+async def _abound_objective(
+    factory: async_sessionmaker[AsyncSession],
+    conversation_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """The objective episode this conversation's runs bind to, if any."""
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT r.objective_id FROM objective_runs r "
+                    "JOIN conversation_runs cr ON cr.run_id = r.run_id "
+                    "WHERE cr.conversation_id = :cid "
+                    "ORDER BY cr.created_at, r.run_id LIMIT 1"
+                ),
+                {"cid": conversation_id},
+            )
+        ).first()
+    return None if row is None else uuid.UUID(str(row[0]))
+
+
+def _objective_turn_conflict(
+    request: Request, exc: ObjectiveContractError
+) -> Response:
+    """Map a submit-time binding rejection onto the C01 envelope."""
+    fields = exc.fields
+    codes = set(fields.values())
+    if ObjectiveErrorCode.OBJECTIVE_NOT_FOUND.value in codes:
+        return _error(
+            request,
+            HTTP_404_NOT_FOUND,
+            ObjectiveErrorCode.OBJECTIVE_NOT_FOUND.value,
+            "no objective in the requesting server scope",
+            fields=fields,
+        )
+    return _error(
+        request,
+        HTTP_409_CONFLICT,
+        next(iter(codes)) if codes else "invalid_payload",
+        "objective binding rejected",
+        fields=fields,
+    )
 
 
 def _not_found_conversation(request: Request) -> Response:
@@ -1398,13 +1677,36 @@ async def _submit_canonical_turn(
             prompt_revision=str(prompt_revision),
             credential_references=(),
             allowed_capabilities=capabilities,
-            mode=PolicyMode.DELEGATED,
+            mode=(
+                PolicyMode(payload.mode)
+                if payload.mode is not None
+                else PolicyMode.DELEGATED
+            ),
         )
     except PolicyError as exc:
         return _validation_error(request, "context", exc.detail)
 
     factory = _sessions(request)
     now = datetime.now(timezone.utc)
+    # Runtime v2 (§3.3; AC1): resolve the turn's explicit objective
+    # binding BEFORE any store write — scope-checked, active-episode
+    # checked, conversation-stability checked. ``None`` = the legacy
+    # handler path; a resolved id selects ``agent.run_v2`` for THIS run.
+    try:
+        turn_objective_id = await _resolve_turn_objective(
+            factory,
+            target,
+            server_uuid,
+            payload.objective_id,
+        )
+    except ObjectiveTurnRejection as rejection:
+        return _error(
+            request,
+            rejection.status,
+            rejection.code,
+            rejection.detail,
+            fields=rejection.fields,
+        )
     requested_phase = (
         payload.requested_phase.value if payload.requested_phase is not None else None
     )
@@ -1506,17 +1808,38 @@ async def _submit_canonical_turn(
                         disposition=TurnDisposition.QUEUED_FOLLOWUP,
                     )
                 )
-            engine_document = _modern_turn_document(
-                run_id=str(client_request_id),
-                server_id=server_id,
-                context=context,
-                profile=model_profile,
-                task=turn.message.content,
-            )
-            try:
-                agent_run.parse_agent_run_intent(_canonical(engine_document))
-            except agent_run.AgentRunError as exc:
-                return _validation_error(request, "message", exc.detail)
+            if turn_objective_id is not None:
+                # Runtime v2 (§2/§3.3): the v2 intent selects the v2
+                # handler explicitly and carries the objective binding;
+                # the ONE v2 producer validates it strictly.
+                engine_document = _v2_turn_document(
+                    run_id=str(client_request_id),
+                    server_id=server_id,
+                    objective_id=str(turn_objective_id),
+                    context=context,
+                    profile=model_profile,
+                    task=turn.message.content,
+                )
+                try:
+                    agent_run_v2.parse_agent_run_intent_v2(
+                        _canonical(engine_document)
+                    )
+                except agent_run.AgentRunError as exc:
+                    return _validation_error(request, "message", exc.detail)
+                turn_handler = agent_run_v2.HANDLER_NAME
+            else:
+                engine_document = _modern_turn_document(
+                    run_id=str(client_request_id),
+                    server_id=server_id,
+                    context=context,
+                    profile=model_profile,
+                    task=turn.message.content,
+                )
+                try:
+                    agent_run.parse_agent_run_intent(_canonical(engine_document))
+                except agent_run.AgentRunError as exc:
+                    return _validation_error(request, "message", exc.detail)
+                turn_handler = agent_run.HANDLER_NAME
             payload_json = _canonical(engine_document)
             engine_digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
             submission_digest = hashlib.sha256(
@@ -1528,6 +1851,8 @@ async def _submit_canonical_turn(
                         profile=model_profile,
                         requested_phase=requested_phase,
                         task_action=payload.task_action,
+                        objective_id=turn_objective_id,
+                        mode=payload.mode,
                     )
                 ).encode("ascii")
             ).hexdigest()
@@ -1551,7 +1876,7 @@ async def _submit_canonical_turn(
                     guard,
                     run_id=str(client_request_id),
                     digest=submission_digest,
-                    handler=agent_run.HANDLER_NAME,
+                    handler=turn_handler,
                     attachments=[],
                     child_count=0,
                     service_tags=[],
@@ -1575,6 +1900,22 @@ async def _submit_canonical_turn(
             )
     except ConversationContractError as exc:
         return _conversation_contract_error(request, exc)
+    if created and turn_objective_id is not None:
+        # §3.3 (AC1): the durable run↔objective binding lands at SUBMIT
+        # under the operator's authority — the truthful marker for reads
+        # and the drain inventory exists before the worker starts; the
+        # worker-side bind is the idempotent backstop (same seam).
+        try:
+            await abind_run(
+                factory,
+                turn_objective_id,
+                server_id=server_uuid,
+                run_id=client_request_id,
+                initiating_server_id=server_uuid,
+                actor_kind=ActorKind.OPERATOR,
+            )
+        except ObjectiveContractError as exc:
+            return _objective_turn_conflict(request, exc)
     if not created:
         # Duplicate submit: same key must carry the SAME turn (C4).
         events = await lifecycle.event_stream(str(client_request_id))
@@ -1608,7 +1949,7 @@ async def _submit_canonical_turn(
         await asyncio.to_thread(
             recovery.client.enqueue_run,
             str(client_request_id),
-            agent_run.HANDLER_NAME,
+            turn_handler,
             payload_json,
         )
     except RunIdInUseError:
@@ -1698,6 +2039,25 @@ async def _child_states(
     return states
 
 
+def _tag_preview_scopes(
+    row: Mapping[str, object],
+    children_rows: list[Mapping[str, object]],
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Group the runs to preview by each run's OWN server scope.
+
+    Every previewed row keeps its durable server pin (a v2 delegation
+    child carries its own initiating server, §7.2), so one parent-scoped
+    query would silently miss a cross-server child; the merge covers the
+    parent and every child with one grouped query per distinct server.
+    """
+    grouped: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for item in (row, *children_rows):
+        grouped.setdefault(uuid.UUID(str(item["server_id"])), []).append(
+            uuid.UUID(str(item["run_id"]))
+        )
+    return grouped
+
+
 async def _conversation_view(
     factory: async_sessionmaker[AsyncSession],
     row: Mapping[str, object],
@@ -1748,12 +2108,17 @@ async def _conversation_view(
         title = await _resolve_chat_title(session, identity, submission_data)
     child_states = await _child_states(factory, children_rows)
     parent_run_id = uuid.UUID(identity)
-    child_run_ids = [uuid.UUID(str(child["run_id"])) for child in children_rows]
-    previews = await apreview_job_tags(
-        factory,
-        [parent_run_id, *child_run_ids],
-        server_id=uuid.UUID(str(row["server_id"])),
-    )
+    # Tag previews are server-scoped reads: every run is previewed under
+    # its OWN server scope and the pages merged — a v2 delegation child is
+    # pinned to its own initiating server (§7.2), which may differ from
+    # the parent's, and one parent-scoped query would miss it.
+    previews: dict[uuid.UUID, EntityTagPreview] = {}
+    for scope_server_id, preview_ids in _tag_preview_scopes(
+        row, children_rows
+    ).items():
+        previews.update(
+            await apreview_job_tags(factory, preview_ids, server_id=scope_server_id)
+        )
     attachments: list[AttachmentView] = []
     service_tags: list[str] = []
     session_run_id: str | None = None
@@ -2376,6 +2741,268 @@ async def steer_conversation(
         else HTTP_200_OK,
         content=view.model_dump_json(),
         media_type="application/json",
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/resume",
+    status_code=HTTP_201_CREATED,
+    response_model=ConversationTurnSubmitResponse,
+    summary="State-specific operator resume (§9): only the valid resume per state",
+    responses={
+        HTTP_200_OK: {
+            "model": ConversationTurnSubmitResponse,
+            "description": "Resume of a parked conversation was already "
+            "expressed by an identical durable request (deduplicated)",
+        },
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No conversation in the requesting server scope "
+            "(cross-server references fail closed, C8)",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "The current run state has NO generic resume: "
+            "``waiting_children`` is child-driven, ``reconciling`` requires "
+            "operator classification first, ``waiting_approval`` resumes only "
+            "the payload-bound approval decision, and queued/running runs are "
+            "already executing (steering is the control); a settled "
+            "conversation resumes through the next submitted turn",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Model configuration or jobs engine unavailable",
+        },
+    },
+)
+async def resume_conversation(
+    request: Request,
+    conversation_id: uuid.UUID,
+    payload: ConversationResumeBody,
+) -> Response:
+    """State-specific resume (runtime-v2.md §9; AC4).
+
+    ONE gate over the frozen park vocabulary — never a generic replay
+    button:
+
+    - ``waiting_children`` → ``409 resume_rejected``: child completion is
+      the only producer that wakes the run (the delegation module's
+      settled-child seam); a manual force-resume would execute past
+      unproven children.
+    - ``reconciling`` → ``409 classification_required``: unknown effects
+      NEVER auto-resume into execution; the operator classifies each open
+      step first (the reconcile route below).
+    - ``waiting_approval`` → ``409 approval_decision_required``: the ONE
+      resume is the payload-bound approval decision
+      (``dispatch_once(approval_id=…)`` worker-side), never a generic wake.
+    - ``queued``/``running`` → ``409 resume_not_applicable``: the run is
+      executing; steering is the control.
+    - No active run (settled/paused): the operator resume from the last
+      settled checkpoint IS the next submitted turn — the checkpoint is
+      the canonical transcript plus the objective episode, and the new
+      run continues from exactly that state (v2 conversations stay v2).
+      With ``message`` the request delegates to the canonical follow-up
+      admission (created/``201``); without one, ``409
+      resume_not_applicable`` names the honest next action.
+    """
+    _store, token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    lifecycle, recovery = _jobs_services(request)
+    factory = _sessions(request)
+    try:
+        await aget_conversation(factory, conversation_id, server_id=payload.server_id)
+    except ConversationContractError as exc:
+        return _conversation_contract_error(request, exc)
+    active = await aactive_run(factory, conversation_id, server_id=payload.server_id)
+    if active is not None:
+        state = await _replayed_state(lifecycle, str(active.run_id))
+        if state is not None and state not in TERMINAL_RUN_STATES:
+            parked = RunState(state)
+            if parked is RunState.WAITING_CHILDREN:
+                return _error(
+                    request,
+                    HTTP_409_CONFLICT,
+                    "resume_rejected",
+                    "the run waits on child completion; children wake it "
+                    "through the settled-child producers",
+                    fields={"conversation_id": "resume_rejected"},
+                )
+            if parked is RunState.RECONCILING:
+                return _error(
+                    request,
+                    HTTP_409_CONFLICT,
+                    "classification_required",
+                    "unknown effects are open; classify them through the "
+                    "reconcile route before the run wakes",
+                    fields={"conversation_id": "classification_required"},
+                )
+            if parked is RunState.WAITING_APPROVAL:
+                return _error(
+                    request,
+                    HTTP_409_CONFLICT,
+                    "approval_decision_required",
+                    "the run waits on a payload-bound approval; the approval "
+                    "decision is the only resume",
+                    fields={"conversation_id": "approval_decision_required"},
+                )
+            return _error(
+                request,
+                HTTP_409_CONFLICT,
+                "resume_not_applicable",
+                "the run is already executing; steering is the control",
+                fields={"conversation_id": "resume_not_applicable"},
+            )
+    if payload.message is None:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            "resume_not_applicable",
+            "a settled conversation resumes by submitting its next turn "
+            "from the last settled checkpoint",
+            fields={"conversation_id": "resume_not_applicable"},
+        )
+    turn = ConversationTurnSubmitRequest(
+        server_id=payload.server_id,
+        client_request_id=uuid.uuid4(),
+        message=payload.message,
+    )
+    return await _submit_canonical_turn(request, turn, conversation_id=conversation_id)
+
+
+@router.post(
+    "/conversations/{conversation_id}/reconcile",
+    status_code=HTTP_200_OK,
+    response_model=ConversationReconcileView,
+    summary="Classify open unknown effects of a parked run (§9; AC4)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowlisted or CSRF token missing/mismatched",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No conversation in the requesting server scope, "
+            "or a classified seq has no step row",
+        },
+        HTTP_409_CONFLICT: {
+            "model": ErrorEnvelope,
+            "description": "The run is not parked in ``reconciling``, or a "
+            "classified row is not open for reconciliation",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Request body failed validation",
+        },
+    },
+)
+async def reconcile_conversation(
+    request: Request,
+    conversation_id: uuid.UUID,
+    payload: ConversationReconcileBody,
+) -> Response:
+    """Operator classification of unknown effects (§9; C04 rule 5/7).
+
+    The ONLY path that closes an ``outcome_unknown`` row from the HTTP
+    surface: each entry maps ``confirm_applied``/``confirm_not_applied``/
+    ``cancel`` onto the recovery owner's FINAL verdict classes and lands
+    through :meth:`RecoveryService.aresolve_step` — the guarded
+    single-owner writer that disposes the recorded lock and wakes the
+    parked run (best effort). The run is NEVER re-executed by this
+    route: a live parked workflow continues from its own durable loop,
+    and an engine-orphaned park stays settled history.
+    """
+    _store, token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    lifecycle, recovery = _jobs_services(request)
+    factory = _sessions(request)
+    try:
+        await aget_conversation(factory, conversation_id, server_id=payload.server_id)
+    except ConversationContractError as exc:
+        return _conversation_contract_error(request, exc)
+    active = await aactive_run(factory, conversation_id, server_id=payload.server_id)
+    if active is None:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            NO_ACTIVE_RUN_CODE,
+            "no active run holds this conversation's writer lease",
+            fields={"conversation_id": NO_ACTIVE_RUN_CODE},
+        )
+    state = await _replayed_state(lifecycle, str(active.run_id))
+    if state != RunState.RECONCILING.value:
+        return _error(
+            request,
+            HTTP_409_CONFLICT,
+            "classification_not_applicable",
+            "only a run parked in reconciling classifies unknown effects",
+            fields={"conversation_id": "classification_not_applicable"},
+        )
+    verdict_map = {
+        "confirm_applied": ReconciliationClass.FINAL_SUCCEEDED,
+        "confirm_not_applied": ReconciliationClass.FINAL_FAILED,
+        "cancel": ReconciliationClass.FINAL_CANCELLED,
+    }
+    results: list[StepResolutionView] = []
+    for entry in payload.classifications:
+        try:
+            resolved = await recovery.aresolve_step(
+                str(active.run_id),
+                entry.seq,
+                verdict_map[entry.verdict],
+                source="conversation_api",
+            )
+        except RecoveryError as exc:
+            code = exc.code
+            if code in (
+                RecoveryErrorCode.STEP_NOT_FOUND,
+                RecoveryErrorCode.RUN_NOT_FOUND,
+            ):
+                return _error(
+                    request,
+                    HTTP_404_NOT_FOUND,
+                    code.value,
+                    "no open step row for this classification",
+                    fields={"seq": code.value},
+                )
+            return _error(
+                request,
+                HTTP_409_CONFLICT,
+                code.value,
+                "the classification was rejected by the recovery owner",
+                fields={"seq": code.value},
+            )
+        results.append(
+            StepResolutionView(
+                seq=entry.seq,
+                state=resolved.state.value,
+                verdict=resolved.verdict.value,
+                wake_sent=bool(resolved.wake_sent),
+            )
+        )
+    final_state = await _replayed_state(lifecycle, str(active.run_id))
+    return ConversationReconcileView(
+        conversation_id=conversation_id,
+        run_id=active.run_id,
+        run_state=final_state,
+        results=results,
     )
 
 
