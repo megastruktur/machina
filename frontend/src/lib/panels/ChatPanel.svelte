@@ -953,6 +953,9 @@
 		lastRevision = null;
 		lastDisposition = null;
 		controlBusy = false;
+		// Replay bookkeeping belongs to exactly one conversation identity:
+		// a switch aborts the in-flight streams and drops unproven buffers.
+		finishReplays();
 		// The outcome block belongs to exactly one conversation: a switch
 		// clears it (the fold re-derives from the replayed run record, or the
 		// block stays honestly absent — never a stale verdict).
@@ -1495,6 +1498,9 @@
 		canonicalOffset = start;
 		canonicalHasMore = start > 0;
 		canonicalCompleteness = page.history_completeness;
+		// A replayed run buffered outside the previous window may now have
+		// its recorded anchor turn visible: land its feed at that turn.
+		flushAnchoredReplays();
 		if (scrollToBottom) queueMicrotask(scrollToConversationBottom);
 	}
 
@@ -1545,6 +1551,8 @@
 			canonicalTotal = page.total;
 			canonicalCompleteness = page.history_completeness;
 			canonicalHasMore = start > 0;
+			// Earlier pages can land a buffered replay's recorded anchor turn.
+			flushAnchoredReplays();
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
@@ -1883,6 +1891,10 @@
 			// A live writer lease resumes its stream; otherwise the bounded
 			// events read settles the honest state block.
 			await refreshCanonicalTail();
+			if (disposed || canonicalId !== conversationId) return;
+			// CTU-1: the recorded terminal-v2 runs replay their persisted
+			// events into the chronological turn feeds (bounded; additive).
+			void restoreTerminalTurnFeeds();
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
@@ -2631,6 +2643,236 @@
 		}
 	}
 
+	// --- terminal-v2 turn-event restore (CTU-1) -------------------------------
+	//
+	// A restored v2 conversation replays the PERSISTED events of its recorded
+	// TERMINAL root runs into the SAME chronological turn feeds the live
+	// stream builds (W2). The recorded objective/run bindings name the runs;
+	// each run's authenticated event replay carries the durable
+	// `chat.submitted` record whose `message_id` IS the exact
+	// run-to-recorded-user-turn mapping — no timestamp or position guessing.
+	// Nothing is fabricated: a run whose submission names no recorded turn of
+	// this conversation anchors nothing; the durable assistant row supersedes
+	// the replayed final-round text (W2 dedup); the recorded failure reason
+	// renders verbatim; the ACTIVE run stays owned by its live stream.
+
+	/** Bounded most-recent window of replayed root runs per restore
+	 * (AGENTS.md §1: a collection read is a bounded page, never a dump). */
+	const RUN_REPLAY_LIMIT = 5;
+	/** Fail-safe ceiling of buffered events per run before its recorded
+	 * anchor is proven; replay stops honestly past it instead of growing. */
+	const REPLAY_BUFFER_LIMIT = 400;
+	/** Settled job states gate: a replayed stream must be a drained
+	 * terminal run (`TERMINAL_RUN_STATES`) — the server self-closes it
+	 * (bounded). */
+
+	/** Narrowed `objective_runs` binding row (the recorded association). */
+	type ReplayRunLink = { runId: string; parentRunId: string | null };
+
+	function runLinksOf(page: unknown): { total: number; links: ReplayRunLink[] } {
+		if (typeof page !== 'object' || page === null) return { total: 0, links: [] };
+		const record = page as Record<string, unknown>;
+		const total = typeof record.total === 'number' ? record.total : 0;
+		if (!Array.isArray(record.items)) return { total, links: [] };
+		const links: ReplayRunLink[] = [];
+		for (const item of record.items) {
+			if (typeof item !== 'object' || item === null) continue;
+			const row = item as Record<string, unknown>;
+			if (typeof row.run_id !== 'string' || row.run_id === '') continue;
+			links.push({
+				runId: row.run_id,
+				parentRunId: typeof row.parent_run_id === 'string' ? row.parent_run_id : null
+			});
+		}
+		return { total, links };
+	}
+
+	/** Replay bookkeeping: abortable streams and per-run state. Instance
+	 * locals — never module-level (SSR safety, ADR §5 rule 4). */
+	let replayControllers: AbortController[] = [];
+	const replayWatermarks = new Map<string, number>();
+	/** Buffered events of a run whose recorded anchor turn is not proven
+	 * yet (pre-`chat.submitted` intent frames; or a turn outside the loaded
+	 * transcript window — flushed when a later page lands it). */
+	const pendingReplays = new Map<string, { conversationId: string; buffered: MaiRunEvent[] }>();
+
+	/** Abort every in-flight replay stream and drop unproven buffers. */
+	function finishReplays(): void {
+		for (const controller of replayControllers) controller.abort();
+		replayControllers = [];
+		pendingReplays.clear();
+		replayWatermarks.clear();
+	}
+
+	/** The `chat.submitted` record of one buffered replay, when it names a
+	 * canonical turn (message_id) — the EXACT anchor, never a guess. */
+	function replayAnchorOf(buffered: MaiRunEvent[]): string | null {
+		for (const event of buffered) {
+			if (event.type !== 'chat.submitted') continue;
+			const record = recordOf(event.data);
+			const messageId = record?.message_id;
+			if (typeof messageId === 'string' && messageId !== '') return messageId;
+			return null; // a submission without the binding: legacy-shaped
+		}
+		return null;
+	}
+
+	/** Anchor one replayed run's feed at its recorded user turn and fold the
+	 * buffered events in recorded order (seq ascending by construction). */
+	function anchorReplayFeed(messageId: string, runId: string, buffered: MaiRunEvent[]): void {
+		if (turnFeeds[messageId] !== undefined) return; // already anchored: dedup
+		turnFeeds = {
+			...turnFeeds,
+			[messageId]: { runId, entries: [], finalRound: null, terminated: false }
+		};
+		for (const event of buffered) foldEvent(event, true);
+	}
+
+	/** Flush every pending replay whose recorded anchor turn is NOW inside
+	 * the loaded transcript window (a later "Load earlier" page landed it). */
+	function flushAnchoredReplays(): void {
+		if (pendingReplays.size === 0) return;
+		for (const [runId, pending] of [...pendingReplays]) {
+			if (pending.conversationId !== canonicalId) {
+				pendingReplays.delete(runId);
+				continue;
+			}
+			const messageId = replayAnchorOf(pending.buffered);
+			if (messageId === null) continue;
+			if (!canonicalMessages.some((message) => message.message_id === messageId)) continue;
+			pendingReplays.delete(runId);
+			anchorReplayFeed(messageId, runId, pending.buffered);
+		}
+	}
+
+	/**
+	 * Restore the terminal-v2 turn feeds of the open canonical conversation:
+	 * the recorded objective/run bindings, bounded to the MOST RECENT root
+	 * runs, each replayed through the authenticated chat run event stream.
+	 * Additive by contract: every failure here leaves the transcript view
+	 * and the existing feeds untouched (no fabricated activity).
+	 */
+	async function restoreTerminalTurnFeeds(): Promise<void> {
+		const objectiveRef = objectiveApi;
+		const id = canonicalId;
+		const scope = canonicalScope;
+		const detail = canonicalDetail;
+		const objectiveId = openObjectiveId;
+		if (objectiveRef === null || id === null || scope === null) return;
+		if (detail === null || detail.handler_name !== 'agent.run_v2') return;
+		if (objectiveId === null || objectiveId === '') return;
+		// Only ROOT runs anchor a user turn: delegation children render in
+		// the composed DelegationTree, never duplicated into turn feeds.
+		try {
+			const head = runLinksOf(
+				await objectiveRef.listObjectiveRuns(objectiveId, scope, { limit: 1, offset: 0 })
+			);
+			if (disposed || canonicalId !== id || canonicalScope !== scope) return;
+			if (head.total <= 0) return;
+			const offset = Math.max(0, head.total - RUN_REPLAY_LIMIT);
+			const page = runLinksOf(
+				await objectiveRef.listObjectiveRuns(objectiveId, scope, {
+					limit: RUN_REPLAY_LIMIT,
+					offset
+				})
+			);
+			if (disposed || canonicalId !== id || canonicalScope !== scope) return;
+			const liveRunIds = new Set<string>(
+				[detail.active_run_id ?? null, conversation?.run_id ?? null].filter(
+					(value): value is string => typeof value === 'string' && value !== ''
+				)
+			);
+			const knownFeeds = new Set(
+				Object.values(turnFeeds).map((feed) => feed.runId)
+			);
+			for (const link of page.links) {
+				if (link.parentRunId !== null) continue; // a child: the tree's fold
+				if (liveRunIds.has(link.runId)) continue; // the live stream owns it
+				if (knownFeeds.has(link.runId)) continue; // already anchored
+				void replayTerminalRun(id, scope, link.runId);
+			}
+		} catch {
+			// The bindings read failing keeps the restore honest: the feeds
+			// stay absent, the transcript stays untouched (C08 rule 6).
+		}
+	}
+
+	/** Replay ONE terminal run's persisted events into its recorded turn
+	 * feed. The server replays cursor-exclusive from the run's beginning and
+	 * self-closes a drained terminal stream — a bounded, authenticated read
+	 * of recorded truth (C08 rule 7). */
+	async function replayTerminalRun(
+		conversationId: string,
+		scope: string,
+		runId: string
+	): Promise<void> {
+		if (api === null) return;
+		// Terminal gate FIRST: a non-settled run's stream never self-closes,
+		// and its live fold belongs to the lease holder, not this restore.
+		try {
+			const run = await api.readRun(runId);
+			if (!TERMINAL_RUN_STATES.has(typeof run.state === 'string' ? run.state : '')) return;
+		} catch {
+			return; // an unreadable run record restores no feed (honest absence)
+		}
+		if (disposed || canonicalId !== conversationId || canonicalScope !== scope) return;
+		if (pendingReplays.has(runId)) return;
+		const buffered: MaiRunEvent[] = [];
+		pendingReplays.set(runId, { conversationId, buffered });
+		const controller = new AbortController();
+		replayControllers = [...replayControllers, controller];
+		try {
+			await api.streamConversationEvents(runId, {
+				cursor: null,
+				signal: controller.signal,
+				onEvent: (frame) => {
+					if (disposed || canonicalId !== conversationId) return;
+					const event = readMaiEvent(frame);
+					if (event === null || event.run_id !== runId) return;
+					// Per-run replay watermark: identical frames applied once.
+					if (event.seq <= (replayWatermarks.get(runId) ?? 0)) return;
+					replayWatermarks.set(runId, event.seq);
+					const pending = pendingReplays.get(runId);
+					if (pending === undefined) {
+						// Anchored already: the feed sink resolves by run id.
+						foldEvent(event, true);
+						return;
+					}
+					if (pending.buffered.length >= REPLAY_BUFFER_LIMIT) return; // bounded
+					pending.buffered.push(event);
+					const anchor = replayAnchorOf(pending.buffered);
+					if (anchor === null) return;
+					pendingReplays.delete(runId);
+					if (!canonicalMessages.some((message) => message.message_id === anchor)) {
+						// The recorded turn is outside the loaded window: keep
+						// the buffer bounded so a later page can land it.
+						pendingReplays.set(runId, { conversationId, buffered: pending.buffered });
+						return;
+					}
+					anchorReplayFeed(anchor, runId, pending.buffered);
+				}
+			});
+			// Resolved: the server closed a drained terminal stream. A still-
+			// pending buffer never proved its anchor; it stays bounded for a
+			// later transcript page (flushAnchoredReplays).
+		} catch {
+			// Aborted (conversation switch/unmount) or transport failure:
+			// the restore stays additive — nothing fabricated, nothing half-
+			// rendered beyond what already proved its anchor.
+		} finally {
+			replayControllers = replayControllers.filter((one) => one !== controller);
+			const pending = pendingReplays.get(runId);
+			if (
+				pending !== undefined &&
+				pending.conversationId === conversationId &&
+				replayAnchorOf(pending.buffered) === null
+			) {
+				// Closed without any canonical anchor: drop the buffer honestly.
+				pendingReplays.delete(runId);
+			}
+		}
+	}
+
 	function stopStreamReveal(): void {
 		if (streamRevealTimer !== null) {
 			clearInterval(streamRevealTimer);
@@ -2753,7 +2995,15 @@
 			: [...visibleToolCalls, observed];
 	}
 
-	function foldEvent(event: MaiRunEvent): void {
+	/**
+	 * Fold one recorded run event. `replay = true` marks a RESTORED
+	 * terminal-v2 run's persisted event: only the anchored turn feed folds —
+	 * every conversation-level fold (the legacy Details transcript, streamed
+	 * reply stores, phase flags, approval gate, outcome block) stays owned
+	 * by the live stream of the ACTIVE run, so a past run's replay can never
+	 * mutate this window's live state (W2; CTU-1).
+	 */
+	function foldEvent(event: MaiRunEvent, replay = false): void {
 		const data = recordOf(event.data);
 		if (data === null) return;
 		const feedKey = feedSinkOf(event);
@@ -2766,14 +3016,18 @@
 				const round = typeof data.round === 'number' ? data.round : 0;
 				if (kind === 'thinking') {
 					const key = `${data.round ?? 0}:${typeof partIndex === 'number' ? partIndex : 'unknown'}`;
-					streamedThinkingByPart = {
-						...streamedThinkingByPart,
-						[key]: (streamedThinkingByPart[key] ?? '') + delta
-					};
+					if (!replay) {
+						streamedThinkingByPart = {
+							...streamedThinkingByPart,
+							[key]: (streamedThinkingByPart[key] ?? '') + delta
+						};
+					}
 					coalesceFeed(feedKey, `think:${key}`, event.seq, 'thinking', round, delta);
 				} else {
-					streamedReply += delta;
-					isStreamingReply = true;
+					if (!replay) {
+						streamedReply += delta;
+						isStreamingReply = true;
+					}
 					coalesceFeed(
 						feedKey,
 						`text:${data.round ?? 0}:${typeof partIndex === 'number' ? partIndex : 'unknown'}`,
@@ -2787,7 +3041,7 @@
 			}
 			case 'agent.tool_requested':
 			case 'agent.tool_result': {
-				applyToolObservation(data, event);
+				if (!replay) applyToolObservation(data, event);
 				{
 					const capabilityId =
 						typeof data.capability_id === 'string' ? data.capability_id : null;
@@ -2822,53 +3076,58 @@
 			case 'chat.submitted': {
 				const record = recordOf(data);
 				const attachments = Array.isArray(record?.attachments) ? record.attachments : [];
-				pushEntry({
-					seq: event.seq,
-					kind: 'submitted',
-					label: 'Submission recorded',
-					rows: [
-						{ k: 'handler', v: rowOf(data, 'handler') },
-						{ k: 'children', v: rowOf(data, 'children') },
-						{ k: 'attachments', v: String(attachments.length) },
-						{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
-					]
-				});
+				if (!replay)
+					pushEntry({
+						seq: event.seq,
+						kind: 'submitted',
+						label: 'Submission recorded',
+						rows: [
+							{ k: 'handler', v: rowOf(data, 'handler') },
+							{ k: 'children', v: rowOf(data, 'children') },
+							{ k: 'attachments', v: String(attachments.length) },
+							{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
+						]
+					});
 				pushFeed(feedKey, feedEntry(event.seq, 'submitted', 'Submission recorded'));
 				break;
 			}
 			case 'chat.steered': {
-				addThinkingStep(
-					`Steering directive queued for next cogitator round (${rowOf(data, 'message_chars')} chars)`
-				);
-				pushEntry({
-					seq: event.seq,
-					kind: 'submitted',
-					label: 'Steering directive recorded',
-					rows: [
-						{ k: 'steer_id', v: shortId(rowOf(data, 'steer_id')) },
-						{ k: 'message_chars', v: rowOf(data, 'message_chars') },
-						{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
-					]
-				});
+				if (!replay) {
+					addThinkingStep(
+						`Steering directive queued for next cogitator round (${rowOf(data, 'message_chars')} chars)`
+					);
+					pushEntry({
+						seq: event.seq,
+						kind: 'submitted',
+						label: 'Steering directive recorded',
+						rows: [
+							{ k: 'steer_id', v: shortId(rowOf(data, 'steer_id')) },
+							{ k: 'message_chars', v: rowOf(data, 'message_chars') },
+							{ k: 'submission_sha256', v: shortHash(rowOf(data, 'submission_sha256')) }
+						]
+					});
+				}
 				pushFeed(feedKey, feedEntry(event.seq, 'steered', 'Steering directive recorded'));
 				break;
 			}
 			case 'agent.started': {
-				addThinkingStep(
-					`Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`
-				);
-				pushEntry({
-					seq: event.seq,
-					kind: 'started',
-					label: 'Model bound',
-					rows: [
-						{ k: 'model', v: rowOf(data, 'model') },
-						{ k: 'profile', v: rowOf(data, 'profile') },
-						{ k: 'connection', v: rowOf(data, 'connection') },
-						{ k: 'role', v: rowOf(data, 'role') },
-						{ k: 'rounds_budget', v: rowOf(data, 'rounds_budget') }
-					]
-				});
+				if (!replay) {
+					addThinkingStep(
+						`Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`
+					);
+					pushEntry({
+						seq: event.seq,
+						kind: 'started',
+						label: 'Model bound',
+						rows: [
+							{ k: 'model', v: rowOf(data, 'model') },
+							{ k: 'profile', v: rowOf(data, 'profile') },
+							{ k: 'connection', v: rowOf(data, 'connection') },
+							{ k: 'role', v: rowOf(data, 'role') },
+							{ k: 'rounds_budget', v: rowOf(data, 'rounds_budget') }
+						]
+					});
+				}
 				// The binding is a HISTORICAL line: the live phase stays the
 				// pending intake (explicit `agent.intake_started` when the W1
 				// backend emits it), never this label (W2 rule 3).
@@ -2876,7 +3135,7 @@
 					feedKey,
 					feedEntry(event.seq, 'phase', `Binding model ${rowOf(data, 'model')} (profile: ${rowOf(data, 'profile')}, connection: ${rowOf(data, 'connection')})`)
 				);
-				intakePending = true;
+				if (!replay) intakePending = true;
 				break;
 			}
 			case 'agent.intake_started': {
@@ -2885,35 +3144,41 @@
 					feedKey,
 					feedEntry(event.seq, 'phase', 'Intake planning started', { pendingIntake: true })
 				);
-				intakePending = true;
+				if (!replay) intakePending = true;
 				break;
 			}
 			case 'agent.intake_interpreted': {
 				pushFeed(feedKey, feedEntry(event.seq, 'phase', 'Request interpreted'));
-				intakePending = false;
-				contextPending = true;
+				if (!replay) {
+					intakePending = false;
+					contextPending = true;
+				}
 				break;
 			}
 			case 'agent.context_assembled': {
 				const record = recordOf(data);
-				addThinkingStep(
-					`Assembled server context (prompt edition ${rowOf(data, 'prompt_revision')}, evidence items: ${rowOf(data, 'evidence_items')})`
-				);
-				pushEntry({
-					seq: event.seq,
-					kind: 'context',
-					label: 'Context assembled',
-					rows: [
-						{ k: 'evidence_items', v: rowOf(data, 'evidence_items') },
-						{ k: 'truncated', v: record?.truncated === true ? 'yes' : 'no' },
-						{ k: 'prompt_revision', v: rowOf(data, 'prompt_revision') }
-					]
-				});
+				if (!replay) {
+					addThinkingStep(
+						`Assembled server context (prompt edition ${rowOf(data, 'prompt_revision')}, evidence items: ${rowOf(data, 'evidence_items')})`
+					);
+					pushEntry({
+						seq: event.seq,
+						kind: 'context',
+						label: 'Context assembled',
+						rows: [
+							{ k: 'evidence_items', v: rowOf(data, 'evidence_items') },
+							{ k: 'truncated', v: record?.truncated === true ? 'yes' : 'no' },
+							{ k: 'prompt_revision', v: rowOf(data, 'prompt_revision') }
+						]
+					});
+				}
 				pushFeed(feedKey, feedEntry(event.seq, 'phase', 'Context assembled'));
 				// Context assembly completes the pre-round stages even when a
 				// legacy run skipped the structured intake events.
-				intakePending = false;
-				contextPending = false;
+				if (!replay) {
+					intakePending = false;
+					contextPending = false;
+				}
 				break;
 			}
 			case 'agent.model_round': {
@@ -2921,7 +3186,7 @@
 				const round = rowOf(data, 'round');
 				if (typeof record?.thinking === 'string' && record.thinking.trim() !== '') {
 					const key = `${data.round ?? 0}:checkpoint`;
-					if (!(key in streamedThinkingByPart)) {
+					if (!replay && !(key in streamedThinkingByPart)) {
 						streamedThinkingByPart = { ...streamedThinkingByPart, [key]: record.thinking };
 					}
 					// Checkpoint fills only an ABSENT streamed part (same dedup
@@ -2939,73 +3204,77 @@
 				}
 				if (record?.status === 'tool_calls') {
 					const calls = Array.isArray(record.tool_calls) ? record.tool_calls : [];
-					for (let idx = 0; idx < calls.length; idx++) {
-						const one = recordOf(calls[idx]);
-						const capId =
-							typeof one?.capability_id === 'string' ? one.capability_id : `call_${idx}`;
-						const seqStr = String(one?.seq ?? event.seq);
-						const hashStr = shortHash(one?.payload_hash);
-						addThinkingStep(`Round ${round}: requesting tool ${capId} (step #${seqStr})`);
-						visibleToolCalls = [
-							...visibleToolCalls,
-							{
-								id: `${event.seq}-${idx}`,
-								runId: event.run_id ?? activeRunId ?? '',
-								capabilityId: capId,
-								stepSeq: seqStr,
-								payloadHash: hashStr,
-								status: 'requested',
-								reason: 'dispatched',
-								opId: '—',
-								toolCallId: `step-${event.run_id ?? activeRunId}-${seqStr}`,
-								args: undefined,
-								result: undefined,
-								truncated: false
-							}
-						];
+					if (!replay) {
+						for (let idx = 0; idx < calls.length; idx++) {
+							const one = recordOf(calls[idx]);
+							const capId =
+								typeof one?.capability_id === 'string' ? one.capability_id : `call_${idx}`;
+							const seqStr = String(one?.seq ?? event.seq);
+							const hashStr = shortHash(one?.payload_hash);
+							addThinkingStep(`Round ${round}: requesting tool ${capId} (step #${seqStr})`);
+							visibleToolCalls = [
+								...visibleToolCalls,
+								{
+									id: `${event.seq}-${idx}`,
+									runId: event.run_id ?? activeRunId ?? '',
+									capabilityId: capId,
+									stepSeq: seqStr,
+									payloadHash: hashStr,
+									status: 'requested',
+									reason: 'dispatched',
+									opId: '—',
+									toolCallId: `step-${event.run_id ?? activeRunId}-${seqStr}`,
+									args: undefined,
+									result: undefined,
+									truncated: false
+								}
+							];
+						}
+						pushEntry({
+							seq: event.seq,
+							kind: 'round',
+							label: `Round ${round} — tool calls requested`,
+							rows: calls.map((call, index) => {
+								const one = recordOf(call);
+								return {
+									k: typeof one?.capability_id === 'string' ? one.capability_id : `call ${index}`,
+									v: `seq ${String(one?.seq ?? '—')} · payload ${shortHash(one?.payload_hash)}`
+								};
+							})
+						});
 					}
-					pushEntry({
-						seq: event.seq,
-						kind: 'round',
-						label: `Round ${round} — tool calls requested`,
-						rows: calls.map((call, index) => {
-							const one = recordOf(call);
-							return {
-								k: typeof one?.capability_id === 'string' ? one.capability_id : `call ${index}`,
-								v: `seq ${String(one?.seq ?? '—')} · payload ${shortHash(one?.payload_hash)}`
-							};
-						})
-					});
 					pushFeed(
 						feedKey,
 						feedEntry(event.seq, 'round', `Round ${round} — requesting tools`)
 					);
 				} else if (record?.status === 'final') {
 					const replyOutput = typeof record.output === 'string' ? record.output.trim() : '';
-					addThinkingStep(`Round ${round}: synthesized final response (${rowOf(data, 'output_chars')} chars)`);
-					if (replyOutput !== '') {
-						latestAssistantReply = replyOutput;
-						if (streamedReply.trim() !== replyOutput) startStreamReveal(replyOutput);
-						else stopStreamReveal();
+					if (!replay) {
+						addThinkingStep(`Round ${round}: synthesized final response (${rowOf(data, 'output_chars')} chars)`);
+						if (replyOutput !== '') {
+							latestAssistantReply = replyOutput;
+							if (streamedReply.trim() !== replyOutput) startStreamReveal(replyOutput);
+							else stopStreamReveal();
+						}
+						pushEntry({
+							seq: event.seq,
+							kind: 'reply',
+							label: `Round ${round} — final answer recorded`,
+							rows: [
+								{
+									k: 'output_chars',
+									v: rowOf(data, 'output_chars')
+								},
+								{
+									k: 'body',
+									v:
+										replyOutput !== ''
+											? replyOutput
+											: 'held in the durable run history — the wire carries no reply text'
+								}
+							]
+						});
 					}
-					pushEntry({
-						seq: event.seq,
-						kind: 'reply',
-						label: `Round ${round} — final answer recorded`,
-						rows: [
-							{
-								k: 'output_chars',
-								v: rowOf(data, 'output_chars')
-							},
-							{
-								k: 'body',
-								v:
-									replyOutput !== ''
-										? replyOutput
-										: 'held in the durable run history — the wire carries no reply text'
-							}
-						]
-					});
 					// The final TEXT renders from the durable canonical
 					// transcript once it lands (W2 dedup: streamed→recorded);
 					// the feed records only the verifiable round fact.
@@ -3034,56 +3303,58 @@
 			}
 			case 'step.started': {
 				const capId = rowOf(data, 'capability_id');
-				addThinkingStep(`Executing tool capability ${capId}…`);
-				const nextCalls = [...visibleToolCalls];
-				const matchIdx = nextCalls.findIndex(
-					(c) => c.capabilityId === capId && c.status === 'requested'
-				);
-				if (matchIdx >= 0) {
-					nextCalls[matchIdx] = { ...nextCalls[matchIdx], status: 'running' };
-					visibleToolCalls = nextCalls;
-				} else if (
-					priorTurns.length > 0 &&
-					priorTurns[priorTurns.length - 1].toolCalls.some(
-						(c) => c.capabilityId === capId && c.status === 'requested'
-					)
-				) {
-					const lastIdx = priorTurns.length - 1;
-					const updatedTools = [...priorTurns[lastIdx].toolCalls];
-					const priorMatch = updatedTools.findIndex(
+				if (!replay) {
+					addThinkingStep(`Executing tool capability ${capId}…`);
+					const nextCalls = [...visibleToolCalls];
+					const matchIdx = nextCalls.findIndex(
 						(c) => c.capabilityId === capId && c.status === 'requested'
 					);
-					if (priorMatch >= 0) {
-						updatedTools[priorMatch] = { ...updatedTools[priorMatch], status: 'running' };
-						const nextPrior = [...priorTurns];
-						nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
-						priorTurns = nextPrior;
-					}
-				} else {
-					visibleToolCalls = [
-						...visibleToolCalls,
-						{
-							id: `step-${event.seq}`,
-							runId: event.run_id ?? activeRunId ?? '',
-							capabilityId: capId,
-							stepSeq: String(event.seq),
-							payloadHash: '—',
-							status: 'running',
-							reason: 'running',
-							opId: '—',
-							toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
-							args: undefined,
-							result: undefined,
-							truncated: false
+					if (matchIdx >= 0) {
+						nextCalls[matchIdx] = { ...nextCalls[matchIdx], status: 'running' };
+						visibleToolCalls = nextCalls;
+					} else if (
+						priorTurns.length > 0 &&
+						priorTurns[priorTurns.length - 1].toolCalls.some(
+							(c) => c.capabilityId === capId && c.status === 'requested'
+						)
+					) {
+						const lastIdx = priorTurns.length - 1;
+						const updatedTools = [...priorTurns[lastIdx].toolCalls];
+						const priorMatch = updatedTools.findIndex(
+							(c) => c.capabilityId === capId && c.status === 'requested'
+						);
+						if (priorMatch >= 0) {
+							updatedTools[priorMatch] = { ...updatedTools[priorMatch], status: 'running' };
+							const nextPrior = [...priorTurns];
+							nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
+							priorTurns = nextPrior;
 						}
-					];
+					} else {
+						visibleToolCalls = [
+							...visibleToolCalls,
+							{
+								id: `step-${event.seq}`,
+								runId: event.run_id ?? activeRunId ?? '',
+								capabilityId: capId,
+								stepSeq: String(event.seq),
+								payloadHash: '—',
+								status: 'running',
+								reason: 'running',
+								opId: '—',
+								toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
+								args: undefined,
+								result: undefined,
+								truncated: false
+							}
+						];
+					}
+					pushEntry({
+						seq: event.seq,
+						kind: 'tool',
+						label: 'Tool attempt started',
+						rows: [{ k: 'capability_id', v: capId }]
+					});
 				}
-				pushEntry({
-					seq: event.seq,
-					kind: 'tool',
-					label: 'Tool attempt started',
-					rows: [{ k: 'capability_id', v: capId }]
-				});
 				if (
 					!updateFeedToolByCapability(feedKey, capId, 'running')
 				) {
@@ -3103,7 +3374,7 @@
 				const capId = rowOf(data, 'capability_id');
 				const reason = rowOf(data, 'reason');
 				const opId = rowOf(data, 'op_id');
-				if (reason.startsWith('approval')) needsApproval = true;
+				if (!replay && reason.startsWith('approval')) needsApproval = true;
 				const isOk =
 					reason === '—' ||
 					reason === '' ||
@@ -3111,76 +3382,78 @@
 					reason === 'succeeded' ||
 					reason === 'completed';
 				const displayReason = reason === '—' || reason === '' ? 'succeeded' : reason;
-				addThinkingStep(`Tool ${capId} finished (${displayReason})`);
-				const nextCalls = [...visibleToolCalls];
-				const matchIdx = nextCalls.findIndex(
-					(c) =>
-						c.capabilityId === capId &&
-						(c.status === 'running' || c.status === 'requested')
-				);
-				if (matchIdx >= 0) {
-					nextCalls[matchIdx] = {
-						...nextCalls[matchIdx],
-						status: isOk ? 'succeeded' : 'failed',
-						reason: displayReason,
-						opId: shortId(opId)
-					};
-					visibleToolCalls = nextCalls;
-				} else if (
-					priorTurns.length > 0 &&
-					priorTurns[priorTurns.length - 1].toolCalls.some(
-						(c) =>
-							c.capabilityId === capId &&
-							(c.status === 'running' || c.status === 'requested')
-					)
-				) {
-					const lastIdx = priorTurns.length - 1;
-					const updatedTools = [...priorTurns[lastIdx].toolCalls];
-					const priorMatch = updatedTools.findIndex(
+				if (!replay) {
+					addThinkingStep(`Tool ${capId} finished (${displayReason})`);
+					const nextCalls = [...visibleToolCalls];
+					const matchIdx = nextCalls.findIndex(
 						(c) =>
 							c.capabilityId === capId &&
 							(c.status === 'running' || c.status === 'requested')
 					);
-					if (priorMatch >= 0) {
-						updatedTools[priorMatch] = {
-							...updatedTools[priorMatch],
+					if (matchIdx >= 0) {
+						nextCalls[matchIdx] = {
+							...nextCalls[matchIdx],
 							status: isOk ? 'succeeded' : 'failed',
 							reason: displayReason,
 							opId: shortId(opId)
 						};
-						const nextPrior = [...priorTurns];
-						nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
-						priorTurns = nextPrior;
-					}
-				} else {
-					visibleToolCalls = [
-						...visibleToolCalls,
-						{
-							id: `outcome-${event.seq}`,
-							runId: event.run_id ?? activeRunId ?? '',
-							capabilityId: capId,
-							stepSeq: String(event.seq),
-							payloadHash: '—',
-							status: isOk ? 'succeeded' : 'failed',
-							reason: displayReason,
-							opId: shortId(opId),
-							toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
-							args: undefined,
-							result: undefined,
-							truncated: false
+						visibleToolCalls = nextCalls;
+					} else if (
+						priorTurns.length > 0 &&
+						priorTurns[priorTurns.length - 1].toolCalls.some(
+							(c) =>
+								c.capabilityId === capId &&
+								(c.status === 'running' || c.status === 'requested')
+						)
+					) {
+						const lastIdx = priorTurns.length - 1;
+						const updatedTools = [...priorTurns[lastIdx].toolCalls];
+						const priorMatch = updatedTools.findIndex(
+							(c) =>
+								c.capabilityId === capId &&
+								(c.status === 'running' || c.status === 'requested')
+						);
+						if (priorMatch >= 0) {
+							updatedTools[priorMatch] = {
+								...updatedTools[priorMatch],
+								status: isOk ? 'succeeded' : 'failed',
+								reason: displayReason,
+								opId: shortId(opId)
+							};
+							const nextPrior = [...priorTurns];
+							nextPrior[lastIdx] = { ...nextPrior[lastIdx], toolCalls: updatedTools };
+							priorTurns = nextPrior;
 						}
-					];
+					} else {
+						visibleToolCalls = [
+							...visibleToolCalls,
+							{
+								id: `outcome-${event.seq}`,
+								runId: event.run_id ?? activeRunId ?? '',
+								capabilityId: capId,
+								stepSeq: String(event.seq),
+								payloadHash: '—',
+								status: isOk ? 'succeeded' : 'failed',
+								reason: displayReason,
+								opId: shortId(opId),
+								toolCallId: `step-${event.run_id ?? activeRunId}-${rowOf(data, 'step_seq')}`,
+								args: undefined,
+								result: undefined,
+								truncated: false
+							}
+						];
+					}
+					pushEntry({
+						seq: event.seq,
+						kind: 'outcome',
+						label: 'Tool outcome recorded',
+						rows: [
+							{ k: 'capability_id', v: capId },
+							{ k: 'reason', v: reason },
+							{ k: 'op_id', v: opId }
+						]
+					});
 				}
-				pushEntry({
-					seq: event.seq,
-					kind: 'outcome',
-					label: 'Tool outcome recorded',
-					rows: [
-						{ k: 'capability_id', v: capId },
-						{ k: 'reason', v: reason },
-						{ k: 'op_id', v: opId }
-					]
-				});
 				if (
 					!updateFeedToolByCapability(feedKey, capId, isOk ? 'succeeded' : 'failed')
 				) {
@@ -3194,16 +3467,19 @@
 				break;
 			}
 			case 'step.awaiting_approval': {
-				needsApproval = true;
+				// The approval gate belongs to the ACTIVE run's live stream;
+				// a restored past approval never re-presents (C03 rule 4).
+				if (!replay) needsApproval = true;
 				break;
 			}
 			case 'agent.awaiting_reconciliation': {
-				pushEntry({
-					seq: event.seq,
-					kind: 'reconciling',
-					label: 'Outcome unknown — reconciliation pending',
-					rows: [{ k: 'deadline', v: rowOf(data, 'deadline') }]
-				});
+				if (!replay)
+					pushEntry({
+						seq: event.seq,
+						kind: 'reconciling',
+						label: 'Outcome unknown — reconciliation pending',
+						rows: [{ k: 'deadline', v: rowOf(data, 'deadline') }]
+					});
 				pushFeed(
 					feedKey,
 					feedEntry(event.seq, 'reconciling', 'Outcome unknown — reconciliation pending')
@@ -3211,60 +3487,69 @@
 				break;
 			}
 			case 'agent.completed': {
-				pushEntry({
-					seq: event.seq,
-					kind: 'completed',
-					label: 'Conversation completed',
-					rows: [
-						{ k: 'rounds', v: rowOf(data, 'rounds') },
-						{ k: 'tool_calls', v: rowOf(data, 'tool_calls') },
-						{ k: 'output_chars', v: rowOf(data, 'output_chars') }
-					]
-				});
+				if (!replay)
+					pushEntry({
+						seq: event.seq,
+						kind: 'completed',
+						label: 'Conversation completed',
+						rows: [
+							{ k: 'rounds', v: rowOf(data, 'rounds') },
+							{ k: 'tool_calls', v: rowOf(data, 'tool_calls') },
+							{ k: 'output_chars', v: rowOf(data, 'output_chars') }
+						]
+					});
 				pushFeed(feedKey, feedEntry(event.seq, 'completed', 'Conversation completed'));
 				markFeedTerminated(feedKey);
-				intakePending = false;
-				contextPending = false;
-				// 21-outcome-ui: the run summary's additive `task_outcome`
-				// document (absent for taskless runs). Fail-closed narrow —
-				// the outcome block is driven by THIS document, never by the
-				// run's technical success state (E1).
-				const outcomeDocument = readTaskOutcome(data);
-				if (outcomeDocument !== null) {
-					taskOutcome = outcomeDocument;
-					taskOutcomeByConversation.set(event.run_id, outcomeDocument);
-					if (canonicalId !== null) {
-						taskOutcomeByConversation.set(canonicalId, outcomeDocument);
+				if (!replay) {
+					intakePending = false;
+					contextPending = false;
+					// 21-outcome-ui: the run summary's additive `task_outcome`
+					// document (absent for taskless runs). Fail-closed narrow —
+					// the outcome block is driven by THIS document, never by the
+					// run's technical success state (E1).
+					const outcomeDocument = readTaskOutcome(data);
+					if (outcomeDocument !== null) {
+						taskOutcome = outcomeDocument;
+						taskOutcomeByConversation.set(event.run_id, outcomeDocument);
+						if (canonicalId !== null) {
+							taskOutcomeByConversation.set(canonicalId, outcomeDocument);
+						}
 					}
 				}
 				break;
 			}
 			case 'agent.failed': {
 				const failReason = rowOf(data, 'reason');
-				if (visibleToolCalls.some((c) => c.status === 'requested' || c.status === 'running')) {
-					visibleToolCalls = visibleToolCalls.map((c) =>
-						c.status === 'requested' || c.status === 'running'
-							? {
-									...c,
-									status: 'failed',
-									reason: `aborted (${failReason !== '—' ? failReason : 'run failed'})`
-								}
-							: c
-					);
+				if (!replay) {
+					if (visibleToolCalls.some((c) => c.status === 'requested' || c.status === 'running')) {
+						visibleToolCalls = visibleToolCalls.map((c) =>
+							c.status === 'requested' || c.status === 'running'
+								? {
+										...c,
+										status: 'failed',
+										reason: `aborted (${failReason !== '—' ? failReason : 'run failed'})`
+									}
+								: c
+						);
+					}
+					pushEntry({
+						seq: event.seq,
+						kind: 'failed',
+						label: 'Conversation failed',
+						rows: [{ k: 'reason', v: failReason }]
+					});
 				}
-				pushEntry({
-					seq: event.seq,
-					kind: 'failed',
-					label: 'Conversation failed',
-					rows: [{ k: 'reason', v: failReason }]
-				});
+				// The recorded failure reason rides the feed verbatim —
+				// restored terminal runs keep their honest ending.
 				pushFeed(
 					feedKey,
 					feedEntry(event.seq, 'failed', `Conversation failed (${failReason})`)
 				);
 				markFeedTerminated(feedKey);
-				intakePending = false;
-				contextPending = false;
+				if (!replay) {
+					intakePending = false;
+					contextPending = false;
+				}
 				break;
 			}
 			case 'agent.delegation_planned': {
@@ -3659,6 +3944,7 @@
 	onDestroy(() => {
 		disposed = true;
 		finishStream();
+		finishReplays();
 		if (refreshTimer !== null) {
 			clearTimeout(refreshTimer);
 			refreshTimer = null;
