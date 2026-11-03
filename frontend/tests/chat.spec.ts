@@ -2115,6 +2115,62 @@ test('reconnect resumes from Last-Event-ID; the watermark deduplicates replayed 
 	expect(seqs).toContain('5');
 });
 
+test('delta bursts schedule zero panel reads; run.transition refreshes exactly once (no overlap)', async ({
+	page
+}) => {
+	await openFixture(page, 'compose');
+	// Fake timers from here on: a wrongly-armed refresh debounce CANNOT fire
+	// before the explicit fastForward below, which makes the zero-read proof
+	// exact instead of a sleep-and-hope window.
+	await page.clock.install({ time: new Date('2026-10-16T09:30:00Z') });
+	const main = page.getByTestId('host-main');
+	await submitFromHost(page, 'host-main', 'Delta burst prompt');
+	const submitted = (await callsOf(page, 'submitMessage'))[0].payload as { run_id: string };
+	const runId = submitted.run_id;
+	await expect(main.getByTestId('conversation-state')).toHaveText('Running');
+	await page.clock.fastForward(300); // settle the submit-path reads before the burst
+	const baseline = (await callsOf(page, 'readConversation')).length;
+
+	// A 120-frame agent.output_delta burst. The panel fold renders the last
+	// chunk (proof the stream was consumed end to end), yet NO subscriber may
+	// turn it into durable reads: both the panel and the composed delegation
+	// tree keep deltas fold-only (pool-exhaustion guard), so the read count
+	// must not move at all — pre-fix, the panel added a debounced read here.
+	const deltas: StreamFrame[] = [
+		frame(1, 'agent.output_delta', { round: 0, kind: 'thinking', part_index: 0, delta: 'Reasoning ' })
+	];
+	for (let i = 2; i <= 120; i++) {
+		deltas.push(
+			frame(i, 'agent.output_delta', { round: 0, kind: 'text', part_index: 0, delta: `chunk-${i} ` })
+		);
+	}
+	await queueStreamPair({ frames: deltas });
+	await expect(main.getByTestId('assistant-reply-text')).toContainText('chunk-120');
+	await page.clock.fastForward(600); // fires any wrongly-armed 150ms refresh debounce
+	expect((await callsOf(page, 'readConversation')).length).toBe(baseline);
+
+	// A genuinely projection-changing event still refreshes the durable view:
+	// the recorded state moved server-side, the run.transition frame arrives
+	// on the resumed (cursor-carried) connection, and exactly ONE debounced
+	// read per subscriber follows — never parallel reads, never a queue.
+	await page.evaluate(
+		(id) => window.__maiChatApi!.setConversationState(id, 'waiting_children'),
+		runId
+	);
+	await page.clock.fastForward(1000); // release the bounded reconnect backoff (750ms)
+	await waitForStreamRequests(4); // submit pair + reconnect pair
+	await queueStreamPair({
+		frames: [frame(200, 'run.transition', { from_state: 'running', to_state: 'waiting_children' })]
+	});
+	await page.clock.fastForward(400); // fires the 150ms refresh debounce
+	await expect(main.getByTestId('conversation-state')).toHaveText('Waiting for child runs');
+	expect((await callsOf(page, 'readConversation')).length).toBe(baseline + 2);
+
+	// Bounded, not queued: no further reads accumulate after the burst.
+	await page.clock.fastForward(2000);
+	expect((await callsOf(page, 'readConversation')).length).toBe(baseline + 2);
+});
+
 test('approval path: the receipt binding renders field-for-field and the one-use decision consumes', async ({
 	page
 }) => {
@@ -2865,7 +2921,11 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 640 
 		const draft = main.getByTestId('compose-message');
 		await draft.fill('Unsent draft survives both disclosures');
 		await waitForStreamRequests(4);
-		await expect.poll(async () => (await callsOf(page, 'readConversation')).length).toBeGreaterThanOrEqual(3);
+		// Fold-only frames (agent.started / agent.model_round) refresh nothing:
+		// the two durable reads are the submit-open read and the composed
+		// tree's mount read — the burst-triggered third was the amplification
+		// this slice removed, so 2 is the full settle here.
+		await expect.poll(async () => (await callsOf(page, 'readConversation')).length).toBeGreaterThanOrEqual(2);
 		const callsBefore = await page.evaluate(() => window.__maiChatApi!.calls);
 		async function geometry() {
 			const result = await main.evaluate((host) => {

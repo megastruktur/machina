@@ -330,6 +330,22 @@
 	const BACKOFF_MS = 750;
 	/** Debounce for the durable refresh triggered by delivered events. */
 	const REFRESH_DEBOUNCE_MS = 150;
+	/**
+	 * Stream events that genuinely change the durable projection — a run state
+	 * transition, a cancel marker, a terminal marker, an approval gate — and
+	 * therefore earn the debounced durable refresh. Everything else the panel
+	 * renders from its live fold alone: agent.output_delta (and the other
+	 * agent/step progress observations) MUST NOT amplify into readConversation
+	 * traffic — the live root cause was one durable read per delta tick
+	 * exhausting the DB pool (SSE read-amplification guard).
+	 */
+	const REFRESH_EVENT_TYPES: ReadonlySet<string> = new Set([
+		'run.transition',
+		'run.cancel_requested',
+		'step.awaiting_approval',
+		'agent.completed',
+		'agent.failed'
+	]);
 	/** Rendered-transcript cap: a long replay cannot grow the DOM without bound. */
 	const MAX_RENDERED_EVENTS = 500;
 	/** The frozen default role this panel submits (chat.py DEFAULT_ROLE). */
@@ -2670,6 +2686,15 @@
 	/** Non-reactive controller locals; the reactive mirrors drive the view only. */
 	let streamAbort: AbortController | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * Single-flight durable refresh: at most one readConversation in flight.
+	 * `refreshTrailing` arms exactly ONE bounded follow-up reread for relevant
+	 * events that arrive mid-read — a burst can never queue an unbounded
+	 * chain of reads nor run two reads in parallel (SSE read-amplification
+	 * guard; both flags are non-reactive controller state).
+	 */
+	let refreshInFlight = false;
+	let refreshTrailing = false;
 	/** Set once the mount cycle ended; async continuations check before writes. */
 	let disposed = true;
 
@@ -3258,7 +3283,16 @@
 	// --- durable refresh (replayed facade state; never an engine call) --------
 
 	function scheduleRefresh(): void {
-		if (refreshTimer !== null || disposed) return;
+		if (disposed) return;
+		// A read is still in flight: arm at most ONE bounded trailing reread.
+		// Relevant events arriving mid-read coalesce into that single
+		// follow-up instead of stacking a parallel read or a queue (the
+		// trailing flag collapses bursts; it never accumulates).
+		if (refreshInFlight) {
+			refreshTrailing = true;
+			return;
+		}
+		if (refreshTimer !== null) return;
 		refreshTimer = setTimeout(() => {
 			refreshTimer = null;
 			void loadConversation();
@@ -3269,6 +3303,15 @@
 		if (api === null) return;
 		const id = activeRunId;
 		if (id === '') return;
+		// Single-flight: exactly one durable read in flight for this panel.
+		// A call landing mid-read (scheduled refresh, Refresh button, steer
+		// follow-up) collapses into the ONE bounded trailing reread instead
+		// of issuing a parallel read (SSE read-amplification guard).
+		if (refreshInFlight) {
+			refreshTrailing = true;
+			return;
+		}
+		refreshInFlight = true;
 		try {
 			const view = await api.readConversation(id);
 			if (disposed || id !== activeRunId) return;
@@ -3301,6 +3344,15 @@
 					messageOf(error) ?? 'The conversation state could not be refreshed.'
 				)
 			};
+		} finally {
+			refreshInFlight = false;
+			// Exactly one bounded trailing reread when a relevant event (or a
+			// direct refresh) landed mid-read; scheduleRefresh re-checks
+			// disposal and debounces, so this can never chain unboundedly.
+			if (refreshTrailing) {
+				refreshTrailing = false;
+				scheduleRefresh();
+			}
 		}
 	}
 
@@ -3540,7 +3592,15 @@
 						foldEvent(event);
 						appliedEvents += 1;
 						streamProblem = null;
-						scheduleRefresh();
+						// Selective durable refresh (SSE read-amplification
+						// guard): ONLY genuinely projection-changing events
+						// (run.transition / run.cancel_requested / terminal
+						// markers / the approval gate) earn the debounced
+						// reread. Fold-only observations — every
+						// agent.output_delta above all — never schedule a
+						// durable read: a delta burst updates the local fold
+						// and nothing else.
+						if (REFRESH_EVENT_TYPES.has(event.type)) scheduleRefresh();
 					}
 				});
 			} catch (error) {
@@ -3577,6 +3637,10 @@
 				clearTimeout(refreshTimer);
 				refreshTimer = null;
 			}
+			// A trailing reread armed before teardown must not fire into a
+			// new mount cycle; the in-flight read's own finally re-checks
+			// disposal.
+			refreshTrailing = false;
 		};
 	});
 
@@ -3599,6 +3663,7 @@
 			clearTimeout(refreshTimer);
 			refreshTimer = null;
 		}
+		refreshTrailing = false;
 	});
 
 	// --- derived view bits -----------------------------------------------------
