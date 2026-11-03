@@ -2487,6 +2487,52 @@
 		);
 	}
 
+	/** One renderable run of visible feed entries: a lone entry, or a bounded
+	 * group of CONTIGUOUS thinking blocks. Runs never bucket across tools,
+	 * text, or phase entries — a non-thinking entry closes the group and a
+	 * later thinking run starts a fresh one. */
+	type FeedGroup =
+		| { kind: 'reasoning'; key: string; entries: FeedEntry[] }
+		| { kind: 'entry'; key: string; entry: FeedEntry };
+
+	function groupedFeedEntries(feed: TurnFeed, suppressStreamedText: boolean): FeedGroup[] {
+		const groups: FeedGroup[] = [];
+		for (const entry of visibleFeedEntries(feed, suppressStreamedText)) {
+			const last = groups[groups.length - 1];
+			if (entry.kind === 'thinking') {
+				if (last !== undefined && last.kind === 'reasoning') last.entries.push(entry);
+				else groups.push({ kind: 'reasoning', key: entry.id, entries: [entry] });
+				continue;
+			}
+			groups.push({ kind: 'entry', key: entry.id, entry });
+		}
+		return groups;
+	}
+
+	/** Short first-line excerpt for a collapsed reasoning summary. */
+	function reasoningExcerpt(entries: FeedEntry[]): string {
+		for (const entry of entries) {
+			const line = entry.text.split('\n').find((candidate) => candidate.trim() !== '');
+			if (line === undefined) continue;
+			const trimmed = line.trim();
+			return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
+		}
+		return '';
+	}
+
+	// Explicit per-group open/closed choices, keyed `${turnKey}:${groupId}`.
+	// An absent entry falls back to the live-default: a LIVE feed's reasoning
+	// streams open; a terminal/restored feed's group starts collapsed.
+	let reasoningGroupChoice = $state<Record<string, boolean>>({});
+
+	function reasoningGroupOpen(turnKey: string, groupKey: string, live: boolean): boolean {
+		return reasoningGroupChoice[`${turnKey}:${groupKey}`] ?? live;
+	}
+
+	function setReasoningGroupOpen(turnKey: string, groupKey: string, open: boolean): void {
+		reasoningGroupChoice = { ...reasoningGroupChoice, [`${turnKey}:${groupKey}`]: open };
+	}
+
 	/** Whether the durable assistant reply for THIS user turn has landed in
 	 * the loaded transcript window (the recorded output is rendered there). */
 	function durableReplyLanded(messageId: string): boolean {
@@ -3816,6 +3862,7 @@
 		// clears every anchored feed; new activity anchors fresh (W2).
 		turnFeeds = {};
 		activeTurnMessageId = null;
+		reasoningGroupChoice = {};
 		intakePending = false;
 		contextPending = false;
 		appliedEvents = 0;
@@ -4773,15 +4820,51 @@
 									<span class="mai-chat__bubble-author">⚙ M.A.I.</span>
 								</div>
 								<div class="mai-chat__bubble-body">
-									{#each visibleFeedEntries(feed, suppressStreamedText) as entry (entry.id)}
-										{#if entry.kind === 'thinking'}
-											<blockquote class="mai-chat__thinking-quote" data-testid="feed-thinking" data-seq={entry.seq}>
-												<div class="mai-chat__thinking-line">
-													<span class="mai-chat__thinking-prefix">&gt;</span>
-													<span>{entry.text}</span>
-												</div>
-											</blockquote>
-										{:else if entry.kind === 'text'}
+								{#each groupedFeedEntries(feed, suppressStreamedText) as group (group.key)}
+									{#if group.kind === 'reasoning'}
+										{@const groupOpen = reasoningGroupOpen(turnKey, group.key, live)}
+										<!-- Contiguous thinking blocks fold into ONE disclosure.
+										     Collapsed by default for terminal/restored feeds; a
+										     live feed streams with its group open. The recorded
+										     block text stays OUT of the DOM until the reader
+										     opens the group (nothing summarized, nothing hidden). -->
+										<details
+											class="mai-chat__reasoning-details"
+											data-testid="feed-reasoning"
+											data-seq={group.entries[0].seq}
+											open={groupOpen}
+										>
+											<!-- Click (mouse or keyboard) records the explicit
+											     choice; `ontoggle` would also fire on Svelte's
+											     own open updates and would freeze the default. -->
+											<summary
+												class="mai-chat__reasoning-summary"
+												data-testid="feed-reasoning-toggle"
+												onclick={() => setReasoningGroupOpen(turnKey, group.key, !groupOpen)}
+											>
+												{#if live}<span class="mai-chat__thinking-pulse" aria-hidden="true"></span>{/if}
+												<span>
+													Reasoning ({group.entries.length}
+													{group.entries.length === 1 ? 'block' : 'blocks'})
+												</span>
+												{#if !groupOpen && reasoningExcerpt(group.entries) !== ''}
+													<span class="mai-chat__reasoning-excerpt">{reasoningExcerpt(group.entries)}</span>
+												{/if}
+											</summary>
+											{#if groupOpen}
+												<blockquote class="mai-chat__thinking-quote">
+													{#each group.entries as entry (entry.id)}
+														<div class="mai-chat__thinking-line" data-testid="feed-thinking" data-seq={entry.seq}>
+															<span class="mai-chat__thinking-prefix">&gt;</span>
+															<span>{entry.text}</span>
+														</div>
+													{/each}
+												</blockquote>
+											{/if}
+										</details>
+									{:else}
+										{@const entry = group.entry}
+										{#if entry.kind === 'text'}
 											<p class="mai-chat__feed-text" data-testid="feed-text" data-seq={entry.seq}>
 												{entry.text}{#if live}<span class="mai-chat__stream-cursor" aria-hidden="true">▍</span>{/if}
 											</p>
@@ -4826,7 +4909,8 @@
 										{:else}
 											<p class="mai-chat__meta" data-testid="feed-event" data-seq={entry.seq} data-kind={entry.kind}>{entry.label}</p>
 										{/if}
-									{/each}
+									{/if}
+								{/each}
 								{#if live && intakePending}
 									<div class="mai-chat__thinking-line" data-testid="thinking-intake-phase">
 										<span class="mai-chat__thinking-prefix">&gt;</span>
@@ -6220,6 +6304,58 @@
 		font-weight: var(--mai-weight-semibold);
 		user-select: none;
 		flex: 0 0 auto;
+	}
+
+	/* Per-turn reasoning group: contiguous thinking blocks fold into ONE
+	 * disclosure. Terminal/restored feeds start collapsed; a live feed
+	 * streams with the group open. Content stays out of the DOM until open. */
+	.mai-chat__reasoning-details {
+		min-width: 0;
+		max-width: 100%;
+		margin: 2px 0;
+		border: 0;
+		border-left: var(--mai-chip-accent-width, 3px) solid var(--mai-color-brass-dim);
+		background: transparent;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+
+	.mai-chat__reasoning-details > summary {
+		list-style: none;
+	}
+
+	.mai-chat__reasoning-details > summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.mai-chat__reasoning-summary {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		cursor: pointer;
+		max-width: 100%;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.04em;
+		color: var(--mai-color-text-muted);
+		user-select: none;
+		padding: 1px var(--mai-space-2);
+		min-height: 24px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--mai-color-brass) 5%, transparent);
+	}
+
+	.mai-chat__reasoning-excerpt {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		text-align: left;
+		font-weight: var(--mai-weight-normal, 400);
+		font-style: italic;
+		opacity: 0.85;
 	}
 
 	.mai-chat__tool-calls {

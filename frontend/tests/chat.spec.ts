@@ -4058,13 +4058,21 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 			'Assembling request context…'
 		);
 
-		// The rest of the run: context, reasoning, ONE tool call at its event
-		// position, streamed text, the round checkpoint, and completion.
+		// The rest of the run: context, live reasoning (streaming EXPANDED in
+		// its reasoning group), ONE tool call at its event position, streamed
+		// text, the round checkpoint, and completion.
 		queueSessionFor(run2, {
 			frames: [
 				frame(5, 'agent.context_assembled', { prompt_revision: 1, truncated: false, evidence_items: 0 }),
 				frame(6, 'agent.output_delta', { round: 1, kind: 'thinking', part_index: 0, delta: 'Inspecting the fleet ' }),
-				frame(7, 'agent.tool_requested', { tool_call_id: 'live-a', capability_id: 'app.list_catalog', args: { limit: 10 } }),
+				frame(7, 'agent.tool_requested', { tool_call_id: 'live-a', capability_id: 'app.list_catalog', args: { limit: 10 } })
+			]
+		});
+		// LIVE thinking stays visible and streaming inside its group (no
+		// terminal frame has arrived, so the feed is still live).
+		await expect(feed2.getByTestId('feed-thinking')).toContainText('Inspecting the fleet');
+		queueSessionFor(run2, {
+			frames: [
 				frame(8, 'agent.output_delta', { round: 1, kind: 'text', part_index: 0, delta: 'Checking the catalog ' }),
 				frame(9, 'agent.tool_result', { tool_call_id: 'live-a', capability_id: 'app.list_catalog', step_seq: 1, state: 'succeeded', result: { items: ['kb'], total: 1 } }),
 				frame(10, 'agent.model_round', { round: 1, status: 'tool_calls', tool_calls: [{ seq: 1, capability_id: 'app.list_catalog', payload_hash: PAYLOAD_SHA }] }),
@@ -4074,6 +4082,10 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 			]
 		});
 		await expect(feed2.getByText('Conversation completed')).toBeVisible({ timeout: 15000 });
+		// Terminal fold: the same reasoning group collapses — its thinking
+		// text leaves the DOM entirely once the run is over.
+		await expect(feed2.getByTestId('feed-reasoning')).not.toHaveAttribute('open');
+		await expect(feed2.getByTestId('feed-thinking')).toHaveCount(0);
 		const order = await feed2
 			.locator('[data-testid^="feed-"]')
 			.evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
@@ -4083,7 +4095,8 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 			'feed-phase', // Intake planning started
 			'feed-phase', // Request interpreted
 			'feed-phase', // Context assembled
-			'feed-thinking', // streamed reasoning
+			'feed-reasoning', // streamed reasoning: ONE collapsed group wrapper
+			'feed-reasoning-toggle', // …its counted + excerpted summary row
 			'feed-tool-card', // tool call at its event position
 			'feed-text', // streamed text run
 			'feed-event', // Round 1 — requesting tools (checkpoint)
@@ -4214,34 +4227,40 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 					round: 1,
 					part_index: 0
 				}),
-				frame(5, 'agent.tool_requested', {
+				frame(5, 'agent.output_delta', {
+					kind: 'thinking',
+					delta: 'Cross-checking the unit mask flags',
+					round: 1,
+					part_index: 1
+				}),
+				frame(6, 'agent.tool_requested', {
 					capability_id: 'fixture.read',
 					tool_call_id: 'call-1',
 					step_seq: 1,
 					args: { path: '/etc/systemd/system' }
 				}),
-				frame(6, 'step.started', { capability_id: 'fixture.read', step_seq: 1 }),
-				frame(7, 'agent.tool_result', {
+				frame(7, 'step.started', { capability_id: 'fixture.read', step_seq: 1 }),
+				frame(8, 'agent.tool_result', {
 					capability_id: 'fixture.read',
 					tool_call_id: 'call-1',
 					step_seq: 1,
 					state: 'succeeded',
 					result: { units: 3 }
 				}),
-				frame(8, 'step.completed', {
+				frame(9, 'step.completed', {
 					capability_id: 'fixture.read',
 					step_seq: 1,
 					reason: 'succeeded',
 					op_id: OP_ID
 				}),
-				frame(9, 'agent.output_delta', {
+				frame(10, 'agent.output_delta', {
 					kind: 'text',
 					delta: 'The unit is masked.',
 					round: 1,
 					part_index: 0
 				}),
-				frame(10, 'agent.model_round', { round: 1, status: 'final', output_chars: 19 }),
-				frame(11, 'agent.completed', { rounds: 1, tool_calls: 1, output_chars: 19 })
+				frame(11, 'agent.model_round', { round: 1, status: 'final', output_chars: 19 }),
+				frame(12, 'agent.completed', { rounds: 1, tool_calls: 1, output_chars: 19 })
 			]
 		});
 		queueSessionFor(V2_RUN_FAILED, {
@@ -4303,13 +4322,28 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		);
 		expect(replayCalls.every((call) => call.cursor === null)).toBe(true);
 
-		// Turn 1's feed at its RECORDED anchor: reasoning, then the tool card
-		// in event order, then the verifiable round/completed facts.
+		// Turn 1's feed at its RECORDED anchor: the contiguous thinking run
+		// folds into ONE collapsed group (counted + excerpted), the tool card
+		// stays in event order, and the verifiable round/completed facts ride
+		// their feed-event rows.
 		const feed1 = main.locator(`[data-testid="turn-feed"][data-turn="${V2_TURN_1}"]`);
 		await expect(feed1).toBeVisible();
-		await expect(feed1.getByTestId('feed-thinking')).toContainText(
-			'Tracing the nginx unit state'
-		);
+		// Restored/terminal reasoning starts COLLAPSED and its recorded block
+		// text is NOT in the DOM until the reader opens the group.
+		const reasoning1 = feed1.getByTestId('feed-reasoning');
+		await expect(reasoning1).toHaveCount(1);
+		await expect(reasoning1).not.toHaveAttribute('open');
+		const reasoningToggle = reasoning1.getByTestId('feed-reasoning-toggle');
+		await expect(reasoningToggle).toContainText('Reasoning (2 blocks)');
+		await expect(reasoningToggle).toContainText('Tracing the nginx unit state');
+		await expect(feed1.getByTestId('feed-thinking')).toHaveCount(0);
+		// Expansion restores EVERY recorded block verbatim, in recorded order.
+		await reasoningToggle.click();
+		await expect(feed1.getByTestId('feed-thinking')).toHaveCount(2);
+		await expect(feed1.getByTestId('feed-thinking')).toContainText([
+			'Tracing the nginx unit state',
+			'Cross-checking the unit mask flags'
+		]);
 		const toolCard = feed1.getByTestId('feed-tool-card');
 		await expect(toolCard).toHaveCount(1);
 		await expect(toolCard).toContainText('fixture.read');
