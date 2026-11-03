@@ -72,6 +72,14 @@ from mai.tag_store import _aclassify_terminal_job_locked
 #: envelope grammar.
 TRANSITION_EVENT_TYPE: Final[str] = "run.transition"
 
+#: Bounded ``seq DESC`` page for the poll-time current-state walk
+#: (``RunLifecycle.current_state``). Transitions are rare; the shared
+#: per-run stream also carries high-volume step/agent events, so reading
+#: only transition rows — newest page first, walking back to the submit
+#: anchor — keeps every poll's row traffic proportional to the state
+#: history instead of the event flood.
+TRANSITION_PAGE_LIMIT: Final[int] = 64
+
 #: The frozen C05 rule 2 diagram as a transition table. ``None`` is the
 #: pre-submit anchor: the submit edge is the only transition out of it.
 #: Terminal states map to the empty set — the table is the stale-result
@@ -395,8 +403,110 @@ class RunLifecycle:
         return states_in_order(await self.event_stream(run_id))
 
     async def current_state(self, run_id: str) -> RunState | None:
-        """The run's current state per the persisted log (no engine call)."""
-        return current_state(await self.event_stream(run_id))
+        """The run's current state per the persisted log (no engine call).
+
+        Bounded poll-time replay: reads ONLY ``run.transition`` rows, in
+        deterministic ``seq DESC`` pages of
+        :data:`TRANSITION_PAGE_LIMIT` (newest page first), and walks
+        backwards until the suffix validates contiguously back to the
+        submit anchor — never trusting the latest row alone. Unrelated
+        events (steps, agent output deltas, other producers) are never
+        fetched or parsed, so a flood of ``agent.output_delta`` rows
+        costs a poll only its small transition history. The acceptance
+        predicate is exactly the full replay's (:func:`states_in_order`):
+        the oldest transition must anchor at the submit edge and every
+        adjacent pair must be contiguous — any violation fails closed
+        with the same code instead of yielding a state from an
+        unvalidated suffix. Full-history consumers still read the whole
+        validated stream via :meth:`event_stream` / :meth:`replay_states`.
+        """
+        try:
+            validate_run_id(run_id)
+        except EngineError as exc:
+            raise RunLifecycleError(
+                RunLifecycleErrorCode.INVALID_RUN_ID,
+                "run_id must be a canonical UUID string",
+            ) from exc
+        async with self._sessions() as session:
+            return await self._replay_current_state(session, run_id)
+
+    @staticmethod
+    async def _replay_current_state(
+        session: AsyncSession, run_id: str
+    ) -> RunState | None:
+        """Walk transition rows newest-first until the submit anchor lands.
+
+        Collects ``(from, to)`` pairs in ``seq DESC`` pages, enforcing the
+        chain backwards (each older event's ``to`` must equal the newer
+        event's ``from`` — the same adjacency the ascending replay
+        checks). The walk stops early only when the submit anchor
+        (``from is None``) is also the oldest row of a short — therefore
+        last — page; the same early stop is proven by exhaustion in the
+        full-page case (the post-loop anchor check). Anything else fails
+        closed with the :func:`states_in_order` codes; a run with no
+        transition rows at all is pre-submit (``None``).
+        """
+        newest_first: list[tuple[RunState | None, RunState]] = []
+        offset = 0
+        while True:
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT seq, ts, type, v, data FROM job_events
+                        WHERE run_id = :r AND type = :t
+                        ORDER BY seq DESC LIMIT :l OFFSET :o
+                        """
+                        ),
+                        {
+                            "r": uuid.UUID(run_id),
+                            "t": TRANSITION_EVENT_TYPE,
+                            "l": TRANSITION_PAGE_LIMIT,
+                            "o": offset,
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            if not rows:
+                break
+            for index, row in enumerate(rows):
+                event = parse_job_event(
+                    {
+                        "seq": row["seq"],
+                        "run_id": run_id,
+                        "ts": row["ts"].isoformat(),
+                        "type": row["type"],
+                        "v": row["v"],
+                        "data": row["data"],
+                    }
+                )
+                from_state, to_state = parse_transition_data(event.data)
+                if newest_first and newest_first[-1][0] is not to_state:
+                    raise RunLifecycleError(
+                        RunLifecycleErrorCode.INVALID_EVENT_DATA,
+                        "transition log is not contiguous at its cursor",
+                    )
+                newest_first.append((from_state, to_state))
+                if (
+                    from_state is None
+                    and index == len(rows) - 1
+                    and len(rows) < TRANSITION_PAGE_LIMIT
+                ):
+                    # The submit anchor is also the oldest row of a short
+                    # (therefore last) page: nothing older exists to check.
+                    return newest_first[0][1]
+            offset += len(rows)
+        if not newest_first:
+            return None  # no transition rows: the run is pre-submit
+        if newest_first[-1][0] is not None:
+            raise RunLifecycleError(
+                RunLifecycleErrorCode.INVALID_EVENT_DATA,
+                "transition log does not anchor at the submit edge",
+            )
+        return newest_first[0][1]
 
     @staticmethod
     async def _load_events(session: AsyncSession, run_id: str) -> tuple[JobEvent, ...]:

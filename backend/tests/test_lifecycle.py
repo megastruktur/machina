@@ -40,8 +40,8 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
@@ -135,6 +135,100 @@ def _wait_until(predicate: Callable[[], bool], timeout: float, what: str) -> Non
             return
         time.sleep(0.5)
     raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
+# ---------------------------------------------------------------------------
+# bounded current-state replay helpers (raw rows + SQL observation)
+# ---------------------------------------------------------------------------
+
+
+def _delta_rows(seqs: range) -> list[tuple[int, str, dict[str, object]]]:
+    """Unrelated ``agent.output_delta`` flood rows (the incident's profile)."""
+    return [(seq, "agent.output_delta", {"text": "x" * 64}) for seq in seqs]
+
+
+def _transition_chain_rows(
+    states: list[RunState],
+) -> list[tuple[int, str, dict[str, object]]]:
+    """Raw transition rows anchoring at the submit edge, ``seq`` 1..N."""
+    rows: list[tuple[int, str, dict[str, object]]] = []
+    previous: RunState | None = None
+    for seq, state in enumerate(states, start=1):
+        rows.append(
+            (
+                seq,
+                TRANSITION_EVENT_TYPE,
+                {
+                    "from": None if previous is None else previous.value,
+                    "to": state.value,
+                },
+            )
+        )
+        previous = state
+    return rows
+
+
+async def _insert_event_rows(
+    factory: async_sessionmaker[AsyncSession],
+    run_id: str,
+    rows: list[tuple[int, str, dict[str, object]]],
+) -> None:
+    """Append raw event rows ``(seq, type, data)`` — a producer's-eye view."""
+    async with factory() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO job_events
+                    (event_id, run_id, seq, ts, type, v, data)
+                VALUES
+                    (:event_id, :run_id, :seq, now(), :type, :v, :data)
+                """
+            ),
+            [
+                {
+                    "event_id": uuid.uuid4(),
+                    "run_id": uuid.UUID(run_id),
+                    "seq": seq,
+                    "type": type_,
+                    "v": EVENT_PAYLOAD_VERSION,
+                    "data": json.dumps(data),
+                }
+                for seq, type_, data in rows
+            ],
+        )
+        await session.commit()
+
+
+def _observe_job_event_selects(
+    engine: AsyncEngine,
+) -> list[tuple[str, dict[str, object]]]:
+    """Record every ``job_events`` SELECT executed on ``engine`` + its binds.
+
+    Observation seam for the bounded-replay claim: the statements (and
+    bound parameters) show exactly which rows a poll may fetch — nothing
+    is mocked, the real query path runs untouched.
+    """
+    observed: list[tuple[str, dict[str, object]]] = []
+
+    def _record(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "FROM job_events" not in statement:
+            return
+        assert statement.lstrip().startswith("SELECT")
+        params = parameters
+        if isinstance(params, list):
+            params = params[0] if params else {}
+        assert isinstance(params, dict)
+        observed.append((statement, dict(params)))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    return observed
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +803,205 @@ class TestPersistedCursor:
                 RUN_ID, RunState.RUNNING, occurred_at=datetime(2026, 10, 15, 12, 0, 0)
             )
         assert excinfo.value.code is RunLifecycleErrorCode.INVALID_TIMESTAMP
+
+
+class TestBoundedCurrentState:
+    """``RunLifecycle.current_state`` replays bounded transition pages only.
+
+    The incident shape: 27k ``agent.output_delta`` rows against a handful
+    of transitions; every detail poll must cost transition rows, never
+    the flood — while keeping the full replay's fail-closed predicate
+    (the same codes, the chain validated back to the submit anchor).
+    """
+
+    @pytest.mark.anyio
+    async def test_delta_flood_is_never_fetched_or_parsed(
+        self,
+        lifecycle_url: str,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        await insert_run()
+        # A 1,500-row agent.output_delta flood straddling a 4-transition
+        # chain on both sides (deltas above, between and below).
+        rows = _delta_rows(range(1, 1501))
+        for seq, data in (
+            (1, {"from": None, "to": "queued"}),
+            (300, {"from": "queued", "to": "running"}),
+            (900, {"from": "running", "to": "waiting_approval"}),
+            (1400, {"from": "waiting_approval", "to": "running"}),
+        ):
+            rows[seq - 1] = (seq, TRANSITION_EVENT_TYPE, data)
+        await _insert_event_rows(factory, RUN_ID, rows)
+
+        eng, sessions = create_app_engine(lifecycle_url)
+        try:
+            observed = _observe_job_event_selects(eng)
+            assert (
+                await RunLifecycle(sessions).current_state(RUN_ID) is RunState.RUNNING
+            )
+        finally:
+            await eng.dispose()
+        assert observed, "current_state must read job_events itself"
+        for statement, params in observed:
+            assert "type" in statement  # every read filters by event type…
+            assert params["t"] == TRANSITION_EVENT_TYPE  # …to transitions only
+            assert params["l"] == 64  # TRANSITION_PAGE_LIMIT: bounded pages
+        # Four transitions fit one page: exactly one bounded query, so the
+        # 1,496 flood rows were never fetched, therefore never parsed.
+        assert len(observed) == 1
+
+    @pytest.mark.anyio
+    async def test_pagination_walks_pages_back_to_the_submit_anchor(
+        self,
+        lifecycle_url: str,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        await insert_run()
+        # 71 transitions — more than one 64-row page: queued → running,
+        # 34 approval round-trips, then the terminal edge.
+        states = [RunState.QUEUED, RunState.RUNNING]
+        states += [RunState.WAITING_APPROVAL, RunState.RUNNING] * 34
+        states.append(RunState.SUCCEEDED)
+        assert len(states) == 71
+        await _insert_event_rows(factory, RUN_ID, _transition_chain_rows(states))
+
+        eng, sessions = create_app_engine(lifecycle_url)
+        try:
+            observed = _observe_job_event_selects(eng)
+            assert (
+                await RunLifecycle(sessions).current_state(RUN_ID) is RunState.SUCCEEDED
+            )
+        finally:
+            await eng.dispose()
+        # DESC pages: 64 rows (seq 71..8, full page), then 7 rows
+        # (seq 7..1) whose oldest row is the submit anchor of a short —
+        # therefore final — page. The chain validated across the page
+        # boundary all the way back to the anchor.
+        assert len(observed) == 2
+        assert [params["o"] for _, params in observed] == [0, 64]
+        for _, params in observed:
+            assert params["t"] == TRANSITION_EVENT_TYPE
+            assert params["l"] == 64
+
+    @pytest.mark.anyio
+    async def test_empty_run_is_pre_submit(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        await insert_run()
+        assert await RunLifecycle(factory).current_state(RUN_ID) is None
+
+    @pytest.mark.anyio
+    async def test_missing_submit_anchor_fails_closed_under_flood(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        await insert_run()
+        rows = _delta_rows(range(3, 1201))
+        rows[0] = (1, TRANSITION_EVENT_TYPE, {"from": "queued", "to": "running"})
+        rows[1] = (2, TRANSITION_EVENT_TYPE, {"from": "running", "to": "succeeded"})
+        await _insert_event_rows(factory, RUN_ID, rows)
+        with pytest.raises(RunLifecycleError) as excinfo:
+            await RunLifecycle(factory).current_state(RUN_ID)
+        assert excinfo.value.code is RunLifecycleErrorCode.INVALID_EVENT_DATA
+        assert "anchor" in excinfo.value.detail
+        # Code parity with the authoritative full replay on the same log.
+        with pytest.raises(RunLifecycleError) as full:
+            states_in_order([_event(1, data={"from": "queued", "to": "running"})])
+        assert full.value.code is excinfo.value.code
+
+    @pytest.mark.anyio
+    async def test_discontinuous_chain_fails_closed_under_flood(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        await insert_run()
+        rows = _delta_rows(range(3, 1201))
+        rows[0] = (1, TRANSITION_EVENT_TYPE, {"from": None, "to": "queued"})
+        rows[1] = (2, TRANSITION_EVENT_TYPE, {"from": "queued", "to": "running"})
+        rows[-1] = (1200, TRANSITION_EVENT_TYPE, {"from": "queued", "to": "failed"})
+        await _insert_event_rows(factory, RUN_ID, rows)
+        with pytest.raises(RunLifecycleError) as excinfo:
+            await RunLifecycle(factory).current_state(RUN_ID)
+        assert excinfo.value.code is RunLifecycleErrorCode.INVALID_EVENT_DATA
+        assert "contiguous" in excinfo.value.detail
+        # Code parity with the authoritative full replay on the same log.
+        with pytest.raises(RunLifecycleError) as full:
+            states_in_order(
+                [
+                    _event(1, data={"from": None, "to": "queued"}),
+                    _event(2, data={"from": "queued", "to": "running"}),
+                    _event(3, data={"from": "queued", "to": "failed"}),
+                ]
+            )
+        assert full.value.code is excinfo.value.code
+
+    @pytest.mark.anyio
+    async def test_second_submit_anchor_is_never_trusted_as_the_latest_row(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+    ) -> None:
+        """A mid-log ``from: null`` row must fail closed, not anchor the walk."""
+        await insert_run()
+        await _insert_event_rows(
+            factory,
+            RUN_ID,
+            [
+                (1, TRANSITION_EVENT_TYPE, {"from": None, "to": "queued"}),
+                (2, TRANSITION_EVENT_TYPE, {"from": "queued", "to": "running"}),
+                (3, TRANSITION_EVENT_TYPE, {"from": None, "to": "running"}),
+            ],
+        )
+        with pytest.raises(RunLifecycleError) as excinfo:
+            await RunLifecycle(factory).current_state(RUN_ID)
+        assert excinfo.value.code is RunLifecycleErrorCode.INVALID_EVENT_DATA
+        assert "contiguous" in excinfo.value.detail
+        # The full replay rejects the same tampered log with the same code.
+        with pytest.raises(RunLifecycleError) as full:
+            states_in_order(
+                [
+                    _event(1, data={"from": None, "to": "queued"}),
+                    _event(2, data={"from": "queued", "to": "running"}),
+                    _event(3, data={"from": None, "to": "running"}),
+                ]
+            )
+        assert full.value.code is excinfo.value.code
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"to": "running"},  # missing 'from'
+            {"from": "running"},  # missing 'to'
+            {"from": "running", "to": "SUCCEEDED"},  # unknown state value
+            {"from": "queued", "to": "running", "extra": 1},  # unknown key
+        ],
+    )
+    async def test_malformed_transition_payload_fails_closed(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        insert_run: Callable[..., object],
+        bad: dict[str, object],
+    ) -> None:
+        await insert_run()
+        await _insert_event_rows(
+            factory,
+            RUN_ID,
+            [
+                (1, TRANSITION_EVENT_TYPE, {"from": None, "to": "queued"}),
+                (2, TRANSITION_EVENT_TYPE, {"from": "queued", "to": "running"}),
+                (3, TRANSITION_EVENT_TYPE, bad),
+            ],
+        )
+        with pytest.raises(RunLifecycleError) as excinfo:
+            await RunLifecycle(factory).current_state(RUN_ID)
+        assert excinfo.value.code is RunLifecycleErrorCode.INVALID_EVENT_DATA
 
 
 class TestStaleResultRace:
