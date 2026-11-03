@@ -71,6 +71,31 @@ const OP_ID = 'ef000000-0000-4000-8000-000000000009';
 const ATTACHMENT_SHA = 'cd'.repeat(32);
 const PAYLOAD_SHA = 'ab'.repeat(32);
 
+/**
+ * CTU-1 v2 restore world: one objective-bound conversation, two recorded
+ * user turns, and SIX recorded objective/run bindings that together prove
+ * every admission gate of the terminal-v2 feed restore:
+ *
+ * | binding | created_at | admission outcome                     |
+ * |---|---|---|
+ * | ANCIENT | 06:00 | outside the bounded most-recent window (never read) |
+ * | GHOST   | 06:30 | binding without a run row → honest 404, no feed |
+ * | LIVE    | 07:00 | still running → the terminal gate refuses |
+ * | CHILD   | 07:30 | delegation child → the tree's fold, not a feed |
+ * | FAILED  | 08:50 | terminal root → replayed into its turn feed   |
+ * | SUCCESS | 09:00 | terminal root → replayed into its turn feed   |
+ */
+const V2_CONV = 'ce100000-1111-4222-8333-444455556666';
+const V2_OBJECTIVE = 'cf200000-1111-4222-8333-444455556666';
+const V2_TURN_1 = 'd0100000-1111-4222-8333-444455556666';
+const V2_TURN_2 = 'd0200000-1111-4222-8333-444455556666';
+const V2_RUN_SUCCESS = 'd1100000-1111-4222-8333-444455556666';
+const V2_RUN_FAILED = 'd2200000-1111-4222-8333-444455556666';
+const V2_RUN_LIVE = 'd3300000-1111-4222-8333-444455556666';
+const V2_RUN_CHILD = 'd4400000-1111-4222-8333-444455556666';
+const V2_RUN_GHOST = 'd5500000-1111-4222-8333-444455556666';
+const V2_RUN_ANCIENT = 'd6600000-1111-4222-8333-444455556666';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -133,6 +158,21 @@ interface ChatWindowApi {
 	/** Seed one complete canonical row on ANY recorded scope (24a: the
 	 * Global-sentinel draft/restore journeys). */
 	seedCanonicalRow(serverId: string, conversationId: string, title: string): void;
+	/** CTU-1 server truth: one v2 canonical conversation with recorded
+	 * `objective_runs` bindings and facade run rows. */
+	seedV2Conversation(spec: {
+		conversationId: string;
+		serverId: string;
+		objectiveId: string;
+		turns: Array<{ messageId: string; role: string; content: string }>;
+		runs: Array<{
+			runId: string;
+			state: string;
+			parentRunId?: string | null;
+			createdAt: string;
+			registered?: boolean;
+		}>;
+	}): void;
 	/** One-shot: the NEXT canonical list resolves only after this delay
 	 * (stale-response scope-guard proof, 24a D-1 rule 4). */
 	armSlowList(delayMs: number): void;
@@ -165,6 +205,15 @@ declare global {
 		 * D-2 — the same slice the composed desktop binds from the real
 		 * client). Without it the panel must fail closed honestly. */
 		__maiChatTasks?: boolean;
+		/** Set by a test init script: the runtime-v2 objective slice rides
+		 * the bag (CTU-1 — the restore seam narrows it). Without it every
+		 * terminal-v2 feed restore stays honestly absent. */
+		__maiChatObjectives?: boolean;
+		/** Set by a test init script: ObjectiveActivity's own readObjective
+		 * method rides the bag too (CTU-2 — the operational-activity surface
+		 * binds and renders). Without it the activity sections stay honestly
+		 * unbound exactly as CTU-1 proved them. */
+		__maiChatObjectiveActivity?: boolean;
 		/** Set by a test init script: the bag's api IS the REAL composed
 		 * client (`createMaiApiClient()`) and the optional history-tag slice
 		 * rides `services.tags` — every panel call leaves as actual HTTP
@@ -279,6 +328,11 @@ const APP_SOURCE = `
 	const conversations = {};
 	const runDetails = {};
 	const approvals = {};
+	// Objective slice stores (CTU-1): the recorded objective/run bindings
+	// ('objective_runs' shape) plus the objective's scope row for the
+	// scope-blind 404 mirror. Seeded ONLY via seedV2Conversation.
+	const objectiveRuns = {};
+	const objectiveRows = {};
 
 	const attachment = { server_id: SERVER_A, op_id: OP_ID, sha256: ATTACHMENT_SHA, bytes: 1234 };
 
@@ -528,7 +582,17 @@ const APP_SOURCE = `
 				active_run_id: row.active_run_id,
 				history_completeness: row.history_completeness,
 				missing_range: null,
-				legacy_gaps: JSON.parse(JSON.stringify(row.legacy_gaps))
+				legacy_gaps: JSON.parse(JSON.stringify(row.legacy_gaps)),
+				// The §10.3 runtime markers ride ONLY when the row records them
+				// (seedV2Conversation): every legacy fixture row stays byte-
+				// identical (undefined markers read as non-v2 by the panel).
+				...(row.handler_name !== undefined
+					? {
+							is_legacy: row.is_legacy === true,
+							handler_name: row.handler_name,
+							objective_ids: row.objective_ids ?? []
+						}
+					: {})
 			};
 		},
 		async listConversationMessages(conversationId, serverId, page) {
@@ -1018,6 +1082,154 @@ const APP_SOURCE = `
 		}
 	};
 
+	// --- runtime-v2 objective slice (CTU-1) ------------------------------------
+	// Rides the bag ONLY when the init script sets __maiChatObjectives: the
+	// exact slice the panel's restore seam narrows (listObjectives,
+	// readObjectiveJournal, listObjectiveEvents, listObjectiveRuns, readRun,
+	// resumeConversation, reconcileConversation). readObjective is
+	// DELIBERATELY absent so ObjectiveActivity's own narrowing fails closed —
+	// the objective activity sections stay honestly unbound while the
+	// turn-feed restore is exercised. Scope-checked like the backend; the
+	// deterministic bindings order is (created_at, run_id) ascending.
+	function objectiveNotFound() {
+		return new ApiError(
+			404,
+			'objective_not_found',
+			'no objective in the requesting server scope'
+		);
+	}
+	const OBJECTIVES_BOUND = window.__maiChatObjectives === true;
+	const objectiveApi = {
+		async listObjectives(serverId, page) {
+			calls.push({
+				op: 'listObjectives',
+				runId: serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const items = Object.entries(objectiveRows)
+				.filter(([, row]) => row.server_id === serverId)
+				.map(([objectiveId]) => ({
+					objective_id: objectiveId,
+					server_id: serverId,
+					status: 'active',
+					title: 'Fixture objective episode',
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:30:00Z'
+				}));
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const sliced = items.slice(offset, offset + limit);
+			return {
+				limit,
+				offset,
+				total: items.length,
+				has_more: offset + sliced.length < items.length,
+				items: sliced
+			};
+		},
+		async readObjectiveJournal(objectiveId, serverId) {
+			calls.push({ op: 'readObjectiveJournal', runId: objectiveId, serverId });
+			const row = objectiveRows[String(objectiveId)];
+			if (!row || row.server_id !== serverId) throw objectiveNotFound();
+			return {
+				schema_version: 1,
+				objective_id: String(objectiveId),
+				derived_seq: 0,
+				actions_truncated: false,
+				receipts_truncated: false
+			};
+		},
+		async listObjectiveEvents(objectiveId, serverId, query) {
+			calls.push({
+				op: 'listObjectiveEvents',
+				runId: objectiveId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(query ?? {}))
+			});
+			const row = objectiveRows[String(objectiveId)];
+			if (!row || row.server_id !== serverId) throw objectiveNotFound();
+			const limit = query?.limit ?? 5;
+			const offset = query?.offset ?? 0;
+			return { limit, offset, total: 0, has_more: false, items: [] };
+		},
+		async listObjectiveRuns(objectiveId, serverId, page) {
+			calls.push({
+				op: 'listObjectiveRuns',
+				runId: objectiveId,
+				serverId,
+				payload: JSON.parse(JSON.stringify(page ?? {}))
+			});
+			const row = objectiveRows[String(objectiveId)];
+			if (!row || row.server_id !== serverId) throw objectiveNotFound();
+			const links = (objectiveRuns[String(objectiveId)] ?? [])
+				.slice()
+				.sort(
+					(a, b) =>
+						a.created_at.localeCompare(b.created_at) || a.run_id.localeCompare(b.run_id)
+				);
+			const limit = page?.limit ?? 10;
+			const offset = page?.offset ?? 0;
+			const sliced = links.slice(offset, offset + limit);
+			return {
+				limit,
+				offset,
+				total: links.length,
+				has_more: offset + sliced.length < links.length,
+				objective_id: String(objectiveId),
+				items: JSON.parse(JSON.stringify(sliced))
+			};
+		},
+		async resumeConversation(conversationId, payload) {
+			calls.push({
+				op: 'resumeConversation',
+				runId: conversationId,
+				payload: JSON.parse(JSON.stringify(payload))
+			});
+			throw new ApiError(
+				409,
+				'no_active_run',
+				"no active run holds this conversation's writer lease"
+			);
+		},
+		async reconcileConversation(conversationId, payload) {
+			calls.push({
+				op: 'reconcileConversation',
+				runId: conversationId,
+				payload: JSON.parse(JSON.stringify(payload))
+			});
+			throw new ApiError(404, 'not_found', 'no reconcilable step for this conversation');
+		}
+	};
+	// CTU-2: ObjectiveActivity's own binding surface rides ONLY when the
+	// init script sets __maiChatObjectiveActivity — CTU-1's unbound behavior
+	// stays byte-identical, the operational-activity disclosure proves the
+	// bound surface here.
+	const ACTIVITY_BOUND = window.__maiChatObjectiveActivity === true;
+	const objectiveActivityApi = {
+		async readObjective(objectiveId, serverId) {
+			calls.push({ op: 'readObjective', runId: objectiveId, serverId });
+			const row = objectiveRows[String(objectiveId)];
+			if (!row || row.server_id !== serverId) throw objectiveNotFound();
+			return {
+				objective_id: String(objectiveId),
+				server_id: serverId,
+				status: 'active',
+				revision: 3,
+				created_at: '2026-10-16T08:00:00Z',
+				updated_at: '2026-10-16T08:30:00Z',
+				original_request: 'Fixture objective episode',
+				constraints: [],
+				scope: [
+					{
+						server_id: serverId,
+						added_by_actor_kind: 'operator',
+						added_at: '2026-10-16T08:00:00Z'
+					}
+				]
+			};
+		}
+	};
+
 	let approvalReadFailure = null;
 	let failNextRead = null;
 	let decideFailure = null;
@@ -1030,6 +1242,12 @@ const APP_SOURCE = `
 		// The §8 task slice rides ONLY when the init script binds it (24b
 		// D-2): the unbound path stays the fail-closed behavior under test.
 		...(TASKS_BOUND ? taskApi : {}),
+		// The v2 objective slice rides ONLY when the init script binds it
+		// (CTU-1): the unbound path keeps every feed restore absent.
+		...(OBJECTIVES_BOUND ? objectiveApi : {}),
+		// ObjectiveActivity's binding surface (CTU-2): readObjective rides
+		// ONLY under its own flag — the CTU-1 bag stays byte-identical.
+		...(OBJECTIVES_BOUND && ACTIVITY_BOUND ? objectiveActivityApi : {}),
 		async submitMessage(payload) {
 			const wire = JSON.parse(JSON.stringify(payload));
 			calls.push({ op: 'submitMessage', payload: wire });
@@ -1422,6 +1640,51 @@ const APP_SOURCE = `
 			canonAppend(row, 'assistant', 'Seeded recorded answer — ' + title);
 			canonicalStore[String(conversationId)] = row;
 		},
+		/**
+		 * CTU-1 server truth: ONE v2 canonical conversation with recorded
+		 * objective_runs bindings and terminal/running run facade rows.
+		 * Message ids are pinned so the test knows the EXACT recorded user
+		 * turn each run's chat.submitted must name. registered=false
+		 * leaves a binding WITHOUT its run row (the honest 404 path).
+		 */
+		seedV2Conversation(spec) {
+			const row = canonRow(
+				String(spec.conversationId),
+				String(spec.serverId),
+				'V2 restored episode',
+				'complete',
+				[]
+			);
+			row.is_legacy = false;
+			row.handler_name = 'agent.run_v2';
+			row.objective_ids = [String(spec.objectiveId)];
+			row.active_run_id = null;
+			for (const turn of spec.turns) {
+				canonAppend(row, turn.role, turn.content, { message_id: String(turn.messageId) });
+			}
+			// AFTER the appends: canonAppend stamps updated_at per row.
+			row.updated_at = '2026-10-16T09:59:00Z';
+			canonicalStore[String(spec.conversationId)] = row;
+			objectiveRows[String(spec.objectiveId)] = { server_id: String(spec.serverId) };
+			objectiveRuns[String(spec.objectiveId)] = spec.runs.map((run) => ({
+				objective_id: String(spec.objectiveId),
+				run_id: String(run.runId),
+				parent_run_id: run.parentRunId == null ? null : String(run.parentRunId),
+				initiating_server_id: String(spec.serverId),
+				handler: 'agent.run_v2',
+				actor_kind: 'operator',
+				created_at: String(run.createdAt)
+			}));
+			for (const run of spec.runs) {
+				if (run.registered === false) continue;
+				conversations[String(run.runId)] = runRow(
+					String(run.runId),
+					String(spec.serverId),
+					String(run.state),
+					{}
+				);
+			}
+		},
 		armSlowList(delayMs) {
 			slowListDelay = Number(delayMs);
 		},
@@ -1673,6 +1936,25 @@ async function waitForStreamRequests(count: number): Promise<void> {
 		.toBeGreaterThanOrEqual(count);
 }
 
+/** True when the FIRST `earlierSel` node precedes the FIRST `laterSel` node
+ * in document order (both present). CTU-2 order proofs ride this — never
+ * bounding-box guesses. */
+async function domPrecedes(
+	page: Page,
+	earlierSel: string,
+	laterSel: string
+): Promise<boolean> {
+	return page.evaluate(
+		([earlier, later]) => {
+			const a = document.querySelector(earlier);
+			const b = document.querySelector(later);
+			if (a === null || b === null) return false;
+			return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+		},
+		[earlierSel, laterSel] as const
+	);
+}
+
 // ---------------------------------------------------------------------------
 
 /** Serves the virtual modules and the built lazy chunks; nothing hits disk. */
@@ -1799,7 +2081,13 @@ test.beforeEach(async ({ page }) => {
 async function openFixture(
 	page: Page,
 	scenario: Scenario,
-	opts?: { tasks?: boolean; prod?: boolean; prodLegacy?: boolean }
+	opts?: {
+		tasks?: boolean;
+		prod?: boolean;
+		prodLegacy?: boolean;
+		objectives?: boolean;
+		objectiveActivity?: boolean;
+	}
 ): Promise<Page> {
 	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
 	await page.addInitScript(
@@ -1807,6 +2095,8 @@ async function openFixture(
 			window.__maiChatScenario = value.scenario;
 			window.__maiChatCanonical = value.scenario === 'canonical';
 			window.__maiChatTasks = value.tasks === true;
+			window.__maiChatObjectives = value.objectives === true;
+			window.__maiChatObjectiveActivity = value.objectiveActivity === true;
 			window.__maiChatProdClient = value.prod === true;
 			window.__maiChatProdLegacy = value.prodLegacy === true;
 		},
@@ -1814,7 +2104,9 @@ async function openFixture(
 			scenario,
 			tasks: opts?.tasks === true,
 			prod: opts?.prod === true,
-			prodLegacy: opts?.prodLegacy === true
+			prodLegacy: opts?.prodLegacy === true,
+			objectives: opts?.objectives === true,
+			objectiveActivity: opts?.objectiveActivity === true
 		}
 	);
 	await page.goto(FIXTURE_URL);
@@ -3844,6 +4136,443 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		await expect(main.getByTestId('turn-feed')).toHaveCount(0);
 		await expect(main.getByTestId('turn-feed-working')).toHaveCount(0);
 	});
+
+	test('CTU-1: restored terminal-v2 runs replay their persisted events into the chronological turn feeds', async ({
+		page
+	}) => {
+		await openFixture(page, 'canonical', { objectives: true });
+		const main = page.getByTestId('host-main');
+
+		// Server truth: a v2 conversation whose two recorded turns were run
+		// by objective-bound runs; the bindings carry every refusal case.
+		await page.evaluate((spec) => window.__maiChatApi!.seedV2Conversation(spec), {
+			conversationId: V2_CONV,
+			serverId: SERVER_A,
+			objectiveId: V2_OBJECTIVE,
+			turns: [
+				{ messageId: V2_TURN_1, role: 'user', content: 'Why is the deploy blocked?' },
+				{
+					messageId: V2_TURN_1 + '-a',
+					role: 'assistant',
+					content: 'Recorded reply: the unit was masked.'
+				},
+				{ messageId: V2_TURN_2, role: 'user', content: 'Retry with the timeout raised.' },
+				{
+					messageId: V2_TURN_2 + '-a',
+					role: 'assistant',
+					content: 'Recorded reply: the retry is queued.'
+				}
+			],
+			runs: [
+				{ runId: V2_RUN_ANCIENT, state: 'succeeded', createdAt: '2026-10-16T06:00:00Z' },
+				{
+					runId: V2_RUN_GHOST,
+					state: 'succeeded',
+					createdAt: '2026-10-16T06:30:00Z',
+					registered: false
+				},
+				{ runId: V2_RUN_LIVE, state: 'running', createdAt: '2026-10-16T07:00:00Z' },
+				{
+					runId: V2_RUN_CHILD,
+					state: 'succeeded',
+					parentRunId: V2_RUN_SUCCESS,
+					createdAt: '2026-10-16T07:30:00Z'
+				},
+				{ runId: V2_RUN_FAILED, state: 'failed', createdAt: '2026-10-16T08:50:00Z' },
+				{ runId: V2_RUN_SUCCESS, state: 'succeeded', createdAt: '2026-10-16T09:00:00Z' }
+			]
+		});
+
+		// The replayed streams: recorded persisted events, ordered by seq,
+		// self-closed like a drained terminal run (replayAll = full history).
+		queueSessionFor(V2_RUN_SUCCESS, {
+			replayAll: true,
+			frames: [
+				frame(1, 'chat.submitted', {
+					submission_sha256: PAYLOAD_SHA,
+					handler: 'agent.run_v2',
+					children: 1,
+					attachments: [],
+					conversation_id: V2_CONV,
+					message_id: V2_TURN_1
+				}),
+				frame(2, 'agent.started', {
+					connection: 'fixture-gateway',
+					profile: 'fixture-fast',
+					model: 'fixture-model-mini',
+					role: 'administrator',
+					rounds_budget: 8
+				}),
+				frame(3, 'agent.context_assembled', {
+					prompt_revision: 1,
+					truncated: false,
+					evidence_items: 0
+				}),
+				frame(4, 'agent.output_delta', {
+					kind: 'thinking',
+					delta: 'Tracing the nginx unit state',
+					round: 1,
+					part_index: 0
+				}),
+				frame(5, 'agent.tool_requested', {
+					capability_id: 'fixture.read',
+					tool_call_id: 'call-1',
+					step_seq: 1,
+					args: { path: '/etc/systemd/system' }
+				}),
+				frame(6, 'step.started', { capability_id: 'fixture.read', step_seq: 1 }),
+				frame(7, 'agent.tool_result', {
+					capability_id: 'fixture.read',
+					tool_call_id: 'call-1',
+					step_seq: 1,
+					state: 'succeeded',
+					result: { units: 3 }
+				}),
+				frame(8, 'step.completed', {
+					capability_id: 'fixture.read',
+					step_seq: 1,
+					reason: 'succeeded',
+					op_id: OP_ID
+				}),
+				frame(9, 'agent.output_delta', {
+					kind: 'text',
+					delta: 'The unit is masked.',
+					round: 1,
+					part_index: 0
+				}),
+				frame(10, 'agent.model_round', { round: 1, status: 'final', output_chars: 19 }),
+				frame(11, 'agent.completed', { rounds: 1, tool_calls: 1, output_chars: 19 })
+			]
+		});
+		queueSessionFor(V2_RUN_FAILED, {
+			replayAll: true,
+			frames: [
+				frame(1, 'chat.submitted', {
+					submission_sha256: PAYLOAD_SHA,
+					handler: 'agent.run_v2',
+					children: 0,
+					attachments: [],
+					conversation_id: V2_CONV,
+					message_id: V2_TURN_2
+				}),
+				frame(2, 'agent.started', {
+					connection: 'fixture-gateway',
+					profile: 'fixture-fast',
+					model: 'fixture-model-mini',
+					role: 'administrator',
+					rounds_budget: 8
+				}),
+				frame(3, 'agent.output_delta', {
+					kind: 'text',
+					delta: 'Partial answer before the failure',
+					round: 1,
+					part_index: 0
+				}),
+				frame(4, 'agent.failed', { reason: 'deadline_exceeded' })
+			]
+		});
+
+		// Restore from the floating history: refresh picks up the seeded v2
+		// row (the newest updated_at) as the first entry.
+		await main.getByTestId('chat-history-toggle').click();
+		await main.getByTestId('history-refresh').click();
+		await expect(main.getByTestId('history-row').first()).toContainText('V2 restored episode');
+		await main.getByTestId('chat-history-item').first().click();
+		await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+			'Retry with the timeout raised.'
+		);
+		await expect(main.getByTestId('transcript-window-meta')).toHaveText(
+			'Showing 4 of 4 recorded messages.'
+		);
+
+		// The bounded bindings read: total probe, then the most-recent window.
+		await expect
+			.poll(async () => await callsOf(page, 'listObjectiveRuns'), { timeout: 15000 })
+			.toHaveLength(2);
+		const runPageCalls = await callsOf(page, 'listObjectiveRuns');
+		expect(runPageCalls[0]!.payload).toMatchObject({ limit: 1, offset: 0 });
+		expect(runPageCalls[1]!.payload).toMatchObject({ limit: 5, offset: 1 });
+
+		// Exactly the two terminal roots replay — the ANCIENT binding fell
+		// outside the bounded window, the GHOST record is the honest 404,
+		// the LIVE run fails the terminal gate, and the CHILD is the tree's.
+		await waitForStreamRequests(2);
+		const replayCalls = await callsOf(page, 'streamConversationEvents');
+		expect(replayCalls.map((call) => call.runId).sort()).toEqual(
+			[V2_RUN_FAILED, V2_RUN_SUCCESS].sort()
+		);
+		expect(replayCalls.every((call) => call.cursor === null)).toBe(true);
+
+		// Turn 1's feed at its RECORDED anchor: reasoning, then the tool card
+		// in event order, then the verifiable round/completed facts.
+		const feed1 = main.locator(`[data-testid="turn-feed"][data-turn="${V2_TURN_1}"]`);
+		await expect(feed1).toBeVisible();
+		await expect(feed1.getByTestId('feed-thinking')).toContainText(
+			'Tracing the nginx unit state'
+		);
+		const toolCard = feed1.getByTestId('feed-tool-card');
+		await expect(toolCard).toHaveCount(1);
+		await expect(toolCard).toContainText('fixture.read');
+		await expect(toolCard).toContainText('SUCCEEDED');
+		await expect(feed1.getByTestId('feed-event')).toContainText([
+			'Submission recorded',
+			'Round 1 — final answer recorded',
+			'Conversation completed'
+		]);
+		// W2 dedup: the durable assistant row recorded the final text — the
+		// replayed final-round copy never renders twice.
+		await expect(feed1.getByTestId('feed-text')).toHaveCount(0);
+
+		// Turn 2's feed keeps the RECORDED failure reason and the recorded
+		// partial streamed text (no assistant row superseded it).
+		const feed2 = main.locator(`[data-testid="turn-feed"][data-turn="${V2_TURN_2}"]`);
+		await expect(feed2).toBeVisible();
+		await expect(feed2.getByTestId('feed-text')).toContainText(
+			'Partial answer before the failure'
+		);
+		await expect(feed2.getByTestId('feed-event')).toContainText([
+			'Submission recorded',
+			'Conversation failed (deadline_exceeded)'
+		]);
+
+		// Exactly two feeds, at their recorded turns; the transcript grew by
+		// NOTHING the server did not record (no fabricated assistant row).
+		await expect(main.getByTestId('turn-feed')).toHaveCount(2);
+		await expect(main.getByTestId('canonical-assistant-message')).toHaveCount(2);
+
+		// Replay mutated NO conversation-level fold: the facade state stays
+		// the honest no-active-run text (never 'Succeeded' from a REPLAYED
+		// agent.completed) and no restored feed renders live chrome.
+		await expect(main.getByTestId('conversation-state')).toHaveText('Conversation');
+		await expect(feed1.locator('.mai-chat__work-indicator')).toHaveCount(0);
+		await expect(feed2.locator('.mai-chat__work-indicator')).toHaveCount(0);
+		await expect(main.getByTestId('turn-feed-working')).toHaveCount(0);
+
+		// Restored feeds are static truth: their entries interleave in
+		// recorded seq order (reasoning < tool request < result < round).
+		const seqs = await feed1
+			.locator('[data-testid="feed-thinking"], [data-testid="feed-tool-card"], [data-testid="feed-event"]')
+			.evaluateAll((nodes) => nodes.map((node) => Number(node.getAttribute('data-seq'))));
+		expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+		await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
+		expect(await page.evaluate(() => window.__maiPanelErrors ?? [])).toEqual([]);
+	});
+
+	for (const viewport of [
+		{ width: 1280, height: 800 },
+		{ width: 360, height: 640 }
+	]) {
+		test(`CTU-2: transcript first — operational activity rides collapsed below (${viewport.width}x${viewport.height})`, async ({
+			page
+		}) => {
+			await page.setViewportSize(viewport);
+			await openFixture(page, 'canonical', {
+				objectives: true,
+				objectiveActivity: true
+			});
+			const main = page.getByTestId('host-main');
+
+			// ObjectiveActivity is BOUND here: its own reads ride real HTTP.
+			// The ledger page carries the SAME recorded bindings the restore
+			// seam reads; the stream self-closes (bounded backoff reconnect).
+			const activityLink = (runId: string, parentRunId: string | null, createdAt: string) => ({
+				objective_id: V2_OBJECTIVE,
+				run_id: runId,
+				parent_run_id: parentRunId,
+				initiating_server_id: SERVER_A,
+				handler: 'agent.run_v2',
+				actor_kind: 'operator',
+				created_at: createdAt
+			});
+			await page.route('**/api/v1/objectives/**', async (route) => {
+				const path = new URL(route.request().url()).pathname;
+				const json = (body: unknown) =>
+					route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
+				if (path.endsWith('/events/stream')) {
+					return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+				}
+				if (path.endsWith('/journal')) {
+					return json({
+						schema_version: 1,
+						objective_id: V2_OBJECTIVE,
+						derived_seq: 0,
+						actions_truncated: false,
+						receipts_truncated: false
+					});
+				}
+				if (path.endsWith('/events')) {
+					return json({ limit: 5, offset: 0, total: 0, has_more: false, items: [] });
+				}
+				if (path.endsWith('/runs')) {
+					return json({
+						limit: 10,
+						offset: 0,
+						total: 6,
+						has_more: false,
+						objective_id: V2_OBJECTIVE,
+						items: [
+							activityLink(V2_RUN_ANCIENT, null, '2026-10-16T06:00:00Z'),
+							activityLink(V2_RUN_GHOST, null, '2026-10-16T06:30:00Z'),
+							activityLink(V2_RUN_LIVE, null, '2026-10-16T07:00:00Z'),
+							activityLink(V2_RUN_CHILD, V2_RUN_SUCCESS, '2026-10-16T07:30:00Z'),
+							activityLink(V2_RUN_FAILED, null, '2026-10-16T08:50:00Z'),
+							activityLink(V2_RUN_SUCCESS, null, '2026-10-16T09:00:00Z')
+						]
+					});
+				}
+				return json({
+					objective_id: V2_OBJECTIVE,
+					server_id: SERVER_A,
+					status: 'active',
+					revision: 3,
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:30:00Z',
+					original_request: 'Fixture objective episode',
+					constraints: [],
+					scope: [
+						{
+							server_id: SERVER_A,
+							added_by_actor_kind: 'operator',
+							added_at: '2026-10-16T08:00:00Z'
+						}
+					]
+				});
+			});
+
+			// The same recorded v2 world CTU-1 restored (reused harness).
+			await page.evaluate((spec) => window.__maiChatApi!.seedV2Conversation(spec), {
+				conversationId: V2_CONV,
+				serverId: SERVER_A,
+				objectiveId: V2_OBJECTIVE,
+				turns: [
+					{ messageId: V2_TURN_1, role: 'user', content: 'Why is the deploy blocked?' },
+					{
+						messageId: V2_TURN_1 + '-a',
+						role: 'assistant',
+						content: 'Recorded reply: the unit was masked.'
+					},
+					{ messageId: V2_TURN_2, role: 'user', content: 'Retry with the timeout raised.' },
+					{
+						messageId: V2_TURN_2 + '-a',
+						role: 'assistant',
+						content: 'Recorded reply: the retry is queued.'
+					}
+				],
+				runs: [
+					{ runId: V2_RUN_ANCIENT, state: 'succeeded', createdAt: '2026-10-16T06:00:00Z' },
+					{
+						runId: V2_RUN_GHOST,
+						state: 'succeeded',
+						createdAt: '2026-10-16T06:30:00Z',
+						registered: false
+					},
+					{ runId: V2_RUN_LIVE, state: 'running', createdAt: '2026-10-16T07:00:00Z' },
+					{
+						runId: V2_RUN_CHILD,
+						state: 'succeeded',
+						parentRunId: V2_RUN_SUCCESS,
+						createdAt: '2026-10-16T07:30:00Z'
+					},
+					{ runId: V2_RUN_FAILED, state: 'failed', createdAt: '2026-10-16T08:50:00Z' },
+					{ runId: V2_RUN_SUCCESS, state: 'succeeded', createdAt: '2026-10-16T09:00:00Z' }
+				]
+			});
+			queueSessionFor(V2_RUN_SUCCESS, {
+				replayAll: true,
+				frames: [
+					frame(1, 'chat.submitted', {
+						submission_sha256: PAYLOAD_SHA,
+						handler: 'agent.run_v2',
+						children: 1,
+						attachments: [],
+						conversation_id: V2_CONV,
+						message_id: V2_TURN_1
+					}),
+					frame(2, 'agent.output_delta', {
+						kind: 'thinking',
+						delta: 'Tracing the nginx unit state',
+						round: 1,
+						part_index: 0
+					}),
+					frame(3, 'agent.completed', { rounds: 1, tool_calls: 0, output_chars: 19 })
+				]
+			});
+			queueSessionFor(V2_RUN_FAILED, {
+				replayAll: true,
+				frames: [
+					frame(1, 'chat.submitted', {
+						submission_sha256: PAYLOAD_SHA,
+						handler: 'agent.run_v2',
+						children: 0,
+						attachments: [],
+						conversation_id: V2_CONV,
+						message_id: V2_TURN_2
+					}),
+					frame(2, 'agent.failed', { reason: 'deadline_exceeded' })
+				]
+			});
+
+			// Restore the v2 conversation from history.
+			await main.getByTestId('chat-history-toggle').click();
+			await main.getByTestId('history-refresh').click();
+			await expect(main.getByTestId('history-row').first()).toContainText('V2 restored episode');
+			await main.getByTestId('chat-history-item').first().click();
+
+			// The restored feeds are on the record before any layout proof.
+			await expect(main.getByTestId('turn-feed')).toHaveCount(2);
+
+			// AC1: the FIRST recorded user message precedes the operational
+			// activity — nothing objective-ish renders above the dialogue.
+			expect(
+				await domPrecedes(page, '[data-testid="canonical-user-message"]', '[data-testid="objective-activity"]')
+			).toBe(true);
+			// The restored feed precedes the secondary ledger too.
+			expect(
+				await domPrecedes(page, '[data-testid="turn-feed"]', '[data-testid="objective-activity"]')
+			).toBe(true);
+
+			// AC3: the operational surface is a COLLAPSED-BY-DEFAULT
+			// disclosure — hidden until the reader asks for it.
+			const disclosure = main.getByTestId('ops-disclosure');
+			await expect(disclosure).toHaveCount(1);
+			await expect(disclosure).not.toHaveAttribute('open');
+			await expect(main.getByTestId('objective-activity')).toBeHidden();
+			await main.getByTestId('ops-disclosure-summary').click();
+			await expect(disclosure).toHaveAttribute('open', '');
+			await expect(main.getByTestId('objective-activity')).toBeVisible();
+
+			// AC4: exactly ONE resume composer — the operational one inside
+			// ObjectiveActivity; the chat composer stays the only primary.
+			await expect(main.getByTestId('resume-section')).toHaveCount(1);
+			await expect(main.getByTestId('resume-message')).toHaveCount(1);
+			await expect(main.getByTestId('compose-message')).toHaveCount(1);
+
+			// Bounded layout: the disclosure lives inside the conversation
+			// scroll region at this viewport — the transcript scrolls, the
+			// page never grows.
+			await expect(main.locator('.mai-chat__conversation-scroll')).toHaveCSS(
+				'overflow-y',
+				'auto'
+			);
+			await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
+
+			// AC5: a NON-v2 conversation renders NO disclosure wrapper — the
+			// legacy Details surface stays byte-identical.
+			await main.getByTestId('chat-history-toggle').click();
+			await main.getByTestId('history-refresh').click();
+			await main
+				.getByTestId('history-row')
+				.filter({ hasText: 'Restore me' })
+				.getByTestId('chat-history-item')
+				.click();
+			await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+				'Restore question 7'
+			);
+			await expect(main.getByTestId('ops-disclosure')).toHaveCount(0);
+			await expect(main.getByTestId('objective-activity')).toHaveCount(0);
+			await expect(main.getByTestId('resume-section')).toHaveCount(0);
+		});
+	}
 
 });
 
