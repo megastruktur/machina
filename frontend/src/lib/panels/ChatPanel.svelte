@@ -4717,19 +4717,6 @@
 				     blocks left this region for the Task Inspector drawer — the
 				     same grid-starvation rationale keeps the gap banner here.) -->
 				<div class="mai-chat__conversation-scroll" bind:this={conversationScrollEl}>
-				{#if v2Conversation && openObjectiveId !== null && canonicalId !== null && canonicalScope !== null}
-					<ObjectiveActivity
-						objectiveId={openObjectiveId}
-						serverId={canonicalScope}
-						conversationId={canonicalId}
-						api={api}
-						serverLabels={serverLabelMap}
-						elapsedSeconds={elapsedSeconds}
-						pendingSteering={canonicalPendingSteering}
-						liveRunId={activeRunId || null}
-					/>
-				{/if}
-
 					{#if canonicalMode && canonicalCompleteness !== 'complete'}
 						<div
 							class="mai-chat__note mai-chat__note--error mai-chat__gap-banner"
@@ -4922,6 +4909,36 @@
 							<p class="mai-chat__meta" data-testid="transcript-window-meta">
 								Showing {canonicalMessages.length} of {canonicalTotal} recorded messages.
 							</p>
+							<!-- CTU-2: the dialogue is primary; the objective's
+							     operational diagnostics (header, run controls,
+							     resume, ledger) are secondary and ride BELOW the
+							     complete transcript in a collapsed-by-default
+							     disclosure. The resume composer stays the ONE
+							     operational surface (inside ObjectiveActivity);
+							     the chat composer above remains the only primary
+							     one. -->
+							{#if v2Conversation && openObjectiveId !== null && canonicalId !== null && canonicalScope !== null}
+								<details
+									class="mai-chat__ops-disclosure"
+									data-testid="ops-disclosure"
+								>
+									<summary class="mai-chat__ops-summary" data-testid="ops-disclosure-summary">
+										Operational activity
+									</summary>
+									<div class="mai-chat__ops-body" data-testid="ops-disclosure-body">
+										<ObjectiveActivity
+											objectiveId={openObjectiveId}
+											serverId={canonicalScope}
+											conversationId={canonicalId}
+											api={api}
+											serverLabels={serverLabelMap}
+											elapsedSeconds={elapsedSeconds}
+											pendingSteering={canonicalPendingSteering}
+											liveRunId={activeRunId || null}
+										/>
+									</div>
+								</details>
+							{/if}
 						{/if}
 					{:else}
 					{#each priorTurns as turn (turn.runId)}
@@ -6024,6 +6041,54 @@
 		overscroll-behavior: contain;
 		padding: 0;
 		scrollbar-gutter: stable;
+	}
+
+	/* CTU-2: the objective's operational diagnostics ride BELOW the
+	   transcript as secondary diagnostics — collapsed until asked for. */
+	.mai-chat__ops-disclosure {
+		min-width: 0;
+		max-width: 100%;
+		border: 1px solid color-mix(in srgb, var(--mai-color-brass) 18%, transparent);
+		border-radius: var(--mai-radius-lg);
+		background: color-mix(in srgb, var(--mai-color-brass) 4%, transparent);
+		padding: 0;
+	}
+
+	.mai-chat__ops-summary {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+		cursor: pointer;
+		user-select: none;
+		list-style: none;
+		padding: var(--mai-space-2) var(--mai-space-3);
+		min-height: 32px;
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-chat__ops-summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.mai-chat__ops-summary::before {
+		content: '▸';
+		color: var(--mai-color-brass-dim);
+		flex: 0 0 auto;
+	}
+
+	.mai-chat__ops-disclosure[open] > .mai-chat__ops-summary::before {
+		content: '▾';
+	}
+
+	.mai-chat__ops-body {
+		min-width: 0;
+		max-width: 100%;
+		padding: 0 var(--mai-space-3) var(--mai-space-3);
 	}
 
 	.mai-chat__bubble {

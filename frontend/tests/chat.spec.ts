@@ -209,6 +209,11 @@ declare global {
 		 * the bag (CTU-1 — the restore seam narrows it). Without it every
 		 * terminal-v2 feed restore stays honestly absent. */
 		__maiChatObjectives?: boolean;
+		/** Set by a test init script: ObjectiveActivity's own readObjective
+		 * method rides the bag too (CTU-2 — the operational-activity surface
+		 * binds and renders). Without it the activity sections stay honestly
+		 * unbound exactly as CTU-1 proved them. */
+		__maiChatObjectiveActivity?: boolean;
 		/** Set by a test init script: the bag's api IS the REAL composed
 		 * client (`createMaiApiClient()`) and the optional history-tag slice
 		 * rides `services.tags` — every panel call leaves as actual HTTP
@@ -1195,6 +1200,35 @@ const APP_SOURCE = `
 			throw new ApiError(404, 'not_found', 'no reconcilable step for this conversation');
 		}
 	};
+	// CTU-2: ObjectiveActivity's own binding surface rides ONLY when the
+	// init script sets __maiChatObjectiveActivity — CTU-1's unbound behavior
+	// stays byte-identical, the operational-activity disclosure proves the
+	// bound surface here.
+	const ACTIVITY_BOUND = window.__maiChatObjectiveActivity === true;
+	const objectiveActivityApi = {
+		async readObjective(objectiveId, serverId) {
+			calls.push({ op: 'readObjective', runId: objectiveId, serverId });
+			const row = objectiveRows[String(objectiveId)];
+			if (!row || row.server_id !== serverId) throw objectiveNotFound();
+			return {
+				objective_id: String(objectiveId),
+				server_id: serverId,
+				status: 'active',
+				revision: 3,
+				created_at: '2026-10-16T08:00:00Z',
+				updated_at: '2026-10-16T08:30:00Z',
+				original_request: 'Fixture objective episode',
+				constraints: [],
+				scope: [
+					{
+						server_id: serverId,
+						added_by_actor_kind: 'operator',
+						added_at: '2026-10-16T08:00:00Z'
+					}
+				]
+			};
+		}
+	};
 
 	let approvalReadFailure = null;
 	let failNextRead = null;
@@ -1211,6 +1245,9 @@ const APP_SOURCE = `
 		// The v2 objective slice rides ONLY when the init script binds it
 		// (CTU-1): the unbound path keeps every feed restore absent.
 		...(OBJECTIVES_BOUND ? objectiveApi : {}),
+		// ObjectiveActivity's binding surface (CTU-2): readObjective rides
+		// ONLY under its own flag — the CTU-1 bag stays byte-identical.
+		...(OBJECTIVES_BOUND && ACTIVITY_BOUND ? objectiveActivityApi : {}),
 		async submitMessage(payload) {
 			const wire = JSON.parse(JSON.stringify(payload));
 			calls.push({ op: 'submitMessage', payload: wire });
@@ -1899,6 +1936,25 @@ async function waitForStreamRequests(count: number): Promise<void> {
 		.toBeGreaterThanOrEqual(count);
 }
 
+/** True when the FIRST `earlierSel` node precedes the FIRST `laterSel` node
+ * in document order (both present). CTU-2 order proofs ride this — never
+ * bounding-box guesses. */
+async function domPrecedes(
+	page: Page,
+	earlierSel: string,
+	laterSel: string
+): Promise<boolean> {
+	return page.evaluate(
+		([earlier, later]) => {
+			const a = document.querySelector(earlier);
+			const b = document.querySelector(later);
+			if (a === null || b === null) return false;
+			return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+		},
+		[earlierSel, laterSel] as const
+	);
+}
+
 // ---------------------------------------------------------------------------
 
 /** Serves the virtual modules and the built lazy chunks; nothing hits disk. */
@@ -2025,7 +2081,13 @@ test.beforeEach(async ({ page }) => {
 async function openFixture(
 	page: Page,
 	scenario: Scenario,
-	opts?: { tasks?: boolean; prod?: boolean; prodLegacy?: boolean; objectives?: boolean }
+	opts?: {
+		tasks?: boolean;
+		prod?: boolean;
+		prodLegacy?: boolean;
+		objectives?: boolean;
+		objectiveActivity?: boolean;
+	}
 ): Promise<Page> {
 	await page.clock.setFixedTime(new Date('2026-10-16T09:30:00Z'));
 	await page.addInitScript(
@@ -2034,6 +2096,7 @@ async function openFixture(
 			window.__maiChatCanonical = value.scenario === 'canonical';
 			window.__maiChatTasks = value.tasks === true;
 			window.__maiChatObjectives = value.objectives === true;
+			window.__maiChatObjectiveActivity = value.objectiveActivity === true;
 			window.__maiChatProdClient = value.prod === true;
 			window.__maiChatProdLegacy = value.prodLegacy === true;
 		},
@@ -2042,7 +2105,8 @@ async function openFixture(
 			tasks: opts?.tasks === true,
 			prod: opts?.prod === true,
 			prodLegacy: opts?.prodLegacy === true,
-			objectives: opts?.objectives === true
+			objectives: opts?.objectives === true,
+			objectiveActivity: opts?.objectiveActivity === true
 		}
 	);
 	await page.goto(FIXTURE_URL);
@@ -4293,6 +4357,222 @@ test.describe('canonical conversation continuity (in-page canonical store)', () 
 		await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
 		expect(await page.evaluate(() => window.__maiPanelErrors ?? [])).toEqual([]);
 	});
+
+	for (const viewport of [
+		{ width: 1280, height: 800 },
+		{ width: 360, height: 640 }
+	]) {
+		test(`CTU-2: transcript first — operational activity rides collapsed below (${viewport.width}x${viewport.height})`, async ({
+			page
+		}) => {
+			await page.setViewportSize(viewport);
+			await openFixture(page, 'canonical', {
+				objectives: true,
+				objectiveActivity: true
+			});
+			const main = page.getByTestId('host-main');
+
+			// ObjectiveActivity is BOUND here: its own reads ride real HTTP.
+			// The ledger page carries the SAME recorded bindings the restore
+			// seam reads; the stream self-closes (bounded backoff reconnect).
+			const activityLink = (runId: string, parentRunId: string | null, createdAt: string) => ({
+				objective_id: V2_OBJECTIVE,
+				run_id: runId,
+				parent_run_id: parentRunId,
+				initiating_server_id: SERVER_A,
+				handler: 'agent.run_v2',
+				actor_kind: 'operator',
+				created_at: createdAt
+			});
+			await page.route('**/api/v1/objectives/**', async (route) => {
+				const path = new URL(route.request().url()).pathname;
+				const json = (body: unknown) =>
+					route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
+				if (path.endsWith('/events/stream')) {
+					return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+				}
+				if (path.endsWith('/journal')) {
+					return json({
+						schema_version: 1,
+						objective_id: V2_OBJECTIVE,
+						derived_seq: 0,
+						actions_truncated: false,
+						receipts_truncated: false
+					});
+				}
+				if (path.endsWith('/events')) {
+					return json({ limit: 5, offset: 0, total: 0, has_more: false, items: [] });
+				}
+				if (path.endsWith('/runs')) {
+					return json({
+						limit: 10,
+						offset: 0,
+						total: 6,
+						has_more: false,
+						objective_id: V2_OBJECTIVE,
+						items: [
+							activityLink(V2_RUN_ANCIENT, null, '2026-10-16T06:00:00Z'),
+							activityLink(V2_RUN_GHOST, null, '2026-10-16T06:30:00Z'),
+							activityLink(V2_RUN_LIVE, null, '2026-10-16T07:00:00Z'),
+							activityLink(V2_RUN_CHILD, V2_RUN_SUCCESS, '2026-10-16T07:30:00Z'),
+							activityLink(V2_RUN_FAILED, null, '2026-10-16T08:50:00Z'),
+							activityLink(V2_RUN_SUCCESS, null, '2026-10-16T09:00:00Z')
+						]
+					});
+				}
+				return json({
+					objective_id: V2_OBJECTIVE,
+					server_id: SERVER_A,
+					status: 'active',
+					revision: 3,
+					created_at: '2026-10-16T08:00:00Z',
+					updated_at: '2026-10-16T08:30:00Z',
+					original_request: 'Fixture objective episode',
+					constraints: [],
+					scope: [
+						{
+							server_id: SERVER_A,
+							added_by_actor_kind: 'operator',
+							added_at: '2026-10-16T08:00:00Z'
+						}
+					]
+				});
+			});
+
+			// The same recorded v2 world CTU-1 restored (reused harness).
+			await page.evaluate((spec) => window.__maiChatApi!.seedV2Conversation(spec), {
+				conversationId: V2_CONV,
+				serverId: SERVER_A,
+				objectiveId: V2_OBJECTIVE,
+				turns: [
+					{ messageId: V2_TURN_1, role: 'user', content: 'Why is the deploy blocked?' },
+					{
+						messageId: V2_TURN_1 + '-a',
+						role: 'assistant',
+						content: 'Recorded reply: the unit was masked.'
+					},
+					{ messageId: V2_TURN_2, role: 'user', content: 'Retry with the timeout raised.' },
+					{
+						messageId: V2_TURN_2 + '-a',
+						role: 'assistant',
+						content: 'Recorded reply: the retry is queued.'
+					}
+				],
+				runs: [
+					{ runId: V2_RUN_ANCIENT, state: 'succeeded', createdAt: '2026-10-16T06:00:00Z' },
+					{
+						runId: V2_RUN_GHOST,
+						state: 'succeeded',
+						createdAt: '2026-10-16T06:30:00Z',
+						registered: false
+					},
+					{ runId: V2_RUN_LIVE, state: 'running', createdAt: '2026-10-16T07:00:00Z' },
+					{
+						runId: V2_RUN_CHILD,
+						state: 'succeeded',
+						parentRunId: V2_RUN_SUCCESS,
+						createdAt: '2026-10-16T07:30:00Z'
+					},
+					{ runId: V2_RUN_FAILED, state: 'failed', createdAt: '2026-10-16T08:50:00Z' },
+					{ runId: V2_RUN_SUCCESS, state: 'succeeded', createdAt: '2026-10-16T09:00:00Z' }
+				]
+			});
+			queueSessionFor(V2_RUN_SUCCESS, {
+				replayAll: true,
+				frames: [
+					frame(1, 'chat.submitted', {
+						submission_sha256: PAYLOAD_SHA,
+						handler: 'agent.run_v2',
+						children: 1,
+						attachments: [],
+						conversation_id: V2_CONV,
+						message_id: V2_TURN_1
+					}),
+					frame(2, 'agent.output_delta', {
+						kind: 'thinking',
+						delta: 'Tracing the nginx unit state',
+						round: 1,
+						part_index: 0
+					}),
+					frame(3, 'agent.completed', { rounds: 1, tool_calls: 0, output_chars: 19 })
+				]
+			});
+			queueSessionFor(V2_RUN_FAILED, {
+				replayAll: true,
+				frames: [
+					frame(1, 'chat.submitted', {
+						submission_sha256: PAYLOAD_SHA,
+						handler: 'agent.run_v2',
+						children: 0,
+						attachments: [],
+						conversation_id: V2_CONV,
+						message_id: V2_TURN_2
+					}),
+					frame(2, 'agent.failed', { reason: 'deadline_exceeded' })
+				]
+			});
+
+			// Restore the v2 conversation from history.
+			await main.getByTestId('chat-history-toggle').click();
+			await main.getByTestId('history-refresh').click();
+			await expect(main.getByTestId('history-row').first()).toContainText('V2 restored episode');
+			await main.getByTestId('chat-history-item').first().click();
+
+			// The restored feeds are on the record before any layout proof.
+			await expect(main.getByTestId('turn-feed')).toHaveCount(2);
+
+			// AC1: the FIRST recorded user message precedes the operational
+			// activity — nothing objective-ish renders above the dialogue.
+			expect(
+				await domPrecedes(page, '[data-testid="canonical-user-message"]', '[data-testid="objective-activity"]')
+			).toBe(true);
+			// The restored feed precedes the secondary ledger too.
+			expect(
+				await domPrecedes(page, '[data-testid="turn-feed"]', '[data-testid="objective-activity"]')
+			).toBe(true);
+
+			// AC3: the operational surface is a COLLAPSED-BY-DEFAULT
+			// disclosure — hidden until the reader asks for it.
+			const disclosure = main.getByTestId('ops-disclosure');
+			await expect(disclosure).toHaveCount(1);
+			await expect(disclosure).not.toHaveAttribute('open');
+			await expect(main.getByTestId('objective-activity')).toBeHidden();
+			await main.getByTestId('ops-disclosure-summary').click();
+			await expect(disclosure).toHaveAttribute('open', '');
+			await expect(main.getByTestId('objective-activity')).toBeVisible();
+
+			// AC4: exactly ONE resume composer — the operational one inside
+			// ObjectiveActivity; the chat composer stays the only primary.
+			await expect(main.getByTestId('resume-section')).toHaveCount(1);
+			await expect(main.getByTestId('resume-message')).toHaveCount(1);
+			await expect(main.getByTestId('compose-message')).toHaveCount(1);
+
+			// Bounded layout: the disclosure lives inside the conversation
+			// scroll region at this viewport — the transcript scrolls, the
+			// page never grows.
+			await expect(main.locator('.mai-chat__conversation-scroll')).toHaveCSS(
+				'overflow-y',
+				'auto'
+			);
+			await expect(main.getByTestId('panel-render-failed')).toHaveCount(0);
+
+			// AC5: a NON-v2 conversation renders NO disclosure wrapper — the
+			// legacy Details surface stays byte-identical.
+			await main.getByTestId('chat-history-toggle').click();
+			await main.getByTestId('history-refresh').click();
+			await main
+				.getByTestId('history-row')
+				.filter({ hasText: 'Restore me' })
+				.getByTestId('chat-history-item')
+				.click();
+			await expect(main.getByTestId('canonical-user-message').last()).toContainText(
+				'Restore question 7'
+			);
+			await expect(main.getByTestId('ops-disclosure')).toHaveCount(0);
+			await expect(main.getByTestId('objective-activity')).toHaveCount(0);
+			await expect(main.getByTestId('resume-section')).toHaveCount(0);
+		});
+	}
 
 });
 
