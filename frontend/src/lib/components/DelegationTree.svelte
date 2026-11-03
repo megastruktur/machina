@@ -51,6 +51,14 @@
 	 *    `run_id`), so a reconnect never duplicates nodes. The stream is
 	 *    read-only: it never submits, cancels or retargets anything (windowed
 	 *    ADR §7).
+	 *  - Refresh discipline (pool-exhaustion guard): the durable reread is
+	 *    triggered ONLY by durable-projection events (`run.transition`,
+	 *    `run.cancel_requested`, `step.awaiting_approval`,
+	 *    `agent.completed`, `agent.failed`). High-frequency fold-only
+	 *    observations (`agent.output_delta`, the budget and delegation
+	 *    folds above) update client state alone and NEVER reread, and
+	 *    rereads are single-flight with at most one trailing retry — a hot
+	 *    stream must not translate into `readConversation` traffic.
 	 *  - Honest cancel (engine guard rule 3): the cancel control posts the
 	 *    explicit tree-cancel body (`cancel_children: true` — a cancelled
 	 *    conversation never orphans delegated work) and renders exactly the
@@ -178,10 +186,25 @@
 	const RESERVED_EVENT = 'agent.budget_reserved';
 	const RELEASED_EVENT = 'agent.budget_released';
 	const CHARGED_EVENT = 'agent.budget_charged';
+	/**
+	 * Event types that can change the DURABLE projection this view rereads
+	 * (replayed root/child rows): only these justify a `readConversation`.
+	 * Everything else on the stream — `agent.output_delta` above all, plus
+	 * the budget/delegation observations the fold above already mirrors —
+	 * is fold-only and never rereads, so a delta burst cannot amplify into
+	 * refresh traffic (pool-exhaustion guard).
+	 */
+	const REFRESH_EVENT_TYPES: ReadonlySet<string> = new Set([
+		'run.transition',
+		'run.cancel_requested',
+		'step.awaiting_approval',
+		'agent.completed',
+		'agent.failed'
+	]);
 
 	/** Fixed reconnect delay after a stream close/failure (bounded, visible). */
 	const BACKOFF_MS = 750;
-	/** Debounce for the durable refresh triggered by delivered events. */
+	/** Debounce coalescing refresh-worthy events into one durable reread. */
 	const REFRESH_DEBOUNCE_MS = 150;
 
 	// --- value-free display helpers (C08 rule 6) -----------------------------
@@ -528,13 +551,25 @@
 				break;
 			}
 			default:
-				// Other stream events (run.transition, agent.model_round, …) are
-				// reflected through the debounced durable refresh, not folded here.
+				// Not folded here: durable-projection events (run.transition,
+				// run.cancel_requested, step.awaiting_approval,
+				// agent.completed) reach the view through the debounced
+				// reread; everything else (agent.output_delta,
+				// agent.model_round, …) is a fold-only observation and
+				// refreshes nothing.
 				break;
 		}
 	}
 
 	// --- durable refresh (replayed facade state; never an engine call) --------
+
+	/**
+	 * Single-flight guard: at most ONE `readConversation` is in flight, with
+	 * at most ONE trailing reread queued behind it — refresh-worthy events
+	 * can never overlap requests (pool-exhaustion guard, requirement 2).
+	 */
+	let loadInFlight = false;
+	let trailingLoad = false;
 
 	function scheduleRefresh(): void {
 		if (refreshTimer !== null || disposed) return;
@@ -545,7 +580,14 @@
 	}
 
 	async function loadConversation(): Promise<void> {
+		if (loadInFlight) {
+			// A relevant reread is already running; coalesce into at most
+			// one trailing retry instead of stacking requests.
+			trailingLoad = true;
+			return;
+		}
 		if (apiBag === null || runId === '') return;
+		loadInFlight = true;
 		try {
 			const view = await apiBag.readConversation(runId);
 			if (disposed || view.run_id !== runId) return;
@@ -561,6 +603,12 @@
 					messageOf(error) ?? 'The conversation state could not be refreshed.'
 				)
 			};
+		} finally {
+			loadInFlight = false;
+		}
+		if (trailingLoad) {
+			trailingLoad = false;
+			if (!disposed) void loadConversation();
 		}
 	}
 
@@ -582,6 +630,9 @@
 		ledger = { seen: 0, reservations: 0, releases: 0, activeSlots: 0, consumedSteps: 0, consumedTokens: 0 };
 		appliedEvents = 0;
 		lastSeq = 0;
+		// A stale trailing-reread flag from a previous mount cycle must not
+		// schedule a spurious read on the next one.
+		trailingLoad = false;
 		streamProblem = null;
 		refreshProblem = null;
 		streamStatus = 'connecting';
@@ -606,7 +657,10 @@
 						foldEvent(event);
 						appliedEvents += 1;
 						streamProblem = null;
-						scheduleRefresh();
+						// Durable reread only when the event can change the
+						// replayed projection: a folded delta burst (applied and
+						// counted above) refreshes nothing.
+						if (REFRESH_EVENT_TYPES.has(event.type)) scheduleRefresh();
 					}
 				});
 			} catch (error) {

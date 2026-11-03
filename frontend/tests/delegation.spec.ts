@@ -612,6 +612,13 @@ test('discovers planned children from the stream exactly once; rows resolve them
 						{ run_id: CHILD_B, state: 'failed' }
 					]
 				}
+			},
+			// The durable-projection event: run.transition (not the fold-only
+			// resolutions) is what justifies the reread that lands the rows.
+			{
+				seq: 3,
+				type: 'run.transition',
+				data: { from: 'running', to: 'waiting_children' }
 			}
 		]
 	});
@@ -659,7 +666,7 @@ test('discovers planned children from the stream exactly once; rows resolve them
 	await expect(main.getByTestId('child-model').nth(0)).toHaveText('Model fast');
 
 	// Session 3: a misbehaving replay re-delivers seq 1–2. Await request 3
-	// (cursor '2'), queue the replay — the producer filter and the consumer
+	// (cursor '3'), queue the replay — the producer filter and the consumer
 	// watermark both drop every frame, so nothing changes.
 	await waitForStreamRequests(3);
 	queueStreamSession({
@@ -676,18 +683,73 @@ test('discovers planned children from the stream exactly once; rows resolve them
 			}
 		]
 	});
-	await expect(main.getByTestId('tree-cursor')).toContainText('Events applied: 2 (cursor #2)');
+	await expect(main.getByTestId('tree-cursor')).toContainText('Events applied: 3 (cursor #3)');
 	await expect(main.getByTestId('child-row')).toHaveCount(2);
 
 	// The subscriptions resumed from the watermark each time: cursors
-	// null → '1' → '2' for the first three requests.
+	// null → '1' → '3' for the first three requests.
 	await expect
 		.poll(
 			async () =>
 				(await callsOf(page, 'streamConversationEvents')).slice(0, 3).map((call) => call.cursor ?? null),
 			{ timeout: 15000 }
 		)
-		.toEqual([null, '1', '2']);
+		.toEqual([null, '1', '3']);
+});
+
+test('output_delta bursts never reread; a transition still refreshes exactly once', async ({ page }) => {
+	await openFixture(page, 'empty');
+	const main = page.getByTestId('component-host').first();
+
+	// Session 1 (on the held mount subscription): a high-frequency fold-only
+	// delta burst. Every frame is applied to the fold and counted by the
+	// cursor — the burst is OBSERVED, never dropped — but none of it can
+	// change the replayed rows, so none of it justifies a read.
+	queueStreamSession({
+		frames: Array.from({ length: 12 }, (_, index) => ({
+			seq: index + 1,
+			type: 'agent.output_delta',
+			data: { round: 1, kind: 'text', part_index: 0, delta: `chunk ${index}` }
+		}))
+	});
+	await waitForStreamRequests(1);
+	await expect(main.getByTestId('tree-cursor')).toContainText('Events applied: 12 (cursor #12)');
+
+	// The closed session reconnects (cursor '12') and is held; the quiet
+	// window spans several debounce windows: the burst produced ZERO reads
+	// beyond the single mount read.
+	await waitForStreamRequests(2);
+	await page.waitForTimeout(600);
+	expect((await callsOf(page, 'readConversation')).length).toBe(1);
+
+	// Session 2 (on the held reconnect): a durable transition BETWEEN two
+	// deltas, plus a second transition inside the same debounce window.
+	// Exactly ONE reread lands; the deltas and the coalesced second
+	// transition add nothing.
+	queueStreamSession({
+		frames: [
+			{
+				seq: 13,
+				type: 'agent.output_delta',
+				data: { round: 1, kind: 'text', part_index: 0, delta: 'x' }
+			},
+			{ seq: 14, type: 'run.transition', data: { from: 'running', to: 'waiting_children' } },
+			{
+				seq: 15,
+				type: 'agent.output_delta',
+				data: { round: 1, kind: 'text', part_index: 0, delta: 'y' }
+			},
+			{ seq: 16, type: 'run.transition', data: { from: 'waiting_children', to: 'running' } }
+		]
+	});
+	await expect
+		.poll(async () => (await callsOf(page, 'readConversation')).length, { timeout: 10000 })
+		.toBe(2);
+	await expect(main.getByTestId('tree-cursor')).toContainText('Events applied: 16 (cursor #16)');
+	// The refreshed root stays honest: the fixture row never changed state.
+	await expect(main.getByTestId('root-state')).toHaveAttribute('data-state', 'active');
+	await page.waitForTimeout(600);
+	expect((await callsOf(page, 'readConversation')).length).toBe(2);
 });
 
 test('bounded outcomes are distinguishable; cancel posts the explicit tree-cancel and renders honest states', async ({ page }) => {
