@@ -82,6 +82,7 @@ from mai.contracts.sessions import (
     SessionContractError,
     SessionEntryView,
     SessionSourceKind,
+    ToolCallItem,
     ToolResultEntry,
     UserMessageEntry,
     partition_replayable_tool_groups,
@@ -938,7 +939,11 @@ def test_oversized_output_stays_under_the_dispatcher_budget() -> None:
     assert entry.status == "unknown_effect"  # no structured success evidence
     envelope = project_replay_envelope(entry)
     size = len(json.dumps(envelope, ensure_ascii=False).encode("utf-8"))
-    assert size <= MAX_RESULT_ENVELOPE_BYTES, size
+    # R03 F2: the envelope cap is the frozen 64 KiB page discipline
+    # (65,536 bytes) — NOT the dispatcher's 1 MiB construction bound.
+    assert size <= 64 * 1024, size
+    assert size <= MAX_RESULT_ENVELOPE_BYTES
+    assert MAX_RESULT_ENVELOPE_BYTES == 65536
     assert "tail-marker" not in json.dumps(envelope)  # the tail was cut, honestly
 
 
@@ -994,6 +999,92 @@ def test_forged_executed_status_raises_never_rewrites() -> None:
     )
     assert coerced.status == "unknown_effect"
     assert coerced.execution_status is ExecutionStatus.OUTCOME_UNKNOWN
+
+
+def test_unknown_effect_results_round_trip_the_native_window() -> None:
+    """R03 F1 pin: a COMPLETE group whose result is unknown_effect/failed
+    still replays natively — every ToolReturnPart outcome is an adapter-
+    valid non-Optional Literal, and the full window round-trips
+    ModelMessagesTypeAdapter.dump_json + validate_json."""
+    sid = uuid.uuid4()
+
+    def result_entry(
+        n: int, seq: int, call_id: str, *, status: str, execution: ExecutionStatus
+    ) -> SessionEntryView:
+        return _entry(
+            ToolResultEntry(
+                kind=EntryKind.TOOL_RESULT,
+                call_id=call_id,
+                tool_name="tail_logs",
+                capability_id="host.logs",
+                status=status,
+                execution_status=execution,
+                domain_outcome=DomainOutcome.UNKNOWN,
+                effect_certainty=EffectCertainty.UNKNOWN,
+                payload_hash="a" * 64,
+            ),
+            n,
+            seq=seq,
+            run_id=None,
+            sid=sid,
+        )
+
+    def assistant_with_one_call(
+        n: int, seq: int, call_id: str, sid: uuid.UUID
+    ) -> SessionEntryView:
+        payload = AssistantMessageEntry(
+            kind=EntryKind.ASSISTANT_MESSAGE,
+            tool_calls=[
+                ToolCallItem(
+                    call_id=call_id,
+                    tool_name="tail_logs",
+                    capability_id="host.logs",
+                    args={"source": "x"},
+                )
+            ],
+            model_profile=MODEL_PROFILE,
+        )
+        return _entry(payload, n, seq=seq, run_id=None, sid=sid)
+
+    # Case A: wrapper ran and FAILED -> native outcome "failed".
+    case_a = [
+        assistant_with_one_call(1, 1, "call-f", sid),
+        result_entry(2, 2, "call-f", status="unknown_effect", execution=ExecutionStatus.FAILED),
+    ]
+    window_a = build_native_model_history(
+        case_a, provider=PROVIDER, model_profile=MODEL_PROFILE, session_server_id=SERVER_A
+    )
+    returns_a = [
+        p for m in window_a.messages for p in m.parts if isinstance(p, ToolReturnPart)
+    ]
+    assert [p.outcome for p in returns_a] == ["failed"]
+    encoded_a = ModelMessagesTypeAdapter.dump_json(list(window_a.messages))
+    assert len(ModelMessagesTypeAdapter.validate_json(encoded_a)) == len(
+        window_a.messages
+    )
+
+    # Case B: unproven/uncertain outcome -> native outcome "interrupted".
+    case_b = [
+        assistant_with_one_call(1, 1, "call-u", sid),
+        result_entry(
+            2,
+            2,
+            "call-u",
+            status="unknown_effect",
+            execution=ExecutionStatus.OUTCOME_UNKNOWN,
+        ),
+    ]
+    window_b = build_native_model_history(
+        case_b, provider=PROVIDER, model_profile=MODEL_PROFILE, session_server_id=SERVER_A
+    )
+    returns_b = [
+        p for m in window_b.messages for p in m.parts if isinstance(p, ToolReturnPart)
+    ]
+    assert [p.outcome for p in returns_b] == ["interrupted"]
+    encoded_b = ModelMessagesTypeAdapter.dump_json(list(window_b.messages))
+    assert len(ModelMessagesTypeAdapter.validate_json(encoded_b)) == len(
+        window_b.messages
+    )
 
 
 def test_forged_output_json_cannot_overwrite_envelope_fields() -> None:
@@ -1070,6 +1161,10 @@ def test_compaction_supersession_and_anchor() -> None:
         model_profile=MODEL_PROFILE,
     )
     assert history.superseded_by_compaction == 2
+    anchors = [
+        p for m in history.messages for p in m.parts if isinstance(p, SystemPromptPart)
+    ]
+    assert len(anchors) == 1, "exactly one compaction anchor (R03 F3)"
     assert isinstance(history.messages[0].parts[0], SystemPromptPart)
     anchor = history.messages[0].parts[0].content
     assert anchor.startswith(
@@ -1154,12 +1249,10 @@ def test_projector_and_bridge_have_zero_old_imports() -> None:
     findings.extend(_forbidden_imports(src / "session_history.py"))
     findings.extend(_forbidden_imports(src / "tools.py"))
     assert findings == [], findings
-    # The pinned harness is NOT imported by the new runtime modules.
-    import sys
-
+    # The projector module carries no harness compactor attribute, and the
+    # harness distribution is not the module's runtime dependency surface
+    # (its absence from the module namespace is the meaningful check here;
+    # process-wide sys.modules state is other tests' concern).
     module = importlib.import_module("mai.agents.session_history")
     assert not hasattr(module, "TieredCompaction")
-    assert "pydantic_ai_harness" not in sys.modules or all(
-        name.split(".")[0] != "pydantic_ai_harness"
-        for name in ()
-    )
+    assert not hasattr(module, "pydantic_ai_harness")

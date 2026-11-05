@@ -81,7 +81,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mai.agents.output_safety import project_text, redact_text
 from mai.agents.tools import ToolResult, ToolStatus as BridgeToolStatus
 from mai.agents.tools import project_tool_result
-from mai.capabilities.dispatch import MAX_OUTPUT_BUDGET_BYTES
 from mai.contracts.sessions import (
     HISTORY_PAGE_MAX_ENTRIES,
     MAX_ERROR_DETAIL_CHARS,
@@ -130,8 +129,10 @@ __all__ = [
 
 # --- frozen bounds ---------------------------------------------------------------
 
-#: The model-facing tool envelope cap = the dispatcher's 64 KiB budget.
-MAX_RESULT_ENVELOPE_BYTES: Final[int] = MAX_OUTPUT_BUDGET_BYTES
+#: The model-facing tool envelope cap = the frozen 64 KiB dispatcher/page
+#: discipline (AGENTS.md §1; NOT ``MAX_OUTPUT_BUDGET_BYTES``, which is the
+#: dispatcher's 1 MiB construction-DoS bound).
+MAX_RESULT_ENVELOPE_BYTES: Final[int] = 64 * 1024
 
 #: Explicit truncation marker (brief §4: never mistake a truncated preview
 #: for complete output).
@@ -174,15 +175,39 @@ _ARGS_RAW_MAX_CHARS: Final[int] = MAX_IDENTITY_CHARS
 #: ``created_at`` (database ``now()``) is the authoritative value.
 _EPOCH: Final[datetime] = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-#: ``ToolReturnPart.outcome`` mapped from the frozen bridge statuses.
-#: ``unknown_effect`` has no honest native outcome — the part is emitted
-#: without one and the envelope documents the uncertainty.
-_OUTCOME_BY_STATUS: Final[dict[str, str | None]] = {
+#: ``ToolReturnPart.outcome`` mapped from the frozen bridge statuses. Every
+#: value is a member of the pinned adapter's NON-Optional Literal
+#: ('success'|'failed'|'denied'|'interrupted'|'retried') — ``None`` is
+#: rejected by ``ModelMessagesTypeAdapter.validate_json`` (R03 F1), so an
+#: ``unknown_effect`` result maps by its execution layer: ``failed`` for a
+#: wrapper that ran and failed, ``interrupted`` for an unproven/uncertain
+#: outcome (did not produce a trusted result), never ``None``.
+_OUTCOME_BY_STATUS: Final[dict[str, str]] = {
     "executed": "success",
     "denied": "denied",
     "approval_required": "interrupted",
-    "unknown_effect": None,
 }
+
+
+def _outcome_for(payload: ToolResultEntry) -> str:
+    """The adapter-valid native outcome for one tool result (R03 F1)."""
+    if payload.status == "unknown_effect":
+        if payload.execution_status is ExecutionStatus.FAILED:
+            return "failed"
+        return "interrupted"
+    outcome = _OUTCOME_BY_STATUS.get(payload.status)
+    if outcome is None:
+        # Frozen vocabulary is closed; an unknown status cannot occur.
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "status",
+                    "tool result carries an unknown frozen status",
+                )
+            ]
+        )
+    return outcome
 
 
 def _value_of(value: object) -> object:
@@ -877,10 +902,6 @@ def build_native_model_history(
     # source id, orphan results keep their object identity.
     pending_by_source = {entry.durable_source_id: entry for entry in pending}
 
-    messages: list[ModelMessage] = []
-    if compaction is not None:
-        messages.append(_compaction_anchor(compaction))
-
     for entry in entries:
         payload = entry.payload
         if isinstance(payload, UserMessageEntry):
@@ -1063,7 +1084,7 @@ def _tool_result_part(
             retry=RetryInfo(cause="validation_error", attempt=1, max_retries=1),
             timestamp=timestamp,
         )
-    outcome = _OUTCOME_BY_STATUS.get(payload.status)
+    outcome = _outcome_for(payload)
     return ToolReturnPart(
         tool_name=payload.tool_name,
         content=project_replay_envelope(payload),
