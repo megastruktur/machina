@@ -1061,9 +1061,14 @@ export interface paths {
          *
          *     Operator authority only: the route runs behind the full session →
          *     origin → CSRF boundary and pins ``ActorKind.OPERATOR`` — there is no
-         *     agent-reachable create path. The ONE store persists the verbatim
-         *     request/constraints (projected for secret safety), the initial
-         *     scope, and the ``objective.created`` ledger event in ONE transaction.
+         *     agent-reachable create path. (The canonical chat admission also
+         *     starts an episode AUTOMATICALLY for a turn with no explicit or bound
+         *     objective — the direct-agent default — through the same store seams
+         *     and under the same submit-time operator authority; it never widens
+         *     scope or authority beyond the selected server.) The ONE store
+         *     persists the verbatim request/constraints (projected for secret
+         *     safety), the initial scope, and the ``objective.created`` ledger
+         *     event in ONE transaction.
          */
         post: operations["create_objective_api_v1_objectives_post"];
         delete?: never;
@@ -2894,6 +2899,115 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agent-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Bounded agent-session list page
+         * @description One bounded, deterministic session page (newest-change first).
+         */
+        get: operations["list_sessions_api_v1_agent_sessions_get"];
+        put?: never;
+        /**
+         * Create Session
+         * @description Idempotent session create: the client idempotency key derives the
+         *     session identity, so a retry converges on the same row.
+         */
+        post: operations["create_session_api_v1_agent_sessions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Session Detail
+         * @description Scoped session detail; a missing and a foreign session are the SAME
+         *     value-free 404.
+         */
+        get: operations["get_session_detail_api_v1_agent_sessions__session_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get History
+         * @description One bounded, byte-checked history page (the D01 contract).
+         */
+        get: operations["get_history_api_v1_agent_sessions__session_id__history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Turn
+         * @description Admit one user turn: durable admission (run row + user entry), then
+         *     the engine enqueue FOLLOWS the commit. HTTP persists INTENT only; the
+         *     worker owns execution.
+         */
+        post: operations["submit_turn_api_v1_agent_sessions__session_id__turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Control
+         * @description One durable control action (steer/pause/cancel/approve/deny/
+         *     reconcile) delegated to the reviewed session-runner facade.
+         */
+        post: operations["submit_control_api_v1_agent_sessions__session_id__control_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -3232,6 +3346,47 @@ export interface components {
             consumed_at: string | null;
             /** Resume Wake Sent */
             resume_wake_sent?: boolean | null;
+        };
+        /**
+         * AssistantMessageEntry
+         * @description One assistant model response (sfc_RESEARCH §2): bounded safe text
+         *     and/or ordered structured tool-call parts, plus the model metadata needed
+         *     for native continuation and explicit provider reasoning artifacts.
+         */
+        AssistantMessageEntry: {
+            /**
+             * @description Discriminator: this payload is an assistant message entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "assistant_message";
+            /**
+             * Text
+             * @description Bounded assistant text (empty when the round was pure tool use)
+             * @default
+             */
+            text: string;
+            /**
+             * Tool Calls
+             * @description Ordered structured tool-call parts of this assistant round
+             */
+            tool_calls?: components["schemas"]["ToolCallItem"][];
+            /**
+             * Model Profile
+             * @description Model profile identity that produced this assistant round
+             */
+            model_profile: string;
+            /**
+             * Provider Artifacts
+             * @description Explicit safe provider reasoning artifacts (never raw chain-of-thought)
+             */
+            provider_artifacts?: components["schemas"]["ProviderReasoningArtifact"][];
+            /**
+             * Tool Group State
+             * @description Atomic tool-group status: none, pending, complete or unresolved
+             * @default none
+             * @enum {string}
+             */
+            tool_group_state: "none" | "pending" | "complete" | "unresolved";
         };
         /**
          * AttachmentBody
@@ -3667,6 +3822,50 @@ export interface components {
             /** Capabilities */
             capabilities?: string[];
         };
+        /**
+         * CompactionEntry
+         * @description One compaction marker (sfc_RESEARCH §5: metadata/pointer, not a hidden
+         *     user message — originals stay stored and addressable; ``session_id``
+         *     never rotates).
+         */
+        CompactionEntry: {
+            /**
+             * @description Discriminator: this payload is a compaction marker (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "compaction";
+            /**
+             * Compaction Id
+             * Format: uuid
+             * @description Stable identity of this compaction generation
+             */
+            compaction_id: string;
+            /**
+             * From Seq
+             * @description First covered session sequence number (inclusive)
+             */
+            from_seq: number;
+            /**
+             * To Seq
+             * @description Last covered session sequence number (inclusive)
+             */
+            to_seq: number;
+            /**
+             * Summary Text
+             * @description Bounded summary of the covered entry range with provenance
+             */
+            summary_text: string;
+            /**
+             * Model Profile
+             * @description Model profile identity the summary was produced for
+             */
+            model_profile: string;
+            /**
+             * Token Usage Anchor
+             * @description Actual provider usage anchor of the summarized source range
+             */
+            token_usage_anchor?: number | null;
+        };
         /** ComposeDetailView */
         ComposeDetailView: {
             /**
@@ -3793,6 +3992,48 @@ export interface components {
             }[];
             /** Compose Service */
             compose_service: string | null;
+        };
+        /**
+         * ControlActionKind
+         * @description Deterministic session control actions (sfc_RESEARCH §6 frame families;
+         *     controls acknowledge — they are never interpreted as user authority).
+         * @enum {string}
+         */
+        ControlActionKind: "steer" | "pause" | "cancel" | "approve" | "deny_approval" | "reconcile";
+        /**
+         * ControlEntry
+         * @description One acknowledged control action (sfc_RESEARCH §2: approval/cancel/
+         *     reconcile/steer acknowledgements — never interpreted as user authority).
+         */
+        ControlEntry: {
+            /**
+             * @description Discriminator: this payload is a control acknowledgement (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "control";
+            /** @description Deterministic control action that was acknowledged */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of the control request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the control action targeted, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when the action decided an approval
+             */
+            approval_id?: string | null;
+            /**
+             * Note
+             * @description Value-free bounded operator note carried with the action
+             */
+            note?: string | null;
         };
         /**
          * ControllerKeyResponse
@@ -4472,6 +4713,52 @@ export interface components {
             policy_revision: number;
         };
         /**
+         * DelegationEntry
+         * @description One delegation relation (sfc_RESEARCH §4): child linkage, bounded
+         *     goal/status and explicit allowed capabilities — the child receives a
+         *     bounded context, never ambient parent state.
+         */
+        DelegationEntry: {
+            /**
+             * @description Discriminator: this payload is a delegation entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "delegation";
+            /**
+             * Child Run Id
+             * Format: uuid
+             * @description Run identity of the delegated child execution
+             */
+            child_run_id: string;
+            /**
+             * Child Session Id
+             * @description Session identity of the child when it owns a distinct session
+             */
+            child_session_id?: string | null;
+            /**
+             * Goal
+             * @description Bounded explicit goal handed to the child
+             */
+            goal: string;
+            /** @description Current frozen lifecycle state of the child run */
+            status: components["schemas"]["SessionRunState"];
+            /**
+             * Allowed Capabilities
+             * @description Explicit narrowed capability grants of the child execution
+             */
+            allowed_capabilities: string[];
+            /**
+             * Result Summary
+             * @description Bounded immutable child result summary once the child settles
+             */
+            result_summary?: string | null;
+            /**
+             * Error Code
+             * @description Stable machine-readable delegation error code when refused
+             */
+            error_code?: string | null;
+        };
+        /**
          * DiscoveryView
          * @description The live observed inventory for one server (read-only snapshot).
          *
@@ -4493,6 +4780,26 @@ export interface components {
             }[];
             /** Lanes */
             lanes: components["schemas"]["LaneView"][];
+        };
+        /**
+         * DocumentAttachRef
+         * @description Provenance reference of a document-attach admission (sfc_INTENT §8):
+         *     the excerpt text travels as bounded untrusted user content; this ref
+         *     carries only the source identity and a safe out-of-band artifact
+         *     reference — never inline document bytes.
+         */
+        DocumentAttachRef: {
+            /**
+             * Document Id
+             * Format: uuid
+             * @description Opaque stable document identity the excerpt came from
+             */
+            document_id: string;
+            /**
+             * Artifact Ref
+             * @description Safe out-of-band reference to the stored excerpt artifact
+             */
+            artifact_ref: string;
         };
         /**
          * DocumentCreateBody
@@ -6734,6 +7041,37 @@ export interface components {
             stale: boolean;
         };
         /**
+         * ProviderReasoningArtifact
+         * @description Explicit safe provider reasoning artifact (sfc_INTENT clarification 5:
+         *     raw unvalidated chain-of-thought is never authoritative history; only
+         *     provider-supported summary/signature/opaque references are carried, and
+         *     only when actually required and reviewed).
+         */
+        ProviderReasoningArtifact: {
+            /**
+             * Provider
+             * @description Provider/model family the artifact is compatible with
+             */
+            provider: string;
+            /**
+             * Artifact Kind
+             * @description Artifact class: bounded summary, provider signature or opaque reference token
+             * @enum {string}
+             */
+            artifact_kind: "summary" | "signature" | "opaque_ref";
+            /**
+             * Content
+             * @description Bounded artifact payload or reference token
+             */
+            content: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted (no fidelity claim)
+             * @default false
+             */
+            redacted: boolean;
+        };
+        /**
          * ReconcileBody
          * @description Reindex-reconcile body: run the durable outbox of one scope.
          */
@@ -6982,6 +7320,30 @@ export interface components {
             };
         };
         /**
+         * RunStateEntry
+         * @description One deterministic run-state transition (sfc_RESEARCH §2: execution
+         *     status and safe reason linked to a run — never model prose).
+         */
+        RunStateEntry: {
+            /**
+             * @description Discriminator: this payload is a run-state transition (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "run_state";
+            /** @description New frozen run lifecycle state after this transition */
+            state: components["schemas"]["SessionRunState"];
+            /**
+             * Reason Code
+             * @description Stable machine-readable transition reason code when present
+             */
+            reason_code?: string | null;
+            /**
+             * Detail
+             * @description Value-free bounded transition detail for operators
+             */
+            detail?: string | null;
+        };
+        /**
          * RunSubmitBody
          * @description Submit body (strict: unknown fields are rejected, value-free 422).
          *
@@ -7094,6 +7456,24 @@ export interface components {
             action: string;
             /** State */
             state: string;
+        };
+        /**
+         * RunbookRef
+         * @description Provenance reference of a runbook-session admission (sfc_INTENT §7):
+         *     runbook execution is a fresh non-interactive session carrying immutable
+         *     service/runbook references.
+         */
+        RunbookRef: {
+            /**
+             * Service Id
+             * @description Opaque adopted-service identity owning the runbook
+             */
+            service_id: string;
+            /**
+             * Runbook Id
+             * @description Stable runbook identity inside the adopted service
+             */
+            runbook_id: string;
         };
         /**
          * RunbookUpsertBody
@@ -7336,6 +7716,459 @@ export interface components {
              * @default
              */
             verify: string;
+        };
+        /**
+         * SessionControlRequest
+         * @description One deterministic control request (sfc_RESEARCH §6: steer/pause/
+         *     cancel/approve/deny/reconcile acknowledge real state; no planner prose,
+         *     no authority fields).
+         */
+        SessionControlRequest: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the control action targets
+             */
+            session_id: string;
+            /** @description Deterministic control action requested */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of this control request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the action targets, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when deciding an approval action
+             */
+            approval_id?: string | null;
+            /**
+             * Note
+             * @description Value-free bounded operator note for the action
+             */
+            note?: string | null;
+        };
+        /**
+         * SessionControlResponse
+         * @description Durable control acknowledgement (sfc_RESEARCH failure behavior: stale
+         *     or conflicting control returns the structured current state, never a
+         *     fabricated success).
+         */
+        SessionControlResponse: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the control action targeted
+             */
+            session_id: string;
+            /** @description Control action that was processed */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key echoed from the request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the action targeted, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Accepted
+             * @description True when the control request was durably accepted
+             */
+            accepted: boolean;
+            /** @description Observed frozen run state after processing, when known */
+            run_state?: components["schemas"]["SessionRunState"] | null;
+        };
+        /**
+         * SessionCreateRequest
+         * @description One idempotent session creation request (sfc_RESEARCH §1: admitting a
+         *     turn allocates a run against the session; creation carries no authority
+         *     field — ``extra="forbid"`` makes :data:`FORBIDDEN_AUTHORITY_FIELDS`
+         *     unrepresentable).
+         */
+        SessionCreateRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope the new session is pinned to
+             */
+            server_id: string;
+            /**
+             * @description How the session came into existence
+             * @default interactive
+             */
+            source: components["schemas"]["SessionSourceKind"];
+            /**
+             * Title
+             * @description Optional user-assigned session title
+             */
+            title?: string | null;
+            /**
+             * Model Profile
+             * @description Preferred model profile identity for the session runs
+             */
+            model_profile?: string | null;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key; retries return the same admission
+             */
+            client_request_id: string;
+        };
+        /**
+         * SessionDetail
+         * @description Safe singleton session header: summary metadata plus bounded history
+         *     pointers (no transcript content).
+         */
+        SessionDetail: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Stable session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this session
+             */
+            server_id: string;
+            /** @description How the session came into existence */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Coarse session status projected from its runs */
+            status: components["schemas"]["SessionStatus"];
+            /**
+             * Title
+             * @description User-assigned session title, when set
+             */
+            title?: string | null;
+            /**
+             * Active Run Id
+             * @description Subordinate run currently executing, when one exists
+             */
+            active_run_id?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC creation timestamp of the session
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description UTC timestamp of the latest committed change
+             */
+            updated_at: string;
+            /**
+             * Latest Seq
+             * @description Highest committed entry sequence, when any history exists
+             */
+            latest_seq?: number | null;
+            /**
+             * Total Entries
+             * @description Total committed domain entries in the session
+             * @default 0
+             */
+            total_entries: number;
+            /**
+             * Compaction Count
+             * @description Number of compaction generations recorded for the session
+             * @default 0
+             */
+            compaction_count: number;
+        };
+        /**
+         * SessionEntryView
+         * @description One committed domain entry as projected to every consumer (sfc_PLAN
+         *     D01): versioned envelope identity plus the discriminated payload. The
+         *     trusted session writer is the sole producer; clients never assign
+         *     ``seq`` or entry identity.
+         */
+        SessionEntryView: {
+            /**
+             * Schema Version
+             * @description Contract schema version of this entry envelope
+             * @default 1
+             */
+            schema_version: number;
+            /**
+             * Entry Id
+             * Format: uuid
+             * @description Stable domain-entry identity inside its session
+             */
+            entry_id: string;
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Seq
+             * @description Session-local monotonic sequence number of this entry
+             */
+            seq: number;
+            /**
+             * Run Id
+             * @description Subordinate run that produced this entry, when run-scoped
+             */
+            run_id?: string | null;
+            /**
+             * Durable Source Id
+             * @description Stable producer source id backing idempotent re-appends
+             */
+            durable_source_id: string;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC commit timestamp of this entry
+             */
+            created_at: string;
+            /**
+             * Payload
+             * @description Discriminated domain payload (union discriminated on `kind`)
+             */
+            payload: components["schemas"]["UserMessageEntry"] | components["schemas"]["AssistantMessageEntry"] | components["schemas"]["ToolResultEntry"] | components["schemas"]["RunStateEntry"] | components["schemas"]["DelegationEntry"] | components["schemas"]["ControlEntry"] | components["schemas"]["CompactionEntry"];
+        };
+        /**
+         * SessionHistoryPage
+         * @description One bounded, byte-capped history page (sfc_PLAN D01 acceptance 3):
+         *     chronological items with honest continuation metadata — count bounds,
+         *     byte bounds and cursor consistency all fail closed.
+         */
+        SessionHistoryPage: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Items
+             * @description Committed entries in strict chronological sequence order
+             */
+            items?: components["schemas"]["SessionEntryView"][];
+            /**
+             * Limit
+             * @description Page size used for this slice (1..50)
+             */
+            limit: number;
+            /**
+             * Total
+             * @description Pre-slice matching count of the whole session history
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when newer committed entries exist above this page
+             */
+            has_more: boolean;
+            /**
+             * Has Older
+             * @description True when older committed entries exist below this page
+             */
+            has_older: boolean;
+            /**
+             * Oldest Seq
+             * @description Lowest sequence number carried by this page, when non-empty
+             */
+            oldest_seq?: number | null;
+            /**
+             * Latest Seq
+             * @description Highest sequence number carried by this page, when non-empty
+             */
+            latest_seq?: number | null;
+            /**
+             * Next Before Seq
+             * @description Exclusive keyset cursor for the next older page, when ``has_older``
+             */
+            next_before_seq?: number | null;
+            /**
+             * Byte Size
+             * @description Declared serialized size of ``items`` in bytes
+             */
+            byte_size: number;
+            /**
+             * Truncated By Bytes
+             * @description True when the byte budget cut items before the count limit
+             * @default false
+             */
+            truncated_by_bytes: boolean;
+        };
+        /**
+         * SessionListPage
+         * @description Bounded session list page (C01 rule 5; AGENTS.md mandatory-pagination
+         *     invariant) with the canonical ``limit|offset|total|has_more`` envelope.
+         */
+        SessionListPage: {
+            /**
+             * Items
+             * @description Session summary rows in deterministic order
+             */
+            items?: components["schemas"]["SessionSummary"][];
+            /**
+             * Limit
+             * @description Page size used for this slice (1..100)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count of the whole collection
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+        };
+        /**
+         * SessionRunState
+         * @description Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;
+         *     ``outcome_unknown`` is honest after a crash — never silently terminal).
+         * @enum {string}
+         */
+        SessionRunState: "queued" | "running" | "waiting_approval" | "waiting_child" | "succeeded" | "failed" | "cancelled" | "outcome_unknown";
+        /**
+         * SessionSourceKind
+         * @description How a session came into existence (sfc_INTENT §7 runbook/document
+         *     decisions): interactive chat, runbook execution, document attach, API.
+         * @enum {string}
+         */
+        SessionSourceKind: "interactive" | "runbook" | "document_attach" | "api";
+        /**
+         * SessionStatus
+         * @description Coarse session-level status the browser/operator sees (derived by the
+         *     trusted projection from run states; never written by clients).
+         * @enum {string}
+         */
+        SessionStatus: "idle" | "running" | "waiting_approval" | "failed" | "cancelled";
+        /**
+         * SessionSummary
+         * @description Safe metadata row of one session (list page item): identity, scope,
+         *     source, coarse status — never transcript content.
+         */
+        SessionSummary: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Stable session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this session
+             */
+            server_id: string;
+            /** @description How the session came into existence */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Coarse session status projected from its runs */
+            status: components["schemas"]["SessionStatus"];
+            /**
+             * Title
+             * @description User-assigned session title, when set
+             */
+            title?: string | null;
+            /**
+             * Active Run Id
+             * @description Subordinate run currently executing, when one exists
+             */
+            active_run_id?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC creation timestamp of the session
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description UTC timestamp of the latest committed change
+             */
+            updated_at: string;
+        };
+        /**
+         * SessionTurnSubmitRequest
+         * @description One accepted user turn submission (sfc_RESEARCH §1: every accepted
+         *     turn allocates a new run id and appends exactly one user entry before
+         *     model work; same idempotency key + same content deduplicates).
+         */
+        SessionTurnSubmitRequest: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the turn is admitted into
+             */
+            session_id: string;
+            /**
+             * Text
+             * @description Bounded user message text (untrusted content, never authority)
+             */
+            text: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of this submission
+             */
+            client_request_id: string;
+            /**
+             * Model Profile
+             * @description Preferred model profile identity for the new run
+             */
+            model_profile?: string | null;
+        };
+        /**
+         * SessionTurnSubmitResponse
+         * @description Durable admission result (sfc_RESEARCH §6: the server ack reports the
+         *     durable admission, never optimistic success).
+         */
+        SessionTurnSubmitResponse: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the turn was admitted into
+             */
+            session_id: string;
+            /**
+             * Run Id
+             * Format: uuid
+             * @description Subordinate run identity allocated for the turn
+             */
+            run_id: string;
+            /**
+             * Entry Id
+             * Format: uuid
+             * @description Committed user entry identity of the admitted turn
+             */
+            entry_id: string;
+            /**
+             * Seq
+             * @description Session-local sequence number of the committed user entry
+             */
+            seq: number;
+            /** @description Frozen lifecycle state of the newly allocated run */
+            run_state: components["schemas"]["SessionRunState"];
+            /**
+             * Deduplicated
+             * @description True when the same idempotency key replayed an earlier admission
+             * @default false
+             */
+            deduplicated: boolean;
         };
         /**
          * SkillCatalogView
@@ -8416,6 +9249,110 @@ export interface components {
             tmux_session: string;
         };
         /**
+         * ToolCallItem
+         * @description One structured assistant tool-call part (sfc_RESEARCH §2 assistant
+         *     entries carry ordered safe text and structured tool-call parts).
+         */
+        ToolCallItem: {
+            /**
+             * Call Id
+             * @description Provider tool-call id; pairs the call with its result
+             */
+            call_id: string;
+            /**
+             * Tool Name
+             * @description Registered capability tool name that was invoked
+             */
+            tool_name: string;
+            /**
+             * Capability Id
+             * @description Capability descriptor id behind the invoked tool name
+             */
+            capability_id: string;
+            /**
+             * Args
+             * @description Bounded tool-call arguments as produced by the model
+             */
+            args: {
+                [key: string]: unknown;
+            };
+            /**
+             * Target Server Id
+             * @description Explicit target server scope for multi-target capabilities
+             */
+            target_server_id?: string | null;
+        };
+        /**
+         * ToolResultEntry
+         * @description One tool result (sfc_RESEARCH §2): call identity, the frozen bridge
+         *     status and the three-layer execution/domain/certainty projection —
+         *     pending/unknown results are never inferred successful (C03/C06).
+         */
+        ToolResultEntry: {
+            /**
+             * @description Discriminator: this payload is a tool result entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "tool_result";
+            /**
+             * Call Id
+             * @description Provider tool-call id this result answers
+             */
+            call_id: string;
+            /**
+             * Tool Name
+             * @description Registered capability tool name that was invoked
+             */
+            tool_name: string;
+            /**
+             * Capability Id
+             * @description Capability descriptor id behind the invoked tool name
+             */
+            capability_id: string;
+            /**
+             * Status
+             * @description Bridge lifecycle status: executed, denied, approval_required or unknown_effect
+             * @enum {string}
+             */
+            status: "executed" | "denied" | "approval_required" | "unknown_effect";
+            /** @description Compact technical wrapper execution status of the attempt */
+            execution_status: components["schemas"]["ExecutionStatus"];
+            /** @description Domain-level outcome; unknown is honest for arbitrary work */
+            domain_outcome: components["schemas"]["DomainOutcome"];
+            /** @description How certain the effect evidence is (certain/uncertain/unknown) */
+            effect_certainty: components["schemas"]["EffectCertainty"];
+            /**
+             * Payload Hash
+             * @description Canonical payload hash binding the result to its approval/dispatch envelope
+             */
+            payload_hash: string;
+            /**
+             * Output Preview
+             * @description Bounded redacted output preview; large output lives behind artifact references
+             */
+            output_preview?: string | null;
+            /**
+             * Artifact Ref
+             * @description Safe out-of-band reference to the full stored tool result
+             */
+            artifact_ref?: string | null;
+            /**
+             * Error Code
+             * @description Stable machine-readable error code when the call failed
+             */
+            error_code?: string | null;
+            /**
+             * Error Detail
+             * @description Value-free fixed failure reason (never echoing contents)
+             */
+            error_detail?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when the call parked on the approval seam
+             */
+            approval_id?: string | null;
+        };
+        /**
          * TranscriptMessage
          * @description One role-preserving sanitized transcript row (§1/§3).
          *
@@ -8499,6 +9436,36 @@ export interface components {
             backup_confirmed: boolean;
             /** Current Recipe */
             current_recipe: string;
+        };
+        /**
+         * UserMessageEntry
+         * @description One admitted user turn (sfc_RESEARCH §2): bounded safe text, client
+         *     request id for idempotency, source metadata and optional provenance
+         *     references.
+         */
+        UserMessageEntry: {
+            /**
+             * @description Discriminator: this payload is a user message entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "user_message";
+            /**
+             * Text
+             * @description Bounded user message text (untrusted content, never authority)
+             */
+            text: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of the admitted turn submission
+             */
+            client_request_id: string;
+            /** @description How this turn entered the session (interactive, runbook, document attach or API) */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Document provenance when the turn was a document attach */
+            document_ref?: components["schemas"]["DocumentAttachRef"] | null;
+            /** @description Runbook provenance when the turn was a runbook execution */
+            runbook_ref?: components["schemas"]["RunbookRef"] | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -16592,6 +17559,225 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_sessions_api_v1_agent_sessions_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope the listing is pinned to (C01 rule 2) */
+                server_id: string;
+                /** @description Page size used for this slice (1..100) */
+                limit?: number;
+                /** @description Slice start within the collection */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionListPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_session_api_v1_agent_sessions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_session_detail_api_v1_agent_sessions__session_id__get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_history_api_v1_agent_sessions__session_id__history_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+                /** @description Bounded page size (1..50) */
+                limit?: number;
+                /** @description Exclusive keyset cursor (older pages) */
+                before_seq?: number | null;
+                /** @description Exclusive keyset cursor (catch-up pages) */
+                after_seq?: number | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionHistoryPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_turn_api_v1_agent_sessions__session_id__turns_post: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTurnSubmitResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_control_api_v1_agent_sessions__session_id__control_post: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionControlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionControlResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

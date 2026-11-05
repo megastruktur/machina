@@ -59,6 +59,8 @@ from mai.agents.models import (
 )
 from mai.api.approvals import register_approvals
 from mai.api.applications import register_applications
+from mai.api.agent_sessions import register_agent_sessions
+from mai.session_channel import SessionChannelHub
 from mai.api.auth import (
     bootstrap_password_from_env,
     effective_client_ip,
@@ -459,6 +461,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # absent (mai.api.jobs).
         app.state.job_lifecycle = RunLifecycle(app.state.session_factory)
         app.state.job_recovery = RecoveryService(url, app.state.session_factory)
+        # Session channel hub (D06): the ONE shared LISTEN/NOTIFY listener
+        # + bounded per-session fanout over the ONE app engine. The reader
+        # is the D02 bounded history reader (after_seq catch-up pages).
+        from functools import partial
+
+        from mai.session_store import aread_session_history
+
+        _factory = app.state.session_factory
+        _tick_raw = (app.state.env or os.environ).get(
+            "MAI_SESSION_CHANNEL_TICK_SECONDS"
+        )
+        try:
+            _tick = float(_tick_raw) if _tick_raw is not None else 5.0
+        except ValueError:
+            _tick = 5.0
+        _tick = min(max(_tick, 0.05), 60.0)
+        app.state.session_channel = SessionChannelHub(
+            entry_reader=partial(aread_session_history, _factory),
+            coarse_tick_seconds=_tick,
+        )
+        app.state.session_channel.start(app.state.engine)
         # Schedules surface (C05 rule 8): the control-plane facade over
         # the ONE engine URL — a bare DBOSClient, never a launched engine
         # (launching here would steal pending workflows via launch
@@ -484,7 +507,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # The schedules facade owns a DBOSClient (its own system-DB pool)
         # and the cancel facade owns an EngineClient: release both before
-        # the app engine goes away.
+        # the app engine goes away. The session-channel hub closes its
+        # dedicated LISTEN connection first.
+        hub = getattr(app.state, "session_channel", None)
+        if hub is not None:
+            await hub.stop()
         schedules = getattr(app.state, "schedules", None)
         if schedules is not None:
             schedules.close()
@@ -634,6 +661,10 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # remote tmux/login shell) plus its session-authenticated info view. No
     # third-party SSH library — the pinned transport is mai.execution.ssh.
     register_terminal(app)
+    # The session-first surface (D06): REST collection/detail/admission/
+    # history/control + the versioned cursor WebSocket channel (ADDITIVE —
+    # /api/v1/chat/** stays until the D09 coordinated deletion).
+    register_agent_sessions(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202
