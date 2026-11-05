@@ -795,7 +795,7 @@ async def test_notify_loss_is_recovered_by_listener_restart(
 async def test_backpressure_heartbeat_and_fanout_shrink(
     app_fixture: FastAPI, migrated_url: str
 ) -> None:
-    from mai.session_channel import SessionSink
+    from mai.session_channel import CHANNEL_OUTBOX_LIMIT, SessionSink
     from mai.contracts.session_channel import (
         ServerCommittedFrame,
         ServerDeltaFrame,
@@ -848,7 +848,7 @@ async def test_backpressure_heartbeat_and_fanout_shrink(
             )
             hub.subscribe(sink)
             stream = f"stream:{sink.connection_id}"
-            for n in range(700):  # > CHANNEL_OUTBOX_LIMIT (512)
+            for n in range(400):  # > CHANNEL_OUTBOX_LIMIT (256)
                 hub.publish_delta(
                     session_id,
                     ServerDeltaFrame(
@@ -859,7 +859,7 @@ async def test_backpressure_heartbeat_and_fanout_shrink(
                     ),
                 )
             assert sink.dropped_deltas > 0
-            assert sink.outbox.qsize() <= 512
+            assert sink.outbox.qsize() <= CHANNEL_OUTBOX_LIMIT
             committed = ServerCommittedFrame(
                 stream_id=stream,
                 entry=SessionEntryView(

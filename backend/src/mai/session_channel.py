@@ -58,7 +58,7 @@ __all__ = [
 
 #: Per-connection outbox bound (frames). Committed entries never silently
 #: drop; overflow degrades to delta-dropping then resync_required.
-CHANNEL_OUTBOX_LIMIT: Final[int] = 512
+CHANNEL_OUTBOX_LIMIT: Final[int] = 256
 
 #: Per-session sink (connection) bound — one session's fanout map cap.
 CHANNEL_SESSION_SINK_LIMIT: Final[int] = 64

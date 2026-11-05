@@ -548,7 +548,13 @@ async def submit_turn(
         client_request_id=payload.client_request_id,
         source=SessionSourceKind.API,
     )
-    await aappend_entry(
+    # aappend_entry returns the durable SessionEntryRow and is idempotent on
+    # durable_source_id: a replayed client_request_id gets the ORIGINAL
+    # entry_id/seq back (no duplicate row), so the response is built from the
+    # append result itself — no confirmation re-read, which would silently
+    # miss the newest entry on sessions with >=50 existing entries
+    # (R06-fix1: the ascending after_seq=0 page returns the OLDEST 50).
+    entry_row = await aappend_entry(
         factory,
         session_id=session_id,
         server_id=server_id,
@@ -589,28 +595,11 @@ async def submit_turn(
             )
         except RunIdInUseError:
             deduplicated = True
-    page = await aread_session_history(
-        factory,
-        session_id=session_id,
-        server_id=server_id,
-        limit=50,
-        after_seq=0,
-    )
-    entry = next(
-        (
-            item
-            for item in page.items
-            if item.durable_source_id == f"turn:{payload.client_request_id}"
-        ),
-        None,
-    )
-    if entry is None:
-        return _not_found(request)
     return SessionTurnSubmitResponse(
         session_id=session_id,
         run_id=run_id,
-        entry_id=entry.entry_id,
-        seq=entry.seq,
+        entry_id=entry_row.entry_id,
+        seq=entry_row.seq,
         run_state=SessionRunState.QUEUED,
         deduplicated=deduplicated,
     )

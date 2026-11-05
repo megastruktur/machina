@@ -452,6 +452,143 @@ async def test_turn_admission_is_durable_and_idempotent(
         assert body2["deduplicated"] is True
 
 
+async def test_turn_admission_on_long_session_is_not_404(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """R06-fix1 regression (F1): a session with MORE entries than one
+    ascending confirmation page (>50). The route builds its response from the
+    append result itself — an ``after_seq=0`` page would return the OLDEST
+    50 entries, miss the new turn and falsely report scope-blind 404 AFTER
+    the durable commit. Admission AND idempotent replay both work here."""
+    import json as _json
+
+    from sqlalchemy import text as sql_text
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        # Seed 60 durable entries (seq 1..60) in ONE executemany transaction.
+        _, sessions = create_app_engine(migrated_url)
+        async with sessions() as db:
+            async with db.begin():
+                rows = [
+                    {
+                        "sid": session_id,
+                        "seq": n,
+                        "kind": "user_message",
+                        "payload": _json.dumps(
+                            {
+                                "kind": "user_message",
+                                "text": f"seed {n}",
+                                "client_request_id": str(uuid.UUID(int=n)),
+                                "source": "api",
+                            }
+                        ),
+                        "src": f"seed-{n}",
+                    }
+                    for n in range(1, 61)
+                ]
+                await db.execute(
+                    sql_text(
+                        """
+                        INSERT INTO session_entries
+                            (entry_id, session_id, run_id, seq, kind,
+                             payload, durable_source_id)
+                        VALUES (gen_random_uuid(), :sid, NULL, :seq, :kind,
+                                CAST(:payload AS jsonb), :src)
+                        """
+                    ),
+                    rows,
+                )
+        key = str(uuid.uuid4())
+        first = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(session_id),
+                "text": "turn on a long session",
+                "client_request_id": key,
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        # The reviewed contract: admission is 200 OK (201 also accepted).
+        assert first.status_code in (200, 201), first.text
+        body = first.json()
+        assert body["session_id"] == str(session_id)
+        # The turn entry appended AFTER the 60 seeded entries.
+        assert body["seq"] == 61
+        assert body["deduplicated"] is False
+        # A replayed idempotency key on the SAME long session: the ORIGINAL
+        # entry_id/run_id/seq — never a 404, never a second row.
+        replay = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(session_id),
+                "text": "turn on a long session",
+                "client_request_id": key,
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert replay.status_code in (200, 201), replay.text
+        replayed = replay.json()
+        assert replayed["entry_id"] == body["entry_id"]
+        assert replayed["run_id"] == body["run_id"]
+        assert replayed["seq"] == 61
+        assert replayed["deduplicated"] is True
+        # Durable truth: 60 seed + user_message + run_state = 62 rows.
+        import psycopg
+
+        with psycopg.connect(migrated_url) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM session_entries WHERE session_id = %s",
+                (session_id,),
+            ).fetchone()[0]
+        assert total == 62
+
+
+async def test_turn_route_refuses_wrong_origin_and_missing_csrf(
+    app_fixture: FastAPI,
+) -> None:
+    """R06-fix1 (F5): direct REST negatives on the NEW mutation route — the
+    exact-origin allowlist and the CSRF double submit, both value-free 403s
+    (no admission happens; the gates precede the store)."""
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        payload = {
+            "session_id": str(session_id),
+            "text": "x",
+            "client_request_id": str(uuid.uuid4()),
+        }
+        url = f"/api/v1/agent-sessions/{session_id}/turns"
+        wrong_origin = client.post(
+            url,
+            params={"server_id": str(SERVER_A)},
+            json=payload,
+            headers={
+                "origin": "http://evil.example",
+                "x-csrf-token": jar[CSRF_COOKIE],
+            },
+            cookies=jar,
+        )
+        assert wrong_origin.status_code == 403
+        assert wrong_origin.json()["error"]["code"] == "origin_rejected"
+        missing_csrf = client.post(
+            url,
+            params={"server_id": str(SERVER_A)},
+            json=payload,
+            headers={"origin": ORIGIN},  # no x-csrf-token header
+            cookies=jar,
+        )
+        assert missing_csrf.status_code == 403
+        assert missing_csrf.json()["error"]["code"] == "csrf_rejected"
+
+
 # ---------------------------------------------------------------------------
 # 6. control facade delegation
 # ---------------------------------------------------------------------------
