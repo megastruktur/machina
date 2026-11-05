@@ -46,7 +46,7 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Final
 
@@ -58,6 +58,15 @@ from pydantic_ai.tools import Tool as PydanticTool
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.agents.session_compaction import acompact_session_head
+from mai.agents.session_delegate import (
+    SESSION_DELEGATE_CAPABILITY_ID,
+    SESSION_DELEGATE_TOOL_NAME,
+    aplan_session_delegation,
+    aupdate_entry_payload_by_source,
+    bounded_child_summary_document,
+    build_deferring_delegate_tool,
+)
 from mai.agents.session_history import (
     abuild_session_model_history,
     apersist_run_exchange,
@@ -917,12 +926,24 @@ async def _round_model(
     round_index: int,
 ) -> dict[str, object]:
     """The async model-round body: native history → agent → durable capture."""
+    from mai.agents.session_history import RunHistoryScope
+
     history = await abuild_session_model_history(
         executor.sessions,
         session_id=uuid.UUID(intent.session_id),
         server_id=uuid.UUID(intent.server_id),
         provider=str(pins.get("connection", "")),
         model_profile=str(pins.get("profile", "")),
+        # D05 delegation isolation: a child's native window carries ONLY
+        # its own entries; a root's window NEVER carries child-run entries.
+        run_scope=(
+            (
+                RunHistoryScope.CHILD_RUN
+                if intent.parent_run_id
+                else RunHistoryScope.ROOT_RUN
+            ),
+            uuid.UUID(intent.run_id),
+        ),
     )
     bridge = executor.bridge_of(intent.context)
     resolved_model = executor.build_model_for(pins)
@@ -945,7 +966,16 @@ async def _round_model(
 
     agent: Agent[None, Any] = Agent(
         model=resolved_model,
-        tools=[_deferring(tool) for tool in bridge.tools],
+        tools=(
+            # Depth-1 delegation (D05): the delegate tool exists ONLY on a
+            # root surface; a child surface never offers it.
+            [_deferring(tool) for tool in bridge.tools]
+            + (
+                [_deferring(build_deferring_delegate_tool())]
+                if intent.parent_run_id is None
+                else []
+            )
+        ),
         output_type=[str, DeferredToolRequests],
     )
     try:
@@ -1923,6 +1953,507 @@ def _session_tool_group_marked(payload_json: str, entry_id: str, state: str) -> 
     return json.dumps({"marked": bool(marked)})
 
 
+# --- D05: bounded session delegation + stable-id compaction seam -----------------
+
+
+def _start_session_child_workflow(child_run_id: str, child_payload: str) -> None:
+    """Start the child ``agent.session_run`` workflow (sync engine start).
+
+    Runs on a worker thread (NEVER on the async handler loop): the engine's
+    ``run_workflow`` is itself a sync workflow handler, so starting it on
+    the loop thread would deadlock the loop against itself. The
+    deterministic id + ``reject`` reuse policy make the start idempotent
+    under crash-replay (the reviewed delegation child-start pattern).
+    """
+    from dbos import SetWorkflowID
+
+    with SetWorkflowID(child_run_id, workflow_id_reuse_policy="reject"):
+        DBOS.start_workflow(_engine.run_workflow, HANDLER_NAME, child_payload)
+
+
+def _delegation_denial_code(error: SessionContractError) -> str:
+    """Map one gate refusal onto its honest delegation error code (the
+    gate ORDER decides which bound refused; the field identifies it)."""
+    fields = {item.field for item in error.errors}
+    if "depth" in fields:
+        return "delegation_depth_exhausted"
+    if "children" in fields:
+        return "fanout_exhausted"
+    if "descendants" in fields:
+        return "descendant_budget_exhausted"
+    return "delegation_denied"
+
+
+async def _plan_delegation(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    *,
+    call: Mapping[str, object],
+    pins: Mapping[str, object],
+) -> dict[str, object]:
+    """Gate + persist the delegation plan (child rows + parent entry).
+
+    The child rows: the ``session_runs`` edge (``acreate_run`` with the
+    parent link), the facade ``job_runs`` row + the mandatory
+    classification (0011 invariant, same transaction), and the parent's
+    ``DelegationEntry``. All idempotent under the DETERMINISTIC child id /
+    durable key, so a crash-replay lands on the SAME child.
+    """
+    from mai.agents.budgets import BudgetLedger
+    from mai.agents.session_delegate import acreate_child_facade_row
+    from mai.session_store import aappend_entry, acreate_run
+
+    session_id = uuid.UUID(intent.session_id)
+    server_id = uuid.UUID(intent.server_id)
+    parent_run_id = uuid.UUID(intent.run_id)
+    delegate_call_id = str(call["tool_call_id"])
+    budget = BudgetLedger(executor.sessions)
+    plan = await aplan_session_delegation(
+        executor.sessions,
+        session_id=session_id,
+        server_id=server_id,
+        parent_run_id=parent_run_id,
+        delegate_call_id=delegate_call_id,
+        args=dict(call["args"]),
+        parent_allowed_capabilities=list(intent.context.allowed_capabilities),
+        parent_mode=str(intent.context.mode.value),
+        model_profile=str(pins.get("profile") or intent.profile or "default"),
+        parent_context_json=intent.context.to_json(),
+        connection=(str(pins["connection"]) if pins.get("connection") else None),
+        budget_ledger=budget,
+    )
+    child_run_id = uuid.UUID(str(plan["child_run_id"]))
+    child_request_id = uuid.uuid5(
+        uuid.UUID(int=0), f"session-delegation:{intent.session_id}:{delegate_call_id}"
+    )
+    await acreate_run(
+        executor.sessions,
+        session_id=session_id,
+        server_id=server_id,
+        run_id=child_run_id,
+        model_profile=intent.profile or "default",
+        client_request_id=child_request_id,
+        parent_run_id=parent_run_id,
+    )
+    await acreate_child_facade_row(
+        executor.sessions,
+        child_run_id=child_run_id,
+        session_id=session_id,
+        server_id=server_id,
+        parent_run_id=parent_run_id,
+        model_profile=str(pins.get("profile") or intent.profile or "default"),
+        requested_grants=plan["narrowed_capabilities"],  # type: ignore[arg-type]
+    )
+    entry_payload = dict(plan["delegation_entry"])
+    entry_payload["kind"] = EntryKind.DELEGATION.value
+    await aappend_entry(
+        executor.sessions,
+        session_id=session_id,
+        server_id=server_id,
+        kind=EntryKind.DELEGATION,
+        payload=entry_payload,
+        run_id=parent_run_id,
+        durable_source_id=f"delegation:{delegate_call_id}",
+    )
+    return plan
+
+
+@DBOS.step(name="agents.session.delegation_execute")
+def _session_delegation_execute(
+    payload_json: str, call_json: str, round_index: int, pins_json: str
+) -> str:
+    """One durable delegation attempt (checkpointed; D05).
+
+    Fail-closed gates BEFORE any child identity is generated; a refusal
+    persists NOTHING except the honest denied tool result (mapped error
+    code). On success the child rows exist, the parent's
+    ``DelegationEntry`` is queued, and the outcome checkpoint names the
+    deterministic child + the wall-clock deadline, so a crash-replay
+    resumes the SAME child (never a second admission).
+    """
+    intent = parse_session_run_intent(payload_json)
+    executor = _resolve_session_run()
+    call = json.loads(call_json)
+    from mai.capabilities.dispatch import canonical_payload_hash
+
+    payload_hash = canonical_payload_hash(dict(call["args"]))
+    try:
+        plan = executor.run(
+            _plan_delegation(
+                executor, intent, call=call, pins=json.loads(pins_json or "{}")
+            )
+        )
+    except SessionContractError as error:
+        code = _delegation_denial_code(error)
+        executor.run(
+            _persist_tool_result(
+                executor,
+                intent,
+                round_index=round_index,
+                call=call,
+                suffix=":delegation",
+                status="denied",
+                execution_status=ExecutionStatus.FAILED,
+                effect_certainty=EffectCertainty.CERTAIN,
+                error_code=code,
+                error_detail=None,
+                approval_id=None,
+                payload_hash=payload_hash,
+                output_preview=None,
+            )
+        )
+        return json.dumps(
+            {"seq": call["seq"], "state": StepState.FAILED.value, "status": "denied",
+             "error_code": code, "payload_hash": payload_hash}
+        )
+    timeout_seconds = float(dict(call["args"])["timeout_seconds"])
+    deadline_iso = (
+        datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+    ).isoformat()
+    return json.dumps(
+        {
+            "seq": call["seq"],
+            "state": "child_started",
+            "status": "child_started",
+            "child_run_id": str(plan["child_run_id"]),
+            "entry_id": str(call["entry_id"]),
+            "deadline_iso": deadline_iso,
+            "child_payload": json.dumps(plan["child_payload"], sort_keys=True),
+            "payload_hash": payload_hash,
+        }
+    )
+
+
+@DBOS.step(name="agents.session.child_state")
+def _session_child_state(payload_json: str, child_run_id: str) -> str:
+    """Read the child's durable truth (checkpointed poll; pure read).
+
+    The child's OWN settlement write (``_session_settled`` → ``session_runs``
+    state) is the primary authority; the engine status is only a fallback
+    for a child that has not reached its settlement write yet. Unmapped or
+    unavailable engine statuses poll on honestly (never guessed terminal).
+    """
+    intent = parse_session_run_intent(payload_json)
+    executor = _resolve_session_run()
+    row = executor.run(_read_child_run_state(executor, intent, child_run_id))
+    if row is not None:
+        state = str(row)
+        if state in ("succeeded", "failed", "cancelled"):
+            return state
+    try:
+        from mai.contracts.jobs import EngineStateError, run_state_from_engine
+
+        handle = DBOS.retrieve_workflow(child_run_id)
+        status = handle.get_status()
+        status_value = (
+            status.value if hasattr(status, "value") else str(status or "PENDING")
+        )
+        try:
+            state = run_state_from_engine(status_value)
+        except EngineStateError:
+            # DBOS retry states: a retriable child is still running; the
+            # retry-exhausted states settle failed (engine truth, honest).
+            state = (
+                RunState.FAILED
+                if "RETRIES" in status_value.upper()
+                else RunState.RUNNING
+            )
+        return state.value
+    except Exception:
+        # The engine read is best-effort at this cadence; the durable
+        # session state decides on the next poll (never guessed terminal).
+        return RunState.RUNNING.value
+
+
+async def _read_child_run_state(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    child_run_id: str,
+) -> str | None:
+    """The child's durable ``session_runs.state`` (scope-checked)."""
+    async with executor.sessions() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT state FROM session_runs WHERE run_id = :rid "
+                    "AND session_id = :sid"
+                ),
+                {"rid": uuid.UUID(child_run_id), "sid": uuid.UUID(intent.session_id)},
+            )
+        ).first()
+    return str(row[0]) if row else None
+
+
+async def _read_child_settlement(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    *,
+    child_run_id: str,
+    engine_state: str,
+) -> dict[str, object]:
+    """Read the child's durable settlement: session state + final text."""
+    async with executor.sessions() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT state FROM session_runs WHERE run_id = :rid "
+                    "AND session_id = :sid"
+                ),
+                {"rid": uuid.UUID(child_run_id), "sid": uuid.UUID(intent.session_id)},
+            )
+        ).first()
+        child_state = str(row[0]) if row else engine_state
+        text_row = (
+            await session.execute(
+                sql_text(
+                    "SELECT payload ->> 'text' FROM session_entries "
+                    "WHERE session_id = :sid AND run_id = :rid "
+                    "AND kind = 'assistant_message' "
+                    "ORDER BY seq DESC LIMIT 1"
+                ),
+                {"sid": uuid.UUID(intent.session_id), "rid": uuid.UUID(child_run_id)},
+            )
+        ).first()
+    summary_text = str(text_row[0]) if text_row and text_row[0] else None
+    return {"child_state": child_state, "summary_text": summary_text}
+
+
+async def _settle_child_delegation(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    payload_json: str,
+    call_json: str,
+    round_index: int,
+    *,
+    child_run_id: str,
+    deadline_iso: str,
+) -> dict[str, object]:
+    """The parent's bounded wait for ONE child (the reviewed child-await
+    pattern: checkpointed poll cadence + deadline).
+
+    Terminal child → checkpointed settlement; deadline expiry → the honest
+    ``unknown_effect`` delegation result (the child may STILL be running —
+    its own lifecycle owns the truth; the parent's log says only what the
+    parent proved).
+    """
+    deadline = datetime.fromisoformat(deadline_iso)
+    poll_seconds = max(0.25, min(intent.wait_poll_seconds, 5.0))
+    while True:
+        child_state = await asyncio.to_thread(
+            _session_child_state, payload_json, child_run_id
+        )
+        if child_state in ("succeeded", "failed", "cancelled"):
+            break
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            child_state = "timeout"
+            break
+        await DBOS.sleep_async(min(poll_seconds, max(remaining, 0.0)))
+    return json.loads(
+        await asyncio.to_thread(
+            _session_child_settled,
+            payload_json,
+            call_json,
+            round_index,
+            child_run_id,
+            child_state,
+        )
+    )
+
+
+@DBOS.step(name="agents.session.child_settled")
+def _session_child_settled(
+    payload_json: str,
+    call_json: str,
+    round_index: int,
+    child_run_id: str,
+    child_state: str,
+) -> str:
+    """Settle ONE delegation: the parent's single bounded tool result + the
+    ``DelegationEntry`` update (receipt-authoritative: the child's durable
+    session state decides; never the child's claims).
+
+    succeeded → ``executed``/certain with the bounded summary document;
+    failed/cancelled → ``denied``/certain (honest child truth); timeout →
+    ``unknown_effect`` with ``delegation_timeout``. The child transcript is
+    NEVER spliced into the parent's history.
+    """
+    intent = parse_session_run_intent(payload_json)
+    executor = _resolve_session_run()
+    call = json.loads(call_json)
+    from mai.capabilities.dispatch import canonical_payload_hash
+
+    payload_hash = canonical_payload_hash(dict(call["args"]))
+    settlement = executor.run(
+        _read_child_settlement(
+            executor, intent, child_run_id=child_run_id, engine_state=child_state
+        )
+    )
+    durable_state = str(settlement["child_state"])
+    if durable_state == "timeout" or child_state == "timeout":
+        durable_state = "timeout"
+    summary_document = bounded_child_summary_document(
+        child_run_id=uuid.UUID(child_run_id),
+        child_status=durable_state,
+        summary_text=settlement.get("summary_text"),
+        error_code=(
+            None
+            if durable_state == "succeeded"
+            else "delegation_timeout"
+            if durable_state == "timeout"
+            else f"child_{durable_state}"
+        ),
+    )
+    preview = json.dumps(summary_document)
+    from mai.contracts.sessions import MAX_TOOL_OUTPUT_PREVIEW_CHARS
+
+    if durable_state == "succeeded":
+        status, execution, certainty, code = (
+            "executed",
+            ExecutionStatus.SUCCEEDED,
+            EffectCertainty.CERTAIN,
+            None,
+        )
+    elif durable_state in ("failed", "cancelled"):
+        status, execution, certainty, code = (
+            "denied",
+            ExecutionStatus.FAILED,
+            EffectCertainty.CERTAIN,
+            f"child_{durable_state}",
+        )
+    else:
+        status, execution, certainty, code = (
+            "unknown_effect",
+            ExecutionStatus.OUTCOME_UNKNOWN,
+            EffectCertainty.UNKNOWN,
+            "delegation_timeout",
+        )
+    executor.run(
+        _persist_tool_result(
+            executor,
+            intent,
+            round_index=round_index,
+            call=call,
+            suffix=":delegation",
+            status=status,
+            execution_status=execution,
+            effect_certainty=certainty,
+            error_code=code,
+            error_detail=None,
+            approval_id=None,
+            payload_hash=payload_hash,
+            output_preview=preview[:MAX_TOOL_OUTPUT_PREVIEW_CHARS],
+        )
+    )
+    executor.run(
+        _update_delegation_entry(
+            executor,
+            intent,
+            delegate_call_id=str(call["tool_call_id"]),
+            child_state=durable_state,
+            summary_document=summary_document,
+        )
+    )
+    return json.dumps(
+        {
+            "seq": call["seq"],
+            "state": StepState.SUCCEEDED.value
+            if durable_state == "succeeded"
+            else StepState.FAILED.value
+            if durable_state in ("failed", "cancelled")
+            else StepState.OUTCOME_UNKNOWN.value,
+            "status": status,
+            "child_run_id": child_run_id,
+            "child_state": durable_state,
+            "error_code": code,
+            "payload_hash": payload_hash,
+        }
+    )
+
+
+async def _update_delegation_entry(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    *,
+    delegate_call_id: str,
+    child_state: str,
+    summary_document: Mapping[str, object],
+) -> None:
+    """Update the parent's ``DelegationEntry`` in place (idempotent)."""
+    from mai.session_store import _lock_session
+
+    session_id = uuid.UUID(intent.session_id)
+    server_id = uuid.UUID(intent.server_id)
+    durable_source_id = f"delegation:{delegate_call_id}"
+    async with executor.sessions() as session:
+        async with session.begin():
+            await _lock_session(session, session_id=session_id, server_id=server_id)
+            row = (
+                await session.execute(
+                    sql_text(
+                        "SELECT payload FROM session_entries "
+                        "WHERE session_id = :sid AND durable_source_id = :src "
+                        "AND kind = 'delegation'"
+                    ),
+                    {"sid": session_id, "src": durable_source_id},
+                )
+            ).first()
+    if row is None:
+        return
+    payload = dict(row[0]) if not isinstance(row[0], str) else json.loads(row[0])
+    payload["status"] = (
+        "outcome_unknown" if child_state == "timeout" else child_state
+    )
+    payload["result_summary"] = str(summary_document.get("summary") or "")
+    payload["error_code"] = summary_document.get("error_code")
+    await aupdate_entry_payload_by_source(
+        executor.sessions,
+        session_id=session_id,
+        server_id=server_id,
+        durable_source_id=durable_source_id,
+        payload=payload,
+    )
+
+
+@DBOS.step(name="agents.session.compaction_checkpoint")
+def _session_compaction_checkpoint(payload_json: str, pins_json: str) -> str:
+    """Stable-id compaction checkpoint (D05): when the uncovered head is
+    due, append ONE ``CompactionEntry`` (idempotent per range under the
+    session fence). Pure structural decision at this seam — no live
+    summarizer; the bounded fallback digest covers it.
+    """
+    intent = parse_session_run_intent(payload_json)
+    executor = _resolve_session_run()
+    pins = json.loads(pins_json)
+    decision = executor.run(
+        acompact_session_head(
+            executor.sessions,
+            session_id=uuid.UUID(intent.session_id),
+            server_id=uuid.UUID(intent.server_id),
+            model_profile=str(pins.get("profile") or intent.profile or "default"),
+            env=None,  # the explicit config seam reads the process env here
+            summarize=None,
+        )
+    )
+    record = decision.get("record")
+    document: dict[str, object] = {
+        "compacted": bool(decision.get("compacted")),
+        "created": bool(decision.get("created")),
+        "reason": str(decision.get("reason")),
+        "estimated_tokens": int(decision.get("estimated_tokens") or 0),
+        "covered_range": decision.get("covered_range"),
+        "summary_source": str(decision.get("summary_source")),
+    }
+    if record is not None:
+        document["record"] = {
+            "compaction_id": str(getattr(record, "compaction_id", "")),
+            "from_seq": int(getattr(record, "from_seq", 0)),
+            "to_seq": int(getattr(record, "to_seq", 0)),
+            "model_profile": str(getattr(record, "model_profile", "")),
+        }
+    return json.dumps(document)
+
+
 @DBOS.step(name="agents.session.settled")
 def _session_settled(payload_json: str, summary_json: str) -> str:
     """The dual-authority terminal settlement (checkpointed, idempotent)."""
@@ -2061,6 +2592,64 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                     break
                 for note in boundary.get("notes", []):
                     tool_records.append({"steering_injected": note})
+                if str(call["tool_name"]) == SESSION_DELEGATE_TOOL_NAME:
+                    # D05: the delegation surface is intercepted BEFORE the
+                    # job_steps fence (delegation creates no step row for
+                    # itself); the checkpointed delegation step gates and
+                    # starts the deterministic child.
+                    outcome = json.loads(
+                        await asyncio.to_thread(
+                            _session_delegation_execute,
+                            payload_json,
+                            call_json,
+                            rounds,
+                            pins_json,
+                        )
+                    )
+                    tool_records.append(
+                        {
+                            "seq": outcome.get("seq"),
+                            "state": outcome.get("state"),
+                            "status": outcome.get("status"),
+                            "error_code": outcome.get("error_code"),
+                        }
+                    )
+                    if str(outcome.get("state")) == "child_started":
+                        # The REAL child: a DBOS child workflow of THIS
+                        # parent (the reviewed child-start pattern). The
+                        # deterministic id + reject reuse policy make the
+                        # start idempotent under crash-replay. The start
+                        # runs on a WORKER thread: ``run_workflow`` is the
+                        # sync engine handler — calling it on the async
+                        # handler loop would block the loop waiting on
+                        # itself (event-loop self-deadlock).
+                        child_run_id = str(outcome["child_run_id"])
+                        try:
+                            await asyncio.to_thread(
+                                _start_session_child_workflow,
+                                child_run_id,
+                                str(outcome["child_payload"]),
+                            )
+                        except dbos_error.DBOSException as start_error:
+                            if "already" not in str(start_error).lower():
+                                raise
+                        settled_child = await _settle_child_delegation(
+                            _resolve_session_run(),
+                            intent,
+                            payload_json,
+                            call_json,
+                            rounds,
+                            child_run_id=child_run_id,
+                            deadline_iso=str(outcome["deadline_iso"]),
+                        )
+                        tool_records.append(
+                            {
+                                "child_run_id": settled_child.get("child_run_id"),
+                                "child_state": settled_child.get("child_state"),
+                                "status": settled_child.get("status"),
+                            }
+                        )
+                    continue
                 outcome = json.loads(
                     await asyncio.to_thread(
                         _session_tool_execute, payload_json, call_json, rounds
@@ -2125,6 +2714,9 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                 break
             # All round results landed: mark the atomic group complete.
             _session_tool_group_marked(payload_json, entry_id, "complete")
+            # D05: the stable-id compaction checkpoint (idempotent per
+            # range; a no-op below the configured threshold).
+            _session_compaction_checkpoint(payload_json, pins_json)
             rounds += 1
             if rounds >= intent.max_rounds:
                 raise SessionStageError("round_budget_exhausted")

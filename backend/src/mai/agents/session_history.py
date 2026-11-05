@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -149,6 +149,41 @@ _RETRY_PROMPT_ERROR_CODE: Final[str] = "payload_schema_mismatch"
 #: Fail-safe context-walk bound (entries): the compaction boundary normally
 #: stops the walk; this cap keeps a compaction-free session honest too.
 MAX_CONTEXT_ENTRIES: Final[int] = 800
+
+
+class RunHistoryScope(Enum):
+    """D05 delegation isolation for the native model window: a CHILD run's
+    window carries ONLY its own entries; a ROOT run's window NEVER carries
+    child-run entries (a child's transcript is never spliced into the
+    parent's native history)."""
+
+    ROOT_RUN = "root"
+    CHILD_RUN = "child"
+
+
+async def _child_run_ids(
+    sessions: Any, *, session_id: uuid.UUID, server_id: uuid.UUID
+) -> frozenset[uuid.UUID]:
+    """The session's delegated (child) run ids — the entries these carry
+    are the child transcripts that never splice into a root's window."""
+    from sqlalchemy import text as _sql_text
+
+    from mai.session_store import _lock_session
+
+    async with sessions() as session:
+        async with session.begin():
+            await _lock_session(session, session_id=session_id, server_id=server_id)
+            rows = (
+                await session.execute(
+                    _sql_text(
+                        "SELECT run_id FROM session_runs "
+                        "WHERE session_id = :sid AND parent_run_id IS NOT NULL"
+                    ),
+                    {"sid": session_id},
+                )
+            ).scalars().all()
+    return frozenset(uuid.UUID(str(row)) for row in rows)
+
 
 #: Operator steering note bound (the D01 control-note bound).
 _STEER_NOTE_MAX_CHARS: Final[int] = 500
@@ -1104,6 +1139,7 @@ async def abuild_session_model_history(
     include_thinking: bool = True,
     retry_mode: bool = False,
     max_context_entries: int = MAX_CONTEXT_ENTRIES,
+    run_scope: tuple[RunHistoryScope, uuid.UUID] | None = None,
 ) -> SessionNativeHistory:
     """Load the bounded model window from the store and project it natively.
 
@@ -1112,7 +1148,27 @@ async def abuild_session_model_history(
     latest compaction boundary (entries covered by the anchor are superseded
     and stay in the store) or at :data:`MAX_CONTEXT_ENTRIES`, whichever comes
     first. The result carries the honest exclusion ledger.
+
+    ``run_scope`` (D05, additive): ``(kind, run_id)`` isolates DELEGATION
+    surfaces from each other — the child's native window sees ONLY its own
+    run's entries; a root run's window NEVER sees child-run entries (a
+    child's transcript is never spliced into the parent's native history).
+    Sibling ROOT runs of the same session stay visible (the D04 cross-run
+    continuation proof). ``None`` (every existing caller) keeps the
+    whole-session window.
     """
+    keep: Callable[[SessionEntryView], bool] | None = None
+    if run_scope is not None:
+        scope_kind, scope_run_id = run_scope
+        if scope_kind is RunHistoryScope.CHILD_RUN:
+            keep = lambda entry: entry.run_id == scope_run_id  # noqa: E731
+        else:
+            child_run_ids = await _child_run_ids(
+                sessions, session_id=session_id, server_id=server_id
+            )
+            keep = lambda entry: (  # noqa: E731
+                entry.run_id is None or entry.run_id not in child_run_ids
+            )
     window: list[SessionEntryView] = []
     boundary_seq: int | None = None  # compaction coverage seen so far
     cursor: int | None = None
@@ -1138,6 +1194,8 @@ async def abuild_session_model_history(
             break
         cursor = page.next_before_seq
     window.sort(key=lambda entry: entry.seq)
+    if keep is not None:
+        window = [entry for entry in window if keep(entry)]
     window = window[-max_context_entries:]
     # build_native_model_history owns compaction handling: it finds the
     # latest compaction in the window, emits the anchor and supersedes the

@@ -57,6 +57,7 @@ from mai.contracts.sessions import (
     MAX_PAGE_BYTES,
     SESSION_LIST_DEFAULT_LIMIT,
     SESSION_LIST_MAX_LIMIT,
+    CompactionEntry,
     EntryKind,
     RunStateEntry,
     SessionContractError,
@@ -86,11 +87,13 @@ __all__ = [
     "aattach_session_tag",
     "acreate_run",
     "acreate_session",
+    "alist_compactions",
     "alist_provider_artifacts",
     "alist_session_tags",
     "alist_sessions",
     "aread_session_history",
     "arecord_admission",
+    "arecord_compaction",
     "arecord_provider_artifact",
     "arecord_run_state",
     "asession_tags_page",
@@ -770,6 +773,83 @@ def _entry_view(row: SessionEntryRow) -> SessionEntryView:
         created_at=row.created_at,
         payload=row.payload,
     )
+
+
+async def arecord_compaction(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    compaction: CompactionEntry,
+) -> tuple[SessionEntryRow, bool]:
+    """Append ONE compaction marker (D05; the sole compaction writer).
+
+    Idempotent per covered RANGE (durable id ``compaction:{from}:{to}``)
+    under the session-row fence: a re-run over the same range returns the
+    EXISTING row with ``created=False`` — never a second summary, never
+    double coverage. The originals are never touched; the marker is just
+    another appended entry (``session_id`` never rotates).
+    """
+    durable_source_id = (
+        f"compaction:{compaction.from_seq}:{compaction.to_seq}"
+    )
+    async with sessions() as session:
+        async with session.begin():
+            await _lock_session(session, session_id=session_id, server_id=server_id)
+            committed = await _find_committed_entry(
+                session,
+                session_id=session_id,
+                run_id=None,
+                durable_source_id=durable_source_id,
+                kind=EntryKind.COMPACTION.value,
+            )
+            if committed is not None:
+                return committed, False
+            row = await _append_entry_tx(
+                session,
+                session_id=session_id,
+                run_id=None,
+                kind=EntryKind.COMPACTION.value,
+                payload=compaction.model_dump(mode="json"),
+                durable_source_id=durable_source_id,
+            )
+            return row, True
+
+
+async def alist_compactions(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    limit: int = 16,
+) -> list[SessionEntryRow]:
+    """The session's compaction markers, newest first (bounded page).
+
+    Bounded per the pagination invariant: ``limit`` is enforced (clamped to
+    the history page maximum); no unbounded scan.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        limit = 1
+    limit = min(limit, HISTORY_PAGE_MAX_ENTRIES)
+    async with sessions() as session:
+        async with session.begin():
+            await _lock_session(session, session_id=session_id, server_id=server_id)
+            rows = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT entry_id, session_id, run_id, seq, kind, payload,
+                               durable_source_id, created_at
+                        FROM session_entries
+                        WHERE session_id = :sid AND kind = 'compaction'
+                        ORDER BY seq DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"sid": session_id, "limit": limit},
+                )
+            ).mappings().all()
+            return [_entry_row(row) for row in rows]
 
 
 async def aread_session_history(
