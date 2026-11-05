@@ -701,6 +701,33 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         host_supervisor=host_shell_cap,
     )
     agent_run.configure_agent_run(agent_executor)
+    # D04 (COORD-D02-01): the single-loop session runner wires alongside
+    # the retained agent.run/run_v2/delegate family and composes the SAME
+    # dispatcher/registry/model-store/locks objects — one composition
+    # serves both runtime families until D09 deletes the old ones.
+    try:
+        from mai.agents import session_runner as agent_session_runner
+
+        agent_session_runner.configure_session_run(
+            agent_session_runner.SessionRunExecutor(
+                sessions=sessions,
+                dispatcher=dispatcher,
+                registry=registry,
+                model_store=model_store,
+                data_root=data_root,
+                locks=ResourceLockService(database_url),
+                resolver=_resolve_env,
+                # The production default model builder (models.build_model)
+                # applies; protocol fixtures inject their own builder via
+                # the handler-module composition.
+                model_builder=None,
+            )
+        )
+    except agent_session_runner.SessionRunError as exc:
+        # Idempotent wiring: the handler module may already have composed
+        # the session runner in this process.
+        if exc.reason != "already_configured":
+            raise
     agent_delegate.configure_delegation(
         agent_delegate.DelegationExecutor(
             sessions=sessions,

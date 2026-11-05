@@ -1170,6 +1170,14 @@ def partition_replayable_tool_groups(
     unresolved so a corrupt window can never yield an unmatched
     ``ToolReturnPart`` in native model history.
 
+    Lifecycle transparency (D04): ``RunStateEntry`` / ``ControlEntry`` /
+    ``DelegationEntry`` / ``CompactionEntry`` records written BETWEEN an
+    assistant call and its results (e.g. the dual-authority
+    ``waiting_approval``/``running`` transitions of an approval park) are
+    part of the group's own lifecycle — they never split the group and are
+    replayed in their chronological positions. Only a ``UserMessageEntry``
+    (or another assistant entry) splits an incomplete group.
+
     Raises:
         SessionContractError: on entries spanning multiple sessions
             (``cross_session_entry``), malformed tool-group metadata or
@@ -1213,10 +1221,19 @@ def partition_replayable_tool_groups(
                 )} != expected_ids
             ):
                 candidate = entries[walk]
-                if not isinstance(candidate.payload, ToolResultEntry):
-                    break  # a non-result entry splits the atomic group
-                matched.append(candidate)
-                walk += 1
+                if isinstance(candidate.payload, ToolResultEntry):
+                    matched.append(candidate)
+                    walk += 1
+                    continue
+                if isinstance(
+                    candidate.payload,
+                    (RunStateEntry, ControlEntry, DelegationEntry, CompactionEntry),
+                ):
+                    # Lifecycle transparency (D04): the group's own park/
+                    # resume transitions and domain records never split it.
+                    walk += 1
+                    continue
+                break  # a user/assistant entry splits the atomic group
             complete = (
                 {r.payload.call_id for r in matched if isinstance(
                     r.payload, ToolResultEntry
