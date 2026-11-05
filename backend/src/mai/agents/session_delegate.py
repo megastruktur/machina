@@ -402,6 +402,24 @@ async def aroot_run_id(
     return root
 
 
+async def arun_exists(
+    sessions: Any, session_id: uuid.UUID, run_id: uuid.UUID
+) -> bool:
+    """Whether the session already carries this run row (the deterministic
+    plan replay marker; pure read)."""
+    async with sessions() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT 1 FROM session_runs "
+                    "WHERE run_id = :rid AND session_id = :sid"
+                ),
+                {"rid": run_id, "sid": session_id},
+            )
+        ).first()
+    return row is not None
+
+
 async def achild_count(
     sessions: Any, session_id: uuid.UUID, parent_run_id: uuid.UUID
 ) -> int:
@@ -539,6 +557,14 @@ async def aplan_session_delegation(
         parsed["allowed_capabilities"],  # type: ignore[arg-type]
     )
 
+    # The child identity is DERIVED first (pure, no persistence): the gates
+    # below EXEMPT this call's own deterministic child when it already
+    # exists, so a replayed plan step (crash between the child-row commit
+    # and the DBOS step record — R05 F1) re-counts accurately and converges
+    # on the SAME child instead of falsely denying.
+    child_run_id = child_run_id_for(session_id, parent_run_id, delegate_call_id)
+    replaying = await arun_exists(sessions, session_id, child_run_id)
+
     # 1. ancestry/depth gate (session bound: depth 1 — a child never delegates).
     depth = await arun_depth(sessions, session_id, parent_run_id)
     if depth >= MAX_SESSION_DELEGATION_DEPTH:
@@ -556,9 +582,12 @@ async def aplan_session_delegation(
     child_depth = check_nesting(depth, None)
     del child_depth
 
-    # 2. fan-out gate: this delegation adds exactly one child; the parent's
-    #    durable children must stay under the session cap.
+    # 2. fan-out gate: this delegation adds exactly one child (none when it
+    #    is this plan's own replay); the parent's durable children must
+    #    stay under the session cap.
     children = await achild_count(sessions, session_id, parent_run_id)
+    if replaying:
+        children = max(0, children - 1)
     if children >= MAX_CHILDREN_PER_SESSION_RUN:
         raise SessionContractError(
             [
@@ -577,6 +606,8 @@ async def aplan_session_delegation(
     #    ancestor walk).
     root_run_id = await aroot_run_id(sessions, session_id, parent_run_id)
     descendants = await adescendant_count(sessions, session_id, root_run_id)
+    if replaying:
+        descendants = max(0, descendants - 1)
     if descendants >= MAX_DESCENDANTS_PER_ROOT:
         raise SessionContractError(
             [
@@ -589,10 +620,9 @@ async def aplan_session_delegation(
             ]
         )
 
-    # 4. child identity (deterministic) + budget reservation (reviewed
-    #    ledger: an unbudgeted root is a no-op; a budgeted root reserves
-    #    exactly one active slot for this child).
-    child_run_id = child_run_id_for(session_id, parent_run_id, delegate_call_id)
+    # 4. budget reservation (reviewed ledger: an unbudgeted root is a
+    #    no-op; a budgeted root reserves exactly one active slot for this
+    #    child — an idempotent no-op on this plan's own replay).
     if budget_ledger is not None:
         await budget_ledger.areserve(
             str(parent_run_id), str(parent_run_id), [str(child_run_id)]

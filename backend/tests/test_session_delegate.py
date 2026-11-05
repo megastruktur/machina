@@ -64,6 +64,11 @@ from mai.agents.session_delegate import (
 from mai.agents.session_runner import (
     HANDLER_NAME as SESSION_HANDLER_NAME,
 )
+from mai.agents.session_runner import (
+    _delegation_denial_code,
+    _plan_delegation,
+    parse_session_run_intent,
+)
 from mai.contracts.sessions import SessionContractError, SessionSourceKind
 from mai.jobs.engine import EngineClient
 from mai.policy.evaluate import ParentScope, execution_context_from_json
@@ -580,6 +585,431 @@ def _tool_call_entry(
 
 def _plan_code(excinfo: pytest.ExceptionInfo[SessionContractError]) -> str:
     return str(excinfo.value)
+
+
+def _make_executor(
+    agent_url: str, factory: async_sessionmaker[AsyncSession], tmp: pathlib.Path
+):
+    """A minimal in-process SessionRunExecutor (the delegation plan path
+    touches sessions + budgets only; wiring is constructor-checked)."""
+    from mai.agents.model_store import ModelConfigStore
+    from mai.agents.session_runner import SessionRunExecutor
+    from mai.capabilities.dispatch import CapabilityDispatcher
+    from mai.credentials.env import EnvResolver
+    from mai.jobs.resource_locks import ResourceLockService
+    from mai.plugins.registry import CapabilityRegistry, parse_descriptor
+    from mai.policy.approvals import ApprovalStore
+    from mai.policy.evaluate import Policy
+
+    def _descriptor(capability_id: str, effect_class: str):
+        return parse_descriptor(
+            {
+                "identifier": capability_id,
+                "version": "1.0.0",
+                "config_schema": None,
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["marker"],
+                    "properties": {"marker": {"type": "string", "minLength": 1}},
+                },
+                "output_schema": {
+                    "type": "object",
+                    "required": ["status", "exit_code", "stdout", "stderr"],
+                    "properties": {
+                        "status": {"type": "string"},
+                        "exit_code": {"type": ["integer", "null"]},
+                        "stdout": {"type": "string"},
+                        "stderr": {"type": "string"},
+                    },
+                },
+                "execution_environments": ["linux_ssh"],
+                "effect_class": effect_class,
+                "resource_scope": [] if effect_class == "read" else ["target.exec"],
+                "required_grants": [],
+            },
+            source=f"<{capability_id} descriptor>",
+        )
+
+    registry = CapabilityRegistry()
+    registry.register(_descriptor("fixture.read", "read"))
+    registry.register(_descriptor("fixture.priv", "privileged"))
+    dispatcher = CapabilityDispatcher(
+        registry=registry,
+        approvals=ApprovalStore(factory),
+        grants=lambda: {READ_CAP: frozenset({uuid.UUID(SERVER_ID)})},
+        policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
+        adopted=lambda server_id: True,
+        credentials=lambda: EnvResolver(str(tmp / "fixture.env")),
+        executor=lambda call: None,  # never dispatched on the plan path
+    )
+    tmp.mkdir(parents=True, exist_ok=True)
+    (tmp / "fixture.env").write_text("MAI_SSH_KEY_FIXTURE=x\n", encoding="utf-8")
+    os.chmod(tmp / "fixture.env", 0o600)
+    return SessionRunExecutor(
+        sessions=factory,
+        dispatcher=dispatcher,
+        registry=registry,
+        model_store=ModelConfigStore(tmp / "model-root"),
+        data_root=str(tmp / "data-root"),
+        locks=ResourceLockService(agent_url),
+        resolver=EnvResolver(str(tmp / "fixture.env")),
+    )
+
+
+async def _insert_budgeted_run(
+    factory: async_sessionmaker[AsyncSession],
+    run_id: str,
+    *,
+    budget: dict[str, object] | None = None,
+) -> None:
+    """Insert the facade ``job_runs`` row (+ classification), optionally
+    budgeted (``root_budget`` JSON)."""
+    import sqlalchemy
+    from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
+
+    async with factory() as session:
+        await session.execute(
+            sqlalchemy.text(
+                """
+                INSERT INTO job_runs
+                    (run_id, server_id, depth, profile_revision,
+                     prompt_revision, model_profile, requested_grants,
+                     root_budget, submitted_at, updated_at)
+                VALUES
+                    (:run_id, :server_id, 0, 3, 7, 'fixture-fast',
+                     :requested_grants, CAST(:budget AS jsonb), now(), now())
+                """
+            ),
+            {
+                "run_id": uuid.UUID(run_id),
+                "server_id": uuid.UUID(SERVER_ID),
+                "requested_grants": json.dumps([READ_CAP, PRIV_CAP]),
+                "budget": json.dumps(budget) if budget else None,
+            },
+        )
+        await session.execute(
+            sqlalchemy.text(
+                """
+                INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                VALUES (:run_id, :tag, 'system')
+                """
+            ),
+            {
+                "run_id": uuid.UUID(run_id),
+                "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+            },
+        )
+        await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# R05 F1: the plan-step replay converges on the SAME child
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_step_replay_converges_on_same_child(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: pathlib.Path,
+) -> None:
+    """Simulate the DBOS plan-step replay: re-run ``_plan_delegation`` for
+    the SAME (session, parent, call_id) after the child rows committed but
+    the step record did not. No IntegrityError, exactly one child row, the
+    fan-out gate does NOT flip to denied, and the budget reservation is
+    NOT double-charged."""
+    from sqlalchemy import text as sql_text
+
+    executor = _make_executor(agent_url, factory, tmp_path)
+    session_id = _run(_make_session(factory))
+    parent_run_id = str(uuid.uuid4())
+    from mai.session_store import acreate_run
+
+    _run(
+        acreate_run(
+            factory,
+            session_id=uuid.UUID(session_id),
+            server_id=uuid.UUID(SERVER_ID),
+            run_id=uuid.UUID(parent_run_id),
+            model_profile="fixture-fast",
+            client_request_id=uuid.uuid4(),
+            parent_run_id=None,
+        )
+    )
+    _run(
+        _insert_budgeted_run(
+            factory,
+            parent_run_id,
+            budget={
+                "v": 1,
+                "max_depth": 1,
+                "max_children": 3,
+                "max_active": 3,
+                "max_steps": 100,
+                "max_total_tokens": 1000000,
+            },
+        )
+    )
+    payload_json = _canonical(
+        _intent_document(
+            parent_run_id,
+            session_id,
+            allowed=(READ_CAP, PRIV_CAP),
+            client_request_id=str(uuid.uuid4()),
+        )
+    )
+    intent = parse_session_run_intent(payload_json)
+    call = {
+        "tool_call_id": "del-1",
+        "tool_name": SESSION_DELEGATE_TOOL_NAME,
+        "capability_id": "session.delegate",
+        "args": _delegate_args(allowed=[READ_CAP], timeout_seconds=60.0),
+        "entry_id": str(uuid.uuid4()),
+        "seq": 100,
+    }
+
+    plan1 = await _plan_delegation(executor, intent, call=call, pins={})
+    plan2 = await _plan_delegation(executor, intent, call=call, pins={})
+    # The replay returned the SAME child (no UniqueViolation, no false
+    # fanout denial — both plans completed).
+    assert plan1["child_run_id"] == plan2["child_run_id"]
+    child_run_id = uuid.UUID(str(plan1["child_run_id"]))
+
+    # Exactly ONE child session_runs row under the parent.
+    runs = _read_session_runs(agent_url, session_id)
+    child_rows = [row for row in runs if row["run_id"] == child_run_id]
+    assert len(child_rows) == 1
+    with_psycopg = _run(_count_rows(agent_url,
+        "SELECT COUNT(*) FROM session_runs WHERE session_id = %s AND parent_run_id = %s",
+        (uuid.UUID(session_id), uuid.UUID(parent_run_id))))
+    assert with_psycopg == 1
+
+    # The budget reservation is NOT double-charged: exactly ONE reserve
+    # event for the root, naming exactly this child.
+    reserved = _run(_count_rows(agent_url,
+        "SELECT COUNT(*) FROM job_events WHERE run_id = %s AND type = 'agent.budget_reserved'",
+        (uuid.UUID(parent_run_id),)))
+    assert reserved == 1
+    child_json = _run(_scalar(agent_url,
+        "SELECT data::text FROM job_events WHERE run_id = %s AND type = 'agent.budget_reserved'",
+        (uuid.UUID(parent_run_id),)))
+    assert str(child_run_id) in str(child_json)
+
+
+async def _count_rows(url: str, query: str, params: tuple) -> int:
+    import psycopg
+
+    with psycopg.connect(url) as conn:
+        return int(conn.execute(query, params).fetchone()[0])
+
+
+async def _scalar(url: str, query: str, params: tuple) -> object:
+    import psycopg
+
+    with psycopg.connect(url) as conn:
+        return conn.execute(query, params).fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# R05 F2: budget overrun is an honest denied delegation result
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_overrun_maps_to_honest_denial(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: pathlib.Path,
+) -> None:
+    """A budgeted root whose remaining active slots cannot fit the child
+    refuses the plan with BudgetError; the mapping layer produces the
+    honest machine-readable code (no child row, no reservation leak)."""
+    executor = _make_executor(agent_url, factory, tmp_path)
+    session_id = _run(_make_session(factory))
+    parent_run_id = str(uuid.uuid4())
+    _run(
+        _insert_budgeted_run(
+            factory,
+            parent_run_id,
+            budget={
+                "v": 1,
+                "max_depth": 1,
+                "max_children": 3,
+                "max_active": 1,
+                "max_steps": 100,
+                "max_total_tokens": 1000000,
+            },
+        )
+    )
+    from mai.agents.budgets import BudgetLedger
+
+    ledger = BudgetLedger(factory)
+    probe_child = uuid.uuid4()
+    await ledger.areserve(parent_run_id, parent_run_id, [str(probe_child)])
+
+    intent = parse_session_run_intent(
+        _canonical(
+            _intent_document(
+                parent_run_id,
+                session_id,
+                allowed=(READ_CAP, PRIV_CAP),
+                client_request_id=str(uuid.uuid4()),
+            )
+        )
+    )
+    call = {
+        "tool_call_id": "del-1",
+        "tool_name": SESSION_DELEGATE_TOOL_NAME,
+        "capability_id": "session.delegate",
+        "args": _delegate_args(allowed=[READ_CAP], timeout_seconds=60.0),
+        "entry_id": str(uuid.uuid4()),
+        "seq": 100,
+    }
+    from mai.agents.budgets import BudgetError
+
+    with pytest.raises(BudgetError) as excinfo:
+        await _plan_delegation(executor, intent, call=call, pins={})
+    code = _delegation_denial_code(excinfo.value)
+    assert code == "active_budget_exhausted"
+    # NOTHING persisted: no child row for this call, and the reservation
+    # stream still holds ONLY the probe (no leaked delegation slot).
+    child_id = str(child_run_id_for(uuid.UUID(session_id), uuid.UUID(parent_run_id), "del-1"))
+    children = _run(_count_rows(agent_url,
+        "SELECT COUNT(*) FROM session_runs WHERE session_id = %s AND parent_run_id = %s",
+        (uuid.UUID(session_id), uuid.UUID(parent_run_id))))
+    assert children == 0
+    reserved = _run(_count_rows(agent_url,
+        "SELECT COUNT(*) FROM job_events WHERE run_id = %s AND type = 'agent.budget_reserved'",
+        (uuid.UUID(parent_run_id),)))
+    assert reserved == 1
+    reserved_children = _run(_scalar(agent_url,
+        "SELECT data::text FROM job_events WHERE run_id = %s AND type = 'agent.budget_reserved'",
+        (uuid.UUID(parent_run_id),)))
+    assert str(probe_child) in str(reserved_children)
+    assert child_id not in str(reserved_children)
+
+
+def test_budget_error_code_mapping() -> None:
+    from mai.agents.budgets import BudgetError, BudgetErrorCode
+
+    error = BudgetError(BudgetErrorCode.CHILD_CAP_EXCEEDS_BUDGET, "cap")
+    assert _delegation_denial_code(error) == "child_cap_exceeds_budget"
+    error = BudgetError(BudgetErrorCode.ACTIVE_BUDGET_EXHAUSTED, "slots")
+    assert _delegation_denial_code(error) == "active_budget_exhausted"
+
+
+def test_budget_overrun_delegation_is_an_honest_denied_result(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """A budgeted root whose remaining active slots cannot fit the child:
+    the delegation step answers the model with the honest DENIED tool
+    result (``active_budget_exhausted``), the parent run SUCCEEDS (no
+    crash), and nothing leaks — no child row, no second reservation."""
+    composition()
+    _write_env_file(scenario)
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        parent=[
+            _delegate_call_entry(call_id="del-1", allowed=[READ_CAP], timeout_seconds=60.0),
+            {"text": "budget refusal observed"},
+        ],
+        child=[
+            _tool_call_entry(name="fixture_read", marker="m1", call_id="c-child"),
+            {"text": "child must never run here"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    parent_run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        # A budgeted root with ONE active slot, already spent on a probe
+        # reservation: the delegation's own reserve cannot fit.
+        _run(
+            _insert_budgeted_run(
+                factory,
+                parent_run_id,
+                budget={
+                    "v": 1,
+                    "max_depth": 1,
+                    "max_children": 3,
+                    "max_active": 1,
+                    "max_steps": 100,
+                    "max_total_tokens": 1000000,
+                },
+            )
+        )
+        from mai.agents.budgets import BudgetLedger
+
+        probe = str(uuid.uuid4())
+        _run(BudgetLedger(factory).areserve(parent_run_id, parent_run_id, [probe]))
+        client.enqueue_run(
+            parent_run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    parent_run_id,
+                    session_id,
+                    allowed=(READ_CAP,),
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _await_terminal(client, parent_run_id, "succeeded", RUN_TIMEOUT, "parent")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The parent answered the model honestly and completed.
+    entries = _read_session_entries(agent_url, session_id)
+    parent_entries = [e for e in entries if e["run_id"] == uuid.UUID(parent_run_id)]
+    results = [
+        e
+        for e in parent_entries
+        if e["kind"] == "tool_result" and e["payload"]["call_id"] == "del-1"
+    ]
+    assert len(results) == 1
+    payload = results[0]["payload"]
+    assert payload["status"] == "denied"
+    assert payload["execution_status"] == "failed"
+    assert payload["effect_certainty"] == "certain"
+    assert payload["error_code"] == "active_budget_exhausted"
+    assert any(
+        "budget refusal observed" in str(e["payload"].get("text", ""))
+        for e in parent_entries
+        if e["kind"] == "assistant_message"
+    )
+    # Nothing leaked: no child run row, no child facade row, no delegation
+    # entry, and the reservation stream still holds ONLY the probe.
+    expected_child = child_run_id_for(
+        uuid.UUID(session_id), uuid.UUID(parent_run_id), "del-1"
+    )
+    runs = _read_session_runs(agent_url, session_id)
+    assert expected_child not in {row["run_id"] for row in runs}
+    assert [e for e in parent_entries if e["kind"] == "delegation"] == []
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(agent_url, row_factory=dict_row) as conn:
+        facade = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_runs WHERE run_id = %s", (expected_child,)
+        ).fetchone()
+        reserves = conn.execute(
+            "SELECT data::text FROM job_events WHERE run_id = %s "
+            "AND type = 'agent.budget_reserved'",
+            (uuid.UUID(parent_run_id),),
+        ).fetchall()
+    assert facade is not None and int(facade["n"]) == 0
+    assert len(reserves) == 1
+    assert probe in str(reserves[0]["data"])
+    assert str(expected_child) not in str(reserves[0]["data"])
+    # The child's fixture effect never happened.
+    assert "effect:fixture.read:m1" not in _journal_lines(scenario)
 
 
 # ---------------------------------------------------------------------------

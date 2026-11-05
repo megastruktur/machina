@@ -1051,11 +1051,16 @@ async def acreate_run(
     client_request_id: uuid.UUID,
     parent_run_id: uuid.UUID | None = None,
 ) -> SessionRunRow:
-    """Create one subordinate child-run row (``queued``).
+    """Create one subordinate child-run row (``queued``), idempotently.
 
-    The run/session identity conflict is enforced by the schema CHECK and
-    the D01 validators; ``parent_run_id`` must reference a run of the same
-    session (schema FK ties parents into ``session_runs``).
+    The run id IS the idempotency key (D05 fix1, R05 F1): a replayed plan
+    step after a crash between the child-row commit and the DBOS step
+    record converges on the EXISTING row (read-back) instead of raising a
+    UniqueViolation. A run id reused under a DIFFERENT session identity is
+    a hard contract conflict. The run/session identity conflict is enforced
+    by the schema CHECK and the D01 validators; ``parent_run_id`` must
+    reference a run of the same session (schema FK ties parents into
+    ``session_runs``).
     """
     if not isinstance(model_profile, str) or not 1 <= len(model_profile) <= _PROVIDER_MAX_CHARS:
         raise SessionContractError(
@@ -1083,6 +1088,7 @@ async def acreate_run(
                         VALUES
                             (:rid, :sid, :server_id, :parent, 'queued',
                              :profile, :creq)
+                        ON CONFLICT (run_id) DO NOTHING
                         RETURNING run_id, session_id, server_id, parent_run_id,
                                   state, model_profile, client_request_id,
                                   created_at, updated_at, completed_at
@@ -1097,7 +1103,37 @@ async def acreate_run(
                         "creq": client_request_id,
                     },
                 )
-            ).mappings().one()
+            ).mappings().first()
+            if row is None:
+                # D05 fix1 (R05 F1): the run id already exists. A replayed
+                # plan step converges on the SAME child row (the crash
+                # between the child commit and the DBOS step record); a run
+                # id reused across SESSIONS is a hard identity conflict.
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT run_id, session_id, server_id, parent_run_id,
+                                   state, model_profile, client_request_id,
+                                   created_at, updated_at, completed_at
+                            FROM session_runs
+                            WHERE run_id = :rid AND session_id = :sid
+                            """
+                        ),
+                        {"rid": run_id, "sid": session_id},
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise SessionContractError(
+                        [
+                            SessionFieldError(
+                                SessionErrorCode.SESSION_RUN_IDENTITY_CONFLICT,
+                                "run_id",
+                                "the run id already exists under a different "
+                                "session identity",
+                            )
+                        ]
+                    )
     return _run_row(row)
 
 

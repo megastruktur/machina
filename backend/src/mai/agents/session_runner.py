@@ -58,6 +58,7 @@ from pydantic_ai.tools import Tool as PydanticTool
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.agents.budgets import BudgetError
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
     SESSION_DELEGATE_CAPABILITY_ID,
@@ -1971,10 +1972,20 @@ def _start_session_child_workflow(child_run_id: str, child_payload: str) -> None
         DBOS.start_workflow(_engine.run_workflow, HANDLER_NAME, child_payload)
 
 
-def _delegation_denial_code(error: SessionContractError) -> str:
-    """Map one gate refusal onto its honest delegation error code (the
-    gate ORDER decides which bound refused; the field identifies it)."""
-    fields = {item.field for item in error.errors}
+def _delegation_denial_code(error: BaseException) -> str:
+    """Map one gate refusal onto its honest delegation error code.
+
+    Contract refusals are identified by the refusing gate's FIELD (the
+    gate ORDER decides); budget refusals (R05 F2) carry their own stable
+    machine-readable :class:`BudgetErrorCode` and map through unchanged —
+    both answer the model with a denied delegation result and persist
+    NOTHING but that result.
+    """
+    from mai.agents.budgets import BudgetError
+
+    if isinstance(error, BudgetError):
+        return str(error.code.value)
+    fields = {item.field for item in error.errors}  # type: ignore[union-attr]
     if "depth" in fields:
         return "delegation_depth_exhausted"
     if "children" in fields:
@@ -2083,7 +2094,11 @@ def _session_delegation_execute(
                 executor, intent, call=call, pins=json.loads(pins_json or "{}")
             )
         )
-    except SessionContractError as error:
+    except (SessionContractError, BudgetError) as error:
+        # R05 F2: a budgeted root that cannot fit this delegation answers
+        # the model with the honest denied result (areserve validated BEFORE
+        # any write, so no child row and no reservation leak) instead of
+        # failing the whole parent workflow with an unclassified error.
         code = _delegation_denial_code(error)
         executor.run(
             _persist_tool_result(

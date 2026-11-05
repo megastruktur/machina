@@ -46,6 +46,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.session_compaction import (
+    MAX_COMPACTION_PAGES,
     MAX_COMPACTION_SCAN_ENTRIES,
     SUMMARIZER_UNAVAILABLE_MARKER,
     acompact_session_head,
@@ -634,4 +635,98 @@ async def test_scan_budget_is_enforced(
     assert estimate > 0
     # The scan budget bound is a module constant (bounded walk invariant).
     assert 10 <= MAX_COMPACTION_SCAN_ENTRIES <= 5000
+    assert 1 <= MAX_COMPACTION_PAGES <= 64
     assert json.dumps(decision := {"estimated": estimate}) is not None
+
+
+# ---------------------------------------------------------------------------
+# R05 F3: the uncovered page walk stops at the coverage floor
+# ---------------------------------------------------------------------------
+
+
+async def test_page_walk_is_proportional_to_uncovered_region(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an existing compaction marker covering the head, the walk
+    fetches pages proportional to the UNCOVERED tail — never the whole
+    history (a 400-entry session with 300 covered must fetch ~2 pages,
+    while the unmarked control walks all ~8)."""
+    import uuid as _uuid
+
+    import mai.agents.session_compaction as compaction_module
+    from mai.contracts.sessions import CompactionEntry
+    from mai.session_store import arecord_compaction
+
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    for n in range(1, 401):
+        await _append_user(factory, sid, n, pad=4)
+
+    # Instrument the store call with a real page counter (the module
+    # imports the reader into its own namespace).
+    real_reader = compaction_module.aread_session_history
+    pages: list[int | None] = []
+
+    async def counting_reader(*args: object, **kwargs: object):
+        pages.append(kwargs.get("before_seq"))
+        return await real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(compaction_module, "aread_session_history", counting_reader)
+
+    # Control: NO marker — the walk covers the whole history.
+    decision = await acompact_session_head(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        model_profile="profile-a",
+        env=dict(_SMALL_ENV),
+    )
+    whole_history_pages = len(pages)
+    assert whole_history_pages >= 400 // 50, whole_history_pages
+    assert decision["pages_fetched"] == whole_history_pages
+
+    # Mark the bottom 300 entries as covered, append fresh work, and
+    # re-measure: the walk must stop at the floor.
+    await arecord_compaction(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        compaction=CompactionEntry(
+            kind="compaction",
+            compaction_id=_uuid.uuid4(),
+            from_seq=1,
+            to_seq=300,
+            summary_text="covered head",
+            model_profile="profile-a",
+        ),
+    )
+    for n in range(401, 461):
+        await _append_user(factory, sid, n, pad=4)
+
+    pages.clear()
+    uncovered, fetched = await compaction_module._collect_uncovered(
+        factory, session_id=sid, server_id=SERVER_A, floor_seq=300
+    )
+    # Everything above the floor is uncovered (the tail users plus the
+    # small control marker); NOT ONE covered entry (seq <= 300) was
+    # fetched, and the walk did NOT continue to seq 1.
+    assert fetched <= 4, fetched
+    # 100 tail-of-covered users (301..400) + the two markers (the control
+    # compact's 1..1 and the explicit 1..300) + the 60 fresh users.
+    assert len(uncovered) == 162
+    assert all(entry.seq > 300 for entry in uncovered)
+    assert len(pages) == fetched
+
+    # The decision document reports the real page count.
+    decision = await acompact_session_head(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        model_profile="profile-a",
+        env=dict(_SMALL_ENV),
+    )
+    assert decision["pages_fetched"] <= 4
+    assert decision["pages_fetched"] < whole_history_pages

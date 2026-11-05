@@ -62,6 +62,7 @@ __all__ = [
     "CHARS_PER_TOKEN",
     "DEFAULT_COMPACTION_TARGET_TOKENS",
     "DEFAULT_COMPACTION_THRESHOLD_TOKENS",
+    "MAX_COMPACTION_PAGES",
     "MAX_COMPACTION_SCAN_ENTRIES",
     "MAX_COMPACTION_TARGET_TOKENS",
     "MAX_COMPACTION_THRESHOLD_TOKENS",
@@ -82,6 +83,11 @@ MAX_COMPACTION_TARGET_TOKENS: Final[int] = 250_000
 
 #: The total uncovered-entry scan budget (bounded page walk).
 MAX_COMPACTION_SCAN_ENTRIES: Final[int] = 800
+
+#: The page-fetch budget for one compaction decision (R05 F3): the walk
+#: stops at the coverage floor, so this cap bounds a pathological scan —
+#: pages stay proportional to the UNCOVERED region, never to the history.
+MAX_COMPACTION_PAGES: Final[int] = 16
 
 #: Summarizer attempts: ONE retry after the first failure.
 SUMMARIZER_ATTEMPTS: Final[int] = 2
@@ -201,15 +207,24 @@ async def acompact_session_head(
         covered_to = int(row.payload.get("to_seq", 0) or 0)
         floor_seq = max(floor_seq, covered_to)
 
-    uncovered = await _collect_uncovered(
+    uncovered, pages_fetched = await _collect_uncovered(
         sessions, session_id=session_id, server_id=server_id, floor_seq=floor_seq
     )
     if not uncovered:
-        return _decision(False, None, False, 0, None, "none", "no_uncovered_entries")
+        return _decision(
+            False, None, False, 0, None, "none", "no_uncovered_entries", pages_fetched
+        )
     total_estimate = estimate_entries_tokens(uncovered)
     if total_estimate <= threshold:
         return _decision(
-            False, None, False, total_estimate, None, "none", "below_threshold"
+            False,
+            None,
+            False,
+            total_estimate,
+            None,
+            "none",
+            "below_threshold",
+            pages_fetched,
         )
 
     # The window: oldest entries first, up to the target estimate.
@@ -229,6 +244,7 @@ async def acompact_session_head(
             None,
             "none",
             "no_complete_boundary",
+            pages_fetched,
         )
     covered = [entry for entry in window if entry.seq <= boundary]
     from_seq = covered[0].seq
@@ -262,6 +278,7 @@ async def acompact_session_head(
         (payload.from_seq, payload.to_seq),
         "existing" if not created else summary_source,
         "compacted",
+        pages_fetched,
     )
 
 
@@ -273,6 +290,7 @@ def _decision(
     covered_range: tuple[int, int] | None,
     summary_source: str,
     reason: str,
+    pages_fetched: int = 0,
 ) -> dict[str, object]:
     return {
         "compacted": compacted,
@@ -282,6 +300,7 @@ def _decision(
         "covered_range": covered_range,
         "summary_source": summary_source,
         "reason": reason,
+        "pages_fetched": pages_fetched,
     }
 
 
@@ -291,12 +310,19 @@ async def _collect_uncovered(
     session_id: Any,
     server_id: Any,
     floor_seq: int,
-) -> list[SessionEntryView]:
+) -> tuple[list[SessionEntryView], int]:
     """The uncovered entries, newest-first page walk (bounded pages, bounded
-    total), returned chronological."""
+    total), returned chronological — plus the real page-fetch count.
+
+    R05 F3: the walk STOPS as soon as a page reaches the coverage floor
+    (``oldest_seq <= floor_seq``): every older page is fully covered by the
+    existing compaction, so pages stay proportional to the UNCOVERED
+    region, never to the whole history.
+    """
     collected: list[SessionEntryView] = []
+    pages_fetched = 0
     cursor: int | None = None
-    while len(collected) < MAX_COMPACTION_SCAN_ENTRIES:
+    while len(collected) < MAX_COMPACTION_SCAN_ENTRIES and pages_fetched < MAX_COMPACTION_PAGES:
         page = await aread_session_history(
             sessions,
             session_id=session_id,
@@ -304,6 +330,7 @@ async def _collect_uncovered(
             limit=min(64, HISTORY_PAGE_MAX_ENTRIES),
             before_seq=cursor,
         )
+        pages_fetched += 1
         if not page.items:
             break
         for entry in reversed(page.items):
@@ -311,13 +338,17 @@ async def _collect_uncovered(
                 collected.append(entry)
             else:
                 break
+        # The coverage floor sits inside (or below) this page: every older
+        # page is fully covered — the uncovered region is fully traversed.
+        if page.oldest_seq is not None and page.oldest_seq <= floor_seq:
+            break
         if len(collected) >= MAX_COMPACTION_SCAN_ENTRIES:
             break
         if not page.has_older or page.next_before_seq is None:
             break
         cursor = page.next_before_seq
     collected.sort(key=lambda entry: entry.seq)
-    return collected
+    return collected, pages_fetched
 
 
 # --- summarization (retry-then-fallback) ---------------------------------------------
