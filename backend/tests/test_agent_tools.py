@@ -65,7 +65,7 @@ from mai.agents.tools import (
 from mai.capabilities.dispatch import (
     REDACTED as DISPATCH_REDACTED,
 )
-from mai.contracts.tasks import (
+from mai.contracts.tool_results import (
     RESULT_DATA_VALUE_MAX_CHARS,
     DomainOutcome,
     EffectCertainty,

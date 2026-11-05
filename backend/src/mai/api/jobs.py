@@ -108,7 +108,6 @@ from mai.api.auth import (
     render_error_envelope,
 )
 from mai.auth.sessions import hash_token
-from mai.contracts.conversations import EntityTagPreviewView
 from mai.contracts.jobs import (
     EVENT_PAYLOAD_VERSION,
     TERMINAL_RUN_STATES,
@@ -118,6 +117,7 @@ from mai.contracts.jobs import (
     parse_job_event,
 )
 from mai.contracts.server import parse_server_profile_text
+from mai.contracts.tags import EntityTagPreviewView
 from mai.jobs import steps as run_steps
 from mai.jobs.engine import EngineError, RunIdInUseError, validate_run_id
 from mai.jobs.lifecycle import (

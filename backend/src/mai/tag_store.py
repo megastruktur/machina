@@ -59,7 +59,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mai.contracts.conversations import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+# D01 extraction: the neutral tag/pagination vocabulary now lives in
+# :mod:`mai.contracts.tags`; this module re-exports it so every existing
+# ``mai.tag_store`` caller keeps working unchanged. The re-exports are the
+# same objects, never copies.
+from mai.contracts.tags import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    EntityTagPreview,
+    compute_has_more,
+)
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 __all__ = [
@@ -89,6 +98,7 @@ __all__ = [
     "apreview_job_tags",
     "apreview_conversation_tags",
     "anormalize_tag_name",
+    "compute_has_more",
 ]
 
 
@@ -332,12 +342,8 @@ class EntityTagRow:
     created_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class EntityTagPreview:
-    """Bounded listing projection: first names plus the honest total."""
-
-    preview: tuple[str, ...]
-    total: int
+# NOTE: EntityTagPreview is re-exported from :mod:`mai.contracts.tags`
+# (D01 neutral extraction) — see the import block above.
 
 
 def _row_to_tag(row: Mapping[str, object]) -> TagRow:

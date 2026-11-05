@@ -80,15 +80,17 @@ from mai.api.auth import (
 )
 from mai.api.conversations import _conversation_not_found
 from mai.api.jobs import (
-    DEFAULT_PAGE_LIMIT,
-    MAX_PAGE_LIMIT,
     _error,
     _not_found_run,
     _sessions,
     _validation_error,
 )
 from mai.auth.sessions import hash_token
-from mai.contracts.conversations import compute_has_more
+from mai.contracts.tags import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    compute_has_more,
+)
 from mai.tag_store import (
     EntityTagRow,
     TagErrorCode,

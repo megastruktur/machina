@@ -51,11 +51,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.conversation_store import StoredMessage
-from mai.contracts.conversations import MessageRole, MessageSourceKind
+from mai.contracts.tags import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, EntityTagPreview
 from mai.jobs.lifecycle import RunLifecycle
 from mai.tag_store import (
-    DEFAULT_PAGE_LIMIT,
-    EntityTagPreview,
     TagErrorCode,
     TagStoreError,
     _check_page_bounds,
@@ -81,7 +79,8 @@ __all__ = [
 ]
 
 # Re-exported for callers composing the wire envelope next to the rows.
-from mai.tag_store import MAX_PAGE_LIMIT  # noqa: E402
+# ``DEFAULT_PAGE_LIMIT`` / ``MAX_PAGE_LIMIT`` / ``EntityTagPreview`` come from
+# :mod:`mai.contracts.tags` (D01 neutral extraction) via the import block above.
 
 
 # ---------------------------------------------------------------------------

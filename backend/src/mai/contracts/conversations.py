@@ -59,6 +59,16 @@ from typing import Literal as PyLiteral
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ValidationError as PydanticValidationError
 
+# D01 extraction: the neutral tag/pagination vocabulary now lives in
+# :mod:`mai.contracts.tags`; this module re-imports it so every existing
+# ``mai.contracts.conversations`` caller keeps working until D09 deletes this
+# module. The re-exports are the same objects, never copies.
+from mai.contracts.tags import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    EntityTagPreviewView,
+    compute_has_more,
+)
 from mai.contracts.tasks import (
     MAX_EVIDENCE_REFS,
     SUMMARY_MAX_CHARS,
@@ -128,13 +138,9 @@ __all__ = [
 #: Payload schema version produced by this freeze (fails closed on drift).
 SCHEMA_VERSION: Final[int] = 1
 
-# --- pagination bounds (C01 rule 5; AGENTS.md mandatory-pagination invariant) ---
-
-#: Default list page size for every collection endpoint/tool in the product.
-DEFAULT_PAGE_LIMIT: Final[int] = 50
-
-#: Hard upper bound any single page may request.
-MAX_PAGE_LIMIT: Final[int] = 200
+# NOTE: DEFAULT_PAGE_LIMIT and MAX_PAGE_LIMIT are re-exported from
+# :mod:`mai.contracts.tags` (D01 neutral extraction) — see the import block
+# above.
 
 # --- intake bounds (ratified; additions require campaign reconciliation) ------
 
@@ -418,9 +424,8 @@ class ConversationTranscriptPage(PageEnvelope):
         return self
 
 
-def compute_has_more(offset: int, returned: int, total: int) -> bool:
-    """Canonical ``has_more`` derivation shared by every paginated producer."""
-    return offset + returned < total
+# NOTE: compute_has_more is re-exported from :mod:`mai.contracts.tags`
+# (D01 neutral extraction) — see the import block above.
 
 
 # --- conversation header views (§3/§4) ----------------------------------------
@@ -441,20 +446,8 @@ class MessageRange(BaseModel):
         return self
 
 
-class EntityTagPreviewView(BaseModel):
-    """Bounded listing projection of tag names plus honest total count."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    preview: list[str] = Field(
-        max_length=3,
-        description="First ≤3 tag names (deterministic name order)",
-    )
-    total: int = Field(
-        ge=1,
-        description="Honest total number of tags attached (including beyond "
-        "preview); at least one tag is mandatory, so 0 is never valid",
-    )
+# NOTE: EntityTagPreviewView is re-exported from :mod:`mai.contracts.tags`
+# (D01 neutral extraction) — see the import block above.
 
 
 class ConversationSummary(BaseModel):

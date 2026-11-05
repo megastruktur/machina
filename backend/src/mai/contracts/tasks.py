@@ -55,6 +55,22 @@ from typing import Literal as PyLiteral
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# D01 extraction: the neutral tool-result vocabulary (bounds + execution/
+# domain/effect-certainty enums) now lives in :mod:`mai.contracts.tool_results`;
+# this module re-imports it so every existing ``mai.contracts.tasks`` caller
+# keeps working until D09 deletes this module. The re-exports are the same
+# objects, never copies.
+from mai.contracts.tool_results import (
+    MAX_EVIDENCE_REFS,
+    RESULT_DATA_MAX_ENTRIES,
+    RESULT_DATA_VALUE_MAX_CHARS,
+    SECRET_DATA_KEYS,
+    DomainOutcome,
+    EffectCertainty,
+    EvidenceKind,
+    ExecutionStatus,
+)
+
 #: Payload schema version produced by this freeze. Consumers fail closed on
 #: any other value (server-contract pattern): a newer producer must bump and
 #: reconcile, not silently drift.
@@ -81,9 +97,6 @@ MAX_CRITERIA: Final[int] = 12
 #: Maximum constraint proposals in one intake turn.
 MAX_CONSTRAINT_PROPOSALS: Final[int] = 12
 
-#: Maximum evidence references carried by one step / verdict / turn section.
-MAX_EVIDENCE_REFS: Final[int] = 16
-
 #: Maximum dependency references per step.
 MAX_DEPENDENCIES: Final[int] = 8
 
@@ -92,27 +105,9 @@ MAX_DEPENDENCIES: Final[int] = 8
 #: "Stable item IDs, dependencies, no cycles").
 STABLE_ID_PATTERN: Final[str] = r"^[a-z][a-z0-9_]{0,63}$"
 
-#: Maximum entries in a verdict's bounded ``result_data`` map, and the value
-#: bound per entry (act_CONTRACTS §9 "safe bounded result data").
-RESULT_DATA_MAX_ENTRIES: Final[int] = 8
-RESULT_DATA_VALUE_MAX_CHARS: Final[int] = 200
-
-#: Credential-shaped key names that may never appear as ``result_data`` keys.
-#: Exact key-name matching (case-insensitive), the same discipline as the
-#: jobs envelope guard — defense-in-depth only, never proof.
-SECRET_DATA_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "private_key",
-        "passphrase",
-        "api_key",
-        "access_key",
-        "credential",
-    }
-)
+# NOTE: MAX_EVIDENCE_REFS, RESULT_DATA_MAX_ENTRIES, RESULT_DATA_VALUE_MAX_CHARS
+# and SECRET_DATA_KEYS are re-exported from :mod:`mai.contracts.tool_results`
+# (D01 neutral extraction) — see the import block above.
 
 
 # --- frozen vocabularies -----------------------------------------------------
@@ -181,42 +176,9 @@ class PatchOp(StrEnum):
     SUPERSEDE = "supersede"
 
 
-class EvidenceKind(StrEnum):
-    """What kind of sourced record an evidence reference points at (§5 facts;
-    §9 evidence validator checks provenance, task/target and observation type)."""
-
-    MESSAGE = "message"
-    OBSERVATION = "observation"
-    RUN_EVENT = "run_event"
-    ARTIFACT = "artifact"
-    DOCUMENT = "document"
-
-
-class ExecutionStatus(StrEnum):
-    """Compact technical execution status of the closing attempt (§9 receipt;
-    values subset the frozen C04 ``CommandOutcome`` vocabulary)."""
-
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    OUTCOME_UNKNOWN = "outcome_unknown"
-    CANCELLED = "cancelled"
-
-
-class DomainOutcome(StrEnum):
-    """Domain-level outcome; ``unknown`` is honest for arbitrary shell work
-    (§9: no regex oracle claims semantic success)."""
-
-    SUCCESS = "success"
-    FAILURE = "failure"
-    UNKNOWN = "unknown"
-
-
-class EffectCertainty(StrEnum):
-    """How certain the effect evidence is (§9 ``effect_certainty``)."""
-
-    CERTAIN = "certain"
-    UNCERTAIN = "uncertain"
-    UNKNOWN = "unknown"
+# NOTE: EvidenceKind, ExecutionStatus, DomainOutcome and EffectCertainty are
+# re-exported from :mod:`mai.contracts.tool_results` (D01 neutral extraction) —
+# see the import block above.
 
 
 class PhaseAction(StrEnum):
