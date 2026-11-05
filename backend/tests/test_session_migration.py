@@ -145,6 +145,7 @@ def _seed_old_world(url: str) -> None:
                 """
                 INSERT INTO conversations (conversation_id, server_id)
                 VALUES (%s, %s)
+                ON CONFLICT (conversation_id) DO NOTHING
                 """,
                 (AGENT_CONV, str(SERVER_A)),
             )
@@ -153,6 +154,7 @@ def _seed_old_world(url: str) -> None:
                 INSERT INTO conversation_tags
                     (conversation_id, tag_id, assignment_source)
                 VALUES (%s, %s, 'system')
+                ON CONFLICT DO NOTHING
                 """,
                 (AGENT_CONV, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
             )
@@ -160,6 +162,7 @@ def _seed_old_world(url: str) -> None:
                 """
                 INSERT INTO conversation_runs (conversation_id, run_id)
                 VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
                 """,
                 (AGENT_CONV, AGENT_ROOT),
             )
@@ -192,6 +195,7 @@ def _seed_old_world(url: str) -> None:
                 """
                 INSERT INTO objectives (objective_id, server_id, original_request)
                 VALUES (%s, %s, 'synthetic legacy request')
+                ON CONFLICT (objective_id) DO NOTHING
                 """,
                 (AGENT_OBJECTIVE, str(SERVER_A)),
             )
@@ -201,6 +205,7 @@ def _seed_old_world(url: str) -> None:
                     (objective_id, run_id, initiating_server_id, handler,
                      actor_kind)
                 VALUES (%s, %s, %s, 'agent.run_v2', 'operator')
+                ON CONFLICT DO NOTHING
                 """,
                 (AGENT_OBJECTIVE, AGENT_ROOT, str(SERVER_A)),
             )
@@ -211,6 +216,7 @@ def _seed_old_world(url: str) -> None:
                     INSERT INTO job_steps
                         (step_id, run_id, seq, capability_id)
                     VALUES (%s, %s, 1, 'host.logs')
+                    ON CONFLICT (run_id, seq) DO NOTHING
                     """,
                     (uuid.uuid4(), run_id),
                 )
@@ -219,6 +225,7 @@ def _seed_old_world(url: str) -> None:
                     INSERT INTO job_events
                         (event_id, run_id, seq, ts, v, type, data)
                     VALUES (%s, %s, 1, now(), 1, 'run.submitted', '{}'::jsonb)
+                    ON CONFLICT DO NOTHING
                     """,
                     (uuid.uuid4(), run_id),
                 )
@@ -226,6 +233,7 @@ def _seed_old_world(url: str) -> None:
                     """
                     INSERT INTO job_tags (job_id, tag_id, assignment_source)
                     VALUES (%s, %s, 'system')
+                    ON CONFLICT DO NOTHING
                     """,
                     (run_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
                 )
@@ -236,6 +244,7 @@ def _seed_old_world(url: str) -> None:
                     (objective_id, run_id, parent_run_id, initiating_server_id,
                      handler, actor_kind)
                 VALUES (%s, %s, %s, %s, 'agent.run_v2', 'child_agent')
+                ON CONFLICT DO NOTHING
                 """,
                 (AGENT_OBJECTIVE, AGENT_CHILD, AGENT_ROOT, str(SERVER_A)),
             )
@@ -247,6 +256,7 @@ def _seed_old_world(url: str) -> None:
                     (schedule_id, server_id, cron, cron_timezone, enabled,
                      run_spec)
                 VALUES (%s, %s, '0 0 * * *', 'UTC', true, '{}'::jsonb)
+                ON CONFLICT (schedule_id) DO NOTHING
                 """,
                 (UNRELATED_SCHEDULE, str(SERVER_A)),
             )
@@ -255,6 +265,7 @@ def _seed_old_world(url: str) -> None:
                 INSERT INTO job_schedule_fires
                     (schedule_id, planned_fire_time, run_id)
                 VALUES (%s, '2026-01-01T00:00:00+00:00'::timestamptz, %s)
+                ON CONFLICT DO NOTHING
                 """,
                 (UNRELATED_SCHEDULE, UNRELATED_RUN),
             )
@@ -478,6 +489,10 @@ def test_destructive_ddl_drops_obsolete_and_spares_generic(
         command.upgrade(_alembic_config(), "head")
     finally:
         _restore_migration_env(saved)
+    # R02 finding 1: make the generic-survival assertion order-independent —
+    # seed this test's own unrelated run instead of relying on a sibling
+    # test having left one behind.
+    _seed_old_world(migrated_url)
     engine = sqlalchemy.create_engine(migrated_url)
     try:
         with engine.begin() as conn:

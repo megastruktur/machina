@@ -1163,7 +1163,12 @@ def partition_replayable_tool_groups(
     by a non-tool-result entry or closed before every call is answered stays
     **visible but excluded**: the assistant copy is marked
     ``tool_group_state="pending"`` (no results yet) or ``"unresolved"``
-    (partial/orphan results), and the partial results are excluded too.
+    (partial/orphan results), and the partial results are excluded too. An
+    orphan ``ToolResultEntry`` — no preceding matching assistant call group
+    in this window (R01 O1: straddling a window boundary or corrupted) — is
+    likewise NEVER replayable: it is classified into ``pending`` as
+    unresolved so a corrupt window can never yield an unmatched
+    ``ToolReturnPart`` in native model history.
 
     Raises:
         SessionContractError: on entries spanning multiple sessions
@@ -1239,6 +1244,15 @@ def partition_replayable_tool_groups(
             pending.append(entry.model_copy(update={"payload": marked_payload}))
             pending.extend(matched)
             index = walk if matched else index + 1
+            continue
+        if isinstance(payload, ToolResultEntry):
+            # R01 O1 (pinned by tests): a tool result with NO preceding
+            # matching assistant call group in this window — straddling a
+            # window boundary or corrupted — is an orphan. It is NEVER
+            # replayable (an unmatched ToolReturnPart would poison the
+            # native model request); it stays visible as unresolved.
+            pending.append(entry)
+            index += 1
             continue
         replayable.append(entry)
         index += 1

@@ -598,6 +598,25 @@ def test_partition_marks_resultless_assistant_pending() -> None:
     assert marked.tool_group_state == "pending"
 
 
+def test_orphan_tool_result_is_never_replayable_r01_o1() -> None:
+    """R01 O1 pin: a ToolResultEntry with no preceding matching assistant
+    call group in the window (window-straddling or corrupted) is classified
+    into ``pending`` and NEVER enters the replayable native model history —
+    an unmatched ToolReturnPart would poison the next provider request."""
+    orphan = _tool_result_entry(1, call_id="call-orphan", seq=1)
+    user = _user_entry(2, seq=2)
+    partition = partition_replayable_tool_groups(
+        [orphan, user], session_server_id=SERVER_A
+    )
+    assert [e.seq for e in partition.pending] == [1]
+    assert [e.seq for e in partition.replayable] == [2]
+    assert isinstance(partition.pending[0].payload, ToolResultEntry)
+    # The orphan alone is excluded as well.
+    alone = partition_replayable_tool_groups([orphan], session_server_id=SERVER_A)
+    assert alone.replayable == ()
+    assert [e.seq for e in alone.pending] == [1]
+
+
 def test_partition_rejects_cross_session_windows_and_cross_scope() -> None:
     assistant = _assistant_entry(1, call_ids=["call-1"], seq=1)
     other = _user_entry(2, session_id=uuid.UUID(int=77), seq=2)
