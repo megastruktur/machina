@@ -298,18 +298,60 @@ export interface ResearchReport {
 }
 
 // ---------------------------------------------------------------------------
-// Chat composition seam (the reviewed 06-chat-api surface, types only)
+// Chat composition seam (06-chat-api legacy + D07 session-first attach)
 // ---------------------------------------------------------------------------
 
 /**
- * The structural subset of the reviewed `ChatApi` the attach path needs:
- * one durable conversation submission. The docs panel composes the wire
- * types of the `06-web-chat` entry; it never invents a chat endpoint.
+ * The durable admission outcome of one session-first attach: the exact
+ * identities the server ack returned (BRIEF_D07 §2.4; sfc_PLAN D07 — typed
+ * admission, idempotency, returned session_id/run_id).
  */
-export interface ChatSubmit {
-	/** POST /api/v1/chat/messages — durable intent; idempotent on `run_id`. */
-	submitMessage(payload: ChatSubmitBody): Promise<ChatCreated>;
+export interface SessionAttachOutcome {
+	/** The session the excerpt turn was admitted into. */
+	session_id: string;
+	/** The subordinate run allocated for the turn. */
+	run_id: string;
+	/** The committed user entry carrying the excerpt. */
+	entry_id: string;
+	/** The entry's per-session monotonic sequence. */
+	seq: number;
+	/** True when a retry/duplicate click hit the same idempotency key. */
+	deduplicated: boolean;
 }
+
+/**
+ * One session-first attach request. `session_id === null/undefined` is the
+ * EXPLICIT create-new-session action; a set id attaches to that explicit
+ * destination session. One `client_request_id` per attach attempt: the
+ * create and the turn are idempotent on it, so a duplicate click or retry
+ * converges instead of duplicating (plan acceptance 3).
+ */
+export interface DocsAttachTurn {
+	/** Explicit destination session; null ⇒ explicit create-new action. */
+	session_id?: string | null;
+	/** The composed excerpt message (citation + quoted excerpt + note). */
+	text: string;
+	/** Preferred model profile for the new run. */
+	model_profile?: string | null;
+	/** Client idempotency key (client-minted, one per attach attempt). */
+	client_request_id: string;
+}
+
+/**
+ * The chat seam the documents panel consumes. Session-first attach is the
+ * D07 path (`attachToSession`); the legacy one-shot conversation submit
+ * stays as the OPTIONAL fallback for pre-session hosts until D09 deletes it
+ * (COORD-D02-01). A bag with neither fails closed.
+ */
+export interface DocsChatApi {
+	/** Create-or-reuse the explicit session, then admit the excerpt turn. */
+	attachToSession(payload: DocsAttachTurn): Promise<SessionAttachOutcome>;
+	/** POST /api/v1/chat/messages — legacy intent; idempotent on `run_id`. */
+	submitMessage?(payload: ChatSubmitBody): Promise<ChatCreated>;
+}
+
+/** Back-compat alias (the pre-D07 seam name); prefer `DocsChatApi`. */
+export type ChatSubmit = DocsChatApi;
 
 // ---------------------------------------------------------------------------
 // Services bag (mirrors the reviewed routes 1:1; opener supplies it)
@@ -351,11 +393,12 @@ export interface DocsApi {
 export interface DocsServices {
 	readonly api: DocsApi;
 	/**
-	 * The conversation submit seam for "attach excerpt to chat". `null`
-	 * (or an incomplete method) fails closed: the panel renders the honest
-	 * unavailable note and never fakes a submission.
+	 * The chat seam for "attach excerpt to chat" — session-first
+	 * `attachToSession` (D07) with the legacy `submitMessage` fallback until
+	 * D09. `null` (or a bag with neither method) fails closed: the panel
+	 * renders the honest unavailable note and never fakes a submission.
 	 */
-	readonly chat: ChatSubmit | null;
+	readonly chat: DocsChatApi | null;
 }
 
 /** The feature entry for composition into the app's one panel registry. */
@@ -383,10 +426,10 @@ export function docsEntry(): PanelEntryInput {
 
 /**
  * Typed services bag factory for openers (the composed desktop passes
- * `docsServices({ …baseClientDocsMethods }, { submitMessage })` into its
- * panel hosts). Freezing keeps the bag read-only from the panel's side;
- * the panel still fails closed if the bag is missing or incomplete.
+ * `docsServices({ …clientDocsMethods }, docsChatAdapter)` into its panel
+ * hosts). Freezing keeps the bag read-only from the panel's side; the panel
+ * still fails closed if the bag is missing or incomplete.
  */
-export function docsServices(api: DocsApi, chat: ChatSubmit | null = null): DocsServices {
+export function docsServices(api: DocsApi, chat: DocsChatApi | null = null): DocsServices {
 	return Object.freeze({ api, chat });
 }

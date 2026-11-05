@@ -36,7 +36,6 @@
 	// single registration point (ADR §7.1) — the shell only composes them.
 	import { applicationsEntry } from './entries/08-web-apps.js';
 	import { capabilityPolicyEntry } from './entries/03-web-policy.js';
-	import { chatEntry } from './entries/06-web-chat.js';
 	import { docsEntry } from './entries/07-web-docs.js';
 	import { executionEntry } from './entries/05-web-execution.js';
 	import { jobsEntry } from './entries/05-web-jobs.js';
@@ -159,7 +158,7 @@
 			capabilityPolicyEntry(),
 			executionEntry(),
 			jobsEntry(),
-			chatEntry(),
+			sessionChatEntry(),
 			modelSettingsEntry(),
 			docsEntry(),
 			applicationsEntry(),
@@ -231,7 +230,7 @@
 	// Guided enrollment (so-03): the focused extraction of the old inline form.
 	import ServerEnrollment from './ServerEnrollment.svelte';
 	import ServerTreeNav from './ServerTreeNav.svelte';
-	import ChatDrawerSection from './ChatDrawerSection.svelte';
+	import ChatDrawerSection, { type ChatHistoryRow } from './ChatDrawerSection.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
 	// its exact contract; the shell maps ONE client onto all of them).
 	// Live transport: one client per shell instance (ADR §5 — instances share
@@ -242,10 +241,14 @@
 	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
 	import {
-		CHAT_PANEL_KIND,
-		GLOBAL_CONSULT_SERVER_ID,
+		SESSION_CHAT_PANEL_KIND as CHAT_PANEL_KIND,
+		sessionChatEntry,
+		sessionChatServices,
+		type SessionChatApi,
+		type SessionChatTagApi
+	} from './entries/06-session-chat.js';
+	import {
 		browserChatEventStream,
-		chatServices,
 		type ChatApi,
 		type ChatServiceOption,
 		type ChatTagApi,
@@ -533,6 +536,7 @@
 			liveServers = servers;
 			live = true;
 			status = null;
+			void loadSessionHistory();
 			if (servers.length > 0) {
 				// Restore the stored choice ONLY when it still names an enrolled
 				// server; anything else (absent, deleted, stale, invalid) falls
@@ -642,14 +646,28 @@
 		reconcileConversation: api.reconcileConversation
 	});
 
+	// Session-first methods (D07): additive onto the SAME bag so ChatPanel
+	// keeps its reviewed vocabulary while the drawer/history surface rides
+	// the typed /api/v1/agent-sessions routes (COORD-D02-01 expand rule).
+	Object.assign(chatApi, {
+		createAgentSession: api.createAgentSession,
+		listAgentSessions: api.listAgentSessions,
+		readAgentSession: api.readAgentSession,
+		renameAgentSession: api.renameAgentSession,
+		listAgentSessionEntries: api.listAgentSessionEntries,
+		submitAgentSessionTurn: api.submitAgentSessionTurn,
+		submitAgentSessionControl: api.submitAgentSessionControl
+	});
+
 	/**
-	 * The OPTIONAL history-tag slice (history-tags W6B/W7A): the REAL
-	 * client's tag methods under the bag's `tags` field — legacy run rows
-	 * read the job tag routes, canonical conversation rows the conversation
+	 * The OPTIONAL history-tag slice (history-tags W6B/W7A, session-first
+	 * routing D07): the REAL client's tag methods under the bag's `tags`
+	 * field — session_id rows read the agent-session tag routes, canonical
+	 * conversation rows the conversation routes, legacy run rows the job
 	 * routes (the catalog is global; every assignment carries its explicit
 	 * server scope). The OFFLINE memory dock omits it and fails closed.
 	 */
-	const chatTagApi: ChatTagApi = {
+	const chatTagApi: SessionChatTagApi = {
 		listTags: api.listTags,
 		createTag: api.createTag,
 		listRunTags: api.listRunTags,
@@ -657,18 +675,37 @@
 		removeRunTag: api.removeRunTag,
 		listConversationTags: api.listConversationTags,
 		assignConversationTag: api.assignConversationTag,
-		removeConversationTag: api.removeConversationTag
+		removeConversationTag: api.removeConversationTag,
+		listAgentSessionTags: api.listAgentSessionTags,
+		assignAgentSessionTag: api.assignAgentSessionTag,
+		removeAgentSessionTag: api.removeAgentSessionTag
 	};
 
 	/**
 	 * One drawer row's bounded tag-page adapter (history-tags W7A). Route
-	 * choice is IDENTITY-driven: rows pinned to a canonical conversation id
-	 * read the conversation tag route (the only route a General Consult
-	 * zero-UUID scope ever uses); legacy run rows read the job tag route.
-	 * The scope is always the ROW's recorded `server_id` — never a hidden
-	 * global. A row without an adapter method stays honestly preview-only.
+	 * choice is IDENTITY-driven (D07): session_id rows read the agent-session
+	 * tag route; rows pinned to a canonical conversation id read the
+	 * conversation tag route (the only route a General Consult zero-UUID
+	 * scope ever uses); legacy run rows read the job tag route. The scope is
+	 * always the ROW's recorded `server_id` — never a hidden global. A row
+	 * without an adapter method stays honestly preview-only.
 	 */
-	function chatRowTagsLoader(row: ConversationView): TagPageLoader | null {
+	function chatRowTagsLoader(row: ChatHistoryRow): TagPageLoader | null {
+		const rowSessionId = row.session_id;
+		if (typeof rowSessionId === 'string' && rowSessionId !== '') {
+			const listAgentSessionTags = api.listAgentSessionTags;
+			if (typeof listAgentSessionTags !== 'function') return null;
+			return async (offset, limit) => {
+				const page = await listAgentSessionTags(rowSessionId, row.server_id, { limit, offset });
+				return {
+					limit: page.limit,
+					offset: page.offset,
+					total: page.total,
+					has_more: page.has_more,
+					items: (page.items ?? []).map((one) => ({ tag_id: one.tag_id, name: one.name }))
+				} as TagPage;
+			};
+		}
 		const rowConversationId = (row as { conversation_id?: string }).conversation_id;
 		const conversationId =
 			typeof rowConversationId === 'string' && rowConversationId !== '' ? rowConversationId : null;
@@ -874,6 +911,56 @@
 	let drawerActiveRunId = $state<string | null>(null);
 	let drawerCollapsed = $state(false);
 
+	// --- Session-first drawer history (D07; AGENTS.md §1 bounded page) -------
+	/** The bounded first page of session-first rows (newest-change first). */
+	let drawerSessions = $state<readonly ChatHistoryRow[]>([]);
+	let drawerSessionsTotal = $state<number | undefined>(undefined);
+	let drawerSessionsHasMore = $state(false);
+	let drawerSessionsLoading = $state(false);
+	/** Drawer page size (the reviewed bounded initial page). */
+	const SESSION_HISTORY_PAGE_LIMIT = 10;
+
+	/** One bounded agent-session page for the drawer (honest failure keeps
+	 * the previous rows and surfaces the status line — never a fake list). */
+	async function loadSessionHistory(): Promise<void> {
+		if (!live || drawerSessionsLoading) return;
+		drawerSessionsLoading = true;
+		try {
+			const page = await api.listAgentSessions({ limit: SESSION_HISTORY_PAGE_LIMIT });
+			drawerSessions = (page.items ?? []).map((session) => ({
+				run_id: session.session_id,
+				session_id: session.session_id,
+				server_id: session.server_id,
+				title: session.title ?? null,
+				service_tags: [] as string[],
+				status: session.status,
+				updated_at: session.updated_at
+			}));
+			drawerSessionsTotal = page.total;
+			drawerSessionsHasMore = page.has_more;
+		} catch (error) {
+			status = `Session history unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			drawerSessionsLoading = false;
+		}
+	}
+
+	/** Rename one session through the typed PATCH route, then refresh. */
+	async function renameSession(sessionId: string, title: string): Promise<void> {
+		await api.renameAgentSession(sessionId, { title });
+		status = 'Session renamed.';
+		await loadSessionHistory();
+	}
+
+	/** Drawer rows: session-first first, then the dual-wired legacy rows. */
+	const drawerRows = $derived<readonly ChatHistoryRow[]>([...drawerSessions, ...drawerConversations]);
+	const drawerRowsTotal = $derived<number | undefined>(
+		drawerSessionsTotal === undefined && drawerConversationsTotal === undefined
+			? undefined
+			: (drawerSessionsTotal ?? 0) + (drawerConversationsTotal ?? 0)
+	);
+	const drawerRowsHasMore = $derived(drawerSessionsHasMore || drawerConversationsHasMore);
+
 	/**
 	 * The dock's explicit panel context — a server scope following the
 	 * launcher's visible selection (read at submit time, never a hidden
@@ -1001,11 +1088,44 @@
 			case JOBS_PANEL_KIND:
 				return asBag(jobsServices(jobsApi));
 			case CHAT_PANEL_KIND:
-				return asBag(chatServices(chatApi, chatTagApi));
+				return asBag(sessionChatServices(chatApi as SessionChatApi, chatTagApi));
 			case MODEL_SETTINGS_PANEL_KIND:
 				return asBag(modelSettingsServices(modelSettingsApi));
 			case DOCS_PANEL_KIND:
-				return asBag(docsServices(api, { submitMessage: api.submitMessage }));
+				return asBag(
+					docsServices(api, {
+						// Session-first attach (D07): the explicit create-new-session
+						// action (session_id null) or the explicit destination
+						// session, then ONE idempotent turn admission — the
+						// excerpts ride /api/v1/agent-sessions, never the ambient
+						// legacy chat. The legacy submitMessage stays on the bag
+						// until D09 for pre-session hosts (COORD-D02-01).
+						attachToSession: async ({ session_id, text, model_profile, client_request_id }) => {
+							const scope = descriptor.scope;
+							const serverId = scope.kind === 'server' ? scope.server_id : null;
+							if (serverId === null) {
+								throw new ApiError(400, 'bad_request', 'documents attach needs a server scope');
+							}
+							const target =
+								session_id ??
+								(
+									await api.createAgentSession({
+										server_id: serverId,
+										source: 'document_attach',
+										model_profile: model_profile ?? null,
+										client_request_id
+									})
+								).session_id;
+							return api.submitAgentSessionTurn(target, {
+								session_id: target,
+								text,
+								client_request_id,
+								model_profile: model_profile ?? null
+							});
+						},
+						submitMessage: api.submitMessage
+					})
+				);
 			case APPLICATIONS_PANEL_KIND: {
 				const serverId =
 					descriptor.scope.kind === 'server' ? descriptor.scope.server_id : selectedServerId;
@@ -1199,22 +1319,45 @@
 		{/snippet}
 
 		<ChatDrawerSection
-			conversations={drawerConversations}
-			totalConversations={drawerConversationsTotal}
-			hasMoreConversations={drawerConversationsHasMore}
+			conversations={drawerRows}
+			totalConversations={drawerRowsTotal}
+			hasMoreConversations={drawerRowsHasMore}
 			loadingMoreConversations={drawerConversationsLoadingMore}
 			activeRunId={drawerActiveRunId}
 			onnewchat={() => {
 				focusChatDock();
 				dockChatPanel?.triggerNewChat();
 			}}
-			onselectconversation={(runId) => {
+			onselectconversation={(rowKey) => {
+				const row = drawerRows.find(
+					(one) => (one.session_id ?? one.run_id) === rowKey
+				);
+				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
+					// Session-first row: the visible session becomes THE one
+					// channelled session (plan acceptance 2); the legacy dock
+					// keeps its own conversation selection untouched.
+					focusChatDock();
+					status = `Session ${rowKey.slice(0, 8)}… selected — channel attached.`;
+					return;
+				}
 				focusChatDock();
-				dockChatPanel?.triggerSelectRun(runId);
+				dockChatPanel?.triggerSelectRun(rowKey);
 			}}
-			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
+			onrefreshhistory={() => {
+				void loadSessionHistory();
+				dockChatPanel?.triggerRefreshHistory();
+			}}
 			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
-			onrenameconversation={(runId, title) => dockChatPanel?.triggerRenameRun(runId, title)}
+			onrenameconversation={async (rowKey, title) => {
+				const row = drawerRows.find(
+					(one) => (one.session_id ?? one.run_id) === rowKey
+				);
+				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
+					await renameSession(row.session_id, title);
+					return;
+				}
+				await dockChatPanel?.triggerRenameRun(rowKey, title);
+			}}
 			tagLoader={chatRowTagsLoader}
 		/>
 

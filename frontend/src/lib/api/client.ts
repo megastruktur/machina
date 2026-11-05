@@ -295,6 +295,72 @@ export type JobTagsPage = components['schemas']['JobTagsPage'];
 export type ConversationTagsPage = components['schemas']['ConversationTagsPage'];
 export type EvidenceRef = components['schemas']['EvidenceRef'];
 
+// --- Session-first surface (D07; sfc_PLAN D07, BRIEF_D07 §2.1) -------------
+// The typed /api/v1/agent-sessions vocabulary. Payload/response shapes come
+// exclusively from schema.generated.ts (the D06 backend wire); the aliases
+// below give the panel/session-client layer its stable names without ever
+// restating field shapes.
+
+/** One session header/detail view (generated SessionDetail). */
+export type AgentSessionView = components['schemas']['SessionDetail'];
+/** One bounded session list row (generated SessionSummary). */
+export type AgentSessionSummary = components['schemas']['SessionSummary'];
+/** One bounded session list page (generated SessionListPage envelope). */
+export type AgentSessionPage = components['schemas']['SessionListPage'];
+/** One durable session entry envelope (generated SessionEntryView). */
+export type SessionEntryEnvelope = components['schemas']['SessionEntryView'];
+/** One bounded entries/history page (generated SessionHistoryPage). */
+export type SessionEntriesPage = components['schemas']['SessionHistoryPage'];
+export type SessionCreateRequest = components['schemas']['SessionCreateRequest'];
+export type SessionTurnSubmitRequest = components['schemas']['SessionTurnSubmitRequest'];
+export type SessionTurnSubmitOutcome = components['schemas']['SessionTurnSubmitResponse'];
+export type SessionControlRequest = components['schemas']['SessionControlRequest'];
+export type SessionControlOutcome = components['schemas']['SessionControlResponse'];
+export type SessionStatus = components['schemas']['SessionStatus'];
+export type SessionRunState = components['schemas']['SessionRunState'];
+/**
+ * Rename body for a session (mirrors the generated conversation
+ * `ChatRenameBody` field-for-field: one bounded user-assigned title; the
+ * PATCH /api/v1/agent-sessions/{session_id} producer lands with the
+ * session API round that owns route additions).
+ */
+export interface SessionRenameRequest {
+	/** User-assigned session title (1..240 chars, producer-validated). */
+	title: string;
+}
+/**
+ * One entity's session-tag page. The D06 backend's sibling tag pages
+ * (JobTagsPage/ConversationTagsPage) all project the frozen TagPage
+ * envelope; the agent-session producer uses the same shape.
+ */
+export type SessionTagsPage = components['schemas']['TagPage'];
+
+/** Bounded session-list query (AGENTS.md §1: every collection read is a page). */
+export interface AgentSessionListQuery {
+	/** Explicit server scope; omit/null for the unfiltered recent page. */
+	server_id?: string | null;
+	/** Optional coarse status filter (SessionStatus vocabulary). */
+	status?: SessionStatus | null;
+	/** Optional catalog tag id filter. */
+	tag?: string | null;
+	/** Page size; producer default and maximum are the reviewed bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+}
+
+/** Bounded session entries query (cursor pages; AGENTS.md §1). */
+export interface AgentSessionEntriesQuery {
+	/** Explicit server scope. */
+	server_id?: string | null;
+	/** Older-than cursor: strictly-lower seq exclusive page. */
+	before_seq?: number | null;
+	/** Newer-than cursor: strictly-higher seq exclusive page (replay). */
+	after_seq?: number | null;
+	/** Page size; producer default 30 and maximum 50 are the reviewed bounds. */
+	limit?: number;
+}
+
 /**
  * Query of the task items/constraints pages: the bounded page plus the
  * explicit P3 history switch. Superseded rows stay RECORDED server-side and
@@ -963,6 +1029,67 @@ export interface MaiApiClient {
 		options: TagRemovalOptions
 	): Promise<void>;
 
+	// --- Session-first surface (D07; sfc_PLAN D07) ---------------------------
+	// The typed /api/v1/agent-sessions transport. Same boundary invariants as
+	// every other slice: C01 envelopes fail through `ApiError`, the session
+	// cookie is the only credential, mutations carry the CSRF double submit,
+	// every collection read is an explicitly-scoped bounded page (AGENTS.md
+	// §1), and there is no client-level "current session/server" anywhere.
+	/**
+	 * POST /api/v1/agent-sessions — idempotent session create (the client
+	 * idempotency key derives the session identity; a retry converges on the
+	 * same row).
+	 */
+	createAgentSession(payload: SessionCreateRequest): Promise<AgentSessionView>;
+	/**
+	 * GET /api/v1/agent-sessions — bounded deterministic page
+	 * (`updated_at DESC, session_id`) with the honest total/has_more.
+	 */
+	listAgentSessions(query?: AgentSessionListQuery): Promise<AgentSessionPage>;
+	/** GET /api/v1/agent-sessions/{id}?server_id=… — safe header detail. */
+	readAgentSession(sessionId: string, serverId?: string | null): Promise<AgentSessionView>;
+	/** PATCH /api/v1/agent-sessions/{id} — durable user-assigned title. */
+	renameAgentSession(sessionId: string, payload: SessionRenameRequest): Promise<AgentSessionView>;
+	/**
+	 * GET /api/v1/agent-sessions/{id}/history?server_id=… — bounded
+	 * cursor-exclusive entries page (`before_seq` older / `after_seq` newer
+	 * replay; producer default 30, max 50).
+	 */
+	listAgentSessionEntries(
+		sessionId: string,
+		query?: AgentSessionEntriesQuery
+	): Promise<SessionEntriesPage>;
+	/**
+	 * POST /api/v1/agent-sessions/{id}/turns — durable intent admission
+	 * (idempotent on `client_request_id`); the worker owns execution.
+	 */
+	submitAgentSessionTurn(
+		sessionId: string,
+		payload: SessionTurnSubmitRequest
+	): Promise<SessionTurnSubmitOutcome>;
+	/**
+	 * POST /api/v1/agent-sessions/{id}/control — steer/pause/cancel/
+	 * approve/deny/reconcile through the reviewed session-runner facade.
+	 */
+	submitAgentSessionControl(
+		sessionId: string,
+		payload: SessionControlRequest
+	): Promise<SessionControlOutcome>;
+	/** GET /api/v1/agent-sessions/{id}/tags?server_id=… — bounded tag page. */
+	listAgentSessionTags(
+		sessionId: string,
+		serverId: string,
+		page?: TagEntityTagsQuery
+	): Promise<SessionTagsPage>;
+	/** POST /api/v1/agent-sessions/{id}/tags — idempotent user assignment. */
+	assignAgentSessionTag(sessionId: string, payload: TagAssignBody): Promise<void>;
+	/** DELETE /api/v1/agent-sessions/{id}/tags/{tag_id}?server_id=… — removal. */
+	removeAgentSessionTag(
+		sessionId: string,
+		tagId: string,
+		options: TagRemovalOptions
+	): Promise<void>;
+
 	// Task surface (§8; 15-task-api). Every method takes its explicit
 	// `server_id` (C01 rule 2); every collection read is a bounded page
 	// (AGENTS.md §1); the two mutations are CAS + idempotency-key guarded
@@ -1446,6 +1573,95 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			return requestVoid(
 				'DELETE',
 				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags/${encodeURIComponent(tagId)}?${params.toString()}`,
+				undefined,
+				204
+			);
+		},
+
+		// Session-first surface (D07). The D06 backend routes back every
+		// read/mutation below except the rename/tags trio, whose producer
+		// routes land with the session-API round that owns route additions —
+		// the methods exist here so the session-first composition is complete
+		// and its specs pin the wire contract now (BRIEF_D07 §2.1).
+		createAgentSession: (payload) =>
+			requestJson<AgentSessionView>('POST', '/api/v1/agent-sessions', payload),
+		listAgentSessions: (query) => {
+			const params = new URLSearchParams();
+			if (query?.server_id !== undefined && query.server_id !== null)
+				params.set('server_id', query.server_id);
+			if (query?.status !== undefined && query.status !== null)
+				params.set('status', query.status);
+			if (query?.tag !== undefined && query.tag !== null && query.tag !== '')
+				params.set('tag', query.tag);
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			if (query?.offset !== undefined) params.set('offset', String(query.offset));
+			const rendered = params.toString();
+			return requestJson<AgentSessionPage>(
+				'GET',
+				`/api/v1/agent-sessions${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		readAgentSession: (sessionId, serverId) => {
+			const params = new URLSearchParams();
+			if (serverId !== undefined && serverId !== null) params.set('server_id', serverId);
+			const rendered = params.toString();
+			return requestJson<AgentSessionView>(
+				'GET',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		renameAgentSession: (sessionId, payload) =>
+			requestJson<AgentSessionView>(
+				'PATCH',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}`,
+				payload
+			),
+		listAgentSessionEntries: (sessionId, query) => {
+			const params = new URLSearchParams();
+			if (query?.server_id !== undefined && query.server_id !== null)
+				params.set('server_id', query.server_id);
+			if (query?.before_seq !== undefined && query.before_seq !== null)
+				params.set('before_seq', String(query.before_seq));
+			if (query?.after_seq !== undefined && query.after_seq !== null)
+				params.set('after_seq', String(query.after_seq));
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			const rendered = params.toString();
+			return requestJson<SessionEntriesPage>(
+				'GET',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/history${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		submitAgentSessionTurn: (sessionId, payload) =>
+			requestJson<SessionTurnSubmitOutcome>(
+				'POST',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/turns`,
+				payload
+			),
+		submitAgentSessionControl: (sessionId, payload) =>
+			requestJson<SessionControlOutcome>(
+				'POST',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/control`,
+				payload
+			),
+		listAgentSessionTags: (sessionId, serverId, page) =>
+			requestJson<SessionTagsPage>(
+				'GET',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/tags?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
+			),
+		assignAgentSessionTag: (sessionId, payload) =>
+			requestVoid(
+				'POST',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/tags`,
+				payload,
+				204
+			),
+		removeAgentSessionTag: (sessionId, tagId, options) => {
+			const params = new URLSearchParams({ server_id: options.serverId });
+			if (options.replacementTagId !== undefined && options.replacementTagId !== '')
+				params.set('replacement_tag_id', options.replacementTagId);
+			return requestVoid(
+				'DELETE',
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/tags/${encodeURIComponent(tagId)}?${params.toString()}`,
 				undefined,
 				204
 			);

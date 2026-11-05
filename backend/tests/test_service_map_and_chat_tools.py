@@ -1012,23 +1012,91 @@ async def test_chat_runs_lists_across_all_servers_and_general_consult(
 # ---------------------------------------------------------------------------
 
 
+async def _seed_session_turn(
+    live_app: FastAPI,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+    bootstrapped_url: str,
+    *,
+    profile: str = "fast",
+    service_tag: str = "jellyfin",
+) -> str:
+    """Session-first admission seed (D07): create the session, admit ONE
+    durable turn through the reviewed D06 route, and attach one catalog tag
+    through the ``session_tags`` association (the session tag routes land
+    with the session-API round that owns route additions)."""
+    create_key = str(uuid.uuid4())
+    created = await call_app(
+        live_app,
+        "POST",
+        "/api/v1/agent-sessions",
+        json_body={
+            "server_id": str(server_a),
+            "source": "interactive",
+            "client_request_id": create_key,
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert created.status == 201, created.body
+    session_id = str(json.loads(created.body)["session_id"])
+    turn = await call_app(
+        live_app,
+        "POST",
+        f"/api/v1/agent-sessions/{session_id}/turns?server_id={server_a}",
+        json_body={
+            "session_id": session_id,
+            "text": "investigate the fixture service",
+            "client_request_id": str(uuid.uuid4()),
+            "model_profile": profile,
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert turn.status in (200, 201), turn.body
+    tag_id = uuid.uuid4()
+    with psycopg.connect(bootstrapped_url) as conn:
+        conn.execute(
+            "INSERT INTO tags (tag_id, name) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING",
+            (tag_id, service_tag),
+        )
+        row = conn.execute(
+            "SELECT tag_id FROM tags WHERE lower(name) = lower(%s)",
+            (service_tag,),
+        ).fetchone()
+        assert row is not None
+        conn.execute(
+            "INSERT INTO session_tags (session_id, tag_id) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING",
+            (uuid.UUID(session_id), row[0]),
+        )
+        conn.commit()
+    return session_id
+
+
+def _session_status(bootstrapped_url: str, session_id: str) -> str:
+    """The persisted projected status (the same row the capability reads)."""
+    with psycopg.connect(bootstrapped_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT status FROM sessions WHERE session_id = %s", (uuid.UUID(session_id),)
+        ).fetchone()
+    assert row is not None
+    return str(row["status"])
+
+
 async def test_chat_read_session_capability_replays_a_conversation(
     live_app: FastAPI,
     jar: dict[str, str],
     server_a: uuid.UUID,
     bootstrapped_url: str,
 ) -> None:
-    run_id = uuid.uuid4()
-    response = await submit_chat(
-        live_app, jar, run_id, str(server_a), service_tags=["jellyfin"]
-    )
-    assert response.status == 201, response.body
-
+    session_id = await _seed_session_turn(live_app, jar, server_a, bootstrapped_url)
     capability = ChatReadSessionCapability(live_app.state.session_factory)
     context = _context((CHAT_READ_CAPABILITY,))
     call = CapabilityCall(
         descriptor=chat_read_descriptor(),
-        payload={"session_id": str(run_id)},
+        payload={"session_id": session_id},
         context=context,
         credentials={},
         op_id=uuid.uuid4(),
@@ -1036,13 +1104,17 @@ async def test_chat_read_session_capability_replays_a_conversation(
     result = await capability(call)
     assert result.ok is True
     summary = json.loads(result.output)
-    assert summary["session_id"] == str(run_id)
+    assert summary["session_id"] == session_id
     assert summary["server_id"] == str(server_a)
-    assert summary["state"] == "queued"
+    # The projected session status (D01 vocabulary) — the persisted row IS
+    # the authority, and an admitted-but-unclaimed turn leaves it idle.
+    assert summary["state"] == _session_status(bootstrapped_url, session_id)
+    assert summary["state"] == "idle"
     assert summary["model_profile"] == "fast"
     assert summary["service_tags"] == ["jellyfin"]
+    # The durable admission: the user entry + the queued run-state entry.
     assert summary["event_count"] >= 2
-    assert summary["events_summary"][0]["type"] == "run.submitted"
+    assert summary["events_summary"][0]["type"] == "user_message"
 
     # Unknown sessions are honest not_found rejections.
     missing = CapabilityCall(
@@ -1062,12 +1134,9 @@ async def test_chat_read_session_executes_through_the_tool_bridge(
     live_app: FastAPI,
     jar: dict[str, str],
     server_a: uuid.UUID,
+    bootstrapped_url: str,
 ) -> None:
-    run_id = uuid.uuid4()
-    response = await submit_chat(
-        live_app, jar, run_id, str(server_a), service_tags=["jellyfin"]
-    )
-    assert response.status == 201, response.body
+    session_id = await _seed_session_turn(live_app, jar, server_a, bootstrapped_url)
 
     registry = _registry()
     bridge = CapabilityToolBridge(
@@ -1080,13 +1149,14 @@ async def test_chat_read_session_executes_through_the_tool_bridge(
     tool = next(
         t for t in bridge.tools if t.name == tool_name_for(CHAT_READ_CAPABILITY)
     )
-    result = json.loads(await tool.function(session_id=str(run_id)))
+    result = json.loads(await tool.function(session_id=session_id))
     assert result["status"] == "executed"
     assert result["allowed"] is True
     summary = json.loads(result["output"]["text"])
-    assert summary["session_id"] == str(run_id)
+    assert summary["session_id"] == session_id
     assert summary["service_tags"] == ["jellyfin"]
-    assert summary["state"] == "queued"
+    assert summary["state"] == _session_status(bootstrapped_url, session_id)
+    assert summary["state"] == "idle"
 
 
 # ---------------------------------------------------------------------------

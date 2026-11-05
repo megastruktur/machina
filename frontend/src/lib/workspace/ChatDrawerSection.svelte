@@ -10,11 +10,50 @@
 	import Button from '$lib/ui/Button.svelte';
 	import HistoryTags, { type TagPageLoader } from '$lib/ui/HistoryTags.svelte';
 	import NavItem from '$lib/ui/NavItem.svelte';
-	import type { ConversationView } from './entries/06-web-chat.js';
+	import type { components } from '$lib/api/schema.generated.js';
+
+	type EntityTagPreviewView = components['schemas']['EntityTagPreviewView'];
+
+	/**
+	 * One history row, identity-dual-wired (D07): session-first rows carry
+	 * `session_id` (the only conversation/history root per sfc_INTENT §1);
+	 * legacy rows carry `conversation_id` (canonical) or fall back to the
+	 * bare `run_id` — each identity routes to ITS OWN tag/rename route and
+	 * the sets are never conflated (COORD-D02-01; deleted at D09). The
+	 * legacy `ConversationView` stays structurally assignable (its required
+	 * `tag_preview` satisfies the optional one here).
+	 */
+	export interface ChatHistoryRow {
+		/** Stable row identity: the legacy run id (session rows mirror it). */
+		run_id: string;
+		/** Session-first identity (sfc session API); absent on legacy rows. */
+		session_id?: string | null;
+		/** Canonical conversation identity; absent on legacy run rows. */
+		conversation_id?: string | null;
+		/** Explicit server scope of the row (C01 rule 2). */
+		server_id: string;
+		/** User-assigned title, when set. */
+		title?: string | null;
+		/** Service tags for the `@tag` label fallback. */
+		service_tags?: readonly string[];
+		/** Legacy run state (legacy rows only). */
+		state?: string | null;
+		/** Coarse session status (session-first rows only). */
+		status?: string | null;
+		/** Last-change timestamp (session-first rows only). */
+		updated_at?: string | null;
+		/** Bounded tag preview (present on legacy rows; honest absence else). */
+		tag_preview?: EntityTagPreviewView | null;
+	}
+
+	/** The row's stable key: the session id when session-first, else run id. */
+	function rowKey(row: ChatHistoryRow): string {
+		return typeof row.session_id === 'string' && row.session_id !== '' ? row.session_id : row.run_id;
+	}
 
 	type Props = {
-		/** Recent conversation rows across servers. */
-		conversations?: readonly ConversationView[];
+		/** Recent history rows across servers (session-first + dual-wired). */
+		conversations?: readonly ChatHistoryRow[];
 		/** Total recorded conversations available across pages. */
 		totalConversations?: number;
 		/** Whether additional conversation pages can be loaded. */
@@ -35,12 +74,14 @@
 		onrenameconversation?: (runId: string, title: string) => Promise<void> | void;
 		/**
 		 * One row's bounded tag-page adapter (history-tags W7A): the composer
-		 * decides the correct route (legacy run rows read the job tag routes,
-		 * canonical conversation rows the conversation tag routes) with the
-		 * row's recorded server scope. Returning `null` keeps the row honest
-		 * preview-only. Absent rows (`tag_preview` missing) render no chips.
+		 * decides the correct route by the ROW's identity (session_id rows
+		 * read the agent-session tag routes, canonical conversation rows the
+		 * conversation tag routes, legacy run rows the job tag routes) with
+		 * the row's recorded server scope. Returning `null` keeps the row
+		 * honest preview-only. Absent rows (`tag_preview` missing) render no
+		 * chips.
 		 */
-		tagLoader?: (row: ConversationView) => TagPageLoader | null;
+		tagLoader?: (row: ChatHistoryRow) => TagPageLoader | null;
 	};
 
 	let {
@@ -72,20 +113,22 @@
 		return id.length > 8 ? `${id.slice(0, 8)}…` : id;
 	}
 
-	function formatConversationLabel(row: ConversationView): string {
+	function formatConversationLabel(row: ChatHistoryRow): string {
 		if (typeof row.title === 'string' && row.title.trim() !== '') {
 			return row.title.trim();
 		}
 		const tags =
 			row.service_tags && row.service_tags.length > 0
 				? row.service_tags.map((t) => `@${t}`).join(' ')
-				: `Run ${shortId(row.run_id)}`;
+				: typeof row.session_id === 'string' && row.session_id !== ''
+					? `Session ${shortId(row.session_id)}`
+					: `Run ${shortId(row.run_id)}`;
 		return tags;
 	}
 
-	function startRename(row: ConversationView, event: MouseEvent): void {
+	function startRename(row: ChatHistoryRow, event: MouseEvent): void {
 		event.stopPropagation();
-		editingRunId = row.run_id;
+		editingRunId = rowKey(row);
 		editingTitle = formatConversationLabel(row);
 	}
 
@@ -147,8 +190,8 @@
 			</p>
 		{:else}
 			<div class="mai-chat-drawer__list" data-testid="drawer-history-list">
-				{#each conversations as row (row.run_id)}
-					{#if editingRunId === row.run_id}
+				{#each conversations as row (rowKey(row))}
+					{#if editingRunId === rowKey(row)}
 						<div class="mai-chat-drawer__edit-row" data-testid="drawer-history-edit-row">
 							<input
 								type="text"
@@ -158,7 +201,7 @@
 								disabled={renameBusy}
 								aria-label="Chat title"
 								data-testid="drawer-history-rename-input"
-								onkeydown={(e) => handleRenameKeydown(row.run_id, e)}
+								onkeydown={(e) => handleRenameKeydown(rowKey(row), e)}
 							/>
 							<button
 								type="button"
@@ -167,7 +210,7 @@
 								aria-label="Save chat title"
 								title="Save"
 								data-testid="drawer-history-rename-save"
-								onclick={() => void commitRename(row.run_id)}
+								onclick={() => void commitRename(rowKey(row))}
 							>
 								✓
 							</button>
@@ -189,10 +232,10 @@
 								<NavItem
 									icon="💬"
 									label={formatConversationLabel(row)}
-									meta={row.state ?? ''}
-									active={activeRunId === row.run_id}
+									meta={row.state ?? row.status ?? ''}
+									active={activeRunId === rowKey(row)}
 									data-testid="drawer-history-item"
-									onclick={() => onselectconversation(row.run_id)}
+									onclick={() => onselectconversation(rowKey(row))}
 								/>
 								{#if onrenameconversation}
 									<button
@@ -207,7 +250,7 @@
 									</button>
 								{/if}
 							</div>
-							{#if row.tag_preview !== undefined && tagLoader !== undefined && row.tag_preview.total > 0}
+							{#if row.tag_preview !== undefined && row.tag_preview !== null && tagLoader !== undefined && row.tag_preview.total > 0}
 								<span class="mai-chat-drawer__row-tags" data-testid="drawer-history-row-tags">
 									<HistoryTags
 										tag_preview={row.tag_preview}

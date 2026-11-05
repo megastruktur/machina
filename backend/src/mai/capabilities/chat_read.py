@@ -1,29 +1,29 @@
-"""The ``chat.read_session`` capability (campaign ``mechanicus-ui`` card 02).
+"""The ``chat.read_session`` capability (campaign ``mechanicus-ui`` card 02;
+D07 rewires the read onto the session-first tables — sfc_PLAN D07).
 
-The agent-facing read seam over the durable chat conversation record
-(contracts.md **C05** facade tables): one ``session_id`` (the
-conversation's ``run_id``) in, the conversation's replayed state and
-recorded event summary out. The capability is deliberately read-only and
+The agent-facing read seam over the durable session-first history root:
+one ``session_id`` in, the session's projected status and bounded entry
+summary out. The capability is deliberately read-only and
 controller-local:
 
 - The target is exclusively the payload's canonical ``session_id`` — no
   host vocabulary of its own (C03 rule 2): a granted call cannot be
-  retargeted at an arbitrary host or conversation outside the persisted
-  record.
-- State is REPLAYED from the persisted ``run.transition`` events through
-  the reviewed lifecycle producer — never guessed, never engine-called.
-- The answer is a bounded JSON summary (identities, state, tags, event
+  retargeted at an arbitrary host or session outside the persisted record.
+- State is the session row's projected ``status`` (D01 SessionStatus
+  vocabulary, projected from its runs by the store) — never guessed,
+  never engine-called; the legacy ``run.transition`` replay is deleted.
+- The answer is a bounded JSON summary (identities, status, tags, entry
   counts); task text, prompts and artifact bodies never enter the output
   (C05 rule 4).
-- Immutable ``service_tags`` are read back from the run's recorded
-  ``chat.submitted`` event — the same recorded source the HTTP
-  ConversationView replays.
+- ``service_tags`` are read back from the session's ``session_tags``
+  associations joined to the global tag catalog.
 
-The executor follows the reviewed dispatcher convention — one
-:class:`~mai.capabilities.dispatch.CapabilityCall` in, one honest
-:class:`~mai.capabilities.dispatch.ExecutorResult` out; every
-grant/approval/policy gate upstream of the executor is the reviewed
-producers', never re-implemented here.
+One gated call reads the ONE session-first history root: the ``sessions``
+row (identity + server scope + projected status), its latest run's model
+profile, its durable ``session_entries`` summary (bounded), and its
+``session_tags`` names. The legacy ``job_runs``/``job_events`` replay is
+deleted with this cutover: the session store is the only conversation
+authority (COORD-D02-01; the old chat surface dies at D09, not here).
 """
 
 from __future__ import annotations
@@ -39,8 +39,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
-from mai.contracts.jobs import parse_job_event
-from mai.jobs.lifecycle import current_state as replay_current_state
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext
 
@@ -56,17 +54,9 @@ __all__ = [
 #: The capability identifier (the executor vocabulary frozen here).
 CAPABILITY_ID: Final[str] = "chat.read_session"
 
-#: The chat submission event this capability reads ``service_tags`` from
-#: (the HTTP chat surface's own vocabulary, recorded seam).
-CHAT_SUBMITTED_EVENT_TYPE: Final[str] = "chat.submitted"
-
-#: The run-state transition event replayed by the reviewed lifecycle
-#: producer.
-RUN_TRANSITION_EVENT_TYPE: Final[str] = "run.transition"
-
-#: Bound on the events summary (a summary, not a dump; the full stream is
-#: the SSE route's vocabulary).
-MAX_EVENTS_SUMMARY: Final[int] = 100
+#: Bound on the entries summary (a summary, not a dump; the full history is
+#: the D06 bounded ``/history`` route's vocabulary).
+MAX_EVENTS_SUMMARY: Final[int] = 50
 
 
 class ChatReadErrorCode(StrEnum):
@@ -105,9 +95,9 @@ def chat_read_descriptor() -> CapabilityDescriptor:
                 "type": "object",
                 "additionalProperties": False,
                 "description": (
-                    "Read a persisted chat conversation session by its canonical "
-                    "run UUID and return its state, model profile, service tags, "
-                    "and bounded event summary."
+                    "Read a persisted agent session by its canonical session "
+                    "UUID and return its projected status, latest model "
+                    "profile, service tags, and a bounded entry summary."
                 ),
                 "required": ["session_id"],
                 "properties": {
@@ -115,8 +105,8 @@ def chat_read_descriptor() -> CapabilityDescriptor:
                         "type": "string",
                         "format": "uuid",
                         "description": (
-                            "The conversation run id (canonical UUID) to "
-                            "read; no host vocabulary exists."
+                            "The session id (canonical UUID) to read; no "
+                            "host vocabulary exists."
                         ),
                     },
                 },
@@ -244,17 +234,20 @@ class ChatReadSessionCapability:
         )
 
     async def _replay(self, session_id: str) -> _ReplayedSession:
-        """The confined read + replay: one run row, its whole event stream."""
+        """The confined read: one session row, its latest run's profile, its
+        bounded entry summary, and its tag names — the session-first tables
+        (``sessions`` / ``session_runs`` / ``session_entries`` /
+        ``session_tags``) are the only authority."""
         async with self._sessions() as session:
             row = (
                 (
                     await session.execute(
                         text(
-                            "SELECT run_id::text AS run_id, "
-                            "server_id::text AS server_id, model_profile "
-                            "FROM job_runs WHERE run_id = :r"
+                            "SELECT session_id::text AS session_id, "
+                            "server_id::text AS server_id, status "
+                            "FROM sessions WHERE session_id = :s"
                         ),
-                        {"r": uuid.UUID(session_id)},
+                        {"s": uuid.UUID(session_id)},
                     )
                 )
                 .mappings()
@@ -263,60 +256,76 @@ class ChatReadSessionCapability:
             if row is None:
                 raise ChatReadError(
                     ChatReadErrorCode.NOT_FOUND,
-                    "no conversation stored for this session id",
+                    "no session stored for this session id",
                 )
-            event_rows = (
+            # The latest run's model profile (the run is subordinate to the
+            # session; a session with no runs yet reads the default profile).
+            profile_row = (
                 (
                     await session.execute(
                         text(
-                            "SELECT seq, ts, type, v, data FROM job_events "
-                            "WHERE run_id = :r ORDER BY seq"
+                            "SELECT model_profile FROM session_runs "
+                            "WHERE session_id = :s "
+                            "ORDER BY updated_at DESC, run_id LIMIT 1"
                         ),
-                        {"r": uuid.UUID(session_id)},
+                        {"s": uuid.UUID(session_id)},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            entry_count = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM session_entries WHERE session_id = :s"),
+                    {"s": uuid.UUID(session_id)},
+                )
+            ).scalar_one()
+            # Bounded summary: the OLDEST 50 entries ascending (the head of
+            # the durable log; the newest tail is the /history route's page).
+            entry_rows = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT seq, kind FROM session_entries "
+                            "WHERE session_id = :s ORDER BY seq "
+                            "LIMIT :bound"
+                        ),
+                        {"s": uuid.UUID(session_id), "bound": MAX_EVENTS_SUMMARY},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            tag_rows = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT t.name FROM session_tags st "
+                            "JOIN tags t ON t.tag_id = st.tag_id "
+                            "WHERE st.session_id = :s "
+                            "ORDER BY st.created_at, t.name"
+                        ),
+                        {"s": uuid.UUID(session_id)},
                     )
                 )
                 .mappings()
                 .all()
             )
 
-        transitions = []
-        service_tags: list[str] = []
-        submitted_seen = False
-        summary: list[tuple[int, str]] = []
-        for index, event_row in enumerate(event_rows):
-            seq = int(event_row["seq"])
-            event_type = str(event_row["type"])
-            if index < MAX_EVENTS_SUMMARY:
-                summary.append((seq, event_type))
-            if event_type == RUN_TRANSITION_EVENT_TYPE:
-                transitions.append(
-                    parse_job_event(
-                        {
-                            "seq": seq,
-                            "run_id": session_id,
-                            "ts": event_row["ts"].isoformat(),
-                            "type": event_type,
-                            "v": event_row["v"],
-                            "data": event_row["data"],
-                        }
-                    )
-                )
-            elif event_type == CHAT_SUBMITTED_EVENT_TYPE and not submitted_seen:
-                submitted_seen = True
-                data = event_row["data"]
-                if isinstance(data, Mapping):
-                    raw_tags = data.get("service_tags") or []
-                    if isinstance(raw_tags, list):
-                        service_tags = [
-                            str(tag) for tag in raw_tags if isinstance(tag, str)
-                        ]
-        state = replay_current_state(sorted(transitions, key=lambda e: e.seq))
+        summary: list[tuple[int, str]] = [
+            (int(entry_row["seq"]), str(entry_row["kind"])) for entry_row in entry_rows
+        ]
+        service_tags = [str(tag_row["name"]) for tag_row in tag_rows]
         return _ReplayedSession(
-            session_id=session_id,
+            session_id=str(row["session_id"]),
             server_id=str(row["server_id"]),
-            state=None if state is None else state.value,
-            model_profile=str(row["model_profile"]),
+            state=str(row["status"]),
+            model_profile=(
+                "default"
+                if profile_row is None or profile_row["model_profile"] is None
+                else str(profile_row["model_profile"])
+            ),
             service_tags=tuple(service_tags),
-            event_count=len(event_rows),
+            event_count=int(entry_count),
             events_summary=tuple(summary),
         )

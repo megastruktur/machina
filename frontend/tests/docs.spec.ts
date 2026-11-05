@@ -10,7 +10,8 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
  * shared UI primitives into a throwaway fixture app served from virtual
  * modules — nothing hits disk and no real backend exists. The fixture API
  * mirrors the reviewed producers 1:1 (`07-docs-api` documents surface +
- * the one reviewed `submitMessage` seam of `06-chat-api`); recorded calls
+ * the D07 session-first `attachToSession` seam over
+ * `/api/v1/agent-sessions`); recorded calls
  * and pre-armed responses are the test-observed boundary (the reviewed
  * `01-web` component-browser fixture convention, not an imaginary backend).
  *
@@ -500,31 +501,21 @@ const APP_SOURCE = `
 		}
 	};
 
-	async function submitMessage(payload) {
-		record('submitMessage', JSON.parse(JSON.stringify(payload)), null);
+	async function attachToSession(payload) {
+		record('attachToSession', JSON.parse(JSON.stringify(payload)), null);
 		throwNext(failNextSubmit);
+		// The session-first admission: create-new (session_id null) then ONE
+		// idempotent turn; the fixture returns the durable identities.
 		return {
-			conversation: {
-				run_id: payload.run_id,
-				server_id: payload.server_id,
-				parent_run_id: null,
-				depth: 0,
-				profile_revision: 1,
-				prompt_revision: 1,
-				model_profile: payload.profile,
-				requested_grants: [],
-				state: 'queued',
-				cancel_requested_at: null,
-				submitted_at: '2026-10-16T09:00:00Z',
-				updated_at: '2026-10-16T09:00:00Z',
-				attachments: [],
-				children: []
-			},
+			session_id: payload.session_id ?? 'a1a1a1a1-a1a1-4a11-8a11-a1a1a1a1a1a1',
+			run_id: 'b2b2b2b2-b2b2-4b22-8b22-b2b2b2b2b2b2',
+			entry_id: 'c3c3c3c3-c3c3-4c33-8c33-c3c3c3c3c3c3',
+			seq: payload.session_id ? 61 : 1,
 			deduplicated: false
 		};
 	}
 
-	const services = docsServices(api, { submitMessage: submitMessage });
+	const services = docsServices(api, { attachToSession: attachToSession });
 	const servicesNoChat = docsServices(api, null);
 
 	// --- registry: the REAL feature entry + one benign sibling ----------------
@@ -1234,7 +1225,7 @@ test('research renders the settled report; a failed run shows its canonical inci
 	});
 });
 
-test('attach composes ONE durable chat submission carrying the excerpt under its citation', async ({
+test('attach composes ONE durable session admission carrying the excerpt under its citation', async ({
 	page
 }) => {
 	const hostA = page.getByTestId('host-a');
@@ -1254,35 +1245,31 @@ test('attach composes ONE durable chat submission carrying the excerpt under its
 	// Local pre-flight: profile is required; nothing is submitted without it.
 	await attach.getByTestId('attach-send').click();
 	await expect(attach.getByText('A model profile is required.')).toBeVisible();
-	const before = (await apiState(page)).calls.filter((call) => call.op === 'submitMessage');
+	const before = (await apiState(page)).calls.filter((call) => call.op === 'attachToSession');
 	expect(before).toHaveLength(0);
 
 	await attach.getByTestId('attach-profile').fill('mai-primary');
 	await attach.getByTestId('attach-note').fill('Please apply on the pinned server.');
 	await attach.getByTestId('attach-send').click();
 
-	await expect(attach.getByTestId('attach-done')).toContainText('Recorded conversation');
+	await expect(attach.getByTestId('attach-done')).toContainText('Recorded session');
 	const { calls } = await apiState(page);
-	const submit = lastCall(calls, 'submitMessage');
+	const attachCall = lastCall(calls, 'attachToSession');
 	// Test-authored wire boundary: the fixture recorded the exact body the
 	// panel sent; the recorded payload IS this shape by construction.
-	const body = submit.payload as {
-		run_id: string;
-		server_id: string;
-		message: string;
-		profile: string;
-		role: string;
-		mode: string;
+	const body = attachCall.payload as {
+		session_id: string | null;
+		text: string;
+		model_profile: string;
+		client_request_id: string;
 	};
 	const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-	expect(body.run_id).toMatch(UUID_RE); // client-minted idempotency key
-	expect(body.server_id).toBe(SERVER_A); // the pinned scope, nothing else
-	expect(body.profile).toBe('mai-primary');
-	expect(body.role).toBe('administrator');
-	expect(body.mode).toBe('ask');
-	expect(body.message).toContain('runbooks:' + DOC_A1 + '#r3:0');
-	expect(body.message).toContain('> Alpha reloads via systemctl');
-	expect(body.message).toContain('Please apply on the pinned server.');
+	expect(body.session_id).toBeNull(); // the explicit create-new-session action
+	expect(body.client_request_id).toMatch(UUID_RE); // idempotency key
+	expect(body.model_profile).toBe('mai-primary');
+	expect(body.text).toContain('runbooks:' + DOC_A1 + '#r3:0');
+	expect(body.text).toContain('> Alpha reloads via systemctl');
+	expect(body.text).toContain('Please apply on the pinned server.');
 
 	// A refused submission stays honest (no fabricated success).
 	await hostA.getByTestId('excerpt-attach').click();
