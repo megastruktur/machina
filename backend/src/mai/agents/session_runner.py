@@ -103,7 +103,6 @@ __all__ = [
     "HANDLER_NAME",
     "MAX_MAX_ROUNDS",
     "RUN_PAYLOAD_VERSION_SESSION",
-    "STEER_TOPIC",
     "SessionRunError",
     "SessionRunExecutor",
     "SessionRunFailed",
@@ -132,10 +131,6 @@ MAX_RECONCILE_WAIT_SECONDS: Final[float] = 3_600.0
 DEFAULT_WAIT_POLL_SECONDS: Final[float] = 5.0
 MIN_WAIT_POLL_SECONDS: Final[float] = 0.5
 MAX_WAIT_POLL_SECONDS: Final[float] = 60.0
-
-#: Durable steering drain topic (a DBOS wake for a parked wait; the DURABLE
-#: transport is the ControlEntry log consumed by the boundary drain step).
-STEER_TOPIC: Final[str] = "mai:session:steer"
 
 #: Deterministic tool-step sequence base (per-run ``job_steps`` rows).
 TOOL_STEP_SEQ_BASE: Final[int] = 100
@@ -816,12 +811,13 @@ async def aupdate_tool_result_payload(
 
 async def _drain_controls(
     executor: SessionRunExecutor, intent: SessionRunIntent
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], str | None]:
     """Consume durable control entries targeted at this run.
 
-    Returns ``(notes, stop_requested)``. STEER notes are injected as
-    labelled user prompts (the ack entry IS the injected prompt);
-    a CANCEL entry is acknowledged and reported as a stop. Consumption is
+    Returns ``(notes, stop)``. STEER notes are injected as labelled user
+    prompts (the ack entry IS the injected prompt); PAUSE and CANCEL are
+    deterministic boundary stops (acknowledged with a CONTROL-kind entry —
+    an operator stop is never synthetic user prose). Consumption is
     recorded by an idempotent acknowledgment entry keyed by the control
     entry's own durable id, so a replayed drain never injects or stops
     twice.
@@ -834,7 +830,7 @@ async def _drain_controls(
         FROM session_entries e
         WHERE e.session_id = :sid
           AND e.kind = 'control'
-          AND e.payload->>'action' IN ('steer', 'cancel')
+          AND e.payload->>'action' IN ('steer', 'pause', 'cancel')
           AND (e.payload->>'target_run_id' = :rid
                OR e.payload->>'target_run_id' IS NULL)
           AND NOT EXISTS (
@@ -858,21 +854,43 @@ async def _drain_controls(
             .all()
         )
     notes: list[str] = []
-    stop_requested = False
+    stop: str | None = None
     for row in rows:
         payload = row["payload"]
         action = payload.get("action") if isinstance(payload, dict) else None
-        if action == "cancel":
-            stop_requested = True
-            note = str(payload.get("note") or "cancel")
-        else:
-            note = payload.get("note") if isinstance(payload, dict) else None
-            note = (
-                note[:_STEER_NOTE_MAX]
-                if isinstance(note, str) and note.strip()
-                else "steering note"
+        if action in ("pause", "cancel"):
+            # Deterministic boundary stop (m2: acknowledged as a CONTROL
+            # entry, never turned into synthetic user prose).
+            stop = str(action)
+            note = str(payload.get("note") or action)
+            await aappend_entry(
+                executor.sessions,
+                session_id=uuid.UUID(intent.session_id),
+                server_id=uuid.UUID(intent.server_id),
+                kind=EntryKind.CONTROL,
+                payload={
+                    "kind": EntryKind.CONTROL.value,
+                    "action": action,
+                    "client_request_id": str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL, f"ack:{row['durable_source_id']}"
+                        )
+                    ),
+                    "target_run_id": intent.run_id,
+                    "approval_id": None,
+                    "note": f"acknowledged: {note[:200]}",
+                },
+                run_id=uuid.UUID(intent.run_id),
+                durable_source_id=f"steer:{row['durable_source_id']}",
             )
-            notes.append(note)
+            continue
+        note = payload.get("note") if isinstance(payload, dict) else None
+        note = (
+            note[:_STEER_NOTE_MAX]
+            if isinstance(note, str) and note.strip()
+            else "steering note"
+        )
+        notes.append(note)
         await aappend_entry(
             executor.sessions,
             session_id=uuid.UUID(intent.session_id),
@@ -889,7 +907,7 @@ async def _drain_controls(
             run_id=uuid.UUID(intent.run_id),
             durable_source_id=f"steer:{row['durable_source_id']}",
         )
-    return notes, stop_requested
+    return notes, stop
 
 
 async def _round_model(
@@ -1022,9 +1040,10 @@ def _session_model_bound(payload_json: str) -> str:
 
 @DBOS.step(name="agents.session.controls_drained")
 def _session_controls_drained(payload_json: str) -> str:
-    """Consume durable steering/cancel controls at a safe boundary.
+    """Consume durable steering/pause/cancel controls at a safe boundary.
 
-    Returns ``{"notes": [...], "stop": bool}`` (checkpointed).
+    Returns ``{"notes": [...], "stop": "cancel"|"pause"|None}``
+    (checkpointed).
     """
     intent = parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
@@ -1070,16 +1089,17 @@ def _session_tool_execute(payload_json: str, call_json: str, round_index: int) -
 
     if state in {item.value for item in TERMINAL_STEP_STATES}:
         # A replayed attempt observes the committed row instead of a second
-        # effect (the row IS the exactly-once ledger).
-        return json.dumps(
-            {
-                "seq": seq,
-                "state": state,
-                "status": "replayed_terminal",
-                "approval_id": None,
-                "payload_hash": str((row.get("receipt") or {}).get("payload_hash", "")),
-            }
+        # effect (the row IS the exactly-once ledger). A SIGKILL between the
+        # outcome commit and the session append leaves the call WITHOUT a
+        # session result: repair it from the committed receipt, idempotently
+        # keyed (M2). An approval-refusal receipt is skipped — its resume
+        # path owns the result entry.
+        outcome = executor.run(
+            _repair_replayed_terminal_result(
+                executor, intent=intent, round_index=round_index, call=call, row=row
+            )
         )
+        return json.dumps(outcome)
     if state == StepState.RUNNING.value:
         # Crash window: the previous worker died mid-effect holding the
         # fence. NEVER re-dispatch; translate honestly.
@@ -1573,6 +1593,101 @@ def _session_read_step(payload_json: str, run_id: str, call_json: str) -> str:
     )
 
 
+async def _repair_replayed_terminal_result(
+    executor: SessionRunExecutor,
+    *,
+    intent: SessionRunIntent,
+    round_index: int,
+    call: Mapping[str, object],
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    """Re-append the session result for an already-terminal step row (M2).
+
+    A SIGKILL between ``apersist_outcome`` and ``_persist_projected_result``
+    commits the effect truth in ``job_steps`` but leaves ``session_entries``
+    without the call's result — the session-append seam. This repair
+    reconstructs the honest ``ToolResultEntry`` from the COMMITTED receipt
+    and appends it under the idempotency key (the store dedupes a replay),
+    so the executed exchange is never silently absent from subsequent native
+    history. An approval-refusal receipt is skipped: its RESUME path owns
+    the call's single result entry (base/denied/approved suffixes).
+    """
+    seq = int(call["seq"])
+    capability_id = str(call["capability_id"])
+    receipt = row.get("receipt") if isinstance(row.get("receipt"), Mapping) else {}
+    row_state = str(row.get("state", StepState.FAILED.value))
+    reason = str(receipt.get("reason", "")) if receipt else ""
+    if reason == "approval_required_but_absent":
+        return {
+            "seq": seq,
+            "state": row_state,
+            "status": "approval_required",
+            "approval_id": (
+                str(receipt.get("approval_id"))
+                if receipt.get("approval_id")
+                else None
+            ),
+            "payload_hash": str(receipt.get("payload_hash", "")),
+        }
+
+    proven = (
+        receipt.get("executor_ok") is True and receipt.get("effect") == "executed"
+    )
+    if row_state == StepState.SUCCEEDED.value and proven:
+        status = "executed"
+        execution_status = ExecutionStatus.SUCCEEDED
+        certainty = EffectCertainty.CERTAIN
+        domain = DomainOutcome.SUCCESS
+    elif receipt.get("effect") == "not_attempted" or row_state == StepState.FAILED.value:
+        status = "denied"
+        execution_status = ExecutionStatus.FAILED
+        certainty = EffectCertainty.CERTAIN
+        domain = DomainOutcome.FAILURE
+    else:
+        status = "unknown_effect"
+        execution_status = ExecutionStatus.OUTCOME_UNKNOWN
+        certainty = EffectCertainty.UNKNOWN
+        domain = DomainOutcome.UNKNOWN
+    entry = ToolResultEntry(
+        kind=EntryKind.TOOL_RESULT,
+        call_id=str(call["tool_call_id"]),
+        tool_name=capability_id,
+        capability_id=capability_id,
+        status=status,
+        execution_status=execution_status,
+        domain_outcome=domain,
+        effect_certainty=certainty,
+        payload_hash=str(receipt.get("payload_hash", "")),
+        output_preview=None,
+        error_code=reason or None,
+        error_detail=None,
+        approval_id=(
+            uuid.UUID(str(receipt["approval_id"]))
+            if receipt.get("approval_id")
+            else None
+        ),
+    )
+    assert_tool_result_honesty(entry)
+    from mai.session_store import aappend_entry
+
+    await aappend_entry(
+        executor.sessions,
+        session_id=uuid.UUID(intent.session_id),
+        server_id=uuid.UUID(intent.server_id),
+        kind=EntryKind.TOOL_RESULT,
+        payload=entry.model_dump(mode="json"),
+        run_id=uuid.UUID(intent.run_id),
+        durable_source_id=f"round:{round_index}:tool:{entry.call_id}",
+    )
+    return {
+        "seq": seq,
+        "state": row_state,
+        "status": status,
+        "approval_id": receipt.get("approval_id"),
+        "payload_hash": str(receipt.get("payload_hash", "")),
+    }
+
+
 @DBOS.step(name="agents.session.approval_wait_entered")
 def _session_approval_wait(payload_json: str, call_json: str, approval_id: str) -> str:
     """Enter ``waiting_approval`` ONCE (dual authority + persisted deadline)."""
@@ -1866,6 +1981,27 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
             session_status=header_status,
         )
     )
+    # Terminal classification event (reviewed parity: agent.completed /
+    # agent.failed carry the value-free outcome + reason).
+    event_type = (
+        "agent.completed"
+        if session_state is SessionRunState.SUCCEEDED
+        else "agent.failed"
+        if session_state is SessionRunState.FAILED
+        else None
+    )
+    if event_type is not None:
+        executor.run(
+            executor.steps.aemit_run_event(
+                intent.run_id,
+                event_type,
+                {
+                    "rounds": summary.get("rounds"),
+                    "tool_calls": summary.get("tool_calls"),
+                    "reason": summary.get("reason"),
+                },
+            )
+        )
     return json.dumps({"settled": state_value})
 
 
@@ -1892,7 +2028,11 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
         while True:
             boundary = json.loads(_session_controls_drained(payload_json))
             if boundary.get("stop"):
-                stopped_by = "cancelled"
+                stopped_by = (
+                    "paused"
+                    if boundary["stop"] == "pause"
+                    else str(boundary["stop"])
+                )
                 break
             round_record = json.loads(
                 await asyncio.to_thread(
@@ -1911,7 +2051,13 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                 # honest recorded outcomes either way).
                 boundary = json.loads(_session_controls_drained(payload_json))
                 if boundary.get("stop"):
-                    stopped_by = "cancelled"
+                    # Control vocabulary: the entry action is 'pause'; the
+                    # settled state is 'cancelled' with reason 'paused'.
+                    stopped_by = (
+                        "paused"
+                        if boundary["stop"] == "pause"
+                        else str(boundary["stop"])
+                    )
                     break
                 for note in boundary.get("notes", []):
                     tool_records.append({"steering_injected": note})
@@ -1951,28 +2097,30 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                         intent, deadline_iso, approval_id
                     )
                     if decision == "timeout":
-                        # The wait expired honestly: reconcile the refused
-                        # binding as unknown (never invented success).
-                        settled = await _settle_unknown_session(
-                            intent, call_json, rounds
-                        )
-                        tool_records[-1] = {
-                            "seq": outcome.get("seq"),
-                            "state": settled.get("row_state"),
-                            "status": settled.get("status"),
-                        }
-                    else:
+                        # The approval wait expired (run_v2 parity: expiry
+                        # FAILS the run — waiting_approval → running →
+                        # failed). No result entry exists for the refused
+                        # binding, so the group is marked unresolved (never
+                        # a false 'complete') and the run settles failed
+                        # with the classified reason.
                         _session_wait_resumed(
                             payload_json, RunState.WAITING_APPROVAL.value
                         )
-                        if decision == "approve":
-                            _session_approval_execute(
-                                payload_json, call_json, presented_id, rounds
-                            )
-                        else:
-                            _session_denied_after_wait(
-                                payload_json, call_json, presented_id, rounds
-                            )
+                        _session_tool_group_marked(
+                            payload_json, entry_id, "unresolved"
+                        )
+                        raise SessionStageError("approval_expired")
+                    _session_wait_resumed(
+                        payload_json, RunState.WAITING_APPROVAL.value
+                    )
+                    if decision == "approve":
+                        _session_approval_execute(
+                            payload_json, call_json, presented_id, rounds
+                        )
+                    else:
+                        _session_denied_after_wait(
+                            payload_json, call_json, presented_id, rounds
+                        )
             if stopped_by is not None:
                 break
             # All round results landed: mark the atomic group complete.
@@ -1982,7 +2130,7 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                 raise SessionStageError("round_budget_exhausted")
         final_state = (
             "cancelled"
-            if stopped_by == "cancelled"
+            if stopped_by in ("cancelled", "paused")
             else "outcome_unknown"
             if stopped_by == "outcome_unknown"
             else "succeeded"
@@ -1993,6 +2141,7 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             "tool_calls": tool_records,
             "output_chars": len(output_text),
             "stopped_by": stopped_by,
+            "reason": stopped_by,
         }
         settled = json.loads(_session_settled(payload_json, json.dumps(summary)))
         if final_state == "cancelled":
@@ -2100,8 +2249,9 @@ async def _park_for_decision(
             if decision not in ("approve", "deny"):
                 decision = "deny"
             return decision, str(message.get("approval_id") or parked_approval_id)
-        if message is not None:
-            return "deny", parked_approval_id
+        # A non-approval wake on the shared topic (e.g. recovery.resolve or
+        # a stray wake) is a durable re-check trigger only: keep waiting
+        # within the budget (run_v2.py:1652-1656 pattern) — never a denial.
 
 
 # --- the control facade (durable steering/cancel for any process) ---------------------
@@ -2176,7 +2326,12 @@ async def asubmit_session_control(
         durable_source_id=f"control:{request.client_request_id}",
     )
     run_state: SessionRunState | None = None
-    if request.action is ControlActionKind.CANCEL and target is not None:
+    if (
+        request.action
+        in (ControlActionKind.CANCEL, ControlActionKind.PAUSE)
+        and target is not None
+        and request.action is ControlActionKind.CANCEL
+    ):
         # The engine-side cancellation: DBOS lands it at the workflow's
         # next step/recv boundary as DBOSWorkflowCancelledError; the
         # runner's handler settles the domain cancelled and re-raises so
@@ -2225,9 +2380,6 @@ async def asubmit_session_control(
         # The runner's boundary drain also observes the durable entry and
         # settles the session domain (belt and braces for a parked run).
         run_state = SessionRunState.CANCELLED
-    if request.action is ControlActionKind.STEER and target is not None:
-        # Wake a parked wait so steering reaches approval-parked runs too.
-        _try_wake(target, {"kind": "steer", "note": request.note or ""})
     return SessionControlResponse(
         session_id=session_id,
         action=request.action,
@@ -2236,18 +2388,6 @@ async def asubmit_session_control(
         accepted=True,
         run_state=run_state,
     )
-
-
-def _try_wake(target: uuid.UUID, message: dict[str, object]) -> None:
-    """Best-effort DBOS wake for a parked wait (no-op outside DBOS)."""
-    try:
-        from dbos import DBOS
-
-        DBOS.send(str(target), message, topic=STEER_TOPIC)
-    except Exception:
-        # No DBOS runtime in this process (or the run is not parked): the
-        # durable ControlEntry transport still delivers at the boundary.
-        return
 
 
 # Registration at import (the engine trampoline resolves the handler by

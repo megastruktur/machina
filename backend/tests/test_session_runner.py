@@ -1556,3 +1556,470 @@ def test_session_runner_has_zero_old_imports() -> None:
                 if alias.name.startswith(_FORBIDDEN_IMPORT_PREFIXES):
                     found.append(alias.name)
     assert found == [], found
+
+
+# ---------------------------------------------------------------------------
+# R04 fix-round focused tests (M1-M4)
+# ---------------------------------------------------------------------------
+
+
+def test_stray_wake_never_denies_a_pending_approval_r04_m1(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """M1: a non-approval wake on RESUME_TOPIC (e.g. recovery.resolve) is
+    consumed as a re-check trigger — the park CONTINUES and the approval
+    still resolves to its payload-bound execution, never to a denial."""
+    composition(capability=PRIV_CAP)
+    _write_policy_files(scenario, grants=[{PRIV_CAP: True}])
+    _script(
+        scenario,
+        [
+            _tool_call_entry(name="fixture_priv", marker="m1", call_id="c1"),
+            {"text": "approved after a stray wake"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id, requested_grants=(PRIV_CAP,)))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id,
+                    session_id,
+                    allowed=(PRIV_CAP,),
+                    mode="ask",
+                    approval_wait_seconds=120.0,
+                    wait_poll_seconds=0.5,
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _wait_until(
+            lambda: _read_sessions_row(agent_url, session_id)["status"]
+            == "waiting_approval",
+            RUN_TIMEOUT,
+            "the waiting_approval park",
+        )
+        # A stray non-approval wake (the recovery.resolve shape) arrives
+        # first: the park must ignore it, not deny the approval.
+        _send_wake(run_id, agent_url, {"kind": "recovery.resolve", "seq": 1})
+        time.sleep(2)
+        assert (
+            _read_sessions_row(agent_url, session_id)["status"]
+            == "waiting_approval"
+        ), "a stray wake must not end the approval wait"
+        row = _read_step_rows(agent_url, run_id)[0]
+        approval_id = row["receipt"]["approval_id"]
+        _send_wake(
+            run_id,
+            agent_url,
+            {"kind": "approval", "approval_id": approval_id, "decision": "approve"},
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "approval resume")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The stray wake never produced a denial; the effect ran exactly once.
+    statuses = [
+        e["payload"]["status"]
+        for e in _read_session_entries(agent_url, session_id)
+        if e["kind"] == "tool_result"
+    ]
+    assert statuses == ["executed"]
+    assert _journal_count(scenario, "effect:fixture.priv:m1") == 1
+
+
+def test_approval_expiry_fails_run_and_marks_group_unresolved_r04_m3(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """M3: the approval wait expiry settles the run FAILED with the
+    classified reason (run_v2 parity), marks the tool group unresolved and
+    never stamps a false 'complete'."""
+    composition(capability=PRIV_CAP)
+    _write_policy_files(scenario, grants=[{PRIV_CAP: True}])
+    _script(
+        scenario,
+        [
+            _tool_call_entry(name="fixture_priv", marker="m1", call_id="c1"),
+            {"text": "never reached"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id, requested_grants=(PRIV_CAP,)))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id,
+                    session_id,
+                    allowed=(PRIV_CAP,),
+                    mode="ask",
+                    approval_wait_seconds=2.0,
+                    wait_poll_seconds=0.5,
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _wait_until(
+            lambda: _read_sessions_row(agent_url, session_id)["status"]
+            == "waiting_approval",
+            RUN_TIMEOUT,
+            "the waiting_approval park",
+        )
+        # No decision arrives: the persisted deadline expires the park.
+        _await_terminal(client, run_id, "failed", RUN_TIMEOUT, "approval expiry")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    assert _run(_run_states(factory, run_id)) == (
+        "queued",
+        "running",
+        "waiting_approval",
+        "running",
+        "failed",
+    )
+    assert _read_sessions_row(agent_url, session_id)["status"] == "failed"
+    assert _read_session_runs(agent_url, session_id)[0]["state"] == "failed"
+    # Zero effect; the group is marked unresolved (never false 'complete').
+    assert _journal_count(scenario, "effect:fixture.priv:m1") == 0
+    entries = _read_session_entries(agent_url, session_id)
+    groups = [
+        e
+        for e in entries
+        if e["kind"] == "assistant_message" and e["payload"].get("tool_calls")
+    ]
+    assert groups and groups[0]["payload"]["tool_group_state"] == "unresolved"
+    results = [e for e in entries if e["kind"] == "tool_result"]
+    assert results == [], "an expired approval persists no tool result"
+    events = _read_events(agent_url, run_id)
+    failed = [event for event in events if event.type == "agent.failed"]
+    assert failed and failed[0].data.get("reason") == "approval_expired"
+
+
+def test_pause_stops_at_boundary_with_reason_paused_r04_m4(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """M4: PAUSE is a deterministic boundary stop — the run settles
+    cancelled (facade) with reason_code 'paused', the header goes idle and
+    no effect runs."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [
+            {"gate": "model-gate", "then": _tool_call_entry()},
+            {"text": "never reached"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        _wait_until(
+            lambda: _journal_count(scenario, "model_call") == 1,
+            RUN_TIMEOUT,
+            "the gated model call",
+        )
+        submitted = _run(
+            asubmit_session_control(
+                factory,
+                session_id=uuid.UUID(session_id),
+                server_id=uuid.UUID(SERVER_ID),
+                request=__import__(
+                    "mai.contracts.sessions", fromlist=["SessionControlRequest"]
+                ).SessionControlRequest(
+                    session_id=uuid.UUID(session_id),
+                    action=__import__(
+                        "mai.contracts.sessions", fromlist=["ControlActionKind"]
+                    ).ControlActionKind.PAUSE,
+                    client_request_id=uuid.uuid4(),
+                    target_run_id=uuid.UUID(run_id),
+                    note="operator paused",
+                ),
+                active_run_id=uuid.UUID(run_id),
+                database_url=agent_url,
+            )
+        )
+        assert submitted.accepted is True
+        (scenario / "gates" / "model-gate").write_text("go", encoding="utf-8")
+        # A pause boundary-stop completes the workflow (the reviewed
+        # runner's semantics: stopped_by rides the summary event); the
+        # dual-authority DOMAIN postcondition is what the settlement
+        # guarantees (facade cancelled, session cancelled, header
+        # cancelled, reason 'paused', zero effect).
+        _wait_until(
+            lambda: (_run(_current_state(factory, run_id)) == "cancelled")
+            and (_read_sessions_row(agent_url, session_id)["status"] == "cancelled")
+            and any(
+                e["kind"] == "run_state"
+                and e["payload"].get("reason_code") == "paused"
+                for e in _read_session_entries(agent_url, session_id)
+            ),
+            RUN_TIMEOUT,
+            "the paused settlement",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    assert _journal_count(scenario, "begin:fixture.read:m1") == 0
+    assert _run(_run_states(factory, run_id))[-1] == "cancelled"
+    runs = _read_session_runs(agent_url, session_id)
+    assert runs[0]["state"] == "cancelled"
+    entries = _read_session_entries(agent_url, session_id)
+    assert any(
+        e["kind"] == "run_state" and e["payload"].get("reason_code") == "paused"
+        for e in entries
+    )
+    assert not [e for e in entries if e["kind"] == "tool_result"]
+
+
+# ---------------------------------------------------------------------------
+# M2: replayed-terminal repair appends the missing session result
+# ---------------------------------------------------------------------------
+
+
+def _in_process_executor(factory: async_sessionmaker[AsyncSession], tmp: pathlib.Path):
+    """A real SessionRunExecutor composed in-process (real dispatcher,
+    real ApprovalStore, journaled executor) for direct-step tests."""
+    from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
+    from mai.credentials.env import EnvResolver
+    from mai.jobs.resource_locks import ResourceLockService
+    from mai.plugins.registry import CapabilityRegistry, parse_descriptor
+
+    descriptor = parse_descriptor(
+        {
+            "identifier": READ_CAP,
+            "version": "1.0.0",
+            "config_schema": None,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["marker"],
+                "properties": {"marker": {"type": "string", "minLength": 1}},
+            },
+            "output_schema": {
+                "type": "object",
+                "required": ["status", "exit_code", "stdout", "stderr"],
+                "properties": {
+                    "status": {"type": "string"},
+                    "exit_code": {"type": ["integer", "null"]},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
+                },
+            },
+            "execution_environments": ["linux_ssh"],
+            "effect_class": "read",
+            "resource_scope": [],
+            "required_grants": [],
+        },
+        source="<fixture.read descriptor>",
+    )
+    registry = CapabilityRegistry()
+    registry.register(descriptor)
+
+    async def executor_call(call):
+        document = {
+            "status": "succeeded",
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }
+        return ExecutorResult(ok=True, output=json.dumps(document, sort_keys=True))
+
+    env_file = tmp / "fixture.env"
+    env_file.write_text(f"{SECRET_NAME}=x\n", encoding="utf-8")
+    dispatcher = CapabilityDispatcher(
+        registry=registry,
+        approvals=ApprovalStore(factory),
+        grants=lambda: {READ_CAP: {uuid.UUID(SERVER_ID)}},
+        policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
+        adopted=lambda server_id: True,
+        credentials=lambda: EnvResolver(str(env_file)),
+        executor=executor_call,
+    )
+    model_root = tmp / "model-root"
+    model_root.mkdir(parents=True, exist_ok=True)
+    return session_runner_mod.SessionRunExecutor(
+        sessions=factory,
+        dispatcher=dispatcher,
+        registry=registry,
+        model_store=ModelConfigStore(str(model_root)),
+        data_root=str(tmp),
+        locks=ResourceLockServiceMod(str(_fixture_url_for_locks())),
+        resolver=None,
+        model_builder=None,
+    )
+
+
+def _fixture_url_for_locks() -> str:
+    return os.environ.get("MAI_DATABASE_URL") or os.environ.get(
+        LIVE_URL_VAR, "postgresql://localhost/mai"
+    )
+
+
+# Local import aliases for the in-process composition (kept beside use to
+# avoid shadowing the subprocess-worker module surface).
+ResourceLockServiceMod = __import__(
+    "mai.jobs.resource_locks", fromlist=["ResourceLockService"]
+).ResourceLockService
+session_runner_mod = __import__(
+    "mai.agents.session_runner", fromlist=["SessionRunExecutor"]
+)
+
+
+def test_replayed_terminal_appends_missing_result_r04_m2(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    tmp_path: pathlib.Path,
+) -> None:
+    """M2: a crash between the outcome commit and the session append leaves
+    a terminal step row WITHOUT a session result. The repair reconstructs
+    the honest ToolResultEntry from the committed receipt, idempotently
+    keyed — the executed result is never absent from the durable log."""
+    import sqlalchemy as sa
+
+    from mai.jobs.steps import StepIntent, StepState
+
+    executor = _in_process_executor(factory, tmp_path)
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    intent = parse_session_run_intent(
+        _canonical(
+            _intent_document(
+                run_id, session_id, client_request_id=str(uuid.uuid4())
+            )
+        )
+    )
+    _run(_ensure_run_row_helper(executor, intent))
+    call = {
+        "tool_call_id": "c1",
+        "tool_name": "fixture_read",
+        "capability_id": READ_CAP,
+        "args": {"marker": "m1"},
+        "seq": 100,
+    }
+    spec = StepIntent(seq=100, capability_id=READ_CAP, payload=dict(call["args"]))
+    _run(executor.steps.aensure_step_intent(run_id, spec))
+    _run(executor.steps.amark_running(run_id, 100, READ_CAP))
+    # The committed outcome receipt (executor_ok True, effect executed):
+    # the SIGKILL happened right after this commit, before the append.
+    _run(
+        executor.steps.apersist_outcome(
+            run_id,
+            100,
+            READ_CAP,
+            StepState.SUCCEEDED,
+            {
+                "v": 1,
+                "op_id": None,
+                "capability_id": READ_CAP,
+                "allowed": True,
+                "reason": "allowed",
+                "effect": "executed",
+                "payload_hash": "a" * 64,
+                "policy_revision": 1,
+                "executor_ok": True,
+            },
+            reason="allowed",
+            op_id=None,
+        )
+    )
+    row = _run(executor.steps.aread_step(run_id, 100))
+    assert row is not None and row["state"] == "succeeded"
+    # No session result yet (the crash window).
+    assert not [
+        e
+        for e in _read_session_entries(agent_url, session_id)
+        if e["kind"] == "tool_result"
+    ]
+
+    call_json = json.dumps(call)
+    outcome_1 = _run_replay_step(executor, intent.to_json(), call_json, 0, row_dict=row)
+    assert outcome_1["status"] == "executed" and outcome_1["state"] == "succeeded"
+    entries = _read_session_entries(agent_url, session_id)
+    results = [e for e in entries if e["kind"] == "tool_result"]
+    assert len(results) == 1 and results[0]["payload"]["status"] == "executed"
+    assert results[0]["payload"]["effect_certainty"] == "certain"
+
+    # Idempotent: a replayed repair (row still terminal) adds no duplicate.
+    row_again = _run(executor.steps.aread_step(run_id, 100))
+    outcome_2 = _run_replay_step(executor, intent.to_json(), call_json, 0, row_dict=row_again)
+    assert outcome_2["status"] == "executed"
+    results_again = [
+        e
+        for e in _read_session_entries(agent_url, session_id)
+        if e["kind"] == "tool_result"
+    ]
+    assert len(results_again) == 1
+    del sa
+
+
+async def _ensure_run_row_helper(executor, intent):
+    from mai.agents.session_runner import _ensure_run_row
+
+    await _ensure_run_row(executor, intent)
+
+
+def _run_replay_step(executor, payload_json, call_json, round_index, *, row_dict):
+    """Drive the repair helper directly (the step decorator is skipped)."""
+    from mai.agents.session_runner import _repair_replayed_terminal_result
+
+    async def _body():
+        intent = parse_session_run_intent(
+            payload_json
+            if isinstance(payload_json, str)
+            else json.dumps(payload_json)
+        )
+        return await _repair_replayed_terminal_result(
+            executor,
+            intent=intent,
+            round_index=round_index,
+            call=json.loads(call_json) if isinstance(call_json, str) else dict(call_json),
+            row=row_dict,
+        )
+
+    return executor.run(_body())
