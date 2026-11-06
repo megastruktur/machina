@@ -184,7 +184,7 @@ from mai.contracts.sessions import (
 from mai.session_channel import notify_session_committed
 from mai.session_store import (
     aappend_entry,
-    acreate_run,
+    acreate_root_run,
     acreate_session,
     arecord_admission,
     arecord_run_state,
@@ -2443,9 +2443,11 @@ async def execute_runbook(
     )
 
     # Durable session-first admission (the SAME discipline as the reviewed
-    # /agent-sessions turn route): session row → child-run row → admission
-    # ledger → user entry (idempotent on ``turn:<client_request_id>``) →
-    # queued run-state, all committed BEFORE the engine enqueue follows.
+    # /agent-sessions turn route): session row → root execution admission
+    # (session run + job_runs facade + mandatory classification, ONE
+    # transaction) → admission ledger → user entry (idempotent on
+    # ``turn:<client_request_id>``) → queued run-state, all committed
+    # BEFORE the engine enqueue follows.
     factory = _sessions(request)
     await acreate_session(
         factory,
@@ -2456,14 +2458,16 @@ async def execute_runbook(
         title=f"{effective.name} — {payload.action}"[:200],
         session_id=session_id,
     )
-    await acreate_run(
+    await acreate_root_run(
         factory,
         session_id=session_id,
         server_id=server_id,
         run_id=run_uuid,
         model_profile=model_profile if model_profile is not None else "default",
         client_request_id=client_request_id,
-        parent_run_id=None,
+        profile_revision=int(stored.revision),
+        prompt_revision=int(profile.prompt_revision),
+        requested_grants=tuple(capabilities),
     )
     await arecord_admission(
         factory,

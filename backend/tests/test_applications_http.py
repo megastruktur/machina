@@ -1532,3 +1532,172 @@ class TestRunbookSessionExecution:
         assert len(staged) == 1
         assert staged[0]["installed"] is False
         assert staged[0]["custom_instructions"] == "host path: /srv/fixture"
+
+    async def test_execute_admits_root_run_with_execution_facade(
+        self,
+        apps_app: FastAPI,
+        jar: dict[str, str],
+        server_a: uuid.UUID,
+    ) -> None:
+        """S3 (queued-chat hotfix): runbook root admission carries the
+        retained execution facade atomically — job_runs depth 0 with the
+        REAL resolved profile/prompt revisions and exactly the narrowed
+        capability binding the execution intent freezes, plus the
+        mandatory classification. Every admission stays exactly one row
+        of each kind; a cross-server attempt admits nothing."""
+        from types import SimpleNamespace
+
+        from mai.api.capability_defaults import resolve_default_capabilities
+        from mai.contracts.server import parse_server_profile_text
+        from mai.tag_store import RESERVED_UNCLASSIFIED_TAG_ID
+
+        # A server-SCOPED adopted entry (unlike catalog runbooks, which
+        # are deliberately server-agnostic): the scope-rejection leg
+        # below relies on this binding.
+        application_id = uuid.uuid4()
+        adopted = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(application_id),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert adopted.status == 201, adopted.body
+
+        # The expected binding, resolved the way admission resolves it.
+        stored = apps_app.state.profiles.read(server_a)
+        parsed = parse_server_profile_text(stored.text)
+        expected_caps = resolve_default_capabilities(
+            SimpleNamespace(app=apps_app), server_a, parsed.capabilities
+        )
+        models_store = getattr(apps_app.state, "models", None)
+        expected_model = None
+        if models_store is not None:
+            try:
+                expected_model = models_store.get_selection().profile
+            except Exception:
+                expected_model = None
+        if expected_model is None:
+            expected_model = "default"
+
+        async def _execute(server: uuid.UUID, action: str) -> HttpResponse:
+            return await call_app(
+                apps_app,
+                "POST",
+                f"{_apps_root(server)}/{application_id}/execute",
+                json_body={"action": action},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+
+        first = await _execute(server_a, "update")
+        assert first.status == 201, first.body
+        view = first.json()
+        assert view["state"] == "queued"
+        run_id = uuid.UUID(view["run_id"])
+
+        with psycopg.connect(
+            apps_app.state.database_url, row_factory=psycopg.rows.dict_row
+        ) as conn:
+            run_row = conn.execute(
+                "SELECT state, parent_run_id, model_profile FROM session_runs "
+                "WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            facade = conn.execute(
+                "SELECT server_id, depth, parent_run_id, profile_revision, "
+                "prompt_revision, model_profile, requested_grants "
+                "FROM job_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            tags = conn.execute(
+                "SELECT tag_id, assignment_source FROM job_tags "
+                "WHERE job_id = %s",
+                (run_id,),
+            ).fetchall()
+        assert run_row is not None and facade is not None
+        assert run_row["state"] == "queued"
+        assert run_row["parent_run_id"] is None
+        assert run_row["model_profile"] == expected_model
+        assert facade["server_id"] == server_a
+        assert facade["depth"] == 0  # a root on the retained execution tree
+        assert facade["parent_run_id"] is None
+        assert facade["profile_revision"] == stored.revision
+        assert facade["prompt_revision"] == parsed.prompt_revision
+        assert facade["model_profile"] == expected_model
+        # No widening: exactly the resolved capability binding, sorted.
+        assert facade["requested_grants"] == sorted(expected_caps)
+        assert len(tags) == 1  # the 0011 mandatory classification
+        assert tags[0]["tag_id"] == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+        assert tags[0]["assignment_source"] == "system"
+
+        # A second admission is a FRESH session/run by design (random
+        # identities): every admitted root keeps exactly one row of each
+        # kind — no duplicates from the admission path itself.
+        second = await _execute(server_a, "verify")
+        assert second.status == 201, second.body
+        run2_id = uuid.UUID(second.json()["run_id"])
+        assert run2_id != run_id
+        with psycopg.connect(
+            apps_app.state.database_url, row_factory=psycopg.rows.dict_row
+        ) as conn:
+            runs = conn.execute(
+                "SELECT COUNT(*) AS n FROM session_runs "
+                "WHERE run_id = ANY(%s)",
+                ([run_id, run2_id],),
+            ).fetchone()["n"]
+            facades = conn.execute(
+                "SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE depth = 0) "
+                "AS roots FROM job_runs WHERE run_id = ANY(%s)",
+                ([run_id, run2_id],),
+            ).fetchone()
+            classifications = conn.execute(
+                "SELECT COUNT(*) AS n FROM job_tags WHERE job_id = ANY(%s)",
+                ([run_id, run2_id],),
+            ).fetchone()["n"]
+            facade2 = conn.execute(
+                "SELECT profile_revision, prompt_revision, requested_grants "
+                "FROM job_runs WHERE run_id = %s",
+                (run2_id,),
+            ).fetchone()
+            total_facades = conn.execute(
+                "SELECT COUNT(*) AS n FROM job_runs"
+            ).fetchone()["n"]
+        assert runs == 2
+        assert facades["n"] == 2 and facades["roots"] == 2
+        assert classifications == 2
+        assert facade2["profile_revision"] == stored.revision
+        assert facade2["prompt_revision"] == parsed.prompt_revision
+        assert facade2["requested_grants"] == sorted(expected_caps)
+        assert total_facades == 2  # no stray facade rows anywhere
+
+        # Scope rejection: the catalog record is deliberately fleet-wide,
+        # so the honest scope boundary is a server with NO canonical
+        # profile — value-free 404 before anything is admitted.
+        unknown_server = uuid.uuid4()
+        cross = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(unknown_server)}/{application_id}/execute",
+            json_body={"action": "verify"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert cross.status == 404, cross.body
+        assert _error(cross)["code"] == "not_found"
+        with psycopg.connect(
+            apps_app.state.database_url, row_factory=psycopg.rows.dict_row
+        ) as conn:
+            after = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM sessions "
+                "        WHERE server_id = %s) AS unknown_sessions, "
+                "       (SELECT COUNT(*) FROM session_runs "
+                "        WHERE server_id = %s) AS unknown_runs, "
+                "       (SELECT COUNT(*) FROM job_runs "
+                "        WHERE server_id = %s) AS unknown_facades",
+                (unknown_server, unknown_server, unknown_server),
+            ).fetchone()
+        assert after["unknown_sessions"] == 0
+        assert after["unknown_runs"] == 0
+        assert after["unknown_facades"] == 0
