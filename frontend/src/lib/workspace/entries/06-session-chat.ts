@@ -151,7 +151,7 @@ export function sessionChatEntry(): PanelEntryInput {
 		// additionally pin ONE session object. Runs/documents/applications
 		// are other panels' pins.
 		scope_object_kinds: ['conversation'],
-		component: () => import('../../panels/ChatPanel.svelte').then((module) => module.default),
+		component: () => import('../../panels/SessionChatPanel.svelte').then((module) => module.default),
 		default_geometry: { x: 48, y: 72, width: 780, height: 620 },
 		min_geometry: { x: 0, y: 0, width: 480, height: 360 },
 		// Free-instance: two windows may hold two sessions of one server

@@ -1170,7 +1170,12 @@ async def _snapshot_or_replay(
     range arrives as bounded pages + resync_required, never a transcript.
     The sink's ``replaying`` flag keeps the hub catch-up off this outbox
     while the route owns it."""
-    sink.replaying = after_seq is not None
+    # TRUE for BOTH paths: the route owns the outbox while it reads/sends
+    # the snapshot. A concurrent hub tick would otherwise read the newest
+    # tail without a cursor (floor 0, limit 50) and duplicate a range the
+    # 30-entry snapshot already covers — inflating the client cache past
+    # the initial-load cap (D08: cached ≤ 30 before any older page).
+    sink.replaying = True
     try:
         await _snapshot_or_replay_locked(
             send=send,

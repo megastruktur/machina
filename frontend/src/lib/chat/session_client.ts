@@ -59,7 +59,7 @@ import { CSRF_HEADER } from '../api/client.js';
  * Distinct from the REST envelope type on purpose: the frames are the
  * generated wire truth this controller consumes.
  */
-type ChannelEntry = ServerSnapshotFrame['entries'][number];
+export type ChannelEntry = ServerSnapshotFrame['entries'][number];
 
 /** Channel protocol version (D06 contract; hello carries it verbatim). */
 const CHANNEL_PROTOCOL_VERSION = 1;
@@ -272,7 +272,24 @@ export function createSessionChannelController(options: SessionChannelOptions): 
 				}
 			}
 		}
+		evictBeyondCacheCap();
 		return highest;
+	}
+
+	/** The view cache bound (D08): never more than 400 committed entries.
+	 *  The OLDEST seqs evict first — the cursor (max seq) is untouched, so
+	 *  reconnect/replay continuity survives eviction; evicted ranges are
+	 *  re-fetchable through the bounded REST history route. */
+	function evictBeyondCacheCap(): void {
+		const CACHE_CAP = 400;
+		while (committedBySeq.size > CACHE_CAP) {
+			let oldest: number | null = null;
+			for (const seq of committedBySeq.keys()) {
+				if (oldest === null || seq < oldest) oldest = seq;
+			}
+			if (oldest === null) break;
+			committedBySeq.delete(oldest);
+		}
 	}
 
 	function sendFrame(frame: ClientHelloFrame | ClientSubscribeFrame | ClientAckFrame | ClientPingFrame): void {

@@ -224,6 +224,7 @@
 	import PanelHost from './PanelHost.svelte';
 	import WindowSwitcher from './WindowSwitcher.svelte';
 	import ChatPanel from '$lib/panels/ChatPanel.svelte';
+	import SessionChatPanel from '$lib/panels/SessionChatPanel.svelte';
 	import Button from '../ui/Button.svelte';
 	import GlassSurface from '$lib/ui/GlassSurface.svelte';
 	import SideDrawer from '$lib/ui/SideDrawer.svelte';
@@ -258,8 +259,10 @@
 	import {
 		createSessionChannelController,
 		type SessionChannelConnectionState,
-		type SessionChannelController
+		type SessionChannelController,
+		type SessionStreamDraft
 	} from '../chat/session_client.js';
+	import type { ChannelEntry } from '../chat/session_client.js';
 	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
 	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
 	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
@@ -541,7 +544,40 @@
 			liveServers = servers;
 			live = true;
 			status = null;
+			if (servers.length > 0) {
+				// Restore the stored choice ONLY when it still names an enrolled
+				// server; anything else (absent, deleted, stale, invalid) falls
+				// back to the first enrolled server and repairs the stored value.
+				const stored = persistence.getSelectedServerId();
+				const exists =
+					stored !== null &&
+					servers.some((profile) => String(profile.server_id) === stored);
+				selectedServerId = exists
+					? stored
+					: String(servers[0].server_id);
+				if (!exists) persistence.setSelectedServerId(selectedServerId);
+			}
+			// The session history loads under the RESOLVED server scope (an
+			// earlier call here filtered against the fixture default server).
 			void loadSessionHistory();
+			// Refresh continuity (R2-3): restore the active session pointer.
+			try {
+				const raw = sessionStorage.getItem(SESSION_POINTER_KEY);
+				if (raw !== null) {
+					const pointer = JSON.parse(raw) as {
+						session_id: string;
+						server_id: string | null;
+					};
+					if (
+						typeof pointer.session_id === 'string' &&
+						pointer.session_id !== ''
+					) {
+						openActiveSession(pointer.session_id, pointer.server_id);
+					}
+				}
+			} catch {
+				/* corrupted pointer: ignored, honesty intact */
+			}
 			if (servers.length > 0) {
 				// Restore the stored choice ONLY when it still names an enrolled
 				// server; anything else (absent, deleted, stale, invalid) falls
@@ -927,6 +963,8 @@
 	let drawerSessionsOffset = $state(0);
 	/** Drawer page size (the reviewed bounded initial page). */
 	const SESSION_HISTORY_PAGE_LIMIT = 10;
+	/** The refresh-continuity pointer (opaque ids ONLY — never transcript). */
+	const SESSION_POINTER_KEY = 'mai-active-session';
 
 	/** One bounded agent-session page for the drawer (honest failure keeps
 	 * the previous rows and surfaces the status line — never a fake list). */
@@ -946,11 +984,13 @@
 				title: session.title ?? null,
 				service_tags: [],
 				status: session.status,
-				updated_at: session.updated_at
+				updated_at: session.updated_at,
+				tag_preview: session.tag_preview ?? null
 			}));
 			drawerSessionsTotal = page.total;
 			drawerSessionsHasMore = page.has_more;
 			drawerSessionsOffset = drawerSessions.length;
+			status = `Loaded ${drawerSessions.length}/${page.total} sessions.`;
 		} catch (error) {
 			status = `Session history unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
 		} finally {
@@ -980,7 +1020,8 @@
 					title: session.title ?? null,
 					service_tags: [],
 					status: session.status,
-					updated_at: session.updated_at
+					updated_at: session.updated_at,
+					tag_preview: session.tag_preview ?? null
 				}));
 			drawerSessions = [...drawerSessions, ...fresh];
 			drawerSessionsOffset += (page.items ?? []).length;
@@ -990,6 +1031,41 @@
 			status = `More sessions unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
 		} finally {
 			drawerSessionsLoadingMore = false;
+		}
+	}
+
+	/** The single-flight `before_seq` older-page fetch (D08 F-acceptance 1). */
+	async function loadOlderEntries(): Promise<void> {
+		if (!live || loadingOlderEntries || olderEntriesExhausted) return;
+		if (activeSessionId === null || sessionEntries.length === 0) return;
+		loadingOlderEntries = true;
+		try {
+			const oldestSeq = Number(sessionEntries[0].seq);
+			const page = await api.listAgentSessionEntries(activeSessionId, {
+				server_id: selectedServerId,
+				before_seq: oldestSeq,
+				limit: 50
+			});
+			const known = new Set(sessionEntries.map((entry) => entry.entry_id));
+			// The REST history page and the channel frames carry the SAME wire
+			// JSON; the two generated views differ only cosmetically, so the
+			// merge is a structural cast (verified by the seq/entry_id dedup).
+			const fresh = ((page.items ?? []) as unknown as ChannelEntry[]).filter(
+				(entry) => !known.has(entry.entry_id)
+			);
+			if (fresh.length === 0) {
+				olderEntriesExhausted = true;
+				return;
+			}
+			const merged = [...sessionEntries, ...fresh]
+				.sort((a, b) => a.seq - b.seq)
+				.slice(-400);
+			// Prepend position anchors in the panel (scroll-height delta).
+			sessionEntries = merged;
+		} catch (error) {
+			status = `Older entries unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			loadingOlderEntries = false;
 		}
 	}
 
@@ -1009,6 +1085,17 @@
 	let channelState = $state<SessionChannelConnectionState>('closed');
 	/** Committed entries delivered by the channel (bounded mirror). */
 	let channelEntries = $state<readonly number[]>([]);
+	/**
+	 * The visible session's bounded entry cache (D08): the channel mirror
+	 * (≤400, controller-evicted) MERGED with REST before_seq older pages —
+	 * always sorted by seq, deduplicated, evicted at the same cap.
+	 */
+	let sessionEntries = $state<ChannelEntry[]>([]);
+	/** The visible session's volatile streaming drafts (channel mirror). */
+	let sessionDrafts = $state<SessionStreamDraft[]>([]);
+	/** Single-flight guard + exhaustion flag for older-page loads. */
+	let loadingOlderEntries = $state(false);
+	let olderEntriesExhausted = $state(false);
 
 	/**
 	 * Open (or switch to) the visible session's channel: the previous
@@ -1021,13 +1108,30 @@
 		activeSessionId = sessionId;
 		channelState = 'connecting';
 		channelEntries = [];
+		// The refresh-continuity pointer (D08, R2-3): ONLY the opaque
+		// session/server ids — never transcript content.
+		try {
+			sessionStorage.setItem(
+				SESSION_POINTER_KEY,
+				JSON.stringify({ session_id: sessionId, server_id: serverId })
+			);
+		} catch {
+			/* storage unavailable: continuity degrades, honesty intact */
+		}
 		activeSessionChannel = createSessionChannelController({
 			sessionId,
 			serverId,
 			handlers: {
 				onConnectionState: (next) => (channelState = next),
-				onCommittedEntriesChanged: (entries) =>
-					(channelEntries = entries.map((entry) => entry.seq))
+				onCommittedEntriesChanged: (entries) => {
+					channelEntries = entries.map((entry) => entry.seq);
+					// The bounded cache mirror (D08): the controller already
+					// deduped + evicted to ≤400.
+					sessionEntries = [...entries];
+				},
+				onStreamDraftChanged: () => {
+					sessionDrafts = [...(activeSessionChannel?.streamDrafts() ?? [])];
+				}
 			}
 		});
 		activeSessionChannel.connect();
@@ -1042,6 +1146,14 @@
 		activeSessionId = null;
 		channelState = 'closed';
 		channelEntries = [];
+		sessionEntries = [];
+		sessionDrafts = [];
+		olderEntriesExhausted = false;
+		try {
+			sessionStorage.removeItem(SESSION_POINTER_KEY);
+		} catch {
+			/* storage unavailable */
+		}
 	}
 
 	/** Drawer rows: session-first first, then the dual-wired legacy rows. */
@@ -1052,6 +1164,20 @@
 			: (drawerSessionsTotal ?? 0) + (drawerConversationsTotal ?? 0)
 	);
 	const drawerRowsHasMore = $derived(drawerSessionsHasMore || drawerConversationsHasMore);
+	/** The visible session has older server-side entries (D08 Load older). */
+	const sessionHasOlder = $derived(
+		!olderEntriesExhausted &&
+			sessionEntries.length > 0 &&
+			Number(sessionEntries[0].seq) > 1
+	);
+	/** The visible session's newest run_state (server truth). */
+	const sessionRunState = $derived.by(() => {
+		for (let i = sessionEntries.length - 1; i >= 0; i -= 1) {
+			const payload = sessionEntries[i].payload;
+			if (payload.kind === 'run_state') return String(payload.state);
+		}
+		return null;
+	});
 
 	/**
 	 * The dock's explicit panel context — a server scope following the
@@ -1588,18 +1714,37 @@
 			</div>
 		{/if}
 		<div class="mai-desktop-shell__dock-body">
-			<ChatPanel
-				bind:this={dockChatPanel}
-				panel={dockPanel}
-				bind:dockCollapsed
-				onhistorychange={(rows, meta) => {
-					drawerConversations = rows;
-					drawerConversationsTotal = meta?.total;
-					drawerConversationsHasMore = meta?.hasMore ?? false;
-					drawerConversationsLoadingMore = meta?.loadingMore ?? false;
-				}}
-				onactivechange={(runId) => (drawerActiveRunId = runId)}
-			/>
+			{#if live && activeSessionId !== null}
+				<!-- D08: the session-first virtualized surface for THE visible
+				     session; the legacy dock stays mounted for sessions with
+				     no active session (COORD-D02-01 deletion lands at D09). -->
+				<SessionChatPanel
+					panel={dockPanel}
+					sessionId={activeSessionId}
+					serverId={selectedServerId}
+					entries={sessionEntries}
+					drafts={sessionDrafts}
+					channelState={channelState}
+					loadingOlder={loadingOlderEntries}
+					hasOlder={sessionHasOlder}
+					onloadolder={() => void loadOlderEntries()}
+					onsessionopened={(sessionId, serverId) =>
+						openActiveSession(sessionId, serverId)}
+				/>
+			{:else}
+				<ChatPanel
+					bind:this={dockChatPanel}
+					panel={dockPanel}
+					bind:dockCollapsed
+					onhistorychange={(rows, meta) => {
+						drawerConversations = rows;
+						drawerConversationsTotal = meta?.total;
+						drawerConversationsHasMore = meta?.hasMore ?? false;
+						drawerConversationsLoadingMore = meta?.loadingMore ?? false;
+					}}
+					onactivechange={(runId) => (drawerActiveRunId = runId)}
+				/>
+			{/if}
 		</div>
 	</section>
 

@@ -388,6 +388,86 @@ async def test_snapshot_then_committed_exactly_once(
 # ---------------------------------------------------------------------------
 
 
+async def test_snapshot_holds_hub_catchup_off_outbox(
+    app_fixture: FastAPI, migrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot path (hello without a cursor) must hold the hub off the
+    connection's outbox while the route reads/sends the snapshot.
+
+    Regression (D08): with ``replaying`` left False on the snapshot path, a
+    concurrent hub tick read the newest tail WITHOUT a cursor at limit 50
+    and pushed committed frames on top of the ≤30-entry snapshot — the
+    client cache held 50 entries (oldest 9951 for a 10k session) instead
+    of the initial-load cap of 30."""
+    from mai.api import agent_sessions as agent_sessions_api
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = client.post(
+            "/api/v1/agent-sessions",
+            json={
+                "server_id": str(SERVER_A),
+                "source": "interactive",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers={"origin": ORIGIN, "x-csrf-token": jar["mai_csrf"]},
+            cookies=jar,
+        )
+        session_id = uuid.UUID(created.json()["session_id"])
+        _, sessions = create_app_engine(migrated_url)
+        # More entries than the snapshot cap so a stray floor-0 catch-up
+        # page (newest 50) would DIFFER from the snapshot (newest 30).
+        for n in range(35):
+            entry = UserMessageEntry(
+                kind=EntryKind.USER_MESSAGE,
+                text=f"seed {n}",
+                client_request_id=uuid.UUID(int=n + 1),
+                source=SessionSourceKind.API,
+            )
+            await aappend_entry(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                kind=EntryKind.USER_MESSAGE,
+                payload=entry.model_dump(mode="json"),
+                run_id=None,
+                durable_source_id=f"seed-{n}",
+            )
+        hub = app_fixture.state.session_channel
+
+        real_reader = agent_sessions_api.aread_session_history
+        observed_replaying: list[bool] = []
+
+        async def spying_reader(*args: object, **kwargs: object):
+            for sink in hub._sessions.get(session_id, {}).values():
+                observed_replaying.append(sink.replaying)
+            return await real_reader(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            agent_sessions_api, "aread_session_history", spying_reader
+        )
+
+        with client.websocket_connect(
+            _channel_url(session_id, SERVER_A),
+            cookies=jar,
+            headers={"origin": ORIGIN},
+        ) as websocket:
+            websocket.send_text(_hello(jar["mai_csrf"]))
+            hello_ok = websocket.receive_json()
+            assert hello_ok["type"] == "hello_ok"
+            snapshot = websocket.receive_json()
+            assert snapshot["type"] == "snapshot"
+            # Initial-load cap: ≤30 entries even while 35 exist.
+            assert len(snapshot["entries"]) == 30
+            assert snapshot["latest_seq"] == 35
+            assert snapshot["has_older"] is True
+        # Every reader call the route made saw the outbox held off.
+        assert observed_replaying, "route never read the snapshot"
+        assert all(observed_replaying)
+        # The outbox shrank after the socket closed.
+        assert hub.sink_count(session_id) == 0
+
+
 async def test_csrf_and_frame_negatives(app_fixture: FastAPI) -> None:
     with TestClient(app_fixture) as client:
         jar = _login(client)
