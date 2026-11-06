@@ -1547,7 +1547,15 @@ def test_kill9_during_child_model_round_effect_exactly_once(
         if e["kind"] == "tool_result" and e["payload"]["call_id"] == "c-child"
     ]
     assert len(child_call_results) == 1
-    assert child_call_results[0]["payload"]["status"] == "executed"
+    # Two honest convergence branches (kill-timing dependent): a kill
+    # before the tool-step receipt commit re-runs the round fresh
+    # ("executed"); a kill after it repairs from the receipt with
+    # uncertain effect certainty ("unknown_effect"). Exactly-once
+    # (begin/effect == 1 above) holds in either branch.
+    assert child_call_results[0]["payload"]["status"] in (
+        "executed",
+        "unknown_effect",
+    )
     parent_entries = [e for e in entries if e["run_id"] == uuid.UUID(parent_run_id)]
     results = [
         e

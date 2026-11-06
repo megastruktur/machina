@@ -21,7 +21,7 @@ Proven here (BRIEF_D06 §B.1):
    run/entry with ``deduplicated=true`` (no second row of any kind).
 6. Control: delegates to the reviewed facade; the value-free envelope.
 7. OpenAPI: the new ``/api/v1/agent-sessions/**`` routes appear; the old
-   ``/api/v1/chat/**`` routes still exist (D09 removes them, not D06).
+   ``/api/v1/chat/**`` routes are absent (D09 removed them).
 """
 
 from __future__ import annotations
@@ -885,7 +885,7 @@ async def test_control_route_delegates_to_facade(
 
 
 # ---------------------------------------------------------------------------
-# 7. OpenAPI presence: new routes exist, old chat surface still exists
+# 7. OpenAPI presence: new routes exist, old chat surface absent
 # ---------------------------------------------------------------------------
 
 
@@ -898,5 +898,5 @@ async def test_openapi_route_presence(app_fixture: FastAPI) -> None:
     assert "/api/v1/agent-sessions/{session_id}/history" in paths
     assert "/api/v1/agent-sessions/{session_id}/turns" in paths
     assert "/api/v1/agent-sessions/{session_id}/control" in paths
-    # ADDITIVE (COORD-D02-01): the old chat surface stays until D09.
-    assert any(path.startswith("/api/v1/chat") for path in paths)
+    # D09: the old chat surface is GONE — no /api/v1/chat/** route remains.
+    assert not any(path.startswith("/api/v1/chat") for path in paths)

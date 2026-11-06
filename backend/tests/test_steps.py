@@ -1011,7 +1011,7 @@ class TestOutcomeTranslation:
         assert outcome["receipt"] == receipt
 
     def test_non_command_capability_statuses_translate_cleanly(self) -> None:
-        """docs.retrieve, service.http, and chat.read_session outputs resolve
+        """docs.retrieve, service.http, and session.read outputs resolve
         without falling into status_unresolved / outcome_unknown."""
         state_ok, reason_ok, _ = steps._translate_outcome(
             _dispatch_outcome(
@@ -1044,7 +1044,7 @@ class TestOutcomeTranslation:
 
         state_chat, reason_chat, _ = steps._translate_outcome(
             _dispatch_outcome(
-                capability_id="chat.read_session",
+                capability_id="session.read",
                 executor_ok=True,
                 output=BoundedOutput(
                     text=json.dumps({"session_id": str(uuid.uuid4()), "event_count": 3}),
