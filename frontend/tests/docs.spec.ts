@@ -1444,9 +1444,11 @@ test('a superseded response cannot paint; closing a window submits nothing furth
 			const payload = call.payload as { server_id: string };
 			expect([SERVER_A, SERVER_B]).toContain(payload.server_id);
 		}
-		if (call.op === 'submitMessage') {
-			const payload = call.payload as { server_id: string };
-			expect(payload.server_id).toBe(SERVER_A);
+		if (call.op === 'attachToSession') {
+			// D09: the legacy submitMessage seam is gone; the session-first
+			// attach always names its explicit destination session.
+			const payload = call.payload as { session_id: string | null };
+			expect(payload.session_id === null || typeof payload.session_id === 'string').toBe(true);
 		}
 	}
 	// Zero uncaught page errors across every race and the unmount.

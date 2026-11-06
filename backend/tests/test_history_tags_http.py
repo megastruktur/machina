@@ -4,11 +4,11 @@ Card ``history-tags`` W6B against the accepted tag store (``mai.tag_store``)
 and the C01/C08 boundary conventions: the global tag catalog CRUD (bounded
 deterministic pages, canonical idempotent create, the used/unused deletion
 policy, the reserved ``unclassified`` row), same-server job-run and
-canonical conversation tag assignments (idempotent, user-sourced, final-tag
+job-run tag assignments (idempotent, user-sourced, final-tag
 protected), scope-blind 404s (missing ≡ cross-server), the zero UUID
 General Consult scope on the CONVERSATION routes only, and the bounded
 ``tag_id`` list filters on the two list seams (covered in-depth in
-``test_jobs_http.py`` / ``test_conversation_http.py``).
+``test_jobs_http.py``.)
 
 Boundary discipline: every claim runs through the real ASGI app
 (``create_app`` + lifespan + middleware + handlers) against a real
@@ -39,7 +39,6 @@ from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from mai.agents.conversation_store import acreate_conversation
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
@@ -284,14 +283,8 @@ async def _truncate(url: str) -> None:
     try:
         async with engine.begin() as conn:
             for table in (
-                # v2 objective tables first: they reference job_runs and
-                # conversations (FK-safe order once the default runs v2).
-                "objective_checklists",
-                "objective_journal",
-                "objective_events",
-                "objective_runs",
-                "objective_servers",
-                "objectives",
+                # The obsolete chat/task/objective tables are dropped by
+                # migration 0015 — nothing to reset there anymore.
                 "job_resource_locks",
                 "job_schedule_fires",
                 "job_steps",
@@ -304,12 +297,7 @@ async def _truncate(url: str) -> None:
                 "profile_projection",
                 "admin_sessions",
                 "admin_credential",
-                "conversation_steering",
-                "conversation_runs",
-                "conversation_tags",
-                "conversation_messages",
-                "conversations",
-            ):
+                            ):
                 # Engine/service-owned tables are absent until first use.
                 present = await conn.execute(
                     text("SELECT to_regclass(:t) IS NOT NULL"),
@@ -394,14 +382,6 @@ async def _create_tag(
     return response.json()
 
 
-async def _seed_conversation(
-    app: FastAPI, server_id: uuid.UUID, *, title: str | None = None
-) -> uuid.UUID:
-    """One canonical conversation through the real store producer."""
-    conversation = await acreate_conversation(
-        app.state.session_factory, server_id=server_id, title=title
-    )
-    return conversation.conversation_id
 
 
 async def _submit_run(
@@ -672,12 +652,12 @@ class TestDeletionPolicy:
     async def test_used_tag_refuses_without_force(
         self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
     ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
+        run = await _submit_run(tags_app, jar, server_a)
         tag = await _create_tag(tags_app, jar, "kept-tag")
         assigned = await _assign(
             tags_app,
             jar,
-            f"/api/v1/chat/conversations/{conversation}/tags",
+            f"/api/v1/jobs/runs/{run}/tags",
             uuid.UUID(tag["tag_id"]),
             server_a,
         )
@@ -699,12 +679,12 @@ class TestDeletionPolicy:
     async def test_forced_delete_of_a_final_tag_requires_replacement(
         self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
     ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
+        run = await _submit_run(tags_app, jar, server_a)
         tag = await _create_tag(tags_app, jar, "sole-classification")
         tag_id = uuid.UUID(tag["tag_id"])
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
+        path = f"/api/v1/jobs/runs/{run}/tags"
 
-        # Make the tag the conversation's ONLY tag: replace the seed.
+        # Make the tag the run's ONLY tag: replace the seed.
         swap = await call_app(
             tags_app,
             "DELETE",
@@ -747,10 +727,10 @@ class TestDeletionPolicy:
     async def test_forced_delete_succeeds_when_entities_keep_other_tags(
         self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
     ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
+        run = await _submit_run(tags_app, jar, server_a)
         doomed = uuid.UUID((await _create_tag(tags_app, jar, "doomed"))["tag_id"])
         keeper = uuid.UUID((await _create_tag(tags_app, jar, "keeper"))["tag_id"])
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
+        path = f"/api/v1/jobs/runs/{run}/tags"
         for tag_id in (doomed, keeper):
             assigned = await _assign(tags_app, jar, path, tag_id, server_a)
             assert assigned.status == 204
@@ -773,12 +753,12 @@ class TestDeletionPolicy:
     async def test_replacement_must_exist_and_differ(
         self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
     ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
+        run = await _submit_run(tags_app, jar, server_a)
         doomed = uuid.UUID((await _create_tag(tags_app, jar, "doomed"))["tag_id"])
         assigned = await _assign(
             tags_app,
             jar,
-            f"/api/v1/chat/conversations/{conversation}/tags",
+            f"/api/v1/jobs/runs/{run}/tags",
             doomed,
             server_a,
         )
@@ -804,272 +784,6 @@ class TestDeletionPolicy:
         )
         assert unknown_replace.status == 404
         assert _error(unknown_replace)["code"] == "tag_not_found"
-
-
-# ---------------------------------------------------------------------------
-# canonical conversation assignments (same-server scope; zero UUID here only)
-# ---------------------------------------------------------------------------
-
-
-class TestConversationTags:
-    async def test_add_list_remove_cycle_records_the_user_actor(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        tag = await _create_tag(tags_app, jar, "reviewed")
-        tag_id = uuid.UUID(tag["tag_id"])
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
-
-        assigned = await _assign(tags_app, jar, path, tag_id, server_a)
-        assert assigned.status == 204
-        assert assigned.body == b""
-
-        listed = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}", cookies=jar
-        )
-        assert listed.status == 200, listed.body
-        body = listed.json()
-        assert body["conversation_id"] == str(conversation)
-        assert body["total"] == 2  # the reserved seed + the user assignment
-        row = next(item for item in body["items"] if item["tag_id"] == str(tag_id))
-        assert row["name"] == "reviewed"
-        assert row["assignment_source"] == "user"
-        # Bounded non-secret actor: the session token's SHA-256 hex.
-        assert len(row["assigned_by"]) == 64
-        assert all(c in "0123456789abcdef" for c in row["assigned_by"])
-
-        removed = await call_app(
-            tags_app,
-            "DELETE",
-            f"{path}/{tag_id}?server_id={server_a}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert removed.status == 204
-
-        relisted = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}", cookies=jar
-        )
-        assert relisted.json()["total"] == 1
-
-    async def test_assignment_is_idempotent(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        tag_id = uuid.UUID((await _create_tag(tags_app, jar, "once"))["tag_id"])
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
-        for _ in range(2):
-            assigned = await _assign(tags_app, jar, path, tag_id, server_a)
-            assert assigned.status == 204
-        listed = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}", cookies=jar
-        )
-        assert listed.json()["total"] == 2
-
-    async def test_assignment_of_unknown_tag_is_typed_404(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        response = await _assign(
-            tags_app,
-            jar,
-            f"/api/v1/chat/conversations/{conversation}/tags",
-            uuid.uuid4(),
-            server_a,
-        )
-        assert response.status == 404
-        assert _error(response)["code"] == "tag_not_found"
-
-    async def test_removal_of_an_absent_association_is_a_no_op(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        # A REAL catalog tag that was never assigned: absent association.
-        unassigned = uuid.UUID((await _create_tag(tags_app, jar, "never-bound"))["tag_id"])
-        response = await call_app(
-            tags_app,
-            "DELETE",
-            f"/api/v1/chat/conversations/{conversation}/tags"
-            f"/{unassigned}?server_id={server_a}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert response.status == 204  # absent association: idempotent no-op
-
-        # An UNKNOWN tag id is a typed 404, not a silent no-op.
-        unknown = await call_app(
-            tags_app,
-            "DELETE",
-            f"/api/v1/chat/conversations/{conversation}/tags"
-            f"/{uuid.uuid4()}?server_id={server_a}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert unknown.status == 404
-        assert _error(unknown)["code"] == "tag_not_found"
-
-    async def test_cross_server_is_scope_blind_and_indistinguishable(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        foreign = f"?server_id={SERVER_B}"
-
-        foreign_get = await call_app(
-            tags_app,
-            "GET",
-            f"/api/v1/chat/conversations/{conversation}/tags{foreign}",
-            cookies=jar,
-        )
-        assert foreign_get.status == 404
-
-        missing_get = await call_app(
-            tags_app,
-            "GET",
-            f"/api/v1/chat/conversations/{uuid.uuid4()}/tags{foreign}",
-            cookies=jar,
-        )
-        assert missing_get.status == 404
-        # Missing ≡ foreign: the SAME closed envelope, existence never leaks.
-        assert _scope_blind(foreign_get) == _scope_blind(missing_get)
-        assert _scope_blind(foreign_get)["code"] == "conversation_not_found"
-
-        tag_id = uuid.UUID((await _create_tag(tags_app, jar, "foreign"))["tag_id"])
-        foreign_assign = await _assign(
-            tags_app,
-            jar,
-            f"/api/v1/chat/conversations/{conversation}/tags",
-            tag_id,
-            SERVER_B,
-        )
-        assert foreign_assign.status == 404
-        assert _error(foreign_assign)["code"] == "conversation_not_found"
-
-        foreign_delete = await call_app(
-            tags_app,
-            "DELETE",
-            f"/api/v1/chat/conversations/{conversation}/tags/{tag_id}{foreign}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert foreign_delete.status == 404
-        assert _error(foreign_delete)["code"] == "conversation_not_found"
-
-    async def test_zero_uuid_general_consult_scope_supported_here_only(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(
-            tags_app, GENERAL_CONSULT, title="general consult"
-        )
-        tag_id = uuid.UUID((await _create_tag(tags_app, jar, "consult"))["tag_id"])
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
-
-        assigned = await _assign(tags_app, jar, path, tag_id, GENERAL_CONSULT)
-        assert assigned.status == 204
-
-        listed = await call_app(
-            tags_app, "GET", f"{path}?server_id={GENERAL_CONSULT}", cookies=jar
-        )
-        assert listed.status == 200, listed.body
-        assert listed.json()["total"] == 2
-
-        # Same entity, same routes, different scope: closed 404.
-        other_scope = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}", cookies=jar
-        )
-        assert other_scope.status == 404
-
-        removed = await call_app(
-            tags_app,
-            "DELETE",
-            f"{path}/{tag_id}?server_id={GENERAL_CONSULT}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert removed.status == 204
-
-        # The zero UUID is NOT a valid scope for the JOB routes.
-        run = await _submit_run(tags_app, jar, server_a)
-        job_zero = await call_app(
-            tags_app,
-            "GET",
-            f"/api/v1/jobs/runs/{run}/tags?server_id={GENERAL_CONSULT}",
-            cookies=jar,
-        )
-        assert job_zero.status == 404
-        assert _error(job_zero)["code"] == "not_found"
-
-    async def test_final_tag_removal_requires_replacement(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        replacement = uuid.UUID(
-            (await _create_tag(tags_app, jar, "archived"))["tag_id"]
-        )
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
-
-        refused = await call_app(
-            tags_app,
-            "DELETE",
-            f"{path}/{RESERVED}?server_id={server_a}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert refused.status == 409
-        assert _error(refused)["code"] == "last_tag"
-
-        swapped = await call_app(
-            tags_app,
-            "DELETE",
-            f"{path}/{RESERVED}?server_id={server_a}"
-            f"&replacement_tag_id={replacement}",
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert swapped.status == 204
-
-        listed = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}", cookies=jar
-        )
-        body = listed.json()
-        assert body["total"] == 1
-        assert body["items"][0]["tag_id"] == str(replacement)
-        assert body["items"][0]["assignment_source"] == "system"
-
-    async def test_tag_page_is_paginated(
-        self, tags_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
-    ) -> None:
-        conversation = await _seed_conversation(tags_app, server_a)
-        path = f"/api/v1/chat/conversations/{conversation}/tags"
-        for name in ("t-a", "t-b", "t-c"):
-            tag_id = uuid.UUID((await _create_tag(tags_app, jar, name))["tag_id"])
-            assigned = await _assign(tags_app, jar, path, tag_id, server_a)
-            assert assigned.status == 204
-
-        first = await call_app(
-            tags_app, "GET", f"{path}?server_id={server_a}&limit=2", cookies=jar
-        )
-        body = first.json()
-        assert body["total"] == 4
-        assert body["has_more"] is True
-        assert len(body["items"]) == 2
-
-        second = await call_app(
-            tags_app,
-            "GET",
-            f"{path}?server_id={server_a}&limit=2&offset=2",
-            cookies=jar,
-        )
-        body = second.json()
-        assert body["total"] == 4
-        assert body["has_more"] is False
-        assert len(body["items"]) == 2
-        names = [row["name"] for row in body["items"]]
-        assert names == sorted(names, key=str.lower)
-
-
-# ---------------------------------------------------------------------------
-# job-run assignments (the legacy chat history surface included)
-# ---------------------------------------------------------------------------
 
 
 class TestJobTags:
@@ -1133,7 +847,7 @@ class TestJobTags:
             f"{path}?server_id={GENERAL_CONSULT}",
             cookies=jar,
         )
-        assert general_consult.status == 404  # zero UUID: conversation-only
+        assert general_consult.status == 404  # zero UUID: never a job-run scope
 
         tag_id = uuid.UUID((await _create_tag(tags_app, jar, "run-tag"))["tag_id"])
         foreign_assign = await _assign(
@@ -1189,13 +903,10 @@ def test_openapi_declares_the_history_tag_surface() -> None:
     assert set(paths["/api/v1/tags/{tag_id}"]) == {"delete"}
     assert set(paths["/api/v1/jobs/runs/{run_id}/tags"]) == {"get", "post"}
     assert set(paths["/api/v1/jobs/runs/{run_id}/tags/{tag_id}"]) == {"delete"}
-    assert set(paths["/api/v1/chat/conversations/{conversation_id}/tags"]) == {
-        "get",
-        "post",
-    }
-    assert set(
-        paths["/api/v1/chat/conversations/{conversation_id}/tags/{tag_id}"]
-    ) == {"delete"}
+    # The conversation-tag routes died with the D09 coordinated deletion.
+    assert (
+        "/api/v1/chat/conversations/{conversation_id}/tags" not in paths
+    )
     component_names = set(schema["components"]["schemas"])
     assert {
         "TagCreateBody",
@@ -1204,5 +915,5 @@ def test_openapi_declares_the_history_tag_surface() -> None:
         "TagAssignBody",
         "EntityTagView",
         "JobTagsPage",
-        "ConversationTagsPage",
     } <= component_names
+    assert "ConversationTagsPage" not in component_names

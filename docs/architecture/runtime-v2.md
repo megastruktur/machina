@@ -1,5 +1,15 @@
 # Runtime v2 — action-first single-operator agent contracts (rv campaign)
 
+> **HISTORICAL (D09, 2026-11-06).** The runtime-v2 objective/journal machinery
+> this contract slice specified was REMOVED with the session-first cutover:
+> `agents/objective_store.py`, `agents/journal_store.py`, `agents/run_v2.py`
+> and migration `0015`'s dropped `objective_*` tables no longer exist. The
+> current agent authority is the session-first runtime
+> (`docs/architecture/contracts.md` §"D09 supersession"); the generic
+> dispatcher/approval/budget invariants this document preserved live on in
+> `agents/session_runner.py` + `agents/session_delegate.py`. The rest of this
+> document is kept as the frozen campaign record.
+
 - **Campaign:** `runtime-v2`, task `contracts` (branch `megastruktur/rv-contracts`)
 - **Status:** FROZEN contract slice. This document is the authoritative Runtime v2
   contract for the later campaign slices (`journal-store`, `action-runtime`,

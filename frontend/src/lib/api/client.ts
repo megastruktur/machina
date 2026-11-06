@@ -136,12 +136,6 @@ export type CancelBody = components['schemas']['CancelBody'];
 export type CancelView = components['schemas']['CancelView'];
 export type ChallengeBody = components['schemas']['ChallengeBody'];
 export type ChallengeOutcomeView = components['schemas']['ChallengeOutcomeView'];
-export type ChatCancelBody = components['schemas']['ChatCancelBody'];
-export type ChatCreated = components['schemas']['ChatCreated'];
-export type ChatPage = components['schemas']['ChatPage'];
-export type ChatRenameBody = components['schemas']['ChatRenameBody'];
-export type ChatSubmitBody = components['schemas']['ChatSubmitBody'];
-export type ConversationView = components['schemas']['ConversationView'];
 export type DecisionBody = components['schemas']['DecisionBody'];
 export type DiscoveryView = components['schemas']['DiscoveryView'];
 export type DocumentEditBody = components['schemas']['DocumentEditBody'];
@@ -193,92 +187,9 @@ export type MemoryRecallBody = components['schemas']['MemoryRecallBody'];
 export type MemoryReflectBody = components['schemas']['MemoryReflectBody'];
 export type MemoryRetainBody = components['schemas']['MemoryRetainBody'];
 
-/**
- * Canonical conversation surface (§3; 09-client-continuity). Types come
- * verbatim from the generated schema (`operations`/`components`); these
- * aliases only give the methods and their consumers stable names. The
- * list/detail/messages/events reads are the scoped paginated page family
- * (C01 rule 2: explicit `server_id`, never a hidden selection).
- */
-export type CanonicalConversationSummary = components['schemas']['ConversationSummary'];
-export type CanonicalConversationPage = components['schemas']['ConversationListPage'];
-export type CanonicalConversationDetail = components['schemas']['ConversationDetailView'];
-export type CanonicalTranscriptMessage = components['schemas']['TranscriptMessage'];
-export type CanonicalTranscriptPage = components['schemas']['ConversationTranscriptPage'];
-export type CanonicalConversationEvent = components['schemas']['ConversationEvent'];
-export type CanonicalEventsPage = components['schemas']['ConversationEventsPage'];
-export type CanonicalConversationTurn = components['schemas']['ConversationTurnSubmitRequest'];
-export type CanonicalTurnSubmitted = components['schemas']['ConversationTurnSubmitResponse'];
-export type TurnDisposition = components['schemas']['TurnDisposition'];
-export type ConversationSteerRequest = components['schemas']['ConversationSteerRequest'];
-export type ConversationSteerView = components['schemas']['ChatSteerView'];
 
-/**
- * Runtime v2 objective surface (§11; activity-ui). Types come verbatim
- * from the generated schema (`components`); these aliases only give the
- * methods and their consumers stable names. Every read is explicitly
- * server-scoped and every collection read is a bounded page envelope
- * (C01 rule 2; AGENTS.md §1; runtime-v2.md §5.2).
- */
-export type ObjectiveDetail = components['schemas']['ObjectiveDetail'];
-export type ObjectiveSummary = components['schemas']['ObjectiveSummary'];
-export type ObjectiveListPage = components['schemas']['ObjectiveListPage'];
-export type ObjectiveStatus = components['schemas']['ObjectiveStatus'];
-export type ObjectiveEvent = components['schemas']['ObjectiveEvent'];
-export type ObjectiveEventPage = components['schemas']['ObjectiveEventPage'];
-export type ObjectiveRunLink = components['schemas']['ObjectiveRunLink'];
-export type ObjectiveRunPage = components['schemas']['ObjectiveRunPage'];
-export type WorkJournal = components['schemas']['WorkJournal'];
-export type JournalActionApplied = components['schemas']['JournalActionApplied'];
-export type JournalReceiptRecorded = components['schemas']['JournalReceiptRecorded'];
-export type JournalUnknownNoted = components['schemas']['JournalUnknownNoted'];
-export type JournalChildLinked = components['schemas']['JournalChildLinked'];
-export type JournalVerificationRecorded = components['schemas']['JournalVerificationRecorded'];
-export type DrainStatusView = components['schemas']['DrainStatusView'];
-export type ConversationResumeBody = components['schemas']['ConversationResumeBody'];
-export type ConversationReconcileBody = components['schemas']['ConversationReconcileBody'];
-export type ConversationReconcileView = components['schemas']['ConversationReconcileView'];
-export type StepClassificationBody = components['schemas']['StepClassificationBody'];
-export type StepResolutionView = components['schemas']['StepResolutionView'];
 
-/** Query of the objective-ledger page: bounded page + the replay cursor. */
-export interface ObjectiveEventsQuery {
-	/** Page size; server default and maximum are producer-owned bounds. */
-	limit?: number;
-	/** Page offset within the ledger. */
-	offset?: number;
-	/** `objective.*` type filter (inside the family only). */
-	type?: string;
-	/** Replay cursor: strictly newer rows only (dedup by construction). */
-	afterSeq?: number;
-}
 
-/**
- * Task surface (§8; 15-task-api). Types come verbatim from the generated
- * schema (`operations`/`components`); these aliases only give the methods
- * and their consumers stable names. The header read is the compact §8 view
- * (no unbounded arrays); the items/constraints/evidence/revisions reads are
- * the scoped paginated page family (C01 rule 2: explicit `server_id`, never
- * a hidden selection; AGENTS.md §1 bounded pages with same-filter totals).
- */
-export type TaskView = components['schemas']['TaskView'];
-export type TaskCounts = components['schemas']['TaskCounts'];
-export type TaskOutcome = components['schemas']['TaskOutcome'];
-export type TaskStepsPage = components['schemas']['TaskStepsPage'];
-export type TaskStepView = components['schemas']['TaskStepView'];
-export type TaskConstraintsPage = components['schemas']['TaskConstraintsPage'];
-export type TaskConstraintView = components['schemas']['TaskConstraintView'];
-export type TaskEvidencePage = components['schemas']['TaskEvidencePage'];
-export type TaskEvidenceView = components['schemas']['TaskEvidenceView'];
-export type TaskRevisionsPage = components['schemas']['TaskRevisionsPage'];
-export type TaskRevisionView = components['schemas']['TaskRevisionView'];
-export type TaskMutationOutcome = components['schemas']['TaskMutationOutcome'];
-export type TaskCorrectionBody = components['schemas']['TaskCorrectionBody'];
-export type TaskDecisionBody = components['schemas']['TaskDecisionBody'];
-export type TaskPlanPatch = components['schemas']['TaskPlanPatch'];
-export type TaskPlanStep = components['schemas']['TaskPlanStep'];
-export type TaskStepOperation = components['schemas']['TaskStepOperation'];
-export type ConstraintProposal = components['schemas']['ConstraintProposal'];
 
 /**
  * History-tag management surface (history-tags W6B). Types come verbatim
@@ -292,8 +203,6 @@ export type TagCreateBody = components['schemas']['TagCreateBody'];
 export type TagAssignBody = components['schemas']['TagAssignBody'];
 export type EntityTagView = components['schemas']['EntityTagView'];
 export type JobTagsPage = components['schemas']['JobTagsPage'];
-export type ConversationTagsPage = components['schemas']['ConversationTagsPage'];
-export type EvidenceRef = components['schemas']['EvidenceRef'];
 
 // --- Session-first surface (D07; sfc_PLAN D07, BRIEF_D07 §2.1) -------------
 // The typed /api/v1/agent-sessions vocabulary. Payload/response shapes come
@@ -862,129 +771,6 @@ export interface MaiApiClient {
 	/** DELETE /api/v1/schedules/{schedule_id} — row + fires cascade. */
 	deleteSchedule(scheduleId: string): Promise<void>;
 
-	/** POST /api/v1/chat/messages — durable intent; idempotent on `run_id`. */
-	submitMessage(payload: ChatSubmitBody): Promise<ChatCreated>;
-	/**
-	 * GET /api/v1/chat/runs — explicitly scoped page when `serverId` is
-	 * passed (identical to the frozen behaviour); with `serverId` omitted
-	 * or `null` the page lists recent ROOT conversations across ALL
-	 * servers + General Consult (the Floating Chat History Selector).
-	 */
-	listConversations(serverId?: string | null, page?: PageQuery): Promise<ChatPage>;
-	/** GET /api/v1/chat/runs/{run_id} — replayed conversation record. */
-	readConversation(runId: string): Promise<ConversationView>;
-	/** PATCH /api/v1/chat/runs/{run_id} — rename a conversation. */
-	renameConversation(runId: string, payload: ChatRenameBody): Promise<ConversationView>;
-	/** POST /api/v1/chat/runs/{run_id}/cancel — explicit tree cancellation. */
-	cancelConversation(runId: string, payload: ChatCancelBody): Promise<CancelView>;
-
-	// Canonical conversation surface (§3; 09-client-continuity). Every method
-	// takes its explicit `server_id`; collection reads take `page?: PageQuery`
-	// (the events page takes its `afterSeq` cursor instead of an offset).
-	/**
-	 * GET /api/v1/chat/conversations?server_id=… — one bounded page of safe
-	 * canonical conversation metadata (deterministic `updated_at DESC,
-	 * conversation_id`; no transcript content ever rides a list page).
-	 */
-	listCanonicalConversations(
-		serverId: string,
-		page?: TaggedConversationsPageQuery
-	): Promise<CanonicalConversationPage>;
-	/** GET /api/v1/chat/conversations/{id}?server_id=… — safe header + gap honesty. */
-	getConversation(conversationId: string, serverId: string): Promise<CanonicalConversationDetail>;
-	/**
-	 * GET /api/v1/chat/conversations/{id}/messages?server_id=… — role-preserving
-	 * sanitized transcript page ordered `(sequence, message_id)`, same-filter total.
-	 */
-	listConversationMessages(
-		conversationId: string,
-		serverId: string,
-		page?: PageQuery
-	): Promise<CanonicalTranscriptPage>;
-	/**
-	 * GET /api/v1/chat/conversations/{id}/events?server_id=&after_seq=&limit= —
-	 * bounded cursor-exclusive metadata events plus the current-state block.
-	 */
-	listConversationEvents(
-		conversationId: string,
-		serverId: string,
-		query?: ConversationEventsQuery
-	): Promise<CanonicalEventsPage>;
-	/**
-	 * POST /api/v1/chat/conversations — create a conversation and admit its
-	 * first turn (idempotent on `client_request_id`: 201 created, 200
-	 * deduplicated; the body's `disposition` is the honest verdict).
-	 */
-	createConversation(payload: CanonicalConversationTurn): Promise<CanonicalTurnSubmitted>;
-	/**
-	 * POST /api/v1/chat/conversations/{id}/messages — one follow-up turn onto
-	 * an existing conversation (201 created / 200 deduplicated / 202
-	 * queued_followup while another run holds the writer lease).
-	 */
-	submitConversationMessage(
-		conversationId: string,
-		payload: CanonicalConversationTurn
-	): Promise<CanonicalTurnSubmitted>;
-	/**
-	 * POST /api/v1/chat/conversations/{id}/steer — one deterministic
-	 * steering/control request onto the active run (201 created, 200
-	 * deduplicated on retransmission).
-	 */
-	steerConversation(
-		conversationId: string,
-		payload: ConversationSteerRequest
-	): Promise<ConversationSteerView>;
-
-	// Runtime v2 objective surface (§11; activity-ui). Every method takes
-	// its explicit `server_id` (C01 rule 2); collection reads are bounded
-	// pages (AGENTS.md §1); mutations cross the session→origin→CSRF
-	// boundary exactly like every other method here.
-	/** GET /api/v1/objectives?server_id=… — bounded page of safe summaries. */
-	listObjectives(
-		serverId: string,
-		page?: PageQuery & { status?: ObjectiveStatus }
-	): Promise<ObjectiveListPage>;
-	/** GET /api/v1/objectives/{id}?server_id=… — scope-checked detail. */
-	readObjective(objectiveId: string, serverId: string): Promise<ObjectiveDetail>;
-	/** GET /api/v1/objectives/{id}/journal?server_id=… — derived work journal. */
-	readObjectiveJournal(objectiveId: string, serverId: string): Promise<WorkJournal>;
-	/** GET /api/v1/objectives/{id}/events?server_id=… — bounded ledger page. */
-	listObjectiveEvents(
-		objectiveId: string,
-		serverId: string,
-		query?: ObjectiveEventsQuery
-	): Promise<ObjectiveEventPage>;
-	/** GET /api/v1/objectives/{id}/runs?server_id=… — bounded run-bindings page. */
-	listObjectiveRuns(
-		objectiveId: string,
-		serverId: string,
-		page?: PageQuery
-	): Promise<ObjectiveRunPage>;
-	/** GET /api/v1/objectives/{id}/checklist?server_id=… — 404 when never maintained. */
-	readObjectiveChecklist(objectiveId: string, serverId: string): Promise<unknown>;
-	/** POST /api/v1/objectives/{id}/scope — operator scope edit under CAS. */
-	changeObjectiveScope(objectiveId: string, payload: components['schemas']['ObjectiveScopeBody']): Promise<ObjectiveDetail>;
-	/** GET /api/v1/objectives/drain-status — legacy vs v2 drain inventory. */
-	readDrainStatus(): Promise<DrainStatusView>;
-	/**
-	 * POST /api/v1/chat/conversations/{id}/resume — state-specific resume
-	 * (§9): parked rejections arrive as structured 409 envelopes; a settled
-	 * conversation's resume is the next submitted turn (201/200).
-	 */
-	resumeConversation(
-		conversationId: string,
-		payload: ConversationResumeBody
-	): Promise<CanonicalTurnSubmitted>;
-	/**
-	 * POST /api/v1/chat/conversations/{id}/reconcile — operator
-	 * classification of open unknown effects; the ONLY path that closes an
-	 * `outcome_unknown` row from the HTTP surface (§9).
-	 */
-	reconcileConversation(
-		conversationId: string,
-		payload: ConversationReconcileBody
-	): Promise<ConversationReconcileView>;
-
 	// History-tag management surface (W6B). The catalog is global; entity
 	// reads/mutations take their explicit `server_id` (C01 rule 2), and the
 	// zero-UUID General Consult scope is valid on the conversation routes
@@ -1006,21 +792,6 @@ export interface MaiApiClient {
 	assignRunTag(runId: string, payload: TagAssignBody): Promise<void>;
 	/** DELETE /api/v1/jobs/runs/{run_id}/tags/{tag_id}?server_id=… — removal. */
 	removeRunTag(runId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
-	/** GET /api/v1/chat/conversations/{id}/tags?server_id=… — bounded page. */
-	listConversationTags(
-		conversationId: string,
-		serverId: string,
-		page?: TagEntityTagsQuery
-	): Promise<ConversationTagsPage>;
-	/** POST /api/v1/chat/conversations/{id}/tags — idempotent user assignment. */
-	assignConversationTag(conversationId: string, payload: TagAssignBody): Promise<void>;
-	/** DELETE /api/v1/chat/conversations/{id}/tags/{tag_id}?server_id=… — removal. */
-	removeConversationTag(
-		conversationId: string,
-		tagId: string,
-		options: TagRemovalOptions
-	): Promise<void>;
-
 	// --- Session-first surface (D07; sfc_PLAN D07) ---------------------------
 	// The typed /api/v1/agent-sessions transport. Same boundary invariants as
 	// every other slice: C01 envelopes fail through `ApiError`, the session
@@ -1083,70 +854,6 @@ export interface MaiApiClient {
 		tagId: string,
 		options: TagRemovalOptions
 	): Promise<void>;
-
-	// Task surface (§8; 15-task-api). Every method takes its explicit
-	// `server_id` (C01 rule 2); every collection read is a bounded page
-	// (AGENTS.md §1); the two mutations are CAS + idempotency-key guarded
-	// (201 created / 200 deduplicated / structured 409 revision_conflict /
-	// scope-blind 404 task_not_found). Plan review (revisions), decisions
-	// and operation approvals (the C03 surface) stay three distinct routes.
-	/**
-	 * GET /api/v1/chat/conversations/{id}/task?server_id=… — the
-	 * conversation's ONE active task header (revision, phase, status,
-	 * counts); absent conversation, foreign scope and absent episode all
-	 * collapse into the SAME scope-blind 404.
-	 */
-	getConversationTask(conversationId: string, serverId: string): Promise<TaskView>;
-	/**
-	 * GET /api/v1/chat/tasks/{id}/items?server_id=… — deterministic
-	 * `(position, step_id)` plan-step page; superseded rows are recorded P3
-	 * history, served only when `includeSuperseded` asks for them.
-	 */
-	listTaskSteps(
-		taskId: string,
-		serverId: string,
-		query?: TaskCollectionQuery
-	): Promise<TaskStepsPage>;
-	/**
-	 * GET /api/v1/chat/tasks/{id}/constraints?server_id=… — deterministic
-	 * `(position, id)` constraint page carrying origin (user vs model) and
-	 * source-message anchors.
-	 */
-	listTaskConstraints(
-		taskId: string,
-		serverId: string,
-		query?: TaskCollectionQuery
-	): Promise<TaskConstraintsPage>;
-	/**
-	 * GET /api/v1/chat/tasks/{id}/evidence?server_id=… — provenance
-	 * identities only (kind + referenced record id + safe note); the route
-	 * never inlines the referenced content.
-	 */
-	listTaskEvidence(taskId: string, serverId: string, page?: PageQuery): Promise<TaskEvidencePage>;
-	/**
-	 * GET /api/v1/chat/tasks/{id}/revisions?server_id=… — the append-only
-	 * shared revision ledger, newest first (the P5 reconnect truth: UI and
-	 * agent tools re-derive the same server revision from it).
-	 */
-	listTaskRevisions(
-		taskId: string,
-		serverId: string,
-		page?: PageQuery
-	): Promise<TaskRevisionsPage>;
-	/**
-	 * POST /api/v1/chat/tasks/{id}/revisions — one authenticated user
-	 * correction/proposal: CAS `base_revision` (stale = structured 409
-	 * revision_conflict, never last-writer-wins), `idempotency_key`
-	 * (retransmission replays onto the SAME revision, 200 deduplicated),
-	 * mandatory source-linked `source_message_id`. Always author="user".
-	 */
-	submitTaskCorrection(taskId: string, payload: TaskCorrectionBody): Promise<TaskMutationOutcome>;
-	/**
-	 * POST /api/v1/chat/tasks/{id}/decisions — one explicit user decision:
-	 * advisory phase selection or pause/cancel (frozen transitions). Never
-	 * applies a plan delta, never authorizes or terminates an operation.
-	 */
-	submitTaskDecision(taskId: string, payload: TaskDecisionBody): Promise<TaskMutationOutcome>;
 
 	/** GET /api/v1/models/connections — value-free references. */
 	listConnections(): Promise<ModelConnectionList>;
@@ -1453,49 +1160,6 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 		deleteSchedule: (scheduleId) =>
 			requestVoid('DELETE', `/api/v1/schedules/${encodeURIComponent(scheduleId)}`, undefined, 204),
 
-		// Conversations (P06).
-		submitMessage: (payload) => requestJson<ChatCreated>('POST', '/api/v1/chat/messages', payload),
-		listConversations: (serverId, page) => {
-			const scope =
-				serverId === undefined || serverId === null
-					? ''
-					: `server_id=${encodeURIComponent(serverId)}`;
-			return requestJson<ChatPage>(
-				'GET',
-				`/api/v1/chat/runs?${scope}${pageSuffix(page)}`
-			);
-		},
-		readConversation: (runId) =>
-			requestJson<ConversationView>('GET', `/api/v1/chat/runs/${encodeURIComponent(runId)}`),
-		renameConversation: (runId, payload) =>
-			requestJson<ConversationView>(
-				'PATCH',
-				`/api/v1/chat/runs/${encodeURIComponent(runId)}`,
-				payload
-			),
-		cancelConversation: (runId, payload) =>
-			requestJson<CancelView>(
-				'POST',
-				`/api/v1/chat/runs/${encodeURIComponent(runId)}/cancel`,
-				payload
-			),
-
-		// Canonical conversation surface (§3; 09-client-continuity). Same
-		// transport as every other method: C01 envelope errors through
-		// `ApiError`, session cookies + CSRF double-submit on mutations.
-		// The W6B tag filter rides the reviewed endpoint; the repeated
-		// tag_id list is appended before the page suffix so both encodings
-		// stay honest.
-		listCanonicalConversations: (serverId, page) => {
-			const tagFilter = new URLSearchParams();
-			for (const tagId of page?.tagIds ?? []) tagFilter.append('tag_id', tagId);
-			if (page?.tagMatch !== undefined) tagFilter.set('tag_match', page.tagMatch);
-			const rendered = tagFilter.toString();
-			return requestJson<CanonicalConversationPage>(
-				'GET',
-				`/api/v1/chat/conversations?server_id=${encodeURIComponent(serverId)}${rendered === '' ? '' : `&${rendered}`}${pageSuffix(page)}`
-			);
-		},
 		// History-tag management surface (W6B). Same transport as every
 		// other method: C01 envelope errors through `ApiError`, session
 		// cookies + CSRF double-submit on mutations.
@@ -1548,30 +1212,6 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				204
 			);
 		},
-		listConversationTags: (conversationId, serverId, page) =>
-			requestJson<ConversationTagsPage>(
-				'GET',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
-		assignConversationTag: (conversationId, payload) =>
-			requestVoid(
-				'POST',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags`,
-				payload,
-				204
-			),
-		removeConversationTag: (conversationId, tagId, options) => {
-			const params = new URLSearchParams({ server_id: options.serverId });
-			if (options.replacementTagId !== undefined && options.replacementTagId !== '')
-				params.set('replacement_tag_id', options.replacementTagId);
-			return requestVoid(
-				'DELETE',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/tags/${encodeURIComponent(tagId)}?${params.toString()}`,
-				undefined,
-				204
-			);
-		},
-
 		// Session-first surface (D07). The D06 backend routes back every
 		// read/mutation below except the rename/tags trio, whose producer
 		// routes land with the session-API round that owns route additions —
@@ -1670,144 +1310,6 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				204
 			);
 		},
-		getConversation: (conversationId, serverId) =>
-			requestJson<CanonicalConversationDetail>(
-				'GET',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}?server_id=${encodeURIComponent(serverId)}`
-			),
-		listConversationMessages: (conversationId, serverId, page) =>
-			requestJson<CanonicalTranscriptPage>(
-				'GET',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
-		listConversationEvents: (conversationId, serverId, query) => {
-			const params = new URLSearchParams();
-			params.set('server_id', serverId);
-			if (query?.afterSeq !== undefined) params.set('after_seq', String(query.afterSeq));
-			if (query?.limit !== undefined) params.set('limit', String(query.limit));
-			return requestJson<CanonicalEventsPage>(
-				'GET',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/events?${params.toString()}`
-			);
-		},
-		createConversation: (payload) =>
-			requestJson<CanonicalTurnSubmitted>('POST', '/api/v1/chat/conversations', payload),
-		submitConversationMessage: (conversationId, payload) =>
-			requestJson<CanonicalTurnSubmitted>(
-				'POST',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
-				payload
-			),
-		steerConversation: (conversationId, payload) =>
-			requestJson<ConversationSteerView>(
-				'POST',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/steer`,
-				payload
-			),
-
-		// Runtime v2 objective surface (§11). Same transport as every other
-		// method: C01 envelope errors through `ApiError`, session cookies +
-		// CSRF double-submit on the scope mutation, bounded pages with the
-		// explicit server scope.
-		listObjectives: (serverId, page) => {
-			const params = new URLSearchParams({ server_id: serverId });
-			if (page?.limit !== undefined) params.set('limit', String(page.limit));
-			if (page?.offset !== undefined) params.set('offset', String(page.offset));
-			if (page?.status !== undefined) params.set('status', page.status);
-			return requestJson<ObjectiveListPage>('GET', `/api/v1/objectives?${params.toString()}`);
-		},
-		readObjective: (objectiveId, serverId) =>
-			requestJson<ObjectiveDetail>(
-				'GET',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}?server_id=${encodeURIComponent(serverId)}`
-			),
-		readObjectiveJournal: (objectiveId, serverId) =>
-			requestJson<WorkJournal>(
-				'GET',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/journal?server_id=${encodeURIComponent(serverId)}`
-			),
-		listObjectiveEvents: (objectiveId, serverId, query) => {
-			const params = new URLSearchParams({ server_id: serverId });
-			if (query?.limit !== undefined) params.set('limit', String(query.limit));
-			if (query?.offset !== undefined) params.set('offset', String(query.offset));
-			if (query?.type !== undefined && query.type !== '') params.set('type', query.type);
-			if (query?.afterSeq !== undefined) params.set('after_seq', String(query.afterSeq));
-			return requestJson<ObjectiveEventPage>(
-				'GET',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/events?${params.toString()}`
-			);
-		},
-		listObjectiveRuns: (objectiveId, serverId, page) =>
-			requestJson<ObjectiveRunPage>(
-				'GET',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/runs?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
-		readObjectiveChecklist: (objectiveId, serverId) =>
-			requestJson<unknown>(
-				'GET',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/checklist?server_id=${encodeURIComponent(serverId)}`
-			),
-		changeObjectiveScope: (objectiveId, payload) =>
-			requestJson<ObjectiveDetail>(
-				'POST',
-				`/api/v1/objectives/${encodeURIComponent(objectiveId)}/scope`,
-				payload
-			),
-		readDrainStatus: () => requestJson<DrainStatusView>('GET', '/api/v1/objectives/drain-status'),
-		resumeConversation: (conversationId, payload) =>
-			requestJson<CanonicalTurnSubmitted>(
-				'POST',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/resume`,
-				payload
-			),
-		reconcileConversation: (conversationId, payload) =>
-			requestJson<ConversationReconcileView>(
-				'POST',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/reconcile`,
-				payload
-			),
-
-		// Task surface (§8; 15-task-api). Same transport as every other
-		// method: session cookies, CSRF double-submit on the two mutations,
-		// C01 envelope errors through `ApiError`.
-		getConversationTask: (conversationId, serverId) =>
-			requestJson<TaskView>(
-				'GET',
-				`/api/v1/chat/conversations/${encodeURIComponent(conversationId)}/task?server_id=${encodeURIComponent(serverId)}`
-			),
-		listTaskSteps: (taskId, serverId, query) =>
-			requestJson<TaskStepsPage>(
-				'GET',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/items?server_id=${encodeURIComponent(serverId)}${taskQuerySuffix(query)}`
-			),
-		listTaskConstraints: (taskId, serverId, query) =>
-			requestJson<TaskConstraintsPage>(
-				'GET',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/constraints?server_id=${encodeURIComponent(serverId)}${taskQuerySuffix(query)}`
-			),
-		listTaskEvidence: (taskId, serverId, page) =>
-			requestJson<TaskEvidencePage>(
-				'GET',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/evidence?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
-		listTaskRevisions: (taskId, serverId, page) =>
-			requestJson<TaskRevisionsPage>(
-				'GET',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/revisions?server_id=${encodeURIComponent(serverId)}${pageSuffix(page)}`
-			),
-		submitTaskCorrection: (taskId, payload) =>
-			requestJson<TaskMutationOutcome>(
-				'POST',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/revisions`,
-				payload
-			),
-		submitTaskDecision: (taskId, payload) =>
-			requestJson<TaskMutationOutcome>(
-				'POST',
-				`/api/v1/chat/tasks/${encodeURIComponent(taskId)}/decisions`,
-				payload
-			),
-
 		// Model settings (P06); deletes carry `expected_revision` as a query param.
 		listConnections: () => requestJson<ModelConnectionList>('GET', '/api/v1/models/connections'),
 		readConnection: (name) =>

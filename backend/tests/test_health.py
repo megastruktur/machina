@@ -25,7 +25,6 @@ import socket
 from dataclasses import dataclass, field
 from typing import Any
 
-import anyio
 import pytest
 from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncEngine

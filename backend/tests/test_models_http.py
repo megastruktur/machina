@@ -449,12 +449,11 @@ def _drop_app_tables(url: str) -> None:
     import psycopg
 
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future
+        # revisions (the enumerated drop list went stale across
+        # migrations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -612,8 +611,9 @@ def test_surface_registers_under_the_shared_boundary() -> None:
     assert "ModelConnectionView" in components
     # Component-namespace discipline (the 06-chat-api lesson): this card's
     # wire types are all Model-prefixed, so no earlier component may be
-    # silently replaced by a same-named later one.
-    assert "ChatCancelBody" in components
+    # silently replaced by a same-named later one. (The ChatCancelBody
+    # witness died with the D09 chat deletion; RunSubmitBody is retained.)
+    assert "RunSubmitBody" in components
     assert "CancelBody" in components
 
 

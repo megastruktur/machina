@@ -29,7 +29,6 @@ import hashlib
 import json
 import logging
 import os
-import stat
 import subprocess
 import sys
 from io import StringIO

@@ -1,5 +1,14 @@
 # Agent-task continuity — conversation and task contracts (act addendum)
 
+> **HISTORICAL (D09, 2026-11-06).** The conversation/task contract modules this
+> addendum owns (`contracts/conversations.py`, `contracts/tasks.py`) and every
+> producer/UI surface below were removed with the session-first cutover
+> (migration `0015` dropped the schema). The session-first vocabulary —
+> `contracts/sessions.py` (`sessions`/`session_runs`/`session_entries`), the
+> cursor WebSocket channel and the `/api/v1/agent-sessions/**` routes — is the
+> sole conversation/history authority; see `contracts.md` §"D09 supersession".
+> This document is kept as the frozen act-campaign record.
+
 - **Card:** `01-contracts` (act campaign "agent-continuity", feature worktree
   `act-foundation`)
 - **Status:** ratified addendum. This document integrates the campaign

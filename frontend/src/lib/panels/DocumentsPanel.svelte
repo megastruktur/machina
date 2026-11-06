@@ -85,19 +85,13 @@
 
 	/**
 	 * Narrow the optional chat seam; incomplete ⇒ null (fail closed). The
-	 * D07 session-first path is `attachToSession`; the legacy
-	 * `submitMessage`-only bag keeps pre-session hosts working until D09
-	 * (COORD-D02-01).
+	 * session-first path is `attachToSession`; the legacy `submitMessage`
+	 * fallback died with the D09 coordinated deletion.
 	 */
 	function readChat(services: PanelServices): ChatSubmit | null {
 		const candidate = services.chat as Partial<ChatSubmit> | null | undefined;
 		if (typeof candidate !== 'object' || candidate === null) return null;
-		if (
-			typeof candidate.attachToSession !== 'function' &&
-			typeof candidate.submitMessage !== 'function'
-		) {
-			return null;
-		}
+		if (typeof candidate.attachToSession !== 'function') return null;
 		return candidate as ChatSubmit;
 	}
 
@@ -669,40 +663,22 @@
 		attachBusy = true;
 		attachProblem = null;
 		try {
-			if (typeof chat.attachToSession === 'function') {
-				// Session-first attach (D07): the explicit create-new action (no
-				// destination session selected) or the explicit destination
-				// session, then ONE idempotent turn admission. The SAME
-				// client_request_id rides every retry of this attach, so a
-				// duplicate click converges (200 deduplicated) instead of
-				// creating a second session/turn.
-				if (attachRequestId === null) attachRequestId = crypto.randomUUID();
-				const outcome = await chat.attachToSession({
-					session_id: null, // explicit create-new-session action
-					text: message,
-					model_profile: attachProfile.trim(),
-					client_request_id: attachRequestId
-				});
-				if (disposed) return;
-				attachDoneSessionId = outcome.session_id;
-				attachDoneRunId = outcome.run_id;
-			} else {
-				// Legacy one-shot conversation submit (kept until D09,
-				// COORD-D02-01): pre-session hosts and their specs.
-				const created = await chat.submitMessage?.({
-					run_id: crypto.randomUUID(),
-					server_id: serverScope,
-					message,
-					profile: attachProfile.trim(),
-					role: 'administrator',
-					mode: 'ask',
-					read_only: false
-				});
-				if (created === undefined) return;
-				if (disposed) return;
-				attachDoneSessionId = null;
-				attachDoneRunId = created.conversation.run_id;
-			}
+			// Session-first attach (D07): the explicit create-new action (no
+			// destination session selected) or the explicit destination
+			// session, then ONE idempotent turn admission. The SAME
+			// client_request_id rides every retry of this attach, so a
+			// duplicate click converges (200 deduplicated) instead of
+			// creating a second session/turn.
+			if (attachRequestId === null) attachRequestId = crypto.randomUUID();
+			const outcome = await chat.attachToSession({
+				session_id: null, // explicit create-new-session action
+				text: message,
+				model_profile: attachProfile.trim(),
+				client_request_id: attachRequestId
+			});
+			if (disposed) return;
+			attachDoneSessionId = outcome.session_id;
+			attachDoneRunId = outcome.run_id;
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';

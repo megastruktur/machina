@@ -100,6 +100,8 @@ REVISION_IDS = (
     "0011",
     "0012",
     "0013",
+    "0014",
+    "0015",
 )
 
 # The exact public application schema at the tip — nothing else, in
@@ -132,26 +134,14 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
-        "conversations",
-        "conversation_messages",
-        "conversation_runs",
-        "conversation_steering",
-        "agent_tasks",
-        "agent_task_steps",
-        "agent_task_constraints",
-        "agent_task_criteria",
-        "agent_task_evidence",
-        "agent_task_revisions",
-        "agent_task_completions",
         "tags",
         "job_tags",
-        "conversation_tags",
-        "objectives",
-        "objective_servers",
-        "objective_runs",
-        "objective_events",
-        "objective_checklists",
-        "objective_journal",
+        "sessions",
+        "session_entries",
+        "session_runs",
+        "session_admissions",
+        "session_provider_artifacts",
+        "session_tags",
     }
 )
 
@@ -200,33 +190,11 @@ def _database_url(url: str, database: str) -> str:
 
 def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
-        # Full app set at the chain tip — the 07-vector-schema,
-        # 08-adoption, 10-observation-schema tables, the conversation
-        # (0008) / agent-task (0009) domains AND the history-tag tables
-        # (0011) are listed here (chain-tip reconciliation, the
-        # ``test_agent_task_run`` DOMAIN_TABLES convention) so the
-        # zero-to-head fixture stays order-independent after sibling
-        # suites ran on the same shared database: a partial list would
-        # leave ``agent_tasks`` rows behind and break the next suite's
-        # conversation-domain DELETE teardown. The 0011 association tables
-        # drop before their job_runs/conversations/tags parents so the
-        # reset stays FK-safe on a schema-bearing database.
-        conn.execute(
-            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
-            "objective_events, objective_runs, objective_servers, "
-            "objectives, "
-            "notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_resource_locks, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_tags, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, conversation_steering, conversation_runs, "
-            "conversation_messages, conversation_tags, conversations, "
-            "agent_task_completions, agent_task_revisions, agent_task_evidence, "
-            "agent_task_criteria, agent_task_constraints, "
-            "agent_task_steps, agent_tasks, tags, alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future revisions
+        # (the enumerated list predates 0015's drops).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         # Engine-owned shadow state: a sibling suite's engine launch on
         # the SAME shared database leaves the ``dbos`` schema behind; the
@@ -835,7 +803,11 @@ def test_downgrade_upgrades_cleanly(
     try:
         os.environ["MAI_DATABASE_URL"] = down_url
         command.upgrade(_alembic_config(), "head")
-        command.downgrade(_alembic_config(), "0003")
+        # D09: 0015's honest no-op downgrade makes 0014 the reachable floor
+        # (downgrading past it fails at 0013 -> 0012: 0015 dropped
+        # objective_journal). The round trip proves the plumbing and that
+        # the job schema survives the reachable downgrade untouched.
+        command.downgrade(_alembic_config(), "0014")
         with psycopg.connect(down_url) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
             leftovers = conn.execute(
@@ -844,8 +816,8 @@ def test_downgrade_upgrades_cleanly(
                 WHERE table_schema = 'public' AND table_name LIKE 'job\\_%'
                 """
             ).fetchone()
-        assert version == ("0003",)
-        assert leftovers == (0,)
+        assert version == ("0014",)
+        assert leftovers == (6,)  # job_tags + runs/steps/events/schedules/schedule_fires
         command.upgrade(_alembic_config(), "head")
         with psycopg.connect(down_url) as conn:
             assert conn.execute(

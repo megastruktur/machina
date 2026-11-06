@@ -334,6 +334,7 @@ def _truncate(url: str) -> None:
             "job_steps",
             "job_events",
             "job_schedules",
+            "job_tags",
             "job_runs",
             "approvals",
             "admin_sessions",
@@ -1390,3 +1391,144 @@ class TestLifecycleSubmits:
                 (run_id,),
             ).fetchone()[0]
         assert list(grants) == ["app.install"]
+
+
+# ---------------------------------------------------------------------------
+# D09: runbook execution through the fresh non-interactive session
+# ---------------------------------------------------------------------------
+
+
+def _catalog_body(name: str = "fixture-runbook") -> dict[str, Any]:
+    return {
+        "name": name,
+        "category": "system",
+        "description": "fixture runbook for the session admission proof",
+        "instructions": {
+            "install": "install via compose up -d",
+            "update": "pull and restart",
+            "uninstall": "compose down",
+            "backup": "tar the volume",
+            "verify": "curl the health endpoint",
+        },
+    }
+
+
+class TestRunbookSessionExecution:
+    async def _seed_catalog(
+        self, apps_app: FastAPI, jar: dict[str, str]
+    ) -> str:
+        response = await call_app(
+            apps_app,
+            "POST",
+            "/api/v1/applications/catalog",
+            json_body=_catalog_body(),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert response.status == 200, response.body
+        return response.json()["runbook_id"]
+
+    async def test_execute_admits_a_fresh_runbook_session(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        runbook_id = await self._seed_catalog(apps_app, jar)
+        created = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(server_a)}/{runbook_id}/execute",
+            json_body={"action": "verify"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+        view = created.json()
+        session_id = uuid.UUID(view["session_id"])
+        run_id = uuid.UUID(view["run_id"])
+        assert view["state"] == "queued"
+        assert view["application_id"] == runbook_id
+
+        # The durable admission: one session row (source=runbook), one
+        # queued child run, one admission-ledger row, ONE user entry
+        # carrying the runbook_ref provenance.
+        with psycopg.connect(apps_app.state.database_url, row_factory=psycopg.rows.dict_row) as conn:
+            session_row = conn.execute(
+                "SELECT server_id, source, status, title FROM sessions "
+                "WHERE session_id = %s",
+                (session_id,),
+            ).fetchone()
+            assert session_row is not None
+            assert str(session_row["server_id"]) == str(server_a)
+            assert session_row["source"] == "runbook"
+            assert session_row["status"] == "idle"
+            assert session_row["title"].endswith(" — verify")
+            run_row = conn.execute(
+                "SELECT session_id, state, model_profile FROM session_runs "
+                "WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            assert run_row is not None
+            assert str(run_row["session_id"]) == str(session_id)
+            assert run_row["state"] == "queued"
+            assert run_row["model_profile"] == "default"
+            admission = conn.execute(
+                "SELECT source, run_id FROM session_admissions "
+                "WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            assert admission is not None
+            assert admission["source"] == "runbook"
+            entries = conn.execute(
+                "SELECT kind, payload, run_id, durable_source_id "
+                "FROM session_entries WHERE session_id = %s ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+            assert len(entries) == 2  # user_message + queued run_state
+            entry = entries[0]
+            assert entry["kind"] == "user_message"
+            assert str(entry["run_id"]) == str(run_id)
+            assert entry["durable_source_id"].startswith("turn:")
+            payload = (
+                entry["payload"]
+                if isinstance(entry["payload"], dict)
+                else json.loads(entry["payload"])
+            )
+            assert payload["source"] == "runbook"
+            assert payload["runbook_ref"]["runbook_id"] == runbook_id
+            assert "verify" in payload["text"]
+            assert entries[1]["kind"] == "run_state"
+
+    async def test_execute_persists_custom_instructions_on_catalog_staging(
+        self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID
+    ) -> None:
+        runbook_id = await self._seed_catalog(apps_app, jar)
+        created = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(server_a)}/{runbook_id}/execute",
+            json_body={
+                "action": "install",
+                "custom_instructions": "host path: /srv/fixture",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+        # The catalog-only target was STAGED as an installed=False entry so
+        # the operator notes survive (unchanged service-map semantics).
+        listed = await call_app(
+            apps_app,
+            "GET",
+            _apps_root(server_a),
+            headers={"origin": ORIGIN},
+            cookies=jar,
+        )
+        assert listed.status == 200
+        entries = listed.json()["applications"]
+        staged = [
+            item
+            for item in entries
+            if item["application_id"] == runbook_id
+        ]
+        assert len(staged) == 1
+        assert staged[0]["installed"] is False
+        assert staged[0]["custom_instructions"] == "host path: /srv/fixture"

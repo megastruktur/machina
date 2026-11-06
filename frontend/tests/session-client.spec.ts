@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { ApiError, createMaiApiClient } from '../src/lib/api/client';
+import type { ChannelEntry } from '../src/lib/chat/session_client';
 import {
 	createSessionChannelController,
 	sessionChannelUrl,
@@ -400,6 +401,51 @@ test.describe('channel controller (injectable socket factory)', () => {
 		controller.dispose();
 	});
 
+	test('externally merged older pages survive the next commit (R08 F1)', async () => {
+		const { sockets, socketFactory } = makeSockets();
+		const controller = createSessionChannelController({
+			sessionId: SESSION_A,
+			getCsrfToken: () => 'csrf-d09',
+			socketFactory
+		});
+		controller.connect();
+		await openChannel(sockets);
+
+		// The bounded initial snapshot carries the newest tail (21..30).
+		sockets[0].serverSend({
+			type: 'snapshot',
+			session_id: SESSION_A,
+			entries: Array.from({ length: 10 }, (_, i) => makeEntry(i + 21)),
+			latest_seq: 30,
+			has_more: true,
+			has_older: true,
+			byte_size: 1,
+			truncated_by_bytes: false
+		});
+		await delay(0);
+		expect(controller.entries().map((entry) => entry.seq)[0]).toBe(21);
+
+		// The shell's REST older page (1..20) feeds the SAME cache through
+		// the explicit merge seam — not a shell-local copy of the list.
+		controller.mergeExternalEntries(
+			Array.from({ length: 20 }, (_, i) => makeEntry(i + 1)) as unknown as readonly ChannelEntry[]
+		);
+		await delay(0);
+		expect(controller.entries().map((entry) => entry.seq)[0]).toBe(1);
+		expect(controller.highestCommittedSeq()).toBe(30);
+
+		// The next channel commit (31) MERGES: the loaded older pages are
+		// NOT discarded and the durable cursor advances.
+		sockets[0].serverSend({ type: 'committed', stream_id: 'stream-x', entry: makeEntry(31) });
+		await delay(0);
+		const seqs = controller.entries().map((entry) => entry.seq);
+		expect(seqs[0]).toBe(1);
+		expect(seqs[seqs.length - 1]).toBe(31);
+		expect(controller.highestCommittedSeq()).toBe(31);
+
+		controller.dispose();
+	});
+
 	test('snapshot/entries merge dedupes by seq; only committed delivery advances the cursor', async () => {
 		const { sockets, socketFactory } = makeSockets();
 		const controller = createSessionChannelController({
@@ -586,8 +632,6 @@ const CHANNEL_CLIENT = `${FRONTEND_ROOT}src/lib/chat/session_client.ts`;
 const TOKENS = `${FRONTEND_ROOT}src/lib/ui/tokens.css`;
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
-const LEGACY_RUN_ID = '22222222-2222-4222-8222-222222222222';
-const CONVERSATION_ID = '33333333-3333-4333-8333-333333333333';
 
 type BuiltBundle = {
 	output: Array<
@@ -666,8 +710,6 @@ import { createSessionChannelController } from ${JSON.stringify(CHANNEL_CLIENT)}
 import ${JSON.stringify(TOKENS)};
 
 const SESSION_ID = ${JSON.stringify(SESSION_ID)};
-const LEGACY_RUN_ID = ${JSON.stringify(LEGACY_RUN_ID)};
-const CONVERSATION_ID = ${JSON.stringify(CONVERSATION_ID)};
 const SERVER_A = ${JSON.stringify(SERVER_A)};
 
 const state = { calls: [], renameResult: null };
@@ -698,9 +740,6 @@ async function recordingFetch(url, init) {
   if (method === 'PATCH' && path === '/api/v1/agent-sessions/' + SESSION_ID) {
     return new Response(JSON.stringify({ session_id: SESSION_ID, server_id: SERVER_A, source: 'interactive', status: 'idle', title: body.title, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
-  if (method === 'PATCH' && path === '/api/v1/chat/runs/' + LEGACY_RUN_ID) {
-    return new Response(JSON.stringify({ run_id: LEGACY_RUN_ID, server_id: SERVER_A, title: body.title, state: 'succeeded', service_tags: [], tag_preview: { preview: [], total: 0 }, submitted_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
   if (method === 'GET' && path === '/api/v1/agent-sessions/' + SESSION_ID + '/tags') {
     const offset = Number(query.get('offset') ?? 0);
     const limit = Number(query.get('limit') ?? 10);
@@ -708,9 +747,6 @@ async function recordingFetch(url, init) {
     if (offset >= 10) all.push(tag(9)); // page two re-serves page one's last row
     const items = all.slice(offset, offset + limit);
     return new Response(JSON.stringify({ limit, offset, total: 12, has_more: offset + limit < 12, items }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  if (method === 'GET' && path === '/api/v1/chat/conversations/' + CONVERSATION_ID + '/tags') {
-    return new Response(JSON.stringify({ limit: 10, offset: Number(query.get('offset') ?? 0), total: 3, has_more: false, items: [tag(20), tag(21), tag(22)] }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   return new Response(JSON.stringify({ error: { code: 'not_found', message: 'no fixture route', request_id: 'req', fields: {} } }), { status: 404, headers: { 'content-type': 'application/json' } });
 }
@@ -727,15 +763,6 @@ const rows = [
     updated_at: '2026-01-01T00:00:00Z',
     service_tags: [],
     tag_preview: { preview: ['alpha', 'beta', 'gamma'], total: 12 }
-  },
-  {
-    run_id: LEGACY_RUN_ID,
-    conversation_id: CONVERSATION_ID,
-    server_id: SERVER_A,
-    title: 'Legacy run',
-    state: 'succeeded',
-    service_tags: ['web'],
-    tag_preview: { preview: ['ops'], total: 3 }
   }
 ];
 
@@ -743,15 +770,11 @@ const rows = [
 // session_id rows read the agent-session route, conversation rows the
 // conversation route, bare run rows the job route.
 function tagLoader(row) {
+  // D09: session_id rows read the agent-session route; the conversation/
+  // legacy-run branches died with the coordinated deletion.
   if (typeof row.session_id === 'string' && row.session_id !== '') {
     return async (offset, limit) => {
       const page = await client.listAgentSessionTags(row.session_id, row.server_id, { offset, limit });
-      return { limit: page.limit, offset: page.offset, total: page.total, has_more: page.has_more, items: (page.items ?? []).map((one) => ({ tag_id: one.tag_id, name: one.name })) };
-    };
-  }
-  if (typeof row.conversation_id === 'string' && row.conversation_id !== '') {
-    return async (offset, limit) => {
-      const page = await client.listConversationTags(row.conversation_id, row.server_id, { offset, limit });
       return { limit: page.limit, offset: page.offset, total: page.total, has_more: page.has_more, items: (page.items ?? []).map((one) => ({ tag_id: one.tag_id, name: one.name })) };
     };
   }
@@ -1002,7 +1025,7 @@ test.beforeEach(async ({ page }) => {
 	await page.mouse.move(200, 560);
 	await page.mouse.down();
 	await page.mouse.up();
-	await expect(page.getByTestId('drawer-history-item')).toHaveCount(2);
+	await expect(page.getByTestId('drawer-history-item')).toHaveCount(1);
 });
 
 test('session rename routes the PATCH to the agent-session identity', async ({ page }) => {
@@ -1028,24 +1051,6 @@ test('session rename routes the PATCH to the agent-session identity', async ({ p
 	expect(rename?.body).toEqual({ title: 'Renamed over session id' });
 	// CSRF double submit rides the mutation (C08 rule 2).
 	expect(rename?.csrf).toBe('csrf-d07');
-});
-
-test('legacy rows keep their reviewed route while dual-wired', async ({ page }) => {
-	const items = page.getByTestId('drawer-history-item');
-	await page.getByTestId('drawer-history-rename').nth(1).click();
-	const input = page.getByTestId('drawer-history-rename-input');
-	await input.fill('Renamed legacy');
-	await input.press('Enter');
-
-	await expect
-		.poll(() => page.evaluate(() => window.__maiSessionState?.renameResult ?? null))
-		.toBe('Renamed legacy');
-	const calls = await page.evaluate(() => window.__maiSessionState?.calls ?? []);
-	const rename = calls.find(
-		(call) => call.method === 'PATCH' && call.url.includes(`/api/v1/chat/runs/${LEGACY_RUN_ID}`)
-	);
-	expect(rename).toBeDefined();
-	expect(rename?.body).toEqual({ title: 'Renamed legacy' });
 });
 
 test('HistoryTags pagination rides the agent-session tag route, deduplicated and honest', async ({
@@ -1085,20 +1090,6 @@ test('HistoryTags pagination rides the agent-session tag route, deduplicated and
 	await expect(pop.getByTestId('drawer-history-row-tags-count')).toContainText('12 of 12');
 	// has_more flipped honestly: no third load control remains.
 	await expect(pop.getByTestId('drawer-history-row-tags-load-more')).toHaveCount(0);
-});
-
-test('the legacy row keeps the conversation tag route while dual-wired', async ({ page }) => {
-	const trigger = page.getByTestId('drawer-history-row-tags-trigger').nth(1);
-	await trigger.hover();
-	const pop = page.getByTestId('drawer-history-row-tags-pop').nth(1);
-	await expect(pop).toBeVisible();
-	await expect(pop.getByTestId('drawer-history-row-tags-row')).toHaveCount(3);
-	const calls = await page.evaluate(() => window.__maiSessionState?.calls ?? []);
-	const legacy = calls.find((call) =>
-		call.url.includes(`/api/v1/chat/conversations/${CONVERSATION_ID}/tags`)
-	);
-	expect(legacy).toBeDefined();
-	expect(legacy?.method).toBe('GET');
 });
 
 // ---------------------------------------------------------------------------

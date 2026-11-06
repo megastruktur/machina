@@ -416,12 +416,12 @@ def _alembic_config() -> Config:
 def _drop_app_tables(url: str) -> None:
     """Reset the fixture database to pre-bootstrap state."""
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future
+        # revisions (the enumerated drop list went stale across
+        # migrations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 

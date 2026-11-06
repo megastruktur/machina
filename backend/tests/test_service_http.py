@@ -34,7 +34,7 @@ import subprocess
 import sys
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -61,12 +61,10 @@ from mai.capabilities.service_http import (
     ServiceError,
     ServiceErrorCode,
     ServiceHttpCapability,
-    ServiceStatus,
     descriptor,
     endpoint_for,
     origin_of,
     request_from_payload,
-    result_document,
     validate_allowlist,
     validate_base_url,
     validate_service_path,

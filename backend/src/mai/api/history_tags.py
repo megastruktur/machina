@@ -1,12 +1,12 @@
-"""History-tag management HTTP surface (history-tags HT-W6B).
+"""History-tag management HTTP surface (history-tags HT-W6B; D09 cutover).
 
 The user-facing half of the 0011 mandatory-tag schema over the ONE
 storage owner (:mod:`mai.tag_store`): a global server-agnostic catalog
-plus same-server job/conversation associations. This surface is a thin
-typed seam — every write and read composes the accepted store functions,
-whose reserved-tag and final-tag semantics are preserved verbatim; no
-agent capability is duplicated here and no route re-queries around the
-store for domain truth.
+plus same-server job associations. This surface is a thin typed seam —
+every write and read composes the accepted store functions, whose
+reserved-tag and final-tag semantics are preserved verbatim; no agent
+capability is duplicated here and no route re-queries around the store
+for domain truth.
 
 - ``GET  /api/v1/tags`` — one bounded catalog page
   (``limit|offset|total|has_more``; AGENTS.md mandatory-pagination
@@ -22,30 +22,20 @@ store for domain truth.
   transaction. The reserved ``unclassified`` row can never be deleted.
 - ``GET/POST/DELETE /api/v1/jobs/runs/{run_id}/tags`` — the run's tag
   page and idempotent user assignments/removals inside an explicit
-  ``server_id`` scope. These routes serve durable job runs, which
-  INCLUDE the legacy chat history runs (legacy conversations are job
-  runs), so legacy chat history tagging happens here too. User-originated
-  assignments carry ``assignment_source='user'`` and a bounded
-  non-secret actor derived from the validated session (the session
-  token's SHA-256 — the C01 principal convention); user input is never
-  accepted as the actor.
-- ``GET/POST/DELETE /api/v1/chat/conversations/{conversation_id}/tags``
-  — the canonical conversation mirror with the same explicit-scope
-  discipline. ONLY these conversation routes accept the zero UUID
-  server scope (``00000000-...-0000`` — the General Consult sentinel
-  from the chat surface); job routes never treat it as a valid scope.
+  ``server_id`` scope. User-originated assignments carry
+  ``assignment_source='user'`` and a bounded non-secret actor derived
+  from the validated session (the session token's SHA-256 — the C01
+  principal convention); user input is never accepted as the actor.
+
+The conversation-tag half (``/api/v1/chat/conversations/{id}/tags``)
+was removed with the D09 coordinated deletion: the ``conversations`` /
+``conversation_tags`` tables are dropped by migration ``0015`` and
+session tagging (``/api/v1/agent-sessions/{id}/tags``) lives on the
+agent-session surface instead.
 
 Scope honesty (C8): a missing entity and another server's entity are
-the SAME closed 404 — for conversations the exact scope-blind
-``conversation_not_found`` envelope of the read surface, for runs the
-exact ``not_found`` envelope of the run surface; existence never leaks
-across scopes and there is no implicit inheritance between the job and
-conversation association domains.
-
-NOT in this slice: the legacy chat list (``GET /api/v1/chat/runs``) is
-NOT filtered by tags — its schema and consumers are owned by the chat
-surface; tag-based filtering there arrives with that surface's own
-slice. This module's docstring is the explicit record of that boundary.
+the SAME closed 404 — the exact ``not_found`` envelope of the run
+surface; existence never leaks across scopes.
 
 Boundary discipline (C01/C08): safe reads take the session layer only;
 every mutation runs session → origin → CSRF before any effect; every
@@ -78,7 +68,6 @@ from mai.api.auth import (
     _require_csrf,
     _require_session,
 )
-from mai.api.conversations import _conversation_not_found
 from mai.api.jobs import (
     _error,
     _not_found_run,
@@ -96,14 +85,11 @@ from mai.tag_store import (
     TagErrorCode,
     TagRow,
     TagStoreError,
-    aassign_conversation_tag,
     aassign_job_tag,
     acreate_tag,
     adelete_tag,
     alist_tags,
-    aremove_conversation_tag,
     aremove_job_tag,
-    atags_for_conversation,
     atags_for_job,
 )
 
@@ -245,36 +231,6 @@ class JobTagsPage(BaseModel):
         return self
 
 
-class ConversationTagsPage(BaseModel):
-    """One bounded tag page for one canonical conversation (same-server)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    conversation_id: uuid.UUID = Field(description="Owning conversation identity")
-    limit: int = Field(
-        ge=1,
-        le=MAX_PAGE_LIMIT,
-        description="Page size used for this slice (1..200)",
-    )
-    offset: int = Field(ge=0, description="Slice start within the collection")
-    total: int = Field(ge=0, description="Pre-slice count for this conversation")
-    has_more: bool = Field(
-        description="True when another page exists after this slice",
-    )
-    items: list[EntityTagView] = Field(
-        default_factory=list,
-        description="Association rows in deterministic name order",
-    )
-
-    @model_validator(mode="after")
-    def _page_is_consistent(self) -> "ConversationTagsPage":
-        if len(self.items) > self.limit:
-            raise ValueError("page carries more items than its limit")
-        if self.has_more != (self.offset + len(self.items) < self.total):
-            raise ValueError("has_more must equal offset + len(items) < total")
-        return self
-
-
 # ---------------------------------------------------------------------------
 # Rejections (classified store codes → the C01 envelope; scope-blind 404s)
 # ---------------------------------------------------------------------------
@@ -291,20 +247,14 @@ _TAG_ERROR_MAP: Final[Mapping[TagErrorCode, tuple[int, str]]] = {
 _UTC: Final = timezone.utc
 
 
-def _store_error_response(
-    request: Request, exc: TagStoreError, *, entity_scope: str
-) -> Response:
+def _store_error_response(request: Request, exc: TagStoreError) -> Response:
     """Map one classified store rejection onto the C01 envelope.
 
-    ``entity_scope`` selects the scope-blind 404 for
-    ``entity_not_found``: conversation routes reuse the read surface's
-    exact ``conversation_not_found`` envelope, job routes the run
-    surface's exact ``not_found`` envelope — missing and cross-server
-    stay indistinguishable on both.
+    ``entity_not_found`` reuses the run surface's exact scope-blind
+    ``not_found`` envelope — missing and cross-server stay
+    indistinguishable.
     """
     if exc.code is TagErrorCode.ENTITY_NOT_FOUND:
-        if entity_scope == "conversation":
-            return _conversation_not_found(request)
         return _not_found_run(request)
     if exc.code is TagErrorCode.VALIDATION:
         return _validation_error(request, exc.field or "request", str(exc))
@@ -436,7 +386,7 @@ async def create_tag(request: Request, payload: TagCreateBody) -> TagView | Resp
             factory, name=payload.name, description=payload.description
         )
     except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="catalog")
+        return _store_error_response(request, exc)
     return _tag_view(row)
 
 
@@ -501,7 +451,7 @@ async def delete_tag(
             replacement_tag_id=replacement_tag_id,
         )
     except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="catalog")
+        return _store_error_response(request, exc)
     return Response(status_code=HTTP_204_NO_CONTENT)
 
 
@@ -552,7 +502,7 @@ async def list_job_tags(
             offset=offset,
         )
     except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="job")
+        return _store_error_response(request, exc)
     return JobTagsPage(
         run_id=str(run_id),
         limit=limit,
@@ -612,7 +562,7 @@ async def assign_job_tag(
             assignment_source=_USER_ASSIGNMENT_SOURCE,
         )
     except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="job")
+        return _store_error_response(request, exc)
     return Response(status_code=HTTP_204_NO_CONTENT)
 
 
@@ -675,184 +625,7 @@ async def remove_job_tag(
             replacement_tag_id=replacement_tag_id,
         )
     except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="job")
-    return Response(status_code=HTTP_204_NO_CONTENT)
-
-
-# --- canonical conversation associations --------------------------------------
-
-
-@router.get(
-    "/chat/conversations/{conversation_id}/tags",
-    status_code=HTTP_200_OK,
-    response_model=ConversationTagsPage,
-    summary="One bounded tag page for one canonical conversation",
-    responses={
-        HTTP_401_UNAUTHORIZED: {
-            "model": ErrorEnvelope,
-            "description": "No valid session",
-        },
-        HTTP_404_NOT_FOUND: {
-            "model": ErrorEnvelope,
-            "description": "No conversation in the requesting server scope",
-        },
-        HTTP_422_UNPROCESSABLE_CONTENT: {
-            "model": ErrorEnvelope,
-            "description": "Query parameters failed validation",
-        },
-    },
-)
-async def list_conversation_tags(
-    request: Request,
-    conversation_id: uuid.UUID,
-    server_id: Annotated[uuid.UUID, _SERVER_ID_QUERY],
-    limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
-    offset: int = Query(default=0, ge=0),
-) -> ConversationTagsPage | Response:
-    """The conversation's bounded tag page (safe read; session only).
-
-    The store resolves the conversation inside the requesting
-    ``server_id`` scope; a missing and a cross-server conversation are
-    the SAME scope-blind 404 envelope as the conversation read surface.
-    The zero UUID server scope (General Consult) is valid HERE ONLY.
-    """
-    await _require_session(request)
-    factory = _sessions(request)
-    try:
-        items, total = await atags_for_conversation(
-            factory,
-            conversation_id,
-            server_id=server_id,
-            limit=limit,
-            offset=offset,
-        )
-    except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="conversation")
-    return ConversationTagsPage(
-        conversation_id=conversation_id,
-        limit=limit,
-        offset=offset,
-        total=total,
-        has_more=compute_has_more(offset, len(items), total),
-        items=[_entity_tag_view(row) for row in items],
-    )
-
-
-@router.post(
-    "/chat/conversations/{conversation_id}/tags",
-    status_code=HTTP_204_NO_CONTENT,
-    summary="Assign one tag to a conversation (idempotent, user-sourced)",
-    responses={
-        HTTP_401_UNAUTHORIZED: {
-            "model": ErrorEnvelope,
-            "description": "No valid session",
-        },
-        HTTP_403_FORBIDDEN: {
-            "model": ErrorEnvelope,
-            "description": "Origin not allowed or CSRF token rejected",
-        },
-        HTTP_404_NOT_FOUND: {
-            "model": ErrorEnvelope,
-            "description": "No conversation or no tag in the requesting scope",
-        },
-        HTTP_422_UNPROCESSABLE_CONTENT: {
-            "model": ErrorEnvelope,
-            "description": "Request body failed validation",
-        },
-    },
-)
-async def assign_conversation_tag(
-    request: Request,
-    conversation_id: uuid.UUID,
-    payload: TagAssignBody,
-) -> Response:
-    """Assign one catalog tag to one conversation (re-assignment: no-op).
-
-    Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-    The assignment is user-originated: ``assignment_source='user'`` and
-    the bounded non-secret actor is the validated session's token hash —
-    never client-supplied input. The zero UUID server scope (General
-    Consult) is valid HERE ONLY.
-    """
-    _store, token = await _require_session(request)  # layer 1
-    _require_allowed_origin(request)  # layer 2
-    _require_csrf(request)  # layer 3
-    factory = _sessions(request)
-    try:
-        await aassign_conversation_tag(
-            factory,
-            conversation_id,
-            payload.tag_id,
-            server_id=payload.server_id,
-            assigned_by=hash_token(token),
-            assignment_source=_USER_ASSIGNMENT_SOURCE,
-        )
-    except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="conversation")
-    return Response(status_code=HTTP_204_NO_CONTENT)
-
-
-@router.delete(
-    "/chat/conversations/{conversation_id}/tags/{tag_id}",
-    status_code=HTTP_204_NO_CONTENT,
-    summary="Remove one conversation tag (idempotent, final-tag protected)",
-    responses={
-        HTTP_401_UNAUTHORIZED: {
-            "model": ErrorEnvelope,
-            "description": "No valid session",
-        },
-        HTTP_403_FORBIDDEN: {
-            "model": ErrorEnvelope,
-            "description": "Origin not allowed or CSRF token rejected",
-        },
-        HTTP_404_NOT_FOUND: {
-            "model": ErrorEnvelope,
-            "description": "No conversation or no tag in the requesting scope",
-        },
-        HTTP_409_CONFLICT: {
-            "model": ErrorEnvelope,
-            "description": "The conversation's final tag cannot be removed "
-            "without a replacement",
-        },
-        HTTP_422_UNPROCESSABLE_CONTENT: {
-            "model": ErrorEnvelope,
-            "description": "Query parameters failed validation",
-        },
-    },
-)
-async def remove_conversation_tag(
-    request: Request,
-    conversation_id: uuid.UUID,
-    tag_id: uuid.UUID,
-    server_id: Annotated[uuid.UUID, _SERVER_ID_QUERY],
-    replacement_tag_id: uuid.UUID | None = Query(
-        default=None,
-        description="Re-classification target committed in the same "
-        "transaction when this is the conversation's final tag",
-    ),
-) -> Response:
-    """Remove one conversation-tag association (absent removal: no-op).
-
-    Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-    Removing the conversation's final ordinary tag requires
-    ``replacement_tag_id``: removal and replacement commit together, so
-    the mandatory-tag invariant never drops below one tag. The zero UUID
-    server scope (General Consult) is valid HERE ONLY.
-    """
-    _store, _token = await _require_session(request)  # layer 1
-    _require_allowed_origin(request)  # layer 2
-    _require_csrf(request)  # layer 3
-    factory = _sessions(request)
-    try:
-        await aremove_conversation_tag(
-            factory,
-            conversation_id,
-            tag_id,
-            server_id=server_id,
-            replacement_tag_id=replacement_tag_id,
-        )
-    except TagStoreError as exc:
-        return _store_error_response(request, exc, entity_scope="conversation")
+        return _store_error_response(request, exc)
     return Response(status_code=HTTP_204_NO_CONTENT)
 
 

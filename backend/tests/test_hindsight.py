@@ -23,7 +23,6 @@ offline and records that limitation in the evidence README.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -53,7 +52,6 @@ from mai.memory.hindsight import (
     MAX_ITEMS,
     MAX_QUERY_CHARS,
     MAX_RESULTS,
-    MAX_TEXT_CHARS,
     MemoryAdapterError,
     MemoryErrorCode,
     MemoryStatus,

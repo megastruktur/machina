@@ -13,8 +13,8 @@
  *    outbox + reconcile, run-evidence generation and the bounded
  *    deep-research pass;
  *  - the composition seam for the ONE reviewed conversation surface
- *    (`06-chat-api` via the `06-web-chat` entry): attaching an excerpt to
- *    chat is a real, durable `submitMessage` intent whose message carries
+ *    (the session-first attach seam, D07): attaching an excerpt to
+ *    a session is a real, durable turn admission whose message carries
  *    the excerpt under its citation — no invented endpoint, no client-side
  *    excerpt store.
  *
@@ -28,13 +28,12 @@
  *
  * No module-level mutable state; safe to evaluate per SSR request (ADR §5
  * rule 4). Composition passes `docsServices({ …clientDocsMethods },
- * { submitMessage })` — the composed client grows the docs transport
+ * { attachToSession })` — the composed client grows the docs transport
  * methods; instances still share nothing.
  */
 
 import type { components } from '../../api/schema.generated.js';
 import type { PanelEntryInput } from '../registry.js';
-import type { ChatCreated, ChatSubmitBody } from './06-web-chat.js';
 
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
 export const DOCS_PANEL_KIND = 'documents';
@@ -46,8 +45,7 @@ export const DOCS_PANEL_KIND = 'documents';
 /** Generated wire shape: one canonical collection (`docs`/`runbooks`). */
 export type DocNamespace = components['schemas']['DocumentNamespace'];
 /** Generated wire shape: one C07 rule 5 verification vocabulary value. */
-export type VerificationStatus =
-    components['schemas']['mai__knowledge__documents__VerificationStatus'];
+export type VerificationStatus = components['schemas']['VerificationStatus'];
 /** Generated wire shape: one scope's reindex-reconcile request. */
 export type ReconcileBody = components['schemas']['ReconcileBody'];
 /** Generated wire shape: one revision-checked full-content edit. */
@@ -338,16 +336,13 @@ export interface DocsAttachTurn {
 }
 
 /**
- * The chat seam the documents panel consumes. Session-first attach is the
- * D07 path (`attachToSession`); the legacy one-shot conversation submit
- * stays as the OPTIONAL fallback for pre-session hosts until D09 deletes it
- * (COORD-D02-01). A bag with neither fails closed.
+ * The chat seam the documents panel consumes: the session-first attach
+ * (D07). The legacy one-shot `submitMessage` fallback died with the D09
+ * coordinated deletion; a bag without `attachToSession` fails closed.
  */
 export interface DocsChatApi {
 	/** Create-or-reuse the explicit session, then admit the excerpt turn. */
 	attachToSession(payload: DocsAttachTurn): Promise<SessionAttachOutcome>;
-	/** POST /api/v1/chat/messages — legacy intent; idempotent on `run_id`. */
-	submitMessage?(payload: ChatSubmitBody): Promise<ChatCreated>;
 }
 
 /** Back-compat alias (the pre-D07 seam name); prefer `DocsChatApi`. */
@@ -393,10 +388,10 @@ export interface DocsApi {
 export interface DocsServices {
 	readonly api: DocsApi;
 	/**
-	 * The chat seam for "attach excerpt to chat" — session-first
-	 * `attachToSession` (D07) with the legacy `submitMessage` fallback until
-	 * D09. `null` (or a bag with neither method) fails closed: the panel
-	 * renders the honest unavailable note and never fakes a submission.
+	 * The chat seam for "attach excerpt to chat" — the session-first
+	 * `attachToSession` (D07). `null` (or a bag without the method) fails
+	 * closed: the panel renders the honest unavailable note and never fakes
+	 * a submission.
 	 */
 	readonly chat: DocsChatApi | null;
 }

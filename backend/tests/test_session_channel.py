@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -48,7 +47,7 @@ from mai.api.app import create_app
 from mai.api.auth import SESSION_COOKIE
 from mai.contracts.sessions import EntryKind, SessionSourceKind, UserMessageEntry
 from mai.database import create_app_engine
-from mai.session_store import aappend_entry, acreate_session
+from mai.session_store import aappend_entry
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
@@ -554,7 +553,6 @@ async def test_csrf_and_frame_negatives(app_fixture: FastAPI) -> None:
 async def test_ten_thousand_entry_resume_is_bounded(
     app_fixture: FastAPI, migrated_url: str
 ) -> None:
-    import sqlalchemy
     from sqlalchemy import text as sql_text
 
     with TestClient(app_fixture) as client:

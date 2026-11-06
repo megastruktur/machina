@@ -31,7 +31,6 @@ databases (``mai_fxt_07_prior``, ``mai_fxt_07_down``).
 from __future__ import annotations
 
 import os
-import re
 import uuid
 
 import psycopg
@@ -56,9 +55,25 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # migration-chain owner): revision 0007 appends the bounded observation +
 # notification persistence; the tip constants are advanced here so this
 # file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001",
+    "0002",
+    "0003",
+    "0004",
+    "0005",
+    "0006",
+    "0007",
+    "0008",
+    "0009",
+    "0010",
+    "0011",
+    "0012",
+    "0013",
+    "0014",
+    "0015",
+)
 
-# The exact public application schema after 0007 — the 0005 set plus the
+# The exact public application schema at the 0015 head — the 0005 set plus the
 # two application catalogue tables (08-adoption) and the three observation
 # tables (10-observation-schema); nothing else, in particular no second
 # vector store, no engine-shadowing tables, no ``dbos`` schema before
@@ -76,6 +91,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_events",
         "job_schedules",
         "job_schedule_fires",
+        "job_tags",
+        "tags",
         "knowledge_documents",
         "knowledge_doc_chunks",
         "application_projection",
@@ -83,6 +100,12 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "sessions",
+        "session_entries",
+        "session_runs",
+        "session_admissions",
+        "session_provider_artifacts",
+        "session_tags",
     }
 )
 
@@ -130,16 +153,12 @@ def _drop_app_tables(url: str) -> None:
         # here together with the 10-observation-schema tables and sequence
         # (chain-tip reconciliation) so the zero-to-head fixture stays
         # order-independent after revision 0007.
-        conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): the enumerated drop list went stale
+        # across migrations — the schema drop is FK-safe and immune to
+        # future revisions (same discipline as the adoption suite).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -765,7 +784,13 @@ def test_upgrade_from_prior_head_preserves_prior_rows(
 def test_downgrade_upgrades_cleanly(
     migrated_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Down/upgrade round trip of the new revision on an isolated database."""
+    """Down/upgrade round trip on an isolated database.
+
+    D09: revision 0015's honest no-op downgrade makes the chain below 0014
+    unreachable from head, so the reachable floor is 0014. The round trip
+    proves the alembic plumbing and that the 0005-era knowledge relations
+    SURVIVE the reachable downgrade untouched.
+    """
     down_db = "mai_fxt_07_down"
     down_url = _database_url(migrated_url, down_db)
     with psycopg.connect(
@@ -789,7 +814,7 @@ def test_downgrade_upgrades_cleanly(
                 (uuid.UUID(DOC_SHARED), SHA),
             )
             conn.commit()
-        command.downgrade(_alembic_config(), "0004")
+        command.downgrade(_alembic_config(), "0014")
         with psycopg.connect(down_url) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
             leftovers = conn.execute(
@@ -802,8 +827,8 @@ def test_downgrade_upgrades_cleanly(
                 "SELECT count(*) FROM information_schema.tables "
                 "WHERE table_schema = 'public' AND table_name = 'job_runs'"
             ).fetchone()
-        assert version == ("0004",)
-        assert leftovers == (0,)
+        assert version == ("0014",)
+        assert leftovers == (2,)  # documents + doc_chunks survive the reachable floor
         assert prior == (1,)  # the P05 schema is untouched by our downgrade
         command.upgrade(_alembic_config(), "head")
         with psycopg.connect(down_url) as conn:
@@ -812,13 +837,12 @@ def test_downgrade_upgrades_cleanly(
             ).fetchone() == (REVISION_IDS[-1],)
             roundtrip = conn.execute(
                 """
-                SELECT count(*) FROM knowledge_documents d
-                JOIN knowledge_doc_chunks c ON c.document_key = d.document_key
-                WHERE d.doc_id = %s
+                SELECT count(*) FROM knowledge_documents
+                WHERE doc_id = %s
                 """,
                 (uuid.UUID(DOC_SHARED),),
             ).fetchone()
-        assert roundtrip == (0,)  # downgrade removed the data relation cleanly
+        assert roundtrip == (1,)  # the reachable downgrade preserved the row
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)

@@ -146,16 +146,27 @@ DO $reset$
 DECLARE
     changed integer := 1;
 BEGIN
-    -- Seed: run ids the obsolete identity/journal tables reference.
+    -- Seed: run ids the obsolete identity/journal tables reference. The
+    -- obsolete tables may already be gone (revision 0015 drops them; a
+    -- downgrade-to-0013 + re-upgrade cycle after that must still work),
+    -- so each reference is guarded by its own existence check. On the
+    -- real 0013 -> 0014 path every table exists and the guards are no-ops.
     CREATE TEMP TABLE _sfc_agent_run_ids (run_id uuid PRIMARY KEY)
         ON COMMIT DROP;
-    INSERT INTO _sfc_agent_run_ids (run_id)
-        SELECT run_id FROM public.conversation_runs
-        UNION
-        SELECT run_id FROM public.objective_runs
-        UNION
-        SELECT parent_run_id FROM public.objective_runs
-        WHERE parent_run_id IS NOT NULL;
+    IF to_regclass('public.conversation_runs') IS NOT NULL THEN
+        INSERT INTO _sfc_agent_run_ids (run_id)
+            SELECT run_id FROM public.conversation_runs
+            ON CONFLICT DO NOTHING;
+    END IF;
+    IF to_regclass('public.objective_runs') IS NOT NULL THEN
+        INSERT INTO _sfc_agent_run_ids (run_id)
+            SELECT run_id FROM public.objective_runs
+            ON CONFLICT DO NOTHING;
+        INSERT INTO _sfc_agent_run_ids (run_id)
+            SELECT parent_run_id FROM public.objective_runs
+            WHERE parent_run_id IS NOT NULL
+            ON CONFLICT DO NOTHING;
+    END IF;
 
     -- Closure: delegation children (agent.delegate history) of agent roots.
     WHILE changed > 0 LOOP
@@ -172,9 +183,11 @@ BEGIN
     -- Dependents first (FK-safe; the 0011 mandatory-tag trigger allows an
     -- association to go away when the entity row itself is gone, and both
     -- happen inside THIS transaction before commit).
-    DELETE FROM public.objective_runs r
-        USING _sfc_agent_run_ids s
-        WHERE r.run_id = s.run_id OR r.parent_run_id = s.run_id;
+    IF to_regclass('public.objective_runs') IS NOT NULL THEN
+        DELETE FROM public.objective_runs r
+            USING _sfc_agent_run_ids s
+            WHERE r.run_id = s.run_id OR r.parent_run_id = s.run_id;
+    END IF;
     DELETE FROM public.job_schedule_fires f
         USING _sfc_agent_run_ids s
         WHERE f.run_id = s.run_id;
@@ -194,48 +207,17 @@ END
 $reset$;
 """
 
-# --- destructive DDL (authored + proven here; INSTALLED AT D09) -----------------
+# --- destructive DDL (authored + proven here; installed by revision 0015) ------
 
-#: Obsolete chat/task/objective/runtime-journal tables, FK-safe drop order:
-#: children first. ``objective_runs`` also references the RETAINED
-#: ``job_runs`` (no ondelete action) so it goes before its siblings and
-#: ``objectives``; ``conversation_tags`` references the RETAINED ``tags``
-#: catalog (RESTRICT) so it goes before ``conversations``.
-DESTRUCTIVE_DDL_STATEMENTS: tuple[str, ...] = (
-    "DROP TABLE IF EXISTS public.objective_runs",
-    "DROP TABLE IF EXISTS public.objective_events",
-    "DROP TABLE IF EXISTS public.objective_checklists",
-    "DROP TABLE IF EXISTS public.objective_journal",
-    "DROP TABLE IF EXISTS public.objective_servers",
-    "DROP TABLE IF EXISTS public.objectives",
-    "DROP TABLE IF EXISTS public.agent_task_completions",
-    "DROP TABLE IF EXISTS public.agent_task_revisions",
-    "DROP TABLE IF EXISTS public.agent_task_evidence",
-    "DROP TABLE IF EXISTS public.agent_task_criteria",
-    "DROP TABLE IF EXISTS public.agent_task_constraints",
-    "DROP TABLE IF EXISTS public.agent_task_steps",
-    "DROP TABLE IF EXISTS public.agent_tasks",
-    "DROP TABLE IF EXISTS public.conversation_tags",
-    "DROP TABLE IF EXISTS public.conversation_steering",
-    "DROP TABLE IF EXISTS public.conversation_runs",
-    "DROP TABLE IF EXISTS public.conversation_messages",
-    "DROP TABLE IF EXISTS public.conversations",
+#: The proven drop list lives in :mod:`mai.migrations` (single source; the
+#: Alembic ``versions/`` directory is not a package, so revision ``0015``
+#: imports it from there when it installs the list into the linear chain).
+#: Re-exported under the same names, so the importlib-based proof test and
+#: any other consumer keep working unchanged.
+from mai.migrations import (  # noqa: E402,F401 - intentional re-export (see docstring)
+    DESTRUCTIVE_DDL_STATEMENTS,
+    run_destructive_ddl,
 )
-
-
-def run_destructive_ddl(connection: sa.engine.Connection) -> None:
-    """Execute the destructive drop list on one open connection.
-
-    Campaign ``machina-session-first-chat``: proven by
-    ``backend/tests/test_session_migration.py`` against a real disposable
-    Postgres (obsolete tables absent, generic surface intact and queryable,
-    no dangling FK). **Installed at the coordinated deletion slice (D09)** —
-    NOT wired into this revision's ``upgrade()``/``downgrade()`` because the
-    retained chat/task/objective modules still consume those tables until
-    the coordinated code deletion (COORD-D02-01).
-    """
-    for statement in DESTRUCTIVE_DDL_STATEMENTS:
-        connection.exec_driver_sql(statement)
 
 
 def upgrade() -> None:

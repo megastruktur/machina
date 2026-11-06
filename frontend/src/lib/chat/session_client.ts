@@ -192,6 +192,15 @@ export interface SessionChannelController {
 	dispose(): void;
 	/** The merged committed log, sorted by `seq`. */
 	entries(): readonly ChannelEntry[];
+	/**
+	 * Merge externally loaded committed entries (e.g. REST `before_seq`
+	 * older pages) into the same seq-deduplicated cache the channel
+	 * frames feed, so channel commits MERGE with rather than REPLACE the
+	 * loaded pages (D09 R08 F1). Deduplicates by seq; honors the same
+	 * ≤400 cap; never advances the durable cursor (the entries are older
+	 * than the live tail by construction).
+	 */
+	mergeExternalEntries(entries: readonly ChannelEntry[]): void;
 	/** The durable cursor (null before any committed entry). */
 	highestCommittedSeq(): number | null;
 	/** One run's volatile draft, or null. */
@@ -506,6 +515,11 @@ export function createSessionChannelController(options: SessionChannelOptions): 
 		connect() {
 			if (disposed || userClosed || socket !== null || reconnectTimer !== null) return;
 			openSocket();
+		},
+		mergeExternalEntries(entries: readonly ChannelEntry[]): void {
+			if (disposed || entries.length === 0) return;
+			mergeCommittedEntries(entries);
+			notifyEntries();
 		},
 		ping() {
 			const ping: ClientPingFrame = { type: 'ping' };

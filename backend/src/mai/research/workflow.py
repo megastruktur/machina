@@ -54,7 +54,7 @@ from mai.agents.context import (
     assemble,
     load_server_context,
 )
-from mai.agents.delegate import MAX_CHILDREN_PER_RUN, ChildSpec
+from mai.agents.budgets import MAX_CHILDREN_PER_RUN
 from mai.agents.model_store import ModelBinding
 from mai.capabilities.dispatch import (
     EFFECT_EXECUTED,
@@ -497,6 +497,24 @@ class StepRecord:
     status: str  # "succeeded" | "failed" | "cancelled"
     display: str
     evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ChildSpec:
+    """One explicitly scoped child task (C06 rule 5: no arbitrary scope).
+
+    ``capabilities`` is the child's REQUEST; the effective child grants
+    are its intersection with the parent's granted set (GRANT-INTERSECT).
+    There is deliberately no server/target field: a child runs on its
+    parent's server, full stop. Owned here since the D09 deletion removed
+    the old ``delegate`` module definition; the shape is unchanged.
+    """
+
+    task: str
+    role: str | None
+    connection: str | None
+    profile: str | None
+    capabilities: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -42,7 +42,6 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import mai.contracts.tags as tags_contract
-import mai.contracts.tasks as tasks_contract
 import mai.contracts.tool_results as tool_results_contract
 from mai.agents import tools as agent_tools
 from mai.contracts.sessions import (
@@ -51,7 +50,6 @@ from mai.contracts.sessions import (
     MAX_ENTRY_TEXT_CHARS,
     MAX_PAGE_BYTES,
     MAX_TOOL_OUTPUT_PREVIEW_CHARS,
-    INITIAL_TAIL_MAX_ENTRIES,
     SESSION_LIST_DEFAULT_LIMIT,
     SESSION_LIST_MAX_LIMIT,
     SCHEMA_VERSION,
@@ -71,7 +69,6 @@ from mai.contracts.sessions import (
     SessionCompactionRecord,
     SessionContractError,
     SessionControlRequest,
-    SessionControlResponse,
     SessionCreateRequest,
     SessionDetail,
     SessionEntryView,
@@ -79,7 +76,6 @@ from mai.contracts.sessions import (
     SessionHistoryPage,
     SessionListPage,
     ProviderReasoningArtifact,
-    SessionCompactionRecord,
     SessionRunRecord,
     SessionRunState,
     SessionSourceKind,
@@ -1086,19 +1082,17 @@ def test_retained_consumers_reuse_the_neutral_tag_objects() -> None:
     assert history_store.EntityTagPreview is tags_contract.EntityTagPreview
     assert history_store.DEFAULT_PAGE_LIMIT is tags_contract.DEFAULT_PAGE_LIMIT
     assert history_store.MAX_PAGE_LIMIT is tags_contract.MAX_PAGE_LIMIT
-    # The deleted-at-D09 conversation contract keeps re-exporting the same
-    # objects so its un-deleted consumers keep working until then.
-    import mai.contracts.conversations as conversations_contract
 
-    assert (
-        conversations_contract.EntityTagPreviewView
-        is tags_contract.EntityTagPreviewView
-    )
-    assert conversations_contract.compute_has_more is tags_contract.compute_has_more
-    assert (
-        conversations_contract.DEFAULT_PAGE_LIMIT is tags_contract.DEFAULT_PAGE_LIMIT
-    )
-    assert conversations_contract.MAX_PAGE_LIMIT is tags_contract.MAX_PAGE_LIMIT
+
+def test_deleted_chat_contracts_are_gone() -> None:
+    """D09: the old chat/task/objective contract modules no longer exist."""
+    for name in (
+        "mai.contracts.conversations",
+        "mai.contracts.tasks",
+        "mai.contracts.objectives",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
 
 
 def test_neutral_tool_result_vocabulary_is_frozen() -> None:
@@ -1130,14 +1124,6 @@ def test_neutral_tool_result_vocabulary_is_frozen() -> None:
         "uncertain",
         "unknown",
     ]
-    # The task contract keeps re-exporting the same objects until D09.
-    assert tasks_contract.DomainOutcome is DomainOutcome
-    assert tasks_contract.ExecutionStatus is ExecutionStatus
-    assert tasks_contract.EffectCertainty is EffectCertainty
-    assert (
-        tasks_contract.MAX_EVIDENCE_REFS is tool_results_contract.MAX_EVIDENCE_REFS
-    )
-    assert tasks_contract.SECRET_DATA_KEYS is tool_results_contract.SECRET_DATA_KEYS
 
 
 def _forbidden_contract_imports(module_path: pathlib.Path) -> list[str]:
@@ -1168,20 +1154,23 @@ def test_agent_tools_has_zero_old_contract_imports() -> None:
     assert not hasattr(agent_tools, "TaskContractError")
 
 
-def test_agent_tools_phase_gate_mirrors_the_ratified_map() -> None:
-    from mai.contracts.tasks import Phase, PhaseAction, validate_phase
+def test_agent_tools_phase_gate_matches_the_frozen_admission_map() -> None:
+    """The neutral gate's behavior table (value-based, no contract import).
 
-    for phase in Phase:
-        for action in PhaseAction:
-            enforced_refuses = False
-            try:
-                validate_phase(phase, action)
-            except ValueError:
-                enforced_refuses = True
-            offer_refuses = not agent_tools._phase_allows(phase, action)
-            assert enforced_refuses == offer_refuses, (phase, action)
-    # Neutral duck-typing: plain strings classify identically to the enums.
-    assert agent_tools._phase_allows("act", "execute_steps") is True
-    assert agent_tools._phase_allows("inspect", "execute_steps") is False
+    The D09 deletion removed the task contract whose enums this table used
+    to mirror; the frozen admission map itself is pinned here directly.
+    """
+    frozen: dict[str, set[str]] = {
+        "metadata_update": {"plan", "inspect", "act"},
+        "plan_proposal": {"plan", "inspect", "act"},
+        "collect_evidence": {"inspect", "act"},
+        "execute_steps": {"act"},
+    }
+    for action, phases in frozen.items():
+        for phase in phases:
+            assert agent_tools._phase_allows(phase, action) is True, (phase, action)
+    # Negative controls: unknown actions and cross-phase pairings refuse.
     assert agent_tools._phase_allows("plan", "unknown_action") is False
+    assert agent_tools._phase_allows("plan", "execute_steps") is False
+    assert agent_tools._phase_allows("inspect", "execute_steps") is False
     assert agent_tools._phase_allows(None, None) is False

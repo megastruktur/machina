@@ -2,7 +2,7 @@
 	/**
 	 * ModelProfileSelect — reusable Model Profile dropdown component.
 	 *
-	 * Replaces the free-form text input for Model profile in ChatPanel with a
+	 * Replaces the free-form text input for the model profile with a
 	 * clean `<Select>` dropdown while preserving a synced visually-hidden input
 	 * for existing automated `.fill()` assertions.
 	 *

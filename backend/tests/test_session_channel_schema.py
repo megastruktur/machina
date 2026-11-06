@@ -13,15 +13,15 @@ generated-TypeScript discipline (BRIEF_D06 §D/§E.9).
    escape hatch.
 5. The pinned generator (``json-schema-to-typescript@16.0.0``) and the
    ``generate:session-channel`` script are declared in ``package.json``.
-6. The OpenAPI surface: the new ``/api/v1/agent-sessions/**`` routes exist;
-   ``/api/v1/chat/**`` still exists at this stage (D09 removes it).
+6. The OpenAPI surface: the ``/api/v1/agent-sessions/**`` routes exist and
+   ``/api/v1/chat/**`` is absent (D09 removed it with the coordinated
+   deletion).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import pathlib
 import uuid
 from pathlib import Path
 
@@ -31,8 +31,6 @@ from fastapi import FastAPI
 from mai.api.app import create_app
 from mai.contracts.session_channel import (
     CHANNEL_PROTOCOL_VERSION,
-    ClientChannelFrame,
-    ServerChannelFrame,
     validate_client_frame,
 )
 
@@ -179,8 +177,8 @@ async def test_openapi_route_presence() -> None:
     assert "/api/v1/agent-sessions" in paths
     assert "/api/v1/agent-sessions/{session_id}/turns" in paths
     assert "/api/v1/agent-sessions/{session_id}/control" in paths
-    # ADDITIVE (COORD-D02-01): the old chat surface stays until D09.
-    assert any(path.startswith("/api/v1/chat") for path in paths)
+    # D09: the old chat surface is GONE — no /api/v1/chat/** route remains.
+    assert not any(path.startswith("/api/v1/chat") for path in paths)
 
 
 def tmp_dir() -> Path:

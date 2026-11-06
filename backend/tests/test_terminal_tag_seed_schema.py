@@ -236,11 +236,11 @@ def test_upgrade_preserves_same_name_user_tags_and_is_idempotent(
         }
 
         # A second upgrade at the tip is a no-op: nothing duplicated or
-        # overwritten, the version stays 0012.
+        # overwritten, the version stays at the chain head (0015 since D09).
         command.upgrade(_alembic_config(), "head")
         with psycopg.connect(url) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert version == ("0012",)
+        assert version == ("0015",)
         assert _fetchall(url, "SELECT count(*) FROM tags")[0][0] == 4
         assert _fetchall(
             url,
@@ -255,9 +255,11 @@ def test_upgrade_preserves_same_name_user_tags_and_is_idempotent(
 
 
 def test_downgrade_removes_only_unused_seeded_ids(migrated_url: str) -> None:
-    with _isolated_database(migrated_url, "mai_fxt_w1_seed_down", "0011") as url:
-        command.upgrade(_alembic_config(), "head")
-
+    # D09: revision 0015's honest no-op downgrade makes the chain below 0014
+    # unreachable from head, so this proof of 0012's own downgrade behavior
+    # builds a fresh database at 0012 (the seed revision) and downgrades one
+    # step only — the same revision pair the test always exercised.
+    with _isolated_database(migrated_url, "mai_fxt_w1_seed_down", "0012") as url:
         # One run classified with the seeded succeeded tag: its id is USED.
         _insert_classified_job_run(url, JOB_A, SEED_SUCCEEDED_ID)
 
@@ -283,8 +285,8 @@ def test_downgrade_removes_only_unused_seeded_ids(migrated_url: str) -> None:
         ) == [(1,)]
 
         # Re-upgrade re-seeds only the removed rows; the adopted id is not
-        # duplicated.
-        command.upgrade(_alembic_config(), "head")
+        # duplicated (the isolated database stays at the 0012 seed revision).
+        command.upgrade(_alembic_config(), "0012")
         assert _fetchall(
             url,
             "SELECT count(*) FROM tags WHERE lower(name) = ANY(%(names)s)",

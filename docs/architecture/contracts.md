@@ -336,8 +336,14 @@ provider/model cards own theirs):
    configured provider + tool-call loop and a resumed run are required before
    model-integration acceptance (scenario registry, AGT group).
 
-Ownership: `06-agent-run`, `06-context`, `06-tool-bridge`, `06-model-*`, `06-chat-api`;
-UI consumers `06-web-chat`, `06-web-models`, `06-web-delegation`.
+Ownership (D09): the durable agent runtime is `agents/session_runner.py` +
+`agents/session_delegate.py` with `agents/tools.py`/`budgets.py`/`models.py`/
+`context.py`/`model_store.py`/`output_safety.py` as the retained execution
+primitives; the HTTP/WebSocket surface is `api/agent_sessions.py` +
+`session_channel.py`. UI consumer `06-session-chat` (`panels/SessionChatPanel.svelte`).
+The legacy `agent.run`/`agent.run_v2`/`agent.delegate` handlers, `api/chat.py`
+and the canonical conversation/task/objective modules were deleted with the
+session-first cutover (migration `0015` dropped their schema).
 
 ## C07 — documents, retrieval and memory
 
@@ -539,6 +545,30 @@ documentation-only per test policy. Author checks: input read receipts, cross-re
 integrity, scenario-coverage completeness, crash-window/cross-server/approval tabletop
 (`01`–`03` files in the evidence directory). Independent acceptance happens at the P00
 phase gate.
+
+## D09 supersession — session-first authority (2026-11-06)
+
+The session-first campaign (`session-first-chat`) replaced the conversation/
+task/objective continuity vocabulary with ONE session/run authority:
+
+- `backend/src/mai/contracts/sessions.py` owns the public agent vocabulary:
+  `sessions` rows are the only conversation/history root; `session_runs` are
+  subordinate durable executions; `session_entries` carry user, assistant,
+  native tool-call/result, run-state, delegation and compaction entries.
+- The browser stream is the versioned cursor WebSocket channel
+  (`contracts/session_channel.py`; `GET /api/v1/agent-sessions/{id}/channel`);
+  REST serves bounded pages and idempotent session commands only. No chat SSE,
+  no fixed polling, no browser transcript persistence.
+- The act addendum below and the runtime-v2 supersessions are HISTORICAL
+  records of the replaced campaigns: `contracts/conversations.py`,
+  `contracts/tasks.py`, `contracts/objectives.py`, `api/chat.py`,
+  `api/conversations.py`, `api/tasks.py`, `api/objectives.py`,
+  `agents/run.py`, `agents/run_v2.py`, `agents/delegate.py`,
+  `capabilities/task_state.py` and their schema (migration `0015`) no longer
+  exist. Generic `tags`/`job_tags` classification and the `tags.*` capability
+  vocabulary survive for non-chat job runs; session tagging lives on the
+  agent-session surface. Runbook execution is a fresh non-interactive session
+  (`source="runbook"`, `POST .../execute` returns `session_id` + `run_id`).
 
 ## Addendum — conversation and task continuity (act campaign, 2026-10-24)
 

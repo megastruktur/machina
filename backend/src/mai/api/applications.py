@@ -71,7 +71,7 @@ resource.
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import contextlib
 import json
 import uuid
 from collections.abc import Mapping
@@ -107,13 +107,16 @@ from mai.api.jobs import (
     StepBody,
     _canonical_profile,
     _jobs_services,
-    _record_submit_intent,
-    _replayed_state,
     _sessions,
     submit_run,
 )
-from mai.agents import run as agent_run
 from mai.agents.context import format_service_map_section
+from mai.agents.session_runner import (
+    HANDLER_NAME as SESSION_RUN_HANDLER_NAME,
+    RUN_PAYLOAD_VERSION_SESSION,
+    SessionRunIntent,
+)
+from mai.api.capability_defaults import resolve_default_capabilities
 from mai.auth.sessions import hash_token
 from mai.jobs.engine import RunIdInUseError
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
@@ -170,6 +173,22 @@ from mai.applications.recipes import (
 )
 from mai.applications.remove import RemoveDataIntent
 from mai.contracts.server import parse_server_profile_text
+from mai.contracts.sessions import (
+    EntryKind,
+    MAX_ENTRY_TEXT_CHARS,
+    RunbookRef,
+    SessionRunState,
+    SessionSourceKind,
+    UserMessageEntry,
+)
+from mai.session_channel import notify_session_committed
+from mai.session_store import (
+    aappend_entry,
+    acreate_run,
+    acreate_session,
+    arecord_admission,
+    arecord_run_state,
+)
 from mai.credentials.env import EnvFileError
 from mai.execution.ssh import (
     SshConnectError,
@@ -441,8 +460,14 @@ class RunbookExecuteBody(BaseModel):
 
 
 class RunbookExecutionView(BaseModel):
-    """One queued background runbook job (identity + replayed state)."""
+    """One queued background runbook job (session + run identities).
 
+    The runbook executes inside its own fresh non-interactive session
+    (``source="runbook"``); ``session_id`` opens that session's bounded
+    history and ``run_id`` is the child run executing the procedure.
+    """
+
+    session_id: uuid.UUID
     run_id: uuid.UUID
     server_id: uuid.UUID
     application_id: uuid.UUID
@@ -2227,7 +2252,7 @@ async def delete_catalog_runbook(
     "/{application_id}/execute",
     status_code=HTTP_201_CREATED,
     response_model=RunbookExecutionView,
-    summary="Queue one background runbook execution (durable agent.run intent)",
+    summary="Queue one background runbook execution (durable session-run admission)",
     responses={
         HTTP_401_UNAUTHORIZED: {
             "model": ErrorEnvelope,
@@ -2253,25 +2278,27 @@ async def execute_runbook(
     application_id: uuid.UUID,
     payload: RunbookExecuteBody,
 ) -> Response:
-    """Queue the runbook procedure as ONE background agent conversation.
+    """Queue the runbook procedure as ONE fresh non-interactive session.
 
     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
     The route persists an explicitly provided ``custom_instructions`` on
     the server's map entry first (a catalog-only target is STAGED as an
-    ``installed=False`` entry, so the notes survive), then records the
-    SAME durable intent discipline as every other submit (facade row +
-    digest event + submit edge, the ONE producer validating the agent-run
-    document) and enqueues through the ONE engine client. No SSH, no
-    Docker and no capability dispatch ever runs inside the request — the
-    agent executes the procedure behind the dispatcher/policy gates and
-    reports status back through ``app.adopt``. The Chat window is never
-    opened or pre-filled by this route.
+    ``installed=False`` entry, so the notes survive), then performs the
+    SAME durable session-first admission as every other submit (session
+    row + child-run row + admission ledger + user entry + queued
+    run-state, all committed BEFORE the engine enqueue follows) through
+    the ONE session runner handler. No SSH, no Docker and no capability
+    dispatch ever runs inside the request — the agent executes the
+    procedure behind the dispatcher/policy gates and reports status back
+    through ``app.adopt``. The response names the created
+    ``session_id`` and ``run_id``; no interactive chat window is opened,
+    borrowed or pre-filled by this route.
     """
     _store, token = await _require_session(request)  # layer 1
     _require_allowed_origin(request)  # layer 2
     _require_csrf(request)  # layer 3
     map_store = _map_store(request)
-    lifecycle, recovery = _jobs_services(request)
+    _, recovery = _jobs_services(request)
     _canonical_profile(request, server_id)
 
     entry = map_store.get_entry(server_id, application_id)
@@ -2342,7 +2369,7 @@ async def execute_runbook(
         "app.unadopt) when uninstall finishes or verify finds the service "
         "absent"
     )
-    task = (
+    prompt = (
         f"Background runbook job: execute the '{payload.action}' procedure for "
         f"the managed service @{effective.name} on this server.\n"
         "Follow the recorded runbook instructions and the server custom "
@@ -2350,23 +2377,20 @@ async def execute_runbook(
         f"When the procedure finishes, update the service status via "
         f"app.adopt: {status_rule}."
     ) + format_service_map_section([effective])
-    if len(task) > agent_run.MAX_TASK_CHARS:
+    if len(prompt) > MAX_ENTRY_TEXT_CHARS:
         return render_error_envelope(
             request,
             HTTP_422_UNPROCESSABLE_CONTENT,
             "validation_failed",
-            "the recorded runbook exceeds the bounded task size; nothing ran",
+            "the recorded runbook exceeds the bounded turn size; nothing ran",
         )
-
-    # Lazy import: chat owns the reviewed default-capability resolution
-    # (grant store + profile + plugins + internal API + built-ins); this
-    # route reuses it verbatim instead of re-deriving a second vocabulary.
-    from mai.api.chat import DEFAULT_ROLE, _resolve_default_capabilities
 
     stored = _canonical_profile(request, server_id)
     profile = parse_server_profile_text(stored.text)
-    capabilities = _resolve_default_capabilities(request, server_id, profile.capabilities)
-    # The job_runs row names the model profile the run will use: the store's
+    capabilities = resolve_default_capabilities(
+        request, server_id, profile.capabilities
+    )
+    # The session run names the model profile the run will use: the store's
     # CURRENT selection (the exact record the worker resolves when the run
     # payload pins no explicit profile); "default" when the store is absent.
     models_store = getattr(request.app.state, "models", None)
@@ -2376,8 +2400,11 @@ async def execute_runbook(
             model_profile = models_store.get_selection().profile
         except Exception:
             model_profile = None
+
+    session_id = uuid.uuid4()
     run_uuid = uuid.uuid4()
     run_id = str(run_uuid)
+    client_request_id = uuid.uuid4()
     try:
         context = ExecutionContext(
             principal=hash_token(token),
@@ -2387,49 +2414,100 @@ async def execute_runbook(
             profile_revision=str(stored.revision),
             prompt_revision=str(profile.prompt_revision),
             credential_references=(),
-            allowed_capabilities=capabilities,
+            allowed_capabilities=tuple(capabilities),
             mode=PolicyMode.DELEGATED,
         )
     except PolicyError as exc:
         return _validation_error(request, "context", exc.detail)
-    document: dict[str, object] = {
-        "v": agent_run.RUN_PAYLOAD_VERSION,
-        "run_id": run_id,
-        "server_id": str(server_id),
-        "context": context.to_json(),
-        "role": DEFAULT_ROLE,
-        "task": task,
-        "connection": None,
-        "profile": None,
-    }
-    payload_json = agent_run.canonical_json(document)
-    try:
-        agent_run.parse_agent_run_intent(payload_json)  # the ONE producer validates
-    except agent_run.AgentRunError as exc:
-        return _validation_error(request, "task", str(exc))
-    digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
+    intent = SessionRunIntent(
+        payload_version=RUN_PAYLOAD_VERSION_SESSION,
+        session_id=str(session_id),
+        run_id=run_id,
+        server_id=str(server_id),
+        client_request_id=str(client_request_id),
+        context=context,
+        prompt=prompt,
+        parent_run_id=None,
+        source=SessionSourceKind.RUNBOOK,
+        connection=None,
+        profile=model_profile,
+        max_rounds=12,
+        approval_wait_seconds=3600.0,
+        reconcile_wait_seconds=300.0,
+        wait_poll_seconds=0.5,
+        document_ref=None,
+        runbook_ref=RunbookRef(
+            service_id=str(application_id),
+            runbook_id=str(application_id),
+        ),
+    )
 
+    # Durable session-first admission (the SAME discipline as the reviewed
+    # /agent-sessions turn route): session row → child-run row → admission
+    # ledger → user entry (idempotent on ``turn:<client_request_id>``) →
+    # queued run-state, all committed BEFORE the engine enqueue follows.
     factory = _sessions(request)
-    async with factory() as session:
-        async with session.begin():
-            created = await _record_submit_intent(
-                session,
-                run_id=run_id,
-                server_id=str(server_id),
-                profile_revision=stored.revision,
-                prompt_revision=profile.prompt_revision,
-                model_profile=model_profile if model_profile is not None else "default",
-                requested_grants=sorted(capabilities),
-                digest=digest,
-                # F3: honest bounded display label — "<runbook name> — <action>"
-                # (e.g. "omp — update"); 200 chars matches the stored CHECK.
-                label=f"{effective.name} — {payload.action}"[:200],
-                now=datetime.now(timezone.utc),
-            )
-    del created  # a freshly minted run id cannot duplicate; enqueue decides
+    await acreate_session(
+        factory,
+        server_id=server_id,
+        source=SessionSourceKind.RUNBOOK,
+        # Honest bounded display label — "<runbook name> — <action>"
+        # (e.g. "omp — update"); 200 chars matches the stored CHECK.
+        title=f"{effective.name} — {payload.action}"[:200],
+        session_id=session_id,
+    )
+    await acreate_run(
+        factory,
+        session_id=session_id,
+        server_id=server_id,
+        run_id=run_uuid,
+        model_profile=model_profile if model_profile is not None else "default",
+        client_request_id=client_request_id,
+        parent_run_id=None,
+    )
+    await arecord_admission(
+        factory,
+        session_id=session_id,
+        server_id=server_id,
+        client_request_id=client_request_id,
+        source=SessionSourceKind.RUNBOOK,
+        run_id=run_uuid,
+    )
+    user_entry = UserMessageEntry(
+        kind=EntryKind.USER_MESSAGE,
+        text=prompt,
+        client_request_id=client_request_id,
+        source=SessionSourceKind.RUNBOOK,
+        runbook_ref=intent.runbook_ref,
+    )
+    entry_row = await aappend_entry(
+        factory,
+        session_id=session_id,
+        server_id=server_id,
+        kind=EntryKind.USER_MESSAGE,
+        payload=user_entry.model_dump(mode="json"),
+        run_id=run_uuid,
+        durable_source_id=f"turn:{client_request_id}",
+    )
+    await arecord_run_state(
+        factory,
+        session_id=session_id,
+        server_id=server_id,
+        run_id=run_uuid,
+        state=SessionRunState.QUEUED,
+    )
+    latest_seq = entry_row.seq
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        # Identity-only NOTIFY payload; a lost wakeup costs one coarse tick.
+        with contextlib.suppress(Exception):
+            await notify_session_committed(engine, session_id, latest_seq)
     try:
         await asyncio.to_thread(
-            recovery.client.enqueue_run, run_id, agent_run.HANDLER_NAME, payload_json
+            recovery.client.enqueue_run,
+            run_id,
+            SESSION_RUN_HANDLER_NAME,
+            json.dumps(intent.to_json(), sort_keys=True),
         )
     except RunIdInUseError:
         return render_error_envelope(
@@ -2445,13 +2523,13 @@ async def execute_runbook(
             "unavailable",
             "jobs engine is unavailable",
         )
-    state = await _replayed_state(lifecycle, run_id)
     return RunbookExecutionView(
+        session_id=session_id,
         run_id=run_uuid,
         server_id=server_id,
         application_id=application_id,
         action=payload.action,
-        state=state or "queued",
+        state=SessionRunState.QUEUED.value,
     )
 
 

@@ -101,6 +101,24 @@ def _restore_migration_env(saved: dict[str, str | None]) -> None:
         os.environ["MAI_DATABASE_URL"] = str(saved["previous"])
 
 
+def _rebuild_at(url: str, revision: str) -> None:
+    """Rebuild the fixture from zero to ``revision``.
+
+    Revision 0015's honest no-op downgrade means a downgraded schema no
+    longer carries the obsolete chat/task/objective tables, so a test that
+    must seed revision-0013 agent rows rebuilds from an empty schema —
+    the disposable fixture makes that cheap and order-independent.
+    """
+    saved = _set_migration_env(url)
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+        command.upgrade(_alembic_config(), revision)
+    finally:
+        _restore_migration_env(saved)
+
+
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
     """Disposable fixture database upgraded from zero to the current head."""
@@ -356,12 +374,18 @@ def test_downgrade_drops_only_new_tables(migrated_url: str) -> None:
         command.downgrade(_alembic_config(), "0013")
         for table in NEW_TABLES:
             assert not _table_exists(migrated_url, table), table
+        # 0015's downgrade is an honest no-op: the obsolete chat/task/
+        # objective tables are NOT fabricated empty below 0015.
         for table in OBSOLETE_TABLES:
-            assert _table_exists(migrated_url, table), table
+            assert not _table_exists(migrated_url, table), table
         assert _table_exists(migrated_url, "job_runs")
         command.upgrade(_alembic_config(), "head")
         for table in NEW_TABLES:
             assert _table_exists(migrated_url, table), table
+        # The re-run destructive drops are idempotent (IF EXISTS): the
+        # obsolete tables stay absent at head.
+        for table in OBSOLETE_TABLES:
+            assert not _table_exists(migrated_url, table), table
     finally:
         _restore_migration_env(saved)
 
@@ -371,9 +395,9 @@ def test_clean_reset_removes_agent_history_and_spares_generic(
 ) -> None:
     saved = _set_migration_env(migrated_url)
     try:
-        command.downgrade(_alembic_config(), "0013")
+        _rebuild_at(migrated_url, "0013")
         _seed_old_world(migrated_url)
-        # The reset executes as part of the REAL 0014 upgrade.
+        # The reset + destructive cutover execute as the REAL chain upgrade.
         command.upgrade(_alembic_config(), "head")
     finally:
         _restore_migration_env(saved)
@@ -409,16 +433,6 @@ def test_clean_reset_removes_agent_history_and_spares_generic(
                 (AGENT_ROOT, AGENT_CHILD),
             ).fetchone()
             assert orphan is not None and orphan[0] == 0, table
-        # Objective bindings of agent-owned runs are gone (FK requirement).
-        bound = conn.execute(
-            """
-            SELECT COUNT(*) FROM objective_runs
-            WHERE run_id IN (%s, %s)
-            """,
-            (AGENT_ROOT, AGENT_CHILD),
-        ).fetchone()
-        assert bound is not None and bound[0] == 0
-
         # Unrelated generic rows survive with their exact counts.
         assert conn.execute(
             "SELECT COUNT(*) FROM job_runs WHERE run_id = %s", (UNRELATED_RUN,)
@@ -448,9 +462,10 @@ def test_clean_reset_removes_agent_history_and_spares_generic(
         }
         assert {"unclassified", "succeeded", "failed", "cancelled"} <= tags
 
-        # The obsolete chat/task/objective tables were NOT dropped (D09).
+        # The obsolete chat/task/objective tables were dropped by 0015 in
+        # the SAME chain upgrade (COORD-D02-01 contract).
         for table in OBSOLETE_TABLES:
-            assert _table_exists(migrated_url, table), table
+            assert not _table_exists(migrated_url, table), table
 
         # The retained generic surface still executes after the reset.
         conn.execute("SELECT COUNT(*) FROM job_runs")
@@ -463,44 +478,52 @@ def test_clean_reset_removes_agent_history_and_spares_generic(
         ).fetchone()
 
 
-def test_destructive_ddl_drops_obsolete_and_spares_generic(
+def test_destructive_cutover_is_installed_at_head_and_spares_generic(
     migrated_url: str,
 ) -> None:
-    """Prove the authored DDL on the real database (NOT in the chain)."""
+    """Prove revision 0015 in the LINEAR chain on the real database.
+
+    The DDL list is the exact one authored + proven at D02 (single source
+    ``mai.migrations``); this test proves the installed revision: head is
+    ``0015``, the obsolete tables are absent, the conversation-only
+    trigger functions are dropped, the generic trigger surface survives,
+    and the unrelated generic rows still execute.
+    """
     import importlib.util
     import pathlib
-    import sqlalchemy
 
+    # Source-level identity: 0015 executes exactly the proven DDL list.
     module_path = (
         pathlib.Path(BACKEND_ROOT)
         / "migrations"
         / "versions"
-        / "0014_agent_sessions.py"
+        / "0015_drop_legacy_chat_task_objective.py"
     )
-    spec = importlib.util.spec_from_file_location("mai_migration_0014", module_path)
+    spec = importlib.util.spec_from_file_location("mai_migration_0015", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    destructive = module.run_destructive_ddl
-    # The obsolete tables exist at head (they are dropped at D09 only); a
-    # failed earlier test must never inherit a downgraded schema.
+    from mai.migrations import DESTRUCTIVE_DDL_STATEMENTS as PROVEN_DDL
+
+    assert module.DESTRUCTIVE_DDL_STATEMENTS == PROVEN_DDL
+    assert module.down_revision == "0014"
+
     saved = _set_migration_env(migrated_url)
     try:
+        # Make this test order-independent: rebuild at 0013 (the obsolete
+        # tables exist there), seed its own old world, then run the real
+        # chain upgrade through 0014+0015.
+        _rebuild_at(migrated_url, "0013")
+        _seed_old_world(migrated_url)
         command.upgrade(_alembic_config(), "head")
     finally:
         _restore_migration_env(saved)
-    # R02 finding 1: make the generic-survival assertion order-independent —
-    # seed this test's own unrelated run instead of relying on a sibling
-    # test having left one behind.
-    _seed_old_world(migrated_url)
-    engine = sqlalchemy.create_engine(migrated_url)
-    try:
-        with engine.begin() as conn:
-            destructive(conn)
-    finally:
-        engine.dispose()
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
+        # The chain head IS the destructive revision.
+        version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        assert version is not None and version[0] == "0015", version
+
         for table in OBSOLETE_TABLES:
             assert not _table_exists(migrated_url, table), table
         for table in (
@@ -515,6 +538,46 @@ def test_destructive_ddl_drops_obsolete_and_spares_generic(
             "session_entries",
         ):
             assert _table_exists(migrated_url, table), table
+
+        # The conversation-only trigger functions are dropped; the generic
+        # history-tag functions survive with their triggers.
+        functions = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT proname FROM pg_proc
+                WHERE pronamespace = 'public'::regnamespace
+                """
+            ).fetchall()
+        }
+        assert (
+            "mai_history_tags_conversation_has_tag" not in functions
+        ), "conversation mandatory-tag function must be dropped"
+        assert (
+            "mai_history_tags_conversation_tag_left" not in functions
+        ), "conversation tag-left function must be dropped"
+        for retained in (
+            "mai_history_tags_job_run_has_tag",
+            "mai_history_tags_job_tag_left",
+            "mai_history_tags_protect_reserved_tag",
+        ):
+            assert retained in functions, retained
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT trigger_name FROM information_schema.triggers "
+                "WHERE trigger_schema = 'public'"
+            ).fetchall()
+        }
+        assert "trg_conversations_mandatory_tag" not in triggers
+        assert "trg_conversation_tags_mandatory_tag" not in triggers
+        for retained in (
+            "trg_job_runs_mandatory_tag",
+            "trg_job_tags_mandatory_tag",
+            "trg_tags_protect_reserved",
+        ):
+            assert retained in triggers, retained
+
         # The generic surface is still queryable and populated.
         assert conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0] >= 1
         assert conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0] >= 4

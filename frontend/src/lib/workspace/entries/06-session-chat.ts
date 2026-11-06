@@ -12,7 +12,7 @@
  *
  * Expand/Contract (COORD-D02-01): the legacy `ChatApi` vocabulary stays the
  * base of the bag until D09 deletes it — `SessionChatApi` EXTENDS it, so
- * `ChatPanel.svelte` keeps every reviewed method while the session-first
+ * The session-first surface keeps the reviewed transport invariants while
  * methods ride the same bag additively. There is no legacy/canonical
  * toggle: one composition, one wire.
  *
@@ -35,19 +35,30 @@ import type {
 	SessionTurnSubmitOutcome,
 	SessionTagAssignRequest,
 	SessionTurnSubmitRequest,
+	TagAssignBody,
+	TagCatalogQuery,
+	TagCreateBody,
 	TagEntityTagsQuery,
-	TagRemovalOptions
+	JobTagsPage,
+	TagPage,
+	TagRemovalOptions,
+	TagView
 } from '../../api/client.js';
 import {
 	sessionChannelUrl,
 	type SessionChannelController
 } from '../../chat/session_client.js';
-import type {
-	ChatApi,
-	ChatServerOption,
-	ChatServiceOption,
-	ChatTagApi
-} from './06-web-chat.js';
+/** One server option offered by the draft-mode server picker. */
+export interface ChatServerOption {
+	readonly id: string;
+	readonly label: string;
+}
+
+/** One mapped/discovered service offered by the draft-mode `@service` autocomplete. */
+export interface SessionChatServiceOption {
+	readonly name: string;
+	readonly category?: string;
+}
 
 /** Stable panel slug — the session-first chat IS the chat panel (D07). */
 export const SESSION_CHAT_PANEL_KIND = 'chat';
@@ -65,13 +76,13 @@ export const sessionChatChannelUrl = sessionChannelUrl;
 export type { SessionChannelController };
 
 /**
- * The session-first API slice this surface consumes: the reviewed legacy
- * `ChatApi` vocabulary (kept until D09, COORD-D02-01) plus the typed
- * `/api/v1/agent-sessions/**` transport. Every collection read is an
+ * The session-first API slice this surface consumes: the typed
+ * `/api/v1/agent-sessions/**` transport (the legacy ChatApi vocabulary
+ * died with the D09 coordinated deletion). Every collection read is an
  * explicitly-scoped bounded page (AGENTS.md §1); mutations carry the CSRF
  * double submit inside the client boundary.
  */
-export interface SessionChatApi extends ChatApi {
+export interface SessionChatApi {
 	/** POST /api/v1/agent-sessions — idempotent session create. */
 	createAgentSession(payload: SessionCreateRequest): Promise<AgentSessionView>;
 	/** GET /api/v1/agent-sessions — bounded deterministic page. */
@@ -106,10 +117,19 @@ export interface SessionChatApi extends ChatApi {
  * The OPTIONAL history-tag slice, session-first routing included: the
  * catalog methods stay the reviewed global ones; per-entity assignment
  * reads/writes route by the ROW's identity (session_id rows read the
- * agent-session tag routes; conversation_id rows the conversation routes;
- * legacy run rows the job routes — never conflated, COORD-D02-01).
+ * agent-session tag routes; job runs the retained generic routes).
  */
-export interface SessionChatTagApi extends ChatTagApi {
+export interface SessionChatTagApi {
+	/** GET /api/v1/tags — bounded catalog page with the name filter. */
+	listTags(query?: TagCatalogQuery): Promise<TagPage>;
+	/** POST /api/v1/tags — idempotent canonical create (same row back). */
+	createTag(payload: TagCreateBody): Promise<TagView>;
+	/** GET /api/v1/jobs/runs/{run_id}/tags?server_id=… — bounded run page. */
+	listRunTags(runId: string, serverId: string, page?: TagEntityTagsQuery): Promise<JobTagsPage>;
+	/** POST /api/v1/jobs/runs/{run_id}/tags — idempotent user assignment. */
+	assignRunTag(runId: string, payload: TagAssignBody): Promise<void>;
+	/** DELETE /api/v1/jobs/runs/{run_id}/tags/{tag_id}?server_id=… — removal. */
+	removeRunTag(runId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
 	/** GET /api/v1/agent-sessions/{id}/tags?server_id=… — bounded page. */
 	listAgentSessionTags(
 		sessionId: string,
@@ -138,7 +158,7 @@ export interface SessionChatServices {
 	/** Available servers for the draft-mode Server Chip / picker. */
 	readonly serverOptions?: readonly ChatServerOption[];
 	/** Mapped/discovered services for the draft-mode `@service` autocomplete. */
-	readonly availableServices?: readonly ChatServiceOption[];
+	readonly availableServices?: readonly SessionChatServiceOption[];
 }
 
 /** The feature entry for composition into the app's one panel registry. */

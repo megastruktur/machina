@@ -102,28 +102,13 @@ def _build_web_read_capability(
 
 
 def _configure_default_agent_runtime(database_url: str) -> None:
-    """Wire ``agent.run``, ``agent.run_v2`` and ``agent.delegate`` when ``MAI_DATA_ROOT`` is set."""
+    """Wire the session-first runtime handlers when ``MAI_DATA_ROOT`` is set."""
     data_root_raw = os.environ.get("MAI_DATA_ROOT", "").strip()
     if not data_root_raw:
         return
     from pathlib import Path
     import uuid
 
-    from mai.agents import delegate as agent_delegate
-    from mai.agents import run as agent_run
-    from mai.agents import run_v2 as agent_run_v2
-
-    if getattr(agent_run, "_EXECUTOR", None) is not None:
-        return
-
-    # The v2 handler registers itself at import (the engine trampoline
-    # resolves ``agent.run_v2`` by name); it composes the SAME executor
-    # as the legacy handler below, so one configuration serves both
-    # runtime families (runtime-v2.md §2: default worker loads them
-    # alongside each other for the drain window).
-    del agent_run_v2
-
-    from mai.agents.budgets import BudgetLedger
     from mai.agents.model_store import ModelConfigStore
     from mai.applications.adopt import (
         ApplicationAdoption,
@@ -143,10 +128,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.capabilities.history_tags import (
         TAGS_CAPABILITY_IDS,
         build_history_tag_capabilities,
-    )
-    from mai.capabilities.task_state import (
-        TASK_STATE_CAPABILITY_IDS,
-        build_task_state_capabilities,
     )
     from mai.capabilities.chat_read import (
         ChatReadSessionCapability,
@@ -178,7 +159,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.credentials.env import EnvResolver, build_runtime_env_resolver
     from mai.database import create_app_engine
     from mai.execution.ssh import SshIdentity, pin_host_key
-    from mai.jobs.engine import EngineClient
     from mai.jobs.resource_locks import ResourceLockService
     from mai.knowledge.index import GatewayEmbedder
     from mai.knowledge.documents import DocumentStore
@@ -364,16 +344,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     for desc in internal_api.descriptors:
         registry.register(desc)
 
-    # Task-state agent tools (act §7; 14b-worker-lane-wiring): the SAME
-    # composition seam the API process uses (``app.state.internal_api``),
-    # so a worker-bound agent can read and update the task bound to its
-    # own run identity. Descriptors are validated fail-closed at build
-    # time; ``session_factory`` is always composed here (the worker owns
-    # the database), so the unavailable fallback never applies.
-    task_state = build_task_state_capabilities(session_factory=sessions)
-    for desc in task_state.descriptors:
-        registry.register(desc)
-
     # History-tag agent tools (W4D): the SAME composition seam the API
     # process uses (``app.state.internal_api``) — descriptors registered
     # fail-closed at build time, executors merged into the one dispatch
@@ -408,7 +378,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         "web.read": web_read_cap,
         UPSERT_MAP_CAPABILITY: _upsert_map_cap,
         **internal_api.executors,
-        **task_state.executors,
         **history_tags.executors,
     }
     plugin_executors: dict[str, object] = {}
@@ -635,16 +604,12 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             pass
         # Automatically grant internal API capabilities (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
-        # app.delete_map_entry, session.read), the task-state agent
-        # tools (run-identity scoped: another conversation's task is
-        # invisible, no arbitrary cross-task selection), the history-tag
-        # tools (tags.*: run-identity scoped like the task tools) and
-        # controller-side web research capabilities (web.search,
-        # web.read) to every enrolled server and General Consult so they
-        # work out of the box.
+        # app.delete_map_entry, session.read), the history-tag
+        # tools (tags.*: run-identity scoped) and controller-side web
+        # research capabilities (web.search, web.read) to every enrolled
+        # server and General Consult so they work out of the box.
         for cap_id in (
             *INTERNAL_API_CAPABILITY_IDS,
-            *TASK_STATE_CAPABILITY_IDS,
             *TAGS_CAPABILITY_IDS,
             "web.search",
             "web.read",
@@ -689,22 +654,10 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         executor=_composite_executor,
     )
     model_store = ModelConfigStore(data_root)
-    agent_executor = agent_run.AgentRunExecutor(
-        sessions=sessions,
-        dispatcher=dispatcher,
-        registry=registry,
-        model_store=model_store,
-        data_root=data_root,
-        locks=ResourceLockService(database_url),
-        resolver=_resolve_env,
-        plugin_sync=_sync_plugin_capabilities,
-        host_supervisor=host_shell_cap,
-    )
-    agent_run.configure_agent_run(agent_executor)
-    # D04 (COORD-D02-01): the single-loop session runner wires alongside
-    # the retained agent.run/run_v2/delegate family and composes the SAME
-    # dispatcher/registry/model-store/locks objects — one composition
-    # serves both runtime families until D09 deletes the old ones.
+    # The single-loop session runner (D04/D05, COORD-D02-01): the ONLY
+    # agent runtime after the D09 deletion — ``agent.run``/``agent.run_v2``/
+    # ``agent.delegate`` are gone. It composes the production dispatcher,
+    # registry, model store and resource locks exactly as before.
     try:
         from mai.agents import session_runner as agent_session_runner
 
@@ -728,14 +681,6 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         # the session runner in this process.
         if exc.reason != "already_configured":
             raise
-    agent_delegate.configure_delegation(
-        agent_delegate.DelegationExecutor(
-            sessions=sessions,
-            executor=agent_executor,
-            client=EngineClient(database_url),
-            ledger=BudgetLedger(sessions),
-        )
-    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

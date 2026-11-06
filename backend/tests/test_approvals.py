@@ -57,7 +57,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 #: The constant tracks the full chain; head assertions target the TIP, so
 #: every later chain appender (0004 jobs, 0005 knowledge, 0006 applications,
 #: 0007 observations) keeps these chain-aware tests truthful.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001", "0002", "0003", "0004", "0005", "0006", "0007",
+    "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
+)
 
 #: Disposable in-fixture stand-in for the privileged effect whose execution
 #: the approval would authorize (APPROVAL-PAYLOAD observable: unchanged on
@@ -97,16 +100,10 @@ def _reset_fixture_db(url: str) -> None:
     drop, matching the reset in tests/test_servers_http.py.
     """
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version, notification_alerts, "
-            "observation_findings, server_observations, knowledge_doc_chunks, "
-            "knowledge_documents, application_projection_journal, "
-            "application_projection"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): FK-safe and immune to future revisions.
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 

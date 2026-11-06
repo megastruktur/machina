@@ -76,11 +76,14 @@ from mai.session_store import acreate_run, acreate_session
 
 # Reuse the PROVEN harness pieces (the brief's mandate): the persistent
 # test loop, the kill -9 / stop protocol, the wait helper, journal readers
-# and fixture constants come from the reviewed suites.
-from test_agent_run import (  # noqa: F401 - harness reuse
+# and fixture constants come from the shared runtime-scenario harness
+# (the legacy agent-run suite was deleted at D09; extraction is verbatim).
+from agent_runtime_harness import (  # noqa: F401 - harness reuse
     PRIV_CAP,
     READ_CAP,
     RUN_TIMEOUT,
+    SECRET_NAME,
+    SECRET_VALUE,
     SERVER_ID,
     _journal_lines,
     _kill9,
@@ -527,8 +530,6 @@ def _spawn_worker(
 
 
 def _write_env_file(scenario: pathlib.Path) -> None:
-    from test_agent_run import SECRET_NAME, SECRET_VALUE
-
     (scenario / "fixture.env").write_text(
         f"{SECRET_NAME}={SECRET_VALUE}\n", encoding="utf-8"
     )
@@ -718,7 +719,6 @@ async def test_plan_step_replay_converges_on_same_child(
     the step record did not. No IntegrityError, exactly one child row, the
     fan-out gate does NOT flip to denied, and the budget reservation is
     NOT double-charged."""
-    from sqlalchemy import text as sql_text
 
     executor = _make_executor(agent_url, factory, tmp_path)
     session_id = _run(_make_session(factory))

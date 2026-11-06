@@ -60,14 +60,11 @@ test('captures the command deck: windows + bottom chat dock with pinned chips', 
 	await openPanel(page, PREFS);
 
 	const dock = page.getByTestId('bottom-chat-dock');
-	await expect(dock.getByTestId('chat-server-chip')).toContainText('Server Alpha');
-
-	// Pin an `@service` context chip through the dock's own autocomplete.
-	await dock.getByTestId('chat-service-picker-toggle').click();
-	await dock.getByTestId('chat-service-option').filter({ hasText: '@enshrouded' }).click();
-	await expect(dock.getByTestId('chat-service-chip')).toContainText('@enshrouded');
-	await expect(dock.getByTestId('chat-server-chip')).toBeVisible();
-	await dock.getByTestId('compose-message').fill('Check the enshrouded server status.');
+	// D09: the dock IS the session panel; offline it renders its honest
+	// unwired state, so the command-deck capture shows the dock chrome +
+	// the honest panel instead of the deleted legacy composer chips.
+	await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
+	await expect(dock.getByTestId('session-config-error')).toBeVisible();
 
 	await page.screenshot({ path: `${ASSETS_DIR}screenshot-command-deck.png`, fullPage: true });
 });

@@ -11,7 +11,7 @@ Machina (M.A.I.) separates **server-agnostic software recipes** from **per-serve
 
 ### Storage & Identity
 - **On-disk path:** `<data_root>/service_map/catalog.json` (managed by `ServiceMapStore` in `backend/src/mai/applications/service_map.py`).
-- **Scope:** Fleet-wide (`global`). Does not require a `server_id` and can be read or mutated from General Consult (`00000000-0000-0000-0000-000000000000`) or any server-scoped conversation.
+- **Scope:** Fleet-wide (`global`). Does not require a `server_id` and can be read or mutated from General Consult (`00000000-0000-0000-0000-000000000000`) or any server-scoped session (D09: runbook execution itself is a fresh non-interactive session with ``source="runbook"``; ``POST .../execute`` returns its ``session_id`` + ``run_id``).
 - **Identity (`runbook_id`):** Deterministic UUID5 derived from the normalized service name (`uuid5(SERVICE_ID_NAMESPACE, f"catalog:{name.lower()}")`), or an explicit UUID when updating an existing record.
 
 ### Schema (`CatalogRunbook`)

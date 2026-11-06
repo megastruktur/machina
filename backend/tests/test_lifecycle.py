@@ -344,25 +344,11 @@ def _drop_app_tables(url: str) -> None:
     and break the next suite's ``upgrade(head)`` or DELETE teardown.
     """
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS objective_journal, objective_checklists, "
-            "objective_events, objective_runs, objective_servers, "
-            "objectives, "
-            "tags, job_tags, job_resource_locks, "
-            "job_schedule_fires, job_schedules, job_events, job_steps, "
-            "job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, notification_alerts, observation_findings, "
-            "server_observations, knowledge_doc_chunks, knowledge_documents, "
-            "application_projection_journal, application_projection, "
-            "conversation_steering, conversation_runs, conversation_tags, "
-            "conversation_messages, conversations, "
-            "agent_task_completions, agent_task_revisions, "
-            "agent_task_evidence, agent_task_criteria, "
-            "agent_task_constraints, agent_task_steps, agent_tasks, "
-            "alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): FK-safe and immune to future revisions
+        # (the enumerated list predates 0015's drops and 0014's session tags).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -1358,11 +1344,8 @@ def _terminal_catalog_tags(request: pytest.FixtureRequest) -> None:
                 "(SELECT tag_id FROM tags WHERE lower(name) = ANY(%(names)s))",
                 {"names": TERMINAL_TAG_NAMES},
             )
-            conn.execute(
-                "DELETE FROM conversation_tags WHERE tag_id IN "
-                "(SELECT tag_id FROM tags WHERE lower(name) = ANY(%(names)s))",
-                {"names": TERMINAL_TAG_NAMES},
-            )
+            # D09: conversation_tags is dropped by migration 0015 — job
+            # associations + catalog rows are the only terminal-tag residue.
             conn.execute(
                 "DELETE FROM tags WHERE lower(name) = ANY(%(names)s)",
                 {"names": TERMINAL_TAG_NAMES},

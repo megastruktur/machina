@@ -193,6 +193,17 @@
 	/** Bumped whenever a measurement lands so offsets recompute. */
 	let measureVersion = $state(0);
 
+	// R08 F4: prune measured heights evicted from the bounded cache — the
+	// map must not grow with browsed history (tens of KB per 1k entries).
+	// Plain-map mutation is safe here: offsets recompute through
+	// `measureVersion`, never through the map itself.
+	$effect(() => {
+		const live = new Set(entries.map((entry) => Number(entry.seq)));
+		for (const seq of [...heights.keys()]) {
+			if (!live.has(seq)) heights.delete(seq);
+		}
+	});
+
 	function measure(node: HTMLElement, entry: ChannelEntry) {
 		const height = node.offsetHeight;
 		if (height > 0 && heights.get(Number(entry.seq)) !== height) {

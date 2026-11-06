@@ -64,6 +64,7 @@ from mai.contracts.observations import (
     validate_alert_shape,
 )
 from mai.database import create_app_engine
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALEMBIC_INI = os.path.join(BACKEND_ROOT, "alembic.ini")
@@ -76,9 +77,25 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # migration-chain owner): revision 0007 appends the bounded observation +
 # notification persistence; the tip constants are advanced here so this
 # file's head assertions stay true.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001",
+    "0002",
+    "0003",
+    "0004",
+    "0005",
+    "0006",
+    "0007",
+    "0008",
+    "0009",
+    "0010",
+    "0011",
+    "0012",
+    "0013",
+    "0014",
+    "0015",
+)
 
-# The exact public application schema after 0007 — the 0006 set plus the
+# The exact public application schema at the 0015 head — the 0006 set plus the
 # three observation-domain tables (10-observation-schema); nothing else, in
 # particular no engine-shadowing run-state table and no ``dbos`` schema
 # before engine launch.
@@ -95,6 +112,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_events",
         "job_schedules",
         "job_schedule_fires",
+        "job_tags",
+        "tags",
         "knowledge_documents",
         "knowledge_doc_chunks",
         "application_projection",
@@ -102,6 +121,12 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "sessions",
+        "session_entries",
+        "session_runs",
+        "session_admissions",
+        "session_provider_artifacts",
+        "session_tags",
     }
 )
 
@@ -141,16 +166,12 @@ def _drop_app_tables(url: str) -> None:
         # Full app set at the chain tip — the 10-observation-schema tables
         # are listed here (chain-tip reconciliation) so the zero-to-head
         # fixture stays order-independent after revision 0007.
-        conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): the enumerated drop list went stale
+        # across migrations — the schema drop is FK-safe and immune to
+        # future revisions (same discipline as the adoption suite).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -301,16 +322,26 @@ async def _insert_finding(
 
 
 async def _insert_job_run(sessions, run_id: str = RUN_ID) -> None:
+    # The 0011 mandatory-tag constraint triggers are DEFERRABLE INITIALLY
+    # DEFERRED: the run and its reserved classification share the ONE
+    # committing transaction (the same discipline the real writers use).
     await _exec(
         sessions,
         """
-        INSERT INTO job_runs
-            (run_id, server_id, depth, profile_revision,
-             prompt_revision, model_profile, requested_grants)
-        VALUES (:rid, :sid, 0, 1, 1, 'probe-agent', '["shell.exec"]')
+        WITH run AS (
+            INSERT INTO job_runs
+                (run_id, server_id, depth, profile_revision,
+                 prompt_revision, model_profile, requested_grants)
+            VALUES (:rid, :sid, 0, 1, 1, 'probe-agent', '["shell.exec"]')
+            RETURNING run_id
+        )
+        INSERT INTO job_tags (job_id, tag_id, assignment_source)
+        SELECT run_id, :tid, 'system' FROM run
+        ON CONFLICT DO NOTHING
         """,
         rid=uuid.UUID(run_id),
         sid=uuid.UUID(SERVER_A),
+        tid=uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
     )
 
 
@@ -1217,7 +1248,12 @@ def test_upgrade_from_prior_head_preserves_prior_rows(
 def test_downgrade_upgrades_cleanly(
     migrated_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Down/upgrade round trip of the new revision on an isolated database."""
+    """Down/upgrade round trip on an isolated database.
+
+    D09: revision 0015's honest no-op downgrade makes the chain below 0014
+    unreachable from head, so the reachable floor is 0014 and the 0007-era
+    observation relations SURVIVE the reachable downgrade untouched.
+    """
     down_db = "mai_fxt_10_down"
     down_url = _database_url(migrated_url, down_db)
     with psycopg.connect(
@@ -1247,7 +1283,7 @@ def test_downgrade_upgrades_cleanly(
                 ),
             )
             conn.commit()
-        command.downgrade(_alembic_config(), "0006")
+        command.downgrade(_alembic_config(), "0014")
         with psycopg.connect(down_url) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
             leftovers = conn.execute(
@@ -1270,9 +1306,9 @@ def test_downgrade_upgrades_cleanly(
                 "SELECT count(*) FROM information_schema.tables "
                 "WHERE table_schema = 'public' AND table_name = 'job_runs'"
             ).fetchone()
-        assert version == ("0006",)
-        assert leftovers == (0,)
-        assert sequence == (0,)  # the schema-owned sequence goes with the tables
+        assert version == ("0014",)
+        assert leftovers == (3,)  # the 0007-era observation schema survives
+        assert sequence == (1,)  # the schema-owned sequence survives with it
         assert prior == (1,)  # the P05 schema is untouched by our downgrade
         command.upgrade(_alembic_config(), "head")
         with psycopg.connect(down_url) as conn:
@@ -1283,7 +1319,7 @@ def test_downgrade_upgrades_cleanly(
                 "SELECT count(*) FROM server_observations WHERE observation_id = %s",
                 (uuid.UUID(OBS_A1),),
             ).fetchone()
-        assert roundtrip == (0,)  # downgrade removed the data relation cleanly
+        assert roundtrip == (1,)  # the reachable downgrade preserved the row
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)

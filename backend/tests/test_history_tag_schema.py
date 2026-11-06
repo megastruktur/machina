@@ -103,7 +103,13 @@ def _database_url(url: str, database: str) -> str:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database upgraded from zero to the current head."""
+    """Disposable fixture database upgraded from zero to ``0014``.
+
+    D09 pin: this suite tests the 0011 history-tag schema (catalog,
+    job/conversation associations, mandatory-tag triggers). Revision 0015
+    drops the conversation half at head, so the fixture freezes at 0014 —
+    the last revision where every 0011 product exists.
+    """
     url = os.environ.get(LIVE_URL_VAR, "")
     if not url:
         pytest.skip(
@@ -118,7 +124,7 @@ def migrated_url() -> str:
         with psycopg.connect(url, autocommit=True) as conn:
             conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
             conn.execute("CREATE SCHEMA public")
-        command.upgrade(_alembic_config(), "head")
+        command.upgrade(_alembic_config(), "0014")
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)

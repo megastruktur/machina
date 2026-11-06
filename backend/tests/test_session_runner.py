@@ -33,10 +33,8 @@ import ast
 import json
 import os
 import pathlib
-import signal
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -67,16 +65,17 @@ from mai.session_store import acreate_session
 
 # Reuse the PROVEN harness pieces (BRIEF_D04 mandate): the persistent test
 # loop, the kill -9 / stop protocol, the wait helper and the journal
-# readers come from the reviewed agent-run suite.
-from test_agent_run import (  # noqa: F401 - harness reuse
+# readers come from the shared runtime-scenario harness (the legacy
+# agent-run suite was deleted at D09; the helpers were extracted verbatim).
+from agent_runtime_harness import (  # noqa: F401 - harness reuse
+    HOST_KEY,
+    PRIV_CAP,
     READY_TIMEOUT,
+    READ_CAP,
     RUN_TIMEOUT,
-    SERVER_ID,
     SECRET_NAME,
     SECRET_VALUE,
-    HOST_KEY,
-    READ_CAP,
-    PRIV_CAP,
+    SERVER_ID,
     _journal_count,
     _journal_lines,
     _kill9,
@@ -104,27 +103,11 @@ def _drop_app_tables(url: str) -> None:
     agent-run suite's drop list, unchanged.
     """
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS session_tags, session_provider_artifacts, "
-            "session_admissions, session_runs, session_entries, sessions, "
-            "objective_journal, objective_checklists, "
-            "objective_events, objective_runs, objective_servers, "
-            "objectives, "
-            "job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_tags, job_runs, "
-            "approvals, profile_projection_journal, profile_projection, "
-            "admin_sessions, admin_credential, alembic_version, "
-            "notification_alerts, observation_findings, server_observations, "
-            "knowledge_doc_chunks, knowledge_documents, "
-            "application_projection_journal, application_projection, "
-            "conversation_steering, conversation_runs, conversation_tags, "
-            "conversation_messages, conversations, "
-            "agent_task_completions, agent_task_revisions, "
-            "agent_task_evidence, agent_task_criteria, "
-            "agent_task_constraints, agent_task_steps, agent_tasks, "
-            "tags"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): FK-safe and immune to future revisions
+        # (the enumerated drop list went stale across migrations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -1300,7 +1283,7 @@ async def await_approval_for(
     store = ApprovalStore(factory)
     from mai.policy.approvals import ApprovalRequest
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     request = ApprovalRequest(
         server_id=server_id,
@@ -1825,7 +1808,6 @@ def _in_process_executor(factory: async_sessionmaker[AsyncSession], tmp: pathlib
     real ApprovalStore, journaled executor) for direct-step tests."""
     from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
     from mai.credentials.env import EnvResolver
-    from mai.jobs.resource_locks import ResourceLockService
     from mai.plugins.registry import CapabilityRegistry, parse_descriptor
 
     descriptor = parse_descriptor(

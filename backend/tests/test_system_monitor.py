@@ -134,16 +134,12 @@ def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         # Full app set at the chain tip (same reconciliation list as
         # 10-observation-schema): order-independent zero-to-head fixture.
-        conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): the enumerated drop list went stale
+        # across migrations — the schema drop is FK-safe and immune to
+        # future revisions (same discipline as the adoption suite).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 

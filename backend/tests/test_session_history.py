@@ -58,7 +58,6 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
-from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.session_history import (
