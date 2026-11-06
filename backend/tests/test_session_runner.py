@@ -479,7 +479,13 @@ def _script_model():
                 time.sleep(0.1)
         inner = entry.get("then", entry)
         if "error" in inner:
-            raise RuntimeError(str(inner["error"]))
+            message = str(inner["error"])
+            exc_name = str(inner.get("error_type") or "RuntimeError")
+            if exc_name == "RuntimeError":
+                raise RuntimeError(message)
+            # E2-fix1 probe seam: a sentinel-NAMED dynamic subclass (the
+            # class NAME is the leak vector under audit F-A).
+            raise type(exc_name, (RuntimeError,), {})(message)
         if "tool_call" in inner:
             call = inner["tool_call"]
             return ModelResponse(
@@ -2203,7 +2209,7 @@ def test_missing_facade_model_error_settles_safe_identity_no_sentinels(
     # The EXPLICIT safe-identity contract: fixed prefix + exception TYPE
     # only — no raw message, no sentinel soup, no long unicode payload.
     assert detail == (
-        "facade row missing at settlement; original failure: RuntimeError"
+        "facade row missing at settlement; original failure: runtime_error"
     ), detail
     assert len(detail) <= 500
     # Zero sentinels across session history, DBOS sinks and worker logs.
@@ -2233,7 +2239,11 @@ _E2_SOUP = " ; ".join(_E2_SENTINELS) + " ; " + ("échec-🔐-" * 60)
 
 
 def _sentinel_hits(
-    url: str, run_id: str, session_id: str, scenario: pathlib.Path
+    url: str,
+    run_id: str,
+    session_id: str,
+    scenario: pathlib.Path,
+    needles: tuple[str, ...] = _E2_SENTINELS,
 ) -> list[tuple[str, str]]:
     """Every (location, sentinel) leak across the affected durable and
     diagnostic surfaces: session history payloads, serialized DBOS
@@ -2241,11 +2251,10 @@ def _sentinel_hits(
     the worker logs."""
     import base64
 
-    s_debug: set[str] = set()
     hits: list[tuple[str, str]] = []
     for entry in _read_session_entries(url, session_id):
         blob = json.dumps(entry["payload"], ensure_ascii=False, default=str)
-        for sentinel in _E2_SENTINELS:
+        for sentinel in needles:
             if sentinel in blob:
                 hits.append((f"session_entries:{entry['kind']}", sentinel))
     with psycopg.connect(url) as conn:
@@ -2269,7 +2278,7 @@ def _sentinel_hits(
             (run_id, run_id, run_id, run_id, run_id),
         ).fetchall()
     for source, blob in rows:
-        for sentinel in _E2_SENTINELS:
+        for sentinel in needles:
             if sentinel in (blob or ""):
                 hits.append((source, sentinel))
             try:  # decode base64-serialized sinks the way DBOS does
@@ -2282,7 +2291,7 @@ def _sentinel_hits(
                 hits.append((f"{source}(b64)", sentinel))
     for log_path in sorted(scenario.glob("*.log")):
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        for sentinel in _E2_SENTINELS:
+        for sentinel in needles:
             if sentinel in text:
                 hits.append((f"log:{log_path.name}", sentinel))
     return hits
@@ -2337,6 +2346,222 @@ def test_e2_sentinels_never_persist_on_facade_present_model_failure(
     assert failures[0].get("detail") is None, failures[0]
     assert failures[0].get("reason_code") == "model_round_failed", failures[0]
     assert _sentinel_hits(agent_url, run_id, session_id, scenario) == []
+
+
+
+# E2-fix1 sentinels: the exception CLASS NAME is the leak vector (audit
+# F-A) plus a fire-once raw DB error on the unexpected path (audit F-B).
+_E2F1_EXC_NAME = "ProbeSECRETTOKENe2sk-e2-CLASSNAME99"
+_E2F1_NEEDLES = _E2_SENTINELS + (_E2F1_EXC_NAME,)
+_E2B_NEEDLES = ("ER2ProbeB", "sk-e2-MSGb789")
+
+
+def test_e2f1_sentinel_named_dynamic_class_never_leaks(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E2-fix1 (F-A): a sentinel-NAMED dynamic exception class (the
+    class NAME is data-derived and was previously echoed verbatim by
+    _safe_error_identity) raised by the real model through the real
+    workflow — facade PRESENT and ABSENT. Diagnostics must carry only
+    the trusted category (runtime_error), and the scan must find zero
+    sentinels (class name AND message soup) anywhere."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+
+    # Facade PRESENT: classified stage failure, detail=None, no leaks.
+    _script(
+        scenario,
+        [{"error": _E2_SOUP, "error_type": _E2F1_EXC_NAME}],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-e2f1a")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "present-facade sentinel-named failure to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
+    failures = [
+        entry["payload"]
+        for entry in _read_session_entries(agent_url, session_id)
+        if entry["kind"] == "run_state" and entry["payload"]["state"] == "failed"
+    ]
+    assert failures and failures[0].get("detail") is None, failures
+    assert failures[0].get("reason_code") == "model_round_failed", failures
+    assert _sentinel_hits(agent_url, run_id, session_id, scenario, _E2F1_NEEDLES) == []
+
+    # Facade ABSENT: the missing-facade settlement detail carries ONLY
+    # the trusted category — never the sentinel class name.
+    baseline = _journal_lines(scenario).count("model_call")
+
+    _script(
+        scenario,
+        [{"gate": "g-e2f1b", "then": {"error": _E2_SOUP, "error_type": _E2F1_EXC_NAME}}],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-e2f1b")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _journal_lines(scenario).count("model_call") > baseline,
+            RUN_TIMEOUT,
+            "absent-facade model to reach the gate",
+        )
+        _drop_facade_row(agent_url, run_id)
+        (scenario / "gates" / "g-e2f1b").write_text("", encoding="utf-8")
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "absent-facade sentinel-named failure to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
+    failures = [
+        entry["payload"]
+        for entry in _read_session_entries(agent_url, session_id)
+        if entry["kind"] == "run_state" and entry["payload"]["state"] == "failed"
+    ]
+    assert failures, failures
+    assert failures[0].get("detail") == (
+        "facade row missing at settlement; original failure: runtime_error"
+    ), failures[0]
+    assert _sentinel_hits(agent_url, run_id, session_id, scenario, _E2F1_NEEDLES) == []
+
+
+def test_e2f1_unexpected_failure_wraps_raw_step_exception(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E2-fix1 (F-B): a sentinel-bearing raw DATABASE error injected at a
+    durable non-model write (fire-once deferred constraint trigger on
+    session_entries, the reviewer's probe mechanics) crosses a DBOS step
+    boundary. The runner must wrap it at the EARLIEST durable-step
+    boundary with a safe classified exception (detached cause/attrs), so
+    DBOS never pickles the raw object; the session settles failed with
+    the trusted database category and zero sentinel hits."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(scenario, [{"text": "done"}])
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    with psycopg.connect(agent_url) as conn:
+        conn.execute("DROP TABLE IF EXISTS _er2_fireonce")
+        conn.execute(
+            "CREATE TABLE _er2_fireonce "
+            "(id int PRIMARY KEY, fired bool NOT NULL DEFAULT false)"
+        )
+        conn.execute("INSERT INTO _er2_fireonce (id) VALUES (1)")
+        conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION _er2_probe_b() RETURNS trigger AS $$
+            BEGIN
+                IF (SELECT fired FROM _er2_fireonce WHERE id = 1) THEN
+                    RETURN NEW;
+                END IF;
+                UPDATE _er2_fireonce SET fired = true WHERE id = 1;
+                RAISE EXCEPTION '%', 'ER2ProbeB sk-e2-MSGb789 raw failure detail';
+            END;
+            $$ LANGUAGE plpgsql;
+            """
+        )
+        conn.execute(
+            "CREATE CONSTRAINT TRIGGER _er2_b AFTER INSERT ON session_entries "
+            "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE "
+            "_er2_probe_b()"
+        )
+        conn.commit()
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-e2f1b2")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "fire-once unexpected failure to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+        with psycopg.connect(agent_url) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS _er2_b ON session_entries")
+            conn.execute("DROP FUNCTION IF EXISTS _er2_probe_b()")
+            conn.commit()
+
+    # The workflow landed ERROR; the RAW DB error never crossed any
+    # durable boundary (both steps' pickled errors are the safe
+    # classified stage). The session state itself stays queued BY THE
+    # INJECTED ARTIFACT: the fire-once trigger aborts the settlement
+    # transaction too (the reviewer's own P3 observation) — the leak
+    # guarantee here is settlement-INDEPENDENT.
+    assert _wf_status(agent_url, run_id) == "ERROR", _wf_status(agent_url, run_id)
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "queued", runs
+    import base64 as _b64
+
+    with psycopg.connect(agent_url) as conn:
+        step_errors = conn.execute(
+            "SELECT COALESCE(error, '') FROM dbos.operation_outputs "
+            "WHERE workflow_uuid = %s",
+            (run_id,),
+        ).fetchall()
+    decoded = ""
+    for (blob,) in step_errors:
+        try:
+            decoded += _b64.b64decode(blob or "", validate=True).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:  # noqa: BLE001 - not base64
+            continue
+    assert "step_unexpected_failure" in decoded, decoded[:200]
+    assert "database_error" in decoded, decoded[:200]
+    assert _sentinel_hits(agent_url, run_id, session_id, scenario, _E2B_NEEDLES) == []
 
 
 def test_missing_facade_detail_boundary_contract(
@@ -2401,7 +2626,7 @@ def test_missing_facade_detail_boundary_contract(
 
     # The evidence falls back to the lifecycle identity when absent.
     fallback = _missing_facade_detail({}, error)  # type: ignore[arg-type]
-    assert fallback == prefix + type(error).__name__  # safe identity, no raw message
+    assert fallback == prefix + "lifecycle"  # trusted-category identity
     assert len(fallback) < 500
 
     # Exactly at the bound: untruncated, durably persisted.

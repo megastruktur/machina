@@ -48,8 +48,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Final
 
+from sqlalchemy.exc import SQLAlchemyError
 from dbos import DBOS
 from dbos import error as dbos_error
 from pydantic_ai import Agent
@@ -108,6 +110,7 @@ from mai.jobs.steps import (
     StepExecutor,
     StepIntent,
     StepState,
+    StepsError,
 )
 from mai.policy.evaluate import ExecutionContext, execution_context_from_json
 
@@ -323,7 +326,7 @@ def parse_session_run_intent(payload_json: str) -> SessionRunIntent:
         context = execution_context_from_json(context_doc)
     except Exception as error:  # noqa: BLE001 - classified payload rejection
         raise SessionStageError(
-            "invalid_context", error_type=type(error).__name__
+            "invalid_context", error_type=_safe_error_identity(error)
         ) from None
     if str(context.run_id) != run_id or str(context.server_id) != server_id:
         raise SessionStageError("context_identity_mismatch")
@@ -586,7 +589,7 @@ async def _ensure_run_row(executor: SessionRunExecutor, intent: SessionRunIntent
         ).lower() and "duplicate" not in str(error).lower():
             print(
                 f"session runner: ensure_run_row failed: "
-                f"{type(error).__name__}: {error}",
+                f"{_safe_error_identity(error)}",
                 flush=True,
             )
             raise
@@ -996,12 +999,12 @@ async def _round_model(
 
         print(
             f"session runner: model round failed: "
-            f"{type(error).__name__}",
+            f"{_safe_error_identity(error)}",
             file=_sys.stderr,
             flush=True,
         )
         stage = SessionStageError(
-            "model_round_failed", error_type=type(error).__name__
+            "model_round_failed", error_type=_safe_error_identity(error)
         )
         # E2: the value-free type identity rides along for the
         # settlement detail (bounded at the durable write by the
@@ -1053,19 +1056,92 @@ async def _round_model(
 
 
 def _safe_error_identity(error: BaseException) -> str:
-    """E2 (F3b) diagnostic policy: the VALUE-FREE identity of a failure —
-    the exception TYPE name only (a finite vocabulary). Raw
-    ``str(error)`` NEVER enters durable detail, exception attributes
-    (DBOS pickles whole exception objects into step sinks), operational
-    payloads or runner logs: messages may carry tokens, DSNs,
-    Authorization headers or query literals."""
-    return type(error).__name__
+    """E2-fix1 (F-A) diagnostic policy: the failure's identity is a
+    FIXED CATEGORY chosen by walking the exception's MRO against a
+    trusted class mapping — never the (data-derived, possibly
+    sentinel-bearing) class NAME or message. Untrusted shapes fall back
+    to the bounded, nonrevealing ``opaque_error``."""
+    for cls in type(error).__mro__:
+        category = _ERROR_CATEGORIES.get(cls)
+        if category is not None:
+            return category
+    return "opaque_error"
+
+
+#: E2-fix1: trusted exception classes → fixed diagnostic categories.
+#: Keys are CLASS OBJECTS from this module's trusted imports; a
+#: data-derived dynamic class never appears here (its MRO can only
+#: match a trusted ancestor, yielding that ancestor's category).
+_ERROR_CATEGORIES: Final[Mapping[type[BaseException], str]] = MappingProxyType(
+    {
+        SessionStageError: "session_run",
+        SessionRunError: "session_run",
+        SessionRunFailed: "session_run",
+        SessionContractError: "session_contract",
+        RunLifecycleError: "lifecycle",
+        StepsError: "steps",
+        BridgeError: "tool_bridge",
+        BudgetError: "budget",
+        dbos_error.DBOSAwaitedWorkflowCancelledError: "cancelled",
+        dbos_error.DBOSWorkflowCancelledError: "cancelled",
+        dbos_error.DBOSException: "engine_interrupt",
+        RuntimeError: "runtime_error",
+        ValueError: "value_error",
+        TypeError: "type_error",
+        KeyError: "key_error",
+        TimeoutError: "timeout_error",
+        OSError: "os_error",
+        Exception: "opaque_error",
+        SQLAlchemyError: "database_error",
+    }
+)
+
+
+def _safe_step_errors(step_fn):
+    """E2-fix1 (F-B): wrap every durable step's ESCAPING exception at
+    the earliest boundary DBOS persists (it pickles the whole escaping
+    object into ``operation_outputs``). Only safe classified exceptions
+    cross: a raw unexpected failure becomes a value-free
+    ``SessionStageError`` with the trusted category (cause and attrs
+    detached via ``from None``); already-classified runner errors and
+    engine-owned DBOS exceptions pass through unchanged."""
+    import functools
+    import sys
+
+    @functools.wraps(step_fn)
+    def _wrapped(*args, **kwargs):
+        try:
+            return step_fn(*args, **kwargs)
+        except (
+            SessionRunError,
+            SessionRunFailed,
+            SessionContractError,
+            RunLifecycleError,
+            StepsError,
+            dbos_error.DBOSException,
+        ):
+            raise
+        except Exception as error:
+            category = _safe_error_identity(error)
+            print(
+                f"session runner: step {step_fn.__name__} failed: {category}",
+                file=sys.stderr,
+                flush=True,
+            )
+            stage = SessionStageError(
+                "step_unexpected_failure", error_type=category
+            )
+            stage.evidence = category  # value-free, for settlement detail
+            raise stage from None
+
+    return _wrapped
 
 
 # --- the DBOS steps (sync; async seams run on the executor's one loop) ---------------
 
 
 @DBOS.step(name="agents.session.started")
+@_safe_step_errors
 def _session_started(payload_json: str) -> str:
     """Anchor ``queued→running`` (facade), record the dual-authority
     ``running`` state and append the idempotent user turn + admission."""
@@ -1086,6 +1162,7 @@ def _session_started(payload_json: str) -> str:
 
 
 @DBOS.step(name="agents.session.model_bound")
+@_safe_step_errors
 def _session_model_bound(payload_json: str) -> str:
     """Pin the (connection, profile) pair (checkpointed)."""
     intent = parse_session_run_intent(payload_json)
@@ -1093,6 +1170,7 @@ def _session_model_bound(payload_json: str) -> str:
 
 
 @DBOS.step(name="agents.session.controls_drained")
+@_safe_step_errors
 def _session_controls_drained(payload_json: str) -> str:
     """Consume durable steering/pause/cancel controls at a safe boundary.
 
@@ -1106,6 +1184,7 @@ def _session_controls_drained(payload_json: str) -> str:
 
 
 @DBOS.step(name="agents.session.model_round")
+@_safe_step_errors
 def _session_model_round(payload_json: str, pins_json: str, round_index: int) -> str:
     """One durable model round (checkpointed).
 
@@ -1123,6 +1202,7 @@ def _session_model_round(payload_json: str, pins_json: str, round_index: int) ->
 
 
 @DBOS.step(name="agents.session.tool_execute")
+@_safe_step_errors
 def _session_tool_execute(payload_json: str, call_json: str, round_index: int) -> str:
     """One durable guarded tool execution (checkpointed).
 
@@ -1427,7 +1507,7 @@ async def _create_approval_request(
 
         print(
             f"session runner: approval creation failed: "
-            f"{type(error).__name__}: {error}",
+            f"{_safe_error_identity(error)}",
             file=_sys.stderr,
             flush=True,
         )
@@ -1458,6 +1538,7 @@ async def _persist_projected_result(
 
 
 @DBOS.step(name="agents.session.reconciling")
+@_safe_step_errors
 def _session_reconciling(payload_json: str, call_json: str) -> str:
     """Enter ``reconciling`` ONCE (dual authority + persisted deadline)."""
     intent = parse_session_run_intent(payload_json)
@@ -1486,6 +1567,7 @@ def _session_reconciling(payload_json: str, call_json: str) -> str:
 
 
 @DBOS.step(name="agents.session.reconcile_resolved")
+@_safe_step_errors
 def _session_reconcile_resolved(
     payload_json: str, call_json: str, round_index: int, timed_out: bool
 ) -> str:
@@ -1569,6 +1651,7 @@ def _session_reconcile_resolved(
 
 
 @DBOS.step(name="agents.session.reconcile_expired")
+@_safe_step_errors
 def _session_reconcile_expired(
     payload_json: str, call_json: str, round_index: int
 ) -> str:
@@ -1631,6 +1714,7 @@ async def _settle_unknown_session(
 
 
 @DBOS.step(name="agents.session.read_step")
+@_safe_step_errors
 def _session_read_step(payload_json: str, run_id: str, call_json: str) -> str:
     intent = parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
@@ -1743,6 +1827,7 @@ async def _repair_replayed_terminal_result(
 
 
 @DBOS.step(name="agents.session.approval_wait_entered")
+@_safe_step_errors
 def _session_approval_wait(payload_json: str, call_json: str, approval_id: str) -> str:
     """Enter ``waiting_approval`` ONCE (dual authority + persisted deadline)."""
     intent = parse_session_run_intent(payload_json)
@@ -1775,6 +1860,7 @@ def _session_approval_wait(payload_json: str, call_json: str, approval_id: str) 
 
 
 @DBOS.step(name="agents.session.wait_resumed")
+@_safe_step_errors
 def _session_wait_resumed(payload_json: str, from_state: str) -> str:
     intent = parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
@@ -1804,6 +1890,7 @@ def _resume_seq(call: Mapping[str, object], round_index: int) -> int:
 
 
 @DBOS.step(name="agents.session.approval_executed")
+@_safe_step_errors
 def _session_approval_execute(
     payload_json: str, call_json: str, approval_id: str, round_index: int
 ) -> str:
@@ -1934,6 +2021,7 @@ def _session_approval_execute(
 
 
 @DBOS.step(name="agents.session.denied_after_wait")
+@_safe_step_errors
 def _session_denied_after_wait(
     payload_json: str, call_json: str, approval_id: str, round_index: int
 ) -> str:
@@ -1962,6 +2050,7 @@ def _session_denied_after_wait(
 
 
 @DBOS.step(name="agents.session.tool_group_marked")
+@_safe_step_errors
 def _session_tool_group_marked(payload_json: str, entry_id: str, state: str) -> str:
     intent = parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
@@ -2093,6 +2182,7 @@ async def _plan_delegation(
 
 
 @DBOS.step(name="agents.session.delegation_execute")
+@_safe_step_errors
 def _session_delegation_execute(
     payload_json: str, call_json: str, round_index: int, pins_json: str
 ) -> str:
@@ -2163,6 +2253,7 @@ def _session_delegation_execute(
 
 
 @DBOS.step(name="agents.session.child_state")
+@_safe_step_errors
 def _session_child_state(payload_json: str, child_run_id: str) -> str:
     """Read the child's durable truth (checkpointed poll; pure read).
 
@@ -2300,6 +2391,7 @@ async def _settle_child_delegation(
 
 
 @DBOS.step(name="agents.session.child_settled")
+@_safe_step_errors
 def _session_child_settled(
     payload_json: str,
     call_json: str,
@@ -2454,6 +2546,7 @@ async def _update_delegation_entry(
 
 
 @DBOS.step(name="agents.session.compaction_checkpoint")
+@_safe_step_errors
 def _session_compaction_checkpoint(payload_json: str, pins_json: str) -> str:
     """Stable-id compaction checkpoint (D05): when the uncovered head is
     due, append ONE ``CompactionEntry`` (idempotent per range under the
@@ -2508,6 +2601,7 @@ def _missing_facade_detail(summary: Mapping[str, object], error: Exception) -> s
 
 
 @DBOS.step(name="agents.session.settled")
+@_safe_step_errors
 def _session_settled(payload_json: str, summary_json: str) -> str:
     """The dual-authority terminal settlement (checkpointed, idempotent)."""
     intent = parse_session_run_intent(payload_json)
@@ -2910,7 +3004,7 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
 
         print(
             f"session runner: unexpected workflow failure: "
-            f"{type(error).__name__}",
+            f"{_safe_error_identity(error)}",
             file=_sys.stderr,
             flush=True,
         )
@@ -2919,7 +3013,10 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             "unexpected_failure",
             detail=_safe_error_identity(error),
         )
-        raise
+        # E2-fix1 (F-B): the RAW exception object must never cross the
+        # workflow boundary (DBOS pickles it into workflow sinks) — the
+        # safe classified failure surfaces instead, cause detached.
+        raise SessionRunFailed("unexpected_failure") from None
 
 
 def _session_failed(payload_json: str, reason: str, *, detail: str | None = None) -> str:
