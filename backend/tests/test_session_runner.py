@@ -2138,28 +2138,26 @@ def _drop_facade_row(url: str, run_id: str) -> None:
         conn.commit()
 
 
-def test_missing_facade_long_original_error_settles_bounded_detail(
+def test_missing_facade_model_error_settles_safe_identity_no_sentinels(
     agent_url: str,
     factory: async_sessionmaker[AsyncSession],
     insert_run,
     scenario: pathlib.Path,
     composition,
 ) -> None:
-    """S5-fix1 (R5): a LONG original failure (unicode) reaching the
-    missing-facade settlement through the REAL workflow must still
-    settle failed with the detail bounded at the canonical contract
-    limit — an over-long detail would fail the durable write itself and
-    strand the session queued again."""
-    long_error = ("vault-🔐-détail-échec—" * 40)[:800]  # unicode, > 500
+    """E2 (F3b): a sentinel-bearing model failure reaching the
+    missing-facade settlement through the REAL workflow settles failed
+    with a VALUE-FREE detail — the exception TYPE only, never the raw
+    message — and zero sentinels anywhere durable or logged (this test
+    supersedes the S5-fix1 raw-evidence expectation with the explicit
+    safe-identity contract; the length bound is still proven separately
+    by the boundary contract test below)."""
     composition()
     _write_policy_files(scenario, grants=[{READ_CAP: True}])
     # The model parks at the gate; the test drops the facade row, then
-    # releases the gate so the model raises the LONG original error and
+    # releases the gate so the model raises the sentinel-soup error and
     # the real settlement runs against a missing facade (second catch).
-    _script(
-        scenario,
-        [{"gate": "g-s5fix1", "then": {"error": long_error}}],
-    )
+    _script(scenario, [{"gate": "g-s5fix1", "then": {"error": _E2_SOUP}}])
     session_id = _run(_make_session(factory))
     run_id = str(uuid.uuid4())
     _run(insert_run(run_id))
@@ -2192,11 +2190,7 @@ def test_missing_facade_long_original_error_settles_bounded_detail(
         client.close()
 
     runs = _read_session_runs(agent_url, session_id)
-    assert len(runs) == 1, runs
-    assert runs[0]["state"] == "failed", (
-        f"session stranded in {runs[0]['state']!r} — the long evidence "
-        "detail broke the settlement write (must stay within the bound)"
-    )
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
     header = _read_sessions_row(agent_url, session_id)
     assert header is not None and header["status"] == "failed"
     failures = [
@@ -2206,11 +2200,14 @@ def test_missing_facade_long_original_error_settles_bounded_detail(
     ]
     assert failures, "the durable failed run_state entry must exist"
     detail = str(failures[0].get("detail") or "")
-    assert detail.startswith(
-        "facade row missing at settlement; original failure: RuntimeError: "
+    # The EXPLICIT safe-identity contract: fixed prefix + exception TYPE
+    # only — no raw message, no sentinel soup, no long unicode payload.
+    assert detail == (
+        "facade row missing at settlement; original failure: RuntimeError"
     ), detail
-    assert len(detail) == 500, f"detail must be exactly the contract bound, got {len(detail)}"
-    assert "🔐" in detail  # unicode evidence preserved inside the bound
+    assert len(detail) <= 500
+    # Zero sentinels across session history, DBOS sinks and worker logs.
+    assert _sentinel_hits(agent_url, run_id, session_id, scenario) == []
     # No tool effects and no fabricated facade.
     assert not any(line.startswith("begin:") for line in _journal_lines(scenario))
     with psycopg.connect(agent_url) as conn:
@@ -2219,6 +2216,127 @@ def test_missing_facade_long_original_error_settles_bounded_detail(
             (uuid.UUID(run_id),),
         ).fetchone()[0]
     assert facades == 0
+
+
+# E2 synthetic sentinels (NEVER real secrets): token/DSN/auth/query
+# shapes that must never reach durable session detail, evidence attrs,
+# serialized DBOS sinks or runner logs.
+_E2_SENTINELS = (
+    "sk-e2-SENTINEL-abc123",
+    "SECRETTOKEN-e2-xyz",
+    "tok-e2-BEARER-987",
+    "postgres://e2user:e2pass@127.0.0.1:5432/e2db",
+    "Authorization: Bearer tok-e2-BEARER-987",
+    "SELECT * FROM secrets WHERE token='sk-e2-SENTINEL-abc123'",
+)
+_E2_SOUP = " ; ".join(_E2_SENTINELS) + " ; " + ("échec-🔐-" * 60)
+
+
+def _sentinel_hits(
+    url: str, run_id: str, session_id: str, scenario: pathlib.Path
+) -> list[tuple[str, str]]:
+    """Every (location, sentinel) leak across the affected durable and
+    diagnostic surfaces: session history payloads, serialized DBOS
+    error/output sinks (raw AND base64-decoded as the harness does) and
+    the worker logs."""
+    import base64
+
+    s_debug: set[str] = set()
+    hits: list[tuple[str, str]] = []
+    for entry in _read_session_entries(url, session_id):
+        blob = json.dumps(entry["payload"], ensure_ascii=False, default=str)
+        for sentinel in _E2_SENTINELS:
+            if sentinel in blob:
+                hits.append((f"session_entries:{entry['kind']}", sentinel))
+    with psycopg.connect(url) as conn:
+        rows = conn.execute(
+            """
+            SELECT 'workflow_status.error', COALESCE(error, '')
+            FROM dbos.workflow_status WHERE workflow_uuid = %s
+            UNION ALL
+            SELECT 'workflow_output.error', COALESCE(error, '')
+            FROM dbos.workflow_output WHERE workflow_uuid = %s
+            UNION ALL
+            SELECT 'workflow_output.output', COALESCE(output, '')
+            FROM dbos.workflow_output WHERE workflow_uuid = %s
+            UNION ALL
+            SELECT 'operation_outputs.output', COALESCE(output, '')
+            FROM dbos.operation_outputs WHERE workflow_uuid = %s
+            UNION ALL
+            SELECT 'operation_outputs.error', COALESCE(error, '')
+            FROM dbos.operation_outputs WHERE workflow_uuid = %s
+            """,
+            (run_id, run_id, run_id, run_id, run_id),
+        ).fetchall()
+    for source, blob in rows:
+        for sentinel in _E2_SENTINELS:
+            if sentinel in (blob or ""):
+                hits.append((source, sentinel))
+            try:  # decode base64-serialized sinks the way DBOS does
+                decoded = base64.b64decode(blob or "", validate=True).decode(
+                    "utf-8", errors="replace"
+                )
+            except Exception:  # noqa: BLE001 - not base64
+                continue
+            if sentinel in decoded:
+                hits.append((f"{source}(b64)", sentinel))
+    for log_path in sorted(scenario.glob("*.log")):
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        for sentinel in _E2_SENTINELS:
+            if sentinel in text:
+                hits.append((f"log:{log_path.name}", sentinel))
+    return hits
+
+
+def test_e2_sentinels_never_persist_on_facade_present_model_failure(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E2 (F3b): with the facade PRESENT, a sentinel-bearing model
+    failure settles failed with detail=None (the healthy settlement
+    passes no detail) and zero sentinels anywhere durable or logged —
+    including the worker log, which previously printed the raw error."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(scenario, [{"error": _E2_SOUP}])
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-e2p")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "sentinel-bearing model failure to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
+    failures = [
+        entry["payload"]
+        for entry in _read_session_entries(agent_url, session_id)
+        if entry["kind"] == "run_state" and entry["payload"]["state"] == "failed"
+    ]
+    assert failures, "the healthy settlement must record the failed run_state"
+    assert failures[0].get("detail") is None, failures[0]
+    assert failures[0].get("reason_code") == "model_round_failed", failures[0]
+    assert _sentinel_hits(agent_url, run_id, session_id, scenario) == []
 
 
 def test_missing_facade_detail_boundary_contract(
@@ -2283,7 +2401,7 @@ def test_missing_facade_detail_boundary_contract(
 
     # The evidence falls back to the lifecycle identity when absent.
     fallback = _missing_facade_detail({}, error)  # type: ignore[arg-type]
-    assert fallback == prefix + f"{type(error).__name__}: {error}"
+    assert fallback == prefix + type(error).__name__  # safe identity, no raw message
     assert len(fallback) < 500
 
     # Exactly at the bound: untruncated, durably persisted.

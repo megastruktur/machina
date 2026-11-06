@@ -996,17 +996,17 @@ async def _round_model(
 
         print(
             f"session runner: model round failed: "
-            f"{type(error).__name__}: {error}",
+            f"{type(error).__name__}",
             file=_sys.stderr,
             flush=True,
         )
         stage = SessionStageError(
             "model_round_failed", error_type=type(error).__name__
         )
-        # S5-fix1: the classified reason stays value-free; the ORIGINAL
-        # failure identity rides along for the settlement detail (bounded
-        # at the durable write by the canonical contract limit).
-        stage.evidence = f"{type(error).__name__}: {error}"
+        # E2: the value-free type identity rides along for the
+        # settlement detail (bounded at the durable write by the
+        # canonical contract limit); the raw message is never attached.
+        stage.evidence = _safe_error_identity(error)
         raise stage from None
 
     persisted = await apersist_run_exchange(
@@ -1050,6 +1050,16 @@ async def _round_model(
         "output_text": output_text,
         "round": round_index,
     }
+
+
+def _safe_error_identity(error: BaseException) -> str:
+    """E2 (F3b) diagnostic policy: the VALUE-FREE identity of a failure —
+    the exception TYPE name only (a finite vocabulary). Raw
+    ``str(error)`` NEVER enters durable detail, exception attributes
+    (DBOS pickles whole exception objects into step sinks), operational
+    payloads or runner logs: messages may carry tokens, DSNs,
+    Authorization headers or query literals."""
+    return type(error).__name__
 
 
 # --- the DBOS steps (sync; async seams run on the executor's one loop) ---------------
@@ -2484,13 +2494,14 @@ def _session_compaction_checkpoint(payload_json: str, pins_json: str) -> str:
 def _missing_facade_detail(summary: Mapping[str, object], error: Exception) -> str:
     """The bounded run-state detail for a missing-facade settlement (S5).
 
-    Carries the ORIGINAL failure evidence (the workflow's summary detail
-    when present, else the lifecycle rejection identity), prefixed with
-    the honest cause, and truncated at the canonical contract bound
+    Carries the failure's VALUE-FREE identity (the workflow's summary
+    detail — produced only by the E2 safe-identity policy — else the
+    lifecycle rejection's exception type), prefixed with the honest
+    cause, and truncated at the canonical contract bound
     ``RunStateEntry`` enforces — an over-long detail would itself fail
     the durable write and strand the session queued.
     """
-    evidence = summary.get("detail") or f"{type(error).__name__}: {error}"
+    evidence = summary.get("detail") or _safe_error_identity(error)
     return (
         "facade row missing at settlement; original failure: " + str(evidence)
     )[:MAX_DETAIL_CHARS]
@@ -2863,15 +2874,21 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             cancelled, dbos_error.DBOSAwaitedWorkflowCancelledError
         )
         print(
-            f"session runner: workflow interrupted: {observed} "
-            f"(cancel={is_cancel})",
+            f"session runner: workflow interrupted: "
+            f"{type(cancelled).__name__} (cancel={is_cancel})",
             file=_sys.stderr,
             flush=True,
         )
         if is_cancel:
             _session_cancelled(payload_json)
         else:
-            _session_failed(payload_json, "engine_interrupted", detail=observed)
+            # E2: the raw interruption text is DETECTION-only; the
+            # durable detail carries the value-free type identity.
+            _session_failed(
+                payload_json,
+                "engine_interrupted",
+                detail=_safe_error_identity(cancelled),
+            )
         raise
     except dbos_error.DBOSWorkflowCancelledError:
         _session_cancelled(payload_json)
@@ -2893,14 +2910,14 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
 
         print(
             f"session runner: unexpected workflow failure: "
-            f"{type(error).__name__}: {error}",
+            f"{type(error).__name__}",
             file=_sys.stderr,
             flush=True,
         )
         _session_failed(
             payload_json,
             "unexpected_failure",
-            detail=f"{type(error).__name__}: {error}",
+            detail=_safe_error_identity(error),
         )
         raise
 
