@@ -22,6 +22,12 @@ Acceptance (BRIEF_D02 §B/§C; sfc_PLAN.md D02; sfc_RESEARCH §8):
    ONE transaction; a repeated same-state call does not duplicate.
 7. **Generic survival**: after the reset, the retained generic tag/job
    surface still executes with its seeded rows.
+8. **Root admission seam** (queued-chat hotfix S1): the root writer
+   creates ``session_runs`` + the depth-0 ``job_runs`` facade + the
+   mandatory ``job_tags`` classification in ONE transaction with real
+   caller-supplied revisions/grants; matching replay converges (including
+   pre-hotfix rows lacking the facade), cross-identity collisions fail
+   closed, and a mid-transaction failure rolls back every insert.
 
 Boundary discipline: every claim runs against a real disposable PostgreSQL
 fixture (``MAI_TEST_DATABASE_URL``; the chain needs pgvector —
@@ -53,6 +59,7 @@ from mai.database import create_app_engine
 from mai.session_store import (
     aappend_entry,
     aattach_session_tag,
+    acreate_root_run,
     acreate_run,
     acreate_session,
     aget_session,
@@ -66,7 +73,11 @@ from mai.session_store import (
     _append_entry_tx,
     _lock_session,
 )
-from mai.tag_store import RESERVED_UNCLASSIFIED_TAG_ID, alist_tags
+from mai.tag_store import (
+    RESERVED_UNCLASSIFIED_TAG_ID,
+    SYSTEM_ASSIGNMENT_SOURCE,
+    alist_tags,
+)
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALEMBIC_INI = os.path.join(BACKEND_ROOT, "alembic.ini")
@@ -803,3 +814,451 @@ async def test_generic_tag_surface_survives_and_store_aux_works(
     )
     assert first.admission_id == second.admission_id
     assert first.run_id == RUN_1
+
+# ---------------------------------------------------------------------------
+# 8. root admission seam (queued-chat hotfix S1)
+# ---------------------------------------------------------------------------
+
+
+ROOT_RUN_1 = uuid.UUID("a1e2c3d4-0002-4002-8002-0000000000a2")
+ROOT_RUN_2 = uuid.UUID("a1e2c3d4-0003-4003-8003-0000000000a3")
+ROOT_RUN_FOREIGN = uuid.UUID("a1e2c3d4-0004-4004-8004-0000000000a4")
+ROOT_CREQ = uuid.UUID(int=0x7C0)
+#: Deliberately NON-default revision values: the facade must carry the
+# caller's real binding (7/9), never a fabricated 1/1.
+ROOT_PROFILE_REV = 7
+ROOT_PROMPT_REV = 9
+ROOT_GRANTS = ["chat.write", "history.read"]
+
+
+async def _purge_root_facade_rows(
+    factory: async_sessionmaker[AsyncSession], *run_ids: uuid.UUID
+) -> None:
+    """Remove THIS section's facade rows (``job_tags`` cascade with
+    ``job_runs``).
+
+    The shared autouse fixture truncates only the session-first tables;
+    the generic job surface keeps its seeded rows (acceptance 7), so the
+    root-seam tests scope their cleanup to exactly the run ids they own.
+    The 0011 trigger refuses to delete an UNCLASSIFIED run, so a bare
+    facade row (the foreign-identity fixture) is classified first.
+    """
+    async with factory() as session:
+        async with session.begin():
+            await session.execute(
+                sql_text(
+                    """
+                    INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                    SELECT u.run_id, :tag, :source
+                    FROM unnest(CAST(:rids AS uuid[])) AS u(run_id)
+                    WHERE EXISTS (
+                        SELECT 1 FROM job_runs jr WHERE jr.run_id = u.run_id
+                    )
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "rids": [str(rid) for rid in run_ids],
+                    "tag": RESERVED_UNCLASSIFIED_TAG_ID,
+                    "source": SYSTEM_ASSIGNMENT_SOURCE,
+                },
+            )
+            await session.execute(
+                sql_text(
+                    "DELETE FROM job_runs WHERE run_id = ANY(CAST(:rids AS uuid[]))"
+                ),
+                {"rids": [str(rid) for rid in run_ids]},
+            )
+
+
+async def _root_seam_rows(
+    factory: async_sessionmaker[AsyncSession], run_id: uuid.UUID
+) -> tuple[object | None, object | None, list[object]]:
+    """Read back the full root-admission footprint of one run id."""
+    async with factory() as session:
+        run = (
+            await session.execute(
+                sql_text(
+                    "SELECT session_id, server_id, parent_run_id, state, "
+                    "model_profile, client_request_id FROM session_runs "
+                    "WHERE run_id = :rid"
+                ),
+                {"rid": run_id},
+            )
+        ).mappings().first()
+        facade = (
+            await session.execute(
+                sql_text(
+                    "SELECT server_id, depth, parent_run_id, profile_revision, "
+                    "prompt_revision, model_profile, requested_grants "
+                    "FROM job_runs WHERE run_id = :rid"
+                ),
+                {"rid": run_id},
+            )
+        ).mappings().first()
+        tags = (
+            (
+                await session.execute(
+                    sql_text(
+                        "SELECT tag_id, assignment_source FROM job_tags "
+                        "WHERE job_id = :rid"
+                    ),
+                    {"rid": run_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return run, facade, list(tags)
+
+
+async def test_root_admission_creates_run_facade_and_classification_atomically(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _purge_root_facade_rows(factory, ROOT_RUN_1)
+    try:
+        session_row = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+        admitted = await acreate_root_run(
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_1,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+            profile_revision=ROOT_PROFILE_REV,
+            prompt_revision=ROOT_PROMPT_REV,
+            requested_grants=ROOT_GRANTS,
+        )
+        assert admitted.state == "queued"
+        assert admitted.parent_run_id is None  # a root, by construction
+        assert admitted.model_profile == "primary"
+        assert admitted.client_request_id == ROOT_CREQ
+
+        run, facade, tags = await _root_seam_rows(factory, ROOT_RUN_1)
+        assert run is not None
+        assert run["session_id"] == session_row.session_id
+        assert run["state"] == "queued"
+        # The facade row: THIS server's root with the caller's real
+        # revisions and grants — depth 0, no parent, nothing fabricated.
+        assert facade is not None
+        assert facade["server_id"] == SERVER_A
+        assert facade["depth"] == 0
+        assert facade["parent_run_id"] is None
+        assert facade["profile_revision"] == ROOT_PROFILE_REV
+        assert facade["prompt_revision"] == ROOT_PROMPT_REV
+        assert facade["model_profile"] == "primary"
+        assert facade["requested_grants"] == sorted(ROOT_GRANTS)
+        # The 0011 mandatory classification, committed with the facade.
+        assert len(tags) == 1
+        assert tags[0]["tag_id"] == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+        assert tags[0]["assignment_source"] == SYSTEM_ASSIGNMENT_SOURCE
+    finally:
+        await _purge_root_facade_rows(factory, ROOT_RUN_1)
+
+
+async def test_matching_root_admission_replay_is_idempotent(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _purge_root_facade_rows(factory, ROOT_RUN_1)
+    try:
+        session_row = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+        first = await acreate_root_run(
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_1,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+            profile_revision=ROOT_PROFILE_REV,
+            prompt_revision=ROOT_PROMPT_REV,
+            requested_grants=ROOT_GRANTS,
+        )
+        second = await acreate_root_run(
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_1,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+            profile_revision=ROOT_PROFILE_REV,
+            prompt_revision=ROOT_PROMPT_REV,
+            requested_grants=ROOT_GRANTS,
+        )
+        assert second == first  # same committed row, same timestamps
+        async with factory() as session:
+            run_count = (
+                await session.execute(
+                    sql_text(
+                        "SELECT COUNT(*) FROM session_runs WHERE run_id = :rid"
+                    ),
+                    {"rid": ROOT_RUN_1},
+                )
+            ).scalar_one()
+            facade_count = (
+                await session.execute(
+                    sql_text(
+                        "SELECT COUNT(*) FROM job_runs WHERE run_id = :rid"
+                    ),
+                    {"rid": ROOT_RUN_1},
+                )
+            ).scalar_one()
+            tag_count = (
+                await session.execute(
+                    sql_text(
+                        "SELECT COUNT(*) FROM job_tags WHERE job_id = :rid"
+                    ),
+                    {"rid": ROOT_RUN_1},
+                )
+            ).scalar_one()
+        assert run_count == 1
+        assert facade_count == 1
+        assert tag_count == 1
+    finally:
+        await _purge_root_facade_rows(factory, ROOT_RUN_1)
+
+
+async def test_root_admission_replay_backfills_legacy_row_without_facade(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The production incident shape: a pre-hotfix root ``session_runs``
+    row committed WITHOUT the facade. A retry through the seam converges:
+    the existing run row is returned unchanged and the missing facade +
+    classification are created — never a duplicate run."""
+    await _purge_root_facade_rows(factory, ROOT_RUN_2)
+    try:
+        session_row = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.API
+        )
+        legacy = await acreate_run(  # the pre-hotfix root writer
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_2,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+        )
+        _, facade, tags = await _root_seam_rows(factory, ROOT_RUN_2)
+        assert facade is None  # exactly the diagnosed missing-row state
+        assert tags == []
+
+        converged = await acreate_root_run(
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_2,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+            profile_revision=ROOT_PROFILE_REV,
+            prompt_revision=ROOT_PROMPT_REV,
+            requested_grants=ROOT_GRANTS,
+        )
+        assert converged.run_id == legacy.run_id
+        assert converged.created_at == legacy.created_at  # same row, not a copy
+        run, facade, tags = await _root_seam_rows(factory, ROOT_RUN_2)
+        assert run is not None
+        assert facade is not None
+        assert facade["profile_revision"] == ROOT_PROFILE_REV
+        assert facade["prompt_revision"] == ROOT_PROMPT_REV
+        assert facade["requested_grants"] == sorted(ROOT_GRANTS)
+        assert len(tags) == 1
+        async with factory() as session:
+            run_count = (
+                await session.execute(
+                    sql_text(
+                        "SELECT COUNT(*) FROM session_runs WHERE run_id = :rid"
+                    ),
+                    {"rid": ROOT_RUN_2},
+                )
+            ).scalar_one()
+        assert run_count == 1
+    finally:
+        await _purge_root_facade_rows(factory, ROOT_RUN_2)
+
+
+async def test_root_admission_rejects_cross_identity_and_rolls_back_atomically(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Fail-closed identity conflicts, with REAL atomic rollback: the
+    transaction inserts ``session_runs`` BEFORE the facade identity check
+    fires, so the post-failure absence of that row proves Postgres rolled
+    the whole transaction back."""
+    await _purge_root_facade_rows(factory, ROOT_RUN_1, ROOT_RUN_FOREIGN)
+    try:
+        # (a) run id already admitted under a DIFFERENT session.
+        first_session = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+        second_session = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+        await acreate_root_run(
+            factory,
+            session_id=first_session.session_id,
+            server_id=SERVER_A,
+            run_id=ROOT_RUN_1,
+            model_profile="primary",
+            client_request_id=ROOT_CREQ,
+            profile_revision=ROOT_PROFILE_REV,
+            prompt_revision=ROOT_PROMPT_REV,
+            requested_grants=ROOT_GRANTS,
+        )
+        with pytest.raises(SessionContractError) as err:
+            await acreate_root_run(
+                factory,
+                session_id=second_session.session_id,
+                server_id=SERVER_A,
+                run_id=ROOT_RUN_1,
+                model_profile="primary",
+                client_request_id=ROOT_CREQ,
+                profile_revision=ROOT_PROFILE_REV,
+                prompt_revision=ROOT_PROMPT_REV,
+                requested_grants=ROOT_GRANTS,
+            )
+        assert err.value.fields == {
+            "run_id": SessionErrorCode.SESSION_RUN_IDENTITY_CONFLICT
+        }
+        async with factory() as session:
+            stolen = (
+                await session.execute(
+                    sql_text(
+                        "SELECT COUNT(*) FROM session_runs "
+                        "WHERE run_id = :rid AND session_id = :sid"
+                    ),
+                    {"rid": ROOT_RUN_1, "sid": second_session.session_id},
+                )
+            ).scalar_one()
+        assert stolen == 0  # nothing committed for the second session
+
+        # (b) facade owned by ANOTHER server (a foreign-surface run id; it
+        # carries its own legitimate classification, as every writer must):
+        # the session_runs insert inside this transaction succeeds, the
+        # facade identity check then fails — everything must roll back.
+        async with factory() as session:
+            async with session.begin():
+                await session.execute(
+                    sql_text(
+                        """
+                        INSERT INTO job_runs
+                            (run_id, server_id, depth, profile_revision,
+                             prompt_revision, model_profile, requested_grants,
+                             submitted_at, updated_at)
+                        VALUES
+                            (:rid, :server_id, 0, 3, 3, 'foreign', :grants,
+                             now(), now())
+                        """
+                    ),
+                    {
+                        "rid": ROOT_RUN_FOREIGN,
+                        "server_id": SERVER_B,
+                        "grants": json.dumps([]),
+                    },
+                )
+                await session.execute(
+                    sql_text(
+                        """
+                        INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                        VALUES (:rid, :tag, :source)
+                        ON CONFLICT DO NOTHING
+                        """
+                    ),
+                    {
+                        "rid": ROOT_RUN_FOREIGN,
+                        "tag": RESERVED_UNCLASSIFIED_TAG_ID,
+                        "source": SYSTEM_ASSIGNMENT_SOURCE,
+                    },
+                )
+        third_session = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+        with pytest.raises(SessionContractError) as facade_err:
+            await acreate_root_run(
+                factory,
+                session_id=third_session.session_id,
+                server_id=SERVER_A,
+                run_id=ROOT_RUN_FOREIGN,
+                model_profile="primary",
+                client_request_id=ROOT_CREQ,
+                profile_revision=ROOT_PROFILE_REV,
+                prompt_revision=ROOT_PROMPT_REV,
+                requested_grants=ROOT_GRANTS,
+            )
+        assert facade_err.value.fields == {
+            "run_id": SessionErrorCode.SESSION_RUN_IDENTITY_CONFLICT
+        }
+        run, facade, tags = await _root_seam_rows(factory, ROOT_RUN_FOREIGN)
+        assert run is None  # the in-transaction insert rolled back
+        assert facade is not None
+        assert facade["server_id"] == SERVER_B  # foreign row untouched
+        assert facade["model_profile"] == "foreign"
+        assert facade["profile_revision"] == 3  # this seam's 7 never landed
+        # Exactly the foreign writer's OWN classification remains — the
+        # classification count cannot grow through a failed admission.
+        assert len(tags) == 1
+        assert tags[0]["tag_id"] == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+    finally:
+        await _purge_root_facade_rows(factory, ROOT_RUN_1, ROOT_RUN_FOREIGN)
+
+
+async def test_root_admission_validation_is_fail_closed_and_scope_blind(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _purge_root_facade_rows(factory, ROOT_RUN_1)
+    try:
+        session_row = await acreate_session(
+            factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+        )
+
+        async def _admit(**overrides: object) -> SessionContractError | None:
+            kwargs: dict[str, object] = {
+                "session_id": session_row.session_id,
+                "server_id": SERVER_A,
+                "run_id": ROOT_RUN_1,
+                "model_profile": "primary",
+                "client_request_id": ROOT_CREQ,
+                "profile_revision": ROOT_PROFILE_REV,
+                "prompt_revision": ROOT_PROMPT_REV,
+                "requested_grants": ROOT_GRANTS,
+            }
+            kwargs.update(overrides)
+            try:
+                await acreate_root_run(factory, **kwargs)  # type: ignore[arg-type]
+            except SessionContractError as exc:
+                return exc
+            return None
+
+        # Fabricated/out-of-contract revisions are refused before any write.
+        assert (
+            await _admit(profile_revision=0)
+        ).fields == {"profile_revision": SessionErrorCode.FORBIDDEN_FIELD}
+        assert (
+            await _admit(prompt_revision=0)
+        ).fields == {"prompt_revision": SessionErrorCode.FORBIDDEN_FIELD}
+        assert (await _admit(profile_revision=True)) is not None  # bool is not a revision
+        # Grants must be a real caller-supplied sequence of references.
+        assert (
+            await _admit(requested_grants=["chat.write", 5])
+        ).fields == {"requested_grants": SessionErrorCode.FORBIDDEN_FIELD}
+        assert (await _admit(requested_grants="history.read")) is not None
+        assert (await _admit(requested_grants=None)) is not None
+        assert (
+            await _admit(model_profile="x" * 129)
+        ).fields == {"model_profile": SessionErrorCode.FORBIDDEN_FIELD}
+        # Nothing from the rejected calls reached the database.
+        run, facade, tags = await _root_seam_rows(factory, ROOT_RUN_1)
+        assert run is None and facade is None and tags == []
+
+        # Scope blindness: another server's session is value-free absent.
+        other = await acreate_session(
+            factory, server_id=SERVER_B, source=SessionSourceKind.INTERACTIVE
+        )
+        scope_err = await _admit(
+            session_id=other.session_id, server_id=SERVER_A
+        )
+        assert scope_err is not None
+        assert scope_err.fields == {"server_id": SessionErrorCode.SESSION_NOT_FOUND}
+    finally:
+        await _purge_root_facade_rows(factory, ROOT_RUN_1)

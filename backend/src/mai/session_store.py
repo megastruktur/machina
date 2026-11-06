@@ -74,6 +74,8 @@ from mai.contracts.sessions import (
 )
 from mai.tag_store import (
     EntityTagPreview,
+    RESERVED_UNCLASSIFIED_TAG_ID,
+    SYSTEM_ASSIGNMENT_SOURCE,
     TagErrorCode,
     TagStoreError,
     aclassify_integrity_error,
@@ -91,7 +93,7 @@ __all__ = [
     "SessionTagRow",
     "aappend_entry",
     "aattach_session_tag",
-    "acreate_run",
+    "acreate_root_run",
     "acreate_session",
     "alist_compactions",
     "alist_provider_artifacts",
@@ -1177,6 +1179,219 @@ async def acreate_run(
                             )
                         ]
                     )
+    return _run_row(row)
+
+async def acreate_root_run(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    run_id: uuid.UUID,
+    model_profile: str,
+    client_request_id: uuid.UUID,
+    profile_revision: int,
+    prompt_revision: int,
+    requested_grants: Sequence[str],
+) -> SessionRunRow:
+    """Admit one ROOT execution run: ``session_runs`` + the retained
+    execution facade (``job_runs`` depth 0) + its mandatory ``job_tags``
+    classification in ONE transaction (queued-chat hotfix S1).
+
+    The retained jobs machinery (steps/lifecycle) FK-references
+    ``job_runs`` and the 0011 mandatory-tag invariant binds the
+    classification into the SAME transaction, so a root admission that
+    committed ``session_runs`` without the facade would strand the run
+    queued forever (diagnostic: session_runs row present, worker startup
+    ``run_not_found``). This seam is the single atomic root writer; child
+    runs keep :func:`acreate_run` + the delegation facade unchanged.
+
+    ``profile_revision``/``prompt_revision``/``requested_grants`` have NO
+    defaults: the caller supplies the real bound revisions and grant
+    references (never fabricated values, never widened authority). A
+    matching replay is idempotent — the run id is the key; a replayed
+    admission converges on the committed rows and back-fills a facade
+    missing from pre-hotfix root rows. A run id already committed under a
+    different session OR a facade owned by a different server/depth is a
+    hard identity conflict (fail closed; the whole transaction rolls
+    back).
+    """
+    if (
+        not isinstance(model_profile, str)
+        or not 1 <= len(model_profile) <= _PROVIDER_MAX_CHARS
+    ):
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "model_profile",
+                    "model_profile must be 1..128 characters",
+                )
+            ]
+        )
+    for field_name, revision in (
+        ("profile_revision", profile_revision),
+        ("prompt_revision", prompt_revision),
+    ):
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise SessionContractError(
+                [
+                    SessionFieldError(
+                        SessionErrorCode.FORBIDDEN_FIELD,
+                        field_name,
+                        "revision must be an integer >= 1 supplied by the "
+                        "caller; fabricated revisions are refused",
+                    )
+                ]
+            )
+    if (
+        isinstance(requested_grants, (str, bytes))
+        or not isinstance(requested_grants, Sequence)
+        or any(
+            not isinstance(grant, str) or not grant for grant in requested_grants
+        )
+    ):
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "requested_grants",
+                    "requested_grants must be a sequence of non-empty grant "
+                    "references supplied by the caller",
+                )
+            ]
+        )
+    grants_document = json.dumps(sorted(requested_grants))
+    async with sessions() as session:
+        async with session.begin():
+            await _lock_session(
+                session, session_id=session_id, server_id=server_id
+            )
+            assert_session_not_run(session_id, run_id)
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO session_runs
+                            (run_id, session_id, server_id, parent_run_id,
+                             state, model_profile, client_request_id)
+                        VALUES
+                            (:rid, :sid, :server_id, NULL, 'queued',
+                             :profile, :creq)
+                        ON CONFLICT (run_id) DO NOTHING
+                        RETURNING run_id, session_id, server_id, parent_run_id,
+                                  state, model_profile, client_request_id,
+                                  created_at, updated_at, completed_at
+                        """
+                    ),
+                    {
+                        "rid": run_id,
+                        "sid": session_id,
+                        "server_id": server_id,
+                        "profile": model_profile,
+                        "creq": client_request_id,
+                    },
+                )
+            ).mappings().first()
+            if row is None:
+                # The run id already exists: same-identity replay converges
+                # on the committed row; a run id committed under a
+                # DIFFERENT session is a hard identity conflict.
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT run_id, session_id, server_id, parent_run_id,
+                                   state, model_profile, client_request_id,
+                                   created_at, updated_at, completed_at
+                            FROM session_runs
+                            WHERE run_id = :rid AND session_id = :sid
+                            """
+                        ),
+                        {"rid": run_id, "sid": session_id},
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise SessionContractError(
+                        [
+                            SessionFieldError(
+                                SessionErrorCode.SESSION_RUN_IDENTITY_CONFLICT,
+                                "run_id",
+                                "the run id already exists under a different "
+                                "session identity",
+                            )
+                        ]
+                    )
+            facade = (
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO job_runs
+                            (run_id, server_id, depth, profile_revision,
+                             prompt_revision, model_profile, requested_grants,
+                             submitted_at, updated_at)
+                        VALUES
+                            (:rid, :server_id, 0, :profile_revision,
+                             :prompt_revision, :profile, :grants, now(), now())
+                        ON CONFLICT (run_id) DO NOTHING
+                        RETURNING run_id
+                        """
+                    ),
+                    {
+                        "rid": run_id,
+                        "server_id": server_id,
+                        "profile_revision": profile_revision,
+                        "prompt_revision": prompt_revision,
+                        "profile": model_profile,
+                        "grants": grants_document,
+                    },
+                )
+            ).scalar()
+            if facade is None:
+                # The facade row already exists (a replay through this seam,
+                # or a pre-hotfix/foreign-surface run id): converge only
+                # when it is THIS server's root facade.
+                existing = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT server_id, depth FROM job_runs
+                            WHERE run_id = :rid
+                            """
+                        ),
+                        {"rid": run_id},
+                    )
+                ).mappings().first()
+                if (
+                    existing is None
+                    or existing["server_id"] != server_id
+                    or existing["depth"] != 0
+                ):
+                    raise SessionContractError(
+                        [
+                            SessionFieldError(
+                                SessionErrorCode.SESSION_RUN_IDENTITY_CONFLICT,
+                                "run_id",
+                                "the run id already exists under a different "
+                                "execution identity",
+                            )
+                        ]
+                    )
+            # 0011 mandatory-tag invariant: the classification commits in
+            # the SAME transaction as the facade row it belongs to.
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                    VALUES (:rid, :tag, :source)
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "rid": run_id,
+                    "tag": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+                    "source": SYSTEM_ASSIGNMENT_SOURCE,
+                },
+            )
     return _run_row(row)
 
 
