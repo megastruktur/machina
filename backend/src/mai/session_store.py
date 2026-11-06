@@ -48,6 +48,7 @@ from enum import Enum
 from typing import Final
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.contracts.sessions import (
@@ -71,7 +72,12 @@ from mai.contracts.sessions import (
     assert_session_not_run,
     assert_session_scope,
 )
-from mai.tag_store import TagErrorCode, TagStoreError
+from mai.tag_store import (
+    EntityTagPreview,
+    TagErrorCode,
+    TagStoreError,
+    aclassify_integrity_error,
+)
 
 __all__ = [
     "ARTIFACT_KINDS",
@@ -90,6 +96,9 @@ __all__ = [
     "alist_compactions",
     "alist_provider_artifacts",
     "alist_session_tags",
+    "arename_session",
+    "aremove_session_tag",
+    "apreview_session_tags",
     "alist_sessions",
     "aread_session_history",
     "arecord_admission",
@@ -107,6 +116,10 @@ ARTIFACT_KINDS: Final[frozenset[str]] = frozenset({"summary", "signature", "opaq
 
 #: Session-tag writer vocabulary (schema CHECK; matches the 0011 catalog).
 ASSIGNMENT_SOURCES: Final[frozenset[str]] = frozenset({"agent", "user", "system"})
+#: The SessionStatus vocabulary (same set the migration's CHECK enforces).
+_SESSION_STATUSES: Final[frozenset[str]] = frozenset(
+    member.value for member in SessionStatus
+)
 
 #: Run states that settle a run (``completed_at`` is stamped for these;
 #: the waiting_*/running/queued states stay resumable).
@@ -442,11 +455,19 @@ async def aget_session(
 async def alist_sessions(
     sessions: async_sessionmaker[AsyncSession],
     *,
-    server_id: uuid.UUID,
+    server_id: uuid.UUID | None = None,
+    status: str | None = None,
+    tag_id: uuid.UUID | None = None,
     limit: int = SESSION_LIST_DEFAULT_LIMIT,
     offset: int = 0,
 ) -> tuple[list[SessionRow], int]:
-    """Bounded deterministic session page (newest-change first) + total."""
+    """Bounded deterministic session page (newest-change first) + total.
+
+    D07-fix1 F2: ``server_id`` is OPTIONAL (``None`` lists the recent page
+    across all enrolled servers + General Consult, mirroring the reviewed
+    conversation list), and the page accepts the bounded ``status`` and
+    ``tag_id`` filters (the tag filter joins ``session_tags`` under the
+    identical predicate, so ``total`` stays honest)."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= SESSION_LIST_MAX_LIMIT:
         raise SessionContractError(
             [
@@ -467,28 +488,50 @@ async def alist_sessions(
                 )
             ]
         )
+    if status is not None and status not in _SESSION_STATUSES:
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "status",
+                    "status must be one of the SessionStatus vocabulary values",
+                )
+            ]
+        )
+    predicate = "WHERE TRUE"
+    params: dict[str, object] = {"l": limit, "o": offset}
+    if server_id is not None:
+        predicate += " AND sessions.server_id = :server_id"
+        params["server_id"] = server_id
+    if status is not None:
+        predicate += " AND sessions.status = :status"
+        params["status"] = status
+    if tag_id is not None:
+        predicate += (
+            " AND sessions.session_id IN "
+            "(SELECT session_id FROM session_tags WHERE tag_id = :tag_id)"
+        )
+        params["tag_id"] = tag_id
     async with sessions() as session:
         rows = (
             await session.execute(
                 text(
-                    """
+                    f"""
                     SELECT session_id, server_id, source, status, title,
                            created_at, updated_at
                     FROM sessions
-                    WHERE server_id = :server_id
+                    {predicate}
                     ORDER BY updated_at DESC, session_id
                     LIMIT :l OFFSET :o
                     """
                 ),
-                {"server_id": server_id, "l": limit, "o": offset},
+                params,
             )
         ).mappings().all()
         total = (
             await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM sessions WHERE server_id = :server_id"
-                ),
-                {"server_id": server_id},
+                text(f"SELECT COUNT(*) FROM sessions {predicate}"),
+                {key: value for key, value in params.items() if key not in ("l", "o")},
             )
         ).scalar_one()
     return [_session_row(row) for row in rows], int(total)
@@ -1639,3 +1682,244 @@ async def asession_tags_page(
 
 #: Read-oriented alias kept for call-site symmetry with the catalog helpers.
 alist_session_tags = asession_tags_page
+
+
+async def arename_session(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID | None,
+    title: str,
+) -> SessionRow:
+    """Rename one session under its session-row lock (D07-fix1 F2).
+
+    The trimmed title must stay in 1..120 characters (a tighter bound than
+    the create path's 240: rename is an explicit user act, and the drawer's
+    inline editor posts exactly this vocabulary). ``server_id=None``
+    resolves the session's OWN stored scope (the drawer rename carries no
+    scope pin); a supplied scope must match, else scope-blind not-found.
+    The updated row is re-read under the SAME lock so the returned
+    ``SessionRow`` is the committed truth.
+    """
+    if not isinstance(title, str):
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "title",
+                    "title must be a string",
+                )
+            ]
+        )
+    trimmed = title.strip()
+    if not 1 <= len(trimmed) <= 120:
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "title",
+                    "title must be 1..120 characters when set",
+                )
+            ]
+        )
+    async with sessions() as session, session.begin():
+        if server_id is None:
+            stored = (
+                await session.execute(
+                    text("SELECT server_id FROM sessions WHERE session_id = :sid"),
+                    {"sid": session_id},
+                )
+            ).scalar()
+            if stored is None:
+                raise _not_found("session_id")
+            server_id = uuid.UUID(str(stored))
+        await _lock_session(session, session_id=session_id, server_id=server_id)
+        await session.execute(
+            text(
+                """
+                UPDATE sessions
+                SET title = :title, updated_at = now()
+                WHERE session_id = :sid
+                """
+            ),
+            {"title": trimmed, "sid": session_id},
+        )
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT session_id, server_id, source, status, title,
+                           created_at, updated_at
+                    FROM sessions
+                    WHERE session_id = :sid
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).mappings().one()
+    return _session_row(row)
+
+
+async def aremove_session_tag(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    replacement_tag_id: uuid.UUID | None = None,
+) -> None:
+    """Remove one session-tag association (D07-fix1 F2); mirrors
+    :func:`mai.tag_store.aremove_conversation_tag`:
+
+    - scope-blind session refusal via :func:`_lock_session`;
+    - an unbound tag is an idempotent no-op (204 either way);
+    - the mandatory-at-least-one-tag invariant: removing the last tag
+      without a replacement refuses ``last_tag`` (409); a replacement
+      attaches in the SAME transaction (``assignment_source='system'``).
+    """
+    if replacement_tag_id is not None and replacement_tag_id == tag_id:
+        raise TagStoreError(
+            TagErrorCode.VALIDATION,
+            "the replacement must differ from the removed tag",
+            "replacement_tag_id",
+        )
+    try:
+        async with sessions() as session, session.begin():
+            await _lock_session(session, session_id=session_id, server_id=server_id)
+            bound = (
+                await session.execute(
+                    text(
+                        "SELECT 1 FROM session_tags "
+                        "WHERE session_id = :sid AND tag_id = :tid"
+                    ),
+                    {"sid": session_id, "tid": tag_id},
+                )
+            ).scalar()
+            if bound is None:
+                return
+            remaining = int(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM session_tags "
+                            "WHERE session_id = :sid"
+                        ),
+                        {"sid": session_id},
+                    )
+                ).scalar_one()
+            )
+            if remaining == 1 and replacement_tag_id is None:
+                raise TagStoreError(
+                    TagErrorCode.LAST_TAG,
+                    "the last tag cannot be removed without a replacement",
+                    "replacement_tag_id",
+                )
+            await session.execute(
+                text(
+                    "DELETE FROM session_tags "
+                    "WHERE session_id = :sid AND tag_id = :tid"
+                ),
+                {"sid": session_id, "tid": tag_id},
+            )
+            if replacement_tag_id is not None:
+                replacement = (
+                    await session.execute(
+                        text("SELECT tag_id FROM tags WHERE tag_id = :tid"),
+                        {"tid": replacement_tag_id},
+                    )
+                ).first()
+                if replacement is None:
+                    raise TagStoreError(
+                        TagErrorCode.TAG_NOT_FOUND,
+                        "no catalog tag with this identity",
+                        "replacement_tag_id",
+                    )
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO session_tags (session_id, tag_id,
+                                                  assignment_source)
+                        VALUES (:sid, :tid, 'system')
+                        ON CONFLICT (session_id, tag_id) DO NOTHING
+                        """
+                    ),
+                    {"sid": session_id, "tid": replacement_tag_id},
+                )
+    except DBAPIError as exc:
+        # Mirrors aremove_conversation_tag: classify commit-time deferred
+        # trigger failures; raw DB errors never leak.
+        raise aclassify_integrity_error(exc) from exc
+
+
+async def apreview_session_tags(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_ids: Sequence[uuid.UUID],
+    server_id: uuid.UUID | None = None,
+) -> dict[uuid.UUID, EntityTagPreview]:
+    """Batch tag previews for at most one list page of sessions (N5).
+
+    Two bounded queries: per-session totals and the first 3 names
+    (deterministic ``created_at, name`` order). ``server_id=None``
+    previews the recent cross-server page (each id was already produced
+    under its own scope). Sessions with zero tags are absent from the
+    result — the caller renders honest absence, never a fabricated
+    preview."""
+    if not session_ids:
+        return {}
+    identifiers = [uuid.UUID(str(value)) for value in session_ids][:SESSION_LIST_MAX_LIMIT]
+    scope_predicate = "" if server_id is None else "AND s.server_id = :server_id"
+    params: dict[str, object] = {"ids": identifiers}
+    if server_id is not None:
+        params["server_id"] = server_id
+    async with sessions() as session:
+        totals = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT st.session_id, COUNT(*) AS total
+                    FROM session_tags st
+                    JOIN sessions s ON s.session_id = st.session_id
+                    WHERE st.session_id = ANY(:ids)
+                      {scope_predicate}
+                    GROUP BY st.session_id
+                    """
+                ),
+                params,
+            )
+        ).mappings().all()
+        names = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT session_id, name
+                    FROM (
+                        SELECT st.session_id, t.name,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY st.session_id
+                                   ORDER BY st.created_at, t.name
+                               ) AS rn
+                        FROM session_tags st
+                        JOIN tags t ON t.tag_id = st.tag_id
+                        JOIN sessions s ON s.session_id = st.session_id
+                        WHERE st.session_id = ANY(:ids)
+                          {scope_predicate}
+                    ) ranked
+                    WHERE rn <= 3
+                    ORDER BY session_id, rn
+                    """
+                ),
+                params,
+            )
+        ).mappings().all()
+    totals_by_id = {uuid.UUID(str(row["session_id"])): int(row["total"]) for row in totals}
+    names_by_id: dict[uuid.UUID, list[str]] = {}
+    for row in names:
+        names_by_id.setdefault(uuid.UUID(str(row["session_id"])), []).append(str(row["name"]))
+    return {
+        session_id: EntityTagPreview(
+            preview=tuple(names_by_id.get(session_id, ())),
+            total=total,
+        )
+        for session_id, total in totals_by_id.items()
+    }

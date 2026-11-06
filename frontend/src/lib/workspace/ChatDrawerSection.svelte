@@ -102,6 +102,8 @@
 	let editingRunId = $state<string | null>(null);
 	let editingTitle = $state('');
 	let renameBusy = $state(false);
+	/** The last rename refusal (honest retry state; cleared on edit/close). */
+	let renameError = $state(false);
 
 	const historyBadge = $derived(
 		totalConversations !== undefined && totalConversations > conversations.length
@@ -130,22 +132,30 @@
 		event.stopPropagation();
 		editingRunId = rowKey(row);
 		editingTitle = formatConversationLabel(row);
+		renameError = false;
 	}
 
 	function cancelRename(): void {
 		if (renameBusy) return;
 		editingRunId = null;
 		editingTitle = '';
+		renameError = false;
 	}
 
-	async function commitRename(runId: string): Promise<void> {
+	async function commitRename(rowId: string): Promise<void> {
 		const trimmed = editingTitle.trim();
 		if (!trimmed || renameBusy) return;
 		renameBusy = true;
 		try {
-			await onrenameconversation?.(runId, trimmed);
+			await onrenameconversation?.(rowId, trimmed);
 			editingRunId = null;
 			editingTitle = '';
+		} catch {
+			// The rename was refused (409/500/…): keep the editor open with
+			// the draft so the user can retry — the rejection never escapes
+			// as an unhandled rejection (C08 rule 6: honest failure, no
+			// fabricated success, no silent swallow of the row's state).
+			renameError = true;
 		} finally {
 			renameBusy = false;
 		}
@@ -193,6 +203,11 @@
 				{#each conversations as row (rowKey(row))}
 					{#if editingRunId === rowKey(row)}
 						<div class="mai-chat-drawer__edit-row" data-testid="drawer-history-edit-row">
+							{#if renameError}
+								<p class="mai-chat-drawer__rename-error" role="alert" data-testid="drawer-history-rename-error">
+									Rename refused — the title stays editable for a retry.
+								</p>
+							{/if}
 							<input
 								type="text"
 								class="mai-chat-drawer__edit-input"
@@ -376,6 +391,13 @@
 		color: var(--mai-color-text);
 		background: var(--mai-color-surface-raised);
 		border-color: var(--mai-color-border);
+	}
+
+	.mai-chat-drawer__rename-error {
+		flex-basis: 100%;
+		margin: 2px 0;
+		color: var(--mai-color-danger, #b3261e);
+		font-size: 0.78rem;
 	}
 
 	.mai-chat-drawer__edit-row {

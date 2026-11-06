@@ -342,7 +342,7 @@ READ_ONLY_EXCLUDED_CAPABILITIES: Final[frozenset[str]] = frozenset(
 #: so the read-only context is ALWAYS a valid non-empty tuple even when
 #: the resolved set carried nothing else readable.
 READ_ONLY_FALLBACK_CAPABILITIES: Final[tuple[str, ...]] = (
-    "chat.read_session",
+    "session.read",
     "docs.retrieve",
 )
 
@@ -893,7 +893,7 @@ def _read_only_capabilities(
 
     The static mutation vocabulary is always excluded; registry-known
     descriptors with ``effect_class != "read"`` are excluded too (an
-    absent registry excludes nothing extra). ``chat.read_session`` /
+    absent registry excludes nothing extra). ``session.read`` /
     ``docs.retrieve`` are ensured last so the ``ExecutionContext``
     always carries a valid, non-empty read-only capability tuple.
     """
@@ -2415,7 +2415,7 @@ async def submit_message(request: Request, payload: ChatSubmitBody) -> Response:
         # Explicit request: the submitted list rides exactly as asked,
         # unioned with the internal-API tool surface (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
-        # app.delete_map_entry, chat.read_session) and controller-side web
+        # app.delete_map_entry, session.read) and controller-side web
         # research tools (web.search, web.read) plus enabled plugin
         # bindings, so the chat agent can always operate Machina services
         # and consult external docs.

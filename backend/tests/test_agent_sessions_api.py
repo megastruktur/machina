@@ -590,6 +590,272 @@ async def test_turn_route_refuses_wrong_origin_and_missing_csrf(
 
 
 # ---------------------------------------------------------------------------
+# 5b. rename + tags surface (D07-fix1 F2/N6)
+# ---------------------------------------------------------------------------
+
+
+async def test_rename_route_updates_title_and_enforces_scope(
+    app_fixture: FastAPI,
+    migrated_url: str,
+) -> None:
+    """PATCH /{session_id}: the durable rename over the explicit (or the
+    session's own stored) scope; cross-server stays the SAME 404; blank
+    titles refuse 400; the CSRF gate precedes any effect."""
+    import psycopg
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        url = f"/api/v1/agent-sessions/{session_id}"
+
+        # Missing CSRF refuses before any effect (403 envelope).
+        no_csrf = client.patch(
+            url,
+            params={"server_id": str(SERVER_A)},
+            json={"title": "nope"},
+            headers={"origin": ORIGIN},
+            cookies=jar,
+        )
+        assert no_csrf.status_code == 403
+        assert no_csrf.json()["error"]["code"] == "csrf_rejected"
+
+        # The explicit-scope rename: 200 detail with the new title.
+        renamed = client.patch(
+            url,
+            params={"server_id": str(SERVER_A)},
+            json={"title": "Renamed A"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["title"] == "Renamed A"
+
+        # Durable truth: the stored row carries the new title.
+        with psycopg.connect(migrated_url) as conn:
+            stored = conn.execute(
+                "SELECT title FROM sessions WHERE session_id = %s",
+                (session_id,),
+            ).fetchone()
+        assert stored is not None and stored[0] == "Renamed A"
+
+        # Scope-blind 404: a wrong server_id is the SAME refusal as a
+        # missing session (no existence leak).
+        cross = client.patch(
+            url,
+            params={"server_id": str(SERVER_B)},
+            json={"title": "cross"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert cross.status_code == 404
+        assert cross.json()["error"]["code"] == "session_not_found"
+
+        # A blank (whitespace-only) title refuses 400.
+        blank = client.patch(
+            url,
+            json={"title": "   "},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert blank.status_code == 400
+        assert blank.json()["error"]["code"] == "forbidden_field"
+
+        # The stored-scope rename (no query pin) still converges.
+        stored_scope = client.patch(
+            url,
+            json={"title": "Renamed B"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert stored_scope.status_code == 200, stored_scope.text
+        assert stored_scope.json()["title"] == "Renamed B"
+
+
+async def test_session_tags_surface_is_bounded_and_honest(
+    app_fixture: FastAPI,
+    migrated_url: str,
+) -> None:
+    """GET/POST/DELETE /{session_id}/tags: idempotent user assignment,
+    bounded pagination, tag_preview on the list + detail rows, and the
+    mandatory-at-least-one-tag invariant (last_tag 409)."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        base = f"/api/v1/agent-sessions/{session_id}"
+
+        # Create-if-missing assignment: the trimmed name mints the row.
+        first = client.post(
+            f"{base}/tags",
+            json={
+                "server_id": str(SERVER_A),
+                "tag_id": "aaaa0000-0000-4000-8000-000000000001",
+                "tag_name": "alpha",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert first.status_code == 204, first.body
+
+        # A replayed assignment (same body: name-first resolution) stays an
+        # idempotent no-op on the SAME tag pair.
+        replay = client.post(
+            f"{base}/tags",
+            json={
+                "server_id": str(SERVER_A),
+                "tag_id": "aaaa0000-0000-4000-8000-000000000001",
+                "tag_name": "alpha",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert replay.status_code == 204
+        # An unknown catalog id WITHOUT a create name refuses tag_not_found.
+        unknown = client.post(
+            f"{base}/tags",
+            json={
+                "server_id": str(SERVER_A),
+                "tag_id": "aaaa0000-0000-4000-8000-0000000000ff",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert unknown.status_code == 404
+        assert unknown.json()["error"]["code"] == "tag_not_found"
+
+        # Seed two more catalog tags and attach them (existing ids win).
+        tag_ids = [uuid.UUID("aaaa0000-0000-4000-8000-000000000001")]
+        with psycopg.connect(migrated_url) as conn:
+            for suffix in (2, 3):
+                tag_id = uuid.UUID(f"aaaa0000-0000-4000-8000-{suffix:012d}")
+                conn.execute(
+                    "INSERT INTO tags (tag_id, name) VALUES (%s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (tag_id, f"beta-{suffix}"),
+                )
+                tag_ids.append(tag_id)
+            conn.commit()
+        for tag_id in tag_ids[1:]:
+            attached = client.post(
+                f"{base}/tags",
+                json={"server_id": str(SERVER_A), "tag_id": str(tag_id)},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert attached.status_code == 204
+
+        # The bounded page: limit=2 -> honest total/has_more + the page 2.
+        page1 = client.get(
+            f"{base}/tags",
+            params={"server_id": str(SERVER_A), "limit": 2},
+            cookies=jar,
+        )
+        assert page1.status_code == 200, page1.text
+        page = page1.json()
+        assert page["session_id"] == str(session_id)
+        assert page["server_id"] == str(SERVER_A)
+        assert page["total"] == 3 and page["has_more"] is True
+        assert len(page["items"]) == 2
+        assert {item["name"] for item in page["items"]} <= {
+            "alpha",
+            "beta-2",
+            "beta-3",
+        }
+        page2 = client.get(
+            f"{base}/tags",
+            params={"server_id": str(SERVER_A), "limit": 2, "offset": 2},
+            cookies=jar,
+        )
+        assert page2.status_code == 200
+        assert page2.json()["has_more"] is False
+        assert len(page2.json()["items"]) == 1
+
+        # tag_preview rides the list page AND the detail (N5).
+        listing = client.get(
+            "/api/v1/agent-sessions",
+            params={"server_id": str(SERVER_A)},
+            cookies=jar,
+        )
+        row = next(
+            one
+            for one in listing.json()["items"]
+            if one["session_id"] == str(session_id)
+        )
+        assert row["tag_preview"]["total"] == 3
+        assert len(row["tag_preview"]["preview"]) == 3
+        detail = client.get(
+            f"/api/v1/agent-sessions/{session_id}",
+            params={"server_id": str(SERVER_A)},
+            cookies=jar,
+        )
+        assert detail.json()["tag_preview"]["total"] == 3
+
+        # Cross-server reads of the tags stay the scope-blind 404.
+        foreign = client.get(
+            f"{base}/tags", params={"server_id": str(SERVER_B)}, cookies=jar
+        )
+        assert foreign.status_code == 404
+
+        # The mandatory-at-least-one-tag invariant: removing the last tag
+        # without a replacement refuses 409 last_tag; with one it commits
+        # in the same transaction (204), leaving the replacement attached.
+        with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+            remaining = conn.execute(
+                "SELECT t.tag_id FROM session_tags st "
+                "JOIN tags t ON t.tag_id = st.tag_id "
+                "WHERE st.session_id = %s",
+                (session_id,),
+            ).fetchall()
+        assert len(remaining) == 3
+        for one in remaining[:-1]:
+            removed = client.delete(
+                f"{base}/tags/{one['tag_id']}",
+                params={"server_id": str(SERVER_A)},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert removed.status_code == 204
+        last_id = remaining[-1]["tag_id"]
+        final = client.delete(
+            f"{base}/tags/{last_id}",
+            params={"server_id": str(SERVER_A)},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert final.status_code == 409
+        assert final.json()["error"]["code"] == "last_tag"
+
+        replacement = uuid.UUID("aaaa0000-0000-4000-8000-000000000009")
+        with psycopg.connect(migrated_url) as conn:
+            conn.execute(
+                "INSERT INTO tags (tag_id, name) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                (replacement, "replacement"),
+            )
+            conn.commit()
+        replaced = client.delete(
+            f"{base}/tags/{last_id}",
+            params={
+                "server_id": str(SERVER_A),
+                "replacement_tag_id": str(replacement),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert replaced.status_code == 204
+        after = client.get(
+            f"{base}/tags", params={"server_id": str(SERVER_A)}, cookies=jar
+        )
+        after_page = after.json()
+        assert after_page["total"] == 1
+        assert after_page["items"][0]["tag_id"] == str(replacement)
+
+
+# ---------------------------------------------------------------------------
 # 6. control facade delegation
 # ---------------------------------------------------------------------------
 

@@ -255,6 +255,11 @@
 		type ConversationView,
 		type RunDetail
 	} from './entries/06-web-chat.js';
+	import {
+		createSessionChannelController,
+		type SessionChannelConnectionState,
+		type SessionChannelController
+	} from '../chat/session_client.js';
 	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
 	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
 	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
@@ -480,7 +485,7 @@
 		'app.unadopt',
 		'app.update',
 		'app.upsert_map_entry',
-		'chat.read_session',
+		'session.read',
 		'docs.retrieve',
 		'host.logs',
 		'host.shell',
@@ -911,12 +916,15 @@
 	let drawerActiveRunId = $state<string | null>(null);
 	let drawerCollapsed = $state(false);
 
-	// --- Session-first drawer history (D07; AGENTS.md §1 bounded page) -------
+	// --- Session-first drawer history (D07; F4 pagination, F3 channel) -------
 	/** The bounded first page of session-first rows (newest-change first). */
 	let drawerSessions = $state<readonly ChatHistoryRow[]>([]);
 	let drawerSessionsTotal = $state<number | undefined>(undefined);
 	let drawerSessionsHasMore = $state(false);
 	let drawerSessionsLoading = $state(false);
+	let drawerSessionsLoadingMore = $state(false);
+	/** The offset the NEXT session page starts at (F4 pagination cursor). */
+	let drawerSessionsOffset = $state(0);
 	/** Drawer page size (the reviewed bounded initial page). */
 	const SESSION_HISTORY_PAGE_LIMIT = 10;
 
@@ -926,22 +934,62 @@
 		if (!live || drawerSessionsLoading) return;
 		drawerSessionsLoading = true;
 		try {
-			const page = await api.listAgentSessions({ limit: SESSION_HISTORY_PAGE_LIMIT });
+			const page = await api.listAgentSessions({
+				server_id: selectedServerId,
+				limit: SESSION_HISTORY_PAGE_LIMIT,
+				offset: 0
+			});
 			drawerSessions = (page.items ?? []).map((session) => ({
 				run_id: session.session_id,
 				session_id: session.session_id,
 				server_id: session.server_id,
 				title: session.title ?? null,
-				service_tags: [] as string[],
+				service_tags: [],
 				status: session.status,
 				updated_at: session.updated_at
 			}));
 			drawerSessionsTotal = page.total;
 			drawerSessionsHasMore = page.has_more;
+			drawerSessionsOffset = drawerSessions.length;
 		} catch (error) {
 			status = `Session history unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
 		} finally {
 			drawerSessionsLoading = false;
+		}
+	}
+
+	/** The NEXT bounded session page: deduplicated append (F4). */
+	async function loadMoreSessionHistory(): Promise<void> {
+		if (!live || drawerSessionsLoadingMore || !drawerSessionsHasMore) return;
+		drawerSessionsLoadingMore = true;
+		try {
+			const page = await api.listAgentSessions({
+				server_id: selectedServerId,
+				limit: SESSION_HISTORY_PAGE_LIMIT,
+				offset: drawerSessionsOffset
+			});
+			const known = new Set(
+				drawerSessions.map((row) => row.session_id ?? row.run_id)
+			);
+			const fresh = (page.items ?? [])
+				.filter((session) => !known.has(session.session_id))
+				.map((session) => ({
+					run_id: session.session_id,
+					session_id: session.session_id,
+					server_id: session.server_id,
+					title: session.title ?? null,
+					service_tags: [],
+					status: session.status,
+					updated_at: session.updated_at
+				}));
+			drawerSessions = [...drawerSessions, ...fresh];
+			drawerSessionsOffset += (page.items ?? []).length;
+			drawerSessionsTotal = page.total;
+			drawerSessionsHasMore = page.has_more;
+		} catch (error) {
+			status = `More sessions unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			drawerSessionsLoadingMore = false;
 		}
 	}
 
@@ -950,6 +998,50 @@
 		await api.renameAgentSession(sessionId, { title });
 		status = 'Session renamed.';
 		await loadSessionHistory();
+	}
+
+	// --- The ONE visible session's channel (F3; plan acceptance 1/2/6) -------
+	/** The active session's id — only THIS one has an open channel. */
+	let activeSessionId = $state<string | null>(null);
+	/** The active session's channel controller (null = none open). */
+	let activeSessionChannel = $state<SessionChannelController | null>(null);
+	/** Honest connection state mirror for the dock surface. */
+	let channelState = $state<SessionChannelConnectionState>('closed');
+	/** Committed entries delivered by the channel (bounded mirror). */
+	let channelEntries = $state<readonly number[]>([]);
+
+	/**
+	 * Open (or switch to) the visible session's channel: the previous
+	 * controller is disposed FIRST — switching sessions drains/closes the
+	 * old stream and aborts nothing durable (plan acceptance 2).
+	 */
+	function openActiveSession(sessionId: string, serverId: string | null): void {
+		if (!live) return;
+		closeActiveSession();
+		activeSessionId = sessionId;
+		channelState = 'connecting';
+		channelEntries = [];
+		activeSessionChannel = createSessionChannelController({
+			sessionId,
+			serverId,
+			handlers: {
+				onConnectionState: (next) => (channelState = next),
+				onCommittedEntriesChanged: (entries) =>
+					(channelEntries = entries.map((entry) => entry.seq))
+			}
+		});
+		activeSessionChannel.connect();
+	}
+
+	/** Switching away / New Chat: the channel closes; nothing lingers. */
+	function closeActiveSession(): void {
+		if (activeSessionChannel !== null) {
+			activeSessionChannel.dispose();
+			activeSessionChannel = null;
+		}
+		activeSessionId = null;
+		channelState = 'closed';
+		channelEntries = [];
 	}
 
 	/** Drawer rows: session-first first, then the dual-wired legacy rows. */
@@ -984,6 +1076,9 @@
 			// The optional history-tag slice rides ONLY the live transport (the
 			// offline memory dock has no tag methods and fails closed).
 			...(live ? { tags: chatTagApi } : {}),
+			// The visible session's channel rides the bag additively (F3):
+			// exactly ONE controller exists, and only while a session is open.
+			...(live ? { channel: activeSessionChannel } : {}),
 			serverOptions,
 			availableServices: DOCK_AVAILABLE_SERVICES
 		},
@@ -1094,12 +1189,12 @@
 			case DOCS_PANEL_KIND:
 				return asBag(
 					docsServices(api, {
-						// Session-first attach (D07): the explicit create-new-session
-						// action (session_id null) or the explicit destination
-						// session, then ONE idempotent turn admission — the
-						// excerpts ride /api/v1/agent-sessions, never the ambient
-						// legacy chat. The legacy submitMessage stays on the bag
-						// until D09 for pre-session hosts (COORD-D02-01).
+						// Session-first attach (D07; N1): the explicit create-new-
+						// session action (session_id null) or the explicit
+						// destination session, then ONE idempotent turn admission
+						// — and the returned session BECOMES the visible session
+						// (its channel opens; the drawer refreshes). The legacy
+						// submitMessage stays on the bag until D09 (COORD-D02-01).
 						attachToSession: async ({ session_id, text, model_profile, client_request_id }) => {
 							const scope = descriptor.scope;
 							const serverId = scope.kind === 'server' ? scope.server_id : null;
@@ -1116,12 +1211,19 @@
 										client_request_id
 									})
 								).session_id;
-							return api.submitAgentSessionTurn(target, {
-								session_id: target,
-								text,
-								client_request_id,
-								model_profile: model_profile ?? null
-							});
+							const outcome = await api.submitAgentSessionTurn(
+								target,
+								{
+									session_id: target,
+									text,
+									client_request_id,
+									model_profile: model_profile ?? null
+								},
+								serverId
+							);
+							openActiveSession(target, serverId);
+							void loadSessionHistory();
+							return outcome;
 						},
 						submitMessage: api.submitMessage
 					})
@@ -1322,9 +1424,14 @@
 			conversations={drawerRows}
 			totalConversations={drawerRowsTotal}
 			hasMoreConversations={drawerRowsHasMore}
-			loadingMoreConversations={drawerConversationsLoadingMore}
+			loadingMoreConversations={
+				drawerSessionsLoadingMore || drawerConversationsLoadingMore
+			}
 			activeRunId={drawerActiveRunId}
 			onnewchat={() => {
+				// A fresh chat abandons the visible session: its channel closes
+				// now, not when the next session opens (plan acceptance 2).
+				closeActiveSession();
 				focusChatDock();
 				dockChatPanel?.triggerNewChat();
 			}}
@@ -1333,11 +1440,11 @@
 					(one) => (one.session_id ?? one.run_id) === rowKey
 				);
 				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
-					// Session-first row: the visible session becomes THE one
-					// channelled session (plan acceptance 2); the legacy dock
-					// keeps its own conversation selection untouched.
+					// Session-first row: open the visible session's channel — the
+					// ONLY open channel (F3; never a fabricated "attached" note:
+					// the dock surface mirrors the real connection state).
+					openActiveSession(row.session_id, row.server_id);
 					focusChatDock();
-					status = `Session ${rowKey.slice(0, 8)}… selected — channel attached.`;
 					return;
 				}
 				focusChatDock();
@@ -1347,7 +1454,10 @@
 				void loadSessionHistory();
 				dockChatPanel?.triggerRefreshHistory();
 			}}
-			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
+			onloadmorehistory={() => {
+				if (drawerSessionsHasMore) void loadMoreSessionHistory();
+				if (drawerConversationsHasMore) dockChatPanel?.triggerLoadMoreHistory();
+			}}
 			onrenameconversation={async (rowKey, title) => {
 				const row = drawerRows.find(
 					(one) => (one.session_id ?? one.run_id) === rowKey
@@ -1460,6 +1570,23 @@
 		aria-label="Chat dock"
 		bind:this={dockEl}
 	>
+		{#if live}
+			<div
+				class="mai-desktop-shell__dock-channel"
+				data-testid="session-channel-state"
+				data-channel-state={channelState}
+				data-active-session={activeSessionId ?? ''}
+			>
+				{#if activeSessionId !== null}
+					<span>session {activeSessionId.slice(0, 8)}… · channel {channelState}</span>
+					{#if channelEntries.length > 0}
+						<span> · committed through seq {channelEntries[channelEntries.length - 1]}</span>
+					{/if}
+				{:else}
+					<span>no session open</span>
+				{/if}
+			</div>
+		{/if}
 		<div class="mai-desktop-shell__dock-body">
 			<ChatPanel
 				bind:this={dockChatPanel}
@@ -1610,6 +1737,15 @@
 	   lower stacking level (`z-index: 5`) than `.mai-desktop-shell__desktop`
 	   (`z-index: 20`) so opened workspace windows always stack in front of
 	   the chat dock instead of being hidden behind it. */
+	.mai-desktop-shell__dock-channel {
+		display: flex;
+		gap: 6px;
+		padding: 2px var(--mai-space-2);
+		font-size: 0.72rem;
+		color: var(--mai-color-muted, inherit);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border, transparent);
+	}
+
 	.mai-desktop-shell__dock {
 		position: absolute;
 		bottom: var(--mai-space-2);

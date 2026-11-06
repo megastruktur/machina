@@ -401,7 +401,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         "host.shell": host_shell_cap,
         "host.logs": host_logs_cap,
         "host.file_read": host_file_read_cap,
-        "chat.read_session": chat_read_cap,
+        "session.read": chat_read_cap,
         "docs.retrieve": docs_retrieve_cap,
         "service.http": _service_http_cap,
         "web.search": web_search_cap,
@@ -635,7 +635,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             pass
         # Automatically grant internal API capabilities (app.discover,
         # app.list_adopted, app.adopt, app.unadopt, app.upsert_map_entry,
-        # app.delete_map_entry, chat.read_session), the task-state agent
+        # app.delete_map_entry, session.read), the task-state agent
         # tools (run-identity scoped: another conversation's task is
         # invisible, no arbitrary cross-task selection), the history-tag
         # tools (tags.*: run-identity scoped like the task tools) and

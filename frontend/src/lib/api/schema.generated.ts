@@ -2908,7 +2908,9 @@ export interface paths {
         };
         /**
          * Bounded agent-session list page
-         * @description One bounded, deterministic session page (newest-change first).
+         * @description One bounded, deterministic session page (newest-change first) with
+         *     honest tag previews (D07-fix1: the drawer renders HistoryTags from the
+         *     list page without a second round trip).
          */
         get: operations["list_sessions_api_v1_agent_sessions_get"];
         put?: never;
@@ -2942,7 +2944,12 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Rename Session
+         * @description Rename one session (the only mutable header field); the trimmed
+         *     title is durable under the session-row lock.
+         */
+        patch: operations["rename_session_api_v1_agent_sessions__session_id__patch"];
         trace?: never;
     };
     "/api/v1/agent-sessions/{session_id}/history": {
@@ -3003,6 +3010,53 @@ export interface paths {
          */
         post: operations["submit_control_api_v1_agent_sessions__session_id__control_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Session Tags
+         * @description One bounded tag page of the session's associations (scope-blind
+         *     refusal when the session is missing or foreign).
+         */
+        get: operations["list_session_tags_api_v1_agent_sessions__session_id__tags_get"];
+        put?: never;
+        /**
+         * Assign Session Tag
+         * @description Assign one catalog tag to the session (idempotent on the pair;
+         *     ``assignment_source='user'``; optional create-if-missing name).
+         */
+        post: operations["assign_session_tag_api_v1_agent_sessions__session_id__tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Session Tag
+         * @description Remove one session-tag association; the mandatory-at-least-one-tag
+         *     invariant refuses the final removal without a replacement (409).
+         */
+        delete: operations["remove_session_tag_api_v1_agent_sessions__session_id__tags__tag_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -7856,6 +7910,8 @@ export interface components {
              * @description Subordinate run currently executing, when one exists
              */
             active_run_id?: string | null;
+            /** @description Bounded tag preview (first ≤3 names + honest total); None only for a session with zero tags (the drawer renders no chips instead of fabricating an empty preview) */
+            tag_preview?: components["schemas"]["EntityTagPreviewView"] | null;
             /**
              * Created At
              * Format: date-time
@@ -8037,6 +8093,18 @@ export interface components {
             has_more: boolean;
         };
         /**
+         * SessionRenameRequest
+         * @description One durable session rename (D07-fix1 F2): the ONLY mutable session
+         *     header field; scope is the query's explicit ``server_id``.
+         */
+        SessionRenameRequest: {
+            /**
+             * Title
+             * @description New user-assigned session title (trimmed, 1..120)
+             */
+            title: string;
+        };
+        /**
          * SessionRunState
          * @description Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;
          *     ``outcome_unknown`` is honest after a crash — never silently terminal).
@@ -8089,6 +8157,8 @@ export interface components {
              * @description Subordinate run currently executing, when one exists
              */
             active_run_id?: string | null;
+            /** @description Bounded tag preview (first ≤3 names + honest total); None only for a session with zero tags (the drawer renders no chips instead of fabricating an empty preview) */
+            tag_preview?: components["schemas"]["EntityTagPreviewView"] | null;
             /**
              * Created At
              * Format: date-time
@@ -8101,6 +8171,73 @@ export interface components {
              * @description UTC timestamp of the latest committed change
              */
             updated_at: string;
+        };
+        /**
+         * SessionTagAssignRequest
+         * @description One idempotent session-tag assignment (D07-fix1 F2).
+         */
+        SessionTagAssignRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope the session is pinned to (C01 rule 2)
+             */
+            server_id: string;
+            /**
+             * Tag Id
+             * Format: uuid
+             * @description Catalog tag identity to attach
+             */
+            tag_id: string;
+            /**
+             * Tag Name
+             * @description Optional create-if-missing catalog name (reserved names refuse; the canonical lower(name) uniqueness applies)
+             */
+            tag_name?: string | null;
+        };
+        /**
+         * SessionTagsPage
+         * @description One bounded tag page for one agent session (D07-fix1 F2; same-server
+         *     scope; the ConversationTagsPage envelope shape with the session ids).
+         */
+        SessionTagsPage: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning the session
+             */
+            server_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..100)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice count for this session under the same filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Association rows in deterministic assignment order
+             */
+            items?: components["schemas"]["EntityTagView"][];
         };
         /**
          * SessionTurnSubmitRequest
@@ -17565,9 +17702,13 @@ export interface operations {
     };
     list_sessions_api_v1_agent_sessions_get: {
         parameters: {
-            query: {
-                /** @description Explicit server scope the listing is pinned to (C01 rule 2) */
-                server_id: string;
+            query?: {
+                /** @description Explicit server scope the listing is pinned to (C01 rule 2); omit for the recent page across all enrolled servers + General Consult */
+                server_id?: string | null;
+                /** @description Optional coarse status filter (SessionStatus vocabulary) */
+                status?: components["schemas"]["SessionStatus"] | null;
+                /** @description Optional catalog tag filter (session_tags association) */
+                tag_id?: string | null;
                 /** @description Page size used for this slice (1..100) */
                 limit?: number;
                 /** @description Slice start within the collection */
@@ -17645,6 +17786,44 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_session_api_v1_agent_sessions__session_id__patch: {
+        parameters: {
+            query?: {
+                /** @description Explicit server scope (scope-blind 404 when it differs from the stored session) */
+                server_id?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionRenameRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -17770,6 +17949,112 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SessionControlResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_session_tags_api_v1_agent_sessions__session_id__tags_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2) */
+                server_id: string;
+                /** @description Page size used for this slice (1..100) */
+                limit?: number;
+                /** @description Slice start */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTagsPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    assign_session_tag_api_v1_agent_sessions__session_id__tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionTagAssignRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_session_tag_api_v1_agent_sessions__session_id__tags__tag_id__delete: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2) */
+                server_id: string;
+                /** @description Mandatory on final-tag removal (last_tag 409 without it); attaches in the same transaction */
+                replacement_tag_id?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

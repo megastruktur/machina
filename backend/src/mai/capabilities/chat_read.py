@@ -1,5 +1,6 @@
-"""The ``chat.read_session`` capability (campaign ``mechanicus-ui`` card 02;
-D07 rewires the read onto the session-first tables — sfc_PLAN D07).
+"""The ``session.read`` capability (campaign ``mechanicus-ui`` card 02;
+D07 rewires the read onto the session-first tables — sfc_PLAN D07;
+D07-fix1 F1 renames the identifier from ``chat.read_session``).
 
 The agent-facing read seam over the durable session-first history root:
 one ``session_id`` in, the session's projected status and bounded entry
@@ -51,8 +52,10 @@ __all__ = [
     "chat_read_descriptor",
 ]
 
-#: The capability identifier (the executor vocabulary frozen here).
-CAPABILITY_ID: Final[str] = "chat.read_session"
+#: The capability identifier (the executor vocabulary frozen here; D07-fix1
+#: F1 renames the read seam to ``session.read`` — the session-first tables
+#: are the only authority).
+CAPABILITY_ID: Final[str] = "session.read"
 
 #: Bound on the entries summary (a summary, not a dump; the full history is
 #: the D06 bounded ``/history`` route's vocabulary).
@@ -76,7 +79,7 @@ class ChatReadError(ValueError):
 
 
 def chat_read_descriptor() -> CapabilityDescriptor:
-    """The validated ``chat.read_session`` descriptor (C03 rule 1).
+    """The validated ``session.read`` descriptor (C03 rule 1).
 
     ``effect_class="read"`` is the load-bearing field: replaying a
     persisted conversation changes no observable state, so the policy
@@ -107,6 +110,15 @@ def chat_read_descriptor() -> CapabilityDescriptor:
                         "description": (
                             "The session id (canonical UUID) to read; no "
                             "host vocabulary exists."
+                        ),
+                    },
+                    "server_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": (
+                            "Optional explicit server scope; a session "
+                            "stored under a different server is a "
+                            "scope-blind not_found (C01 rule 2)."
                         ),
                     },
                 },
@@ -169,7 +181,7 @@ class _ReplayedSession:
 
 
 class ChatReadSessionCapability:
-    """``chat.read_session`` executor: one gated call → one honest summary.
+    """``session.read`` executor: one gated call → one honest summary.
 
     Constructor-checked and fail-closed (the dispatch pattern): the
     session factory must be the app's reviewed ``async_sessionmaker``
@@ -215,8 +227,31 @@ class ChatReadSessionCapability:
                 ChatReadErrorCode.INVALID_PAYLOAD,
                 "session_id must be a canonical UUID string",
             ) from None
+        # Bounded server-scope validation (C01 rule 2): an explicit payload
+        # scope or the context's own scope must MATCH the stored session's
+        # server — anything else is the SAME scope-blind not_found (no
+        # existence leak across servers). ``None`` context scope (General
+        # Consult sentinel / host-agnostic callers) imposes no constraint.
+        requested_server = payload.get("server_id")
+        if requested_server is not None:
+            try:
+                requested_server = str(uuid.UUID(str(requested_server)))
+            except (ValueError, AttributeError):
+                raise ChatReadError(
+                    ChatReadErrorCode.INVALID_PAYLOAD,
+                    "server_id must be a canonical UUID string",
+                ) from None
 
         replayed = await self._replay(session_id)
+        context_server = getattr(call.context, "server_id", None)
+        if context_server is not None:
+            context_server = str(context_server)  # context carries a UUID
+        for scope in (requested_server, context_server):
+            if scope is not None and scope != replayed.server_id:
+                raise ChatReadError(
+                    ChatReadErrorCode.NOT_FOUND,
+                    "no session stored for this identity in this scope",
+                )
         output = {
             "session_id": replayed.session_id,
             "server_id": replayed.server_id,

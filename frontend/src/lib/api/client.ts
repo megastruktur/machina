@@ -318,22 +318,14 @@ export type SessionControlRequest = components['schemas']['SessionControlRequest
 export type SessionControlOutcome = components['schemas']['SessionControlResponse'];
 export type SessionStatus = components['schemas']['SessionStatus'];
 export type SessionRunState = components['schemas']['SessionRunState'];
+/** Rename body for a session (generated; the D07-fix1 backend route). */
+export type SessionRenameRequest = components['schemas']['SessionRenameRequest'];
 /**
- * Rename body for a session (mirrors the generated conversation
- * `ChatRenameBody` field-for-field: one bounded user-assigned title; the
- * PATCH /api/v1/agent-sessions/{session_id} producer lands with the
- * session API round that owns route additions).
+ * One entity's session-tag page (generated; the D07-fix1 backend route
+ * mirrors the reviewed ConversationTagsPage envelope field-for-field).
  */
-export interface SessionRenameRequest {
-	/** User-assigned session title (1..240 chars, producer-validated). */
-	title: string;
-}
-/**
- * One entity's session-tag page. The D06 backend's sibling tag pages
- * (JobTagsPage/ConversationTagsPage) all project the frozen TagPage
- * envelope; the agent-session producer uses the same shape.
- */
-export type SessionTagsPage = components['schemas']['TagPage'];
+export type SessionTagsPage = components['schemas']['SessionTagsPage'];
+export type SessionTagAssignRequest = components['schemas']['SessionTagAssignRequest'];
 
 /** Bounded session-list query (AGENTS.md §1: every collection read is a page). */
 export interface AgentSessionListQuery {
@@ -1065,7 +1057,8 @@ export interface MaiApiClient {
 	 */
 	submitAgentSessionTurn(
 		sessionId: string,
-		payload: SessionTurnSubmitRequest
+		payload: SessionTurnSubmitRequest,
+		serverId?: string | null
 	): Promise<SessionTurnSubmitOutcome>;
 	/**
 	 * POST /api/v1/agent-sessions/{id}/control — steer/pause/cancel/
@@ -1073,7 +1066,8 @@ export interface MaiApiClient {
 	 */
 	submitAgentSessionControl(
 		sessionId: string,
-		payload: SessionControlRequest
+		payload: SessionControlRequest,
+		serverId?: string | null
 	): Promise<SessionControlOutcome>;
 	/** GET /api/v1/agent-sessions/{id}/tags?server_id=… — bounded tag page. */
 	listAgentSessionTags(
@@ -1082,7 +1076,7 @@ export interface MaiApiClient {
 		page?: TagEntityTagsQuery
 	): Promise<SessionTagsPage>;
 	/** POST /api/v1/agent-sessions/{id}/tags — idempotent user assignment. */
-	assignAgentSessionTag(sessionId: string, payload: TagAssignBody): Promise<void>;
+	assignAgentSessionTag(sessionId: string, payload: SessionTagAssignRequest): Promise<void>;
 	/** DELETE /api/v1/agent-sessions/{id}/tags/{tag_id}?server_id=… — removal. */
 	removeAgentSessionTag(
 		sessionId: string,
@@ -1631,18 +1625,28 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/history${rendered === '' ? '' : `?${rendered}`}`
 			);
 		},
-		submitAgentSessionTurn: (sessionId, payload) =>
-			requestJson<SessionTurnSubmitOutcome>(
+		submitAgentSessionTurn: (sessionId, payload, serverId) => {
+			const params = new URLSearchParams();
+			if (serverId !== undefined && serverId !== null)
+				params.set('server_id', serverId);
+			const rendered = params.toString();
+			return requestJson<SessionTurnSubmitOutcome>(
 				'POST',
-				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/turns`,
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/turns${rendered === '' ? '' : `?${rendered}`}`,
 				payload
-			),
-		submitAgentSessionControl: (sessionId, payload) =>
-			requestJson<SessionControlOutcome>(
+			);
+		},
+		submitAgentSessionControl: (sessionId, payload, serverId) => {
+			const params = new URLSearchParams();
+			if (serverId !== undefined && serverId !== null)
+				params.set('server_id', serverId);
+			const rendered = params.toString();
+			return requestJson<SessionControlOutcome>(
 				'POST',
-				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/control`,
+				`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/control${rendered === '' ? '' : `?${rendered}`}`,
 				payload
-			),
+			);
+		},
 		listAgentSessionTags: (sessionId, serverId, page) =>
 			requestJson<SessionTagsPage>(
 				'GET',

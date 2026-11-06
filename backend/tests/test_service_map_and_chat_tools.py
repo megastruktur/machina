@@ -11,7 +11,7 @@ Coverage:
 - ``mai.api.applications``: manual-origin adoption straight into the
   Service Map, custom categories riding the adopt request, and the
   merged taxonomy + manual entries on the list page.
-- Capabilities: ``app.upsert_map_entry`` and ``chat.read_session``
+- Capabilities: ``app.upsert_map_entry`` and ``session.read``
   descriptors validate through the reviewed ``CapabilityRegistry`` and
   execute through the reviewed ``CapabilityDispatcher`` /
   ``CapabilityToolBridge``.
@@ -88,7 +88,7 @@ SERVER_B = uuid.UUID("00000000-0000-0000-0000-00000000000b")
 GENERAL_CONSULT = uuid.UUID(int=0)
 
 UPSERT_CAPABILITY = "app.upsert_map_entry"
-CHAT_READ_CAPABILITY = "chat.read_session"
+CHAT_READ_CAPABILITY = "session.read"
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1008,7 @@ async def test_chat_runs_lists_across_all_servers_and_general_consult(
 
 
 # ---------------------------------------------------------------------------
-# chat.read_session capability against the real facade tables
+# session.read capability against the real facade tables
 # ---------------------------------------------------------------------------
 
 
@@ -1093,7 +1093,9 @@ async def test_chat_read_session_capability_replays_a_conversation(
 ) -> None:
     session_id = await _seed_session_turn(live_app, jar, server_a, bootstrapped_url)
     capability = ChatReadSessionCapability(live_app.state.session_factory)
-    context = _context((CHAT_READ_CAPABILITY,))
+    # The bounded scope validation (D07-fix1 F1): the call context's server
+    # scope must MATCH the session's stored scope.
+    context = _context((CHAT_READ_CAPABILITY,), server_id=server_a)
     call = CapabilityCall(
         descriptor=chat_read_descriptor(),
         payload={"session_id": session_id},
@@ -1106,6 +1108,41 @@ async def test_chat_read_session_capability_replays_a_conversation(
     summary = json.loads(result.output)
     assert summary["session_id"] == session_id
     assert summary["server_id"] == str(server_a)
+    # A foreign-scope context reads NOTHING: the same scope-blind
+    # not_found a missing session produces (no cross-server existence leak).
+    foreign = CapabilityCall(
+        descriptor=chat_read_descriptor(),
+        payload={"session_id": session_id},
+        context=_context((CHAT_READ_CAPABILITY,)),
+        credentials={},
+        op_id=uuid.uuid4(),
+    )
+    from mai.capabilities.chat_read import ChatReadError
+
+    with pytest.raises(ChatReadError):
+        await capability(foreign)
+    # An explicit payload scope that matches still reads.
+    scoped = CapabilityCall(
+        descriptor=chat_read_descriptor(),
+        payload={"session_id": session_id, "server_id": str(server_a)},
+        context=context,
+        credentials={},
+        op_id=uuid.uuid4(),
+    )
+    scoped_result = await capability(scoped)
+    assert scoped_result.ok is True
+    # An explicit payload scope that DIFFERS refuses.
+    with pytest.raises(ChatReadError):
+        await capability(
+            CapabilityCall(
+                descriptor=chat_read_descriptor(),
+                payload={"session_id": session_id, "server_id": str(uuid.uuid4())},
+                context=context,
+                credentials={},
+                op_id=uuid.uuid4(),
+            )
+        )
+    # Unknown sessions are honest not_found rejections.
     # The projected session status (D01 vocabulary) — the persisted row IS
     # the authority, and an admitted-but-unclaimed turn leaves it idle.
     assert summary["state"] == _session_status(bootstrapped_url, session_id)
@@ -1142,9 +1179,11 @@ async def test_chat_read_session_executes_through_the_tool_bridge(
     bridge = CapabilityToolBridge(
         registry=registry,
         dispatcher=_dispatcher(
-            registry, ChatReadSessionCapability(live_app.state.session_factory)
+            registry,
+            ChatReadSessionCapability(live_app.state.session_factory),
+            grants=lambda: {CHAT_READ_CAPABILITY: {server_a}},
         ),
-        context=_context((CHAT_READ_CAPABILITY,)),
+        context=_context((CHAT_READ_CAPABILITY,), server_id=server_a),
     )
     tool = next(
         t for t in bridge.tools if t.name == tool_name_for(CHAT_READ_CAPABILITY)

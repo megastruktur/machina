@@ -33,8 +33,8 @@ import type {
 	SessionEntriesPage,
 	SessionTagsPage,
 	SessionTurnSubmitOutcome,
+	SessionTagAssignRequest,
 	SessionTurnSubmitRequest,
-	TagAssignBody,
 	TagEntityTagsQuery,
 	TagRemovalOptions
 } from '../../api/client.js';
@@ -91,12 +91,14 @@ export interface SessionChatApi extends ChatApi {
 	/** POST /api/v1/agent-sessions/{id}/turns — durable intent admission. */
 	submitAgentSessionTurn(
 		sessionId: string,
-		payload: SessionTurnSubmitRequest
+		payload: SessionTurnSubmitRequest,
+		serverId?: string | null
 	): Promise<SessionTurnSubmitOutcome>;
 	/** POST /api/v1/agent-sessions/{id}/control — steer/pause/cancel/… */
 	submitAgentSessionControl(
 		sessionId: string,
-		payload: SessionControlRequest
+		payload: SessionControlRequest,
+		serverId?: string | null
 	): Promise<SessionControlOutcome>;
 }
 
@@ -115,7 +117,7 @@ export interface SessionChatTagApi extends ChatTagApi {
 		page?: TagEntityTagsQuery
 	): Promise<SessionTagsPage>;
 	/** POST /api/v1/agent-sessions/{id}/tags — idempotent assignment. */
-	assignAgentSessionTag(sessionId: string, payload: TagAssignBody): Promise<void>;
+	assignAgentSessionTag(sessionId: string, payload: SessionTagAssignRequest): Promise<void>;
 	/** DELETE /api/v1/agent-sessions/{id}/tags/{tag_id}?server_id=… */
 	removeAgentSessionTag(sessionId: string, tagId: string, options: TagRemovalOptions): Promise<void>;
 }

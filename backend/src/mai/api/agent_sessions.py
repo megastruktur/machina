@@ -42,13 +42,20 @@ import contextlib
 import hmac
 import json
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from fastapi import APIRouter, FastAPI, Query, Request, Response, WebSocket
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from fastapi import WebSocketDisconnect
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND
+from starlette.status import (
+    HTTP_204_NO_CONTENT,
+    HTTP_400_BAD_REQUEST,
+    HTTP_404_NOT_FOUND,
+    HTTP_409_CONFLICT,
+)
 
 from mai.agents.session_runner import (
     HANDLER_NAME,
@@ -62,6 +69,7 @@ from mai.api.auth import (
     _require_session,
     render_error_envelope,
 )
+from mai.api.history_tags import EntityTagView
 from mai.auth.sessions import hash_token
 from mai.contracts.session_channel import (
     CHANNEL_PROTOCOL_VERSION,
@@ -92,14 +100,17 @@ from mai.contracts.sessions import (
     SessionErrorCode,
     SessionHistoryPage,
     SessionListPage,
+    SessionRenameRequest,
     SessionRunState,
     SessionSourceKind,
     SessionStatus,
     SessionSummary,
+    SessionTagAssignRequest,
     SessionTurnSubmitRequest,
     SessionTurnSubmitResponse,
     UserMessageEntry,
 )
+from mai.contracts.tags import EntityTagPreview, EntityTagPreviewView
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.session_channel import (
     SessionChannelHub,
@@ -108,14 +119,20 @@ from mai.session_channel import (
 )
 from mai.session_store import (
     aappend_entry,
+    aattach_session_tag,
     acreate_run,
     acreate_session,
     aget_session,
     alist_sessions,
+    apreview_session_tags,
     aread_session_history,
     arecord_admission,
     arecord_run_state,
+    aremove_session_tag,
+    arename_session,
+    asession_tags_page,
 )
+from mai.tag_store import TagErrorCode, TagStoreError
 
 __all__ = [
     "SESSIONS_API_PATH",
@@ -170,17 +187,99 @@ def _bad_request(request: Request, code: str, message: str) -> Response:
     return render_error_envelope(request, HTTP_400_BAD_REQUEST, code, message)
 
 
-def _summary_row(row: Any) -> SessionSummary:
-    """Project one ``SessionRow`` onto the safe summary (never content)."""
+class SessionTagsPage(BaseModel):
+    """One bounded tag page for one agent session (D07-fix1 F2; same-server
+    scope; the ConversationTagsPage envelope shape with the session ids)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: uuid.UUID = Field(description="Owning session identity")
+    server_id: uuid.UUID = Field(description="Server scope pinning the session")
+    limit: int = Field(
+        ge=1,
+        le=SESSION_LIST_MAX_LIMIT,
+        description="Page size used for this slice (1.."
+        f"{SESSION_LIST_MAX_LIMIT})",
+    )
+    offset: int = Field(ge=0, description="Slice start within the collection")
+    total: int = Field(
+        ge=0,
+        description="Pre-slice count for this session under the same filter",
+    )
+    has_more: bool = Field(
+        description="True when another page exists after this slice",
+    )
+    items: list[EntityTagView] = Field(
+        default_factory=list,
+        description="Association rows in deterministic assignment order",
+    )
+
+    @model_validator(mode="after")
+    def _page_is_consistent(self) -> "SessionTagsPage":
+        if len(self.items) > self.limit:
+            raise ValueError("page carries more items than its limit")
+        if self.has_more != (self.offset + len(self.items) < self.total):
+            raise ValueError("has_more must equal offset + len(items) < total")
+        return self
+
+
+#: Tag-store rejection -> (HTTP status, value-free C01 code). The session
+#: routes reuse the reviewed history-tags mapping verbatim.
+_SESSION_TAG_ERROR_MAP: Final[Mapping[TagErrorCode, tuple[int, str]]] = {
+    TagErrorCode.VALIDATION: (HTTP_400_BAD_REQUEST, "forbidden_field"),
+    TagErrorCode.TAG_NOT_FOUND: (HTTP_404_NOT_FOUND, "tag_not_found"),
+    TagErrorCode.TAG_IN_USE: (HTTP_409_CONFLICT, "tag_in_use"),
+    TagErrorCode.RESERVED_TAG: (HTTP_409_CONFLICT, "reserved_tag"),
+    TagErrorCode.LAST_TAG: (HTTP_409_CONFLICT, "last_tag"),
+    TagErrorCode.INVARIANT_VIOLATION: (HTTP_409_CONFLICT, "conflict"),
+}
+
+
+def _tag_error(request: Request, exc: TagStoreError) -> Response:
+    """Render one classified tag-store rejection as the C01 envelope."""
+    status, code = _SESSION_TAG_ERROR_MAP.get(exc.code, (HTTP_400_BAD_REQUEST, "forbidden_field"))
+    return render_error_envelope(request, status, code, str(exc))
+
+
+def _summary_row(
+    row: Any, tag_preview: EntityTagPreview | None = None
+) -> SessionSummary:
+    """Project one ``SessionRow`` onto the safe summary (never content).
+    ``tag_preview`` rides additively (D07-fix1 N5) so drawer session rows
+    render HistoryTags without a second round trip."""
     return SessionSummary(
         session_id=row.session_id,
         server_id=row.server_id,
         source=SessionSourceKind(str(row.source)),
         status=SessionStatus(str(row.status)),
         title=row.title,
+        tag_preview=(
+            None
+            if tag_preview is None
+            else EntityTagPreviewView(
+                preview=list(tag_preview.preview),
+                total=tag_preview.total,
+            )
+        ),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+async def _tag_previews(
+    factory: async_sessionmaker[AsyncSession],
+    session_ids: Sequence[uuid.UUID],
+    *,
+    server_id: uuid.UUID | None,
+) -> dict[uuid.UUID, EntityTagPreview]:
+    """Batch previews for one page; ``server_id=None`` previews the recent
+    cross-server page (ids are already scope-produced)."""
+    try:
+        return await apreview_session_tags(
+            factory, session_ids=session_ids, server_id=server_id
+        )
+    except SessionContractError:
+        return {}
 
 
 async def _detail_of(
@@ -198,7 +297,8 @@ async def _detail_of(
         return None
     if row is None:
         return None
-    summary = _summary_row(row)
+    previews = await _tag_previews(factory, [session_id], server_id=server_id)
+    summary = _summary_row(row, previews.get(session_id))
     async with factory() as session:
         async with session.begin():
             aggregates = (
@@ -325,9 +425,19 @@ def _entry_page(frame_page: SessionHistoryPage) -> ServerEntriesFrame:
 )
 async def list_sessions(
     request: Request,
-    server_id: uuid.UUID = Query(
+    server_id: uuid.UUID | None = Query(
+        default=None,
         description="Explicit server scope the listing is pinned to "
-        "(C01 rule 2)",
+        "(C01 rule 2); omit for the recent page across all enrolled "
+        "servers + General Consult",
+    ),
+    status: SessionStatus | None = Query(
+        default=None,
+        description="Optional coarse status filter (SessionStatus vocabulary)",
+    ),
+    tag_id: uuid.UUID | None = Query(
+        default=None,
+        description="Optional catalog tag filter (session_tags association)",
     ),
     limit: int = Query(
         default=SESSION_LIST_DEFAULT_LIMIT,
@@ -340,14 +450,26 @@ async def list_sessions(
         default=0, ge=0, description="Slice start within the collection"
     ),
 ) -> SessionListPage:
-    """One bounded, deterministic session page (newest-change first)."""
+    """One bounded, deterministic session page (newest-change first) with
+    honest tag previews (D07-fix1: the drawer renders HistoryTags from the
+    list page without a second round trip)."""
     await _require_session(request)
     factory = _factory(request)
     rows, total = await alist_sessions(
-        factory, server_id=server_id, limit=limit, offset=offset
+        factory,
+        server_id=server_id,
+        status=status,
+        tag_id=tag_id,
+        limit=limit,
+        offset=offset,
+    )
+    previews = await _tag_previews(
+        factory, [row.session_id for row in rows], server_id=server_id
     )
     return SessionListPage(
-        items=[_summary_row(row) for row in rows],
+        items=[
+            _summary_row(row, previews.get(row.session_id)) for row in rows
+        ],
         limit=limit,
         offset=offset,
         total=int(total),
@@ -642,6 +764,232 @@ async def submit_control(
         active_run_id=active,
         database_url=database_url,
     )
+
+
+# --- rename + tags surface (D07-fix1 F2) ---------------------------------------------
+# The reviewed boundary order everywhere: session cookie (layer 1), exact
+# Origin allowlist (layer 2), CSRF double submit (layer 3); every route is
+# explicitly server-scoped and fails scope-blind 404 (C01 rule 2); every
+# collection read is a bounded page (AGENTS.md §1).
+
+
+@router.patch("/{session_id}", response_model=SessionDetail)
+async def rename_session(
+    request: Request,
+    session_id: uuid.UUID,
+    payload: SessionRenameRequest,
+    server_id: uuid.UUID | None = Query(
+        default=None,
+        description="Explicit server scope (scope-blind 404 when it "
+        "differs from the stored session)",
+    ),
+) -> Response | SessionDetail:
+    """Rename one session (the only mutable header field); the trimmed
+    title is durable under the session-row lock."""
+    _ = await _require_session(request)
+    _require_allowed_origin(request)
+    _require_csrf(request)
+    factory = _factory(request)
+    try:
+        row = await arename_session(
+            factory,
+            session_id=session_id,
+            server_id=server_id,
+            title=payload.title,
+        )
+    except SessionContractError as exc:
+        # A title-bound rejection is a 400 (the client sent it); any scope
+        # rejection stays the scope-blind 404 (C01 rule 2).
+        if any(error.field == "title" for error in exc.errors):
+            return _bad_request(
+                request,
+                SessionErrorCode.FORBIDDEN_FIELD.value,
+                "title must be 1..120 characters when set",
+            )
+        return _not_found(request)
+    detail = await _detail_of(
+        factory, session_id=row.session_id, server_id=row.server_id
+    )
+    if detail is None:
+        return _not_found(request)
+    return detail
+
+
+@router.get("/{session_id}/tags", response_model=SessionTagsPage)
+async def list_session_tags(
+    request: Request,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID = Query(
+        description="Explicit server scope (C01 rule 2)",
+    ),
+    limit: int = Query(
+        default=SESSION_LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=SESSION_LIST_MAX_LIMIT,
+        description="Page size used for this slice (1.."
+        f"{SESSION_LIST_MAX_LIMIT})",
+    ),
+    offset: int = Query(default=0, ge=0, description="Slice start"),
+) -> Response | SessionTagsPage:
+    """One bounded tag page of the session's associations (scope-blind
+    refusal when the session is missing or foreign)."""
+    _ = await _require_session(request)
+    factory = _factory(request)
+    try:
+        rows, total = await asession_tags_page(
+            factory, session_id=session_id, server_id=server_id, limit=limit, offset=offset
+        )
+    except SessionContractError:
+        # The store's empty-vs-foreign probe raised the scope-blind
+        # contract error: missing and cross-server stay the SAME 404.
+        return _not_found(request)
+    # Resolve the names through ONE bounded catalog probe for the page.
+    names: dict[uuid.UUID, str] = {}
+    if rows:
+        async with factory() as session:
+            tag_rows = (
+                await session.execute(
+                    sql_text(
+                        "SELECT tag_id, name FROM tags "
+                        "WHERE tag_id = ANY(:ids)"
+                    ),
+                    {"ids": [row.tag_id for row in rows]},
+                )
+            ).mappings().all()
+        names = {uuid.UUID(str(row["tag_id"])): str(row["name"]) for row in tag_rows}
+    items = [
+        EntityTagView(
+            tag_id=row.tag_id,
+            name=names.get(row.tag_id, ""),
+            assigned_by=row.assigned_by,
+            assignment_source=row.assignment_source,
+            created_at=row.created_at.isoformat().replace("+00:00", "Z"),
+        )
+        for row in rows
+    ]
+    return SessionTagsPage(
+        session_id=session_id,
+        server_id=server_id,
+        limit=limit,
+        offset=offset,
+        total=int(total),
+        has_more=offset + len(items) < int(total),
+        items=items,
+    )
+
+
+@router.post("/{session_id}/tags", status_code=HTTP_204_NO_CONTENT)
+async def assign_session_tag(
+    request: Request,
+    session_id: uuid.UUID,
+    payload: SessionTagAssignRequest,
+) -> Response:
+    """Assign one catalog tag to the session (idempotent on the pair;
+    ``assignment_source='user'``; optional create-if-missing name)."""
+    _ = await _require_session(request)
+    _require_allowed_origin(request)
+    _require_csrf(request)
+    factory = _factory(request)
+    try:
+        if payload.tag_name is not None and payload.tag_name.strip() != "":
+            # Name-first resolution (idempotent submits): an existing
+            # catalog tag with that canonical name wins (its id is the
+            # association target regardless of the body's tag_id); a fresh
+            # name with an unknown requested id mints the catalog row and
+            # THAT id is the target.
+            resolved = await _tag_id_by_name(factory, payload.tag_name)
+            if resolved is not None:
+                tag_id = resolved
+            elif await _tag_exists(factory, payload.tag_id):
+                tag_id = payload.tag_id
+            else:
+                from mai.tag_store import acreate_tag
+
+                created = await acreate_tag(
+                    factory,
+                    name=payload.tag_name.strip(),
+                    description=None,
+                )
+                tag_id = uuid.UUID(str(created.tag_id))
+        else:
+            tag_id = payload.tag_id
+    except TagStoreError as exc:
+        return _tag_error(request, exc)
+    try:
+        await aattach_session_tag(
+            factory,
+            session_id=session_id,
+            server_id=payload.server_id,
+            tag_id=tag_id,
+            assigned_by="",
+            assignment_source="user",
+        )
+    except SessionContractError:
+        return _not_found(request)
+    except TagStoreError as exc:
+        return _tag_error(request, exc)
+
+
+@router.delete(
+    "/{session_id}/tags/{tag_id}", status_code=HTTP_204_NO_CONTENT
+)
+async def remove_session_tag(
+    request: Request,
+    session_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    server_id: uuid.UUID = Query(
+        description="Explicit server scope (C01 rule 2)",
+    ),
+    replacement_tag_id: uuid.UUID | None = Query(
+        default=None,
+        description="Mandatory on final-tag removal (last_tag 409 "
+        "without it); attaches in the same transaction",
+    ),
+) -> Response:
+    """Remove one session-tag association; the mandatory-at-least-one-tag
+    invariant refuses the final removal without a replacement (409)."""
+    _ = await _require_session(request)
+    _require_allowed_origin(request)
+    _require_csrf(request)
+    factory = _factory(request)
+    try:
+        await aremove_session_tag(
+            factory,
+            session_id=session_id,
+            server_id=server_id,
+            tag_id=tag_id,
+            replacement_tag_id=replacement_tag_id,
+        )
+    except TagStoreError as exc:
+        return _tag_error(request, exc)
+
+
+async def _tag_exists(
+    factory: async_sessionmaker[AsyncSession], tag_id: uuid.UUID
+) -> bool:
+    """One bounded catalog probe (route-local helper)."""
+    async with factory() as session:
+        row = (
+            await session.execute(
+                sql_text("SELECT 1 FROM tags WHERE tag_id = :tid"),
+                {"tid": tag_id},
+            )
+        ).first()
+    return row is not None
+
+
+async def _tag_id_by_name(
+    factory: async_sessionmaker[AsyncSession], name: str
+) -> uuid.UUID | None:
+    """Canonical lower(name) catalog probe (route-local helper)."""
+    async with factory() as session:
+        row = (
+            await session.execute(
+                sql_text("SELECT tag_id FROM tags WHERE lower(name) = lower(:name)"),
+                {"name": name.strip()},
+            )
+        ).first()
+    return uuid.UUID(str(row[0])) if row else None
 
 
 # --- the WebSocket channel ------------------------------------------------------------

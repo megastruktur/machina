@@ -10,6 +10,21 @@ import {
 
 /** Node globals (ambient: the project tsconfig targets browser-first code). */
 declare const process: { env: Record<string, string | undefined> };
+declare module 'node:fs' {
+	export function readFileSync(path: URL | string, encoding?: string): string;
+}
+declare module 'node:child_process' {
+	export function spawnSync(
+		command: string,
+		args: string[],
+		options?: Record<string, unknown>
+	): { status: number | null; stderr: string; stdout: string };
+	export function spawn(
+		command: string,
+		args: string[],
+		options?: Record<string, unknown>
+	): { kill(): void };
+}
 
 /**
  * session-client.spec.ts — D07 proofs for the session-first client surface
@@ -94,6 +109,42 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 const SESSION_A = '11111111-1111-4111-8111-111111111111';
+
+// ---------------------------------------------------------------------------
+// Compile-time pins (F2 guard): every shipped session client method maps to
+// a REAL generated producer path — `paths[...]` lookups fail compilation
+// when the route is absent from schema.generated.ts (the exact gap R07 F2
+// caught).
+// ---------------------------------------------------------------------------
+import type { paths } from '../src/lib/api/schema.generated';
+
+type Assert<T extends true> = T;
+type _ListPinned = Assert<
+	paths['/api/v1/agent-sessions'] extends { get: unknown; post: unknown } ? true : false
+>;
+type _DetailPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}`] extends { get: unknown; patch: unknown } ? true : false
+>;
+type _HistoryPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}/history`] extends { get: unknown } ? true : false
+>;
+type _TurnsPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}/turns`] extends { post: unknown } ? true : false
+>;
+type _ControlPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}/control`] extends { post: unknown } ? true : false
+>;
+type _TagsPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}/tags`] extends {
+		get: unknown;
+		post: unknown;
+	}
+		? true
+		: false
+>;
+type _TagRemovalPinned = Assert<
+	paths[`/api/v1/agent-sessions/{session_id}/tags/{tag_id}`] extends { delete: unknown } ? true : false
+>;
 const SERVER_A = '5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60';
 
 const SESSION_VIEW = {
@@ -118,6 +169,16 @@ const ENVELOPE = {
 		fields: {}
 	}
 } as const;
+
+// Local Network Access: the gated live-backend E2E drives a REAL
+// WebSocket from the fixture page to the spawned uvicorn port; Chromium's
+// LNA protection blocks that cross-port reach unless disabled for this
+// spec's browsers (harmless for the same-origin mocked layers).
+test.use({
+	launchOptions: {
+		args: ['--disable-features=LocalNetworkAccessChecks,BlockInsecurePrivateNetworkRequests']
+	}
+});
 
 test.describe('REST boundary (injected fetch)', () => {
 	test('mutations carry the CSRF double submit; GETs do not', async () => {
@@ -521,6 +582,7 @@ const FRONTEND_ROOT = new URL('../', import.meta.url).pathname;
 const VIRTUAL_ID = 'virtual:mai-session-client-entry';
 const DRAWER = `${FRONTEND_ROOT}src/lib/workspace/ChatDrawerSection.svelte`;
 const CLIENT = `${FRONTEND_ROOT}src/lib/api/client.ts`;
+const CHANNEL_CLIENT = `${FRONTEND_ROOT}src/lib/chat/session_client.ts`;
 const TOKENS = `${FRONTEND_ROOT}src/lib/ui/tokens.css`;
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
@@ -540,6 +602,50 @@ declare global {
 			calls: Array<{ method: string; url: string; body: unknown; csrf: string | null }>;
 			renameResult: string | null;
 		};
+		/** F3 lifecycle bridge: the visible-session channel surface. */
+		__maiChannels?: {
+			active: string[];
+			states: Record<string, string>;
+		};
+		/** Live-backend E2E bridge (gated describe). */
+		__maiE2E?: {
+			log: Array<{ step: string; detail: unknown }>;
+			channelState?: string;
+			committedSeqs?: number[];
+		};
+		__MAI_WS_DEBUG?: boolean;
+		__openSession?(sessionId: string, serverId: string | null): void;
+		__closeSession?(): void;
+		__maiLoadMoreCalls?: number;
+		__live?: {
+			client: {
+				bootstrap(payload: { password: string }): Promise<void>;
+				login(payload: { password: string }): Promise<void>;
+				createAgentSession(payload: {
+					server_id: string;
+					source: string;
+					client_request_id: string;
+				}): Promise<{ session_id: string }>;
+				submitAgentSessionTurn(
+					sessionId: string,
+					payload: { session_id: string; text: string; client_request_id: string },
+					serverId?: string | null
+				): Promise<{ session_id: string; run_id: string; seq: number }>;
+				renameAgentSession(
+					sessionId: string,
+					payload: { title: string }
+				): Promise<{ title: string }>;
+				assignAgentSessionTag(
+					sessionId: string,
+					payload: { server_id: string; tag_id: string; tag_name?: string }
+				): Promise<void>;
+				listAgentSessionTags(
+					sessionId: string,
+					serverId: string
+				): Promise<{ total: number; items: Array<{ tag_id: string; name: string }> }>;
+			};
+			openChannel(sessionId: string, serverId: string): void;
+		};
 	}
 }
 
@@ -556,6 +662,7 @@ function harnessEntry(): string {
 import { mount } from 'svelte';
 import ChatDrawerSection from ${JSON.stringify(DRAWER)};
 import { createMaiApiClient } from ${JSON.stringify(CLIENT)};
+import { createSessionChannelController } from ${JSON.stringify(CHANNEL_CLIENT)};
 import ${JSON.stringify(TOKENS)};
 
 const SESSION_ID = ${JSON.stringify(SESSION_ID)};
@@ -666,17 +773,135 @@ async function rename(rowKey, title) {
   state.renameResult = 'unrouted';
 }
 
+
+// --- F3 lifecycle bridge: the visible-session channel surface ------------
+// The SAME open/switch/close discipline the composed desktop uses (one
+// controller per visible session; switching disposes the old stream). The
+// strip mirrors the REAL controller callbacks - never a fabricated state.
+const channels = new Map();
+const channelStates = {};
+function renderChannels() {
+	const strip = document.getElementById('channels');
+	if (strip === null) return;
+	const active = [...channels.keys()];
+	window.__maiChannels = { active, states: { ...channelStates } };
+	const visible = active[0] ?? null;
+	strip.setAttribute(
+		'data-channel-state',
+		visible === null ? 'closed' : channelStates[visible] ?? 'connecting'
+	);
+	strip.setAttribute('data-active-session', visible ?? '');
+	strip.textContent =
+		visible === null
+			? 'no session open'
+			: 'session ' + visible.slice(0, 8) + '... - channel ' + (channelStates[visible] ?? 'connecting');
+}
+window.__openSession = (sessionId, serverId) => {
+	for (const existing of channels.values()) existing.dispose();
+	channels.clear();
+	const controller = createSessionChannelController({
+		sessionId,
+		serverId,
+		getCsrfToken: () => 'csrf-d07',
+		reconnectDelaysMs: [50, 50],
+		handlers: {
+			onConnectionState: (state) => {
+				channelStates[sessionId] = state;
+				renderChannels();
+			}
+		}
+	});
+	channels.set(sessionId, controller);
+	channelStates[sessionId] = 'connecting';
+	controller.connect();
+	renderChannels();
+};
+window.__closeSession = () => {
+	for (const existing of channels.values()) existing.dispose();
+	channels.clear();
+	renderChannels();
+};
+
+
+// --- Live-backend E2E bridge (gated; N6) ----------------------------------
+// The REAL client and the REAL controller over the REAL backend spawned by
+// the gated describe below: zero recording, zero mocking. The base comes
+// from the fixture URL's ?base= query so the same bundle serves both.
+const E2E_BASE = new URLSearchParams(location.search).get('base');
+function liveCookie(name) {
+	for (const pair of document.cookie.split(';')) {
+		const eq = pair.indexOf('=');
+		if (eq === -1) continue;
+		if (pair.slice(0, eq).trim() === name) return decodeURIComponent(pair.slice(eq + 1).trim());
+	}
+	return null;
+}
+if (E2E_BASE !== null) {
+	const liveClient = createMaiApiClient();
+	const e2e = { log: [], channelState: 'closed', committedSeqs: [] };
+	window.__maiE2E = e2e;
+	let activeController = null;
+	window.__live = {
+		client: liveClient,
+		openChannel: (sessionId, serverId) => {
+			if (activeController !== null) activeController.dispose();
+			activeController = createSessionChannelController({
+				sessionId,
+				serverId,
+				baseUrl: E2E_BASE,
+				handlers: {
+					onConnectionState: (state) => {
+						e2e.channelState = state;
+						if (window.__MAI_WS_DEBUG) console.log('[ctrl] state', state);
+					},
+					onHelloOk: () => {
+						if (window.__MAI_WS_DEBUG) console.log('[ctrl] hello_ok');
+					},
+					onSnapshot: (frame) => {
+						if (window.__MAI_WS_DEBUG)
+							console.log('[ctrl] snapshot', frame.entries.length);
+					},
+					onError: (frame) => {
+						if (window.__MAI_WS_DEBUG)
+							console.log('[ctrl] error', frame.code, frame.reason);
+					},
+					onCommittedEntriesChanged: (entries) => {
+						e2e.committedSeqs = entries.map((entry) => entry.seq);
+						if (window.__MAI_WS_DEBUG)
+							console.log('[ctrl] committed seqs', e2e.committedSeqs);
+					}
+				}
+			});
+			activeController.connect();
+		},
+		closeChannel: () => {
+			if (activeController !== null) activeController.dispose();
+			activeController = null;
+			e2e.channelState = 'closed';
+		}
+	};
+}
+
+const HAS_MORE = new URLSearchParams(location.search).get('hasmore') === '1';
 mount(ChatDrawerSection, {
   target: document.getElementById('app'),
   props: {
     conversations: rows,
     totalConversations: 15,
-    hasMoreConversations: false,
+    hasMoreConversations: HAS_MORE,
     loadingMoreConversations: false,
     activeRunId: null,
     onnewchat: () => {},
     onselectconversation: () => {},
     onrenameconversation: (rowKey, title) => rename(rowKey, title),
+    onloadmorehistory: () => {
+      window.__maiSessionState?.calls.push({
+        method: 'LOAD_MORE',
+        url: '',
+        body: null,
+        csrf: null
+      });
+    },
     tagLoader
   }
 });
@@ -750,12 +975,19 @@ test.beforeEach(async ({ page }) => {
 </head>
 <body style="padding-top:24px">
 <div id="app"></div>
+<div id="channels" data-testid="session-channel-state"></div>
+<div id="live-e2e"></div>
 <script type="module" src="${FIXTURE_URL}demo.js"><\/script>
 </body>
 </html>`;
 
 	await page.route('**/*', (route: Route) => {
-		const { pathname } = new URL(route.request().url());
+		const requestUrl = new URL(route.request().url());
+		// The gated live-backend E2E (N6) must reach the REAL uvicorn child:
+		// requests to any other origin pass through untouched (mocked-fetch
+		// could never catch a missing producer route - R07 F2's lesson).
+		if (requestUrl.port !== '4173') return route.continue();
+		const { pathname } = requestUrl;
 		if (!pathname.startsWith(FIXTURE_URL)) return route.fulfill({ contentType: 'text/html', body: html });
 		if (pathname.endsWith('demo.js')) {
 			return route.fulfill({ contentType: 'text/javascript; charset=utf-8', body: harnessJs });
@@ -867,4 +1099,444 @@ test('the legacy row keeps the conversation tag route while dual-wired', async (
 	);
 	expect(legacy).toBeDefined();
 	expect(legacy?.method).toBe('GET');
+});
+
+// ---------------------------------------------------------------------------
+// F2 guard: the shipped-method → producer-path table (runtime half)
+// ---------------------------------------------------------------------------
+
+test('every shipped session method has a generated producer path', async () => {
+	const { readFileSync } = await import('node:fs');
+	const clientSource = readFileSync(
+		new URL('../src/lib/api/client.ts', import.meta.url),
+		'utf-8'
+	);
+	const schemaSource = readFileSync(
+		new URL('../src/lib/api/schema.generated.ts', import.meta.url),
+		'utf-8'
+	);
+	// (client method, HTTP verb, wire path) — the wire paths the client
+	// actually renders. Each path MUST exist as a generated `paths` key
+	// (schema.generated.ts is produced by the documented generator), so a
+	// client method whose backend route disappears fails here.
+	const table = [
+		['createAgentSession', 'post', '/api/v1/agent-sessions'],
+		['listAgentSessions', 'get', '/api/v1/agent-sessions'],
+		['readAgentSession', 'get', '/api/v1/agent-sessions/{session_id}'],
+		['renameAgentSession', 'patch', '/api/v1/agent-sessions/{session_id}'],
+		['listAgentSessionEntries', 'get', '/api/v1/agent-sessions/{session_id}/history'],
+		['submitAgentSessionTurn', 'post', '/api/v1/agent-sessions/{session_id}/turns'],
+		['submitAgentSessionControl', 'post', '/api/v1/agent-sessions/{session_id}/control'],
+		['listAgentSessionTags', 'get', '/api/v1/agent-sessions/{session_id}/tags'],
+		['assignAgentSessionTag', 'post', '/api/v1/agent-sessions/{session_id}/tags'],
+		['removeAgentSessionTag', 'delete', '/api/v1/agent-sessions/{session_id}/tags/{tag_id}']
+	] as const;
+	for (const [method, verb, path] of table) {
+		// The client renders every path as a template literal.
+		expect(
+			clientSource.includes(`'${verb.toUpperCase()}'`),
+			`${method} must issue ${verb.toUpperCase()}`
+		).toBe(true);
+		expect(
+			schemaSource.includes(`"${path}":`),
+			`${method}'s producer path ${path} must exist in schema.generated.ts`
+		).toBe(true);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// F4: the drawer Load-more control drives the pagination callback
+// ---------------------------------------------------------------------------
+
+test('Load more drives the pagination callback exactly once per click', async ({ page }) => {
+	// The ?hasmore fixture mounts the drawer with hasMoreConversations=true
+	// and records every onloadmorehistory invocation.
+	await page.goto(`${FIXTURE_URL}?hasmore=1`);
+	await page.mouse.move(200, 560);
+	await expect(page.getByTestId('drawer-history-load-more')).toBeVisible();
+	await page.getByTestId('drawer-history-load-more').click();
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					window.__maiSessionState?.calls.filter((call) => call.method === 'LOAD_MORE')
+						.length ?? 0
+			)
+		)
+		.toBe(1);
+	await page.getByTestId('drawer-history-load-more').click();
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					window.__maiSessionState?.calls.filter((call) => call.method === 'LOAD_MORE')
+						.length ?? 0
+			)
+		)
+		.toBe(2);
+});
+
+// ---------------------------------------------------------------------------
+// F3: the visible-session channel lifecycle over REAL WebSockets
+// ---------------------------------------------------------------------------
+
+interface MockServer {
+	seenHellos: number;
+	closed: boolean;
+}
+
+test('switching sessions closes the old socket and opens the new one', async ({ page }) => {
+	const opened: MockServer[] = [];
+	await page.routeWebSocket(/\/channel/, (ws) => {
+		const server: MockServer = { seenHellos: 0, closed: false };
+		opened.push(server);
+		ws.onMessage((data) => {
+			const raw = data as string;
+			if (raw.includes('"hello"')) {
+				server.seenHellos += 1;
+				const frame = JSON.parse(raw) as { after_seq: number | null };
+				// The handshake answers hello_ok so the controller reports open.
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: SESSION_ID,
+						server_id: SERVER_A,
+						stream_id: 's',
+						latest_seq: frame.after_seq ?? 0
+					})
+				);
+			}
+		});
+	});
+
+	const sessionB = '55555555-5555-4555-8555-555555555555';
+	await page.evaluate((ids) => {
+		window.__openSession!(ids[0], null);
+	}, [SESSION_ID, sessionB]);
+	await expect
+		.poll(() =>
+			page.evaluate((id) => window.__maiChannels?.states[id] ?? '', SESSION_ID)
+		)
+		.toBe('open');
+	await expect
+		.poll(() => page.evaluate(() => window.__maiChannels?.active ?? []))
+		.toEqual([SESSION_ID]);
+
+	// Switching: session B's controller DISPOSES session A's socket.
+	await page.evaluate((ids) => {
+		window.__openSession!(ids[1], null);
+	}, [SESSION_ID, sessionB]);
+	await expect
+		.poll(() => page.evaluate(() => window.__maiChannels?.active ?? []))
+		.toEqual([sessionB]);
+	await expect
+		.poll(() => page.evaluate((id) => window.__maiChannels?.states[id] ?? '', sessionB))
+		.toBe('open');
+	// Exactly TWO sockets were ever opened; the old one is gone from the
+	// visible surface.
+	expect(opened.length).toBe(2);
+	const strip = page.getByTestId('session-channel-state');
+	await expect(strip).toHaveAttribute('data-active-session', sessionB);
+});
+
+test('connection loss surfaces reconnecting, not success', async ({ page }) => {
+	const servers: Array<{ close: () => void }> = [];
+	await page.routeWebSocket(/\/channel/, (ws) => {
+		const handle = {
+			close: () => ws.close({ code: 1006, reason: 'transport lost' })
+		};
+		servers.push(handle);
+		ws.onMessage((data) => {
+			if ((data as string).includes('"hello"')) {
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: SESSION_ID,
+						server_id: SERVER_A,
+						stream_id: 's',
+						latest_seq: 0
+					})
+				);
+			}
+		});
+	});
+
+	await page.evaluate((id) => window.__openSession!(id, null), SESSION_ID);
+	await expect
+		.poll(() =>
+			page.evaluate((id) => window.__maiChannels?.states[id] ?? '', SESSION_ID)
+		)
+		.toBe('open');
+	// The transport drops: the strip shows the honest reconnecting state.
+	servers[0].close();
+	await expect(page.getByTestId('session-channel-state')).toHaveAttribute(
+		'data-channel-state',
+		/reconnecting|connecting/
+	);
+	// The bounded ladder reconnects and the state settles open again.
+	await expect
+		.poll(
+			() => page.evaluate((id) => window.__maiChannels?.states[id] ?? '', SESSION_ID),
+			{ timeout: 5_000 }
+		)
+		.toBe('open');
+	await expect(page.getByTestId('session-channel-state')).toHaveAttribute(
+		'data-channel-state',
+		'open'
+	);
+});
+
+test('New Chat closes the visible session channel', async ({ page }) => {
+	await page.routeWebSocket(/\/channel/, (ws) => {
+		ws.onMessage((data) => {
+			if ((data as string).includes('"hello"')) {
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: SESSION_ID,
+						server_id: SERVER_A,
+						stream_id: 's',
+						latest_seq: 0
+					})
+				);
+			}
+		});
+	});
+	await page.evaluate((id) => window.__openSession!(id, null), SESSION_ID);
+	await expect
+		.poll(() =>
+			page.evaluate((id) => window.__maiChannels?.states[id] ?? '', SESSION_ID)
+		)
+		.toBe('open');
+	await page.evaluate(() => window.__closeSession!());
+	await expect(page.getByTestId('session-channel-state')).toHaveAttribute(
+		'data-channel-state',
+		'closed'
+	);
+	await expect(page.evaluate(() => window.__maiChannels?.active ?? [])).resolves.toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// N6: the real-browser + live FastAPI/Postgres E2E (gated)
+// ---------------------------------------------------------------------------
+
+test.describe('live backend E2E (gated)', () => {
+	test.skip(
+		process.env.MAI_E2E_SESSION_BACKEND !== '1',
+		'requires MAI_E2E_SESSION_BACKEND=1 and the disposable Postgres fixture'
+	);
+
+	const E2E_BASE = process.env.MAI_E2E_API_URL ?? 'http://127.0.0.1:8917';
+	const E2E_PORT = Number(new URL(E2E_BASE).port);
+	const E2E_SERVER = '00000000-0000-0000-0000-000000000000';
+
+	test.beforeAll(async () => {
+		const { spawnSync } = await import('node:child_process');
+		const dbUrl = process.env.MAI_E2E_DATABASE_URL!;
+		const adminUrl = dbUrl.replace(/\/[^/]*$/, '/postgres');
+		// 1. The E2E database (idempotent).
+		spawnSync(
+			'uv',
+			[
+				'run',
+				'python',
+				'-c',
+				`import psycopg; c = psycopg.connect(${JSON.stringify(adminUrl)}, autocommit=True); c.execute('DROP DATABASE IF EXISTS mai_e2e'); c.execute('CREATE DATABASE mai_e2e')`
+			],
+			{ cwd: new URL('../../backend', import.meta.url).pathname, stdio: 'inherit' }
+		);
+		// 2. The real Alembic chain.
+		const migrated = spawnSync(
+			'uv',
+			['run', 'alembic', 'upgrade', 'head'],
+			{
+				cwd: new URL('../../backend', import.meta.url).pathname,
+				env: { ...process.env, MAI_DATABASE_URL: dbUrl },
+				encoding: 'utf-8'
+			}
+		);
+		if (migrated.status !== 0) throw new Error(`alembic failed: ${migrated.stderr}`);
+		// 3. The DBOS schema is ENGINE-owned (the reviewed test fixture's
+		//    contract): launch_worker bootstraps it, then shuts down.
+		const bootstrapped = spawnSync(
+			'uv',
+			[
+				'run',
+				'python',
+				'-c',
+				'import os; from mai.jobs import engine as jobs_engine; jobs_engine.launch_worker(os.environ["MAI_DATABASE_URL"]); jobs_engine.shutdown()'
+			],
+			{
+				cwd: new URL('../../backend', import.meta.url).pathname,
+				env: { ...process.env, MAI_DATABASE_URL: dbUrl },
+				encoding: 'utf-8'
+			}
+		);
+		if (bootstrapped.status !== 0) {
+			throw new Error(`jobs engine bootstrap failed: ${bootstrapped.stderr}`);
+		}
+	});
+
+	test.beforeEach(async ({ page }) => {
+		// Same-origin /api/v1/** is proxied to the REAL backend: the browser
+		// talks to one origin (cookies + CSRF honest) while the wire
+		// terminates on the spawned uvicorn child.
+		await page.route('**/api/v1/**', async (route) => {
+			const requestUrl = new URL(route.request().url());
+			if (requestUrl.port !== '4173') return route.continue();
+			const target = requestUrl.toString().replace(
+				'http://127.0.0.1:4173',
+				E2E_BASE
+			);
+			const response = await route.fetch({ url: target });
+			await route.fulfill({ response });
+		});
+		await page.goto(`${FIXTURE_URL}?base=${E2E_BASE}`);
+		await page.waitForFunction(() => window.__live !== null && window.__live !== undefined);
+	});
+
+	test('create -> turn -> WS channel -> rename -> tags against the REAL backend', async ({
+		page
+	}) => {
+		const rootUrl = new URL('../../backend', import.meta.url).pathname;
+		const { spawn: spawnProc } = await import('node:child_process');
+		// The uvicorn fixture lives exactly as long as this test.
+		const child = spawnProc(
+			'bash',
+			[
+				'-c',
+				`exec uv run uvicorn mai.api.app:create_app --factory --host 127.0.0.1 --port ${E2E_PORT} >/tmp/mai-e2e-uvicorn.log 2>&1`
+			],
+			{
+				cwd: rootUrl,
+				env: {
+					...process.env,
+					MAI_DATABASE_URL: process.env.MAI_E2E_DATABASE_URL!,
+					MAI_PUBLIC_ORIGINS: 'http://127.0.0.1:4173',
+					MAI_DATA_ROOT: '/tmp/mai-d07fix1-e2e-root'
+				}
+			}
+		);
+		try {
+			// Wait for readiness.
+			await expect
+				.poll(
+					async () => {
+						try {
+							const response = await fetch(`${E2E_BASE}/api/v1/health`);
+							return response.status;
+						} catch {
+							return 0;
+						}
+					},
+					{ timeout: 30_000 }
+				)
+				.toBe(200);
+
+			// Bootstrap + login (G1 setup state; cookies land on 127.0.0.1).
+			await page.evaluate(async (base) => {
+				const client = window.__live!.client;
+				await client.bootstrap({ password: 'e2e-password-d07fix1' }).catch(() => undefined);
+				await client.login({ password: 'e2e-password-d07fix1' });
+			}, E2E_BASE);
+
+			// Create -> turn (durable admission).
+			const admitted = await page.evaluate(async (ids) => {
+			try {
+				const client = window.__live!.client;
+				const created = await client.createAgentSession({
+					server_id: ids.server,
+					source: 'interactive',
+					client_request_id: crypto.randomUUID()
+				});
+				const outcome = await client.submitAgentSessionTurn(
+					created.session_id,
+					{
+						session_id: created.session_id,
+						text: 'the real-backend turn',
+						client_request_id: crypto.randomUUID()
+					},
+					ids.server
+				);
+				return { created, outcome };
+			} catch (error) {
+				const api = error as { code?: string; fields?: unknown; message?: string };
+				throw new Error(
+					`E2E admission failed: ${api.code ?? ''} ${api.message ?? ''} fields=${JSON.stringify(api.fields ?? {})}`
+				);
+			}
+		}, { server: E2E_SERVER });
+			expect(admitted.outcome.seq).toBe(1);
+
+			// The REAL WebSocket channel: hello -> hello_ok -> snapshot with
+			// the committed turn entry (the real backend fanout).
+			const cookieNames = (
+				await page.context().cookies('http://127.0.0.1:8917')
+			).map((cookie) => cookie.name);
+			expect(cookieNames).toContain('mai_session');
+			expect(cookieNames).toContain('mai_csrf');
+			page.on('websocket', (ws) => {
+				process.env.MAI_WS_DEBUG === '1' &&
+					console.log(
+						`[ws] open=${ws.url()}`
+					);
+				ws.on('socketerror', (error) => {
+					if (process.env.MAI_WS_DEBUG === '1') console.log('[ws] error', String(error));
+				});
+				ws.on('close', () => {
+					if (process.env.MAI_WS_DEBUG === '1') console.log('[ws] closed', ws.url());
+				});
+			});
+			if (process.env.MAI_WS_DEBUG === '1') {
+				console.log('[e2e] cookies:', await page.evaluate(() => document.cookie));
+			}
+			await page.evaluate((ids) => {
+				window.__live!.openChannel(ids.session, ids.server);
+			}, { session: admitted.created.session_id, server: E2E_SERVER });
+			await expect
+				.poll(() =>
+					page.evaluate(() => ({
+						state: window.__maiE2E?.channelState ?? '',
+						seqs: window.__maiE2E?.committedSeqs ?? []
+					}))
+				)
+				.toMatchObject({ state: 'open' });
+			// The committed cursor advanced over the admitted turn (seq 1);
+			// the worker may commit further durable entries (run_state /
+			// assistant) while the channel is open — continuity, never a gap.
+			const committed = await page.evaluate(
+				() => window.__maiE2E?.committedSeqs ?? []
+			);
+			expect(committed.length).toBeGreaterThanOrEqual(1);
+			expect(committed[0]).toBe(1);
+
+			// Rename over the REAL PATCH route.
+			const renamedTitle = await page.evaluate(async (ids) => {
+				const client = window.__live!.client;
+				const detail = await client.renameAgentSession(ids.session, {
+					title: 'E2E renamed'
+				});
+				return detail.title;
+			}, { session: admitted.created.session_id });
+			expect(renamedTitle).toBe('E2E renamed');
+
+			// Tags: create-if-missing assignment + the bounded page.
+			const tagPage = await page.evaluate(async (ids) => {
+				const client = window.__live!.client;
+				await client.assignAgentSessionTag(ids.session, {
+					server_id: ids.server,
+					tag_id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+					tag_name: 'e2e'
+				});
+				return client.listAgentSessionTags(ids.session, ids.server);
+			}, { session: admitted.created.session_id, server: E2E_SERVER });
+			expect(tagPage.total).toBe(1);
+			expect(tagPage.items[0]?.name).toBe('e2e');
+		} finally {
+			child.kill();
+		}
+	});
 });

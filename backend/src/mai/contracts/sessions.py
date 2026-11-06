@@ -54,6 +54,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from mai.contracts.tags import EntityTagPreviewView
 from mai.contracts.tool_results import DomainOutcome, EffectCertainty, ExecutionStatus
 
 __all__ = [
@@ -86,6 +87,8 @@ __all__ = [
     "SessionControlRequest",
     "SessionControlResponse",
     "SessionCreateRequest",
+    "SessionRenameRequest",
+    "SessionTagAssignRequest",
     "SessionDetail",
     "SessionEntryPayload",
     "SessionEntryView",
@@ -929,6 +932,12 @@ class SessionSummary(BaseModel):
         default=None,
         description="Subordinate run currently executing, when one exists",
     )
+    tag_preview: EntityTagPreviewView | None = Field(
+        default=None,
+        description="Bounded tag preview (first ≤3 names + honest total); "
+        "None only for a session with zero tags (the drawer renders no "
+        "chips instead of fabricating an empty preview)",
+    )
     created_at: datetime = Field(
         description="UTC creation timestamp of the session",
     )
@@ -957,6 +966,38 @@ class SessionDetail(SessionSummary):
         default=0,
         ge=0,
         description="Number of compaction generations recorded for the session",
+    )
+
+
+class SessionRenameRequest(BaseModel):
+    """One durable session rename (D07-fix1 F2): the ONLY mutable session
+    header field; scope is the query's explicit ``server_id``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(
+        min_length=1,
+        max_length=MAX_TITLE_CHARS,
+        description="New user-assigned session title (trimmed, 1..120)",
+    )
+
+
+class SessionTagAssignRequest(BaseModel):
+    """One idempotent session-tag assignment (D07-fix1 F2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_id: uuid.UUID = Field(
+        description="Server scope the session is pinned to (C01 rule 2)",
+    )
+    tag_id: uuid.UUID = Field(
+        description="Catalog tag identity to attach",
+    )
+    tag_name: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional create-if-missing catalog name (reserved "
+        "names refuse; the canonical lower(name) uniqueness applies)",
     )
 
 

@@ -126,6 +126,11 @@ export interface SessionChannelOptions {
 	getCsrfToken?: () => string | null;
 	/** Socket factory; defaults to the browser WebSocket. Injectable. */
 	socketFactory?: (url: string) => ChannelSocket;
+	/**
+	 * Base URL for non-same-origin deployments (E2E seam; mirrors the
+	 * client's option). Default: the page origin.
+	 */
+	baseUrl?: string;
 	/** One-shot reconnect backoff ladder in ms (default 0.5s→30s, capped). */
 	reconnectDelaysMs?: readonly number[];
 	/** Frame/state handlers (all optional). */
@@ -444,7 +449,8 @@ export function createSessionChannelController(options: SessionChannelOptions): 
 		// A RE-open attempt stays honest: the panel shows reconnecting (not a
 		// fresh connection) until the server re-acknowledges the handshake.
 		setState(everConnected ? 'reconnecting' : 'connecting');
-		const originPrefix = typeof location !== 'undefined' ? location.origin : '';
+		const originPrefix =
+			options.baseUrl ?? (typeof location !== 'undefined' ? location.origin : '');
 		const next = factory(url.startsWith('/') ? `${originPrefix}${url}` : url);
 		socket = next;
 		helloSeen = false;

@@ -1331,7 +1331,7 @@ async def test_submit_read_only_strips_mutation_capabilities(
     # fallbacks are always ensured so the context tuple is non-empty.
     assert READ_CAP in grants
     assert PRIV_CAP in grants  # no registry on the API process: unseen
-    assert {"chat.read_session", "docs.retrieve"} <= grants
+    assert {"session.read", "docs.retrieve"} <= grants
 
     # Identical read-only resubmission attaches; flipping the flag is a
     # new submission (409 for the same idempotency key).
@@ -1416,7 +1416,7 @@ async def test_submit_read_only_filters_registry_effect_classes(
         grants = set(created.json()["conversation"]["requested_grants"])
         assert READ_CAP in grants
         assert PRIV_CAP not in grants
-        assert {"chat.read_session", "docs.retrieve"} <= grants
+        assert {"session.read", "docs.retrieve"} <= grants
     finally:
         chat_app.state.registry = None
 
@@ -1440,7 +1440,7 @@ def test_read_only_instruction_is_pinned_onto_the_task() -> None:
         profile_revision="1",
         prompt_revision="1",
         credential_references=(),
-        allowed_capabilities=("chat.read_session",),
+        allowed_capabilities=("session.read",),
         mode=chat_surface.PolicyMode.DELEGATED,
     )
     document = chat_surface._agent_document(body, body.run_id, body.server_id, context)
