@@ -2005,3 +2005,115 @@ def _run_replay_step(executor, payload_json, call_json, round_index, *, row_dict
         )
 
     return executor.run(_body())
+
+
+# ---------------------------------------------------------------------------
+# 13. S5: legacy admission without the facade settles failed, not queued
+# ---------------------------------------------------------------------------
+
+
+def _legacy_root_run_row(
+    factory: async_sessionmaker[AsyncSession], session_id: str, run_id: str
+) -> object:
+    """The PRE-hotfix root admission footprint (the original production
+    defect shape): the ``session_runs`` row WITHOUT any ``job_runs``
+    facade — exactly what the old ``acreate_run``-only admission left
+    behind. The reviewed ``insert_run`` fixture is deliberately NOT
+    used."""
+    from mai.session_store import acreate_run
+
+    async def _body():
+        return await acreate_run(
+            factory,
+            session_id=uuid.UUID(session_id),
+            server_id=uuid.UUID(SERVER_ID),
+            run_id=uuid.UUID(run_id),
+            model_profile="fixture-fast",
+            client_request_id=uuid.uuid4(),
+        )
+
+    return _run(_body())
+
+
+def _workflow_terminal_error(url: str, run_id: str) -> bool:
+    """Whether the DBOS workflow has landed ERROR (terminal for this
+    fault shape: the bootstrap step cannot observe a missing run)."""
+    with psycopg.connect(url) as conn:
+        status = conn.execute(
+            "SELECT status FROM dbos.workflow_status WHERE workflow_uuid = %s",
+            (run_id,),
+        ).fetchone()
+    return status is not None and str(status[0]).upper() == "ERROR"
+
+
+def test_missing_facade_bootstrap_settles_session_failed_not_queued(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """S5 (queued-chat hotfix): a legacy admission (session run row, NO
+    facade — the original production shape) must settle the durable
+    session state ``failed`` with an honest reason when the real worker
+    hits the missing bootstrap metadata. The failure PRECEDES model
+    binding: zero model calls, zero tool effects, and the facade is
+    never fabricated."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    # The script must never be consumed; its presence proves the model
+    # path was reachable but never reached.
+    _script(scenario, [{"text": "never reached"}])
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _legacy_root_run_row(factory, session_id, run_id)
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-legacy")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "legacy-admission workflow to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The session domain settled honestly: failed run + failed header,
+    # never stranded queued.
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1, runs
+    assert runs[0]["state"] == "failed", (
+        f"session authority stranded in {runs[0]['state']!r} after the "
+        "missing-facade bootstrap failure (must settle failed)"
+    )
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "failed"
+    # The durable run_state entry carries the honest reason + evidence.
+    entries = _read_session_entries(agent_url, session_id)
+    failures = [
+        entry["payload"]
+        for entry in entries
+        if entry["kind"] == "run_state" and entry["payload"]["state"] == "failed"
+    ]
+    assert failures, entries
+    assert failures[0].get("reason_code") == "unexpected_failure"
+    assert failures[0].get("detail"), "original bootstrap evidence must be preserved"
+    # Zero model/tool activity and NO fabricated facade.
+    lines = _journal_lines(scenario)
+    assert "model_call" not in lines, lines
+    assert not any(line.startswith("begin:") for line in lines), lines
+    with psycopg.connect(agent_url) as conn:
+        facades = conn.execute(
+            "SELECT COUNT(*) FROM job_runs WHERE run_id = %s",
+            (uuid.UUID(run_id),),
+        ).fetchone()[0]
+    assert facades == 0, "the facade must never be fabricated by settlement"

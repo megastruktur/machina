@@ -95,7 +95,12 @@ from mai.contracts.sessions import (
 )
 from mai.contracts.tool_results import DomainOutcome, EffectCertainty, ExecutionStatus
 from mai.jobs import engine as _engine
-from mai.jobs.lifecycle import RunLifecycle, RunState
+from mai.jobs.lifecycle import (
+    RunLifecycle,
+    RunLifecycleError,
+    RunLifecycleErrorCode,
+    RunState,
+)
 from mai.jobs.steps import (
     RESUME_TOPIC,
     TERMINAL_STEP_STATES,
@@ -628,6 +633,7 @@ async def _record_session_state(
     *,
     reason_code: str | None = None,
     session_status: SessionStatus | None = None,
+    detail: str | None = None,
 ) -> None:
     """The dual-authority state write: session domain + session header."""
     from mai.session_store import arecord_run_state
@@ -639,6 +645,7 @@ async def _record_session_state(
         run_id=uuid.UUID(intent.run_id),
         state=state,
         reason_code=reason_code,
+        detail=detail,
     )
     if session_status is not None:
         await _set_session_status(executor, intent, session_status)
@@ -2493,7 +2500,34 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
     facade_state, session_state, header_status = mapping.get(
         state_value, (RunState.FAILED, SessionRunState.FAILED, SessionStatus.FAILED)
     )
-    current = executor.run(executor.lifecycle.current_state(intent.run_id))
+
+    def _settle_without_facade(error: RunLifecycleError) -> str:
+        """S5: the facade row is missing — settle the SESSION domain
+        honestly failed (never silently queued), skip the facade
+        lifecycle/event writes (NEVER fabricated) and preserve the
+        original failure evidence in the durable run-state detail. The
+        engine state stays the caller's truth; no success is claimed
+        without the facade authority."""
+        executor.run(
+            _record_session_state(
+                executor,
+                intent,
+                SessionRunState.FAILED,
+                reason_code=str(summary.get("reason") or "bootstrap_run_row_missing"),
+                detail=(
+                    "facade row missing at settlement; original failure: "
+                    + str(summary.get("detail") or f"{type(error).__name__}: {error}")
+                )[:512],
+                session_status=SessionStatus.FAILED,
+            )
+        )
+        return json.dumps({"settled": "failed", "facade": "missing"})
+    try:
+        current = executor.run(executor.lifecycle.current_state(intent.run_id))
+    except RunLifecycleError as error:
+        if error.code is not RunLifecycleErrorCode.RUN_NOT_FOUND:
+            raise  # unrelated lifecycle failures are never swallowed
+        return _settle_without_facade(error)
     if current is not None and current in (
         RunState.SUCCEEDED,
         RunState.FAILED,
@@ -2514,10 +2548,17 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
                 SessionRunState.SUCCEEDED,
                 SessionStatus.IDLE,
             )
-    if current is not facade_state:
-        executor.run(
-            executor.lifecycle.record_transition(intent.run_id, facade_state)
-        )
+    try:
+        if current is not facade_state:
+            executor.run(
+                executor.lifecycle.record_transition(intent.run_id, facade_state)
+            )
+    except RunLifecycleError as error:
+        if error.code is not RunLifecycleErrorCode.RUN_NOT_FOUND:
+            raise  # unrelated lifecycle failures are never swallowed
+        # The facade row vanished between the read and this write: the
+        # same honest session-only settlement.
+        return _settle_without_facade(error)
     executor.run(
         _record_session_state(
             executor,
@@ -2809,13 +2850,18 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             file=_sys.stderr,
             flush=True,
         )
-        _session_failed(payload_json, "unexpected_failure")
+        _session_failed(
+            payload_json,
+            "unexpected_failure",
+            detail=f"{type(error).__name__}: {error}",
+        )
         raise
 
 
-def _session_failed(payload_json: str, reason: str) -> str:
+def _session_failed(payload_json: str, reason: str, *, detail: str | None = None) -> str:
     return _session_settled(
-        payload_json, json.dumps({"state": "failed", "reason": reason})
+        payload_json,
+        json.dumps({"state": "failed", "reason": reason, "detail": detail}),
     )
 
 
