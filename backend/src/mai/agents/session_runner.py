@@ -75,6 +75,7 @@ from mai.agents.session_history import (
 )
 from mai.agents.tools import BridgeError, CapabilityToolBridge, ToolResult
 from mai.contracts.sessions import (
+    MAX_DETAIL_CHARS,
     MAX_ENTRY_TEXT_CHARS,
     AssistantMessageEntry,
     ControlActionKind,
@@ -999,9 +1000,14 @@ async def _round_model(
             file=_sys.stderr,
             flush=True,
         )
-        raise SessionStageError(
+        stage = SessionStageError(
             "model_round_failed", error_type=type(error).__name__
-        ) from None
+        )
+        # S5-fix1: the classified reason stays value-free; the ORIGINAL
+        # failure identity rides along for the settlement detail (bounded
+        # at the durable write by the canonical contract limit).
+        stage.evidence = f"{type(error).__name__}: {error}"
+        raise stage from None
 
     persisted = await apersist_run_exchange(
         executor.sessions,
@@ -2475,6 +2481,20 @@ def _session_compaction_checkpoint(payload_json: str, pins_json: str) -> str:
         }
     return json.dumps(document)
 
+def _missing_facade_detail(summary: Mapping[str, object], error: Exception) -> str:
+    """The bounded run-state detail for a missing-facade settlement (S5).
+
+    Carries the ORIGINAL failure evidence (the workflow's summary detail
+    when present, else the lifecycle rejection identity), prefixed with
+    the honest cause, and truncated at the canonical contract bound
+    ``RunStateEntry`` enforces — an over-long detail would itself fail
+    the durable write and strand the session queued.
+    """
+    evidence = summary.get("detail") or f"{type(error).__name__}: {error}"
+    return (
+        "facade row missing at settlement; original failure: " + str(evidence)
+    )[:MAX_DETAIL_CHARS]
+
 
 @DBOS.step(name="agents.session.settled")
 def _session_settled(payload_json: str, summary_json: str) -> str:
@@ -2514,10 +2534,7 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
                 intent,
                 SessionRunState.FAILED,
                 reason_code=str(summary.get("reason") or "bootstrap_run_row_missing"),
-                detail=(
-                    "facade row missing at settlement; original failure: "
-                    + str(summary.get("detail") or f"{type(error).__name__}: {error}")
-                )[:512],
+                detail=_missing_facade_detail(summary, error),
                 session_status=SessionStatus.FAILED,
             )
         )
@@ -2806,7 +2823,9 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             **summary,
         }
     except SessionStageError as stage:
-        _session_failed(payload_json, stage.reason)
+        _session_failed(
+            payload_json, stage.reason, detail=getattr(stage, "evidence", None)
+        )
         raise SessionRunFailed(stage.reason) from None
     except SessionContractError:
         _session_failed(payload_json, "contract_rejected")
@@ -2829,7 +2848,7 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
         if is_cancel:
             _session_cancelled(payload_json)
         else:
-            _session_failed(payload_json, "engine_interrupted")
+            _session_failed(payload_json, "engine_interrupted", detail=observed)
         raise
     except dbos_error.DBOSWorkflowCancelledError:
         _session_cancelled(payload_json)

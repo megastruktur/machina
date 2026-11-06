@@ -478,6 +478,8 @@ def _script_model():
                     raise RuntimeError("model gate timeout")
                 time.sleep(0.1)
         inner = entry.get("then", entry)
+        if "error" in inner:
+            raise RuntimeError(str(inner["error"]))
         if "tool_call" in inner:
             call = inner["tool_call"]
             return ModelResponse(
@@ -2117,3 +2119,178 @@ def test_missing_facade_bootstrap_settles_session_failed_not_queued(
             (uuid.UUID(run_id),),
         ).fetchone()[0]
     assert facades == 0, "the facade must never be fabricated by settlement"
+
+
+def _drop_facade_row(url: str, run_id: str) -> None:
+    """Simulate an externally dropped facade mid-run (S5 second catch):
+    events first (RESTRICT children), then the run row — job_tags go in
+    the same transaction (the 0011 triggers are deferrable)."""
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "DELETE FROM job_events WHERE run_id = %s", (uuid.UUID(run_id),)
+        )
+        conn.execute(
+            "DELETE FROM job_tags WHERE job_id = %s", (uuid.UUID(run_id),)
+        )
+        conn.execute(
+            "DELETE FROM job_runs WHERE run_id = %s", (uuid.UUID(run_id),)
+        )
+        conn.commit()
+
+
+def test_missing_facade_long_original_error_settles_bounded_detail(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """S5-fix1 (R5): a LONG original failure (unicode) reaching the
+    missing-facade settlement through the REAL workflow must still
+    settle failed with the detail bounded at the canonical contract
+    limit — an over-long detail would fail the durable write itself and
+    strand the session queued again."""
+    long_error = ("vault-🔐-détail-échec—" * 40)[:800]  # unicode, > 500
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    # The model parks at the gate; the test drops the facade row, then
+    # releases the gate so the model raises the LONG original error and
+    # the real settlement runs against a missing facade (second catch).
+    _script(
+        scenario,
+        [{"gate": "g-s5fix1", "then": {"error": long_error}}],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-s5f1")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: "model_call" in _journal_lines(scenario),
+            RUN_TIMEOUT,
+            "model to reach the gate",
+        )
+        _drop_facade_row(agent_url, run_id)
+        (scenario / "gates" / "g-s5fix1").write_text("", encoding="utf-8")
+        _wait_until(
+            lambda: _workflow_terminal_error(agent_url, run_id),
+            RUN_TIMEOUT,
+            "dropped-facade workflow to land ERROR",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1, runs
+    assert runs[0]["state"] == "failed", (
+        f"session stranded in {runs[0]['state']!r} — the long evidence "
+        "detail broke the settlement write (must stay within the bound)"
+    )
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "failed"
+    failures = [
+        entry["payload"]
+        for entry in _read_session_entries(agent_url, session_id)
+        if entry["kind"] == "run_state" and entry["payload"]["state"] == "failed"
+    ]
+    assert failures, "the durable failed run_state entry must exist"
+    detail = str(failures[0].get("detail") or "")
+    assert detail.startswith(
+        "facade row missing at settlement; original failure: RuntimeError: "
+    ), detail
+    assert len(detail) == 500, f"detail must be exactly the contract bound, got {len(detail)}"
+    assert "🔐" in detail  # unicode evidence preserved inside the bound
+    # No tool effects and no fabricated facade.
+    assert not any(line.startswith("begin:") for line in _journal_lines(scenario))
+    with psycopg.connect(agent_url) as conn:
+        facades = conn.execute(
+            "SELECT COUNT(*) FROM job_runs WHERE run_id = %s",
+            (uuid.UUID(run_id),),
+        ).fetchone()[0]
+    assert facades == 0
+
+
+def test_missing_facade_detail_boundary_contract(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """S5-fix1 (R5): the bounded detail through the REAL construction
+    helper and the REAL durable write — at/under/over the canonical
+    ``RunStateEntry`` limit, unicode included, never a ValidationError."""
+    from types import SimpleNamespace
+
+    from mai.agents.session_runner import (
+        _missing_facade_detail,
+        _record_session_state,
+        parse_session_run_intent,
+    )
+    from mai.jobs.lifecycle import RunLifecycleError, RunLifecycleErrorCode
+
+    prefix = "facade row missing at settlement; original failure: "
+    error = RunLifecycleError(
+        RunLifecycleErrorCode.RUN_NOT_FOUND, "no job_runs row for this run_id"
+    )
+    executor = SimpleNamespace(
+        sessions=factory,
+        run=lambda coro: _run(coro),
+    )
+
+    def _settle_and_read(evidence: str) -> str:
+        summary = {
+            "state": "failed",
+            "reason": "unexpected_failure",
+            "detail": evidence,
+        }
+        detail = _missing_facade_detail(summary, error)  # type: ignore[arg-type]
+        session_id = _run(_make_session(factory))
+        run_id = str(uuid.uuid4())
+        _legacy_root_run_row(factory, session_id, run_id)
+        intent = parse_session_run_intent(
+            _canonical(_intent_document(run_id, session_id))
+        )
+        from mai.contracts.sessions import SessionRunState
+
+        _run(
+            _record_session_state(  # type: ignore[arg-type]
+                executor,
+                intent,
+                SessionRunState.FAILED,
+                reason_code="unexpected_failure",
+                detail=detail,
+            )
+        )
+        # The write went through the REAL store contract: the persisted
+        # run_state entry carries exactly the bounded detail.
+        persisted = [
+            entry["payload"]
+            for entry in _read_session_entries(agent_url, session_id)
+            if entry["kind"] == "run_state"
+        ]
+        assert persisted, "durable run_state entry must exist"
+        assert persisted[0]["detail"] == detail
+        return detail
+
+    # The evidence falls back to the lifecycle identity when absent.
+    fallback = _missing_facade_detail({}, error)  # type: ignore[arg-type]
+    assert fallback == prefix + f"{type(error).__name__}: {error}"
+    assert len(fallback) < 500
+
+    # Exactly at the bound: untruncated, durably persisted.
+    at_bound = "x" * (500 - len(prefix))
+    assert len(_settle_and_read(at_bound)) == 500
+
+    # One over and far over (unicode): truncated to exactly 500 through
+    # the real durable write, never a ValidationError.
+    for evidence in ("y" * (501 - len(prefix)), "🔐-détail—" * 100):
+        assert len(_settle_and_read(evidence)) == 500
