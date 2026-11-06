@@ -6,9 +6,7 @@ product-wide pagination bounds previously frozen inside the conversation
 contract move here so retained Jobs/tags surfaces (``api/jobs.py``,
 ``api/history_tags.py``, ``tag_store.py``, ``history_store.py``) and the new
 session-first vocabulary depend on this neutral module instead of the deleted
-chat contracts. ``contracts/conversations.py`` keeps re-exporting these names
-until D09 deletes that module; the re-exports are the same objects, so every
-existing caller keeps working unchanged.
+chat contracts.
 
 Governing rules:
 

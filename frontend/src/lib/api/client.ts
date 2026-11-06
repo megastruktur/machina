@@ -535,67 +535,6 @@ export function readMaiEvent(frame: SseFrame): MaiRunEvent | null {
 	};
 }
 
-/** Frozen `objective.*` ledger frame (§5; envelope at objective scope). */
-export interface ObjectiveEventFrame {
-	event_id: string;
-	objective_id: string;
-	sequence: number;
-	ts: string;
-	type: string;
-	actor_kind: string;
-	v: number;
-	data: Record<string, unknown>;
-	run_id: string | null;
-}
-
-/** Narrow a parsed SSE frame to the objective-ledger envelope, else null. */
-export function readObjectiveEvent(frame: SseFrame): ObjectiveEventFrame | null {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(frame.data);
-	} catch {
-		return null;
-	}
-	if (typeof parsed !== 'object' || parsed === null) return null;
-	const record = parsed as Record<string, unknown>;
-	if (
-		typeof record.event_id !== 'string' ||
-		typeof record.objective_id !== 'string' ||
-		typeof record.sequence !== 'number' ||
-		typeof record.ts !== 'string' ||
-		typeof record.type !== 'string' ||
-		typeof record.actor_kind !== 'string' ||
-		typeof record.v !== 'number' ||
-		typeof record.data !== 'object' ||
-		record.data === null
-	) {
-		return null;
-	}
-	return {
-		event_id: record.event_id,
-		objective_id: record.objective_id,
-		sequence: record.sequence,
-		ts: record.ts,
-		type: record.type,
-		actor_kind: record.actor_kind,
-		v: record.v,
-		data: record.data as Record<string, unknown>,
-		run_id: typeof record.run_id === 'string' ? record.run_id : null
-	};
-}
-
-/**
- * The objective activity-ledger SSE URL (§11; C08 rule 7: transport = SSE,
- * replay cursor = `Last-Event-ID`). The panel composes the concrete URL
- * through this one builder — never a hand-typed path.
- */
-export function objectiveEventsUrl(objectiveId: string, serverId: string): string {
-	return (
-		`/api/v1/objectives/${encodeURIComponent(objectiveId)}/events/stream` +
-		`?server_id=${encodeURIComponent(serverId)}`
-	);
-}
-
 export interface SubscribeEventsOptions {
 	/** Replay cursor to resume from; travels as the SSE `Last-Event-ID`. */
 	cursor?: string | null;

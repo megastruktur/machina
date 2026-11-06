@@ -96,13 +96,13 @@ import json
 import os
 import uuid
 
-from mai.agents import run as agent_run
+from mai.agents import session_runner
 from mai.capabilities.host_file_read import descriptor as file_read_descriptor
 from mai.jobs.worker import _configure_default_agent_runtime
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 
 _configure_default_agent_runtime(os.environ["MAI_DATABASE_URL"])
-dispatcher = agent_run._EXECUTOR._steps._dispatcher
+dispatcher = session_runner._EXECUTOR.steps._dispatcher
 context = ExecutionContext(
     principal="probe",
     server_id=uuid.UUID(os.environ["PROBE_SERVER_ID"]),
@@ -1533,7 +1533,7 @@ class TestStepsTranslation:
 
 class TestWiring:
     def test_chat_profile_map_routes_both_file_read_slugs(self) -> None:
-        from mai.api.chat import SERVER_PROFILE_CAPABILITY_MAP
+        from mai.api.capability_defaults import SERVER_PROFILE_CAPABILITY_MAP
 
         assert SERVER_PROFILE_CAPABILITY_MAP["file_read"] == CAPABILITY_ID
         assert SERVER_PROFILE_CAPABILITY_MAP["host.file_read"] == CAPABILITY_ID

@@ -1031,10 +1031,11 @@ class CapabilityToolBridge:
         Excludes enabled tools whose §6 phase action ``phase`` necessarily
         refuses (for a task-bound ``inspect`` round: target execute
         effects such as ``host.shell`` — the model is never invited into
-        a necessarily-refused attempt). ``action_of`` is the runner's
-        ratified capability→action mapping (:func:`mai.agents.run.
-        _phase_action_for_capability`), so task-state control tools stay
-        classified exactly as the execution gate classifies them.
+        a necessarily-refused attempt). ``action_of`` is the
+        caller-supplied ratified capability→action mapping
+        ((capability id, effect class) → action), so task-state control
+        tools stay classified exactly as the execution gate classifies
+        them.
 
         D01 neutral extraction: this bridge no longer imports the task
         contracts, so ``phase``/``action_of`` results are compared by
