@@ -94,6 +94,7 @@ __all__ = [
     "aappend_entry",
     "aattach_session_tag",
     "acreate_root_run",
+    "acreate_run",
     "acreate_session",
     "alist_compactions",
     "alist_provider_artifacts",
