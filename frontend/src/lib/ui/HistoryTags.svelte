@@ -65,7 +65,7 @@
 		testId?: string;
 	};
 
-	/** Bounded page size for the full tag list (AGENTS.md §1; ChatPanel-sized). */
+	/** Bounded page size for the full tag list (AGENTS.md §1; drawer-sized). */
 	const PAGE_LIMIT = 10;
 	/** Popup width bound and the viewport margin it must respect. */
 	const POP_MAX_WIDTH = 320;

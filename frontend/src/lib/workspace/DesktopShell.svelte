@@ -36,7 +36,6 @@
 	// single registration point (ADR §7.1) — the shell only composes them.
 	import { applicationsEntry } from './entries/08-web-apps.js';
 	import { capabilityPolicyEntry } from './entries/03-web-policy.js';
-	import { chatEntry } from './entries/06-web-chat.js';
 	import { docsEntry } from './entries/07-web-docs.js';
 	import { executionEntry } from './entries/05-web-execution.js';
 	import { jobsEntry } from './entries/05-web-jobs.js';
@@ -159,7 +158,7 @@
 			capabilityPolicyEntry(),
 			executionEntry(),
 			jobsEntry(),
-			chatEntry(),
+			sessionChatEntry(),
 			modelSettingsEntry(),
 			docsEntry(),
 			applicationsEntry(),
@@ -224,14 +223,14 @@
 	import WindowFrame from './WindowFrame.svelte';
 	import PanelHost from './PanelHost.svelte';
 	import WindowSwitcher from './WindowSwitcher.svelte';
-	import ChatPanel from '$lib/panels/ChatPanel.svelte';
+	import SessionChatPanel from '$lib/panels/SessionChatPanel.svelte';
 	import Button from '../ui/Button.svelte';
 	import GlassSurface from '$lib/ui/GlassSurface.svelte';
 	import SideDrawer from '$lib/ui/SideDrawer.svelte';
 	// Guided enrollment (so-03): the focused extraction of the old inline form.
 	import ServerEnrollment from './ServerEnrollment.svelte';
 	import ServerTreeNav from './ServerTreeNav.svelte';
-	import ChatDrawerSection from './ChatDrawerSection.svelte';
+	import ChatDrawerSection, { type ChatHistoryRow } from './ChatDrawerSection.svelte';
 	// Live transport + the per-panel service slices (each feature entry names
 	// its exact contract; the shell maps ONE client onto all of them).
 	// Live transport: one client per shell instance (ADR §5 — instances share
@@ -242,16 +241,20 @@
 	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
 	import {
-		CHAT_PANEL_KIND,
-		GLOBAL_CONSULT_SERVER_ID,
-		browserChatEventStream,
-		chatServices,
-		type ChatApi,
-		type ChatServiceOption,
-		type ChatTagApi,
-		type ConversationView,
-		type RunDetail
-	} from './entries/06-web-chat.js';
+		SESSION_CHAT_PANEL_KIND as CHAT_PANEL_KIND,
+		sessionChatEntry,
+		sessionChatServices,
+		type SessionChatApi,
+		type SessionChatServiceOption,
+		type SessionChatTagApi
+	} from './entries/06-session-chat.js';
+	import {
+		createSessionChannelController,
+		type SessionChannelConnectionState,
+		type SessionChannelController,
+		type SessionStreamDraft
+	} from '../chat/session_client.js';
+	import type { ChannelEntry } from '../chat/session_client.js';
 	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
 	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
 	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
@@ -477,7 +480,7 @@
 		'app.unadopt',
 		'app.update',
 		'app.upsert_map_entry',
-		'chat.read_session',
+		'session.read',
 		'docs.retrieve',
 		'host.logs',
 		'host.shell',
@@ -538,9 +541,34 @@
 				// server; anything else (absent, deleted, stale, invalid) falls
 				// back to the first enrolled server and repairs the stored value.
 				const stored = persistence.getSelectedServerId();
-				const exists = stored !== null && servers.some((profile) => String(profile.server_id) === stored);
-				selectedServerId = exists ? stored : String(servers[0].server_id);
+				const exists =
+					stored !== null &&
+					servers.some((profile) => String(profile.server_id) === stored);
+				selectedServerId = exists
+					? stored
+					: String(servers[0].server_id);
 				if (!exists) persistence.setSelectedServerId(selectedServerId);
+			}
+			// The session history loads under the RESOLVED server scope (an
+			// earlier call here filtered against the fixture default server).
+			void loadSessionHistory();
+			// Refresh continuity (R2-3): restore the active session pointer.
+			try {
+				const raw = sessionStorage.getItem(SESSION_POINTER_KEY);
+				if (raw !== null) {
+					const pointer = JSON.parse(raw) as {
+						session_id: string;
+						server_id: string | null;
+					};
+					if (
+						typeof pointer.session_id === 'string' &&
+						pointer.session_id !== ''
+					) {
+						openActiveSession(pointer.session_id, pointer.server_id);
+					}
+				}
+			} catch {
+				/* corrupted pointer: ignored, honesty intact */
 			}
 			// An empty enrolled list keeps the selection honest: no fabrication.
 		} catch (error) {
@@ -588,95 +616,60 @@
 
 	// --- Per-panel service slices (each entry's exact contract) ---------------
 
-	const chatApi: ChatApi = {
-		submitMessage: api.submitMessage,
-		listConversations: api.listConversations,
-		readConversation: api.readConversation,
-		renameConversation: api.renameConversation,
-		cancelConversation: api.cancelConversation,
-		streamConversationEvents: browserChatEventStream,
-		readRun: api.readRun,
-		readApproval: api.readApproval,
-		decideApproval: api.decideApproval,
-		// Canonical conversation surface (§3; 09-client-continuity, wired by
-		// 10-chat-continuity-ui): the panel prefers these for submit, restore,
-		// steering and gap honesty; a bag without them degrades to legacy.
-		listCanonicalConversations: api.listCanonicalConversations,
-		getConversation: api.getConversation,
-		listConversationMessages: api.listConversationMessages,
-		listConversationEvents: api.listConversationEvents,
-		createConversation: api.createConversation,
-		submitConversationMessage: api.submitConversationMessage,
-		steerConversation: api.steerConversation,
-		// §8 task surface (24b D-2, 15-task-api/16-task-client): the REAL
-		// client's task methods ride the same dock slice so
-		// ChatPanel.readTaskServices() binds them and TaskUnderstanding +
-		// TaskPlan render server truth. The OFFLINE memory slice below omits
-		// every one of them — it fails closed honestly and makes zero task
-		// requests (no fabricated task data offline).
-		getConversationTask: api.getConversationTask,
-		listTaskSteps: api.listTaskSteps,
-		listTaskConstraints: api.listTaskConstraints,
-		listTaskEvidence: api.listTaskEvidence,
-		listTaskRevisions: api.listTaskRevisions,
-		submitTaskCorrection: api.submitTaskCorrection,
-		submitTaskDecision: api.submitTaskDecision,
-		/** Live-transport marker read by ChatPanel.profilesLive (not on the wire). */
-		listProfiles: async () => []
-	};
-	// Runtime v2 objective surface (§11; activity-ui) — assigned past the
-	// literal so the frozen `ChatApi` vocabulary stays unchanged: ChatPanel
-	// narrows the slice structurally and renders the objective activity only
-	// when EVERY method exists. The OFFLINE memory dock below omits them and
-	// fails closed (no fabricated objective sections offline).
-	Object.assign(chatApi, {
-		listObjectives: api.listObjectives,
-		readObjective: api.readObjective,
-		readObjectiveJournal: api.readObjectiveJournal,
-		listObjectiveEvents: api.listObjectiveEvents,
-		listObjectiveRuns: api.listObjectiveRuns,
-		readObjectiveChecklist: api.readObjectiveChecklist,
-		changeObjectiveScope: api.changeObjectiveScope,
-		readDrainStatus: api.readDrainStatus,
-		resumeConversation: api.resumeConversation,
-		reconcileConversation: api.reconcileConversation
-	});
+	/**
+	 * The dock's session-first API slice (D09): the typed
+	 * /api/v1/agent-sessions transport ONLY — the legacy chat/task/
+	 * objective vocabulary died with the coordinated deletion. Offline the
+	 * bag carries no methods: the panel's structural narrowing fails
+	 * closed and renders the honest not-wired state (zero requests).
+	 */
+	const dockSessionApi = $derived<SessionChatApi>(
+		live
+			? {
+					createAgentSession: api.createAgentSession,
+					listAgentSessions: api.listAgentSessions,
+					readAgentSession: api.readAgentSession,
+					renameAgentSession: api.renameAgentSession,
+					listAgentSessionEntries: api.listAgentSessionEntries,
+					submitAgentSessionTurn: api.submitAgentSessionTurn,
+					submitAgentSessionControl: api.submitAgentSessionControl
+				}
+			: ({} as SessionChatApi)
+	);
 
 	/**
-	 * The OPTIONAL history-tag slice (history-tags W6B/W7A): the REAL
-	 * client's tag methods under the bag's `tags` field — legacy run rows
-	 * read the job tag routes, canonical conversation rows the conversation
+	 * The OPTIONAL history-tag slice (history-tags W6B/W7A, session-first
+	 * routing D07): the REAL client's tag methods under the bag's `tags`
+	 * field — session_id rows read the agent-session tag routes, canonical
+	 * conversation rows the conversation routes, legacy run rows the job
 	 * routes (the catalog is global; every assignment carries its explicit
 	 * server scope). The OFFLINE memory dock omits it and fails closed.
 	 */
-	const chatTagApi: ChatTagApi = {
+	const chatTagApi: SessionChatTagApi = {
 		listTags: api.listTags,
 		createTag: api.createTag,
 		listRunTags: api.listRunTags,
 		assignRunTag: api.assignRunTag,
 		removeRunTag: api.removeRunTag,
-		listConversationTags: api.listConversationTags,
-		assignConversationTag: api.assignConversationTag,
-		removeConversationTag: api.removeConversationTag
+		listAgentSessionTags: api.listAgentSessionTags,
+		assignAgentSessionTag: api.assignAgentSessionTag,
+		removeAgentSessionTag: api.removeAgentSessionTag
 	};
 
 	/**
-	 * One drawer row's bounded tag-page adapter (history-tags W7A). Route
-	 * choice is IDENTITY-driven: rows pinned to a canonical conversation id
-	 * read the conversation tag route (the only route a General Consult
-	 * zero-UUID scope ever uses); legacy run rows read the job tag route.
-	 * The scope is always the ROW's recorded `server_id` — never a hidden
-	 * global. A row without an adapter method stays honestly preview-only.
+	 * One drawer row's bounded tag-page adapter (history-tags W7A; D09
+	 * session-first): session_id rows read the agent-session tag route;
+	 * legacy run rows read the retained generic job tag route. The scope is
+	 * always the ROW's recorded `server_id` — never a hidden global. A row
+	 * without an adapter method stays honestly preview-only.
 	 */
-	function chatRowTagsLoader(row: ConversationView): TagPageLoader | null {
-		const rowConversationId = (row as { conversation_id?: string }).conversation_id;
-		const conversationId =
-			typeof rowConversationId === 'string' && rowConversationId !== '' ? rowConversationId : null;
-		if (conversationId !== null) {
-			const listConversationTags = api.listConversationTags;
-			if (typeof listConversationTags !== 'function') return null;
+	function chatRowTagsLoader(row: ChatHistoryRow): TagPageLoader | null {
+		const rowSessionId = row.session_id;
+		if (typeof rowSessionId === 'string' && rowSessionId !== '') {
+			const listAgentSessionTags = api.listAgentSessionTags;
+			if (typeof listAgentSessionTags !== 'function') return null;
 			return async (offset, limit) => {
-				const page = await listConversationTags(conversationId, row.server_id, { limit, offset });
+				const page = await listAgentSessionTags(rowSessionId, row.server_id, { limit, offset });
 				return {
 					limit: page.limit,
 					offset: page.offset,
@@ -715,164 +708,257 @@
 	};
 
 	// ---------------------------------------------------------------------
-	// Always-Visible Bottom Chat Dock (mui-03): ChatPanel mounts persistently
-	// at the bottom of the viewport — NOT as a registry window (the dock
-	// element carries no data-panel-kind and never enters the workspace
-	// state). The fixture desktop must perform ZERO API requests, so until a
-	// live session answers, the dock receives a safe IN-MEMORY ChatApi: every
-	// method resolves from a local store, the event stream parks until its
-	// abort signal (no fetch ever leaves the page), and approval routes fail
-	// closed as absence. The dock is fully interactive offline; a live
-	// session swaps the slice for the real transport-backed one.
+	// Always-Visible Bottom Chat Dock (mui-03; D09): SessionChatPanel mounts
+	// persistently at the bottom of the viewport — NOT as a registry window
+	// (the dock element carries no data-panel-kind and never enters the
+	// workspace state). The fixture desktop must perform ZERO API requests:
+	// offline the bag carries no session methods, so the panel's structural
+	// narrowing fails closed and renders the honest not-wired state.
 	// ---------------------------------------------------------------------
 
 	/** Fixture services offered by the dock's `@service` autocomplete. */
-	const DOCK_AVAILABLE_SERVICES: readonly ChatServiceOption[] = Object.freeze([
+	const DOCK_AVAILABLE_SERVICES: readonly SessionChatServiceOption[] = Object.freeze([
 		{ name: 'enshrouded', category: 'games' },
 		{ name: 'nginx', category: 'web' },
 		{ name: 'postgres', category: 'databases' },
 		{ name: 'backups', category: 'maintenance' }
 	]);
 
-	/**
-	 * One offline conversation store per shell instance (ADR §5 rule 2 — no
-	 * module-level state). Submitted rows replay exactly like wire rows:
-	 * value-free view data, `running` state, no events.
-	 */
-	function createMemoryChatApi(): ChatApi {
-		const conversations = new Map<string, ConversationView>();
-		const stamp = () => new Date().toISOString();
-		const rowOf = (runId: string, serverId: string, profile: string): ConversationView => ({
-			run_id: runId,
-			server_id: serverId,
-			parent_run_id: null,
-			depth: 0,
-			profile_revision: 1,
-			prompt_revision: 1,
-			model_profile: profile,
-			requested_grants: [],
-			label: '',
-			state: 'running',
-			cancel_requested_at: null,
-			submitted_at: stamp(),
-			updated_at: stamp(),
-			tag_preview: { preview: ['unclassified'], total: 1 }
-		});
-		return {
-			async submitMessage(payload) {
-				const base = rowOf(payload.run_id, payload.server_id, payload.profile);
-				base.requested_grants = [...(payload.allowed_capabilities ?? [])];
-				base.children = (payload.children ?? []).map((child, index) => ({
-					...rowOf(
-						`${payload.run_id}-child-${String(index + 1)}`,
-						payload.server_id,
-						child.profile ?? payload.profile
-					),
-					parent_run_id: payload.run_id,
-					depth: 1,
-					state: 'queued'
-				}));
-				base.attachments = (payload.attachments ?? []).map((one) => ({
-					...one,
-					sha256: '',
-					bytes: 0
-				}));
-				if (payload.service_tags !== undefined) base.service_tags = [...payload.service_tags];
-				conversations.set(payload.run_id, base);
-				return { conversation: structuredClone(base), deduplicated: false };
-			},
-			async listConversations(serverId, page) {
-				const rows = [...conversations.values()]
-					.filter((row) => row.server_id === serverId)
-					.sort((a, b) => b.submitted_at.localeCompare(a.submitted_at));
-				const limit = page?.limit ?? 10;
-				const offset = page?.offset ?? 0;
-				const sliced = rows.slice(offset, offset + limit);
-				return {
-					conversations: structuredClone(sliced),
-					limit,
-					offset,
-					total: rows.length
-				};
-			},
-			async readConversation(runId) {
-				const row = conversations.get(runId);
-				if (row === undefined) {
-					throw new ApiError(404, 'not_found', 'no run stored for this run id');
-				}
-				return structuredClone(row);
-			},
-			async renameConversation(runId, payload) {
-				const row = conversations.get(runId);
-				if (row === undefined) {
-					throw new ApiError(404, 'not_found', 'no run stored for this run id');
-				}
-				const trimmed = payload.title.trim();
-				if (trimmed === '') {
-					throw new ApiError(422, 'validation_failed', 'title must not be blank');
-				}
-				row.title = trimmed;
-				row.updated_at = stamp();
-				return structuredClone(row);
-			},
-			async cancelConversation(runId) {
-				const row = conversations.get(runId);
-				if (row === undefined) {
-					throw new ApiError(404, 'not_found', 'no run stored for this run id');
-				}
-				if (row.cancel_requested_at === null) row.cancel_requested_at = stamp();
-				return {
-					run_id: runId,
-					state: row.state,
-					outcome: null,
-					requested_at: row.cancel_requested_at,
-					outcome_at: null,
-					requested_now: true,
-					unresolved_seqs: []
-				};
-			},
-			/** Offline: park until the panel aborts the subscription — no fetch. */
-			async streamConversationEvents(_runId, options) {
-				return new Promise<void>((_resolve, reject) => {
-					options.signal?.addEventListener(
-						'abort',
-						() => reject(new DOMException('stream aborted', 'AbortError')),
-						{ once: true }
-					);
-				});
-			},
-			async readRun(runId) {
-				const row = await this.readConversation(runId);
-				const detail: RunDetail = { ...row, steps: [] };
-				return detail;
-			},
-			async readApproval() {
-				throw new ApiError(404, 'not_found', 'no approval records in offline mode');
-			},
-			async decideApproval() {
-				throw new ApiError(404, 'not_found', 'no approval records in offline mode');
-			}
-		};
-	}
-
-	/** Offline slice: one per shell instance, replaced by the live slice. */
-	const memoryChatApi = createMemoryChatApi();
 
 	/** Dock composer visibility: compact bar vs the full transcript dock. */
 	let dockCollapsed = $state(false);
 	let dockEl: HTMLElement | null = null;
-
-	/** The dock's API slice: live transport once a session answers, else memory. */
-	const dockChatApi = $derived<ChatApi>(live ? chatApi : memoryChatApi);
-
-	/** The mounted dock ChatPanel instance + its mirrored history/active state. */
-	let dockChatPanel = $state<ChatPanel | null>(null);
-	let drawerConversations = $state<readonly ConversationView[]>([]);
-	let drawerConversationsTotal = $state<number | undefined>(undefined);
-	let drawerConversationsHasMore = $state(false);
-	let drawerConversationsLoadingMore = $state(false);
-	let drawerActiveRunId = $state<string | null>(null);
 	let drawerCollapsed = $state(false);
+
+	// --- Session-first drawer history (D07; F4 pagination, F3 channel) -------
+	/** The bounded first page of session-first rows (newest-change first). */
+	let drawerSessions = $state<readonly ChatHistoryRow[]>([]);
+	let drawerSessionsTotal = $state<number | undefined>(undefined);
+	let drawerSessionsHasMore = $state(false);
+	let drawerSessionsLoading = $state(false);
+	let drawerSessionsLoadingMore = $state(false);
+	/** The offset the NEXT session page starts at (F4 pagination cursor). */
+	let drawerSessionsOffset = $state(0);
+	/** Drawer page size (the reviewed bounded initial page). */
+	const SESSION_HISTORY_PAGE_LIMIT = 10;
+	/** The refresh-continuity pointer (opaque ids ONLY — never transcript). */
+	const SESSION_POINTER_KEY = 'mai-active-session';
+
+	/** One bounded agent-session page for the drawer (honest failure keeps
+	 * the previous rows and surfaces the status line — never a fake list). */
+	async function loadSessionHistory(): Promise<void> {
+		if (!live || drawerSessionsLoading) return;
+		drawerSessionsLoading = true;
+		try {
+			const page = await api.listAgentSessions({
+				server_id: selectedServerId,
+				limit: SESSION_HISTORY_PAGE_LIMIT,
+				offset: 0
+			});
+			drawerSessions = (page.items ?? []).map((session) => ({
+				run_id: session.session_id,
+				session_id: session.session_id,
+				server_id: session.server_id,
+				title: session.title ?? null,
+				service_tags: [],
+				status: session.status,
+				updated_at: session.updated_at,
+				tag_preview: session.tag_preview ?? null
+			}));
+			drawerSessionsTotal = page.total;
+			drawerSessionsHasMore = page.has_more;
+			drawerSessionsOffset = drawerSessions.length;
+			// Success renders in the drawer itself (rows + counts); no global
+			// status write — a background refresh must never clobber a
+			// concurrent action's status line. Failures still surface below.
+		} catch (error) {
+			status = `Session history unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			drawerSessionsLoading = false;
+		}
+	}
+
+	/** The NEXT bounded session page: deduplicated append (F4). */
+	async function loadMoreSessionHistory(): Promise<void> {
+		if (!live || drawerSessionsLoadingMore || !drawerSessionsHasMore) return;
+		drawerSessionsLoadingMore = true;
+		try {
+			const page = await api.listAgentSessions({
+				server_id: selectedServerId,
+				limit: SESSION_HISTORY_PAGE_LIMIT,
+				offset: drawerSessionsOffset
+			});
+			const known = new Set(
+				drawerSessions.map((row) => row.session_id ?? row.run_id)
+			);
+			const fresh = (page.items ?? [])
+				.filter((session) => !known.has(session.session_id))
+				.map((session) => ({
+					run_id: session.session_id,
+					session_id: session.session_id,
+					server_id: session.server_id,
+					title: session.title ?? null,
+					service_tags: [],
+					status: session.status,
+					updated_at: session.updated_at,
+					tag_preview: session.tag_preview ?? null
+				}));
+			drawerSessions = [...drawerSessions, ...fresh];
+			drawerSessionsOffset += (page.items ?? []).length;
+			drawerSessionsTotal = page.total;
+			drawerSessionsHasMore = page.has_more;
+		} catch (error) {
+			status = `More sessions unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			drawerSessionsLoadingMore = false;
+		}
+	}
+
+	/** The single-flight `before_seq` older-page fetch (D08 F-acceptance 1). */
+	async function loadOlderEntries(): Promise<void> {
+		if (!live || loadingOlderEntries || olderEntriesExhausted) return;
+		if (activeSessionId === null || sessionEntries.length === 0) return;
+		loadingOlderEntries = true;
+		try {
+			const oldestSeq = Number(sessionEntries[0].seq);
+			// R08 F5: pin the ACTIVE SESSION's own server scope — not the
+			// current selector — so a selector change after a pointer restore
+			// degrades nothing (the fetch follows the session's server).
+			const page = await api.listAgentSessionEntries(activeSessionId, {
+				server_id: activeSessionServerId ?? selectedServerId,
+				before_seq: oldestSeq,
+				limit: 50
+			});
+			const known = new Set(sessionEntries.map((entry) => entry.entry_id));
+			// The REST history page and the channel frames carry the SAME wire
+			// JSON; the two generated views differ only cosmetically, so the
+			// merge is a structural cast (verified by the seq/entry_id dedup).
+			const fresh = ((page.items ?? []) as unknown as ChannelEntry[]).filter(
+				(entry) => !known.has(entry.entry_id)
+			);
+			if (fresh.length === 0) {
+				olderEntriesExhausted = true;
+				return;
+			}
+			// R08 F1: the REST page feeds the SAME controller cache the
+			// channel frames feed — the next commit MERGES with (rather than
+			// replaces) the loaded older pages, mid-scroll reading holds.
+			if (activeSessionChannel !== null) {
+				activeSessionChannel.mergeExternalEntries(fresh);
+			} else {
+				const merged = [...sessionEntries, ...fresh]
+					.sort((a, b) => a.seq - b.seq)
+					.slice(-400);
+				sessionEntries = merged;
+			}
+		} catch (error) {
+			status = `Older entries unavailable${error instanceof ApiError ? ` (${error.code})` : ''}.`;
+		} finally {
+			loadingOlderEntries = false;
+		}
+	}
+
+	/** Rename one session through the typed PATCH route, then refresh. */
+	async function renameSession(sessionId: string, title: string): Promise<void> {
+		await api.renameAgentSession(sessionId, { title });
+		status = 'Session renamed.';
+		await loadSessionHistory();
+	}
+
+	// --- The ONE visible session's channel (F3; plan acceptance 1/2/6) -------
+	/** The active session's id — only THIS one has an open channel. */
+	let activeSessionId = $state<string | null>(null);
+	/** The active session's pinned server scope (R08 F5; set at open time). */
+	let activeSessionServerId = $state<string | null>(null);
+	/** The active session's channel controller (null = none open). */
+	let activeSessionChannel = $state<SessionChannelController | null>(null);
+	/** Honest connection state mirror for the dock surface. */
+	let channelState = $state<SessionChannelConnectionState>('closed');
+	/** Committed entries delivered by the channel (bounded mirror). */
+	let channelEntries = $state<readonly number[]>([]);
+	/**
+	 * The visible session's bounded entry cache (D08): the channel mirror
+	 * (≤400, controller-evicted) MERGED with REST before_seq older pages —
+	 * always sorted by seq, deduplicated, evicted at the same cap.
+	 */
+	let sessionEntries = $state<ChannelEntry[]>([]);
+	/** The visible session's volatile streaming drafts (channel mirror). */
+	let sessionDrafts = $state<SessionStreamDraft[]>([]);
+	/** Single-flight guard + exhaustion flag for older-page loads. */
+	let loadingOlderEntries = $state(false);
+	let olderEntriesExhausted = $state(false);
+
+	/**
+	 * Open (or switch to) the visible session's channel: the previous
+	 * controller is disposed FIRST — switching sessions drains/closes the
+	 * old stream and aborts nothing durable (plan acceptance 2).
+	 */
+	function openActiveSession(sessionId: string, serverId: string | null): void {
+		if (!live) return;
+		closeActiveSession();
+		activeSessionId = sessionId;
+		activeSessionServerId = serverId;
+		channelState = 'connecting';
+		channelEntries = [];
+		// The refresh-continuity pointer (D08, R2-3): ONLY the opaque
+		// session/server ids — never transcript content.
+		try {
+			sessionStorage.setItem(
+				SESSION_POINTER_KEY,
+				JSON.stringify({ session_id: sessionId, server_id: serverId })
+			);
+		} catch {
+			/* storage unavailable: continuity degrades, honesty intact */
+		}
+		activeSessionChannel = createSessionChannelController({
+			sessionId,
+			serverId,
+			handlers: {
+				onConnectionState: (next) => (channelState = next),
+				onCommittedEntriesChanged: (entries) => {
+					channelEntries = entries.map((entry) => entry.seq);
+					// The bounded cache mirror (D08): the controller already
+					// deduped + evicted to ≤400.
+					sessionEntries = [...entries];
+				},
+				onStreamDraftChanged: () => {
+					sessionDrafts = [...(activeSessionChannel?.streamDrafts() ?? [])];
+				}
+			}
+		});
+		activeSessionChannel.connect();
+	}
+
+	/** Switching away / New Chat: the channel closes; nothing lingers. */
+	function closeActiveSession(): void {
+		if (activeSessionChannel !== null) {
+			activeSessionChannel.dispose();
+			activeSessionChannel = null;
+		}
+		activeSessionId = null;
+		activeSessionServerId = null;
+		channelState = 'closed';
+		channelEntries = [];
+		sessionEntries = [];
+		sessionDrafts = [];
+		olderEntriesExhausted = false;
+		try {
+			sessionStorage.removeItem(SESSION_POINTER_KEY);
+		} catch {
+			/* storage unavailable */
+		}
+	}
+
+	/** Drawer rows: the session-first history only (D09). */
+	const drawerRows = $derived<readonly ChatHistoryRow[]>([...drawerSessions]);
+	const drawerRowsTotal = $derived<number | undefined>(drawerSessionsTotal);
+	const drawerRowsHasMore = $derived(drawerSessionsHasMore);
+	/** The visible session has older server-side entries (D08 Load older). */
+	const sessionHasOlder = $derived(
+		!olderEntriesExhausted &&
+			sessionEntries.length > 0 &&
+			Number(sessionEntries[0].seq) > 1
+	);
 
 	/**
 	 * The dock's explicit panel context — a server scope following the
@@ -893,10 +979,13 @@
 		},
 		scope: { kind: 'server', server_id: selectedServerId },
 		services: {
-			api: dockChatApi,
+			api: dockSessionApi,
 			// The optional history-tag slice rides ONLY the live transport (the
 			// offline memory dock has no tag methods and fails closed).
 			...(live ? { tags: chatTagApi } : {}),
+			// The visible session's channel rides the bag additively (F3):
+			// exactly ONE controller exists, and only while a session is open.
+			...(live ? { channel: activeSessionChannel } : {}),
 			serverOptions,
 			availableServices: DOCK_AVAILABLE_SERVICES
 		},
@@ -1001,11 +1090,50 @@
 			case JOBS_PANEL_KIND:
 				return asBag(jobsServices(jobsApi));
 			case CHAT_PANEL_KIND:
-				return asBag(chatServices(chatApi, chatTagApi));
+				return asBag(sessionChatServices(dockSessionApi, chatTagApi));
 			case MODEL_SETTINGS_PANEL_KIND:
 				return asBag(modelSettingsServices(modelSettingsApi));
 			case DOCS_PANEL_KIND:
-				return asBag(docsServices(api, { submitMessage: api.submitMessage }));
+				return asBag(
+					docsServices(api, {
+						// Session-first attach (D07; N1): the explicit create-new-
+						// session action (session_id null) or the explicit
+						// destination session, then ONE idempotent turn admission
+						// — and the returned session BECOMES the visible session
+						// (its channel opens; the drawer refreshes). The legacy
+						// submitMessage stays on the bag until D09 (COORD-D02-01).
+						attachToSession: async ({ session_id, text, model_profile, client_request_id }) => {
+							const scope = descriptor.scope;
+							const serverId = scope.kind === 'server' ? scope.server_id : null;
+							if (serverId === null) {
+								throw new ApiError(400, 'bad_request', 'documents attach needs a server scope');
+							}
+							const target =
+								session_id ??
+								(
+									await api.createAgentSession({
+										server_id: serverId,
+										source: 'document_attach',
+										model_profile: model_profile ?? null,
+										client_request_id
+									})
+								).session_id;
+							const outcome = await api.submitAgentSessionTurn(
+								target,
+								{
+									session_id: target,
+									text,
+									client_request_id,
+									model_profile: model_profile ?? null
+								},
+								serverId
+							);
+							openActiveSession(target, serverId);
+							void loadSessionHistory();
+							return outcome;
+						}
+					})
+				);
 			case APPLICATIONS_PANEL_KIND: {
 				const serverId =
 					descriptor.scope.kind === 'server' ? descriptor.scope.server_id : selectedServerId;
@@ -1199,22 +1327,43 @@
 		{/snippet}
 
 		<ChatDrawerSection
-			conversations={drawerConversations}
-			totalConversations={drawerConversationsTotal}
-			hasMoreConversations={drawerConversationsHasMore}
-			loadingMoreConversations={drawerConversationsLoadingMore}
-			activeRunId={drawerActiveRunId}
+			conversations={drawerRows}
+			totalConversations={drawerRowsTotal}
+			hasMoreConversations={drawerRowsHasMore}
+			loadingMoreConversations={drawerSessionsLoadingMore}
 			onnewchat={() => {
+				// A fresh chat abandons the visible session: its channel closes
+				// now, not when the next session opens (plan acceptance 2).
+				closeActiveSession();
 				focusChatDock();
-				dockChatPanel?.triggerNewChat();
 			}}
-			onselectconversation={(runId) => {
+			onselectconversation={(rowKey) => {
+				// Session-first rows only (D09): open the visible session's
+				// channel — the ONLY open channel (F3; never a fabricated
+				// "attached" note: the dock surface mirrors the real
+				// connection state).
+				const row = drawerRows.find(
+					(one) => (one.session_id ?? one.run_id) === rowKey
+				);
+				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
+					openActiveSession(row.session_id, row.server_id);
+				}
 				focusChatDock();
-				dockChatPanel?.triggerSelectRun(runId);
 			}}
-			onrefreshhistory={() => dockChatPanel?.triggerRefreshHistory()}
-			onloadmorehistory={() => dockChatPanel?.triggerLoadMoreHistory()}
-			onrenameconversation={(runId, title) => dockChatPanel?.triggerRenameRun(runId, title)}
+			onrefreshhistory={() => {
+				void loadSessionHistory();
+			}}
+			onloadmorehistory={() => {
+				if (drawerSessionsHasMore) void loadMoreSessionHistory();
+			}}
+			onrenameconversation={async (rowKey, title) => {
+				const row = drawerRows.find(
+					(one) => (one.session_id ?? one.run_id) === rowKey
+				);
+				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
+					await renameSession(row.session_id, title);
+				}
+			}}
 			tagLoader={chatRowTagsLoader}
 		/>
 
@@ -1305,11 +1454,11 @@
 		{/each}
 	</div>
 
-	<!-- The Always-Visible Bottom Chat Dock: ChatPanel lives here
+	<!-- The Always-Visible Bottom Chat Dock: SessionChatPanel lives here
 	     persistently — never a registry window (no data-panel-kind, no
 	     workspace state). Collapsing hides the body visually so the mounted
 	     panel (and its draft) survives; the fixture desktop drives it with
-	     the in-memory slice and performs zero API requests. -->
+	     the unwired bag and performs zero API requests. -->
 	<section
 		class="mai-desktop-shell__dock"
 		class:mai-desktop-shell__dock--collapsed={dockCollapsed}
@@ -1317,18 +1466,56 @@
 		aria-label="Chat dock"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-body">
-			<ChatPanel
-				bind:this={dockChatPanel}
+		<div class="mai-desktop-shell__dock-chrome">
+			<!-- The ONE dock disclosure control (moved out of the deleted
+			     legacy ChatPanel at D09): collapsing hides the dock body so the
+			     mounted panel (and its drafts) survive untouched. -->
+			<button
+				type="button"
+				class="mai-desktop-shell__dock-toggle"
+				data-testid="bottom-chat-dock-toggle"
+				aria-expanded={!dockCollapsed}
+				aria-label={dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
+				aria-controls="mai-bottom-chat-dock-body"
+				onclick={() => (dockCollapsed = !dockCollapsed)}
+			>
+				{dockCollapsed ? 'Chat dock ▲' : 'Chat dock ▼'}
+			</button>
+		</div>
+		{#if live}
+			<div
+				class="mai-desktop-shell__dock-channel"
+				data-testid="session-channel-state"
+				data-channel-state={channelState}
+				data-active-session={activeSessionId ?? ''}
+			>
+				{#if activeSessionId !== null}
+					<span>session {activeSessionId.slice(0, 8)}… · channel {channelState}</span>
+					{#if channelEntries.length > 0}
+						<span> · committed through seq {channelEntries[channelEntries.length - 1]}</span>
+					{/if}
+				{:else}
+					<span>no session open</span>
+				{/if}
+			</div>
+		{/if}
+		<div class="mai-desktop-shell__dock-body" id="mai-bottom-chat-dock-body">
+			<!-- D09: the session-first virtualized surface is THE dock; the
+			     legacy ChatPanel fallback is deleted (no toggle). Without a
+			     live session the panel renders its honest empty/create state;
+			     offline it fails closed on the unwired bag. -->
+			<SessionChatPanel
 				panel={dockPanel}
-				bind:dockCollapsed
-				onhistorychange={(rows, meta) => {
-					drawerConversations = rows;
-					drawerConversationsTotal = meta?.total;
-					drawerConversationsHasMore = meta?.hasMore ?? false;
-					drawerConversationsLoadingMore = meta?.loadingMore ?? false;
-				}}
-				onactivechange={(runId) => (drawerActiveRunId = runId)}
+				sessionId={activeSessionId}
+				serverId={selectedServerId}
+				entries={sessionEntries}
+				drafts={sessionDrafts}
+				channelState={channelState}
+				loadingOlder={loadingOlderEntries}
+				hasOlder={sessionHasOlder}
+				onloadolder={() => void loadOlderEntries()}
+				onsessionopened={(sessionId, serverId) =>
+					openActiveSession(sessionId, serverId)}
 			/>
 		</div>
 	</section>
@@ -1339,7 +1526,7 @@
 		<WindowSwitcher
 			entries={switcherEntries}
 			onactivate={(windowId) => {
-				dockChatPanel?.scrollComposerIntoView();
+				focusChatDock();
 				presentation.activate(windowId);
 			}}
 		/>
@@ -1467,6 +1654,15 @@
 	   lower stacking level (`z-index: 5`) than `.mai-desktop-shell__desktop`
 	   (`z-index: 20`) so opened workspace windows always stack in front of
 	   the chat dock instead of being hidden behind it. */
+	.mai-desktop-shell__dock-channel {
+		display: flex;
+		gap: 6px;
+		padding: 2px var(--mai-space-2);
+		font-size: 0.72rem;
+		color: var(--mai-color-muted, inherit);
+		border-bottom: var(--mai-border-width) solid var(--mai-color-border, transparent);
+	}
+
 	.mai-desktop-shell__dock {
 		position: absolute;
 		bottom: var(--mai-space-2);
@@ -1512,6 +1708,30 @@
 	.mai-desktop-shell__dock-body {
 		overflow: visible;
 		min-width: 0;
+	}
+
+	.mai-desktop-shell__dock-chrome {
+		display: flex;
+		justify-content: flex-end;
+		padding: var(--mai-space-1) var(--mai-space-2) 0;
+	}
+
+	.mai-desktop-shell__dock-toggle {
+		font: inherit;
+		font-size: 12px;
+		line-height: 1;
+		padding: 4px 10px;
+		border-radius: 999px;
+		border: 1px solid var(--mai-border, transparent);
+		background: var(--mai-surface, transparent);
+		color: inherit;
+		cursor: pointer;
+	}
+
+	/* Collapsed: the body is visually hidden (the mounted panel and its
+	   drafts survive) and the chrome row is the only painted surface. */
+	.mai-desktop-shell__dock--collapsed .mai-desktop-shell__dock-body {
+		display: none;
 	}
 
 	.mai-desktop-shell__taskbar {

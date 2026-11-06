@@ -83,11 +83,15 @@
 		return candidate as DocsApi;
 	}
 
-	/** Narrow the optional conversation seam; incomplete ⇒ null (fail closed). */
+	/**
+	 * Narrow the optional chat seam; incomplete ⇒ null (fail closed). The
+	 * session-first path is `attachToSession`; the legacy `submitMessage`
+	 * fallback died with the D09 coordinated deletion.
+	 */
 	function readChat(services: PanelServices): ChatSubmit | null {
 		const candidate = services.chat as Partial<ChatSubmit> | null | undefined;
 		if (typeof candidate !== 'object' || candidate === null) return null;
-		if (typeof candidate.submitMessage !== 'function') return null;
+		if (typeof candidate.attachToSession !== 'function') return null;
 		return candidate as ChatSubmit;
 	}
 
@@ -589,7 +593,11 @@
 	let attachProfile = $state('');
 	let attachNote = $state('');
 	let attachBusy = $state(false);
+	/** The attach attempt's idempotency key: one per attach, reused on retry. */
+	let attachRequestId = $state<string | null>(null);
 	let attachDoneRunId = $state<string | null>(null);
+	/** The session the excerpt was admitted into (session-first path). */
+	let attachDoneSessionId = $state<string | null>(null);
 	let attachProblem = $state<{ code: string; message: string } | null>(null);
 	let attachFields = $state<Record<string, string>>({});
 
@@ -605,6 +613,8 @@
 		attachCitation = citation;
 		attachExcerpt = excerpt;
 		attachDoneRunId = null;
+		attachDoneSessionId = null;
+		attachRequestId = null;
 		attachProblem = null;
 		attachFields = {};
 	}
@@ -625,6 +635,8 @@
 		attachProfile = '';
 		attachNote = '';
 		attachDoneRunId = null;
+		attachDoneSessionId = null;
+		attachRequestId = null;
 		attachProblem = null;
 		attachFields = {};
 	}
@@ -651,17 +663,22 @@
 		attachBusy = true;
 		attachProblem = null;
 		try {
-			const created = await chat.submitMessage({
-				run_id: crypto.randomUUID(),
-				server_id: serverScope,
-				message,
-				profile: attachProfile.trim(),
-				role: 'administrator',
-				mode: 'ask',
-				read_only: false
+			// Session-first attach (D07): the explicit create-new action (no
+			// destination session selected) or the explicit destination
+			// session, then ONE idempotent turn admission. The SAME
+			// client_request_id rides every retry of this attach, so a
+			// duplicate click converges (200 deduplicated) instead of
+			// creating a second session/turn.
+			if (attachRequestId === null) attachRequestId = crypto.randomUUID();
+			const outcome = await chat.attachToSession({
+				session_id: null, // explicit create-new-session action
+				text: message,
+				model_profile: attachProfile.trim(),
+				client_request_id: attachRequestId
 			});
 			if (disposed) return;
-			attachDoneRunId = created.conversation.run_id;
+			attachDoneSessionId = outcome.session_id;
+			attachDoneRunId = outcome.run_id;
 		} catch (error) {
 			if (disposed) return;
 			const code = codeOf(error) ?? 'unavailable';
@@ -1379,14 +1396,16 @@
 						/>
 						<div class="mai-docs__actions">
 							<Button onclick={submitAttach} loading={attachBusy} data-testid="attach-send">
-								Send to conversation
+								Send to session
 							</Button>
 						</div>
 					</div>
 					{#if attachDoneRunId !== null}
 						<p class="mai-docs__note" role="status" data-testid="attach-done">
-							Recorded conversation {shortId(attachDoneRunId)} — the excerpt travels inside the
-							durable message under its citation.
+							{attachDoneSessionId !== null
+								? `Recorded session ${shortId(attachDoneSessionId)} · run ${shortId(attachDoneRunId)}`
+								: `Recorded conversation ${shortId(attachDoneRunId)}`} —
+							the excerpt travels inside the durable message under its citation.
 						</p>
 					{/if}
 					{#if attachProblem !== null}

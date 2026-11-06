@@ -1379,14 +1379,10 @@ def migrated_url() -> str:
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS application_projection_journal, "
-                "application_projection, knowledge_doc_chunks, "
-                "knowledge_documents, job_schedule_fires, job_schedules, "
-                "job_events, job_steps, job_runs, approvals, "
-                "profile_projection_journal, profile_projection, "
-                "admin_sessions, admin_credential, alembic_version"
-            )
+            # Whole-schema reset (D09): FK-safe and immune to future revisions.
+            conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+            conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
             conn.commit()
         from alembic import command
 

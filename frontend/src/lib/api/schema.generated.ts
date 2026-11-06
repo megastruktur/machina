@@ -608,658 +608,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/chat/messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit a chat message as a durable agent conversation (C05 rule 5)
-         * @description Persist one chat submission and durably enqueue the conversation.
-         *
-         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-         *     The target profile's revisions are bound from the canonical store;
-         *     attachment references are resolved by confined, integrity-checked
-         *     reads; the composed intent is validated by the ONE producers; the
-         *     facade row, the intent digest events and the submit edge commit
-         *     atomically; the engine enqueue follows the commit so a crash leaves
-         *     a re-armable gap, not a half intent.
-         */
-        post: operations["submit_message_api_v1_chat_messages_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded server-scoped page of canonical conversations
-         * @description One bounded page of safe conversation metadata (§3 ``GET`` list).
-         *
-         *     The page is exactly the requested server's scope; ordering and the
-         *     same-filter total are the storage owner's deterministic contract
-         *     (``updated_at DESC, conversation_id``). Rows are safe metadata: no
-         *     transcript content ever rides a list page. ``tag_id`` (repeated
-         *     UUID, at most 50, matched ``any``/``all`` per ``tag_match``) filters
-         *     BEFORE pagination through the store's matching predicate for both
-         *     slice and total; omitting it preserves the unfiltered behavior and
-         *     malformed/oversized sets fail closed (422).
-         */
-        get: operations["list_canonical_conversations_api_v1_chat_conversations_get"];
-        put?: never;
-        /**
-         * Create a conversation and submit its first turn (canonical seam)
-         * @description Create one conversation and atomically admit its first turn (§3).
-         *
-         *     The modern seam: ``client_request_id`` IS the new conversation's
-         *     identity and the first run's idempotency key, so a retry after any
-         *     crash or network timeout recovers the exact conversation, message
-         *     and run triple — deduplicated (``200``), never a second row (C4).
-         *     The canonical user message and the durable enqueue intent commit
-         *     through the conversation store's serialized admission window (C6);
-         *     the engine enqueue follows the commit (re-armable gap, never a half
-         *     intent).
-         */
-        post: operations["create_conversation_api_v1_chat_conversations_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded role-preserving transcript page (deterministic order)
-         * @description The sanitized transcript page (§3 ``GET`` messages; C2).
-         *
-         *     Ordered ``(seq, message_id)`` with the same-filter ``total``; the
-         *     page carries the conversation's honest history-completeness marker.
-         *     A fresh session restores the true server transcript — no browser
-         *     cache dependency, no placeholder rows, no fabricated turns.
-         */
-        get: operations["list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get"];
-        put?: never;
-        /**
-         * Submit one follow-up turn onto a conversation (canonical seam)
-         * @description Append one user turn to an existing conversation (§3).
-         *
-         *     The turn records ONLY the actual new user text — the canonical
-         *     transcript is assembled server-side at execution time, never
-         *     browser-stitched (C1). A finished follow-up starts a new durable run
-         *     bound to the SAME canonical conversation; a turn arriving while
-         *     another run holds the writer lease is admitted, recorded and
-         *     honestly reported ``queued_followup`` (``202``, no competing
-         *     executor). Retrying the SAME ``client_request_id`` deduplicates
-         *     against the original turn (C4); a conflicting payload under the same
-         *     key fails closed (``409 client_request_conflict``).
-         */
-        post: operations["submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/steer": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit one deterministic steering/control request onto an active run
-         * @description Record one active-run steering/control request (§3; C5).
-         *
-         *     DURABLE FIRST: the ``conversation_steering`` row commits before the
-         *     caller is told anything and before any delivery, so a crash between
-         *     the append and the run's consumption recovers through the run's own
-         *     safe-boundary poll — and a retransmitted ``client_request_id``
-         *     deduplicates onto the SAME row, never a second control (C4). Pause
-         *     and cancel are deterministic: they are recorded without any intake
-         *     model call and consumed at the run's next safe effect boundary;
-         *     in-flight effects are never claimed killed without their receipt.
-         */
-        post: operations["steer_conversation_api_v1_chat_conversations__conversation_id__steer_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/resume": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * State-specific operator resume (§9): only the valid resume per state
-         * @description State-specific resume (runtime-v2.md §9; AC4).
-         *
-         *     ONE gate over the frozen park vocabulary — never a generic replay
-         *     button:
-         *
-         *     - ``waiting_children`` → ``409 resume_rejected``: child completion is
-         *       the only producer that wakes the run (the delegation module's
-         *       settled-child seam); a manual force-resume would execute past
-         *       unproven children.
-         *     - ``reconciling`` → ``409 classification_required``: unknown effects
-         *       NEVER auto-resume into execution; the operator classifies each open
-         *       step first (the reconcile route below).
-         *     - ``waiting_approval`` → ``409 approval_decision_required``: the ONE
-         *       resume is the payload-bound approval decision
-         *       (``dispatch_once(approval_id=…)`` worker-side), never a generic wake.
-         *     - ``queued``/``running`` → ``409 resume_not_applicable``: the run is
-         *       executing; steering is the control.
-         *     - No active run (settled/paused): the operator resume from the last
-         *       settled checkpoint IS the next submitted turn — the checkpoint is
-         *       the canonical transcript plus the objective episode, and the new
-         *       run continues from exactly that state (v2 conversations stay v2).
-         *       With ``message`` the request delegates to the canonical follow-up
-         *       admission (created/``201``); without one, ``409
-         *       resume_not_applicable`` names the honest next action.
-         */
-        post: operations["resume_conversation_api_v1_chat_conversations__conversation_id__resume_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/reconcile": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Classify open unknown effects of a parked run (§9; AC4)
-         * @description Operator classification of unknown effects (§9; C04 rule 5/7).
-         *
-         *     The ONLY path that closes an ``outcome_unknown`` row from the HTTP
-         *     surface: each entry maps ``confirm_applied``/``confirm_not_applied``/
-         *     ``cancel`` onto the recovery owner's FINAL verdict classes and lands
-         *     through :meth:`RecoveryService.aresolve_step` — the guarded
-         *     single-owner writer that disposes the recorded lock and wakes the
-         *     parked run (best effort). The run is NEVER re-executed by this
-         *     route: a live parked workflow continues from its own durable loop,
-         *     and an engine-orphaned park stays settled history.
-         */
-        post: operations["reconcile_conversation_api_v1_chat_conversations__conversation_id__reconcile_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/runs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List conversations (bounded page; one server or all servers)
-         * @description One bounded page of root conversations (C01 rules 5 and 7).
-         *
-         *     Safe method: session layer only. With an explicit ``server_id`` the
-         *     page is exactly that server's scope (the frozen C01 rule 7
-         *     behaviour); with ``server_id`` omitted the page lists recent ROOT
-         *     conversations across ALL servers (including General Consult), so the
-         *     Floating Chat History Selector can restore any session's server +
-         *     service tags. Conversations are the ROOT runs (depth 0); delegated
-         *     children are reachable through their parent's detail. States replay
-         *     from the persisted transition events.
-         */
-        get: operations["list_conversations_api_v1_chat_runs_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/runs/{run_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Read one conversation: binding, replayed state, children, references
-         * @description One conversation's durable record; state is replayed, never engine-called.
-         *
-         *     Children are identity+state views of the persisted child rows; the
-         *     recorded attachment references are identity+integrity handles. Task
-         *     text, prompts and artifact bodies never appear (C05 rule 4).
-         */
-        get: operations["read_conversation_api_v1_chat_runs__run_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /**
-         * Rename a conversation (durable user-defined title)
-         * @description Persist a user-defined conversation title on the run's event stream.
-         */
-        patch: operations["rename_conversation_api_v1_chat_runs__run_id__patch"];
-        trace?: never;
-    };
-    "/api/v1/chat/runs/{run_id}/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Cancel a conversation (records the request; reports known outcomes)
-         * @description Record the cancel request and report only a KNOWN engine outcome.
-         *
-         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-         *     Composes the reviewed safe-cancel facade over the explicit tree
-         *     cancellation (guard rule 4): the request is recorded ONCE, the
-         *     engine cancellation covers the conversation's children unless the
-         *     caller explicitly keeps them, and the tiny HTTP observation budget
-         *     expires into an honest ``202`` — never a claimed ``cancelled``.
-         */
-        post: operations["cancel_conversation_api_v1_chat_runs__run_id__cancel_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/runs/{run_id}/steps/{seq}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Read one tool call's lazy-loaded params and response
-         * @description Lazy-load one tool call's params and response for an expanded chat card.
-         *
-         *     Reads the persisted ``job_steps`` row (including ``params`` and
-         *     ``response`` in ``receipt``) and falls back to the target-side receipt
-         *     directory or DBOS ``operation_outputs`` if the step predates inline
-         *     ``params``/``response`` persistence.
-         */
-        get: operations["read_tool_step_api_v1_chat_runs__run_id__steps__seq__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/runs/{run_id}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Subscribe to a conversation's persisted events (SSE, replay cursor)
-         * @description SSE subscription over the conversation's event stream (C05 rule 4).
-         *
-         *     The same transport the jobs surface froze: the replay cursor is the
-         *     standard SSE ``Last-Event-ID`` header; frames are strictly
-         *     cursor-exclusive and ordered by ``seq``, so a reconnect with the
-         *     last seen ``id`` deduplicates by construction. Authorization
-         *     completes BEFORE the response starts; the stream is read-only (a
-         *     disconnected browser cancels nothing, C08 rule 7). Delegation
-         *     children subscribe through this same route with their own run ids —
-         *     their identities are discovered from the parent's
-         *     ``agent.delegation_planned`` event (value-free references).
-         */
-        get: operations["stream_conversation_events_api_v1_chat_runs__run_id__events_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One conversation's safe header with honest legacy-gap metadata
-         * @description The safe singleton header (§3 ``GET`` one) with §4 gap honesty.
-         *
-         *     A ``partial``/``unavailable`` conversation labels its gaps explicitly
-         *     (missing range + bounded proven-but-unrecoverable submission count);
-         *     a complete conversation carries no gap metadata and pays no extra
-         *     query. Nothing about another scope's identity can appear in any
-         *     rejection (C8).
-         */
-        get: operations["read_canonical_conversation_api_v1_chat_conversations__conversation_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded cursor-exclusive metadata event page (resumable)
-         * @description Bounded resumable metadata events (§3 ``GET`` events; C2).
-         *
-         *     The cursor is the conversation-local monotonic message sequence.
-         *     Frames are strictly cursor-exclusive and ascending, so a reconnect
-         *     with the last seen ``after_seq`` deduplicates by construction —
-         *     without gaps and without duplicates. Events carry content
-         *     IDENTITIES only (never transcript text, C05); the envelope's
-         *     current-state block carries the bounded lease/steering/revision
-         *     truth for honest catch-up rendering.
-         */
-        get: operations["list_canonical_events_api_v1_chat_conversations__conversation_id__events_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/drain-status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Legacy drain inventory: unsettled legacy runs vs v2 runs (§10.2)
-         * @description The deployment-drain inventory (scenario RV2-DEPLOY-DRAIN).
-         *
-         *     Safe method: session layer only. The counters derive ONLY from
-         *     app-owned records (``job_runs``/``job_events``/``objective_runs``);
-         *     the legacy/v2 split is the ``objective_runs`` binding itself (the
-         *     DB CHECK admits only ``agent.run_v2``), so an unsettled legacy run
-         *     can never masquerade as drained.
-         */
-        get: operations["read_drain_status_api_v1_objectives_drain_status_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded page of in-scope objectives (AGENTS.md pagination)
-         * @description One bounded page of safe objective summaries (§3 ``GET`` list).
-         *
-         *     The page is exactly the requested server's scope (a page row's scope
-         *     contains ``server_id``); ordering is ``updated_at DESC,
-         *     objective_id`` with the same-filter ``COUNT(*)`` and derived
-         *     ``has_more``. Rows carry safe metadata only — no request text.
-         */
-        get: operations["list_objectives_api_v1_objectives_get"];
-        put?: never;
-        /**
-         * Create one objective episode (operator authority; §3.1)
-         * @description Create one objective episode (§3.1; AC1/AC2).
-         *
-         *     Operator authority only: the route runs behind the full session →
-         *     origin → CSRF boundary and pins ``ActorKind.OPERATOR`` — there is no
-         *     agent-reachable create path. The ONE store persists the verbatim
-         *     request/constraints (projected for secret safety), the initial
-         *     scope, and the ``objective.created`` ledger event in ONE transaction.
-         */
-        post: operations["create_objective_api_v1_objectives_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One scope-checked objective read (§3)
-         * @description The scope-checked singleton read (§3; C8 fail closed).
-         *
-         *     A foreign-scope reference is the scope-blind
-         *     ``404 objective_not_found`` — the verbatim episode (request,
-         *     constraints, scope membership) is visible only inside its scope.
-         */
-        get: operations["read_objective_api_v1_objectives__objective_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/journal": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The derived work journal (§8.1; trusted records only)
-         * @description The bounded work-journal projection (§8.1).
-         *
-         *     A fixed-shape read of the ledger fold: verbatim goal/constraints,
-         *     action attempts, receipts, verification verdicts, unknown effects,
-         *     delegation links — with explicit truncation flags. The cache
-         *     catches up honestly over any ledger tail before answering (§8.4).
-         */
-        get: operations["read_journal_api_v1_objectives__objective_id__journal_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded objective-ledger page (§5.2 pagination)
-         * @description One deterministic ledger page (§5.2; AC3).
-         *
-         *     Ordered by ``sequence`` with the same-filter ``total``; ``type``
-         *     filters inside the ``objective.*`` family only; ``after_seq`` is the
-         *     replay cursor returning strictly-newer rows. Payloads are the
-         *     projected value-free documents (redaction and bounds applied at
-         *     WRITE; this read never re-bounds silently).
-         */
-        get: operations["list_objective_events_api_v1_objectives__objective_id__events_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/events/stream": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Subscribe to the objective activity ledger (SSE, replay cursor)
-         * @description SSE subscription over the ``objective.*`` ledger (§5.2; AC3).
-         *
-         *     The replay cursor is ``after_seq`` (query) or the standard SSE
-         *     ``Last-Event-ID`` header (the query wins when both are present);
-         *     absent means "from the beginning". Frames are strictly
-         *     cursor-exclusive and ordered by ``seq``, so a reconnect with the
-         *     last seen ``id`` deduplicates by construction. Authorization
-         *     completes BEFORE the response starts; the stream is read-only and
-         *     bounded — it self-closes once a settled episode is drained past the
-         *     cursor (a settled objective can never emit another event).
-         */
-        get: operations["stream_objective_events_api_v1_objectives__objective_id__events_stream_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/runs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded page of the objective's run bindings (§3.3)
-         * @description The objective's durable run/child bindings (§3.3; AC1).
-         *
-         *     Every binding names a run of the frozen ``agent.run_v2`` handler (the
-         *     DB CHECK is the §10 backstop), its initiating server and actor
-         *     provenance — the truth the dual-ownership guarantee reports against.
-         */
-        get: operations["list_objective_runs_api_v1_objectives__objective_id__runs_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/scope": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Operator scope edit under the expected-revision CAS (§3.2; AC2)
-         * @description Expand or shrink the objective scope (§3.2; AC2/AC5).
-         *
-         *     The ONLY scope-change authority surface: the authenticated operator
-         *     session pins ``ActorKind.OPERATOR`` — no agent, child or model call
-         *     can reach this route. The ONE store applies the delta under the row
-         *     lock + CAS and appends ``objective.scope_changed`` with the exact
-         *     effective delta in the SAME transaction; a rejected edit changes
-         *     nothing.
-         */
-        post: operations["change_objective_scope_api_v1_objectives__objective_id__scope_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/objectives/{objective_id}/checklist": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The advisory checklist projection (§8.2)
-         * @description The bounded advisory checklist (§8.2; never authority).
-         *
-         *     A never-maintained checklist answers ``404 checklist_absent`` — the
-         *     honest absence marker, never a fabricated empty document.
-         */
-        get: operations["read_checklist_api_v1_objectives__objective_id__checklist_get"];
-        /**
-         * Replace the advisory checklist under its CAS revision (§8.2)
-         * @description CAS-replace the advisory checklist (§8.2; §11).
-         *
-         *     Operator authority only. The write appends
-         *     ``objective.checklist_updated`` and bumps the revision in ONE
-         *     transaction; a stale revision changes nothing (``409
-         *     revision_conflict``). The checklist stays advisory: no tick grants
-         *     authority or completes anything.
-         */
-        put: operations["put_checklist_api_v1_objectives__objective_id__checklist_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/tags": {
         parameters: {
             query?: never;
@@ -1372,236 +720,6 @@ export interface paths {
          *     invariant never drops below one tag.
          */
         delete: operations["remove_job_tag_api_v1_jobs_runs__run_id__tags__tag_id__delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/tags": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded tag page for one canonical conversation
-         * @description The conversation's bounded tag page (safe read; session only).
-         *
-         *     The store resolves the conversation inside the requesting
-         *     ``server_id`` scope; a missing and a cross-server conversation are
-         *     the SAME scope-blind 404 envelope as the conversation read surface.
-         *     The zero UUID server scope (General Consult) is valid HERE ONLY.
-         */
-        get: operations["list_conversation_tags_api_v1_chat_conversations__conversation_id__tags_get"];
-        put?: never;
-        /**
-         * Assign one tag to a conversation (idempotent, user-sourced)
-         * @description Assign one catalog tag to one conversation (re-assignment: no-op).
-         *
-         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-         *     The assignment is user-originated: ``assignment_source='user'`` and
-         *     the bounded non-secret actor is the validated session's token hash —
-         *     never client-supplied input. The zero UUID server scope (General
-         *     Consult) is valid HERE ONLY.
-         */
-        post: operations["assign_conversation_tag_api_v1_chat_conversations__conversation_id__tags_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/tags/{tag_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /**
-         * Remove one conversation tag (idempotent, final-tag protected)
-         * @description Remove one conversation-tag association (absent removal: no-op).
-         *
-         *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
-         *     Removing the conversation's final ordinary tag requires
-         *     ``replacement_tag_id``: removal and replacement commit together, so
-         *     the mandatory-tag invariant never drops below one tag. The zero UUID
-         *     server scope (General Consult) is valid HERE ONLY.
-         */
-        delete: operations["remove_conversation_tag_api_v1_chat_conversations__conversation_id__tags__tag_id__delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/conversations/{conversation_id}/task": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The conversation's ONE active task header (§8; no unbounded arrays)
-         * @description The compact §8 header view for the conversation's active episode.
-         *
-         *     Resolution goes through the conversation row's ``active_task_id`` —
-         *     the ONE task pointer §1 defines — so a completed episode's history
-         *     never masquerades as the current task. Absent conversation, foreign
-         *     scope and absent episode all collapse into the SAME scope-blind 404:
-         *     existence never leaks (C8).
-         */
-        get: operations["read_conversation_task_api_v1_chat_conversations__conversation_id__task_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/tasks/{task_id}/items": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded server-scoped plan-step page (§8; AGENTS.md §1)
-         * @description The deterministic plan-step page, ordered ``(position, step_id)``.
-         *
-         *     ``total`` is the ``COUNT(*)`` under the identical filter predicate;
-         *     superseded rows stay recorded and are served only when explicitly
-         *     requested (P3). Cross-server access is the scope-blind 404 (C8).
-         */
-        get: operations["list_task_steps_api_v1_chat_tasks__task_id__items_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/tasks/{task_id}/constraints": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded server-scoped constraint page (§8; AGENTS.md §1)
-         * @description The deterministic constraint page, ordered ``(position, id)``.
-         *
-         *     The §1/§6 safety boundary is read like every other collection:
-         *     bounded, deterministic, never silently truncated — every row carries
-         *     its ``origin`` (user requirement vs model inference) and its source
-         *     message anchors.
-         */
-        get: operations["list_task_constraints_api_v1_chat_tasks__task_id__constraints_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/tasks/{task_id}/evidence": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded server-scoped evidence-registry page (§8/§9)
-         * @description The deterministic evidence-registry page, ordered ``(created_at, id)``.
-         *
-         *     Provenance IDENTITIES only (kind + referenced record ID + safe note):
-         *     the route never re-fetches or inlines the referenced source content.
-         */
-        get: operations["list_task_evidence_api_v1_chat_tasks__task_id__evidence_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/tasks/{task_id}/revisions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * One bounded revision-ledger page (§8 audit; P5 shared truth)
-         * @description The append-only revision ledger, newest revision first (§8).
-         *
-         *     The SAME ledger the agent tools write, so a reconnecting UI (P5)
-         *     re-derives the shared server revision and the pending/applied
-         *     distinction from one authoritative history — never from browser
-         *     state.
-         */
-        get: operations["list_task_revisions_api_v1_chat_tasks__task_id__revisions_get"];
-        put?: never;
-        /**
-         * One authenticated user correction/proposal under CAS + idempotency (§8)
-         * @description The user correction route (§8): ONE shared revision service call.
-         *
-         *     Always ``author="user"`` — a user correction is never authored as the
-         *     model — and always SOURCE-LINKED: the frozen patch model requires the
-         *     user message being corrected, and the store existence-checks it
-         *     against the task's conversation (P4) before recording the revision.
-         *     A stale tab's ``base_revision`` is the structured
-         *     ``409 revision_conflict`` — never last-writer-wins (C6); a
-         *     retransmitted ``idempotency_key`` replays onto the SAME revision (C4,
-         *     ``200 deduplicated``). Plan review never touches the phase, the
-         *     status or any approval (§6).
-         */
-        post: operations["submit_task_correction_api_v1_chat_tasks__task_id__revisions_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/chat/tasks/{task_id}/decisions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * One explicit user decision: phase selection or pause/cancel (§8)
-         * @description The user decision route (§8): DISTINCT from plan review and from
-         *     operation approval.
-         *
-         *     The route performs metadata-only header updates through the ONE
-         *     store's CAS seam: phase selection is advisory (never permission) and
-         *     pause/cancel follow the frozen outcome transitions (a cancelled
-         *     episode closes and releases the conversation's active-task pointer).
-         *     It NEVER applies a plan delta, NEVER authorizes a pending operation
-         *     and NEVER terminates one — effect authorization stays on the C03
-         *     approvals surface, unchanged (§6: metadata decisions cannot change
-         *     grants). A stale ``expected_revision`` (the named revision the user
-         *     reviewed) is the structured ``409 revision_conflict`` (C6); a
-         *     retransmitted ``client_request_id`` replays (``200 deduplicated``).
-         */
-        post: operations["submit_task_decision_api_v1_chat_tasks__task_id__decisions_post"];
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2318,20 +1436,22 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Queue one background runbook execution (durable agent.run intent)
-         * @description Queue the runbook procedure as ONE background agent conversation.
+         * Queue one background runbook execution (durable session-run admission)
+         * @description Queue the runbook procedure as ONE fresh non-interactive session.
          *
          *     Mutation: session → origin → CSRF (ADR §5 order) before any effect.
          *     The route persists an explicitly provided ``custom_instructions`` on
          *     the server's map entry first (a catalog-only target is STAGED as an
-         *     ``installed=False`` entry, so the notes survive), then records the
-         *     SAME durable intent discipline as every other submit (facade row +
-         *     digest event + submit edge, the ONE producer validating the agent-run
-         *     document) and enqueues through the ONE engine client. No SSH, no
-         *     Docker and no capability dispatch ever runs inside the request — the
-         *     agent executes the procedure behind the dispatcher/policy gates and
-         *     reports status back through ``app.adopt``. The Chat window is never
-         *     opened or pre-filled by this route.
+         *     ``installed=False`` entry, so the notes survive), then performs the
+         *     SAME durable session-first admission as every other submit (session
+         *     row + child-run row + admission ledger + user entry + queued
+         *     run-state, all committed BEFORE the engine enqueue follows) through
+         *     the ONE session runner handler. No SSH, no Docker and no capability
+         *     dispatch ever runs inside the request — the agent executes the
+         *     procedure behind the dispatcher/policy gates and reports status back
+         *     through ``app.adopt``. The response names the created
+         *     ``session_id`` and ``run_id``; no interactive chat window is opened,
+         *     borrowed or pre-filled by this route.
          */
         post: operations["execute_runbook_api_v1_servers__server_id__applications__application_id__execute_post"];
         delete?: never;
@@ -2894,6 +2014,169 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agent-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Bounded agent-session list page
+         * @description One bounded, deterministic session page (newest-change first) with
+         *     honest tag previews (D07-fix1: the drawer renders HistoryTags from the
+         *     list page without a second round trip).
+         */
+        get: operations["list_sessions_api_v1_agent_sessions_get"];
+        put?: never;
+        /**
+         * Create Session
+         * @description Idempotent session create: the client idempotency key derives the
+         *     session identity, so a retry converges on the same row.
+         */
+        post: operations["create_session_api_v1_agent_sessions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Session Detail
+         * @description Scoped session detail; a missing and a foreign session are the SAME
+         *     value-free 404.
+         */
+        get: operations["get_session_detail_api_v1_agent_sessions__session_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Rename Session
+         * @description Rename one session (the only mutable header field); the trimmed
+         *     title is durable under the session-row lock.
+         */
+        patch: operations["rename_session_api_v1_agent_sessions__session_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get History
+         * @description One bounded, byte-checked history page (the D01 contract).
+         */
+        get: operations["get_history_api_v1_agent_sessions__session_id__history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Turn
+         * @description Admit one user turn: durable admission (run row + user entry), then
+         *     the engine enqueue FOLLOWS the commit. HTTP persists INTENT only; the
+         *     worker owns execution.
+         */
+        post: operations["submit_turn_api_v1_agent_sessions__session_id__turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Control
+         * @description One durable control action (steer/pause/cancel/approve/deny/
+         *     reconcile) delegated to the reviewed session-runner facade.
+         */
+        post: operations["submit_control_api_v1_agent_sessions__session_id__control_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Session Tags
+         * @description One bounded tag page of the session's associations (scope-blind
+         *     refusal when the session is missing or foreign).
+         */
+        get: operations["list_session_tags_api_v1_agent_sessions__session_id__tags_get"];
+        put?: never;
+        /**
+         * Assign Session Tag
+         * @description Assign one catalog tag to the session (idempotent on the pair;
+         *     ``assignment_source='user'``; optional create-if-missing name).
+         */
+        post: operations["assign_session_tag_api_v1_agent_sessions__session_id__tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agent-sessions/{session_id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Session Tag
+         * @description Remove one session-tag association; the mandatory-at-least-one-tag
+         *     invariant refuses the final removal without a replacement (409).
+         */
+        delete: operations["remove_session_tag_api_v1_agent_sessions__session_id__tags__tag_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2945,18 +2228,6 @@ export interface components {
         AckResult: {
             alert: components["schemas"]["AlertView"];
         };
-        /**
-         * ActionRisk
-         * @description Declared risk/action class of a step (§5 "risk/action class").
-         * @enum {string}
-         */
-        ActionRisk: "read_only" | "mutating" | "irreversible";
-        /**
-         * ActorKind
-         * @description Actor provenance for audit records (§4; labels, never principals).
-         * @enum {string}
-         */
-        ActorKind: "operator" | "agent" | "child_agent" | "automation";
         /**
          * AdoptBody
          * @description Adoption body (strict; the explicit C09 rule 1 admin decision).
@@ -3234,28 +2505,45 @@ export interface components {
             resume_wake_sent?: boolean | null;
         };
         /**
-         * AttachmentBody
-         * @description One permitted-artifact context reference (identity only).
+         * AssistantMessageEntry
+         * @description One assistant model response (sfc_RESEARCH §2): bounded safe text
+         *     and/or ordered structured tool-call parts, plus the model metadata needed
+         *     for native continuation and explicit provider reasoning artifacts.
          */
-        AttachmentBody: {
-            /** Server Id */
-            server_id: string;
-            /** Op Id */
-            op_id: string;
-        };
-        /**
-         * AttachmentView
-         * @description One recorded attachment reference (identity + integrity handles).
-         */
-        AttachmentView: {
-            /** Server Id */
-            server_id: string;
-            /** Op Id */
-            op_id: string;
-            /** Sha256 */
-            sha256: string;
-            /** Bytes */
-            bytes: number;
+        AssistantMessageEntry: {
+            /**
+             * @description Discriminator: this payload is an assistant message entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "assistant_message";
+            /**
+             * Text
+             * @description Bounded assistant text (empty when the round was pure tool use)
+             * @default
+             */
+            text: string;
+            /**
+             * Tool Calls
+             * @description Ordered structured tool-call parts of this assistant round
+             */
+            tool_calls?: components["schemas"]["ToolCallItem"][];
+            /**
+             * Model Profile
+             * @description Model profile identity that produced this assistant round
+             */
+            model_profile: string;
+            /**
+             * Provider Artifacts
+             * @description Explicit safe provider reasoning artifacts (never raw chain-of-thought)
+             */
+            provider_artifacts?: components["schemas"]["ProviderReasoningArtifact"][];
+            /**
+             * Tool Group State
+             * @description Atomic tool-group status: none, pending, complete or unresolved
+             * @default none
+             * @enum {string}
+             */
+            tool_group_state: "none" | "pending" | "complete" | "unresolved";
         };
         /**
          * BindingView
@@ -3450,222 +2738,48 @@ export interface components {
             duration_seconds: number;
         };
         /**
-         * ChatCancelBody
-         * @description Cancel body: explicit tree cancellation (guard rule 4).
-         *
-         *     A conversation cancel defaults to cancelling its children — a
-         *     cancelled chat must never orphan delegated work. (Deliberately a
-         *     distinct wire type from the jobs surface's ``CancelBody``: the
-         *     defaults differ and the exported component names must not collide.)
+         * CompactionEntry
+         * @description One compaction marker (sfc_RESEARCH §5: metadata/pointer, not a hidden
+         *     user message — originals stay stored and addressable; ``session_id``
+         *     never rotates).
          */
-        ChatCancelBody: {
+        CompactionEntry: {
             /**
-             * Cancel Children
-             * @default true
+             * @description Discriminator: this payload is a compaction marker (enum property replaced by openapi-typescript)
+             * @enum {string}
              */
-            cancel_children: boolean;
-        };
-        /**
-         * ChatCreated
-         * @description Submit outcome: the conversation view plus the dedup verdict.
-         */
-        ChatCreated: {
-            conversation: components["schemas"]["ConversationView"];
-            /** Deduplicated */
-            deduplicated: boolean;
-        };
-        /**
-         * ChatPage
-         * @description One bounded, explicitly server-scoped list page (C01 rule 5/7).
-         */
-        ChatPage: {
-            /** Conversations */
-            conversations: components["schemas"]["ConversationView"][];
-            /** Limit */
-            limit: number;
-            /** Offset */
-            offset: number;
-            /** Total */
-            total: number;
-        };
-        /**
-         * ChatRenameBody
-         * @description Rename body: durable user-defined conversation title.
-         */
-        ChatRenameBody: {
-            /** Title */
-            title: string;
-        };
-        /**
-         * ChatSteerView
-         * @description Steer/control outcome (§3): the durable control row's identity.
-         *
-         *     ``delivery_status`` is always ``pending`` at response time: the row
-         *     is durable BEFORE the caller is told anything, and it is consumed
-         *     by the lease-holding run at its next safe effect boundary — the
-         *     UI displays pending/applied distinctly and never fabricates an
-         *     instant state.
-         */
-        ChatSteerView: {
+            kind: "compaction";
             /**
-             * Conversation Id
+             * Compaction Id
              * Format: uuid
-             * @description Target conversation identity
+             * @description Stable identity of this compaction generation
              */
-            conversation_id: string;
+            compaction_id: string;
             /**
-             * Steering Id
-             * Format: uuid
-             * @description Durable steering/control row identity
+             * From Seq
+             * @description First covered session sequence number (inclusive)
              */
-            steering_id: string;
+            from_seq: number;
             /**
-             * Run Id
-             * @description Lease-holding run the control addresses, when one exists
+             * To Seq
+             * @description Last covered session sequence number (inclusive)
              */
-            run_id: string | null;
-            /** @description steer, pause or cancel */
-            action: components["schemas"]["SteerAction"];
+            to_seq: number;
             /**
-             * Client Request Id
-             * Format: uuid
-             * @description Idempotency key deduplicating repeated control submissions
+             * Summary Text
+             * @description Bounded summary of the covered entry range with provenance
              */
-            client_request_id: string;
-            /** @description created or deduplicated (same-key retransmission) */
-            disposition: components["schemas"]["TurnDisposition"];
+            summary_text: string;
             /**
-             * Delivery Status
-             * @description Always pending at response time; the active run consumes the control at a safe effect boundary
-             * @constant
+             * Model Profile
+             * @description Model profile identity the summary was produced for
              */
-            delivery_status: "pending";
-        };
-        /**
-         * ChatSubmitBody
-         * @description Submit body (strict: unknown fields are rejected, value-free 422).
-         *
-         *     ``run_id`` is REQUIRED: the client-generated idempotency key (C05
-         *     rule 5). ``profile`` names the model profile selection explicitly
-         *     (C06 rule 1); ``connection`` stays optional (the model store's
-         *     stored pairing when omitted). ``allowed_capabilities`` is the
-         *     conversation's explicit parent grant request — omitted or empty
-         *     means the agent runs with EVERY capability granted for the target
-         *     server (grant store, server-profile capabilities, enabled plugin
-         *     bindings and the built-in defaults) under the default ``delegated``
-         *     mode; delegation children are clamped to its intersection.
-         *     ``read_only`` strips every non-read capability and pins a strict
-         *     non-mutation instruction onto the agent task. ``root_budget`` is
-         *     the optional aggregate delegation budget (C05 rule 7): frozen on
-         *     the run row, narrowed against the delegation gates, and enforced
-         *     by the root ledger across the whole tree.
-         */
-        ChatSubmitBody: {
-            /** Run Id */
-            run_id: string;
+            model_profile: string;
             /**
-             * Server Id
-             * @default 00000000-0000-0000-0000-000000000000
+             * Token Usage Anchor
+             * @description Actual provider usage anchor of the summarized source range
              */
-            server_id: string;
-            /** Message */
-            message: string;
-            /** Profile */
-            profile: string;
-            /** Connection */
-            connection?: string | null;
-            /**
-             * Role
-             * @default administrator
-             */
-            role: string;
-            /** Rounds */
-            rounds?: number | null;
-            /** @default delegated */
-            mode: components["schemas"]["PolicyMode"];
-            /** Credential References */
-            credential_references?: string[];
-            /** Allowed Capabilities */
-            allowed_capabilities?: string[] | null;
-            /**
-             * Read Only
-             * @default false
-             */
-            read_only: boolean;
-            /** Children */
-            children?: components["schemas"]["ChildBody"][];
-            root_budget?: components["schemas"]["RootBudgetBody"] | null;
-            /** Attachments */
-            attachments?: components["schemas"]["AttachmentBody"][];
-            /** Service Tags */
-            service_tags?: string[];
-            /** Session Run Id */
-            session_run_id?: string | null;
-        };
-        /**
-         * ChecklistItem
-         * @description One advisory checklist entry — never authority, never evidence.
-         */
-        ChecklistItem: {
-            /**
-             * Text
-             * @description Projected checklist item text (advisory)
-             */
-            text: string;
-            /**
-             * Done
-             * @description Advisory tick; grants no authority and completes nothing
-             * @default false
-             */
-            done: boolean;
-        };
-        /**
-         * ChecklistPutBody
-         * @description One advisory checklist replacement under its CAS revision (§8.2).
-         *
-         *     The checklist is ADVISORY: no tick grants authority, completes
-         *     anything, or gates a run. Revision ``0`` names the never-maintained
-         *     state (the initial CAS pin); every later write pins the read
-         *     revision.
-         */
-        ChecklistPutBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Requesting in-scope server identity (C8 scope check)
-             */
-            server_id: string;
-            /**
-             * Expected Revision
-             * @description Expected checklist revision (0 = never maintained)
-             */
-            expected_revision: number;
-            /**
-             * Items
-             * @description The full replacement advisory checklist
-             */
-            items: components["schemas"]["ChecklistItem"][];
-        };
-        /**
-         * ChildBody
-         * @description One explicitly scoped child task (the frozen ``ChildSpec`` words).
-         *
-         *     There is deliberately no server/target field: a child runs on its
-         *     parent's server (C06 rule 5). ``capabilities`` is the child's
-         *     REQUEST; the effective grants are the intersection with the parent's
-         *     requested set, applied by the reviewed ``plan_children``.
-         */
-        ChildBody: {
-            /** Task */
-            task: string;
-            /** Role */
-            role?: string | null;
-            /** Connection */
-            connection?: string | null;
-            /** Profile */
-            profile?: string | null;
-            /** Capabilities */
-            capabilities?: string[];
+            token_usage_anchor?: number | null;
         };
         /** ComposeDetailView */
         ComposeDetailView: {
@@ -3723,56 +2837,6 @@ export interface components {
             bindings: components["schemas"]["BindingView"][];
         };
         /**
-         * ConstraintOrigin
-         * @description Source anchor distinguishing user requirements from model inferences
-         *     (act_CONTRACTS §5 ``constraints_proposed``).
-         * @enum {string}
-         */
-        ConstraintOrigin: "user" | "model";
-        /**
-         * ConstraintProposal
-         * @description One proposed constraint with source anchors (§5 ``constraints_proposed``).
-         *
-         *     ``origin`` distinguishes user requirements from model inferences: a
-         *     model-generated update can never remove/supersede a USER-origin constraint
-         *     (§6) — that needs an explicit user correction through the revision API.
-         */
-        ConstraintProposal: {
-            /**
-             * Constraint Id
-             * @description Stable slug of the proposed constraint
-             */
-            constraint_id: string;
-            /**
-             * Category
-             * @description Constraint category slug, e.g. safety or scope
-             */
-            category: string;
-            /**
-             * Statement
-             * @description Safe constraint statement; no secret material
-             */
-            statement: string;
-            /** @description Whether the user stated this or the model inferred it */
-            origin: components["schemas"]["ConstraintOrigin"];
-            /**
-             * Source Message Refs
-             * @description User messages this constraint is anchored to
-             */
-            source_message_refs?: string[];
-            /**
-             * Suggested
-             * @description Whether to add a new constraint or supersede an existing one
-             * @enum {string}
-             */
-            suggested: "add" | "supersede";
-            /**
-             * Supersedes Constraint Id
-             * @description Existing constraint ID replaced by a supersede proposal
-             */
-            supersedes_constraint_id?: string | null;
-        };
-        /**
          * ContainerView
          * @description One observed container (the discovery safe view: no env/mounts).
          */
@@ -3795,6 +2859,48 @@ export interface components {
             compose_service: string | null;
         };
         /**
+         * ControlActionKind
+         * @description Deterministic session control actions (sfc_RESEARCH §6 frame families;
+         *     controls acknowledge — they are never interpreted as user authority).
+         * @enum {string}
+         */
+        ControlActionKind: "steer" | "pause" | "cancel" | "approve" | "deny_approval" | "reconcile";
+        /**
+         * ControlEntry
+         * @description One acknowledged control action (sfc_RESEARCH §2: approval/cancel/
+         *     reconcile/steer acknowledgements — never interpreted as user authority).
+         */
+        ControlEntry: {
+            /**
+             * @description Discriminator: this payload is a control acknowledgement (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "control";
+            /** @description Deterministic control action that was acknowledged */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of the control request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the control action targeted, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when the action decided an approval
+             */
+            approval_id?: string | null;
+            /**
+             * Note
+             * @description Value-free bounded operator note carried with the action
+             */
+            note?: string | null;
+        };
+        /**
          * ControllerKeyResponse
          * @description The controller public half only: one OpenSSH public-key line.
          */
@@ -3805,650 +2911,6 @@ export interface components {
             key_type: string;
             /** Fingerprint */
             fingerprint: string;
-        };
-        /**
-         * ConversationCurrentView
-         * @description Current-state catch-up block on every events page (§3).
-         *
-         *     Bounded scalar state (identities + counts only), so a reconnecting
-         *     consumer renders the lease/steering truth without fabricating a
-         *     timeline entry for state that has no monotonic cursor.
-         */
-        ConversationCurrentView: {
-            /**
-             * Latest Seq
-             * @description Newest allocated transcript sequence (0 when empty)
-             */
-            latest_seq: number;
-            /** @description Honest history marker for this conversation (§4) */
-            history_completeness: components["schemas"]["HistoryCompleteness"];
-            /**
-             * Active Run Id
-             * @description Current lease-holding durable run, when one exists
-             */
-            active_run_id: string | null;
-            /**
-             * Active Task Id
-             * @description Current active task episode, when one exists (§1)
-             */
-            active_task_id: string | null;
-            /**
-             * Pending Steering
-             * @description Bounded count of not-yet-applied durable control rows
-             */
-            pending_steering: number;
-        };
-        /**
-         * ConversationDetailView
-         * @description Safe singleton header plus explicit legacy-gap metadata (§3/§4).
-         *
-         *     ``legacy_gaps`` is empty exactly when ``history_completeness`` is
-         *     ``complete``; otherwise it names every gap the store proved. The
-         *     runtime markers (§10.3, AC5) are TRUTHFUL: ``is_legacy`` is derived
-         *     from the v2-only ``objective_runs`` linkage (a conversation none of
-         *     whose runs bind a v2 objective is legacy, ``handler_name
-         *     "agent.run"``) — never reinterpreted, never a fake v2 achievement.
-         */
-        ConversationDetailView: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Opaque stable conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Server scope pinning this conversation
-             */
-            server_id: string;
-            /**
-             * Title
-             * @description User-assigned conversation title, when set
-             */
-            title?: string | null;
-            /**
-             * Created At
-             * Format: date-time
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: string;
-            /**
-             * Updated At
-             * Format: date-time
-             * @description RFC3339 UTC last-activity timestamp
-             */
-            updated_at: string;
-            /**
-             * Message Count
-             * @description Persisted message count
-             */
-            message_count: number;
-            /**
-             * Active Task Id
-             * @description Current active task episode, when one exists (§1)
-             */
-            active_task_id?: string | null;
-            /**
-             * Active Run Id
-             * @description Current durable run, when one is attached (§1)
-             */
-            active_run_id?: string | null;
-            /** @description Bounded tag name preview plus honest total */
-            tag_preview: components["schemas"]["EntityTagPreviewView"];
-            /** @description complete, partial or unavailable; never fabricated (§4) */
-            history_completeness: components["schemas"]["HistoryCompleteness"];
-            /** @description Missing transcript range when completeness is not complete */
-            missing_range?: components["schemas"]["MessageRange"] | null;
-            /**
-             * Legacy Gaps
-             * @description Honest legacy-gap metadata (§4); empty when complete
-             */
-            legacy_gaps?: components["schemas"]["LegacyHistoryGap"][];
-            /**
-             * Is Legacy
-             * @description True when no run of this conversation is v2-bound (runtime-v2.md §10.3 read-compatibility marker)
-             */
-            is_legacy: boolean;
-            /**
-             * Handler Name
-             * @description The durable handler family this conversation runs: 'agent.run' when legacy, 'agent.run_v2' when objective-bound
-             * @enum {string}
-             */
-            handler_name: "agent.run" | "agent.run_v2";
-            /**
-             * Objective Ids
-             * @description The v2 objective episodes this conversation's runs bind to (read-only probe; empty for legacy conversations)
-             */
-            objective_ids: string[];
-        };
-        /**
-         * ConversationEvent
-         * @description One metadata-only transcript event (§3 ``GET`` events).
-         *
-         *     The ``seq`` IS the dedup cursor: conversation-local, monotonic,
-         *     gap-free (allocated under the conversation's write lock), so a
-         *     reconnect with the last seen sequence replays strictly newer events
-         *     without gaps or duplicates (C2). No content field exists to leak.
-         */
-        ConversationEvent: {
-            /**
-             * Seq
-             * @description Conversation-local monotonic sequence (the dedup cursor)
-             */
-            seq: number;
-            /**
-             * Kind
-             * @description The event kind (one canonical transcript append)
-             * @constant
-             */
-            kind: "transcript.appended";
-            /**
-             * Message Id
-             * Format: uuid
-             * @description Opaque stable message identity
-             */
-            message_id: string;
-            /**
-             * Role
-             * @description Trusted producer-assigned role (vocabulary mirror)
-             */
-            role: string;
-            /**
-             * Source Kind
-             * @description Origin of the message (vocabulary mirror)
-             */
-            source_kind: string;
-            /**
-             * Redacted
-             * @description True when content was deliberately redacted
-             */
-            redacted: boolean;
-            /**
-             * Has Content Ref
-             * @description True when content lives behind the safe content_ref
-             */
-            has_content_ref: boolean;
-            /**
-             * Created At
-             * @description RFC3339 UTC event timestamp
-             */
-            created_at: string;
-        };
-        /**
-         * ConversationEventsPage
-         * @description One bounded, cursor-exclusive events page (§3 ``GET`` events).
-         *
-         *     The cursor filters the set (``seq > after_seq``); ``total`` is the
-         *     pre-slice count under that identical predicate and the slice serves
-         *     the filtered set from its start, so ``has_more`` follows the
-         *     canonical derivation. The page is deterministic and replayable: the
-         *     same cursor always returns the same slice (C2 reconnect dedup).
-         */
-        ConversationEventsPage: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Items skipped within the cursor-filtered set; the cursor (after_seq) is the resume position, so the filtered set is served from its start
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * After Seq
-             * @description The replay cursor: only strictly newer events are returned
-             */
-            after_seq: number;
-            /**
-             * Events
-             * @description Metadata events in strictly ascending seq order
-             */
-            events?: components["schemas"]["ConversationEvent"][];
-            /** @description Current-state catch-up block (identities and counts) */
-            current: components["schemas"]["ConversationCurrentView"];
-        };
-        /**
-         * ConversationListPage
-         * @description One bounded, explicitly server-scoped list page (§3 ``GET`` list).
-         *
-         *     Safe metadata only: rows never carry transcript content, so the page
-         *     stays safe for generic list surfaces (C01 rule 5; AGENTS.md §1).
-         */
-        ConversationListPage: {
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Conversation rows in deterministic updated_at order
-             */
-            items?: components["schemas"]["ConversationSummary"][];
-        };
-        /**
-         * ConversationReconcileBody
-         * @description One bounded classification batch for a parked ``reconciling`` run.
-         */
-        ConversationReconcileBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (§1 rule 2)
-             */
-            server_id: string;
-            /**
-             * Classifications
-             * @description One entry per open ``outcome_unknown`` step (bounded)
-             */
-            classifications: components["schemas"]["StepClassificationBody"][];
-        };
-        /**
-         * ConversationReconcileView
-         * @description The honest reconcile outcome: per-step resolutions, never a guess.
-         */
-        ConversationReconcileView: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Run Id
-             * Format: uuid
-             * @description The classified run's identity
-             */
-            run_id: string;
-            /**
-             * Run State
-             * @description The facade state replayed AFTER the classifications
-             */
-            run_state: string | null;
-            /**
-             * Results
-             * @description Per-step resolution outcomes in request order
-             */
-            results: components["schemas"]["StepResolutionView"][];
-        };
-        /**
-         * ConversationResumeBody
-         * @description One state-specific operator resume request (§9; AC4).
-         *
-         *     ``message`` is the operator's continuation instruction: the resumed
-         *     run starts FROM the conversation's last settled checkpoint (the
-         *     canonical transcript plus the objective episode context) — never a
-         *     generic replay of effects. Omitted, the request is a pure state
-         *     probe: it either names the exact structured refusal for the current
-         *     parked state or answers ``resume_not_applicable``.
-         */
-        ConversationResumeBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (§1 rule 2)
-             */
-            server_id: string;
-            /**
-             * Message
-             * @description Continuation instruction for the resumed run
-             */
-            message?: string | null;
-        };
-        /**
-         * ConversationSteerRequest
-         * @description Deterministic control request (§3): pause/cancel carry no planner
-         *     input; natural-language steering is interpreted at the next safe
-         *     boundary and displayed as pending until applied.
-         */
-        ConversationSteerRequest: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Target conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (§1 rule 2)
-             */
-            server_id: string;
-            /** @description steer, pause or cancel */
-            action: components["schemas"]["SteerAction"];
-            /**
-             * Message
-             * @description Natural-language steering text; forbidden on pause/cancel
-             */
-            message?: string | null;
-            /**
-             * Client Request Id
-             * @description Idempotency key for repeated control submissions
-             */
-            client_request_id?: string | null;
-            /**
-             * Expected Revision
-             * @description Expected task revision for CAS on steering, when relevant
-             */
-            expected_revision?: number | null;
-        };
-        /**
-         * ConversationSummary
-         * @description Safe metadata row of one conversation (§3 ``GET`` list page item).
-         *
-         *     No transcript content: summaries stay safe for generic list surfaces.
-         */
-        ConversationSummary: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Opaque stable conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Server scope pinning this conversation
-             */
-            server_id: string;
-            /**
-             * Title
-             * @description User-assigned conversation title, when set
-             */
-            title?: string | null;
-            /**
-             * Created At
-             * Format: date-time
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: string;
-            /**
-             * Updated At
-             * Format: date-time
-             * @description RFC3339 UTC last-activity timestamp
-             */
-            updated_at: string;
-            /**
-             * Message Count
-             * @description Persisted message count
-             */
-            message_count: number;
-            /**
-             * Active Task Id
-             * @description Current active task episode, when one exists (§1)
-             */
-            active_task_id?: string | null;
-            /**
-             * Active Run Id
-             * @description Current durable run, when one is attached (§1)
-             */
-            active_run_id?: string | null;
-            /** @description Bounded tag name preview plus honest total */
-            tag_preview: components["schemas"]["EntityTagPreviewView"];
-        };
-        /**
-         * ConversationTagsPage
-         * @description One bounded tag page for one canonical conversation (same-server).
-         */
-        ConversationTagsPage: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice count for this conversation
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Association rows in deterministic name order
-             */
-            items?: components["schemas"]["EntityTagView"][];
-        };
-        /**
-         * ConversationTranscriptPage
-         * @description One role-preserving sanitized message page (§3), ordered by
-         *     ``(sequence, message_id)`` with the same-filter ``total``.
-         */
-        ConversationTranscriptPage: {
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * @description History-completeness marker for the loaded range
-             * @default complete
-             */
-            history_completeness: components["schemas"]["HistoryCompleteness"];
-            /**
-             * Items
-             * @description Message rows in deterministic sequence order
-             */
-            items?: components["schemas"]["TranscriptMessage"][];
-        };
-        /**
-         * ConversationTurnSubmitRequest
-         * @description One accepted user turn (§3 ``POST`` shape): idempotency key, explicit
-         *     server scope, optional CAS revision and explicit task action.
-         */
-        ConversationTurnSubmitRequest: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (§1 rule 2)
-             */
-            server_id: string;
-            /**
-             * Client Request Id
-             * Format: uuid
-             * @description UI-authored idempotency key deduplicating retransmission
-             */
-            client_request_id: string;
-            /**
-             * Message
-             * @description Safe user message text (raw-secret exclusion happens upstream)
-             */
-            message: string;
-            /**
-             * Profile
-             * @description Model profile reference for the next allowed call
-             */
-            profile?: string | null;
-            /** @description Advisory requested phase; never permission (§5) */
-            requested_phase?: components["schemas"]["Phase"] | null;
-            /**
-             * Expected Revision
-             * @description Expected task revision for CAS; stale writes conflict
-             */
-            expected_revision?: number | null;
-            /**
-             * Task Action
-             * @description Explicit episode action: continue or start a new task (§1)
-             */
-            task_action?: ("continue" | "new_task") | null;
-            /**
-             * Objective Id
-             * @description Runtime v2 objective episode (runtime-v2.md §3.3): when set, the turn selects the v2 handler explicitly and binds this durable run to the operator-owned objective; the initiating server must be an explicit scope member at submit time
-             */
-            objective_id?: string | null;
-            /**
-             * Mode
-             * @description Prompting mode within grants (§C03 rule 5): 'ask' prompts for an approval decision on non-read effects; omitted pins 'delegated' (the mode never widens any check)
-             */
-            mode?: ("ask" | "delegated") | null;
-        };
-        /**
-         * ConversationTurnSubmitResponse
-         * @description Persisted turn identity plus run disposition (§3; brief AC 2).
-         */
-        ConversationTurnSubmitResponse: {
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Message Id
-             * Format: uuid
-             * @description Persisted message identity
-             */
-            message_id: string;
-            /**
-             * Task Id
-             * @description Task episode bound to the turn, when one exists
-             */
-            task_id: string | null;
-            /**
-             * Run Id
-             * @description Durable run bound to the turn, when one started
-             */
-            run_id: string | null;
-            /**
-             * Revision
-             * @description Current task revision after the turn was admitted
-             */
-            revision: number;
-            /** @description created, deduplicated or queued_followup */
-            disposition: components["schemas"]["TurnDisposition"];
-        };
-        /**
-         * ConversationView
-         * @description One conversation: the run view plus its recorded references.
-         *
-         *     ``service_tags`` are the immutable ``@service`` chips recorded at
-         *     submission (read back from the run's ``chat.submitted`` record).
-         *     ``title`` is the user-assigned conversation name when renamed.
-         */
-        ConversationView: {
-            /** Run Id */
-            run_id: string;
-            /** Server Id */
-            server_id: string;
-            /** Parent Run Id */
-            parent_run_id: string | null;
-            /** Depth */
-            depth: number;
-            /** Profile Revision */
-            profile_revision: number;
-            /** Prompt Revision */
-            prompt_revision: number;
-            /** Model Profile */
-            model_profile: string;
-            /** Requested Grants */
-            requested_grants: string[];
-            /** Label */
-            label: string;
-            /** State */
-            state: string | null;
-            /** Cancel Requested At */
-            cancel_requested_at: string | null;
-            /** Submitted At */
-            submitted_at: string;
-            /** Updated At */
-            updated_at: string;
-            tag_preview: components["schemas"]["EntityTagPreviewView"];
-            /** Attachments */
-            attachments?: components["schemas"]["AttachmentView"][];
-            /** Children */
-            children?: components["schemas"]["RunView"][];
-            /** Service Tags */
-            service_tags?: string[];
-            /** Session Run Id */
-            session_run_id?: string | null;
-            /** Title */
-            title?: string | null;
-        };
-        /**
-         * CriterionResult
-         * @description One requirement-result map entry (§9 ``task.propose_completion``).
-         */
-        CriterionResult: {
-            /**
-             * Criterion Id
-             * @description Acceptance criterion this result reports on
-             */
-            criterion_id: string;
-            /** @description passed, failed or unavailable; never not_checked in a verdict */
-            result: components["schemas"]["VerificationStatus-Output"];
-            /**
-             * Evidence Refs
-             * @description Evidence supporting this result
-             */
-            evidence_refs?: components["schemas"]["EvidenceRef"][];
         };
         /**
          * DecisionBody
@@ -4472,6 +2934,52 @@ export interface components {
             policy_revision: number;
         };
         /**
+         * DelegationEntry
+         * @description One delegation relation (sfc_RESEARCH §4): child linkage, bounded
+         *     goal/status and explicit allowed capabilities — the child receives a
+         *     bounded context, never ambient parent state.
+         */
+        DelegationEntry: {
+            /**
+             * @description Discriminator: this payload is a delegation entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "delegation";
+            /**
+             * Child Run Id
+             * Format: uuid
+             * @description Run identity of the delegated child execution
+             */
+            child_run_id: string;
+            /**
+             * Child Session Id
+             * @description Session identity of the child when it owns a distinct session
+             */
+            child_session_id?: string | null;
+            /**
+             * Goal
+             * @description Bounded explicit goal handed to the child
+             */
+            goal: string;
+            /** @description Current frozen lifecycle state of the child run */
+            status: components["schemas"]["SessionRunState"];
+            /**
+             * Allowed Capabilities
+             * @description Explicit narrowed capability grants of the child execution
+             */
+            allowed_capabilities: string[];
+            /**
+             * Result Summary
+             * @description Bounded immutable child result summary once the child settles
+             */
+            result_summary?: string | null;
+            /**
+             * Error Code
+             * @description Stable machine-readable delegation error code when refused
+             */
+            error_code?: string | null;
+        };
+        /**
          * DiscoveryView
          * @description The live observed inventory for one server (read-only snapshot).
          *
@@ -4493,6 +3001,26 @@ export interface components {
             }[];
             /** Lanes */
             lanes: components["schemas"]["LaneView"][];
+        };
+        /**
+         * DocumentAttachRef
+         * @description Provenance reference of a document-attach admission (sfc_INTENT §8):
+         *     the excerpt text travels as bounded untrusted user content; this ref
+         *     carries only the source identity and a safe out-of-band artifact
+         *     reference — never inline document bytes.
+         */
+        DocumentAttachRef: {
+            /**
+             * Document Id
+             * Format: uuid
+             * @description Opaque stable document identity the excerpt came from
+             */
+            document_id: string;
+            /**
+             * Artifact Ref
+             * @description Safe out-of-band reference to the stored excerpt artifact
+             */
+            artifact_ref: string;
         };
         /**
          * DocumentCreateBody
@@ -4522,7 +3050,7 @@ export interface components {
             /** Origin Revision */
             origin_revision?: string | null;
             /** @default unverified */
-            verification: components["schemas"]["mai__knowledge__documents__VerificationStatus"];
+            verification: components["schemas"]["VerificationStatus"];
         };
         /**
          * DocumentDeleteBody
@@ -4577,27 +3105,6 @@ export interface components {
          * @enum {string}
          */
         DomainOutcome: "success" | "failure" | "unknown";
-        /**
-         * DrainStatusView
-         * @description The deployment-drain inventory (§10.2; scenario RV2-DEPLOY-DRAIN).
-         *
-         *     ``legacy`` counts every facade run NOT bound in the v2-only
-         *     ``objective_runs`` table (the legacy ``agent.run`` roots and their
-         *     ``agent.delegate`` subtrees share the drain window); ``v2`` counts
-         *     the bound runs. ``ready_to_retire_legacy`` is honest derived truth:
-         *     zero unsettled legacy runs — never a guess.
-         */
-        DrainStatusView: {
-            /** @description Legacy-runtime counters (agent.run family) */
-            legacy: components["schemas"]["RuntimeDrainCounters"];
-            /** @description Runtime v2 counters (agent.run_v2 bindings) */
-            v2: components["schemas"]["RuntimeDrainCounters"];
-            /**
-             * Ready To Retire Legacy
-             * @description True when no legacy run remains unsettled
-             */
-            ready_to_retire_legacy: boolean;
-        };
         /**
          * EffectCertainty
          * @description How certain the effect evidence is (§9 ``effect_certainty``).
@@ -4702,35 +3209,6 @@ export interface components {
             evaluated: number;
             /** Outcomes */
             outcomes: components["schemas"]["EvaluateOutcomeView"][];
-        };
-        /**
-         * EvidenceKind
-         * @description What kind of sourced record an evidence reference points at (§5 facts;
-         *     §9 evidence validator checks provenance, task/target and observation type).
-         * @enum {string}
-         */
-        EvidenceKind: "message" | "observation" | "run_event" | "artifact" | "document";
-        /**
-         * EvidenceRef
-         * @description One sourced evidence reference (§5 facts; §9 evidence binding).
-         *
-         *     ``evidence_id`` points at an existing sourced record in the task/conversation
-         *     scope; existence is checked by the runtime store, never assumed here.
-         */
-        EvidenceRef: {
-            /** @description Kind of the sourced record referenced: message, observation, run_event, artifact or document */
-            kind: components["schemas"]["EvidenceKind"];
-            /**
-             * Evidence Id
-             * Format: uuid
-             * @description Canonical UUID of the referenced record (message_id, observation_id, run_id or doc_id) — the record must exist
-             */
-            evidence_id: string;
-            /**
-             * Note
-             * @description Short safe annotation for UI display
-             */
-            note?: string | null;
         };
         /**
          * ExecutionEnvironment
@@ -4945,13 +3423,6 @@ export interface components {
             start_period_seconds: number;
         };
         /**
-         * HistoryCompleteness
-         * @description History-completeness marker (§3/§4): ``partial|unavailable`` must be
-         *     shown, never papered over with fabricated turns.
-         * @enum {string}
-         */
-        HistoryCompleteness: "complete" | "partial" | "unavailable";
-        /**
          * InstalledPluginView
          * @description One installed native plugin's rich catalog view (plugins window).
          *
@@ -5018,138 +3489,6 @@ export interface components {
             items?: components["schemas"]["EntityTagView"][];
         };
         /**
-         * JournalActionApplied
-         * @description One trusted action attempt (§8.1): sanitized arguments summary,
-         *     dispatcher decision, operation reference.
-         */
-        JournalActionApplied: {
-            /**
-             * Action Id
-             * Format: uuid
-             * @description Opaque action-attempt identity
-             */
-            action_id: string;
-            /**
-             * Capability Id
-             * @description Dispatched capability identity
-             */
-            capability_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description The effect's exactly-one explicit target server
-             */
-            server_id: string;
-            /**
-             * Decision
-             * @description Dispatcher decision vocabulary value
-             */
-            decision: string;
-            /**
-             * Operation Id
-             * @description Operation reference when the effect was attempted
-             */
-            operation_id?: string | null;
-            /**
-             * Detail
-             * @description Projected sanitized argument summary when carried
-             */
-            detail?: string | null;
-        };
-        /**
-         * JournalChildLinked
-         * @description One delegation link (§8.1): parent/child linkage + bounded budget.
-         */
-        JournalChildLinked: {
-            /**
-             * Run Id
-             * Format: uuid
-             * @description Child run identity
-             */
-            run_id: string;
-            /**
-             * Parent Run Id
-             * Format: uuid
-             * @description Parent run identity
-             */
-            parent_run_id: string;
-            /**
-             * Server Ids
-             * @description The child's explicit server subset
-             */
-            server_ids: string[];
-            /** @description The child's bounded budget when set */
-            budget?: components["schemas"]["ObjectiveBudget"] | null;
-        };
-        /**
-         * JournalReceiptRecorded
-         * @description One trusted dispatcher receipt reference (§8.1).
-         */
-        JournalReceiptRecorded: {
-            /**
-             * Operation Id
-             * @description Operation identity the receipt closes
-             */
-            operation_id: string;
-            /**
-             * Outcome
-             * @description Receipt outcome vocabulary value
-             */
-            outcome: string;
-            /**
-             * Effect Class
-             * @description Effect class vocabulary value
-             */
-            effect_class: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description The effect's exactly-one explicit target server
-             */
-            server_id: string;
-        };
-        /**
-         * JournalUnknownNoted
-         * @description One unknown/unreconciled effect record (§9: unknowns stay explicit).
-         */
-        JournalUnknownNoted: {
-            /**
-             * Effect Ref
-             * @description Stable reference of the uncertain effect
-             */
-            effect_ref: string;
-            /**
-             * Server Id
-             * @description Target server when classified enough to name one
-             */
-            server_id?: string | null;
-            /**
-             * Detail
-             * @description Projected bounded detail when carried
-             */
-            detail?: string | null;
-            /**
-             * Reconciled
-             * @description True once explicit classification resolved the effect
-             * @default false
-             */
-            reconciled: boolean;
-        };
-        /**
-         * JournalVerificationRecorded
-         * @description One trusted verification record (§8.3): the evidence-bound verdict,
-         *     with the honest ``missing_evidence`` downgrade flag.
-         */
-        JournalVerificationRecorded: {
-            /** @description The evidence-bound completion verdict */
-            verdict: components["schemas"]["ObjectiveCompletionVerdict"];
-            /**
-             * Missing Evidence
-             * @description True when evidence discipline downgraded the claim
-             */
-            missing_evidence: boolean;
-        };
-        /**
          * LaneView
          * @description One lane outcome (C08 rule 6: honest absence, never empty success).
          */
@@ -5164,41 +3503,6 @@ export interface components {
             truncated: boolean;
             /** Malformed Lines */
             malformed_lines: number;
-        };
-        /**
-         * LegacyHistoryGap
-         * @description One honestly-labelled legacy gap (§4; scenario C7).
-         *
-         *     Gap metadata is derived ONLY from proved app-owned records; a gap is
-         *     shown, never papered over with a fabricated turn or a placeholder.
-         */
-        LegacyHistoryGap: {
-            /**
-             * Kind
-             * @description Which gap this row labels: a missing transcript sequence range, or proven submissions with no recoverable row
-             * @enum {string}
-             */
-            kind: "missing_range" | "unrecoverable_submissions";
-            /**
-             * From Sequence
-             * @description First missing transcript sequence (missing_range only)
-             */
-            from_sequence?: number | null;
-            /**
-             * To Sequence
-             * @description Last missing transcript sequence, inclusive (missing_range only)
-             */
-            to_sequence?: number | null;
-            /**
-             * Count
-             * @description Bounded count of the labelled records (unrecoverable_submissions only)
-             */
-            count?: number | null;
-            /**
-             * Description
-             * @description Value-free human-readable gap explanation
-             */
-            description: string;
         };
         /**
          * LifecycleSubmitBody
@@ -5324,35 +3628,6 @@ export interface components {
             /** Document Id */
             document_id?: string | null;
         };
-        /**
-         * MessageRange
-         * @description A missing transcript range shown when history is not complete (§4).
-         */
-        MessageRange: {
-            /**
-             * From Sequence
-             * @description First missing sequence
-             */
-            from_sequence: number;
-            /**
-             * To Sequence
-             * @description Last missing sequence (inclusive)
-             */
-            to_sequence: number;
-        };
-        /**
-         * MessageRole
-         * @description Frozen message roles (§1). Intake payloads cannot forge a role:
-         *     assistant/tool rows are created only through trusted producer paths.
-         * @enum {string}
-         */
-        MessageRole: "user" | "assistant" | "tool" | "system";
-        /**
-         * MessageSourceKind
-         * @description Where a message came from (§1 source kind; §4 legacy material).
-         * @enum {string}
-         */
-        MessageSourceKind: "browser" | "api" | "legacy_import" | "system";
         /**
          * ModelCapabilitiesBody
          * @description Optional endpoint capabilities the connection declares (C06 rule 1).
@@ -5631,491 +3906,6 @@ export interface components {
             sha256: string;
         };
         /**
-         * ObjectiveBudget
-         * @description Bounded objective budget caps (§3; the budget LEDGER vocabulary of
-         *     ``mai.agents.budgets`` stays the spend-tracking authority — these are
-         *     the operator-set caps stored with the objective).
-         */
-        ObjectiveBudget: {
-            /**
-             * Max Active Runs
-             * @description Aggregate active-slot cap (1..32, the ledger bound)
-             */
-            max_active_runs?: number | null;
-            /**
-             * Max Total Steps
-             * @description Aggregate durable-step cap (1..10000, the ledger bound)
-             */
-            max_total_steps?: number | null;
-            /**
-             * Max Total Tokens
-             * @description Aggregate model-token cap (1..10000000, the ledger bound)
-             */
-            max_total_tokens?: number | null;
-        };
-        /**
-         * ObjectiveCompletionVerdict
-         * @description Compact evidence-bound completion projection for one objective.
-         *
-         *     The legacy ``TaskCompletionVerdict`` discipline (runtime-v2.md §8.3):
-         *     ``verified`` can never be self-granted —
-         *     :func:`validate_objective_completion` requires passed criterion results
-         *     bound to evidence, else the structured
-         *     ``completion_missing_evidence``. ``domain_outcome`` stays honestly
-         *     ``unknown`` for arbitrary shell work; model prose never inflates
-         *     evidence.
-         */
-        ObjectiveCompletionVerdict: {
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Opaque stable objective identity this verdict closes
-             */
-            objective_id: string;
-            /**
-             * Base Revision
-             * @description Objective revision this verdict was produced against
-             */
-            base_revision: number;
-            /**
-             * Idempotency Key
-             * Format: uuid
-             * @description Caller key so retransmitted verdicts deduplicate
-             */
-            idempotency_key: string;
-            /** @description Domain outcome; verified requires evidence-bound coverage */
-            task_outcome: components["schemas"]["TaskOutcome"];
-            /** @description Technical status of the closing attempt */
-            execution_status: components["schemas"]["ExecutionStatus"];
-            /** @description Honest domain outcome; unknown stays unknown for shell work */
-            domain_outcome: components["schemas"]["DomainOutcome"];
-            /** @description Certainty of the observed effects */
-            effect_certainty: components["schemas"]["EffectCertainty"];
-            /**
-             * Error Code
-             * @description Stable machine-readable error code, when failed
-             */
-            error_code?: string | null;
-            /**
-             * Retry Hint
-             * @description Advice only; policy decides what may execute
-             */
-            retry_hint?: string | null;
-            /**
-             * Evidence Refs
-             * @description Aggregate evidence supporting the verdict
-             */
-            evidence_refs?: components["schemas"]["EvidenceRef"][];
-            /**
-             * Criterion Results
-             * @description Requirement-result map bound to evidence
-             */
-            criterion_results?: components["schemas"]["CriterionResult"][];
-        };
-        /**
-         * ObjectiveCreateBody
-         * @description One explicit operator objective episode (§3.1; AC1).
-         *
-         *     ``original_request``/``constraints`` persist VERBATIM (projected for
-         *     secret safety, never model-reworded); ``scope_server_ids`` is the
-         *     operator-owned initial authorized set and must contain the
-         *     initiating server. ``client_request_id`` makes the create idempotent:
-         *     same key + same projected content returns the SAME objective;
-         *     changed content is the structured conflict.
-         */
-        ObjectiveCreateBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Initiating (home) server identity
-             */
-            server_id: string;
-            /**
-             * Original Request
-             * @description Verbatim operator request (provenance-carrying)
-             */
-            original_request: string;
-            /**
-             * Constraints
-             * @description Verbatim operator constraints (bounded list)
-             */
-            constraints?: string[];
-            /**
-             * Scope Server Ids
-             * @description The explicit operator-owned initial server scope
-             */
-            scope_server_ids: string[];
-            /**
-             * Title
-             * @description Operator-assigned title when set
-             */
-            title?: string | null;
-            /** @description Bounded budget caps when set */
-            budget?: components["schemas"]["ObjectiveBudget"] | null;
-            /**
-             * Client Request Id
-             * @description Idempotency key deduplicating retransmitted creates
-             */
-            client_request_id?: string | null;
-        };
-        /**
-         * ObjectiveDetail
-         * @description One scope-checked objective read (§3 store truth).
-         */
-        ObjectiveDetail: {
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Opaque stable objective identity
-             */
-            objective_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Initiating (home) server identity
-             */
-            server_id: string;
-            /**
-             * Title
-             * @description Operator-assigned title when set
-             */
-            title?: string | null;
-            /** @description Current objective status */
-            status: components["schemas"]["ObjectiveStatus"];
-            /**
-             * Revision
-             * @description Current CAS revision
-             */
-            revision: number;
-            /**
-             * Created At
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: unknown;
-            /**
-             * Updated At
-             * @description RFC3339 UTC last-update timestamp
-             */
-            updated_at: unknown;
-            /**
-             * Original Request
-             * @description Verbatim operator request (projected; provenance-carrying)
-             */
-            original_request: string;
-            /**
-             * Constraints
-             * @description Verbatim operator constraints (never model-reworded)
-             */
-            constraints: string[];
-            /** @description Bounded budget caps when set */
-            budget?: components["schemas"]["ObjectiveBudget"] | null;
-            /**
-             * Scope
-             * @description The explicit operator-owned server scope
-             */
-            scope: components["schemas"]["ObjectiveScopeServer"][];
-        };
-        /**
-         * ObjectiveEvent
-         * @description One canonical ``objective.*`` ledger row (C05 rule 4 envelope shape
-         *     at objective scope, plus the §4 actor-kind provenance field).
-         */
-        ObjectiveEvent: {
-            /**
-             * Event Id
-             * Format: uuid
-             * @description Opaque stable event identity
-             */
-            event_id: string;
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Owning objective identity
-             */
-            objective_id: string;
-            /**
-             * Sequence
-             * @description Objective-local monotonic sequence number
-             */
-            sequence: number;
-            /**
-             * Ts
-             * @description RFC3339 UTC event timestamp
-             */
-            ts: unknown;
-            /**
-             * Type
-             * @description Dotted-slug event type inside the objective.* family
-             */
-            type: string;
-            /** @description Actor provenance (§4) */
-            actor_kind: components["schemas"]["ActorKind"];
-            /**
-             * V
-             * @description Payload schema version
-             */
-            v: number;
-            /**
-             * Data
-             * @description Value-free projected payload (never secrets, never prose)
-             */
-            data: {
-                [key: string]: unknown;
-            };
-            /**
-             * Run Id
-             * @description Producing run when the event originated inside a run
-             */
-            run_id?: string | null;
-        };
-        /**
-         * ObjectiveEventPage
-         * @description One deterministic ledger page ordered by ``sequence`` with the
-         *     same-filter ``total`` and derived ``has_more`` (§5.2).
-         */
-        ObjectiveEventPage: {
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Owning objective identity
-             */
-            objective_id: string;
-            /**
-             * Items
-             * @description Ledger rows in deterministic sequence order
-             */
-            items?: components["schemas"]["ObjectiveEvent"][];
-        };
-        /**
-         * ObjectiveListPage
-         * @description One deterministic objective list page (safe summaries only).
-         */
-        ObjectiveListPage: {
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Objective summaries in deterministic order
-             */
-            items?: components["schemas"]["ObjectiveSummary"][];
-        };
-        /**
-         * ObjectiveRunLink
-         * @description One run ↔ objective binding (§3.3; the v2-handler CHECK is the
-         *     durable 'no in-flight legacy run becomes v2' guard).
-         */
-        ObjectiveRunLink: {
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Owning objective identity
-             */
-            objective_id: string;
-            /**
-             * Run Id
-             * Format: uuid
-             * @description Bound durable run identity
-             */
-            run_id: string;
-            /**
-             * Parent Run Id
-             * @description Parent delegated run when this binding is a child
-             */
-            parent_run_id?: string | null;
-            /**
-             * Initiating Server Id
-             * Format: uuid
-             * @description The run's one initiating server (a scope member at submit)
-             */
-            initiating_server_id: string;
-            /**
-             * Handler
-             * @description The v2 run handler identity (legacy handlers are rejected)
-             * @constant
-             */
-            handler: "agent.run_v2";
-            /** @description Actor provenance of the binding */
-            actor_kind: components["schemas"]["ActorKind"];
-            /**
-             * Created At
-             * @description RFC3339 UTC binding timestamp
-             */
-            created_at: unknown;
-        };
-        /**
-         * ObjectiveRunPage
-         * @description One deterministic objective-run linkage page.
-         */
-        ObjectiveRunPage: {
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Owning objective identity
-             */
-            objective_id: string;
-            /**
-             * Items
-             * @description Run bindings in deterministic order
-             */
-            items?: components["schemas"]["ObjectiveRunLink"][];
-        };
-        /**
-         * ObjectiveScopeBody
-         * @description One operator scope edit under the expected-revision CAS (§3.2; AC2).
-         *
-         *     The route is the ONLY scope-change authority surface: it pins
-         *     ``actor_kind=operator``; agents and children have no path here.
-         *     ``add_server_ids``/``remove_server_ids`` are the explicit delta; the
-         *     home server is immortal and the result stays non-empty and bounded
-         *     (the ONE store's ``validate_scope_change`` decides, fail closed).
-         */
-        ObjectiveScopeBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Requesting in-scope server identity (C8 scope check)
-             */
-            server_id: string;
-            /**
-             * Expected Revision
-             * @description Expected objective revision; a stale value conflicts
-             */
-            expected_revision: number;
-            /**
-             * Add Server Ids
-             * @description Servers the operator admits into the scope
-             */
-            add_server_ids?: string[];
-            /**
-             * Remove Server Ids
-             * @description Servers the operator removes from the scope
-             */
-            remove_server_ids?: string[];
-        };
-        /**
-         * ObjectiveScopeServer
-         * @description One explicit in-scope server (§3.2; operator-owned set member).
-         */
-        ObjectiveScopeServer: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description In-scope server identity
-             */
-            server_id: string;
-            /** @description Actor provenance of the scope admission */
-            added_by_actor_kind: components["schemas"]["ActorKind"];
-            /**
-             * Added At
-             * @description RFC3339 UTC admission timestamp
-             */
-            added_at: unknown;
-        };
-        /**
-         * ObjectiveStatus
-         * @description Objective episode status (§3; terminal states are frozen).
-         * @enum {string}
-         */
-        ObjectiveStatus: "active" | "completed" | "failed" | "cancelled";
-        /**
-         * ObjectiveSummary
-         * @description One list-page objective row (safe metadata; no request text).
-         */
-        ObjectiveSummary: {
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Opaque stable objective identity
-             */
-            objective_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Initiating (home) server identity
-             */
-            server_id: string;
-            /**
-             * Title
-             * @description Operator-assigned title when set
-             */
-            title?: string | null;
-            /** @description Current objective status */
-            status: components["schemas"]["ObjectiveStatus"];
-            /**
-             * Revision
-             * @description Current CAS revision
-             */
-            revision: number;
-            /**
-             * Created At
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: unknown;
-            /**
-             * Updated At
-             * @description RFC3339 UTC last-update timestamp
-             */
-            updated_at: unknown;
-        };
-        /**
          * ObservationPage
          * @description One bounded observation page for one explicitly named server.
          */
@@ -6335,18 +4125,6 @@ export interface components {
             /** Password */
             password: string;
         };
-        /**
-         * PatchOp
-         * @description Bounded patch operation kinds (§5 "add/update/supersede operations").
-         * @enum {string}
-         */
-        PatchOp: "add" | "update" | "supersede";
-        /**
-         * Phase
-         * @description Application task phases (act_CONTRACTS §5/§6): advisory, never permission.
-         * @enum {string}
-         */
-        Phase: "plan" | "inspect" | "act";
         /**
          * PlanBody
          * @description Plan preview body (strict): identity + recipe document + target.
@@ -6734,6 +4512,37 @@ export interface components {
             stale: boolean;
         };
         /**
+         * ProviderReasoningArtifact
+         * @description Explicit safe provider reasoning artifact (sfc_INTENT clarification 5:
+         *     raw unvalidated chain-of-thought is never authoritative history; only
+         *     provider-supported summary/signature/opaque references are carried, and
+         *     only when actually required and reviewed).
+         */
+        ProviderReasoningArtifact: {
+            /**
+             * Provider
+             * @description Provider/model family the artifact is compatible with
+             */
+            provider: string;
+            /**
+             * Artifact Kind
+             * @description Artifact class: bounded summary, provider signature or opaque reference token
+             * @enum {string}
+             */
+            artifact_kind: "summary" | "signature" | "opaque_ref";
+            /**
+             * Content
+             * @description Bounded artifact payload or reference token
+             */
+            content: string;
+            /**
+             * Redacted
+             * @description True when content was deliberately redacted (no fidelity claim)
+             * @default false
+             */
+            redacted: boolean;
+        };
+        /**
          * ReconcileBody
          * @description Reindex-reconcile body: run the durable outbox of one scope.
          */
@@ -6865,36 +4674,6 @@ export interface components {
             expected_revision: number;
         };
         /**
-         * RootBudgetBody
-         * @description The frozen aggregate delegation-budget document (C05 rule 7).
-         *
-         *     The strict ``job_runs.root_budget`` vocabulary (the ONE producer is
-         *     :func:`mai.agents.budgets.parse_root_budget`; these bounds mirror
-         *     it for a value-free 422): every cap NARROWS a module bound —
-         *     ``max_depth``/``max_children`` the delegation module's nesting and
-         *     fan-out bounds, ``max_active``/``max_steps``/``max_total_tokens``
-         *     the ledger's tree-aggregate bounds. Omitted (the default ``None``)
-         *     is the explicit unbudgeted root: the module bounds alone apply and
-         *     no ``agent.budget_*`` events are written (backward compatible).
-         */
-        RootBudgetBody: {
-            /**
-             * V
-             * @default 1
-             */
-            v: number;
-            /** Max Depth */
-            max_depth: number;
-            /** Max Children */
-            max_children: number;
-            /** Max Active */
-            max_active: number;
-            /** Max Steps */
-            max_steps: number;
-            /** Max Total Tokens */
-            max_total_tokens: number;
-        };
-        /**
          * RunCreated
          * @description Submit outcome: the run view plus the dedup verdict (C05 rule 5).
          */
@@ -6980,6 +4759,30 @@ export interface components {
             payload: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * RunStateEntry
+         * @description One deterministic run-state transition (sfc_RESEARCH §2: execution
+         *     status and safe reason linked to a run — never model prose).
+         */
+        RunStateEntry: {
+            /**
+             * @description Discriminator: this payload is a run-state transition (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "run_state";
+            /** @description New frozen run lifecycle state after this transition */
+            state: components["schemas"]["SessionRunState"];
+            /**
+             * Reason Code
+             * @description Stable machine-readable transition reason code when present
+             */
+            reason_code?: string | null;
+            /**
+             * Detail
+             * @description Value-free bounded transition detail for operators
+             */
+            detail?: string | null;
         };
         /**
          * RunSubmitBody
@@ -7072,9 +4875,18 @@ export interface components {
         };
         /**
          * RunbookExecutionView
-         * @description One queued background runbook job (identity + replayed state).
+         * @description One queued background runbook job (session + run identities).
+         *
+         *     The runbook executes inside its own fresh non-interactive session
+         *     (``source="runbook"``); ``session_id`` opens that session's bounded
+         *     history and ``run_id`` is the child run executing the procedure.
          */
         RunbookExecutionView: {
+            /**
+             * Session Id
+             * Format: uuid
+             */
+            session_id: string;
             /**
              * Run Id
              * Format: uuid
@@ -7094,6 +4906,24 @@ export interface components {
             action: string;
             /** State */
             state: string;
+        };
+        /**
+         * RunbookRef
+         * @description Provenance reference of a runbook-session admission (sfc_INTENT §7):
+         *     runbook execution is a fresh non-interactive session carrying immutable
+         *     service/runbook references.
+         */
+        RunbookRef: {
+            /**
+             * Service Id
+             * @description Opaque adopted-service identity owning the runbook
+             */
+            service_id: string;
+            /**
+             * Runbook Id
+             * @description Stable runbook identity inside the adopted service
+             */
+            runbook_id: string;
         };
         /**
          * RunbookUpsertBody
@@ -7147,33 +4977,6 @@ export interface components {
              * @default
              */
             custom_instructions: string;
-        };
-        /**
-         * RuntimeDrainCounters
-         * @description One runtime family's drain inventory (§10.2).
-         */
-        RuntimeDrainCounters: {
-            /**
-             * Runtime
-             * @description The runtime family the counters describe
-             * @enum {string}
-             */
-            runtime: "legacy" | "v2";
-            /**
-             * Handler
-             * @description The family's durable handler identity (value-free label)
-             */
-            handler: string;
-            /**
-             * Unsettled
-             * @description Runs of this family whose replayed state is non-terminal
-             */
-            unsettled: number;
-            /**
-             * Total
-             * @description Runs of this family recorded in the facade
-             */
-            total: number;
         };
         /**
          * ScheduleCreateBody
@@ -7338,6 +5141,542 @@ export interface components {
             verify: string;
         };
         /**
+         * SessionControlRequest
+         * @description One deterministic control request (sfc_RESEARCH §6: steer/pause/
+         *     cancel/approve/deny/reconcile acknowledge real state; no planner prose,
+         *     no authority fields).
+         */
+        SessionControlRequest: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the control action targets
+             */
+            session_id: string;
+            /** @description Deterministic control action requested */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of this control request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the action targets, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when deciding an approval action
+             */
+            approval_id?: string | null;
+            /**
+             * Note
+             * @description Value-free bounded operator note for the action
+             */
+            note?: string | null;
+        };
+        /**
+         * SessionControlResponse
+         * @description Durable control acknowledgement (sfc_RESEARCH failure behavior: stale
+         *     or conflicting control returns the structured current state, never a
+         *     fabricated success).
+         */
+        SessionControlResponse: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the control action targeted
+             */
+            session_id: string;
+            /** @description Control action that was processed */
+            action: components["schemas"]["ControlActionKind"];
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key echoed from the request
+             */
+            client_request_id: string;
+            /**
+             * Target Run Id
+             * @description Run the action targeted, when scoped to one run
+             */
+            target_run_id?: string | null;
+            /**
+             * Accepted
+             * @description True when the control request was durably accepted
+             */
+            accepted: boolean;
+            /** @description Observed frozen run state after processing, when known */
+            run_state?: components["schemas"]["SessionRunState"] | null;
+        };
+        /**
+         * SessionCreateRequest
+         * @description One idempotent session creation request (sfc_RESEARCH §1: admitting a
+         *     turn allocates a run against the session; creation carries no authority
+         *     field — ``extra="forbid"`` makes :data:`FORBIDDEN_AUTHORITY_FIELDS`
+         *     unrepresentable).
+         */
+        SessionCreateRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope the new session is pinned to
+             */
+            server_id: string;
+            /**
+             * @description How the session came into existence
+             * @default interactive
+             */
+            source: components["schemas"]["SessionSourceKind"];
+            /**
+             * Title
+             * @description Optional user-assigned session title
+             */
+            title?: string | null;
+            /**
+             * Model Profile
+             * @description Preferred model profile identity for the session runs
+             */
+            model_profile?: string | null;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key; retries return the same admission
+             */
+            client_request_id: string;
+        };
+        /**
+         * SessionDetail
+         * @description Safe singleton session header: summary metadata plus bounded history
+         *     pointers (no transcript content).
+         */
+        SessionDetail: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Stable session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this session
+             */
+            server_id: string;
+            /** @description How the session came into existence */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Coarse session status projected from its runs */
+            status: components["schemas"]["SessionStatus"];
+            /**
+             * Title
+             * @description User-assigned session title, when set
+             */
+            title?: string | null;
+            /**
+             * Active Run Id
+             * @description Subordinate run currently executing, when one exists
+             */
+            active_run_id?: string | null;
+            /** @description Bounded tag preview (first ≤3 names + honest total); None only for a session with zero tags (the drawer renders no chips instead of fabricating an empty preview) */
+            tag_preview?: components["schemas"]["EntityTagPreviewView"] | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC creation timestamp of the session
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description UTC timestamp of the latest committed change
+             */
+            updated_at: string;
+            /**
+             * Latest Seq
+             * @description Highest committed entry sequence, when any history exists
+             */
+            latest_seq?: number | null;
+            /**
+             * Total Entries
+             * @description Total committed domain entries in the session
+             * @default 0
+             */
+            total_entries: number;
+            /**
+             * Compaction Count
+             * @description Number of compaction generations recorded for the session
+             * @default 0
+             */
+            compaction_count: number;
+        };
+        /**
+         * SessionEntryView
+         * @description One committed domain entry as projected to every consumer (sfc_PLAN
+         *     D01): versioned envelope identity plus the discriminated payload. The
+         *     trusted session writer is the sole producer; clients never assign
+         *     ``seq`` or entry identity.
+         */
+        SessionEntryView: {
+            /**
+             * Schema Version
+             * @description Contract schema version of this entry envelope
+             * @default 1
+             */
+            schema_version: number;
+            /**
+             * Entry Id
+             * Format: uuid
+             * @description Stable domain-entry identity inside its session
+             */
+            entry_id: string;
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Seq
+             * @description Session-local monotonic sequence number of this entry
+             */
+            seq: number;
+            /**
+             * Run Id
+             * @description Subordinate run that produced this entry, when run-scoped
+             */
+            run_id?: string | null;
+            /**
+             * Durable Source Id
+             * @description Stable producer source id backing idempotent re-appends
+             */
+            durable_source_id: string;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC commit timestamp of this entry
+             */
+            created_at: string;
+            /**
+             * Payload
+             * @description Discriminated domain payload (union discriminated on `kind`)
+             */
+            payload: components["schemas"]["UserMessageEntry"] | components["schemas"]["AssistantMessageEntry"] | components["schemas"]["ToolResultEntry"] | components["schemas"]["RunStateEntry"] | components["schemas"]["DelegationEntry"] | components["schemas"]["ControlEntry"] | components["schemas"]["CompactionEntry"];
+        };
+        /**
+         * SessionHistoryPage
+         * @description One bounded, byte-capped history page (sfc_PLAN D01 acceptance 3):
+         *     chronological items with honest continuation metadata — count bounds,
+         *     byte bounds and cursor consistency all fail closed.
+         */
+        SessionHistoryPage: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Items
+             * @description Committed entries in strict chronological sequence order
+             */
+            items?: components["schemas"]["SessionEntryView"][];
+            /**
+             * Limit
+             * @description Page size used for this slice (1..50)
+             */
+            limit: number;
+            /**
+             * Total
+             * @description Pre-slice matching count of the whole session history
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when newer committed entries exist above this page
+             */
+            has_more: boolean;
+            /**
+             * Has Older
+             * @description True when older committed entries exist below this page
+             */
+            has_older: boolean;
+            /**
+             * Oldest Seq
+             * @description Lowest sequence number carried by this page, when non-empty
+             */
+            oldest_seq?: number | null;
+            /**
+             * Latest Seq
+             * @description Highest sequence number carried by this page, when non-empty
+             */
+            latest_seq?: number | null;
+            /**
+             * Next Before Seq
+             * @description Exclusive keyset cursor for the next older page, when ``has_older``
+             */
+            next_before_seq?: number | null;
+            /**
+             * Byte Size
+             * @description Declared serialized size of ``items`` in bytes
+             */
+            byte_size: number;
+            /**
+             * Truncated By Bytes
+             * @description True when the byte budget cut items before the count limit
+             * @default false
+             */
+            truncated_by_bytes: boolean;
+        };
+        /**
+         * SessionListPage
+         * @description Bounded session list page (C01 rule 5; AGENTS.md mandatory-pagination
+         *     invariant) with the canonical ``limit|offset|total|has_more`` envelope.
+         */
+        SessionListPage: {
+            /**
+             * Items
+             * @description Session summary rows in deterministic order
+             */
+            items?: components["schemas"]["SessionSummary"][];
+            /**
+             * Limit
+             * @description Page size used for this slice (1..100)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice matching count of the whole collection
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+        };
+        /**
+         * SessionRenameRequest
+         * @description One durable session rename (D07-fix1 F2): the ONLY mutable session
+         *     header field; scope is the query's explicit ``server_id``.
+         */
+        SessionRenameRequest: {
+            /**
+             * Title
+             * @description New user-assigned session title (trimmed, 1..120)
+             */
+            title: string;
+        };
+        /**
+         * SessionRunState
+         * @description Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;
+         *     ``outcome_unknown`` is honest after a crash — never silently terminal).
+         * @enum {string}
+         */
+        SessionRunState: "queued" | "running" | "waiting_approval" | "waiting_child" | "succeeded" | "failed" | "cancelled" | "outcome_unknown";
+        /**
+         * SessionSourceKind
+         * @description How a session came into existence (sfc_INTENT §7 runbook/document
+         *     decisions): interactive chat, runbook execution, document attach, API.
+         * @enum {string}
+         */
+        SessionSourceKind: "interactive" | "runbook" | "document_attach" | "api";
+        /**
+         * SessionStatus
+         * @description Coarse session-level status the browser/operator sees (derived by the
+         *     trusted projection from run states; never written by clients).
+         * @enum {string}
+         */
+        SessionStatus: "idle" | "running" | "waiting_approval" | "failed" | "cancelled";
+        /**
+         * SessionSummary
+         * @description Safe metadata row of one session (list page item): identity, scope,
+         *     source, coarse status — never transcript content.
+         */
+        SessionSummary: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Stable session identity (the only conversation root)
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning this session
+             */
+            server_id: string;
+            /** @description How the session came into existence */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Coarse session status projected from its runs */
+            status: components["schemas"]["SessionStatus"];
+            /**
+             * Title
+             * @description User-assigned session title, when set
+             */
+            title?: string | null;
+            /**
+             * Active Run Id
+             * @description Subordinate run currently executing, when one exists
+             */
+            active_run_id?: string | null;
+            /** @description Bounded tag preview (first ≤3 names + honest total); None only for a session with zero tags (the drawer renders no chips instead of fabricating an empty preview) */
+            tag_preview?: components["schemas"]["EntityTagPreviewView"] | null;
+            /**
+             * Created At
+             * Format: date-time
+             * @description UTC creation timestamp of the session
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             * @description UTC timestamp of the latest committed change
+             */
+            updated_at: string;
+        };
+        /**
+         * SessionTagAssignRequest
+         * @description One idempotent session-tag assignment (D07-fix1 F2).
+         */
+        SessionTagAssignRequest: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope the session is pinned to (C01 rule 2)
+             */
+            server_id: string;
+            /**
+             * Tag Id
+             * Format: uuid
+             * @description Catalog tag identity to attach
+             */
+            tag_id: string;
+            /**
+             * Tag Name
+             * @description Optional create-if-missing catalog name (reserved names refuse; the canonical lower(name) uniqueness applies)
+             */
+            tag_name?: string | null;
+        };
+        /**
+         * SessionTagsPage
+         * @description One bounded tag page for one agent session (D07-fix1 F2; same-server
+         *     scope; the ConversationTagsPage envelope shape with the session ids).
+         */
+        SessionTagsPage: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Owning session identity
+             */
+            session_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Server scope pinning the session
+             */
+            server_id: string;
+            /**
+             * Limit
+             * @description Page size used for this slice (1..100)
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Slice start within the collection
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Pre-slice count for this session under the same filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when another page exists after this slice
+             */
+            has_more: boolean;
+            /**
+             * Items
+             * @description Association rows in deterministic assignment order
+             */
+            items?: components["schemas"]["EntityTagView"][];
+        };
+        /**
+         * SessionTurnSubmitRequest
+         * @description One accepted user turn submission (sfc_RESEARCH §1: every accepted
+         *     turn allocates a new run id and appends exactly one user entry before
+         *     model work; same idempotency key + same content deduplicates).
+         */
+        SessionTurnSubmitRequest: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the turn is admitted into
+             */
+            session_id: string;
+            /**
+             * Text
+             * @description Bounded user message text (untrusted content, never authority)
+             */
+            text: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of this submission
+             */
+            client_request_id: string;
+            /**
+             * Model Profile
+             * @description Preferred model profile identity for the new run
+             */
+            model_profile?: string | null;
+        };
+        /**
+         * SessionTurnSubmitResponse
+         * @description Durable admission result (sfc_RESEARCH §6: the server ack reports the
+         *     durable admission, never optimistic success).
+         */
+        SessionTurnSubmitResponse: {
+            /**
+             * Session Id
+             * Format: uuid
+             * @description Session the turn was admitted into
+             */
+            session_id: string;
+            /**
+             * Run Id
+             * Format: uuid
+             * @description Subordinate run identity allocated for the turn
+             */
+            run_id: string;
+            /**
+             * Entry Id
+             * Format: uuid
+             * @description Committed user entry identity of the admitted turn
+             */
+            entry_id: string;
+            /**
+             * Seq
+             * @description Session-local sequence number of the committed user entry
+             */
+            seq: number;
+            /** @description Frozen lifecycle state of the newly allocated run */
+            run_state: components["schemas"]["SessionRunState"];
+            /**
+             * Deduplicated
+             * @description True when the same idempotency key replayed an earlier admission
+             * @default false
+             */
+            deduplicated: boolean;
+        };
+        /**
          * SkillCatalogView
          * @description The skill namespace: loadable summaries plus value-free rejections.
          */
@@ -7448,14 +5787,6 @@ export interface components {
             container: components["schemas"]["ContainerView"];
         };
         /**
-         * SteerAction
-         * @description Deterministic control actions (§3): pause/cancel never wait for a
-         *     planner; natural-language steering is interpreted at the next safe
-         *     boundary.
-         * @enum {string}
-         */
-        SteerAction: "steer" | "pause" | "cancel";
-        /**
          * StepBody
          * @description One ordered capability step of a run intent (C05 rule 3).
          *
@@ -7474,61 +5805,6 @@ export interface components {
             /** Resource */
             resource?: string | null;
         };
-        /**
-         * StepClassificationBody
-         * @description One operator classification of one open effect (§9; AC4).
-         *
-         *     The frozen vocabulary: ``confirm_applied`` (the effect IS on the
-         *     target), ``confirm_not_applied`` (it is NOT) or ``cancel`` (stop
-         *     without executing). Classification NEVER re-executes anything and
-         *     never fabricates a receipt — it closes one ``outcome_unknown`` row
-         *     from the host truth the operator attests.
-         */
-        StepClassificationBody: {
-            /**
-             * Seq
-             * @description The durable step row's sequence
-             */
-            seq: number;
-            /**
-             * Verdict
-             * @description The operator's classification of the uncertain effect
-             * @enum {string}
-             */
-            verdict: "confirm_applied" | "confirm_not_applied" | "cancel";
-        };
-        /**
-         * StepResolutionView
-         * @description One classification outcome exactly as the recovery owner landed it.
-         */
-        StepResolutionView: {
-            /**
-             * Seq
-             * @description The classified step row's sequence
-             */
-            seq: number;
-            /**
-             * State
-             * @description The durable step state AFTER the classification
-             */
-            state: string;
-            /**
-             * Verdict
-             * @description The applied classification vocabulary value
-             */
-            verdict: string;
-            /**
-             * Wake Sent
-             * @description Whether the parked run was woken (best effort by contract)
-             */
-            wake_sent: boolean;
-        };
-        /**
-         * StepStatus
-         * @description Frozen todo statuses (act_CONTRACTS §7; additions need reconciliation).
-         * @enum {string}
-         */
-        StepStatus: "pending" | "in_progress" | "blocked" | "executed" | "skipped";
         /**
          * StepView
          * @description One durable step row (intent + safe receipt; C04 rule 4).
@@ -7668,717 +5944,6 @@ export interface components {
             updated_at: string;
         };
         /**
-         * TaskConstraintView
-         * @description One constraint row with its source anchors (§5/§6).
-         *
-         *     ``origin`` distinguishes user requirements from model inferences —
-         *     the authority fact that keeps a model correction from ever erasing a
-         *     user prohibition (P4).
-         */
-        TaskConstraintView: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Constraint Id
-             * @description Stable slug of the constraint
-             */
-            constraint_id: string;
-            /**
-             * Category
-             * @description Constraint category slug, e.g. safety
-             */
-            category: string;
-            /**
-             * Statement
-             * @description Safe constraint statement; no secret material
-             */
-            statement: string;
-            /** @description Whether the user stated this or the model inferred it */
-            origin: components["schemas"]["ConstraintOrigin"];
-            /**
-             * Source Message Refs
-             * @description User messages this constraint is anchored to
-             */
-            source_message_refs: string[];
-            /**
-             * Position
-             * @description Deterministic list position
-             */
-            position: number;
-            /**
-             * Superseded At
-             * @description RFC3339 UTC supersede timestamp for recorded history, else null
-             */
-            superseded_at: string | null;
-            /**
-             * Superseded By
-             * @description Constraint ID that replaced this row, else null (P3 history)
-             */
-            superseded_by: string | null;
-            /**
-             * Created At
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: string;
-            /**
-             * Updated At
-             * @description RFC3339 UTC last-revision timestamp
-             */
-            updated_at: string;
-        };
-        /**
-         * TaskConstraintsPage
-         * @description One bounded constraint page (§8 ``GET constraints``; AGENTS.md §1).
-         */
-        TaskConstraintsPage: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Constraint rows in deterministic (position, id) order
-             */
-            items?: components["schemas"]["TaskConstraintView"][];
-        };
-        /**
-         * TaskCorrectionBody
-         * @description One authenticated user correction/proposal (§8 ``POST revisions``).
-         *
-         *     The body embeds the FROZEN ratified patch model — the exact same
-         *     validated delta the model tools submit — so CAS (``base_revision``),
-         *     idempotency (``idempotency_key``) and the mandatory source message
-         *     (``source_message_id``) are contract-owned, not re-implemented here.
-         *     The route always stores ``author="user"``.
-         */
-        TaskCorrectionBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
-             */
-            server_id: string;
-            /** @description The bounded plan delta (user correction/proposal) with CAS base_revision, idempotency key and source message reference */
-            patch: components["schemas"]["TaskPlanPatch"];
-            /**
-             * Constraint Proposals
-             * @description Bounded constraint add/supersede proposals anchored to user messages
-             */
-            constraint_proposals?: components["schemas"]["ConstraintProposal"][];
-        };
-        /**
-         * TaskCounts
-         * @description List counts for the compact task view (§8: no unbounded arrays).
-         */
-        TaskCounts: {
-            /**
-             * Steps Total
-             * @description Total plan steps on the task
-             */
-            steps_total: number;
-            /**
-             * Steps Executed
-             * @description Steps in executed status
-             */
-            steps_executed: number;
-            /**
-             * Constraints Total
-             * @description Active constraints on the task
-             */
-            constraints_total: number;
-            /**
-             * Evidence Total
-             * @description Evidence records on the task
-             */
-            evidence_total: number;
-            /**
-             * Criteria Total
-             * @description Acceptance criteria on the task
-             */
-            criteria_total: number;
-            /**
-             * Criteria Verified
-             * @description Criteria currently passed
-             */
-            criteria_verified: number;
-        };
-        /**
-         * TaskDecisionBody
-         * @description One explicit user decision (§8 ``POST decisions``).
-         *
-         *     Phase selection is ADVISORY (never permission, §6) and pause/cancel
-         *     move only the domain outcome layer through its frozen transition map.
-         *     A decision NEVER applies a plan delta (that is the revisions route)
-         *     and NEVER authorizes or terminates a pending operation (that is the
-         *     C03 approvals surface; §6: metadata decisions cannot change grants).
-         */
-        TaskDecisionBody: {
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden
-             */
-            server_id: string;
-            /**
-             * Expected Revision
-             * @description The named revision this decision reviewed; a stale value is the structured 409 revision_conflict (C6)
-             */
-            expected_revision: number;
-            /**
-             * Client Request Id
-             * Format: uuid
-             * @description Caller key so retransmitted decisions deduplicate (§1)
-             */
-            client_request_id: string;
-            /** @description The user's chosen next phase (plan|inspect|act); advisory only, never permission (§6) */
-            requested_phase?: components["schemas"]["Phase"] | null;
-            /**
-             * Task Action
-             * @description Explicit deterministic control: pause parks the open episode as needs_input, cancel closes it (terminal)
-             */
-            task_action?: ("pause" | "cancel") | null;
-        };
-        /**
-         * TaskEvidencePage
-         * @description One bounded evidence page (§8 ``GET evidence``; AGENTS.md §1).
-         */
-        TaskEvidencePage: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Evidence rows in deterministic (created_at, id) order
-             */
-            items?: components["schemas"]["TaskEvidenceView"][];
-        };
-        /**
-         * TaskEvidenceView
-         * @description One evidence-registry row (§9 provenance identities only).
-         *
-         *     The registry stores WHICH sourced record backs the task (kind + ID +
-         *     optional safe note), never a copy of the referenced content.
-         */
-        TaskEvidenceView: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Evidence Id
-             * Format: uuid
-             * @description Opaque UUID of the referenced record
-             */
-            evidence_id: string;
-            /** @description Kind of sourced record referenced */
-            kind: components["schemas"]["EvidenceKind"];
-            /**
-             * Note
-             * @description Short safe annotation for UI display, when recorded
-             */
-            note: string | null;
-            /**
-             * Origin Step Id
-             * @description Step that first registered this evidence, when known
-             */
-            origin_step_id: string | null;
-            /**
-             * Created At
-             * @description RFC3339 UTC registration timestamp
-             */
-            created_at: string;
-        };
-        /**
-         * TaskMutationOutcome
-         * @description The shared outcome of one accepted/replayed task mutation (§1).
-         *
-         *     The fresh header view (revision, phase, status, counts), the
-         *     append-only revision row this mutation produced (source-linked,
-         *     authority-recorded) and the honest idempotency disposition
-         *     (``created`` | ``deduplicated``).
-         */
-        TaskMutationOutcome: {
-            /** @description The fresh compact header view after the mutation (§8) */
-            task: components["schemas"]["TaskView"];
-            /** @description The revision-ledger row this mutation produced/replayed */
-            revision: components["schemas"]["TaskRevisionView"];
-            /**
-             * Disposition
-             * @description created for a first application, deduplicated for an idempotent replay (C4)
-             * @enum {string}
-             */
-            disposition: "created" | "deduplicated";
-        };
-        /**
-         * TaskOutcome
-         * @description Application task outcome (act_CONTRACTS §9); technical RunState frozen
-         *     at C05 rule 2 is untouched — this is the domain layer above it.
-         * @enum {string}
-         */
-        TaskOutcome: "in_progress" | "needs_input" | "partially_verified" | "verified" | "failed" | "cancelled";
-        /**
-         * TaskPlanPatch
-         * @description Bounded plan delta (§5 ``todo_patch``, §7 ``task.propose_update``).
-         *
-         *     A patch is a DELTA against the current task at ``base_revision`` — never
-         *     whole-list replacement — and stays strictly under the 16 KiB serialized
-         *     budget so it can never blow the capability dispatcher envelope.
-         */
-        TaskPlanPatch: {
-            /**
-             * Schema Version
-             * @description Patch schema version; consumers fail closed on drift
-             * @default 1
-             */
-            schema_version: number;
-            /**
-             * Source Message Id
-             * Format: uuid
-             * @description User message this interpretation/patch was produced from
-             */
-            source_message_id: string;
-            /**
-             * Base Revision
-             * @description Expected task revision for compare-and-swap (§1)
-             */
-            base_revision: number;
-            /**
-             * Idempotency Key
-             * Format: uuid
-             * @description Caller key so retransmitted patches deduplicate (§1)
-             */
-            idempotency_key: string;
-            /**
-             * Title
-             * @description Proposed task header title (≤ 240 chars)
-             */
-            title?: string | null;
-            /**
-             * Summary
-             * @description Proposed task summary (≤ 1000 chars)
-             */
-            summary?: string | null;
-            /**
-             * Rationale
-             * @description Why this delta is proposed (≤ 1000 chars)
-             */
-            rationale?: string | null;
-            /**
-             * Operations
-             * @description Bounded add/update/supersede operations (max 12)
-             */
-            operations?: components["schemas"]["TaskStepOperation"][];
-        };
-        /**
-         * TaskPlanStep
-         * @description One stable plan item (§7): bounded, dependency-linked, evidence-bound.
-         *
-         *     ``executed`` without evidence references is invalid (P4): "done" is only
-         *     rendered from agreed checks, never from a model-ticked boolean.
-         */
-        TaskPlanStep: {
-            /**
-             * Step Id
-             * @description Stable item ID that survives replanning deltas
-             */
-            step_id: string;
-            /**
-             * Title
-             * @description Short step title safe for browser display
-             */
-            title: string;
-            /**
-             * @description Frozen todo status of this step
-             * @default pending
-             */
-            status: components["schemas"]["StepStatus"];
-            /**
-             * @description Separate verification state bound to evidence
-             * @default not_checked
-             */
-            verification: components["schemas"]["mai__contracts__tasks__VerificationStatus"];
-            /**
-             * Evidence Refs
-             * @description Sourced evidence supporting executed/verified state
-             */
-            evidence_refs?: components["schemas"]["EvidenceRef"][];
-            /**
-             * Depends On
-             * @description Stable step IDs this step depends on; no cycles
-             */
-            depends_on?: string[];
-            /**
-             * @description Declared risk/action class of the step
-             * @default read_only
-             */
-            risk: components["schemas"]["ActionRisk"];
-            /**
-             * Prerequisite Unresolved
-             * @description True when a required prerequisite is still missing
-             * @default false
-             */
-            prerequisite_unresolved: boolean;
-            /**
-             * Expected Check
-             * @description The check that will decide this step is done
-             */
-            expected_check?: string | null;
-            /**
-             * Skip Reason
-             * @description Required reason when status is skipped
-             */
-            skip_reason?: string | null;
-        };
-        /**
-         * TaskRevisionView
-         * @description One append-only revision-log row (§8 audit; P5 shared truth).
-         *
-         *     ``author`` is the stored authority fact (``user`` for every correction
-         *     this surface accepts — never the model) and ``source_message_id`` is
-         *     the user message the revision was produced from, so a disputed
-         *     interpretation always explains itself through its origin (§8 UI
-         *     contract).
-         */
-        TaskRevisionView: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Revision
-             * @description The optimistic revision token (§1)
-             */
-            revision: number;
-            /**
-             * Kind
-             * @description Frozen revision kind (create|plan_patch|item_update|metadata|completion)
-             */
-            kind: string;
-            /**
-             * Author
-             * @description Stored authority: user, model or system (§6)
-             */
-            author: string;
-            /**
-             * Source Message Id
-             * @description User message this revision was produced from, when linked
-             */
-            source_message_id: string | null;
-            /**
-             * Item Id
-             * @description Stable item ID for item-scoped revisions, else null
-             */
-            item_id: string | null;
-            /**
-             * Payload
-             * @description Bounded revision summary (operation/constraint identities)
-             */
-            payload: {
-                [key: string]: unknown;
-            } | null;
-            /**
-             * Applied At
-             * @description RFC3339 UTC application timestamp
-             */
-            applied_at: string;
-        };
-        /**
-         * TaskRevisionsPage
-         * @description One bounded revision-ledger page (§8; AGENTS.md §1), newest first.
-         */
-        TaskRevisionsPage: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Revision rows in deterministic revision-descending order
-             */
-            items?: components["schemas"]["TaskRevisionView"][];
-        };
-        /**
-         * TaskStepOperation
-         * @description One bounded patch operation against a single step (§5 delta semantics).
-         */
-        TaskStepOperation: {
-            /** @description Patch operation kind: add, update or supersede */
-            op: components["schemas"]["PatchOp"];
-            /** @description The step payload the operation applies */
-            step: components["schemas"]["TaskPlanStep"];
-            /**
-             * Position
-             * @description Requested list position for ordering-sensitive updates
-             */
-            position?: number | null;
-            /**
-             * Supersedes Step Id
-             * @description Existing step ID replaced by a supersede operation
-             */
-            supersedes_step_id?: string | null;
-        };
-        /**
-         * TaskStepView
-         * @description One plan item (§7 vocabulary mirror of the storage row).
-         *
-         *     ``executed``/``skipped`` stay visible with their evidence references
-         *     and skip reasons — "done" is rendered from agreed checks, never a
-         *     ticked boolean (§7); superseded rows stay RECORDED (P3).
-         */
-        TaskStepView: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Step Id
-             * @description Stable item ID that survives replanning
-             */
-            step_id: string;
-            /**
-             * Title
-             * @description Short step title safe for browser display
-             */
-            title: string;
-            /** @description Frozen todo status of this step */
-            status: components["schemas"]["StepStatus"];
-            /** @description Separate verification state bound to evidence */
-            verification: components["schemas"]["VerificationStatus-Output"];
-            /**
-             * Position
-             * @description Deterministic list position
-             */
-            position: number;
-            /** @description Declared risk/action class of the step */
-            risk: components["schemas"]["ActionRisk"];
-            /**
-             * Prerequisite Unresolved
-             * @description True when a required prerequisite is still missing
-             */
-            prerequisite_unresolved: boolean;
-            /**
-             * Expected Check
-             * @description The check that will decide this step is done, when declared
-             */
-            expected_check: string | null;
-            /**
-             * Skip Reason
-             * @description Recorded reason when the step is skipped, otherwise null
-             */
-            skip_reason: string | null;
-            /**
-             * Result Summary
-             * @description Safe bounded result summary, when one was recorded
-             */
-            result_summary: string | null;
-            /**
-             * Evidence Refs
-             * @description Sourced evidence supporting executed/verified state
-             */
-            evidence_refs: components["schemas"]["EvidenceRef"][];
-            /**
-             * Depends On
-             * @description Stable step IDs this step depends on (no cycles)
-             */
-            depends_on: string[];
-            /**
-             * Superseded At
-             * @description RFC3339 UTC supersede timestamp for recorded history, else null
-             */
-            superseded_at: string | null;
-            /**
-             * Superseded By
-             * @description Step ID that replaced this row, else null (P3 history)
-             */
-            superseded_by: string | null;
-            /**
-             * Created At
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: string;
-            /**
-             * Updated At
-             * @description RFC3339 UTC last-revision timestamp
-             */
-            updated_at: string;
-        };
-        /**
-         * TaskStepsPage
-         * @description One bounded plan-step page (§8 ``GET items``; AGENTS.md §1).
-         */
-        TaskStepsPage: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Owning task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Limit
-             * @description Page size used for this slice (1..200)
-             */
-            limit: number;
-            /**
-             * Offset
-             * @description Slice start within the collection
-             */
-            offset: number;
-            /**
-             * Total
-             * @description Pre-slice matching count under the identical filter
-             */
-            total: number;
-            /**
-             * Has More
-             * @description True when another page exists after this slice
-             */
-            has_more: boolean;
-            /**
-             * Items
-             * @description Step rows in deterministic (position, step_id) order
-             */
-            items?: components["schemas"]["TaskStepView"][];
-        };
-        /**
-         * TaskView
-         * @description Compact task header view (§8 ``GET task`` shape): revision, phase,
-         *     status and counts only — item/constraint/evidence collections are fetched
-         *     as explicitly paginated pages, never embedded here.
-         */
-        TaskView: {
-            /**
-             * Task Id
-             * Format: uuid
-             * @description Opaque stable task identity (§1)
-             */
-            task_id: string;
-            /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
-             */
-            conversation_id: string;
-            /**
-             * Server Id
-             * Format: uuid
-             * @description Server scope pinning this task (§1)
-             */
-            server_id: string;
-            /**
-             * Revision
-             * @description Current optimistic revision token
-             */
-            revision: number;
-            /**
-             * Title
-             * @description Task header title (≤ 240 chars)
-             */
-            title: string;
-            /**
-             * Summary
-             * @description Task summary (≤ 1000 chars)
-             */
-            summary?: string | null;
-            /** @description Advisory phase; never permission */
-            requested_phase: components["schemas"]["Phase"];
-            /** @description Domain outcome layer above RunState */
-            status: components["schemas"]["TaskOutcome"];
-            /**
-             * Active Step Id
-             * @description Step currently being worked on, if any
-             */
-            active_step_id?: string | null;
-            /** @description List counts for bounded rendering */
-            counts: components["schemas"]["TaskCounts"];
-            /**
-             * Created At
-             * @description RFC3339 UTC creation timestamp
-             */
-            created_at: string;
-            /**
-             * Updated At
-             * @description RFC3339 UTC last-revision timestamp
-             */
-            updated_at: string;
-        };
-        /**
          * TerminalSessionInfoView
          * @description Wire view for opening a terminal against one pinned target.
          */
@@ -8416,65 +5981,109 @@ export interface components {
             tmux_session: string;
         };
         /**
-         * TranscriptMessage
-         * @description One role-preserving sanitized transcript row (§1/§3).
-         *
-         *     Content may be carried as a safe ``content_ref`` instead of raw text
-         *     (C05 privacy resolution); ``redacted`` marks deliberately redacted rows,
-         *     for which no textual-fidelity claim is made.
+         * ToolCallItem
+         * @description One structured assistant tool-call part (sfc_RESEARCH §2 assistant
+         *     entries carry ordered safe text and structured tool-call parts).
          */
-        TranscriptMessage: {
+        ToolCallItem: {
             /**
-             * Conversation Id
-             * Format: uuid
-             * @description Owning conversation identity
+             * Call Id
+             * @description Provider tool-call id; pairs the call with its result
              */
-            conversation_id: string;
+            call_id: string;
             /**
-             * Message Id
-             * Format: uuid
-             * @description Opaque stable message identity
+             * Tool Name
+             * @description Registered capability tool name that was invoked
              */
-            message_id: string;
+            tool_name: string;
             /**
-             * Sequence
-             * @description Conversation-local monotonic sequence number
+             * Capability Id
+             * @description Capability descriptor id behind the invoked tool name
              */
-            sequence: number;
-            /** @description Trusted producer-assigned role */
-            role: components["schemas"]["MessageRole"];
-            /** @description Origin of the message */
-            source_kind: components["schemas"]["MessageSourceKind"];
+            capability_id: string;
             /**
-             * Created At
-             * Format: date-time
-             * @description RFC3339 UTC message timestamp
+             * Args
+             * @description Bounded tool-call arguments as produced by the model
              */
-            created_at: string;
+            args: {
+                [key: string]: unknown;
+            };
             /**
-             * Content
-             * @description Sanitized message text when carried inline
-             * @default
+             * Target Server Id
+             * @description Explicit target server scope for multi-target capabilities
              */
-            content: string;
-            /**
-             * Redacted
-             * @description True when content was deliberately redacted (no fidelity claim)
-             * @default false
-             */
-            redacted: boolean;
-            /**
-             * Content Ref
-             * @description Safe out-of-band content reference instead of raw text
-             */
-            content_ref?: string | null;
+            target_server_id?: string | null;
         };
         /**
-         * TurnDisposition
-         * @description Run disposition of an accepted turn submit (§3; brief: 201/200/202).
-         * @enum {string}
+         * ToolResultEntry
+         * @description One tool result (sfc_RESEARCH §2): call identity, the frozen bridge
+         *     status and the three-layer execution/domain/certainty projection —
+         *     pending/unknown results are never inferred successful (C03/C06).
          */
-        TurnDisposition: "created" | "deduplicated" | "queued_followup";
+        ToolResultEntry: {
+            /**
+             * @description Discriminator: this payload is a tool result entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "tool_result";
+            /**
+             * Call Id
+             * @description Provider tool-call id this result answers
+             */
+            call_id: string;
+            /**
+             * Tool Name
+             * @description Registered capability tool name that was invoked
+             */
+            tool_name: string;
+            /**
+             * Capability Id
+             * @description Capability descriptor id behind the invoked tool name
+             */
+            capability_id: string;
+            /**
+             * Status
+             * @description Bridge lifecycle status: executed, denied, approval_required or unknown_effect
+             * @enum {string}
+             */
+            status: "executed" | "denied" | "approval_required" | "unknown_effect";
+            /** @description Compact technical wrapper execution status of the attempt */
+            execution_status: components["schemas"]["ExecutionStatus"];
+            /** @description Domain-level outcome; unknown is honest for arbitrary work */
+            domain_outcome: components["schemas"]["DomainOutcome"];
+            /** @description How certain the effect evidence is (certain/uncertain/unknown) */
+            effect_certainty: components["schemas"]["EffectCertainty"];
+            /**
+             * Payload Hash
+             * @description Canonical payload hash binding the result to its approval/dispatch envelope
+             */
+            payload_hash: string;
+            /**
+             * Output Preview
+             * @description Bounded redacted output preview; large output lives behind artifact references
+             */
+            output_preview?: string | null;
+            /**
+             * Artifact Ref
+             * @description Safe out-of-band reference to the full stored tool result
+             */
+            artifact_ref?: string | null;
+            /**
+             * Error Code
+             * @description Stable machine-readable error code when the call failed
+             */
+            error_code?: string | null;
+            /**
+             * Error Detail
+             * @description Value-free fixed failure reason (never echoing contents)
+             */
+            error_detail?: string | null;
+            /**
+             * Approval Id
+             * @description Approval record id when the call parked on the approval seam
+             */
+            approval_id?: string | null;
+        };
         /**
          * UpdateSubmitBody
          * @description Update submit: adds the CURRENT recipe baseline assertion.
@@ -8500,6 +6109,36 @@ export interface components {
             /** Current Recipe */
             current_recipe: string;
         };
+        /**
+         * UserMessageEntry
+         * @description One admitted user turn (sfc_RESEARCH §2): bounded safe text, client
+         *     request id for idempotency, source metadata and optional provenance
+         *     references.
+         */
+        UserMessageEntry: {
+            /**
+             * @description Discriminator: this payload is a user message entry (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "user_message";
+            /**
+             * Text
+             * @description Bounded user message text (untrusted content, never authority)
+             */
+            text: string;
+            /**
+             * Client Request Id
+             * Format: uuid
+             * @description Client idempotency key of the admitted turn submission
+             */
+            client_request_id: string;
+            /** @description How this turn entered the session (interactive, runbook, document attach or API) */
+            source: components["schemas"]["SessionSourceKind"];
+            /** @description Document provenance when the turn was a document attach */
+            document_ref?: components["schemas"]["DocumentAttachRef"] | null;
+            /** @description Runbook provenance when the turn was a runbook execution */
+            runbook_ref?: components["schemas"]["RunbookRef"] | null;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -8515,131 +6154,10 @@ export interface components {
         };
         /**
          * VerificationStatus
-         * @description Verification is separate from execution and bound to evidence (§7).
-         * @enum {string}
-         */
-        "VerificationStatus-Output": "not_checked" | "passed" | "failed" | "unavailable";
-        /**
-         * WorkJournal
-         * @description The derived work-journal projection (§8.1): trusted records only —
-         *     verbatim goal/constraints live on the objective row and are referenced,
-         *     never re-owned here. ``derived_seq`` is the exact ledger cursor this
-         *     projection was derived at, so crash/restart catch-up is honest.
-         */
-        WorkJournal: {
-            /**
-             * Schema Version
-             * @description Projection document schema version
-             * @default 1
-             * @constant
-             */
-            schema_version: 1;
-            /**
-             * Objective Id
-             * Format: uuid
-             * @description Owning objective identity
-             */
-            objective_id: string;
-            /**
-             * Derived Seq
-             * @description Ledger sequence this projection was derived through
-             * @default 0
-             */
-            derived_seq: number;
-            /** @description Advisory checklist section */
-            checklist?: components["schemas"]["WorkJournalChecklist"];
-            /**
-             * Actions
-             * @description Action attempts, oldest first (bounded, drop-oldest)
-             */
-            actions?: components["schemas"]["JournalActionApplied"][];
-            /**
-             * Actions Truncated
-             * @description True when old action rows were dropped at the bound
-             * @default false
-             */
-            actions_truncated: boolean;
-            /**
-             * Receipts
-             * @description Receipts, oldest first (bounded, drop-oldest)
-             */
-            receipts?: components["schemas"]["JournalReceiptRecorded"][];
-            /**
-             * Receipts Truncated
-             * @description True when old receipt rows were dropped at the bound
-             * @default false
-             */
-            receipts_truncated: boolean;
-            /** @description Latest verification verdict when any */
-            verification?: components["schemas"]["JournalVerificationRecorded"] | null;
-            /**
-             * Unknowns
-             * @description Unknown/unreconciled effects (bounded, drop-oldest)
-             */
-            unknowns?: components["schemas"]["JournalUnknownNoted"][];
-            /**
-             * Unknowns Truncated
-             * @description True when old unknown rows were dropped at the bound
-             * @default false
-             */
-            unknowns_truncated: boolean;
-            /**
-             * Children
-             * @description Delegation links (bounded, drop-oldest)
-             */
-            children?: components["schemas"]["JournalChildLinked"][];
-            /**
-             * Children Truncated
-             * @description True when old child links were dropped at the bound
-             * @default false
-             */
-            children_truncated: boolean;
-            /**
-             * @description Objective status as derived from the ledger
-             * @default active
-             */
-            status: components["schemas"]["ObjectiveStatus"];
-        };
-        /**
-         * WorkJournalChecklist
-         * @description The checklist section of the derived journal (§8.2): advisory,
-         *     with an honest malformed marker that never erases other sections.
-         */
-        WorkJournalChecklist: {
-            /**
-             * Items
-             * @description The last valid advisory checklist seen
-             */
-            items?: components["schemas"]["ChecklistItem"][];
-            /**
-             * Revision
-             * @description Checklist revision of the last valid update
-             */
-            revision?: number | null;
-            /**
-             * Malformed
-             * @description True when a checklist update failed its typed parse
-             * @default false
-             */
-            malformed: boolean;
-            /**
-             * Detail
-             * @description Value-free reason when malformed
-             */
-            detail?: string | null;
-        };
-        /**
-         * VerificationStatus
-         * @description Verification is separate from execution and bound to evidence (§7).
-         * @enum {string}
-         */
-        mai__contracts__tasks__VerificationStatus: "not_checked" | "passed" | "failed" | "unavailable";
-        /**
-         * VerificationStatus
          * @description C07 rule 5 boundary: outcomes are separated from hypotheses.
          * @enum {string}
          */
-        mai__knowledge__documents__VerificationStatus: "unverified" | "verified" | "hypothesis";
+        VerificationStatus: "unverified" | "verified" | "hypothesis";
     };
     responses: never;
     parameters: never;
@@ -10234,1668 +7752,6 @@ export interface operations {
             };
         };
     };
-    submit_message_api_v1_chat_messages_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ChatSubmitBody"];
-            };
-        };
-        responses: {
-            /** @description Duplicate submission attached to the existing run (the intent-level resume: a lost enqueue re-arms) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatCreated"];
-                };
-            };
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatCreated"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No canonical profile for the target server, or no artifact stored for an attachment reference */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Run id reused by a different submission, or stored artifact state requires recovery */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Chat domain, artifact store or engine unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_canonical_conversations_api_v1_chat_conversations_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-                tag_id?: string[] | null;
-                tag_match?: "any" | "all";
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationListPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    create_conversation_api_v1_chat_conversations_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The submitted idempotency key is already bound to another server's conversation scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Idempotency key retransmitted with changed content, or another writer holds the conversation lease */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Model configuration or jobs engine unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_canonical_messages_api_v1_chat_conversations__conversation_id__messages_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTranscriptPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_conversation_message_api_v1_chat_conversations__conversation_id__messages_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConversationTurnSubmitRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Idempotency key retransmitted with changed content, another writer holds the conversation lease, a stale task revision was pinned, or history reconstruction is incomplete */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Model configuration or jobs engine unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    steer_conversation_api_v1_chat_conversations__conversation_id__steer_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConversationSteerRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatSteerView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No active run holds the conversation lease, or the idempotency key was retransmitted (deduplicated, 200) */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation (steer requires a message; pause/cancel carry none) */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    resume_conversation_api_v1_chat_conversations__conversation_id__resume_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConversationResumeBody"];
-            };
-        };
-        responses: {
-            /** @description Resume of a parked conversation was already expressed by an identical durable request (deduplicated) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
-                };
-            };
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTurnSubmitResponse"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope (cross-server references fail closed, C8) */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The current run state has NO generic resume: ``waiting_children`` is child-driven, ``reconciling`` requires operator classification first, ``waiting_approval`` resumes only the payload-bound approval decision, and queued/running runs are already executing (steering is the control); a settled conversation resumes through the next submitted turn */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Model configuration or jobs engine unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    reconcile_conversation_api_v1_chat_conversations__conversation_id__reconcile_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConversationReconcileBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationReconcileView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope, or a classified seq has no step row */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The run is not parked in ``reconciling``, or a classified row is not open for reconciliation */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_conversations_api_v1_chat_runs_get: {
-        parameters: {
-            query?: {
-                server_id?: string | null;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_conversation_api_v1_chat_runs__run_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No run stored for this run id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Persisted run state requires recovery */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    rename_conversation_api_v1_chat_runs__run_id__patch: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ChatRenameBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No run stored for this run id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Persisted run state requires recovery */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    cancel_conversation_api_v1_chat_runs__run_id__cancel_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ChatCancelBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CancelView"];
-                };
-            };
-            /** @description Request recorded; engine outcome not observed within the budget — outcome stays null, re-entry resumes the wait */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CancelView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No run stored for this run id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The engine has no workflow under this run id */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_tool_step_api_v1_chat_runs__run_id__steps__seq__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-                seq: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No step stored for this run id and seq */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    stream_conversation_events_api_v1_chat_runs__run_id__events_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description No valid session (answered before any stream byte) */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description An Origin header that is not allowlisted */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No run stored for this run id */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Last-Event-ID cursor is not a non-negative integer */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_canonical_conversation_api_v1_chat_conversations__conversation_id__get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
-                server_id: string;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationDetailView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_canonical_events_api_v1_chat_conversations__conversation_id__events_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' conversations are invisible, not forbidden */
-                server_id: string;
-                /** @description Replay cursor: return only strictly newer events */
-                after_seq?: number;
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationEventsPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    read_drain_status_api_v1_objectives_drain_status_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DrainStatusView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Persistence unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_objectives_api_v1_objectives_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-                status?: components["schemas"]["ObjectiveStatus"] | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveListPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    create_objective_api_v1_objectives_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ObjectiveCreateBody"];
-            };
-        };
-        responses: {
-            /** @description Idempotent retransmission: the SAME objective returned for the same client request id and content */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveDetail"];
-                };
-            };
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveDetail"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The client request id was used with changed content, or the scope payload violates the frozen bounds */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Persistence unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_objective_api_v1_objectives__objective_id__get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveDetail"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    read_journal_api_v1_objectives__objective_id__journal_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WorkJournal"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_objective_events_api_v1_objectives__objective_id__events_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-                type?: string | null;
-                after_seq?: number | null;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveEventPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    stream_objective_events_api_v1_objectives__objective_id__events_stream_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-                after_seq?: number | null;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description No valid session (answered before any stream byte) */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description An Origin header that is not allowlisted */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Replay cursor is not a non-negative integer */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_objective_runs_api_v1_objectives__objective_id__runs_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveRunPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    change_objective_scope_api_v1_objectives__objective_id__scope_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ObjectiveScopeBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ObjectiveDetail"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description A stale expected revision, a home-server removal, an add/remove overlap, or an empty/oversized result */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_checklist_api_v1_objectives__objective_id__checklist_get: {
-        parameters: {
-            query: {
-                /** @description Requesting in-scope server identity (C8 scope check); other scopes' objectives are invisible, not forbidden */
-                server_id: string;
-            };
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope, or the advisory checklist was never maintained */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    put_checklist_api_v1_objectives__objective_id__checklist_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                objective_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ChecklistPutBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowlisted or CSRF token missing/mismatched */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No objective in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description A stale expected checklist revision */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
     list_tags_api_v1_tags_get: {
         parameters: {
             query?: {
@@ -12235,605 +8091,6 @@ export interface operations {
                 };
             };
             /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    list_conversation_tags_api_v1_chat_conversations__conversation_id__tags_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationTagsPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    assign_conversation_tag_api_v1_chat_conversations__conversation_id__tags_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TagAssignBody"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowed or CSRF token rejected */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation or no tag in the requesting scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Request body failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    remove_conversation_tag_api_v1_chat_conversations__conversation_id__tags__tag_id__delete: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' entities are invisible, not forbidden */
-                server_id: string;
-                /** @description Re-classification target committed in the same transaction when this is the conversation's final tag */
-                replacement_tag_id?: string | null;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-                tag_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Origin not allowed or CSRF token rejected */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No conversation or no tag in the requesting scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The conversation's final tag cannot be removed without a replacement */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Query parameters failed validation */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    read_conversation_task_api_v1_chat_conversations__conversation_id__task_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
-                server_id: string;
-            };
-            header?: never;
-            path: {
-                conversation_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskView"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_task_steps_api_v1_chat_tasks__task_id__items_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-                /** @description Include superseded rows (recorded P3 history) in the page */
-                include_superseded?: boolean;
-            };
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskStepsPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_task_constraints_api_v1_chat_tasks__task_id__constraints_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-                /** @description Include superseded rows (recorded P3 history) in the page */
-                include_superseded?: boolean;
-            };
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskConstraintsPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_task_evidence_api_v1_chat_tasks__task_id__evidence_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskEvidencePage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    list_task_revisions_api_v1_chat_tasks__task_id__revisions_get: {
-        parameters: {
-            query: {
-                /** @description Explicit server scope (C01 rule 2); other servers' tasks are invisible, not forbidden */
-                server_id: string;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskRevisionsPage"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_task_correction_api_v1_chat_tasks__task_id__revisions_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TaskCorrectionBody"];
-            };
-        };
-        responses: {
-            /** @description Idempotent replay of an already-applied correction (C4) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskMutationOutcome"];
-                };
-            };
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskMutationOutcome"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Stale base revision (C6) or contract rejection */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The proposed patch is contract-invalid */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    submit_task_decision_api_v1_chat_tasks__task_id__decisions_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                task_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TaskDecisionBody"];
-            };
-        };
-        responses: {
-            /** @description Idempotent replay of an already-applied decision (C4) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskMutationOutcome"];
-                };
-            };
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskMutationOutcome"];
-                };
-            };
-            /** @description No valid session */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description No task in the requesting server scope */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Stale named revision (C6) or frozen-transition rejection */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description The decision is contract-invalid */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -16592,6 +11849,373 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_sessions_api_v1_agent_sessions_get: {
+        parameters: {
+            query?: {
+                /** @description Explicit server scope the listing is pinned to (C01 rule 2); omit for the recent page across all enrolled servers + General Consult */
+                server_id?: string | null;
+                /** @description Optional coarse status filter (SessionStatus vocabulary) */
+                status?: components["schemas"]["SessionStatus"] | null;
+                /** @description Optional catalog tag filter (session_tags association) */
+                tag_id?: string | null;
+                /** @description Page size used for this slice (1..100) */
+                limit?: number;
+                /** @description Slice start within the collection */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionListPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_session_api_v1_agent_sessions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_session_detail_api_v1_agent_sessions__session_id__get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_session_api_v1_agent_sessions__session_id__patch: {
+        parameters: {
+            query?: {
+                /** @description Explicit server scope (scope-blind 404 when it differs from the stored session) */
+                server_id?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionRenameRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_history_api_v1_agent_sessions__session_id__history_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+                /** @description Bounded page size (1..50) */
+                limit?: number;
+                /** @description Exclusive keyset cursor (older pages) */
+                before_seq?: number | null;
+                /** @description Exclusive keyset cursor (catch-up pages) */
+                after_seq?: number | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionHistoryPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_turn_api_v1_agent_sessions__session_id__turns_post: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionTurnSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTurnSubmitResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_control_api_v1_agent_sessions__session_id__control_post: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2; scope-blind 404) */
+                server_id: string;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionControlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionControlResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_session_tags_api_v1_agent_sessions__session_id__tags_get: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2) */
+                server_id: string;
+                /** @description Page size used for this slice (1..100) */
+                limit?: number;
+                /** @description Slice start */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTagsPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    assign_session_tag_api_v1_agent_sessions__session_id__tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionTagAssignRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_session_tag_api_v1_agent_sessions__session_id__tags__tag_id__delete: {
+        parameters: {
+            query: {
+                /** @description Explicit server scope (C01 rule 2) */
+                server_id: string;
+                /** @description Mandatory on final-tag removal (last_tag 409 without it); attaches in the same transaction */
+                replacement_tag_id?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

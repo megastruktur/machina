@@ -85,11 +85,28 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # reconciliation (card 10-observation-schema owns 0007): the tip constants
 # are advanced here; later chain appenders advance them again in their own
 # files.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001",
+    "0002",
+    "0003",
+    "0004",
+    "0005",
+    "0006",
+    "0007",
+    "0008",
+    "0009",
+    "0010",
+    "0011",
+    "0012",
+    "0013",
+    "0014",
+    "0015",
+)
 
-# The exact public application schema at the 0007 tip: the 0006 set plus
-# the three observation-domain tables — nothing else, in particular no
-# engine-shadowing run-state table (C05 rule 1).
+# The exact public application schema at the 0015 head: the 0007 set plus
+# the 0011 tag catalog/job-tags and the D02 session-first tables; the
+# obsolete chat/task/objective tables are dropped by 0015 — nothing else,
+# in particular no engine-shadowing run-state table (C05 rule 1).
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -103,6 +120,8 @@ EXPECTED_APP_TABLES = frozenset(
         "job_events",
         "job_schedules",
         "job_schedule_fires",
+        "job_tags",
+        "tags",
         "knowledge_documents",
         "knowledge_doc_chunks",
         "application_projection",
@@ -110,6 +129,12 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "sessions",
+        "session_entries",
+        "session_runs",
+        "session_admissions",
+        "session_provider_artifacts",
+        "session_tags",
     }
 )
 
@@ -140,7 +165,7 @@ def _alembic_config() -> AlembicConfig:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0007``."""
+    """Disposable fixture database migrated from zero through head."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -151,17 +176,12 @@ def migrated_url() -> str:
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS notification_alerts, "
-                "observation_findings, server_observations, "
-                "application_projection_journal, "
-                "application_projection, knowledge_doc_chunks, "
-                "knowledge_documents, job_schedule_fires, job_schedules, "
-                "job_events, job_steps, job_runs, approvals, "
-                "profile_projection_journal, profile_projection, "
-                "admin_sessions, admin_credential, alembic_version"
-            )
-            conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+            # Whole-schema reset (the sibling suites' approach): the
+            # enumerated-drop list went stale across migrations; the
+            # schema drop is FK-safe and immune to future revisions.
+            conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+            conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
             conn.commit()
         command.upgrade(_alembic_config(), "head")
     finally:
@@ -294,13 +314,16 @@ def test_downgrade_round_trip_restores_the_head(
 ) -> None:
     monkeypatch.setenv("MAI_DATABASE_URL", migrated_url)
     try:
-        command.downgrade(_alembic_config(), "0005")
+        # D09: 0015's honest no-op downgrade means the oldest reachable
+        # revision is 0014 (its downgrade only drops the session-first
+        # tables; the dropped obsolete tables are never fabricated back).
+        command.downgrade(_alembic_config(), "0014")
         with psycopg.connect(migrated_url) as conn:
-            tables = conn.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name LIKE 'application%'"
-            ).fetchall()
-            assert tables == []
+            # The obsolete chat/task/objective tables stay absent — the
+            # 0015 no-op downgrade fabricates nothing.
+            assert not conn.execute(
+                "SELECT to_regclass('public.conversations') IS NOT NULL"
+            ).fetchone()[0]
         command.upgrade(_alembic_config(), "head")
     finally:
         command.upgrade(_alembic_config(), "head")

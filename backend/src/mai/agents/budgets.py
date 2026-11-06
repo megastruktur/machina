@@ -12,9 +12,9 @@ application-level). This module owns:
   by 06-delegation-budgets"). It bounds the delegation tree's NESTING
   (depth), FAN-OUT (children per delegation), CONCURRENCY (non-terminal
   reserved slots), and aggregate SPEND (durable steps and model tokens).
-  A budget may only NARROW the module bounds declared by
-  :mod:`mai.agents.delegate` (``MAX_DELEGATION_DEPTH``,
-  ``MAX_CHILDREN_PER_RUN``) — it can never widen them. A ``NULL`` root
+  A budget may only NARROW the module bounds declared HERE
+  (``MAX_DELEGATION_DEPTH``, ``MAX_CHILDREN_PER_RUN``) — it can never
+  widen them. A ``NULL`` root
   budget is a valid unbudgeted root: the module bounds still apply, no
   ledger events are written.
 - **Pure enforcement gates** (:func:`check_nesting`,
@@ -39,7 +39,7 @@ application-level). This module owns:
 Deliberate boundaries (recorded limitations, card evidence): the
 delegation planner wiring lives with the consuming surface — this module
 is the enforcement primitive + vocabulary the planner calls at its
-plan/start/release points (:mod:`mai.agents.delegate` propagates the
+plan/start/release points (the delegation planner propagates the
 root budget verbatim, references only, exactly as its freeze declared).
 Charges are value-free counts the calling producer reports (the
 per-model token attribution is the agent-run surface's duty); the ledger
@@ -53,6 +53,7 @@ value-free child evidence.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,9 +64,17 @@ from typing import Final
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mai.agents.delegate import MAX_CHILDREN_PER_RUN, MAX_DELEGATION_DEPTH
-from mai.agents.run import canonical_json
 from mai.contracts.jobs import EVENT_PAYLOAD_VERSION
+
+#: Explicit delegation module bounds (C05 rule 7: explicit,
+#: application-level; the budget vocabulary may only narrow these). A
+#: parent may start at most this many children per delegation and only
+#: below this tree depth. Owned HERE since the D09 deletion moved the
+#: old ``delegate`` module bounds into their enforcement primitive; the
+#: session-first delegation layer (``session_delegate``) narrows these
+#: further with its own session bounds (depth 1, 3 children/parent).
+MAX_CHILDREN_PER_RUN: Final[int] = 8
+MAX_DELEGATION_DEPTH: Final[int] = 4
 
 __all__ = [
     "BUDGET_PAYLOAD_VERSION",
@@ -80,7 +89,10 @@ __all__ = [
     "BudgetErrorCode",
     "BudgetLedger",
     "BudgetState",
+    "MAX_CHILDREN_PER_RUN",
+    "MAX_DELEGATION_DEPTH",
     "RootBudget",
+    "canonical_json",
     "check_fanout",
     "check_nesting",
     "ledger_state",
@@ -234,6 +246,27 @@ def parse_root_budget(document: object) -> RootBudget | None:
     )
 
 
+def canonical_json(payload: object) -> str:
+    """Deterministic JSON text (sort_keys, tight separators, ASCII).
+
+    Same canonical form as ``mai.jobs.steps.canonical_json``; owned here
+    since the D09 deletion removed the old ``agents.run`` definition this
+    module imported.
+    """
+    try:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"not JSON-canonicalizable ({type(error).__name__})"
+        ) from None
+
+
 def check_nesting(parent_depth: int, budget: RootBudget | None) -> int:
     """Fail closed on excessive nesting; return the child depth.
 
@@ -261,7 +294,7 @@ def check_fanout(count: int, budget: RootBudget | None) -> int:
     """Fail closed on excessive fan-out; return the validated count.
 
     One delegation may start at most the budget's ``max_children``
-    narrowed by :data:`mai.agents.delegate.MAX_CHILDREN_PER_RUN`.
+    narrowed by :data:`mai.agents.budgets.MAX_CHILDREN_PER_RUN`.
     """
     if isinstance(count, bool) or not isinstance(count, int):
         raise _reject_payload("child count must be an integer")

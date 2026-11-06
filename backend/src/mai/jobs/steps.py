@@ -678,7 +678,7 @@ def _translate_outcome(
         return StepState.OUTCOME_UNKNOWN.value, STATUS_UNRESOLVED_REASON, receipt
     if (
         isinstance(document, dict)
-        and outcome.capability_id == "chat.read_session"
+        and outcome.capability_id == "session.read"
         and isinstance(document.get("session_id"), str)
         and outcome.executor_ok is True
     ):

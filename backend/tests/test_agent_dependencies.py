@@ -30,17 +30,16 @@ import pydantic_ai
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 # The one selected agent-runtime requirement: distribution, its single enabled
-# extra, and the exact pin. The version is pinned EXACTLY (not floored) in
-# lockstep with pydantic-ai-harness, whose own hard pin
-# pydantic-ai-slim==2.60.0 forces the pair to move together deliberately.
+# extra, and the exact pin (pinned EXACTLY, not floored).
 AGENT_RUNTIME_DISTRIBUTION = "pydantic-ai-slim"
 AGENT_RUNTIME_EXTRA = "openai"
 AGENT_RUNTIME_PIN = "==2.60.0"
-# The conversation-compaction capability library (TieredCompaction and its
-# tier strategies attach to the per-round Agent); pinned exactly because the
-# harness itself hard-pins pydantic-ai-slim.
+# D09: the conversation-compaction harness is REMOVED — the session-first
+# runtime serializes native PydanticAI history itself (session_history.py)
+# and compaction lives in the session layer (session_compaction.py). The
+# distribution must be absent from the manifest, the lock AND the env
+# (negative controls, not a lockstep pin).
 HARNESS_DISTRIBUTION = "pydantic-ai-harness"
-HARNESS_PIN = "==0.60.0"
 
 # Provider SDKs pydantic-ai supports but MAI did not select: the configured
 # gateway is OpenAI-compatible (criterion 2 — no automatic proprietary-provider
@@ -151,8 +150,8 @@ def test_manifest_declares_exactly_the_selected_agent_runtime() -> None:
     )
     assert AGENT_RUNTIME_PIN in entry, f"exact pin {AGENT_RUNTIME_PIN} missing: {entry}"
     harness_entries = _requirements_for(_declared_requirements(), HARNESS_DISTRIBUTION)
-    assert harness_entries == [HARNESS_DISTRIBUTION + HARNESS_PIN], (
-        f"harness must be declared exactly once as {HARNESS_DISTRIBUTION}{HARNESS_PIN}: {harness_entries}"
+    assert harness_entries == [], (
+        f"the removed harness must not be declared: {harness_entries}"
     )
     # The meta-package would silently pull additional provider SDKs: never
     # declare it alongside the slim distribution.

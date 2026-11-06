@@ -1,8 +1,10 @@
-"""Bounded tag catalog + job/conversation association store (history-tags W2).
+"""Bounded tag catalog + job-run association store (history-tags W2; D09).
 
 The persistence layer for the 0011 mandatory-tag schema: a global,
-server-agnostic tag catalog plus per-entity associations for ``job_runs``
-and ``conversations``. The catalog is case/whitespace-normalized and
+server-agnostic tag catalog plus per-entity associations for ``job_runs``.
+The conversation association half (``conversation_tags``) was removed with
+the D09 coordinated deletion (migration ``0015`` drops the table); session
+tagging lives in :mod:`mai.session_store` on the ``session_tags`` table. The catalog is case/whitespace-normalized and
 canonically unique (``ux_tags_name_canonical`` on ``lower(name)``); the
 schema enforces at-least-one-tag per entity with deferred constraint
 triggers, and this store is the disciplined writer on top:
@@ -16,11 +18,10 @@ triggers, and this store is the disciplined writer on top:
   deterministic ordering and ``COUNT(*)`` under the identical predicate
   (AGENTS.md pagination invariant; ``compute_has_more`` composes the wire
   envelope). Bounds fail closed, never clamp.
-- **Entity access is scope-checked and closed**: a job/conversation is
+- **Entity access is scope-checked and closed**: a job run is
   resolved by (id, server_id) — a missing entity and a cross-server entity
   are the SAME single ``entity_not_found`` refusal (existence never leaks
-  across scopes). Job and conversation associations are fully independent;
-  there is no implicit inheritance in either direction.
+  across scopes).
 - **Assignment/removal is idempotent**; removing an entity's FINAL
   ordinary tag is refused without an atomic replacement
   (``replacement_tag_id`` swaps both in one transaction, so the schema's
@@ -59,7 +60,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mai.contracts.conversations import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+# D01 extraction: the neutral tag/pagination vocabulary now lives in
+# :mod:`mai.contracts.tags`; this module re-exports it so every existing
+# ``mai.tag_store`` caller keeps working unchanged. The re-exports are the
+# same objects, never copies.
+from mai.contracts.tags import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    EntityTagPreview,
+    compute_has_more,
+)
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID, SYSTEM_ASSIGNMENT_SOURCE
 
 __all__ = [
@@ -78,17 +88,13 @@ __all__ = [
     "acreate_tag",
     "adelete_tag",
     "aassign_job_tag",
-    "aassign_conversation_tag",
     "aremove_job_tag",
-    "aremove_conversation_tag",
     "aresolve_job_server",
-    "aresolve_conversation_server",
     "atags_for_job",
-    "atags_for_conversation",
     "alist_tags",
     "apreview_job_tags",
-    "apreview_conversation_tags",
     "anormalize_tag_name",
+    "compute_has_more",
 ]
 
 
@@ -332,12 +338,8 @@ class EntityTagRow:
     created_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class EntityTagPreview:
-    """Bounded listing projection: first names plus the honest total."""
-
-    preview: tuple[str, ...]
-    total: int
+# NOTE: EntityTagPreview is re-exported from :mod:`mai.contracts.tags`
+# (D01 neutral extraction) — see the import block above.
 
 
 def _row_to_tag(row: Mapping[str, object]) -> TagRow:
@@ -536,19 +538,14 @@ async def _adelete_tag_locked(
             "the reserved unclassified tag cannot be deleted",
             "tag_id",
         )
-    job_refs, conversation_refs = (
-        await session.execute(
-            text(
-                """
-                SELECT
-                    (SELECT count(*) FROM job_tags WHERE tag_id = :t),
-                    (SELECT count(*) FROM conversation_tags WHERE tag_id = :t)
-                """
-            ),
-            {"t": tag_id},
-        )
-    ).one()
-    total_refs = int(job_refs) + int(conversation_refs)
+    total_refs = int(
+        (
+            await session.execute(
+                text("SELECT count(*) FROM job_tags WHERE tag_id = :t"),
+                {"t": tag_id},
+            )
+        ).scalar_one()
+    )
     if total_refs == 0:
         await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
         return 0
@@ -597,23 +594,7 @@ async def _adelete_tag_locked(
             {"t": tag_id},
         )
     ).scalars().all()
-    needy_conversations = (
-        await session.execute(
-            text(
-                """
-                SELECT ct.conversation_id FROM conversation_tags ct
-                WHERE ct.tag_id = :t
-                  AND NOT EXISTS (
-                      SELECT 1 FROM conversation_tags other
-                      WHERE other.conversation_id = ct.conversation_id
-                        AND other.tag_id <> :t
-                  )
-                """
-            ),
-            {"t": tag_id},
-        )
-    ).scalars().all()
-    if (needy_jobs or needy_conversations) and replacement_tag_id is None:
+    if needy_jobs and replacement_tag_id is None:
         raise TagStoreError(
             TagErrorCode.TAG_IN_USE,
             "some entities keep only this tag; pass replacement_tag_id "
@@ -636,28 +617,8 @@ async def _adelete_tag_locked(
                 "jobs": list(needy_jobs),
             },
         )
-    if needy_conversations:
-        await session.execute(
-            text(
-                """
-                INSERT INTO conversation_tags
-                    (conversation_id, tag_id, assignment_source)
-                SELECT u.conversation_id, :r, :src
-                FROM unnest(CAST(:convs AS uuid[])) AS u(conversation_id)
-                ON CONFLICT DO NOTHING
-                """
-            ),
-            {
-                "r": replacement_tag_id,
-                "src": SYSTEM_ASSIGNMENT_SOURCE,
-                "convs": list(needy_conversations),
-            },
-        )
     await session.execute(
         text("DELETE FROM job_tags WHERE tag_id = :t"), {"t": tag_id}
-    )
-    await session.execute(
-        text("DELETE FROM conversation_tags WHERE tag_id = :t"), {"t": tag_id}
     )
     await session.execute(text("DELETE FROM tags WHERE tag_id = :t"), {"t": tag_id})
     return total_refs
@@ -687,24 +648,6 @@ async def aresolve_job_server(
             TagErrorCode.ENTITY_NOT_FOUND,
             "no job run in the requesting server scope",
             "job_id",
-        )
-
-
-async def aresolve_conversation_server(
-    session: AsyncSession, conversation_id: uuid.UUID, *, server_id: uuid.UUID
-) -> None:
-    """Resolve a conversation inside the requesting server scope, else refuse."""
-    row = (
-        await session.execute(
-            text("SELECT server_id FROM conversations WHERE conversation_id = :c"),
-            {"c": conversation_id},
-        )
-    ).scalar()
-    if row is None or row != server_id:
-        raise TagStoreError(
-            TagErrorCode.ENTITY_NOT_FOUND,
-            "no conversation in the requesting server scope",
-            "conversation_id",
         )
 
 
@@ -751,44 +694,6 @@ async def aassign_job_tag(
                     """
                 ),
                 {"j": job_id, "t": tag_id, "by": actor, "src": source},
-            )
-    except IntegrityError as exc:
-        raise aclassify_integrity_error(exc) from exc
-
-
-async def aassign_conversation_tag(
-    sessions: async_sessionmaker[AsyncSession],
-    conversation_id: uuid.UUID,
-    tag_id: uuid.UUID,
-    *,
-    server_id: uuid.UUID,
-    assigned_by: str = "",
-    assignment_source: str = SYSTEM_ASSIGNMENT_SOURCE,
-) -> None:
-    """Assign one tag to a conversation; re-assignment is a no-op."""
-    source = _validated_source(assignment_source)
-    actor = _validated_assigned_by(assigned_by)
-    try:
-        async with sessions() as session, session.begin():
-            await _alocked_tag_id(session, tag_id)
-            await aresolve_conversation_server(
-                session, conversation_id, server_id=server_id
-            )
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO conversation_tags (conversation_id, tag_id,
-                                                   assigned_by, assignment_source)
-                    VALUES (:c, :t, :by, :src)
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                {
-                    "c": conversation_id,
-                    "t": tag_id,
-                    "by": actor,
-                    "src": source,
-                },
             )
     except IntegrityError as exc:
         raise aclassify_integrity_error(exc) from exc
@@ -870,89 +775,6 @@ async def aremove_job_tag(
         raise aclassify_integrity_error(exc) from exc
 
 
-async def aremove_conversation_tag(
-    sessions: async_sessionmaker[AsyncSession],
-    conversation_id: uuid.UUID,
-    tag_id: uuid.UUID,
-    *,
-    server_id: uuid.UUID,
-    replacement_tag_id: uuid.UUID | None = None,
-) -> None:
-    """Remove one conversation-tag association; mirrors :func:`aremove_job_tag`."""
-    if replacement_tag_id == tag_id and replacement_tag_id is not None:
-        raise TagStoreError(
-            TagErrorCode.VALIDATION,
-            "the replacement must differ from the removed tag",
-            "replacement_tag_id",
-        )
-    try:
-        async with sessions() as session, session.begin():
-            await _alocked_tag_id(session, tag_id)
-            await aresolve_conversation_server(
-                session, conversation_id, server_id=server_id
-            )
-            bound = (
-                await session.execute(
-                    text(
-                        """
-                        SELECT 1 FROM conversation_tags
-                        WHERE conversation_id = :c AND tag_id = :t
-                        """
-                    ),
-                    {"c": conversation_id, "t": tag_id},
-                )
-            ).scalar()
-            if bound is None:
-                return
-            remaining = int(
-                (
-                    await session.execute(
-                        text(
-                            "SELECT count(*) FROM conversation_tags "
-                            "WHERE conversation_id = :c"
-                        ),
-                        {"c": conversation_id},
-                    )
-                ).scalar_one()
-            )
-            if remaining == 1 and replacement_tag_id is None:
-                raise TagStoreError(
-                    TagErrorCode.LAST_TAG,
-                    "the last tag cannot be removed without a replacement",
-                    "replacement_tag_id",
-                )
-            await session.execute(
-                text(
-                    """
-                    DELETE FROM conversation_tags
-                    WHERE conversation_id = :c AND tag_id = :t
-                    """
-                ),
-                {"c": conversation_id, "t": tag_id},
-            )
-            if replacement_tag_id is not None:
-                await _alocked_tag_id(session, replacement_tag_id)
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO conversation_tags
-                            (conversation_id, tag_id, assignment_source)
-                        VALUES (:c, :r, :src)
-                        ON CONFLICT DO NOTHING
-                        """
-                    ),
-                    {
-                        "c": conversation_id,
-                        "r": replacement_tag_id,
-                        "src": SYSTEM_ASSIGNMENT_SOURCE,
-                    },
-                )
-    except DBAPIError as exc:
-        # Mirrors aremove_job_tag: catch the commit-time deferred-trigger
-        # failure (P0001 as ProgrammingError) too, never leak raw DB errors.
-        raise aclassify_integrity_error(exc) from exc
-
-
 # ---------------------------------------------------------------------------
 # per-entity pages + batch previews
 # ---------------------------------------------------------------------------
@@ -976,27 +798,6 @@ async def atags_for_job(
         table="job_tags",
         entity_column="job_id",
         resolver=aresolve_job_server,
-    )
-
-
-async def atags_for_conversation(
-    sessions: async_sessionmaker[AsyncSession],
-    conversation_id: uuid.UUID,
-    *,
-    server_id: uuid.UUID,
-    limit: int = DEFAULT_PAGE_LIMIT,
-    offset: int = 0,
-) -> tuple[list[EntityTagRow], int]:
-    """Deterministic bounded tag page for one conversation (scope-checked)."""
-    return await _atags_for_entity(
-        sessions,
-        conversation_id,
-        server_id=server_id,
-        limit=limit,
-        offset=offset,
-        table="conversation_tags",
-        entity_column="conversation_id",
-        resolver=aresolve_conversation_server,
     )
 
 
@@ -1072,26 +873,6 @@ async def apreview_job_tags(
         entity_column="job_id",
         parent="job_runs",
         parent_key="run_id",
-    )
-
-
-async def apreview_conversation_tags(
-    sessions: async_sessionmaker[AsyncSession],
-    conversation_ids: Sequence[uuid.UUID],
-    *,
-    server_id: uuid.UUID,
-    preview_limit: int = 3,
-) -> dict[uuid.UUID, EntityTagPreview]:
-    """Bounded per-conversation tag preview + count in ONE grouped query."""
-    return await _apreview_entity_tags(
-        sessions,
-        conversation_ids,
-        server_id=server_id,
-        preview_limit=preview_limit,
-        association="conversation_tags",
-        entity_column="conversation_id",
-        parent="conversations",
-        parent_key="conversation_id",
     )
 
 

@@ -59,6 +59,8 @@ from mai.agents.models import (
 )
 from mai.api.approvals import register_approvals
 from mai.api.applications import register_applications
+from mai.api.agent_sessions import register_agent_sessions
+from mai.session_channel import SessionChannelHub
 from mai.api.auth import (
     bootstrap_password_from_env,
     effective_client_ip,
@@ -68,8 +70,6 @@ from mai.api.auth import (
     resolve_public_origins,
     resolve_trusted_proxies,
 )
-from mai.api.chat import register_chat
-from mai.api.conversations import register_conversations
 from mai.api.documents import (
     EMBEDDINGS_BASE_URL_VAR,
     EMBEDDINGS_CREDENTIAL_REF_VAR,
@@ -87,7 +87,6 @@ from mai.api.knowledge_models import (
 )
 from mai.api.models import register_models
 from mai.api.monitoring import register_monitoring
-from mai.api.objectives import register_objectives
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
@@ -98,7 +97,6 @@ from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
-from mai.api.tasks import register_tasks
 from mai.api.terminal import register_terminal
 from mai.memory.hindsight import (
     HindsightProvider,
@@ -110,7 +108,6 @@ from mai.capabilities.internal_api import (
     build_internal_api_capabilities,
 )
 from mai.capabilities.history_tags import build_history_tag_capabilities
-from mai.capabilities.task_state import build_task_state_capabilities
 from mai.applications.adopt import (
     ApplicationAdoption,
     ApplicationManifestStore,
@@ -360,33 +357,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             data_root=resolve_profiles_root(app.state.env),
             env_resolver=lambda: app.state.credentials,
         )
-        # Task-state tools (act 14-task-tools, act_CONTRACTS §7): the
-        # bounded read/proposal/item-update surface over the ONE task
-        # service, registered through the SAME composition seam so every
-        # consumer of ``app.state.internal_api`` sees one
-        # descriptor→executor surface. Descriptors are validated
-        # fail-closed at composition time; a missing database composition
-        # (``session_factory=None``) yields executors that answer
-        # unavailable.
-        _task_state = build_task_state_capabilities(
-            session_factory=app.state.session_factory,
-        )
-        # History-tag tools (W4D): the SAME composition seam — the
-        # ``tags.*`` surface joins the one ``app.state.internal_api``
-        # descriptor→executor mapping alongside the internal-API and
-        # task-state tools, so every consumer sees one surface.
+        # History-tag tools (W4D; D09 job-only): the composition seam —
+        # the ``tags.*`` surface joins the one ``app.state.internal_api``
+        # descriptor→executor mapping alongside the internal-API tools,
+        # so every consumer sees one surface.
         _history_tags = build_history_tag_capabilities(
             session_factory=app.state.session_factory,
         )
         app.state.internal_api = InternalApiComposition(
             descriptors=(
                 *app.state.internal_api.descriptors,
-                *_task_state.descriptors,
                 *_history_tags.descriptors,
             ),
             executors={
                 **app.state.internal_api.executors,
-                **_task_state.executors,
                 **_history_tags.executors,
             },
         )
@@ -459,6 +443,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # absent (mai.api.jobs).
         app.state.job_lifecycle = RunLifecycle(app.state.session_factory)
         app.state.job_recovery = RecoveryService(url, app.state.session_factory)
+        # Session channel hub (D06): the ONE shared LISTEN/NOTIFY listener
+        # + bounded per-session fanout over the ONE app engine. The reader
+        # is the D02 bounded history reader (after_seq catch-up pages).
+        from functools import partial
+
+        from mai.session_store import aread_session_history
+
+        _factory = app.state.session_factory
+        _tick_raw = (app.state.env or os.environ).get(
+            "MAI_SESSION_CHANNEL_TICK_SECONDS"
+        )
+        try:
+            _tick = float(_tick_raw) if _tick_raw is not None else 5.0
+        except ValueError:
+            _tick = 5.0
+        _tick = min(max(_tick, 0.05), 60.0)
+        app.state.session_channel = SessionChannelHub(
+            entry_reader=partial(aread_session_history, _factory),
+            coarse_tick_seconds=_tick,
+        )
+        app.state.session_channel.start(app.state.engine)
         # Schedules surface (C05 rule 8): the control-plane facade over
         # the ONE engine URL — a bare DBOSClient, never a launched engine
         # (launching here would steal pending workflows via launch
@@ -484,7 +489,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # The schedules facade owns a DBOSClient (its own system-DB pool)
         # and the cancel facade owns an EngineClient: release both before
-        # the app engine goes away.
+        # the app engine goes away. The session-channel hub closes its
+        # dedicated LISTEN connection first.
+        hub = getattr(app.state, "session_channel", None)
+        if hub is not None:
+            await hub.stop()
         schedules = getattr(app.state, "schedules", None)
         if schedules is not None:
             schedules.close()
@@ -547,46 +556,19 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # schedule records over the reviewed facade — HTTP persists
     # configuration only, firing stays engine/worker-owned.
     register_schedules(app)
-    # The chat conversation surface (C06): durable agent-conversation
-    # submit/detail/cancel/event routes over the reviewed agent-run and
-    # delegation facade — HTTP persists intent only; model rounds, tool
-    # calls and child workflows run in the worker.
-    register_chat(app)
-    # The canonical conversation history surface (act_CONTRACTS §3/§4):
-    # bounded, explicitly server-scoped reads over the app-owned
-    # conversation store — the paginated list/detail/transcript pages and
-    # the cursor-deduplicated metadata event page, with honest legacy-gap
-    # labels (partial/unavailable) instead of invented turns. Read-only:
-    # writes stay on the reviewed chat submit/steer seam.
-    register_conversations(app)
-    # The runtime-v2 objective surface (runtime-v2.md §3/§8/§10/§11):
-    # explicit operator-owned objective episodes over the ONE v2 stores —
-    # creation, scope CAS (operator authority only), journal/checklist
-    # projections, the bounded ``objective.*`` ledger pages, the
-    # cursor-exclusive activity SSE and the legacy drain inventory.
-    register_objectives(app)
-    # The history-tag management surface (history-tags HT-W6B): the
-    # global tag catalog CRUD plus same-server job-run and canonical
-    # conversation tag assignments over the ONE tag store — idempotent
-    # user-sourced writes, the used/unused deletion policy and the
-    # reserved unclassified semantics preserved verbatim; the legacy
-    # chat list stays unfiltered (owned by the chat surface's own slice).
+    # The history-tag management surface (history-tags HT-W6B; D09
+    # job-only): the global tag catalog CRUD plus same-server job-run
+    # tag assignments over the ONE tag store — idempotent user-sourced
+    # writes, the used/unused deletion policy and the reserved
+    # unclassified semantics preserved verbatim. Session tagging lives
+    # on the agent-session surface; the conversation-tag routes died
+    # with the D09 coordinated deletion.
     register_history_tags(app)
-    # The task read/correction/decision surface (act_CONTRACTS §6/§8): the
-    # compact header view for the conversation's ONE active episode, the
-    # explicitly server-scoped paginated items/constraints/evidence/
-    # revisions pages, the authenticated user correction route (ONE shared
-    # revision service call: CAS + idempotency + source-linked,
-    # author=user) and the distinct decision route (advisory phase
-    # selection, pause/cancel) — operation approvals stay on the C03
-    # approvals surface; metadata decisions never authorize or terminate
-    # target operations.
-    register_tasks(app)
     # The model configuration/selection/probe surface (C03 rule 6/C06
     # rule 1): connection/profile/selection records over the confined
     # atomic store — credential references only, never resolved material
     # — plus the bounded classified probe. The durable model rounds of
-    # conversations stay worker-owned; the probe is a single bounded
+    # sessions stay worker-owned; the probe is a single bounded
     # diagnostic round owned by this surface.
     register_models(app)
     # The memory surface (C07): the session-derived, grant-gated
@@ -634,6 +616,10 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # remote tmux/login shell) plus its session-authenticated info view. No
     # third-party SSH library — the pinned transport is mai.execution.ssh.
     register_terminal(app)
+    # The session-first surface (D06): REST collection/detail/admission/
+    # history/control + the versioned cursor WebSocket channel — the ONE
+    # agent surface after the D09 coordinated deletion.
+    register_agent_sessions(app)
 
     @app.middleware("http")
     async def attach_request_boundary(request: Request, call_next):  # noqa: ANN202

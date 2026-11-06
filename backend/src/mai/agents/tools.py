@@ -7,9 +7,9 @@ tools are not an authorization boundary") and **C03 rules 2–7**;
 card ``19-tool-results`` adds the compact model-facing projection
 (:func:`project_tool_result`) that separates the three layers a tool
 answer must not conflate — wrapper execution (:class:`~mai.contracts.
-tasks.ExecutionStatus`), domain outcome (:class:`~mai.contracts.tasks.
-DomainOutcome`) and effect certainty (:class:`~mai.contracts.tasks.
-EffectCertainty`) — while every collection it carries stays paginated
+tool_results.ExecutionStatus`), domain outcome (:class:`~mai.contracts.
+tool_results.DomainOutcome`) and effect certainty (:class:`~mai.contracts.
+tool_results.EffectCertainty`) — while every collection it carries stays paginated
 and every string stays inside the dispatcher's redaction boundary.
 
 What this module is
@@ -83,7 +83,8 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Final
 
 from pydantic_ai.tools import Tool
 
@@ -96,7 +97,7 @@ from mai.capabilities.dispatch import (
     DispatchOutcome,
     canonical_payload_hash,
 )
-from mai.contracts.tasks import (
+from mai.contracts.tool_results import (
     MAX_EVIDENCE_REFS,
     RESULT_DATA_MAX_ENTRIES,
     RESULT_DATA_VALUE_MAX_CHARS,
@@ -105,10 +106,6 @@ from mai.contracts.tasks import (
     EffectCertainty,
     EvidenceKind,
     ExecutionStatus,
-    Phase,
-    PhaseAction,
-    TaskContractError,
-    validate_phase,
 )
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
 from mai.policy.evaluate import ExecutionContext
@@ -146,6 +143,46 @@ TOOL_RESULT_PROJECTION_SCHEMA_VERSION = 1
 #: call arrives without its approval decision (mirrored verbatim from the
 #: C03 dispatch vocabulary; the run layer parks the attempt on it).
 _APPROVAL_REQUIRED_REASON = "approval_required_but_absent"
+
+# --- neutral phase-gate mirror (D01 extraction; guidance only) -----------------
+#
+# The task contracts (deleted at D09 by the campaign plan) own the
+# ratified phase×action admission map the runner classifies capabilities
+# with. ``tools.py`` must not import those task-domain contracts, so the
+# offer-shaping filter compares neutral *values* against this local mirror:
+# metadata/plan actions are admissible in every phase; evidence collection
+# in ``inspect``/``act``; execution only in ``act``. This stays GUIDANCE —
+# the enforcement boundary is the dispatcher's own fail-closed phase gate,
+# which the task contracts keep owning until D09 removes both together.
+
+_PHASE_ANY: Final[frozenset[str]] = frozenset({"plan", "inspect", "act"})
+_PHASE_INSPECT_OR_ACT: Final[frozenset[str]] = frozenset({"inspect", "act"})
+_PHASE_ACT_ONLY: Final[frozenset[str]] = frozenset({"act"})
+
+_PHASE_ACTION_ADMISSION: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "metadata_update": _PHASE_ANY,
+        "plan_proposal": _PHASE_ANY,
+        "collect_evidence": _PHASE_INSPECT_OR_ACT,
+        "execute_steps": _PHASE_ACT_ONLY,
+    }
+)
+
+
+def _phase_allows(phase: object, action: object) -> bool:
+    """Value-based mirror of the ratified phase×action admission map.
+
+    ``phase``/``action`` arrive as task-domain ``StrEnum`` members (or plain
+    strings) from legacy callers; both are compared by ``value`` so this
+    bridge stays free of task-contract imports. Unknown actions are refused
+    (fail-closed), matching the enforcement boundary's behavior.
+    """
+    phase_value = getattr(phase, "value", phase)
+    action_value = getattr(action, "value", action)
+    if not isinstance(phase_value, str) or not isinstance(action_value, str):
+        return False
+    allowed_phases = _PHASE_ACTION_ADMISSION.get(action_value)
+    return allowed_phases is not None and phase_value in allowed_phases
 
 #: Bounded projection slices (act_CONTRACTS §9 "safe bounded result data"
 #: + the mandatory-pagination invariant). Subchecks have no central bound
@@ -800,13 +837,13 @@ def project_tool_result(result: ToolResult) -> dict[str, object]:
     Separates the three layers the model must not conflate:
 
     - ``execution_status`` — the technical wrapper execution (frozen C04
-      subset via :class:`~mai.contracts.tasks.ExecutionStatus`);
+      subset via :class:`~mai.contracts.tool_results.ExecutionStatus`);
     - ``domain_outcome`` — what the operation semantically did
-      (:class:`~mai.contracts.tasks.DomainOutcome`); ``unknown`` is the
+      (:class:`~mai.contracts.tool_results.DomainOutcome`); ``unknown`` is the
       honest answer for arbitrary shell work — a wrapper exit code alone
       NEVER produces ``success`` (E3);
     - ``effect_certainty`` — how certain the effect evidence is
-      (:class:`~mai.contracts.tasks.EffectCertainty`); ``certain`` only
+      (:class:`~mai.contracts.tool_results.EffectCertainty`); ``certain`` only
       for a proven execution with explicit consistent structured success
       evidence (AC1: a failed subcheck or an unknown semantic outcome is
       never promoted to certain success).
@@ -986,23 +1023,30 @@ class CapabilityToolBridge:
 
     def tools_for_phase(
         self,
-        phase: Phase,
-        action_of: Callable[[str, str], PhaseAction],
+        phase: object,
+        action_of: Callable[[str, str], object],
     ) -> tuple[Tool, ...]:
         """The phase-guided tool surface (§6 guidance).
 
         Excludes enabled tools whose §6 phase action ``phase`` necessarily
         refuses (for a task-bound ``inspect`` round: target execute
         effects such as ``host.shell`` — the model is never invited into
-        a necessarily-refused attempt). ``action_of`` is the runner's
-        ratified capability→action mapping (:func:`mai.agents.run.
-        _phase_action_for_capability`), so task-state control tools stay
-        classified exactly as the execution gate classifies them.
+        a necessarily-refused attempt). ``action_of`` is the
+        caller-supplied ratified capability→action mapping
+        ((capability id, effect class) → action), so task-state control
+        tools stay classified exactly as the execution gate classifies
+        them.
 
-        GUIDANCE, not the permission boundary: the dispatcher's
-        ``validate_phase`` gate stays fail-closed at the execution
-        boundary — replayed, stale, racing or direct calls are still
-        denied before dispatch; this filter only shapes the offer.
+        D01 neutral extraction: this bridge no longer imports the task
+        contracts, so ``phase``/``action_of`` results are compared by
+        neutral value (``StrEnum.value`` or plain ``str``) against the
+        local :func:`_phase_allows` mirror of the ratified phase×action
+        admission map.
+
+        GUIDANCE, not the permission boundary: the dispatcher's phase
+        gate stays fail-closed at the execution boundary — replayed,
+        stale, racing or direct calls are still denied before dispatch;
+        this filter only shapes the offer.
         """
         kept: list[Tool] = []
         for binding in self._bindings.values():
@@ -1010,11 +1054,8 @@ class CapabilityToolBridge:
                 binding.capability_id,
                 str(binding.descriptor.effect_class),
             )
-            try:
-                validate_phase(phase, action)
-            except TaskContractError:
-                continue
-            kept.append(binding.tool)
+            if _phase_allows(phase, action):
+                kept.append(binding.tool)
         return tuple(kept)
 
     def _build_tool(

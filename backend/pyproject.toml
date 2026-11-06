@@ -50,7 +50,6 @@ dependencies = [
     # (no separate DBOS step). Harness 0.60.0 hard-pins
     # pydantic-ai-slim==2.60.0, so the runtime pin above moves in
     # lockstep with it; the frozen dbos==3.2.0 engine pin is untouched.
-    "pydantic-ai-harness==0.60.0",
     # Document-chunk embeddings client (contracts.md C07 rule 3/7; ADR
     # docs/architecture/knowledge-packaging.md §4): the doc index embeds via
     # POST {base_url}/v1/embeddings on the SAME configured OpenAI-compatible

@@ -455,12 +455,11 @@ def _drop_app_tables(url: str) -> None:
     bootstrap.
     """
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future
+        # revisions (the enumerated drop list went stale across
+        # migrations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -1012,7 +1011,7 @@ class TestOutcomeTranslation:
         assert outcome["receipt"] == receipt
 
     def test_non_command_capability_statuses_translate_cleanly(self) -> None:
-        """docs.retrieve, service.http, and chat.read_session outputs resolve
+        """docs.retrieve, service.http, and session.read outputs resolve
         without falling into status_unresolved / outcome_unknown."""
         state_ok, reason_ok, _ = steps._translate_outcome(
             _dispatch_outcome(
@@ -1045,7 +1044,7 @@ class TestOutcomeTranslation:
 
         state_chat, reason_chat, _ = steps._translate_outcome(
             _dispatch_outcome(
-                capability_id="chat.read_session",
+                capability_id="session.read",
                 executor_ok=True,
                 output=BoundedOutput(
                     text=json.dumps({"session_id": str(uuid.uuid4()), "event_count": 3}),

@@ -43,6 +43,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from mai.credentials.env import SecretValue
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 from mai.database import create_app_engine
 from mai.notifications.service import (
     DEFAULT_COOLDOWN,
@@ -100,16 +101,12 @@ def _drop_app_tables(url: str) -> None:
     with psycopg.connect(url) as conn:
         # Full app set at the chain tip (same reconciliation list as
         # 10-observation-schema): order-independent zero-to-head fixture.
-        conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): the enumerated drop list went stale
+        # across migrations — the schema drop is FK-safe and immune to
+        # future revisions (same discipline as the adoption suite).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -201,6 +198,9 @@ async def _insert_finding(
 
 
 async def _insert_job_run(sessions, run_id: uuid.UUID, server_id: str) -> None:
+    # The 0011 mandatory-tag constraint triggers are DEFERRABLE INITIALLY
+    # DEFERRED: the run and its reserved classification share the ONE
+    # committing transaction (the same discipline the real writers use).
     async with sessions() as session:
         await session.execute(
             text(
@@ -216,6 +216,16 @@ async def _insert_job_run(sessions, run_id: uuid.UUID, server_id: str) -> None:
                 """
             ),
             {"rid": run_id, "sid": uuid.UUID(server_id), "now": NOW},
+        )
+        await session.execute(
+            text(
+                """
+                INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                VALUES (:jid, :tid, 'system')
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            {"jid": run_id, "tid": uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)},
         )
         await session.commit()
 

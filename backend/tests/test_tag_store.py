@@ -9,10 +9,11 @@ Claims under test (plans/history-tags.md slice 3, migration 0011 schema):
 3. Catalog pages: deterministic ``lower(name)`` order, honest ``total``,
    case-insensitive name/description substring filters with escaped LIKE
    metacharacters.
-4. Entity scoping: job/conversation tags resolve only inside the requesting
+4. Entity scoping: job tags resolve only inside the requesting
    server scope; missing and cross-server entities are the same closed
-   ``entity_not_found`` refusal; job and conversation associations are
-   fully independent (no implicit inheritance).
+   ``entity_not_found`` refusal. (The conversation association half was
+   removed at D09 with the dropped ``conversation_tags`` table; session
+   tagging lives in the session store.)
 5. Assign/remove: idempotent; removing the FINAL ordinary tag requires an
    atomic ``replacement_tag_id``; absent-association removal is a no-op.
 6. Deletion policy: unused deletes; used refuses without force; force
@@ -51,15 +52,11 @@ from mai.tag_store import (
     aclassify_terminal_job,
     acreate_tag,
     adelete_tag,
-    aassign_conversation_tag,
     aassign_job_tag,
     alist_tags,
     anormalize_tag_name,
-    apreview_conversation_tags,
     apreview_job_tags,
-    aremove_conversation_tag,
     aremove_job_tag,
-    atags_for_conversation,
     atags_for_job,
 )
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID as SRC_RESERVED_ID
@@ -75,9 +72,6 @@ JOB_A = uuid.UUID("a1e2c3d4-0001-4001-8001-0000000000a1")
 JOB_B = uuid.UUID("a1e2c3d4-0002-4002-8002-0000000000a2")
 JOB_C = uuid.UUID("a1e2c3d4-0003-4003-8003-0000000000a3")
 JOB_D = uuid.UUID("a1e2c3d4-0004-4004-8004-0000000000a4")
-CONV_A = uuid.UUID("b2f3d4e5-0001-4001-8001-0000000000b1")
-CONV_B = uuid.UUID("b2f3d4e5-0002-4002-8002-0000000000b2")
-CONV_C = uuid.UUID("b2f3d4e5-0003-4003-8003-0000000000b3")
 TAG_X = uuid.UUID("c3a4b5d6-0001-4001-8001-0000000000c1")
 TAG_Y = uuid.UUID("c3a4b5d6-0002-4002-8002-0000000000c2")
 
@@ -115,13 +109,10 @@ def clean_domain(migrated_url: str):
     """Fresh catalog + empty entity domain per test (reserved re-seeded)."""
     yield
     with psycopg.connect(migrated_url, autocommit=True) as conn:
-        # CASCADE covers the referencing job/conversation domain tables
-        # (steps, events, schedules, runs, steering, tasks...) in one
-        # statement; only public app tables are FK-connected.
-        conn.execute(
-            "TRUNCATE job_tags, conversation_tags, job_runs, conversations, "
-            "tags CASCADE"
-        )
+        # CASCADE covers the referencing job domain tables (steps, events,
+        # schedules, runs...) in one statement; only public app tables are
+        # FK-connected.
+        conn.execute("TRUNCATE job_tags, job_runs, tags CASCADE")
         conn.execute(
             "INSERT INTO tags (tag_id, name, description) "
             "VALUES (%s, 'unclassified', 'reserved default') "
@@ -153,21 +144,6 @@ def _insert_job(
         conn.execute(
             "INSERT INTO job_tags (job_id, tag_id) VALUES (%s, %s)",
             (job_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
-        )
-        conn.commit()
-
-
-def _insert_conversation(
-    url: str, conversation_id: uuid.UUID, server_id: uuid.UUID = SERVER_A
-) -> None:
-    with psycopg.connect(url) as conn:
-        conn.execute(
-            "INSERT INTO conversations (conversation_id, server_id) VALUES (%s, %s)",
-            (conversation_id, server_id),
-        )
-        conn.execute(
-            "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (%s, %s)",
-            (conversation_id, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)),
         )
         conn.commit()
 
@@ -287,52 +263,24 @@ async def test_catalog_filters_are_case_insensitive_and_escaped(factory) -> None
 
 
 @pytest.mark.anyio
-async def test_job_and_conversation_tags_are_scope_checked(factory, migrated_url) -> None:
+async def test_job_tags_are_scope_checked(factory, migrated_url) -> None:
     _insert_job(migrated_url, JOB_A, SERVER_A)
-    _insert_conversation(migrated_url, CONV_A, SERVER_A)
     tag = await acreate_tag(factory, name="ops")
     await aassign_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_A)
-    await aassign_conversation_tag(
-        factory, CONV_A, tag.tag_id, server_id=SERVER_A
-    )
 
     for coro in (
         aassign_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_B),
-        aassign_conversation_tag(factory, CONV_A, tag.tag_id, server_id=SERVER_B),
         aremove_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_B),
         atags_for_job(factory, JOB_A, server_id=SERVER_B),
-        atags_for_conversation(factory, CONV_A, server_id=SERVER_B),
         atags_for_job(factory, uuid.uuid4(), server_id=SERVER_A),
-        atags_for_conversation(factory, uuid.uuid4(), server_id=SERVER_A),
     ):
         with pytest.raises(TagStoreError) as excinfo:
             await coro
         assert excinfo.value.code is TagErrorCode.ENTITY_NOT_FOUND
 
     job_items, job_total = await atags_for_job(factory, JOB_A, server_id=SERVER_A)
-    conv_items, conv_total = await atags_for_conversation(
-        factory, CONV_A, server_id=SERVER_A
-    )
-    assert job_total == 2 and conv_total == 2  # reserved + ops each
+    assert job_total == 2  # reserved + ops
     assert {row.name for row in job_items} == {"unclassified", "ops"}
-
-
-@pytest.mark.anyio
-async def test_no_implicit_inheritance_between_jobs_and_conversations(
-    factory, migrated_url
-) -> None:
-    # The SAME uuid value in both domains: associations never leak across.
-    _insert_job(migrated_url, JOB_A, SERVER_A)
-    _insert_conversation(migrated_url, JOB_A, SERVER_A)
-    tag = await acreate_tag(factory, name="investigation")
-    await aassign_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_A)
-    job_items, _ = await atags_for_job(factory, JOB_A, server_id=SERVER_A)
-    conv_items, conv_total = await atags_for_conversation(
-        factory, JOB_A, server_id=SERVER_A
-    )
-    assert {row.name for row in job_items} == {"unclassified", "investigation"}
-    assert conv_total == 1
-    assert {row.name for row in conv_items} == {"unclassified"}
 
 
 # ---------------------------------------------------------------------------
@@ -369,38 +317,38 @@ async def test_assign_is_idempotent_and_keeps_first_provenance(
 async def test_remove_is_idempotent_and_final_tag_needs_replacement(
     factory, migrated_url
 ) -> None:
-    _insert_conversation(migrated_url, CONV_A)
+    _insert_job(migrated_url, JOB_A)
     tag = await acreate_tag(factory, name="ops")
     # Absent association: idempotent no-op.
-    await aremove_conversation_tag(factory, CONV_A, tag.tag_id, server_id=SERVER_A)
-    await aassign_conversation_tag(factory, CONV_A, tag.tag_id, server_id=SERVER_A)
+    await aremove_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_A)
+    await aassign_job_tag(factory, JOB_A, tag.tag_id, server_id=SERVER_A)
 
     # With two tags, removing either is a normal non-final removal.
-    await aremove_conversation_tag(
-        factory, CONV_A, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
+    await aremove_job_tag(
+        factory, JOB_A, uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
         server_id=SERVER_A,
     )
-    _, total = await atags_for_conversation(factory, CONV_A, server_id=SERVER_A)
+    _, total = await atags_for_job(factory, JOB_A, server_id=SERVER_A)
     assert total == 1
     # Removing the now-FINAL ordinary tag without a replacement refuses.
     with pytest.raises(TagStoreError) as excinfo:
-        await aremove_conversation_tag(
-            factory, CONV_A, tag.tag_id, server_id=SERVER_A
+        await aremove_job_tag(
+            factory, JOB_A, tag.tag_id, server_id=SERVER_A
         )
     assert excinfo.value.code is TagErrorCode.LAST_TAG
     # The atomic replacement swaps both in one transaction.
     replacement = await acreate_tag(factory, name="followup")
-    await aremove_conversation_tag(
-        factory, CONV_A, tag.tag_id, server_id=SERVER_A,
+    await aremove_job_tag(
+        factory, JOB_A, tag.tag_id, server_id=SERVER_A,
         replacement_tag_id=replacement.tag_id,
     )
-    items, total = await atags_for_conversation(factory, CONV_A, server_id=SERVER_A)
+    items, total = await atags_for_job(factory, JOB_A, server_id=SERVER_A)
     assert total == 1
     assert items[0].name == "followup" and items[0].tag_id == replacement.tag_id
     # Replacement equal to the removed tag is rejected up front.
     with pytest.raises(TagStoreError) as excinfo:
-        await aremove_conversation_tag(
-            factory, CONV_A, replacement.tag_id, server_id=SERVER_A,
+        await aremove_job_tag(
+            factory, JOB_A, replacement.tag_id, server_id=SERVER_A,
             replacement_tag_id=replacement.tag_id,
         )
     assert excinfo.value.code is TagErrorCode.VALIDATION
@@ -432,17 +380,14 @@ async def test_force_deletes_only_when_every_entity_keeps_a_tag(
     factory, migrated_url
 ) -> None:
     _insert_job(migrated_url, JOB_A)
-    _insert_conversation(migrated_url, CONV_A)
     doomed = await acreate_tag(factory, name="doomed")
     await aassign_job_tag(factory, JOB_A, doomed.tag_id, server_id=SERVER_A)
-    await aassign_conversation_tag(factory, CONV_A, doomed.tag_id, server_id=SERVER_A)
 
     removed = await adelete_tag(factory, doomed.tag_id, force=True)
-    assert removed == 2
+    assert removed == 1
     assert _rows(migrated_url, "SELECT count(*) FROM tags WHERE tag_id = %s", (doomed.tag_id,))[0][0] == 0
-    # Both entities keep the reserved default (the 0011 invariant holds).
+    # The entity keeps the reserved default (the 0011 invariant holds).
     assert _rows(migrated_url, "SELECT count(*) FROM job_tags WHERE job_id = %s", (JOB_A,))[0][0] == 1
-    assert _rows(migrated_url, "SELECT count(*) FROM conversation_tags WHERE conversation_id = %s", (CONV_A,))[0][0] == 1
 
 
 @pytest.mark.anyio
@@ -519,17 +464,6 @@ async def test_batch_previews_are_bounded_and_scope_filtered(
         await apreview_job_tags(factory, [JOB_A], server_id=SERVER_A, preview_limit=0)
     with pytest.raises(ValueError):
         await apreview_job_tags(factory, [JOB_A], server_id=SERVER_A, preview_limit=11)
-
-    _insert_conversation(migrated_url, CONV_A)
-    conv_tag = await acreate_tag(factory, name="chat-tag")
-    await aassign_conversation_tag(
-        factory, CONV_A, conv_tag.tag_id, server_id=SERVER_A
-    )
-    conv_previews = await apreview_conversation_tags(
-        factory, [CONV_A], server_id=SERVER_A
-    )
-    assert conv_previews[CONV_A].preview == ("chat-tag", "unclassified")
-    assert conv_previews[CONV_A].total == 2
 
 
 # ---------------------------------------------------------------------------
@@ -650,34 +584,34 @@ async def test_two_concurrent_removers_loser_gets_typed_last_tag(
 async def test_concurrent_force_delete_vs_remover_typed_last_tag(
     factory, migrated_url
 ) -> None:
-    """Forced catalog deletion vs a concurrent conversation-tag remover.
+    """Forced catalog deletion vs a concurrent job-tag remover.
 
-    The conversation keeps two tags; the force-delete cascades one, the
-    remover takes the other. Exactly one writer survives, the loser is the
-    typed LAST_TAG refusal (commit-time P0001 for whoever loses the commit
-    race), never a raw ProgrammingError, and the conversation always keeps
-    exactly one final tag. Exercises adelete_tag and
-    aremove_conversation_tag commit paths together.
+    The job keeps two tags; the force-delete cascades one, the remover
+    takes the other. Exactly one writer survives, the loser is the typed
+    LAST_TAG refusal (commit-time P0001 for whoever loses the commit
+    race), never a raw ProgrammingError, and the job always keeps exactly
+    one final tag. Exercises adelete_tag and aremove_job_tag commit
+    paths together.
     """
-    _insert_conversation(migrated_url, CONV_A)
+    _insert_job(migrated_url, JOB_A)
     keeper = await acreate_tag(factory, name="keeper")
     doomed = await acreate_tag(factory, name="doomed")
-    await aremove_conversation_tag(
+    await aremove_job_tag(
         factory,
-        CONV_A,
+        JOB_A,
         uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID),
         server_id=SERVER_A,
         replacement_tag_id=keeper.tag_id,
     )
-    await aassign_conversation_tag(factory, CONV_A, doomed.tag_id, server_id=SERVER_A)
+    await aassign_job_tag(factory, JOB_A, doomed.tag_id, server_id=SERVER_A)
     assert _rows(
         migrated_url,
-        "SELECT count(*) FROM conversation_tags WHERE conversation_id = %s",
-        (CONV_A,),
+        "SELECT count(*) FROM job_tags WHERE job_id = %s",
+        (JOB_A,),
     )[0][0] == 2
 
     results = await asyncio.gather(
-        aremove_conversation_tag(factory, CONV_A, keeper.tag_id, server_id=SERVER_A),
+        aremove_job_tag(factory, JOB_A, keeper.tag_id, server_id=SERVER_A),
         adelete_tag(factory, doomed.tag_id, force=True),
         return_exceptions=True,
     )
@@ -696,11 +630,11 @@ async def test_concurrent_force_delete_vs_remover_typed_last_tag(
     assert isinstance(loser, TagStoreError), f"raw DB error leaked: {loser!r}"
     assert loser.code in {TagErrorCode.LAST_TAG, TagErrorCode.TAG_IN_USE}
     # Final-tag preservation in every interleaving: exactly one tag remains
-    # on the conversation.
+    # on the job.
     remaining = _rows(
         migrated_url,
-        "SELECT tag_id FROM conversation_tags WHERE conversation_id = %s",
-        (CONV_A,),
+        "SELECT tag_id FROM job_tags WHERE job_id = %s",
+        (JOB_A,),
     )
     assert len(remaining) == 1
     assert remaining[0][0] in (keeper.tag_id, doomed.tag_id)

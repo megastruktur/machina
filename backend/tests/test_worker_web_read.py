@@ -274,9 +274,6 @@ class TestRuntimeInvocation:
         asserts that the production composition calls the very seam the
         ``web.read`` executor is built from.
         """
-        from mai.agents import delegate as agent_delegate
-        from mai.agents import run as agent_run
-
         calls: list[object] = []
         original = worker._build_web_read_capability
 
@@ -286,15 +283,9 @@ class TestRuntimeInvocation:
 
         monkeypatch.setattr(worker, "_build_web_read_capability", spy)
         monkeypatch.setenv("MAI_DATA_ROOT", str(tmp_path))
-        agent_run.reset_agent_run()
-        agent_delegate.reset_delegation()
-        try:
-            worker._configure_default_agent_runtime(
-                "postgresql://mai:mai@127.0.0.1:5999/mai"
-            )
-        finally:
-            agent_run.reset_agent_run()
-            agent_delegate.reset_delegation()
+        worker._configure_default_agent_runtime(
+            "postgresql://mai:mai@127.0.0.1:5999/mai"
+        )
 
         assert len(calls) == 1
         # Production wiring passes no transport/resolver seam: real DNS,

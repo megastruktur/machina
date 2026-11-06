@@ -19,7 +19,6 @@ captured stdout or evidence.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import subprocess
 import sys
@@ -33,7 +32,6 @@ from alembic.config import Config as AlembicConfig
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from mai.auth.sessions import (
     MAX_LIVE_SESSIONS,
@@ -59,7 +57,10 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 #: assertions below target the chain TIP, so this constant tracks the full
 #: chain (0001 profiles, 0002 sessions, 0003 approvals, 0004 jobs, 0005
 #: knowledge, 0006 applications, 0007 observations) rather than pinning a head.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001", "0002", "0003", "0004", "0005", "0006", "0007",
+    "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
+)
 
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-02-auth-store-only"
@@ -88,11 +89,11 @@ def migrated_url() -> str:
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS approvals, admin_sessions, "
-                "admin_credential, profile_projection_journal, "
-                "profile_projection, alembic_version"
-            )
+            # Whole-schema reset (D09): FK-safe and immune to future revisions
+            # (the enumerated drop list went stale across migrations).
+            conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+            conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
             conn.commit()
         command.upgrade(_alembic_config(), "head")
     finally:

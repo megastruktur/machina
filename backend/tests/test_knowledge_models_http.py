@@ -396,17 +396,10 @@ def _drop_app_tables(url: str) -> None:
     import psycopg
 
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS job_resource_locks, job_schedule_fires, "
-            "job_schedules, job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, observation_findings, notification_alerts, "
-            "server_observations, knowledge_doc_chunks, knowledge_documents, "
-            "application_projection, application_projection_journal, "
-            "alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future revisions.
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
         conn.commit()
 
 
@@ -1088,7 +1081,8 @@ class TestOpenApiContract:
         ):
             assert name in components
         # Earlier surfaces' components stay intact (no namespace collision).
-        for name in ("ChatCancelBody", "RunSubmitBody", "PlanView"):
+        # (The ChatCancelBody witness died with the D09 chat deletion.)
+        for name in ("RunSubmitBody", "PlanView"):
             assert name in components
 
     def test_no_route_bypasses_the_api_prefix(self) -> None:

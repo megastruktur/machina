@@ -33,12 +33,10 @@ from pathlib import Path
 
 import pytest
 
-from mai.agents.context import load_server_context
 from mai.agents.model_store import ModelConfigStore
 from mai.capabilities.dispatch import (
     CapabilityCall,
     CapabilityDispatcher,
-    DispatchOutcome,
     ExecutorResult,
 )
 from mai.capabilities.logs import (
@@ -47,7 +45,7 @@ from mai.capabilities.logs import (
 )
 from mai.database import create_app_engine
 from mai.knowledge.documents import DocumentStore
-from mai.knowledge.generate import DocGenerator, GenerateResult
+from mai.knowledge.generate import DocGenerator
 from mai.knowledge.retrieve import (
     CAPABILITY_ID as CAP_DOCS_RETRIEVE,
     descriptor as retrieve_descriptor,

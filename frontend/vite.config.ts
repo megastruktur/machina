@@ -15,6 +15,20 @@ export default defineConfig({
 	preview: {
 		host: '127.0.0.1',
 		port: 4173,
-		strictPort: true
+		strictPort: true,
+		// D08 live-shell E2E: when MAI_PREVIEW_API_PROXY is set, the preview
+		// on the E2E port proxies same-origin /api (REST *and* WebSocket) to
+		// the spawned backend — mirroring the reviewed single-proxy
+		// deployment. Unset in every other context (zero behavior change).
+		...(process.env.MAI_PREVIEW_API_PROXY
+			? {
+					proxy: {
+						'/api': {
+							target: process.env.MAI_PREVIEW_API_PROXY,
+							ws: true
+						}
+					}
+				}
+			: {})
 	}
 });

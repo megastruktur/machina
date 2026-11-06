@@ -2,6 +2,15 @@ import { test, type Page } from '@playwright/test';
 import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
+// The hostile-content fixtures reference this marker on `window`; the
+// declaration moved here from the deleted chat.spec.ts (D09).
+declare global {
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	interface Window {
+		__maiPwned?: number;
+	}
+}
+
 /**
  * 10-web-evidence — real-browser proofs for the reusable observation/finding
  * evidence details component (`ObservationDetails.svelte`).

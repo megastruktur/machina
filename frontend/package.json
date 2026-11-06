@@ -12,7 +12,8 @@
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-		"test:browser": "playwright test"
+		"test:browser": "playwright test",
+		"generate:session-channel": "(cd ../backend && uv run python -m mai.scripts.export_session_channel_schema --out ../frontend/src/lib/api/session-channel.schema.json) && pnpm exec json2ts --output src/lib/api/session-channel.generated.ts src/lib/api/session-channel.schema.json"
 	},
 	"devDependencies": {
 		"@playwright/test": "1.64.0",
@@ -20,6 +21,8 @@
 		"@sveltejs/kit": "2.70.3",
 		"@sveltejs/vite-plugin-svelte": "6.2.4",
 		"@tailwindcss/vite": "^4.3.3",
+		"@types/node": "^26.6.6",
+		"json-schema-to-typescript": "16.0.0",
 		"svelte": "5.57.2",
 		"svelte-check": "4.7.6",
 		"tailwindcss": "^4.3.3",

@@ -70,7 +70,10 @@ HOST_KEY = "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
 # 0005 knowledge, 0006 applications and 0007 observations. Head assertions
 # below target the chain TIP, so this constant tracks the full chain rather
 # than pinning a head.
-REVISION_IDS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007")
+REVISION_IDS = (
+    "0001", "0002", "0003", "0004", "0005", "0006", "0007",
+    "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
+)
 
 
 def _profile_text(server_id: uuid.UUID, name: str = "build-host") -> str:
@@ -119,12 +122,11 @@ def migrated_url() -> str:
     os.environ["MAI_DATABASE_URL"] = url  # migrations/env.py contract
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(
-                "DROP TABLE IF EXISTS approvals, "
-                "profile_projection_journal, "
-                "profile_projection, admin_sessions, admin_credential, "
-                "alembic_version"
-            )
+            # Whole-schema reset (D09): FK-safe and immune to future revisions
+            # (the enumerated drop list went stale across migrations).
+            conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+            conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
             conn.commit()
         command.upgrade(_alembic_config(), "head")
     finally:

@@ -63,13 +63,11 @@ def _alembic_config() -> AlembicConfig:
 def _drop_app_tables(url: str) -> None:
     """Reset the fixture database to pre-bootstrap state."""
     with psycopg.connect(url) as conn:
-        conn.execute(
-            "DROP TABLE IF EXISTS knowledge_doc_chunks, knowledge_documents, "
-            "job_resource_locks, job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
+        # Whole-schema reset (D09): FK-safe and immune to future revisions
+        # (the enumerated drop list went stale across migrations).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
@@ -235,7 +233,6 @@ async def docs_app(migrated_url: str, embeddings_url: str, tmp_path: Path):
 @pytest.fixture
 def embeddings_ctl(embeddings_url: str):
     """Handle to the session fixture server for outage toggling."""
-    import urllib.request
 
     server_holder: dict[str, Any] = {}
 

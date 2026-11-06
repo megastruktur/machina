@@ -1,0 +1,4386 @@
+{
+  "$id": "https://mai.dev/schemas/session-channel/v1/session-channel.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MAI session channel frames",
+  "description": "Versioned (protocol v1) session channel frames; frame ceiling 65536 bytes; generated from mai.contracts.session_channel \u2014 never hand-edited.",
+  "oneOf": [
+    {
+      "$id": "https://mai.dev/schemas/session-channel/v1/client-channel-frame.json",
+      "title": "ClientChannelFrame",
+      "additionalProperties": false,
+      "description": "Export envelope: one client frame (the discriminated union).",
+      "properties": {
+        "frame": {
+          "description": "One versioned client channel frame (discriminated on type)",
+          "discriminator": {
+            "mapping": {
+              "ack": "#/$defs/ClientAckFrame",
+              "hello": "#/$defs/ClientHelloFrame",
+              "ping": "#/$defs/ClientPingFrame",
+              "subscribe": "#/$defs/ClientSubscribeFrame"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/definitions/ClientHelloFrame"
+            },
+            {
+              "$ref": "#/definitions/ClientSubscribeFrame"
+            },
+            {
+              "$ref": "#/definitions/ClientAckFrame"
+            },
+            {
+              "$ref": "#/definitions/ClientPingFrame"
+            }
+          ],
+          "title": "Frame"
+        }
+      },
+      "required": [
+        "frame"
+      ],
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "definitions": {
+        "ClientAckFrame": {
+          "additionalProperties": false,
+          "description": "Advance THIS connection's committed cursor (affects only the\nconnection's own catch-up; the durable store is the only authority).",
+          "properties": {
+            "type": {
+              "const": "ack",
+              "default": "ack",
+              "description": "Frame discriminator: committed-cursor acknowledgement",
+              "title": "Type",
+              "type": "string"
+            },
+            "after_seq": {
+              "description": "The client's own committed cursor (last handled sequence)",
+              "minimum": 1,
+              "title": "After Seq",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "after_seq"
+          ],
+          "title": "ClientAckFrame",
+          "type": "object"
+        },
+        "ClientHelloFrame": {
+          "additionalProperties": false,
+          "description": "Open one channel: protocol handshake + replay cursor + the CSRF\ndouble-submit proof (constant-time compared against the cookie).",
+          "properties": {
+            "type": {
+              "const": "hello",
+              "default": "hello",
+              "description": "Frame discriminator: channel open request",
+              "title": "Type",
+              "type": "string"
+            },
+            "protocol_version": {
+              "description": "Protocol version the client speaks (this server accepts exactly 1; anything else is refused version_unsupported)",
+              "maximum": 64,
+              "minimum": 1,
+              "title": "Protocol Version",
+              "type": "integer"
+            },
+            "after_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replay cursor: committed entries strictly after this sequence are replayed; None means newest-page snapshot",
+              "title": "After Seq"
+            },
+            "csrf_token": {
+              "description": "Double-submit CSRF proof equal to the mai_csrf cookie",
+              "maxLength": 256,
+              "minLength": 1,
+              "title": "Csrf Token",
+              "type": "string"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of this channel open",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "csrf_token",
+            "client_request_id"
+          ],
+          "title": "ClientHelloFrame",
+          "type": "object"
+        },
+        "ClientPingFrame": {
+          "additionalProperties": false,
+          "description": "Application-level heartbeat probe; answered by ``pong``.",
+          "properties": {
+            "type": {
+              "const": "ping",
+              "default": "ping",
+              "description": "Frame discriminator: heartbeat probe",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "title": "ClientPingFrame",
+          "type": "object"
+        },
+        "ClientSubscribeFrame": {
+          "additionalProperties": false,
+          "description": "(Re-)subscribe from a cursor: bounded replay of committed entries\nafter ``after_seq``, then live delivery.",
+          "properties": {
+            "type": {
+              "const": "subscribe",
+              "default": "subscribe",
+              "description": "Frame discriminator: replay/re-subscribe request",
+              "title": "Type",
+              "type": "string"
+            },
+            "after_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replay cursor for this subscription (None: newest page)",
+              "title": "After Seq"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of this subscription request",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "client_request_id"
+          ],
+          "title": "ClientSubscribeFrame",
+          "type": "object"
+        },
+        "AssistantMessageEntry": {
+          "additionalProperties": false,
+          "description": "One assistant model response (sfc_RESEARCH \u00a72): bounded safe text\nand/or ordered structured tool-call parts, plus the model metadata needed\nfor native continuation and explicit provider reasoning artifacts.",
+          "properties": {
+            "kind": {
+              "const": "assistant_message",
+              "description": "Discriminator: this payload is an assistant message entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "default": "",
+              "description": "Bounded assistant text (empty when the round was pure tool use)",
+              "maxLength": 20000,
+              "title": "Text",
+              "type": "string"
+            },
+            "tool_calls": {
+              "description": "Ordered structured tool-call parts of this assistant round",
+              "items": {
+                "$ref": "#/definitions/ToolCallItem"
+              },
+              "maxItems": 16,
+              "title": "Tool Calls",
+              "type": "array"
+            },
+            "model_profile": {
+              "description": "Model profile identity that produced this assistant round",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Model Profile",
+              "type": "string"
+            },
+            "provider_artifacts": {
+              "description": "Explicit safe provider reasoning artifacts (never raw chain-of-thought)",
+              "items": {
+                "$ref": "#/definitions/ProviderReasoningArtifact"
+              },
+              "maxItems": 8,
+              "title": "Provider Artifacts",
+              "type": "array"
+            },
+            "tool_group_state": {
+              "default": "none",
+              "description": "Atomic tool-group status: none, pending, complete or unresolved",
+              "enum": [
+                "none",
+                "pending",
+                "complete",
+                "unresolved"
+              ],
+              "title": "Tool Group State",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model_profile"
+          ],
+          "title": "AssistantMessageEntry",
+          "type": "object"
+        },
+        "CompactionEntry": {
+          "additionalProperties": false,
+          "description": "One compaction marker (sfc_RESEARCH \u00a75: metadata/pointer, not a hidden\nuser message \u2014 originals stay stored and addressable; ``session_id``\nnever rotates).",
+          "properties": {
+            "kind": {
+              "const": "compaction",
+              "description": "Discriminator: this payload is a compaction marker",
+              "title": "Kind",
+              "type": "string"
+            },
+            "compaction_id": {
+              "description": "Stable identity of this compaction generation",
+              "format": "uuid",
+              "title": "Compaction Id",
+              "type": "string"
+            },
+            "from_seq": {
+              "description": "First covered session sequence number (inclusive)",
+              "minimum": 1,
+              "title": "From Seq",
+              "type": "integer"
+            },
+            "to_seq": {
+              "description": "Last covered session sequence number (inclusive)",
+              "minimum": 1,
+              "title": "To Seq",
+              "type": "integer"
+            },
+            "summary_text": {
+              "description": "Bounded summary of the covered entry range with provenance",
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Summary Text",
+              "type": "string"
+            },
+            "model_profile": {
+              "description": "Model profile identity the summary was produced for",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Model Profile",
+              "type": "string"
+            },
+            "token_usage_anchor": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Actual provider usage anchor of the summarized source range",
+              "title": "Token Usage Anchor"
+            }
+          },
+          "required": [
+            "kind",
+            "compaction_id",
+            "from_seq",
+            "to_seq",
+            "summary_text",
+            "model_profile"
+          ],
+          "title": "CompactionEntry",
+          "type": "object"
+        },
+        "ControlActionKind": {
+          "description": "Deterministic session control actions (sfc_RESEARCH \u00a76 frame families;\ncontrols acknowledge \u2014 they are never interpreted as user authority).",
+          "enum": [
+            "steer",
+            "pause",
+            "cancel",
+            "approve",
+            "deny_approval",
+            "reconcile"
+          ],
+          "title": "ControlActionKind",
+          "type": "string"
+        },
+        "ControlEntry": {
+          "additionalProperties": false,
+          "description": "One acknowledged control action (sfc_RESEARCH \u00a72: approval/cancel/\nreconcile/steer acknowledgements \u2014 never interpreted as user authority).",
+          "properties": {
+            "kind": {
+              "const": "control",
+              "description": "Discriminator: this payload is a control acknowledgement",
+              "title": "Kind",
+              "type": "string"
+            },
+            "action": {
+              "$ref": "#/definitions/ControlActionKind",
+              "description": "Deterministic control action that was acknowledged"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of the control request",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            },
+            "target_run_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Run the control action targeted, when scoped to one run",
+              "title": "Target Run Id"
+            },
+            "approval_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Approval record id when the action decided an approval",
+              "title": "Approval Id"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "maxLength": 500,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free bounded operator note carried with the action",
+              "title": "Note"
+            }
+          },
+          "required": [
+            "kind",
+            "action",
+            "client_request_id"
+          ],
+          "title": "ControlEntry",
+          "type": "object"
+        },
+        "DelegationEntry": {
+          "additionalProperties": false,
+          "description": "One delegation relation (sfc_RESEARCH \u00a74): child linkage, bounded\ngoal/status and explicit allowed capabilities \u2014 the child receives a\nbounded context, never ambient parent state.",
+          "properties": {
+            "kind": {
+              "const": "delegation",
+              "description": "Discriminator: this payload is a delegation entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "child_run_id": {
+              "description": "Run identity of the delegated child execution",
+              "format": "uuid",
+              "title": "Child Run Id",
+              "type": "string"
+            },
+            "child_session_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Session identity of the child when it owns a distinct session",
+              "title": "Child Session Id"
+            },
+            "goal": {
+              "description": "Bounded explicit goal handed to the child",
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Goal",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "Current frozen lifecycle state of the child run"
+            },
+            "allowed_capabilities": {
+              "description": "Explicit narrowed capability grants of the child execution",
+              "items": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 16,
+              "title": "Allowed Capabilities",
+              "type": "array"
+            },
+            "result_summary": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded immutable child result summary once the child settles",
+              "title": "Result Summary"
+            },
+            "error_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable delegation error code when refused",
+              "title": "Error Code"
+            }
+          },
+          "required": [
+            "kind",
+            "child_run_id",
+            "goal",
+            "status",
+            "allowed_capabilities"
+          ],
+          "title": "DelegationEntry",
+          "type": "object"
+        },
+        "DocumentAttachRef": {
+          "additionalProperties": false,
+          "description": "Provenance reference of a document-attach admission (sfc_INTENT \u00a78):\nthe excerpt text travels as bounded untrusted user content; this ref\ncarries only the source identity and a safe out-of-band artifact\nreference \u2014 never inline document bytes.",
+          "properties": {
+            "document_id": {
+              "description": "Opaque stable document identity the excerpt came from",
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            },
+            "artifact_ref": {
+              "description": "Safe out-of-band reference to the stored excerpt artifact",
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Artifact Ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "document_id",
+            "artifact_ref"
+          ],
+          "title": "DocumentAttachRef",
+          "type": "object"
+        },
+        "DomainOutcome": {
+          "description": "Domain-level outcome; ``unknown`` is honest for arbitrary shell work\n(\u00a79: no regex oracle claims semantic success).",
+          "enum": [
+            "success",
+            "failure",
+            "unknown"
+          ],
+          "title": "DomainOutcome",
+          "type": "string"
+        },
+        "EffectCertainty": {
+          "description": "How certain the effect evidence is (\u00a79 ``effect_certainty``).",
+          "enum": [
+            "certain",
+            "uncertain",
+            "unknown"
+          ],
+          "title": "EffectCertainty",
+          "type": "string"
+        },
+        "ExecutionStatus": {
+          "description": "Compact technical execution status of the closing attempt (\u00a79 receipt;\nvalues subset the frozen C04 ``CommandOutcome`` vocabulary).",
+          "enum": [
+            "succeeded",
+            "failed",
+            "outcome_unknown",
+            "cancelled"
+          ],
+          "title": "ExecutionStatus",
+          "type": "string"
+        },
+        "ProviderReasoningArtifact": {
+          "additionalProperties": false,
+          "description": "Explicit safe provider reasoning artifact (sfc_INTENT clarification 5:\nraw unvalidated chain-of-thought is never authoritative history; only\nprovider-supported summary/signature/opaque references are carried, and\nonly when actually required and reviewed).",
+          "properties": {
+            "provider": {
+              "description": "Provider/model family the artifact is compatible with",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            },
+            "artifact_kind": {
+              "description": "Artifact class: bounded summary, provider signature or opaque reference token",
+              "enum": [
+                "summary",
+                "signature",
+                "opaque_ref"
+              ],
+              "title": "Artifact Kind",
+              "type": "string"
+            },
+            "content": {
+              "description": "Bounded artifact payload or reference token",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "redacted": {
+              "default": false,
+              "description": "True when content was deliberately redacted (no fidelity claim)",
+              "title": "Redacted",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "artifact_kind",
+            "content"
+          ],
+          "title": "ProviderReasoningArtifact",
+          "type": "object"
+        },
+        "RunStateEntry": {
+          "additionalProperties": false,
+          "description": "One deterministic run-state transition (sfc_RESEARCH \u00a72: execution\nstatus and safe reason linked to a run \u2014 never model prose).",
+          "properties": {
+            "kind": {
+              "const": "run_state",
+              "description": "Discriminator: this payload is a run-state transition",
+              "title": "Kind",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "New frozen run lifecycle state after this transition"
+            },
+            "reason_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable transition reason code when present",
+              "title": "Reason Code"
+            },
+            "detail": {
+              "anyOf": [
+                {
+                  "maxLength": 500,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free bounded transition detail for operators",
+              "title": "Detail"
+            }
+          },
+          "required": [
+            "kind",
+            "state"
+          ],
+          "title": "RunStateEntry",
+          "type": "object"
+        },
+        "RunbookRef": {
+          "additionalProperties": false,
+          "description": "Provenance reference of a runbook-session admission (sfc_INTENT \u00a77):\nrunbook execution is a fresh non-interactive session carrying immutable\nservice/runbook references.",
+          "properties": {
+            "service_id": {
+              "description": "Opaque adopted-service identity owning the runbook",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Service Id",
+              "type": "string"
+            },
+            "runbook_id": {
+              "description": "Stable runbook identity inside the adopted service",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Runbook Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "service_id",
+            "runbook_id"
+          ],
+          "title": "RunbookRef",
+          "type": "object"
+        },
+        "ServerChannelErrorFrame": {
+          "additionalProperties": false,
+          "description": "Bounded, VALUE-FREE channel error (never content, never secrets).",
+          "properties": {
+            "type": {
+              "const": "error",
+              "default": "error",
+              "description": "Frame discriminator: bounded value-free channel error",
+              "title": "Type",
+              "type": "string"
+            },
+            "code": {
+              "description": "Stable machine-readable error code",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Code",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Value-free bounded reason (never echoes content)",
+              "maxLength": 200,
+              "title": "Reason",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "reason"
+          ],
+          "title": "ServerChannelErrorFrame",
+          "type": "object"
+        },
+        "ServerCommittedFrame": {
+          "additionalProperties": false,
+          "description": "ONE durable entry, delivered exactly once per ``seq`` per\nconnection (the snapshot/live race is resolved by the connection's\ndelivered-through cursor).",
+          "properties": {
+            "type": {
+              "const": "committed",
+              "default": "committed",
+              "description": "Frame discriminator: one durable committed entry",
+              "title": "Type",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Connection stream identity carrying this delivery",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "entry": {
+              "$ref": "#/definitions/SessionEntryView",
+              "description": "The durable committed entry (bound to entry_id + seq)"
+            }
+          },
+          "required": [
+            "stream_id",
+            "entry"
+          ],
+          "title": "ServerCommittedFrame",
+          "type": "object"
+        },
+        "ServerDeltaFrame": {
+          "additionalProperties": false,
+          "description": "VOLATILE, uncommitted stream text. Bound to ``(stream_id,\ndelta_id)``; durable NOWHERE; never a committed entry; dropped first\nunder backpressure.",
+          "properties": {
+            "type": {
+              "const": "delta",
+              "default": "delta",
+              "description": "Frame discriminator: volatile stream text delta",
+              "title": "Type",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Volatile stream identity this delta belongs to",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "delta_id": {
+              "description": "Ordered delta identity within its stream",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Delta Id",
+              "type": "string"
+            },
+            "text": {
+              "description": "Bounded uncommitted text chunk (volatile, never durable, never authority)",
+              "maxLength": 4096,
+              "title": "Text",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "Run whose volatile stream produced this delta",
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream_id",
+            "delta_id",
+            "text",
+            "run_id"
+          ],
+          "title": "ServerDeltaFrame",
+          "type": "object"
+        },
+        "ServerEntriesFrame": {
+          "additionalProperties": false,
+          "description": "One bounded ordered replay page (cursor resume). Every page carries\nthe honest continuation cursor; a huge requested range arrives as\nbounded pages plus ``resync_required``, never one full transcript.",
+          "properties": {
+            "type": {
+              "const": "entries",
+              "default": "entries",
+              "description": "Frame discriminator: bounded ordered replay page",
+              "title": "Type",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Bounded committed entries strictly after the client cursor, in sequence order",
+              "items": {
+                "$ref": "#/definitions/SessionEntryView"
+              },
+              "maxItems": 50,
+              "title": "Entries",
+              "type": "array"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence on the session",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "has_more": {
+              "description": "True when more replay pages follow",
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "has_older": {
+              "description": "True when older committed entries exist below this page",
+              "title": "Has Older",
+              "type": "boolean"
+            },
+            "next_before_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exclusive keyset cursor for the next older page, when has_older",
+              "title": "Next Before Seq"
+            }
+          },
+          "required": [
+            "entries",
+            "latest_seq",
+            "has_more",
+            "has_older"
+          ],
+          "title": "ServerEntriesFrame",
+          "type": "object"
+        },
+        "ServerHelloOkFrame": {
+          "additionalProperties": false,
+          "description": "Handshake accepted: protocol pinned, stream/scope identity and the\nsession's latest committed sequence.",
+          "properties": {
+            "type": {
+              "const": "hello_ok",
+              "default": "hello_ok",
+              "description": "Frame discriminator: handshake accepted",
+              "title": "Type",
+              "type": "string"
+            },
+            "protocol_version": {
+              "description": "Protocol version the server pinned for this connection",
+              "minimum": 1,
+              "title": "Protocol Version",
+              "type": "integer"
+            },
+            "session_id": {
+              "description": "Session identity this connection is bound to",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "server_id": {
+              "description": "Server scope pinning the bound session",
+              "format": "uuid",
+              "title": "Server Id",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Volatile stream identity of this connection (deltas are bound to it; committed entries are not)",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "latest_seq": {
+              "description": "Highest committed entry sequence at handshake time",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "capabilities": {
+              "description": "Bounded optional channel capabilities the server offers",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "title": "Capabilities",
+              "type": "array"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "session_id",
+            "server_id",
+            "stream_id",
+            "latest_seq"
+          ],
+          "title": "ServerHelloOkFrame",
+          "type": "object"
+        },
+        "ServerPongFrame": {
+          "additionalProperties": false,
+          "description": "Heartbeat answer.",
+          "properties": {
+            "type": {
+              "const": "pong",
+              "default": "pong",
+              "description": "Frame discriminator: heartbeat answer",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "title": "ServerPongFrame",
+          "type": "object"
+        },
+        "ServerResyncRequiredFrame": {
+          "additionalProperties": false,
+          "description": "The connection lost continuity (cursor forgery suspected, replay\nbudget exhausted, outbox overflow): the client MUST re-snapshot from\nthe durable store.",
+          "properties": {
+            "type": {
+              "const": "resync_required",
+              "default": "resync_required",
+              "description": "Frame discriminator: client must re-snapshot",
+              "title": "Type",
+              "type": "string"
+            },
+            "reason_code": {
+              "description": "Stable machine-readable resync reason",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Reason Code",
+              "type": "string"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence known to the server",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "reason_code",
+            "latest_seq"
+          ],
+          "title": "ServerResyncRequiredFrame",
+          "type": "object"
+        },
+        "ServerRunStateFrame": {
+          "additionalProperties": false,
+          "description": "One frozen run-state transition mirrored from the durable\n``run_state`` entries (never model prose).",
+          "properties": {
+            "type": {
+              "const": "run_state",
+              "default": "run_state",
+              "description": "Frame discriminator: frozen run-state transition",
+              "title": "Type",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "Run whose lifecycle state changed",
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "New frozen lifecycle state of the run"
+            },
+            "reason_code": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable transition reason, when present",
+              "title": "Reason Code"
+            }
+          },
+          "required": [
+            "run_id",
+            "state"
+          ],
+          "title": "ServerRunStateFrame",
+          "type": "object"
+        },
+        "ServerSnapshotFrame": {
+          "additionalProperties": false,
+          "description": "Bounded newest-page snapshot (no cursor handshake). The page shape\nmirrors the D01 history page: explicit cursor continuity fields, byte\nbounds and honest truncation.",
+          "properties": {
+            "type": {
+              "const": "snapshot",
+              "default": "snapshot",
+              "description": "Frame discriminator: bounded newest-page snapshot",
+              "title": "Type",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Session identity the snapshot belongs to",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Bounded newest committed entries (chronological)",
+              "items": {
+                "$ref": "#/definitions/SessionEntryView"
+              },
+              "maxItems": 30,
+              "title": "Entries",
+              "type": "array"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence on the session (snapshot ordering authority)",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "has_more": {
+              "description": "True when newer committed entries exist above this page",
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "has_older": {
+              "description": "True when older committed entries exist below this page",
+              "title": "Has Older",
+              "type": "boolean"
+            },
+            "oldest_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Lowest sequence carried by this snapshot, when non-empty",
+              "title": "Oldest Seq"
+            },
+            "next_before_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exclusive keyset cursor for the next older page, when has_older",
+              "title": "Next Before Seq"
+            },
+            "byte_size": {
+              "description": "Declared serialized size of the snapshot entries",
+              "maximum": 65536,
+              "minimum": 0,
+              "title": "Byte Size",
+              "type": "integer"
+            },
+            "truncated_by_bytes": {
+              "description": "True when the byte budget cut entries before the count limit",
+              "title": "Truncated By Bytes",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "session_id",
+            "entries",
+            "latest_seq",
+            "has_more",
+            "has_older",
+            "byte_size",
+            "truncated_by_bytes"
+          ],
+          "title": "ServerSnapshotFrame",
+          "type": "object"
+        },
+        "SessionEntryView": {
+          "additionalProperties": false,
+          "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
+          "properties": {
+            "schema_version": {
+              "default": 1,
+              "description": "Contract schema version of this entry envelope",
+              "title": "Schema Version",
+              "type": "integer"
+            },
+            "entry_id": {
+              "description": "Stable domain-entry identity inside its session",
+              "format": "uuid",
+              "title": "Entry Id",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Owning session identity (the only conversation root)",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "seq": {
+              "description": "Session-local monotonic sequence number of this entry",
+              "minimum": 1,
+              "title": "Seq",
+              "type": "integer"
+            },
+            "run_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Subordinate run that produced this entry, when run-scoped",
+              "title": "Run Id"
+            },
+            "durable_source_id": {
+              "description": "Stable producer source id backing idempotent re-appends",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Durable Source Id",
+              "type": "string"
+            },
+            "created_at": {
+              "description": "UTC commit timestamp of this entry",
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "payload": {
+              "description": "Discriminated domain payload (union discriminated on `kind`)",
+              "discriminator": {
+                "mapping": {
+                  "assistant_message": "#/$defs/AssistantMessageEntry",
+                  "compaction": "#/$defs/CompactionEntry",
+                  "control": "#/$defs/ControlEntry",
+                  "delegation": "#/$defs/DelegationEntry",
+                  "run_state": "#/$defs/RunStateEntry",
+                  "tool_result": "#/$defs/ToolResultEntry",
+                  "user_message": "#/$defs/UserMessageEntry"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/definitions/UserMessageEntry"
+                },
+                {
+                  "$ref": "#/definitions/AssistantMessageEntry"
+                },
+                {
+                  "$ref": "#/definitions/ToolResultEntry"
+                },
+                {
+                  "$ref": "#/definitions/RunStateEntry"
+                },
+                {
+                  "$ref": "#/definitions/DelegationEntry"
+                },
+                {
+                  "$ref": "#/definitions/ControlEntry"
+                },
+                {
+                  "$ref": "#/definitions/CompactionEntry"
+                }
+              ],
+              "title": "Payload"
+            }
+          },
+          "required": [
+            "entry_id",
+            "session_id",
+            "seq",
+            "durable_source_id",
+            "created_at",
+            "payload"
+          ],
+          "title": "SessionEntryView",
+          "type": "object"
+        },
+        "SessionRunState": {
+          "description": "Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;\n``outcome_unknown`` is honest after a crash \u2014 never silently terminal).",
+          "enum": [
+            "queued",
+            "running",
+            "waiting_approval",
+            "waiting_child",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "outcome_unknown"
+          ],
+          "title": "SessionRunState",
+          "type": "string"
+        },
+        "SessionSourceKind": {
+          "description": "How a session came into existence (sfc_INTENT \u00a77 runbook/document\ndecisions): interactive chat, runbook execution, document attach, API.",
+          "enum": [
+            "interactive",
+            "runbook",
+            "document_attach",
+            "api"
+          ],
+          "title": "SessionSourceKind",
+          "type": "string"
+        },
+        "ToolCallItem": {
+          "additionalProperties": false,
+          "description": "One structured assistant tool-call part (sfc_RESEARCH \u00a72 assistant\nentries carry ordered safe text and structured tool-call parts).",
+          "properties": {
+            "call_id": {
+              "description": "Provider tool-call id; pairs the call with its result",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Call Id",
+              "type": "string"
+            },
+            "tool_name": {
+              "description": "Registered capability tool name that was invoked",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "capability_id": {
+              "description": "Capability descriptor id behind the invoked tool name",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Capability Id",
+              "type": "string"
+            },
+            "args": {
+              "additionalProperties": true,
+              "description": "Bounded tool-call arguments as produced by the model",
+              "title": "Args",
+              "type": "object"
+            },
+            "target_server_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Explicit target server scope for multi-target capabilities",
+              "title": "Target Server Id"
+            }
+          },
+          "required": [
+            "call_id",
+            "tool_name",
+            "capability_id",
+            "args"
+          ],
+          "title": "ToolCallItem",
+          "type": "object"
+        },
+        "ToolResultEntry": {
+          "additionalProperties": false,
+          "description": "One tool result (sfc_RESEARCH \u00a72): call identity, the frozen bridge\nstatus and the three-layer execution/domain/certainty projection \u2014\npending/unknown results are never inferred successful (C03/C06).",
+          "properties": {
+            "kind": {
+              "const": "tool_result",
+              "description": "Discriminator: this payload is a tool result entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "call_id": {
+              "description": "Provider tool-call id this result answers",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Call Id",
+              "type": "string"
+            },
+            "tool_name": {
+              "description": "Registered capability tool name that was invoked",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "capability_id": {
+              "description": "Capability descriptor id behind the invoked tool name",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Capability Id",
+              "type": "string"
+            },
+            "status": {
+              "description": "Bridge lifecycle status: executed, denied, approval_required or unknown_effect",
+              "enum": [
+                "executed",
+                "denied",
+                "approval_required",
+                "unknown_effect"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "execution_status": {
+              "$ref": "#/definitions/ExecutionStatus",
+              "description": "Compact technical wrapper execution status of the attempt"
+            },
+            "domain_outcome": {
+              "$ref": "#/definitions/DomainOutcome",
+              "description": "Domain-level outcome; unknown is honest for arbitrary work"
+            },
+            "effect_certainty": {
+              "$ref": "#/definitions/EffectCertainty",
+              "description": "How certain the effect evidence is (certain/uncertain/unknown)"
+            },
+            "payload_hash": {
+              "description": "Canonical payload hash binding the result to its approval/dispatch envelope",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Payload Hash",
+              "type": "string"
+            },
+            "output_preview": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded redacted output preview; large output lives behind artifact references",
+              "title": "Output Preview"
+            },
+            "artifact_ref": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Safe out-of-band reference to the full stored tool result",
+              "title": "Artifact Ref"
+            },
+            "error_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable error code when the call failed",
+              "title": "Error Code"
+            },
+            "error_detail": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free fixed failure reason (never echoing contents)",
+              "title": "Error Detail"
+            },
+            "approval_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Approval record id when the call parked on the approval seam",
+              "title": "Approval Id"
+            }
+          },
+          "required": [
+            "kind",
+            "call_id",
+            "tool_name",
+            "capability_id",
+            "status",
+            "execution_status",
+            "domain_outcome",
+            "effect_certainty",
+            "payload_hash"
+          ],
+          "title": "ToolResultEntry",
+          "type": "object"
+        },
+        "UserMessageEntry": {
+          "additionalProperties": false,
+          "description": "One admitted user turn (sfc_RESEARCH \u00a72): bounded safe text, client\nrequest id for idempotency, source metadata and optional provenance\nreferences.",
+          "properties": {
+            "kind": {
+              "const": "user_message",
+              "description": "Discriminator: this payload is a user message entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "description": "Bounded user message text (untrusted content, never authority)",
+              "maxLength": 20000,
+              "title": "Text",
+              "type": "string"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of the admitted turn submission",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/definitions/SessionSourceKind",
+              "description": "How this turn entered the session (interactive, runbook, document attach or API)"
+            },
+            "document_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DocumentAttachRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Document provenance when the turn was a document attach"
+            },
+            "runbook_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RunbookRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Runbook provenance when the turn was a runbook execution"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "client_request_id",
+            "source"
+          ],
+          "title": "UserMessageEntry",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "$id": "https://mai.dev/schemas/session-channel/v1/server-channel-frame.json",
+      "title": "ServerChannelFrame",
+      "additionalProperties": false,
+      "description": "Export envelope: one server frame (the discriminated union).",
+      "properties": {
+        "frame": {
+          "description": "One versioned server channel frame (discriminated on type)",
+          "discriminator": {
+            "mapping": {
+              "committed": "#/$defs/ServerCommittedFrame",
+              "delta": "#/$defs/ServerDeltaFrame",
+              "entries": "#/$defs/ServerEntriesFrame",
+              "error": "#/$defs/ServerChannelErrorFrame",
+              "hello_ok": "#/$defs/ServerHelloOkFrame",
+              "pong": "#/$defs/ServerPongFrame",
+              "resync_required": "#/$defs/ServerResyncRequiredFrame",
+              "run_state": "#/$defs/ServerRunStateFrame",
+              "snapshot": "#/$defs/ServerSnapshotFrame"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/definitions/ServerHelloOkFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerSnapshotFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerEntriesFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerDeltaFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerCommittedFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerRunStateFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerResyncRequiredFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerChannelErrorFrame"
+            },
+            {
+              "$ref": "#/definitions/ServerPongFrame"
+            }
+          ],
+          "title": "Frame"
+        }
+      },
+      "required": [
+        "frame"
+      ],
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "definitions": {
+        "ClientAckFrame": {
+          "additionalProperties": false,
+          "description": "Advance THIS connection's committed cursor (affects only the\nconnection's own catch-up; the durable store is the only authority).",
+          "properties": {
+            "type": {
+              "const": "ack",
+              "default": "ack",
+              "description": "Frame discriminator: committed-cursor acknowledgement",
+              "title": "Type",
+              "type": "string"
+            },
+            "after_seq": {
+              "description": "The client's own committed cursor (last handled sequence)",
+              "minimum": 1,
+              "title": "After Seq",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "after_seq"
+          ],
+          "title": "ClientAckFrame",
+          "type": "object"
+        },
+        "ClientHelloFrame": {
+          "additionalProperties": false,
+          "description": "Open one channel: protocol handshake + replay cursor + the CSRF\ndouble-submit proof (constant-time compared against the cookie).",
+          "properties": {
+            "type": {
+              "const": "hello",
+              "default": "hello",
+              "description": "Frame discriminator: channel open request",
+              "title": "Type",
+              "type": "string"
+            },
+            "protocol_version": {
+              "description": "Protocol version the client speaks (this server accepts exactly 1; anything else is refused version_unsupported)",
+              "maximum": 64,
+              "minimum": 1,
+              "title": "Protocol Version",
+              "type": "integer"
+            },
+            "after_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replay cursor: committed entries strictly after this sequence are replayed; None means newest-page snapshot",
+              "title": "After Seq"
+            },
+            "csrf_token": {
+              "description": "Double-submit CSRF proof equal to the mai_csrf cookie",
+              "maxLength": 256,
+              "minLength": 1,
+              "title": "Csrf Token",
+              "type": "string"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of this channel open",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "csrf_token",
+            "client_request_id"
+          ],
+          "title": "ClientHelloFrame",
+          "type": "object"
+        },
+        "ClientPingFrame": {
+          "additionalProperties": false,
+          "description": "Application-level heartbeat probe; answered by ``pong``.",
+          "properties": {
+            "type": {
+              "const": "ping",
+              "default": "ping",
+              "description": "Frame discriminator: heartbeat probe",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "title": "ClientPingFrame",
+          "type": "object"
+        },
+        "ClientSubscribeFrame": {
+          "additionalProperties": false,
+          "description": "(Re-)subscribe from a cursor: bounded replay of committed entries\nafter ``after_seq``, then live delivery.",
+          "properties": {
+            "type": {
+              "const": "subscribe",
+              "default": "subscribe",
+              "description": "Frame discriminator: replay/re-subscribe request",
+              "title": "Type",
+              "type": "string"
+            },
+            "after_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replay cursor for this subscription (None: newest page)",
+              "title": "After Seq"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of this subscription request",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "client_request_id"
+          ],
+          "title": "ClientSubscribeFrame",
+          "type": "object"
+        },
+        "AssistantMessageEntry": {
+          "additionalProperties": false,
+          "description": "One assistant model response (sfc_RESEARCH \u00a72): bounded safe text\nand/or ordered structured tool-call parts, plus the model metadata needed\nfor native continuation and explicit provider reasoning artifacts.",
+          "properties": {
+            "kind": {
+              "const": "assistant_message",
+              "description": "Discriminator: this payload is an assistant message entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "default": "",
+              "description": "Bounded assistant text (empty when the round was pure tool use)",
+              "maxLength": 20000,
+              "title": "Text",
+              "type": "string"
+            },
+            "tool_calls": {
+              "description": "Ordered structured tool-call parts of this assistant round",
+              "items": {
+                "$ref": "#/definitions/ToolCallItem"
+              },
+              "maxItems": 16,
+              "title": "Tool Calls",
+              "type": "array"
+            },
+            "model_profile": {
+              "description": "Model profile identity that produced this assistant round",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Model Profile",
+              "type": "string"
+            },
+            "provider_artifacts": {
+              "description": "Explicit safe provider reasoning artifacts (never raw chain-of-thought)",
+              "items": {
+                "$ref": "#/definitions/ProviderReasoningArtifact"
+              },
+              "maxItems": 8,
+              "title": "Provider Artifacts",
+              "type": "array"
+            },
+            "tool_group_state": {
+              "default": "none",
+              "description": "Atomic tool-group status: none, pending, complete or unresolved",
+              "enum": [
+                "none",
+                "pending",
+                "complete",
+                "unresolved"
+              ],
+              "title": "Tool Group State",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model_profile"
+          ],
+          "title": "AssistantMessageEntry",
+          "type": "object"
+        },
+        "CompactionEntry": {
+          "additionalProperties": false,
+          "description": "One compaction marker (sfc_RESEARCH \u00a75: metadata/pointer, not a hidden\nuser message \u2014 originals stay stored and addressable; ``session_id``\nnever rotates).",
+          "properties": {
+            "kind": {
+              "const": "compaction",
+              "description": "Discriminator: this payload is a compaction marker",
+              "title": "Kind",
+              "type": "string"
+            },
+            "compaction_id": {
+              "description": "Stable identity of this compaction generation",
+              "format": "uuid",
+              "title": "Compaction Id",
+              "type": "string"
+            },
+            "from_seq": {
+              "description": "First covered session sequence number (inclusive)",
+              "minimum": 1,
+              "title": "From Seq",
+              "type": "integer"
+            },
+            "to_seq": {
+              "description": "Last covered session sequence number (inclusive)",
+              "minimum": 1,
+              "title": "To Seq",
+              "type": "integer"
+            },
+            "summary_text": {
+              "description": "Bounded summary of the covered entry range with provenance",
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Summary Text",
+              "type": "string"
+            },
+            "model_profile": {
+              "description": "Model profile identity the summary was produced for",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Model Profile",
+              "type": "string"
+            },
+            "token_usage_anchor": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Actual provider usage anchor of the summarized source range",
+              "title": "Token Usage Anchor"
+            }
+          },
+          "required": [
+            "kind",
+            "compaction_id",
+            "from_seq",
+            "to_seq",
+            "summary_text",
+            "model_profile"
+          ],
+          "title": "CompactionEntry",
+          "type": "object"
+        },
+        "ControlActionKind": {
+          "description": "Deterministic session control actions (sfc_RESEARCH \u00a76 frame families;\ncontrols acknowledge \u2014 they are never interpreted as user authority).",
+          "enum": [
+            "steer",
+            "pause",
+            "cancel",
+            "approve",
+            "deny_approval",
+            "reconcile"
+          ],
+          "title": "ControlActionKind",
+          "type": "string"
+        },
+        "ControlEntry": {
+          "additionalProperties": false,
+          "description": "One acknowledged control action (sfc_RESEARCH \u00a72: approval/cancel/\nreconcile/steer acknowledgements \u2014 never interpreted as user authority).",
+          "properties": {
+            "kind": {
+              "const": "control",
+              "description": "Discriminator: this payload is a control acknowledgement",
+              "title": "Kind",
+              "type": "string"
+            },
+            "action": {
+              "$ref": "#/definitions/ControlActionKind",
+              "description": "Deterministic control action that was acknowledged"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of the control request",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            },
+            "target_run_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Run the control action targeted, when scoped to one run",
+              "title": "Target Run Id"
+            },
+            "approval_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Approval record id when the action decided an approval",
+              "title": "Approval Id"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "maxLength": 500,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free bounded operator note carried with the action",
+              "title": "Note"
+            }
+          },
+          "required": [
+            "kind",
+            "action",
+            "client_request_id"
+          ],
+          "title": "ControlEntry",
+          "type": "object"
+        },
+        "DelegationEntry": {
+          "additionalProperties": false,
+          "description": "One delegation relation (sfc_RESEARCH \u00a74): child linkage, bounded\ngoal/status and explicit allowed capabilities \u2014 the child receives a\nbounded context, never ambient parent state.",
+          "properties": {
+            "kind": {
+              "const": "delegation",
+              "description": "Discriminator: this payload is a delegation entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "child_run_id": {
+              "description": "Run identity of the delegated child execution",
+              "format": "uuid",
+              "title": "Child Run Id",
+              "type": "string"
+            },
+            "child_session_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Session identity of the child when it owns a distinct session",
+              "title": "Child Session Id"
+            },
+            "goal": {
+              "description": "Bounded explicit goal handed to the child",
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Goal",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "Current frozen lifecycle state of the child run"
+            },
+            "allowed_capabilities": {
+              "description": "Explicit narrowed capability grants of the child execution",
+              "items": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 16,
+              "title": "Allowed Capabilities",
+              "type": "array"
+            },
+            "result_summary": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded immutable child result summary once the child settles",
+              "title": "Result Summary"
+            },
+            "error_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable delegation error code when refused",
+              "title": "Error Code"
+            }
+          },
+          "required": [
+            "kind",
+            "child_run_id",
+            "goal",
+            "status",
+            "allowed_capabilities"
+          ],
+          "title": "DelegationEntry",
+          "type": "object"
+        },
+        "DocumentAttachRef": {
+          "additionalProperties": false,
+          "description": "Provenance reference of a document-attach admission (sfc_INTENT \u00a78):\nthe excerpt text travels as bounded untrusted user content; this ref\ncarries only the source identity and a safe out-of-band artifact\nreference \u2014 never inline document bytes.",
+          "properties": {
+            "document_id": {
+              "description": "Opaque stable document identity the excerpt came from",
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            },
+            "artifact_ref": {
+              "description": "Safe out-of-band reference to the stored excerpt artifact",
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Artifact Ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "document_id",
+            "artifact_ref"
+          ],
+          "title": "DocumentAttachRef",
+          "type": "object"
+        },
+        "DomainOutcome": {
+          "description": "Domain-level outcome; ``unknown`` is honest for arbitrary shell work\n(\u00a79: no regex oracle claims semantic success).",
+          "enum": [
+            "success",
+            "failure",
+            "unknown"
+          ],
+          "title": "DomainOutcome",
+          "type": "string"
+        },
+        "EffectCertainty": {
+          "description": "How certain the effect evidence is (\u00a79 ``effect_certainty``).",
+          "enum": [
+            "certain",
+            "uncertain",
+            "unknown"
+          ],
+          "title": "EffectCertainty",
+          "type": "string"
+        },
+        "ExecutionStatus": {
+          "description": "Compact technical execution status of the closing attempt (\u00a79 receipt;\nvalues subset the frozen C04 ``CommandOutcome`` vocabulary).",
+          "enum": [
+            "succeeded",
+            "failed",
+            "outcome_unknown",
+            "cancelled"
+          ],
+          "title": "ExecutionStatus",
+          "type": "string"
+        },
+        "ProviderReasoningArtifact": {
+          "additionalProperties": false,
+          "description": "Explicit safe provider reasoning artifact (sfc_INTENT clarification 5:\nraw unvalidated chain-of-thought is never authoritative history; only\nprovider-supported summary/signature/opaque references are carried, and\nonly when actually required and reviewed).",
+          "properties": {
+            "provider": {
+              "description": "Provider/model family the artifact is compatible with",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            },
+            "artifact_kind": {
+              "description": "Artifact class: bounded summary, provider signature or opaque reference token",
+              "enum": [
+                "summary",
+                "signature",
+                "opaque_ref"
+              ],
+              "title": "Artifact Kind",
+              "type": "string"
+            },
+            "content": {
+              "description": "Bounded artifact payload or reference token",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "redacted": {
+              "default": false,
+              "description": "True when content was deliberately redacted (no fidelity claim)",
+              "title": "Redacted",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "artifact_kind",
+            "content"
+          ],
+          "title": "ProviderReasoningArtifact",
+          "type": "object"
+        },
+        "RunStateEntry": {
+          "additionalProperties": false,
+          "description": "One deterministic run-state transition (sfc_RESEARCH \u00a72: execution\nstatus and safe reason linked to a run \u2014 never model prose).",
+          "properties": {
+            "kind": {
+              "const": "run_state",
+              "description": "Discriminator: this payload is a run-state transition",
+              "title": "Kind",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "New frozen run lifecycle state after this transition"
+            },
+            "reason_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable transition reason code when present",
+              "title": "Reason Code"
+            },
+            "detail": {
+              "anyOf": [
+                {
+                  "maxLength": 500,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free bounded transition detail for operators",
+              "title": "Detail"
+            }
+          },
+          "required": [
+            "kind",
+            "state"
+          ],
+          "title": "RunStateEntry",
+          "type": "object"
+        },
+        "RunbookRef": {
+          "additionalProperties": false,
+          "description": "Provenance reference of a runbook-session admission (sfc_INTENT \u00a77):\nrunbook execution is a fresh non-interactive session carrying immutable\nservice/runbook references.",
+          "properties": {
+            "service_id": {
+              "description": "Opaque adopted-service identity owning the runbook",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Service Id",
+              "type": "string"
+            },
+            "runbook_id": {
+              "description": "Stable runbook identity inside the adopted service",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Runbook Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "service_id",
+            "runbook_id"
+          ],
+          "title": "RunbookRef",
+          "type": "object"
+        },
+        "ServerChannelErrorFrame": {
+          "additionalProperties": false,
+          "description": "Bounded, VALUE-FREE channel error (never content, never secrets).",
+          "properties": {
+            "type": {
+              "const": "error",
+              "default": "error",
+              "description": "Frame discriminator: bounded value-free channel error",
+              "title": "Type",
+              "type": "string"
+            },
+            "code": {
+              "description": "Stable machine-readable error code",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Code",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Value-free bounded reason (never echoes content)",
+              "maxLength": 200,
+              "title": "Reason",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "reason"
+          ],
+          "title": "ServerChannelErrorFrame",
+          "type": "object"
+        },
+        "ServerCommittedFrame": {
+          "additionalProperties": false,
+          "description": "ONE durable entry, delivered exactly once per ``seq`` per\nconnection (the snapshot/live race is resolved by the connection's\ndelivered-through cursor).",
+          "properties": {
+            "type": {
+              "const": "committed",
+              "default": "committed",
+              "description": "Frame discriminator: one durable committed entry",
+              "title": "Type",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Connection stream identity carrying this delivery",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "entry": {
+              "$ref": "#/definitions/SessionEntryView",
+              "description": "The durable committed entry (bound to entry_id + seq)"
+            }
+          },
+          "required": [
+            "stream_id",
+            "entry"
+          ],
+          "title": "ServerCommittedFrame",
+          "type": "object"
+        },
+        "ServerDeltaFrame": {
+          "additionalProperties": false,
+          "description": "VOLATILE, uncommitted stream text. Bound to ``(stream_id,\ndelta_id)``; durable NOWHERE; never a committed entry; dropped first\nunder backpressure.",
+          "properties": {
+            "type": {
+              "const": "delta",
+              "default": "delta",
+              "description": "Frame discriminator: volatile stream text delta",
+              "title": "Type",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Volatile stream identity this delta belongs to",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "delta_id": {
+              "description": "Ordered delta identity within its stream",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Delta Id",
+              "type": "string"
+            },
+            "text": {
+              "description": "Bounded uncommitted text chunk (volatile, never durable, never authority)",
+              "maxLength": 4096,
+              "title": "Text",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "Run whose volatile stream produced this delta",
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream_id",
+            "delta_id",
+            "text",
+            "run_id"
+          ],
+          "title": "ServerDeltaFrame",
+          "type": "object"
+        },
+        "ServerEntriesFrame": {
+          "additionalProperties": false,
+          "description": "One bounded ordered replay page (cursor resume). Every page carries\nthe honest continuation cursor; a huge requested range arrives as\nbounded pages plus ``resync_required``, never one full transcript.",
+          "properties": {
+            "type": {
+              "const": "entries",
+              "default": "entries",
+              "description": "Frame discriminator: bounded ordered replay page",
+              "title": "Type",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Bounded committed entries strictly after the client cursor, in sequence order",
+              "items": {
+                "$ref": "#/definitions/SessionEntryView"
+              },
+              "maxItems": 50,
+              "title": "Entries",
+              "type": "array"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence on the session",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "has_more": {
+              "description": "True when more replay pages follow",
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "has_older": {
+              "description": "True when older committed entries exist below this page",
+              "title": "Has Older",
+              "type": "boolean"
+            },
+            "next_before_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exclusive keyset cursor for the next older page, when has_older",
+              "title": "Next Before Seq"
+            }
+          },
+          "required": [
+            "entries",
+            "latest_seq",
+            "has_more",
+            "has_older"
+          ],
+          "title": "ServerEntriesFrame",
+          "type": "object"
+        },
+        "ServerHelloOkFrame": {
+          "additionalProperties": false,
+          "description": "Handshake accepted: protocol pinned, stream/scope identity and the\nsession's latest committed sequence.",
+          "properties": {
+            "type": {
+              "const": "hello_ok",
+              "default": "hello_ok",
+              "description": "Frame discriminator: handshake accepted",
+              "title": "Type",
+              "type": "string"
+            },
+            "protocol_version": {
+              "description": "Protocol version the server pinned for this connection",
+              "minimum": 1,
+              "title": "Protocol Version",
+              "type": "integer"
+            },
+            "session_id": {
+              "description": "Session identity this connection is bound to",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "server_id": {
+              "description": "Server scope pinning the bound session",
+              "format": "uuid",
+              "title": "Server Id",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Volatile stream identity of this connection (deltas are bound to it; committed entries are not)",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Stream Id",
+              "type": "string"
+            },
+            "latest_seq": {
+              "description": "Highest committed entry sequence at handshake time",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "capabilities": {
+              "description": "Bounded optional channel capabilities the server offers",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "title": "Capabilities",
+              "type": "array"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "session_id",
+            "server_id",
+            "stream_id",
+            "latest_seq"
+          ],
+          "title": "ServerHelloOkFrame",
+          "type": "object"
+        },
+        "ServerPongFrame": {
+          "additionalProperties": false,
+          "description": "Heartbeat answer.",
+          "properties": {
+            "type": {
+              "const": "pong",
+              "default": "pong",
+              "description": "Frame discriminator: heartbeat answer",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "title": "ServerPongFrame",
+          "type": "object"
+        },
+        "ServerResyncRequiredFrame": {
+          "additionalProperties": false,
+          "description": "The connection lost continuity (cursor forgery suspected, replay\nbudget exhausted, outbox overflow): the client MUST re-snapshot from\nthe durable store.",
+          "properties": {
+            "type": {
+              "const": "resync_required",
+              "default": "resync_required",
+              "description": "Frame discriminator: client must re-snapshot",
+              "title": "Type",
+              "type": "string"
+            },
+            "reason_code": {
+              "description": "Stable machine-readable resync reason",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Reason Code",
+              "type": "string"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence known to the server",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "reason_code",
+            "latest_seq"
+          ],
+          "title": "ServerResyncRequiredFrame",
+          "type": "object"
+        },
+        "ServerRunStateFrame": {
+          "additionalProperties": false,
+          "description": "One frozen run-state transition mirrored from the durable\n``run_state`` entries (never model prose).",
+          "properties": {
+            "type": {
+              "const": "run_state",
+              "default": "run_state",
+              "description": "Frame discriminator: frozen run-state transition",
+              "title": "Type",
+              "type": "string"
+            },
+            "run_id": {
+              "description": "Run whose lifecycle state changed",
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/SessionRunState",
+              "description": "New frozen lifecycle state of the run"
+            },
+            "reason_code": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable transition reason, when present",
+              "title": "Reason Code"
+            }
+          },
+          "required": [
+            "run_id",
+            "state"
+          ],
+          "title": "ServerRunStateFrame",
+          "type": "object"
+        },
+        "ServerSnapshotFrame": {
+          "additionalProperties": false,
+          "description": "Bounded newest-page snapshot (no cursor handshake). The page shape\nmirrors the D01 history page: explicit cursor continuity fields, byte\nbounds and honest truncation.",
+          "properties": {
+            "type": {
+              "const": "snapshot",
+              "default": "snapshot",
+              "description": "Frame discriminator: bounded newest-page snapshot",
+              "title": "Type",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Session identity the snapshot belongs to",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "entries": {
+              "description": "Bounded newest committed entries (chronological)",
+              "items": {
+                "$ref": "#/definitions/SessionEntryView"
+              },
+              "maxItems": 30,
+              "title": "Entries",
+              "type": "array"
+            },
+            "latest_seq": {
+              "description": "Highest committed sequence on the session (snapshot ordering authority)",
+              "minimum": 0,
+              "title": "Latest Seq",
+              "type": "integer"
+            },
+            "has_more": {
+              "description": "True when newer committed entries exist above this page",
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "has_older": {
+              "description": "True when older committed entries exist below this page",
+              "title": "Has Older",
+              "type": "boolean"
+            },
+            "oldest_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Lowest sequence carried by this snapshot, when non-empty",
+              "title": "Oldest Seq"
+            },
+            "next_before_seq": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exclusive keyset cursor for the next older page, when has_older",
+              "title": "Next Before Seq"
+            },
+            "byte_size": {
+              "description": "Declared serialized size of the snapshot entries",
+              "maximum": 65536,
+              "minimum": 0,
+              "title": "Byte Size",
+              "type": "integer"
+            },
+            "truncated_by_bytes": {
+              "description": "True when the byte budget cut entries before the count limit",
+              "title": "Truncated By Bytes",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "session_id",
+            "entries",
+            "latest_seq",
+            "has_more",
+            "has_older",
+            "byte_size",
+            "truncated_by_bytes"
+          ],
+          "title": "ServerSnapshotFrame",
+          "type": "object"
+        },
+        "SessionEntryView": {
+          "additionalProperties": false,
+          "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
+          "properties": {
+            "schema_version": {
+              "default": 1,
+              "description": "Contract schema version of this entry envelope",
+              "title": "Schema Version",
+              "type": "integer"
+            },
+            "entry_id": {
+              "description": "Stable domain-entry identity inside its session",
+              "format": "uuid",
+              "title": "Entry Id",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Owning session identity (the only conversation root)",
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            },
+            "seq": {
+              "description": "Session-local monotonic sequence number of this entry",
+              "minimum": 1,
+              "title": "Seq",
+              "type": "integer"
+            },
+            "run_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Subordinate run that produced this entry, when run-scoped",
+              "title": "Run Id"
+            },
+            "durable_source_id": {
+              "description": "Stable producer source id backing idempotent re-appends",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Durable Source Id",
+              "type": "string"
+            },
+            "created_at": {
+              "description": "UTC commit timestamp of this entry",
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "payload": {
+              "description": "Discriminated domain payload (union discriminated on `kind`)",
+              "discriminator": {
+                "mapping": {
+                  "assistant_message": "#/$defs/AssistantMessageEntry",
+                  "compaction": "#/$defs/CompactionEntry",
+                  "control": "#/$defs/ControlEntry",
+                  "delegation": "#/$defs/DelegationEntry",
+                  "run_state": "#/$defs/RunStateEntry",
+                  "tool_result": "#/$defs/ToolResultEntry",
+                  "user_message": "#/$defs/UserMessageEntry"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/definitions/UserMessageEntry"
+                },
+                {
+                  "$ref": "#/definitions/AssistantMessageEntry"
+                },
+                {
+                  "$ref": "#/definitions/ToolResultEntry"
+                },
+                {
+                  "$ref": "#/definitions/RunStateEntry"
+                },
+                {
+                  "$ref": "#/definitions/DelegationEntry"
+                },
+                {
+                  "$ref": "#/definitions/ControlEntry"
+                },
+                {
+                  "$ref": "#/definitions/CompactionEntry"
+                }
+              ],
+              "title": "Payload"
+            }
+          },
+          "required": [
+            "entry_id",
+            "session_id",
+            "seq",
+            "durable_source_id",
+            "created_at",
+            "payload"
+          ],
+          "title": "SessionEntryView",
+          "type": "object"
+        },
+        "SessionRunState": {
+          "description": "Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;\n``outcome_unknown`` is honest after a crash \u2014 never silently terminal).",
+          "enum": [
+            "queued",
+            "running",
+            "waiting_approval",
+            "waiting_child",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "outcome_unknown"
+          ],
+          "title": "SessionRunState",
+          "type": "string"
+        },
+        "SessionSourceKind": {
+          "description": "How a session came into existence (sfc_INTENT \u00a77 runbook/document\ndecisions): interactive chat, runbook execution, document attach, API.",
+          "enum": [
+            "interactive",
+            "runbook",
+            "document_attach",
+            "api"
+          ],
+          "title": "SessionSourceKind",
+          "type": "string"
+        },
+        "ToolCallItem": {
+          "additionalProperties": false,
+          "description": "One structured assistant tool-call part (sfc_RESEARCH \u00a72 assistant\nentries carry ordered safe text and structured tool-call parts).",
+          "properties": {
+            "call_id": {
+              "description": "Provider tool-call id; pairs the call with its result",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Call Id",
+              "type": "string"
+            },
+            "tool_name": {
+              "description": "Registered capability tool name that was invoked",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "capability_id": {
+              "description": "Capability descriptor id behind the invoked tool name",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Capability Id",
+              "type": "string"
+            },
+            "args": {
+              "additionalProperties": true,
+              "description": "Bounded tool-call arguments as produced by the model",
+              "title": "Args",
+              "type": "object"
+            },
+            "target_server_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Explicit target server scope for multi-target capabilities",
+              "title": "Target Server Id"
+            }
+          },
+          "required": [
+            "call_id",
+            "tool_name",
+            "capability_id",
+            "args"
+          ],
+          "title": "ToolCallItem",
+          "type": "object"
+        },
+        "ToolResultEntry": {
+          "additionalProperties": false,
+          "description": "One tool result (sfc_RESEARCH \u00a72): call identity, the frozen bridge\nstatus and the three-layer execution/domain/certainty projection \u2014\npending/unknown results are never inferred successful (C03/C06).",
+          "properties": {
+            "kind": {
+              "const": "tool_result",
+              "description": "Discriminator: this payload is a tool result entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "call_id": {
+              "description": "Provider tool-call id this result answers",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Call Id",
+              "type": "string"
+            },
+            "tool_name": {
+              "description": "Registered capability tool name that was invoked",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "capability_id": {
+              "description": "Capability descriptor id behind the invoked tool name",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Capability Id",
+              "type": "string"
+            },
+            "status": {
+              "description": "Bridge lifecycle status: executed, denied, approval_required or unknown_effect",
+              "enum": [
+                "executed",
+                "denied",
+                "approval_required",
+                "unknown_effect"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "execution_status": {
+              "$ref": "#/definitions/ExecutionStatus",
+              "description": "Compact technical wrapper execution status of the attempt"
+            },
+            "domain_outcome": {
+              "$ref": "#/definitions/DomainOutcome",
+              "description": "Domain-level outcome; unknown is honest for arbitrary work"
+            },
+            "effect_certainty": {
+              "$ref": "#/definitions/EffectCertainty",
+              "description": "How certain the effect evidence is (certain/uncertain/unknown)"
+            },
+            "payload_hash": {
+              "description": "Canonical payload hash binding the result to its approval/dispatch envelope",
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Payload Hash",
+              "type": "string"
+            },
+            "output_preview": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded redacted output preview; large output lives behind artifact references",
+              "title": "Output Preview"
+            },
+            "artifact_ref": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Safe out-of-band reference to the full stored tool result",
+              "title": "Artifact Ref"
+            },
+            "error_code": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Stable machine-readable error code when the call failed",
+              "title": "Error Code"
+            },
+            "error_detail": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Value-free fixed failure reason (never echoing contents)",
+              "title": "Error Detail"
+            },
+            "approval_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Approval record id when the call parked on the approval seam",
+              "title": "Approval Id"
+            }
+          },
+          "required": [
+            "kind",
+            "call_id",
+            "tool_name",
+            "capability_id",
+            "status",
+            "execution_status",
+            "domain_outcome",
+            "effect_certainty",
+            "payload_hash"
+          ],
+          "title": "ToolResultEntry",
+          "type": "object"
+        },
+        "UserMessageEntry": {
+          "additionalProperties": false,
+          "description": "One admitted user turn (sfc_RESEARCH \u00a72): bounded safe text, client\nrequest id for idempotency, source metadata and optional provenance\nreferences.",
+          "properties": {
+            "kind": {
+              "const": "user_message",
+              "description": "Discriminator: this payload is a user message entry",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "description": "Bounded user message text (untrusted content, never authority)",
+              "maxLength": 20000,
+              "title": "Text",
+              "type": "string"
+            },
+            "client_request_id": {
+              "description": "Client idempotency key of the admitted turn submission",
+              "format": "uuid",
+              "title": "Client Request Id",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/definitions/SessionSourceKind",
+              "description": "How this turn entered the session (interactive, runbook, document attach or API)"
+            },
+            "document_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DocumentAttachRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Document provenance when the turn was a document attach"
+            },
+            "runbook_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RunbookRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Runbook provenance when the turn was a runbook execution"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "client_request_id",
+            "source"
+          ],
+          "title": "UserMessageEntry",
+          "type": "object"
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ClientAckFrame": {
+      "additionalProperties": false,
+      "description": "Advance THIS connection's committed cursor (affects only the\nconnection's own catch-up; the durable store is the only authority).",
+      "properties": {
+        "type": {
+          "const": "ack",
+          "default": "ack",
+          "description": "Frame discriminator: committed-cursor acknowledgement",
+          "title": "Type",
+          "type": "string"
+        },
+        "after_seq": {
+          "description": "The client's own committed cursor (last handled sequence)",
+          "minimum": 1,
+          "title": "After Seq",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "after_seq"
+      ],
+      "title": "ClientAckFrame",
+      "type": "object"
+    },
+    "ClientHelloFrame": {
+      "additionalProperties": false,
+      "description": "Open one channel: protocol handshake + replay cursor + the CSRF\ndouble-submit proof (constant-time compared against the cookie).",
+      "properties": {
+        "type": {
+          "const": "hello",
+          "default": "hello",
+          "description": "Frame discriminator: channel open request",
+          "title": "Type",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Protocol version the client speaks (this server accepts exactly 1; anything else is refused version_unsupported)",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "after_seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Replay cursor: committed entries strictly after this sequence are replayed; None means newest-page snapshot",
+          "title": "After Seq"
+        },
+        "csrf_token": {
+          "description": "Double-submit CSRF proof equal to the mai_csrf cookie",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Csrf Token",
+          "type": "string"
+        },
+        "client_request_id": {
+          "description": "Client idempotency key of this channel open",
+          "format": "uuid",
+          "title": "Client Request Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "csrf_token",
+        "client_request_id"
+      ],
+      "title": "ClientHelloFrame",
+      "type": "object"
+    },
+    "ClientPingFrame": {
+      "additionalProperties": false,
+      "description": "Application-level heartbeat probe; answered by ``pong``.",
+      "properties": {
+        "type": {
+          "const": "ping",
+          "default": "ping",
+          "description": "Frame discriminator: heartbeat probe",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ClientPingFrame",
+      "type": "object"
+    },
+    "ClientSubscribeFrame": {
+      "additionalProperties": false,
+      "description": "(Re-)subscribe from a cursor: bounded replay of committed entries\nafter ``after_seq``, then live delivery.",
+      "properties": {
+        "type": {
+          "const": "subscribe",
+          "default": "subscribe",
+          "description": "Frame discriminator: replay/re-subscribe request",
+          "title": "Type",
+          "type": "string"
+        },
+        "after_seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Replay cursor for this subscription (None: newest page)",
+          "title": "After Seq"
+        },
+        "client_request_id": {
+          "description": "Client idempotency key of this subscription request",
+          "format": "uuid",
+          "title": "Client Request Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_request_id"
+      ],
+      "title": "ClientSubscribeFrame",
+      "type": "object"
+    },
+    "AssistantMessageEntry": {
+      "additionalProperties": false,
+      "description": "One assistant model response (sfc_RESEARCH \u00a72): bounded safe text\nand/or ordered structured tool-call parts, plus the model metadata needed\nfor native continuation and explicit provider reasoning artifacts.",
+      "properties": {
+        "kind": {
+          "const": "assistant_message",
+          "description": "Discriminator: this payload is an assistant message entry",
+          "title": "Kind",
+          "type": "string"
+        },
+        "text": {
+          "default": "",
+          "description": "Bounded assistant text (empty when the round was pure tool use)",
+          "maxLength": 20000,
+          "title": "Text",
+          "type": "string"
+        },
+        "tool_calls": {
+          "description": "Ordered structured tool-call parts of this assistant round",
+          "items": {
+            "$ref": "#/definitions/ToolCallItem"
+          },
+          "maxItems": 16,
+          "title": "Tool Calls",
+          "type": "array"
+        },
+        "model_profile": {
+          "description": "Model profile identity that produced this assistant round",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Model Profile",
+          "type": "string"
+        },
+        "provider_artifacts": {
+          "description": "Explicit safe provider reasoning artifacts (never raw chain-of-thought)",
+          "items": {
+            "$ref": "#/definitions/ProviderReasoningArtifact"
+          },
+          "maxItems": 8,
+          "title": "Provider Artifacts",
+          "type": "array"
+        },
+        "tool_group_state": {
+          "default": "none",
+          "description": "Atomic tool-group status: none, pending, complete or unresolved",
+          "enum": [
+            "none",
+            "pending",
+            "complete",
+            "unresolved"
+          ],
+          "title": "Tool Group State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "model_profile"
+      ],
+      "title": "AssistantMessageEntry",
+      "type": "object"
+    },
+    "CompactionEntry": {
+      "additionalProperties": false,
+      "description": "One compaction marker (sfc_RESEARCH \u00a75: metadata/pointer, not a hidden\nuser message \u2014 originals stay stored and addressable; ``session_id``\nnever rotates).",
+      "properties": {
+        "kind": {
+          "const": "compaction",
+          "description": "Discriminator: this payload is a compaction marker",
+          "title": "Kind",
+          "type": "string"
+        },
+        "compaction_id": {
+          "description": "Stable identity of this compaction generation",
+          "format": "uuid",
+          "title": "Compaction Id",
+          "type": "string"
+        },
+        "from_seq": {
+          "description": "First covered session sequence number (inclusive)",
+          "minimum": 1,
+          "title": "From Seq",
+          "type": "integer"
+        },
+        "to_seq": {
+          "description": "Last covered session sequence number (inclusive)",
+          "minimum": 1,
+          "title": "To Seq",
+          "type": "integer"
+        },
+        "summary_text": {
+          "description": "Bounded summary of the covered entry range with provenance",
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Summary Text",
+          "type": "string"
+        },
+        "model_profile": {
+          "description": "Model profile identity the summary was produced for",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Model Profile",
+          "type": "string"
+        },
+        "token_usage_anchor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Actual provider usage anchor of the summarized source range",
+          "title": "Token Usage Anchor"
+        }
+      },
+      "required": [
+        "kind",
+        "compaction_id",
+        "from_seq",
+        "to_seq",
+        "summary_text",
+        "model_profile"
+      ],
+      "title": "CompactionEntry",
+      "type": "object"
+    },
+    "ControlActionKind": {
+      "description": "Deterministic session control actions (sfc_RESEARCH \u00a76 frame families;\ncontrols acknowledge \u2014 they are never interpreted as user authority).",
+      "enum": [
+        "steer",
+        "pause",
+        "cancel",
+        "approve",
+        "deny_approval",
+        "reconcile"
+      ],
+      "title": "ControlActionKind",
+      "type": "string"
+    },
+    "ControlEntry": {
+      "additionalProperties": false,
+      "description": "One acknowledged control action (sfc_RESEARCH \u00a72: approval/cancel/\nreconcile/steer acknowledgements \u2014 never interpreted as user authority).",
+      "properties": {
+        "kind": {
+          "const": "control",
+          "description": "Discriminator: this payload is a control acknowledgement",
+          "title": "Kind",
+          "type": "string"
+        },
+        "action": {
+          "$ref": "#/definitions/ControlActionKind",
+          "description": "Deterministic control action that was acknowledged"
+        },
+        "client_request_id": {
+          "description": "Client idempotency key of the control request",
+          "format": "uuid",
+          "title": "Client Request Id",
+          "type": "string"
+        },
+        "target_run_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Run the control action targeted, when scoped to one run",
+          "title": "Target Run Id"
+        },
+        "approval_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Approval record id when the action decided an approval",
+          "title": "Approval Id"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Value-free bounded operator note carried with the action",
+          "title": "Note"
+        }
+      },
+      "required": [
+        "kind",
+        "action",
+        "client_request_id"
+      ],
+      "title": "ControlEntry",
+      "type": "object"
+    },
+    "DelegationEntry": {
+      "additionalProperties": false,
+      "description": "One delegation relation (sfc_RESEARCH \u00a74): child linkage, bounded\ngoal/status and explicit allowed capabilities \u2014 the child receives a\nbounded context, never ambient parent state.",
+      "properties": {
+        "kind": {
+          "const": "delegation",
+          "description": "Discriminator: this payload is a delegation entry",
+          "title": "Kind",
+          "type": "string"
+        },
+        "child_run_id": {
+          "description": "Run identity of the delegated child execution",
+          "format": "uuid",
+          "title": "Child Run Id",
+          "type": "string"
+        },
+        "child_session_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Session identity of the child when it owns a distinct session",
+          "title": "Child Session Id"
+        },
+        "goal": {
+          "description": "Bounded explicit goal handed to the child",
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Goal",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/SessionRunState",
+          "description": "Current frozen lifecycle state of the child run"
+        },
+        "allowed_capabilities": {
+          "description": "Explicit narrowed capability grants of the child execution",
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Allowed Capabilities",
+          "type": "array"
+        },
+        "result_summary": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounded immutable child result summary once the child settles",
+          "title": "Result Summary"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stable machine-readable delegation error code when refused",
+          "title": "Error Code"
+        }
+      },
+      "required": [
+        "kind",
+        "child_run_id",
+        "goal",
+        "status",
+        "allowed_capabilities"
+      ],
+      "title": "DelegationEntry",
+      "type": "object"
+    },
+    "DocumentAttachRef": {
+      "additionalProperties": false,
+      "description": "Provenance reference of a document-attach admission (sfc_INTENT \u00a78):\nthe excerpt text travels as bounded untrusted user content; this ref\ncarries only the source identity and a safe out-of-band artifact\nreference \u2014 never inline document bytes.",
+      "properties": {
+        "document_id": {
+          "description": "Opaque stable document identity the excerpt came from",
+          "format": "uuid",
+          "title": "Document Id",
+          "type": "string"
+        },
+        "artifact_ref": {
+          "description": "Safe out-of-band reference to the stored excerpt artifact",
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Artifact Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "document_id",
+        "artifact_ref"
+      ],
+      "title": "DocumentAttachRef",
+      "type": "object"
+    },
+    "DomainOutcome": {
+      "description": "Domain-level outcome; ``unknown`` is honest for arbitrary shell work\n(\u00a79: no regex oracle claims semantic success).",
+      "enum": [
+        "success",
+        "failure",
+        "unknown"
+      ],
+      "title": "DomainOutcome",
+      "type": "string"
+    },
+    "EffectCertainty": {
+      "description": "How certain the effect evidence is (\u00a79 ``effect_certainty``).",
+      "enum": [
+        "certain",
+        "uncertain",
+        "unknown"
+      ],
+      "title": "EffectCertainty",
+      "type": "string"
+    },
+    "ExecutionStatus": {
+      "description": "Compact technical execution status of the closing attempt (\u00a79 receipt;\nvalues subset the frozen C04 ``CommandOutcome`` vocabulary).",
+      "enum": [
+        "succeeded",
+        "failed",
+        "outcome_unknown",
+        "cancelled"
+      ],
+      "title": "ExecutionStatus",
+      "type": "string"
+    },
+    "ProviderReasoningArtifact": {
+      "additionalProperties": false,
+      "description": "Explicit safe provider reasoning artifact (sfc_INTENT clarification 5:\nraw unvalidated chain-of-thought is never authoritative history; only\nprovider-supported summary/signature/opaque references are carried, and\nonly when actually required and reviewed).",
+      "properties": {
+        "provider": {
+          "description": "Provider/model family the artifact is compatible with",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "artifact_kind": {
+          "description": "Artifact class: bounded summary, provider signature or opaque reference token",
+          "enum": [
+            "summary",
+            "signature",
+            "opaque_ref"
+          ],
+          "title": "Artifact Kind",
+          "type": "string"
+        },
+        "content": {
+          "description": "Bounded artifact payload or reference token",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Content",
+          "type": "string"
+        },
+        "redacted": {
+          "default": false,
+          "description": "True when content was deliberately redacted (no fidelity claim)",
+          "title": "Redacted",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider",
+        "artifact_kind",
+        "content"
+      ],
+      "title": "ProviderReasoningArtifact",
+      "type": "object"
+    },
+    "RunStateEntry": {
+      "additionalProperties": false,
+      "description": "One deterministic run-state transition (sfc_RESEARCH \u00a72: execution\nstatus and safe reason linked to a run \u2014 never model prose).",
+      "properties": {
+        "kind": {
+          "const": "run_state",
+          "description": "Discriminator: this payload is a run-state transition",
+          "title": "Kind",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/SessionRunState",
+          "description": "New frozen run lifecycle state after this transition"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stable machine-readable transition reason code when present",
+          "title": "Reason Code"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Value-free bounded transition detail for operators",
+          "title": "Detail"
+        }
+      },
+      "required": [
+        "kind",
+        "state"
+      ],
+      "title": "RunStateEntry",
+      "type": "object"
+    },
+    "RunbookRef": {
+      "additionalProperties": false,
+      "description": "Provenance reference of a runbook-session admission (sfc_INTENT \u00a77):\nrunbook execution is a fresh non-interactive session carrying immutable\nservice/runbook references.",
+      "properties": {
+        "service_id": {
+          "description": "Opaque adopted-service identity owning the runbook",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Service Id",
+          "type": "string"
+        },
+        "runbook_id": {
+          "description": "Stable runbook identity inside the adopted service",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Runbook Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "service_id",
+        "runbook_id"
+      ],
+      "title": "RunbookRef",
+      "type": "object"
+    },
+    "ServerChannelErrorFrame": {
+      "additionalProperties": false,
+      "description": "Bounded, VALUE-FREE channel error (never content, never secrets).",
+      "properties": {
+        "type": {
+          "const": "error",
+          "default": "error",
+          "description": "Frame discriminator: bounded value-free channel error",
+          "title": "Type",
+          "type": "string"
+        },
+        "code": {
+          "description": "Stable machine-readable error code",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Value-free bounded reason (never echoes content)",
+          "maxLength": 200,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "reason"
+      ],
+      "title": "ServerChannelErrorFrame",
+      "type": "object"
+    },
+    "ServerCommittedFrame": {
+      "additionalProperties": false,
+      "description": "ONE durable entry, delivered exactly once per ``seq`` per\nconnection (the snapshot/live race is resolved by the connection's\ndelivered-through cursor).",
+      "properties": {
+        "type": {
+          "const": "committed",
+          "default": "committed",
+          "description": "Frame discriminator: one durable committed entry",
+          "title": "Type",
+          "type": "string"
+        },
+        "stream_id": {
+          "description": "Connection stream identity carrying this delivery",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Stream Id",
+          "type": "string"
+        },
+        "entry": {
+          "$ref": "#/definitions/SessionEntryView",
+          "description": "The durable committed entry (bound to entry_id + seq)"
+        }
+      },
+      "required": [
+        "stream_id",
+        "entry"
+      ],
+      "title": "ServerCommittedFrame",
+      "type": "object"
+    },
+    "ServerDeltaFrame": {
+      "additionalProperties": false,
+      "description": "VOLATILE, uncommitted stream text. Bound to ``(stream_id,\ndelta_id)``; durable NOWHERE; never a committed entry; dropped first\nunder backpressure.",
+      "properties": {
+        "type": {
+          "const": "delta",
+          "default": "delta",
+          "description": "Frame discriminator: volatile stream text delta",
+          "title": "Type",
+          "type": "string"
+        },
+        "stream_id": {
+          "description": "Volatile stream identity this delta belongs to",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Stream Id",
+          "type": "string"
+        },
+        "delta_id": {
+          "description": "Ordered delta identity within its stream",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Delta Id",
+          "type": "string"
+        },
+        "text": {
+          "description": "Bounded uncommitted text chunk (volatile, never durable, never authority)",
+          "maxLength": 4096,
+          "title": "Text",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "Run whose volatile stream produced this delta",
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stream_id",
+        "delta_id",
+        "text",
+        "run_id"
+      ],
+      "title": "ServerDeltaFrame",
+      "type": "object"
+    },
+    "ServerEntriesFrame": {
+      "additionalProperties": false,
+      "description": "One bounded ordered replay page (cursor resume). Every page carries\nthe honest continuation cursor; a huge requested range arrives as\nbounded pages plus ``resync_required``, never one full transcript.",
+      "properties": {
+        "type": {
+          "const": "entries",
+          "default": "entries",
+          "description": "Frame discriminator: bounded ordered replay page",
+          "title": "Type",
+          "type": "string"
+        },
+        "entries": {
+          "description": "Bounded committed entries strictly after the client cursor, in sequence order",
+          "items": {
+            "$ref": "#/definitions/SessionEntryView"
+          },
+          "maxItems": 50,
+          "title": "Entries",
+          "type": "array"
+        },
+        "latest_seq": {
+          "description": "Highest committed sequence on the session",
+          "minimum": 0,
+          "title": "Latest Seq",
+          "type": "integer"
+        },
+        "has_more": {
+          "description": "True when more replay pages follow",
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "has_older": {
+          "description": "True when older committed entries exist below this page",
+          "title": "Has Older",
+          "type": "boolean"
+        },
+        "next_before_seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exclusive keyset cursor for the next older page, when has_older",
+          "title": "Next Before Seq"
+        }
+      },
+      "required": [
+        "entries",
+        "latest_seq",
+        "has_more",
+        "has_older"
+      ],
+      "title": "ServerEntriesFrame",
+      "type": "object"
+    },
+    "ServerHelloOkFrame": {
+      "additionalProperties": false,
+      "description": "Handshake accepted: protocol pinned, stream/scope identity and the\nsession's latest committed sequence.",
+      "properties": {
+        "type": {
+          "const": "hello_ok",
+          "default": "hello_ok",
+          "description": "Frame discriminator: handshake accepted",
+          "title": "Type",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Protocol version the server pinned for this connection",
+          "minimum": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Session identity this connection is bound to",
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "server_id": {
+          "description": "Server scope pinning the bound session",
+          "format": "uuid",
+          "title": "Server Id",
+          "type": "string"
+        },
+        "stream_id": {
+          "description": "Volatile stream identity of this connection (deltas are bound to it; committed entries are not)",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Stream Id",
+          "type": "string"
+        },
+        "latest_seq": {
+          "description": "Highest committed entry sequence at handshake time",
+          "minimum": 0,
+          "title": "Latest Seq",
+          "type": "integer"
+        },
+        "capabilities": {
+          "description": "Bounded optional channel capabilities the server offers",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Capabilities",
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "session_id",
+        "server_id",
+        "stream_id",
+        "latest_seq"
+      ],
+      "title": "ServerHelloOkFrame",
+      "type": "object"
+    },
+    "ServerPongFrame": {
+      "additionalProperties": false,
+      "description": "Heartbeat answer.",
+      "properties": {
+        "type": {
+          "const": "pong",
+          "default": "pong",
+          "description": "Frame discriminator: heartbeat answer",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ServerPongFrame",
+      "type": "object"
+    },
+    "ServerResyncRequiredFrame": {
+      "additionalProperties": false,
+      "description": "The connection lost continuity (cursor forgery suspected, replay\nbudget exhausted, outbox overflow): the client MUST re-snapshot from\nthe durable store.",
+      "properties": {
+        "type": {
+          "const": "resync_required",
+          "default": "resync_required",
+          "description": "Frame discriminator: client must re-snapshot",
+          "title": "Type",
+          "type": "string"
+        },
+        "reason_code": {
+          "description": "Stable machine-readable resync reason",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "latest_seq": {
+          "description": "Highest committed sequence known to the server",
+          "minimum": 0,
+          "title": "Latest Seq",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "reason_code",
+        "latest_seq"
+      ],
+      "title": "ServerResyncRequiredFrame",
+      "type": "object"
+    },
+    "ServerRunStateFrame": {
+      "additionalProperties": false,
+      "description": "One frozen run-state transition mirrored from the durable\n``run_state`` entries (never model prose).",
+      "properties": {
+        "type": {
+          "const": "run_state",
+          "default": "run_state",
+          "description": "Frame discriminator: frozen run-state transition",
+          "title": "Type",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "Run whose lifecycle state changed",
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/SessionRunState",
+          "description": "New frozen lifecycle state of the run"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stable machine-readable transition reason, when present",
+          "title": "Reason Code"
+        }
+      },
+      "required": [
+        "run_id",
+        "state"
+      ],
+      "title": "ServerRunStateFrame",
+      "type": "object"
+    },
+    "ServerSnapshotFrame": {
+      "additionalProperties": false,
+      "description": "Bounded newest-page snapshot (no cursor handshake). The page shape\nmirrors the D01 history page: explicit cursor continuity fields, byte\nbounds and honest truncation.",
+      "properties": {
+        "type": {
+          "const": "snapshot",
+          "default": "snapshot",
+          "description": "Frame discriminator: bounded newest-page snapshot",
+          "title": "Type",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session identity the snapshot belongs to",
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "entries": {
+          "description": "Bounded newest committed entries (chronological)",
+          "items": {
+            "$ref": "#/definitions/SessionEntryView"
+          },
+          "maxItems": 30,
+          "title": "Entries",
+          "type": "array"
+        },
+        "latest_seq": {
+          "description": "Highest committed sequence on the session (snapshot ordering authority)",
+          "minimum": 0,
+          "title": "Latest Seq",
+          "type": "integer"
+        },
+        "has_more": {
+          "description": "True when newer committed entries exist above this page",
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "has_older": {
+          "description": "True when older committed entries exist below this page",
+          "title": "Has Older",
+          "type": "boolean"
+        },
+        "oldest_seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Lowest sequence carried by this snapshot, when non-empty",
+          "title": "Oldest Seq"
+        },
+        "next_before_seq": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exclusive keyset cursor for the next older page, when has_older",
+          "title": "Next Before Seq"
+        },
+        "byte_size": {
+          "description": "Declared serialized size of the snapshot entries",
+          "maximum": 65536,
+          "minimum": 0,
+          "title": "Byte Size",
+          "type": "integer"
+        },
+        "truncated_by_bytes": {
+          "description": "True when the byte budget cut entries before the count limit",
+          "title": "Truncated By Bytes",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "entries",
+        "latest_seq",
+        "has_more",
+        "has_older",
+        "byte_size",
+        "truncated_by_bytes"
+      ],
+      "title": "ServerSnapshotFrame",
+      "type": "object"
+    },
+    "SessionEntryView": {
+      "additionalProperties": false,
+      "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
+      "properties": {
+        "schema_version": {
+          "default": 1,
+          "description": "Contract schema version of this entry envelope",
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "entry_id": {
+          "description": "Stable domain-entry identity inside its session",
+          "format": "uuid",
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Owning session identity (the only conversation root)",
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Session-local monotonic sequence number of this entry",
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Subordinate run that produced this entry, when run-scoped",
+          "title": "Run Id"
+        },
+        "durable_source_id": {
+          "description": "Stable producer source id backing idempotent re-appends",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Durable Source Id",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "UTC commit timestamp of this entry",
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "payload": {
+          "description": "Discriminated domain payload (union discriminated on `kind`)",
+          "discriminator": {
+            "mapping": {
+              "assistant_message": "#/$defs/AssistantMessageEntry",
+              "compaction": "#/$defs/CompactionEntry",
+              "control": "#/$defs/ControlEntry",
+              "delegation": "#/$defs/DelegationEntry",
+              "run_state": "#/$defs/RunStateEntry",
+              "tool_result": "#/$defs/ToolResultEntry",
+              "user_message": "#/$defs/UserMessageEntry"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/definitions/UserMessageEntry"
+            },
+            {
+              "$ref": "#/definitions/AssistantMessageEntry"
+            },
+            {
+              "$ref": "#/definitions/ToolResultEntry"
+            },
+            {
+              "$ref": "#/definitions/RunStateEntry"
+            },
+            {
+              "$ref": "#/definitions/DelegationEntry"
+            },
+            {
+              "$ref": "#/definitions/ControlEntry"
+            },
+            {
+              "$ref": "#/definitions/CompactionEntry"
+            }
+          ],
+          "title": "Payload"
+        }
+      },
+      "required": [
+        "entry_id",
+        "session_id",
+        "seq",
+        "durable_source_id",
+        "created_at",
+        "payload"
+      ],
+      "title": "SessionEntryView",
+      "type": "object"
+    },
+    "SessionRunState": {
+      "description": "Frozen run lifecycle state (sfc_PLAN: honest pending/unknown states;\n``outcome_unknown`` is honest after a crash \u2014 never silently terminal).",
+      "enum": [
+        "queued",
+        "running",
+        "waiting_approval",
+        "waiting_child",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "outcome_unknown"
+      ],
+      "title": "SessionRunState",
+      "type": "string"
+    },
+    "SessionSourceKind": {
+      "description": "How a session came into existence (sfc_INTENT \u00a77 runbook/document\ndecisions): interactive chat, runbook execution, document attach, API.",
+      "enum": [
+        "interactive",
+        "runbook",
+        "document_attach",
+        "api"
+      ],
+      "title": "SessionSourceKind",
+      "type": "string"
+    },
+    "ToolCallItem": {
+      "additionalProperties": false,
+      "description": "One structured assistant tool-call part (sfc_RESEARCH \u00a72 assistant\nentries carry ordered safe text and structured tool-call parts).",
+      "properties": {
+        "call_id": {
+          "description": "Provider tool-call id; pairs the call with its result",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Call Id",
+          "type": "string"
+        },
+        "tool_name": {
+          "description": "Registered capability tool name that was invoked",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Tool Name",
+          "type": "string"
+        },
+        "capability_id": {
+          "description": "Capability descriptor id behind the invoked tool name",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Capability Id",
+          "type": "string"
+        },
+        "args": {
+          "additionalProperties": true,
+          "description": "Bounded tool-call arguments as produced by the model",
+          "title": "Args",
+          "type": "object"
+        },
+        "target_server_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit target server scope for multi-target capabilities",
+          "title": "Target Server Id"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool_name",
+        "capability_id",
+        "args"
+      ],
+      "title": "ToolCallItem",
+      "type": "object"
+    },
+    "ToolResultEntry": {
+      "additionalProperties": false,
+      "description": "One tool result (sfc_RESEARCH \u00a72): call identity, the frozen bridge\nstatus and the three-layer execution/domain/certainty projection \u2014\npending/unknown results are never inferred successful (C03/C06).",
+      "properties": {
+        "kind": {
+          "const": "tool_result",
+          "description": "Discriminator: this payload is a tool result entry",
+          "title": "Kind",
+          "type": "string"
+        },
+        "call_id": {
+          "description": "Provider tool-call id this result answers",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Call Id",
+          "type": "string"
+        },
+        "tool_name": {
+          "description": "Registered capability tool name that was invoked",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Tool Name",
+          "type": "string"
+        },
+        "capability_id": {
+          "description": "Capability descriptor id behind the invoked tool name",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Capability Id",
+          "type": "string"
+        },
+        "status": {
+          "description": "Bridge lifecycle status: executed, denied, approval_required or unknown_effect",
+          "enum": [
+            "executed",
+            "denied",
+            "approval_required",
+            "unknown_effect"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "execution_status": {
+          "$ref": "#/definitions/ExecutionStatus",
+          "description": "Compact technical wrapper execution status of the attempt"
+        },
+        "domain_outcome": {
+          "$ref": "#/definitions/DomainOutcome",
+          "description": "Domain-level outcome; unknown is honest for arbitrary work"
+        },
+        "effect_certainty": {
+          "$ref": "#/definitions/EffectCertainty",
+          "description": "How certain the effect evidence is (certain/uncertain/unknown)"
+        },
+        "payload_hash": {
+          "description": "Canonical payload hash binding the result to its approval/dispatch envelope",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Payload Hash",
+          "type": "string"
+        },
+        "output_preview": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounded redacted output preview; large output lives behind artifact references",
+          "title": "Output Preview"
+        },
+        "artifact_ref": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Safe out-of-band reference to the full stored tool result",
+          "title": "Artifact Ref"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stable machine-readable error code when the call failed",
+          "title": "Error Code"
+        },
+        "error_detail": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Value-free fixed failure reason (never echoing contents)",
+          "title": "Error Detail"
+        },
+        "approval_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Approval record id when the call parked on the approval seam",
+          "title": "Approval Id"
+        }
+      },
+      "required": [
+        "kind",
+        "call_id",
+        "tool_name",
+        "capability_id",
+        "status",
+        "execution_status",
+        "domain_outcome",
+        "effect_certainty",
+        "payload_hash"
+      ],
+      "title": "ToolResultEntry",
+      "type": "object"
+    },
+    "UserMessageEntry": {
+      "additionalProperties": false,
+      "description": "One admitted user turn (sfc_RESEARCH \u00a72): bounded safe text, client\nrequest id for idempotency, source metadata and optional provenance\nreferences.",
+      "properties": {
+        "kind": {
+          "const": "user_message",
+          "description": "Discriminator: this payload is a user message entry",
+          "title": "Kind",
+          "type": "string"
+        },
+        "text": {
+          "description": "Bounded user message text (untrusted content, never authority)",
+          "maxLength": 20000,
+          "title": "Text",
+          "type": "string"
+        },
+        "client_request_id": {
+          "description": "Client idempotency key of the admitted turn submission",
+          "format": "uuid",
+          "title": "Client Request Id",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/SessionSourceKind",
+          "description": "How this turn entered the session (interactive, runbook, document attach or API)"
+        },
+        "document_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DocumentAttachRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Document provenance when the turn was a document attach"
+        },
+        "runbook_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RunbookRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Runbook provenance when the turn was a runbook execution"
+        }
+      },
+      "required": [
+        "kind",
+        "text",
+        "client_request_id",
+        "source"
+      ],
+      "title": "UserMessageEntry",
+      "type": "object"
+    }
+  }
+}

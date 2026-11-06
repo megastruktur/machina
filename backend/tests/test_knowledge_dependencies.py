@@ -111,12 +111,11 @@ UNSELECTED_BROWSER_AUTOMATION_DISTRIBUTIONS = ("playwright", "selenium", "pyppet
 UNSELECTED_BROWSER_AUTOMATION_IMPORTS = ("playwright", "selenium", "pyppeteer")
 
 # Frozen lane pins owned by earlier dependency cards, asserted unchanged
-# (contracts.md C05 engine freeze; P06 agent-runtime entry — re-frozen by
-# the compaction card to the exact 2.60.0/harness-0.60.0 lockstep pins).
+# (contracts.md C05 engine freeze; P06 agent-runtime entry). The compaction
+# harness was REMOVED at D09 — asserted ABSENT instead of frozen.
 FROZEN_ENGINE_REQUIREMENT = "dbos==3.2.0"
 FROZEN_ENGINE_VERSION = "3.2.0"
 FROZEN_AGENT_RUNTIME_REQUIREMENT = "pydantic-ai-slim[openai]==2.60.0"
-FROZEN_HARNESS_REQUIREMENT = "pydantic-ai-harness==0.60.0"
 
 
 def _declared_requirements() -> list[str]:
@@ -243,9 +242,7 @@ def test_frozen_lane_pins_unchanged() -> None:
         f"frozen agent-runtime entry changed: {agent_runtime}"
     )
     harness = _requirements_for(declared, "pydantic-ai-harness")
-    assert harness == [FROZEN_HARNESS_REQUIREMENT], (
-        f"frozen compaction-harness entry changed: {harness}"
-    )
+    assert harness == [], f"the removed compaction harness reappeared: {harness}"
     locked = _locked_packages()
     assert locked.get("dbos") == FROZEN_ENGINE_VERSION, (
         f"dbos {locked.get('dbos')} != frozen {FROZEN_ENGINE_VERSION}"

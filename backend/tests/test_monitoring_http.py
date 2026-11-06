@@ -52,6 +52,7 @@ from fastapi import FastAPI
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.database import create_app_engine
+from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 from mai.notifications.service import (
     DEFAULT_COOLDOWN,
     evaluate_findings,
@@ -117,16 +118,12 @@ def _drop_app_tables(url: str) -> None:
         # Full app set at the chain tip (same reconciliation list as the
         # 10-notifications / 10-observation-schema fixtures):
         # order-independent zero-to-head fixture.
-        conn.execute(
-            "DROP TABLE IF EXISTS notification_alerts, observation_findings, "
-            "server_observations, application_projection_journal, "
-            "application_projection, knowledge_doc_chunks, knowledge_documents, "
-            "job_schedule_fires, job_schedules, "
-            "job_events, job_steps, job_runs, approvals, "
-            "profile_projection_journal, profile_projection, admin_sessions, "
-            "admin_credential, alembic_version"
-        )
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        # Whole-schema reset (D09): the enumerated drop list went stale
+        # across migrations — the schema drop is FK-safe and immune to
+        # future revisions (same discipline as the adoption suite).
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -312,22 +309,33 @@ def _seed_finding(
 
 
 def _seed_job_run(url: str, run_id: uuid.UUID, *, server_id: str = SERVER_A) -> None:
+    # The 0011 mandatory-tag constraint triggers are DEFERRABLE INITIALLY
+    # DEFERRED: the run and its reserved classification share the ONE
+    # committing transaction (the same discipline the real writers use).
     now = _utc()
     with psycopg.connect(url) as conn:
-        conn.execute(
-            """
-            INSERT INTO job_runs
-                (run_id, server_id, parent_run_id, depth, profile_revision,
-                 prompt_revision, model_profile, requested_grants,
-                 root_budget, error_ref, evidence_ref, cancel_requested_at,
-                 submitted_at, updated_at)
-            VALUES
-                (%s, %s, NULL, 0, 1, 1, 'fixture-profile',
-                 '[]'::jsonb, NULL, NULL, NULL, NULL, %s, %s)
-            """,
-            (run_id, uuid.UUID(server_id), now, now),
-        )
-        conn.commit()
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO job_runs
+                    (run_id, server_id, parent_run_id, depth, profile_revision,
+                     prompt_revision, model_profile, requested_grants,
+                     root_budget, error_ref, evidence_ref, cancel_requested_at,
+                     submitted_at, updated_at)
+                VALUES
+                    (%s, %s, NULL, 0, 1, 1, 'fixture-profile',
+                     '[]'::jsonb, NULL, NULL, NULL, NULL, %s, %s)
+                """,
+                (run_id, uuid.UUID(server_id), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO job_tags (job_id, tag_id, assignment_source)
+                VALUES (%s, %s, 'system')
+                ON CONFLICT DO NOTHING
+                """,
+                (run_id, RESERVED_UNCLASSIFIED_TAG_ID),
+            )
 
 
 def _count(url: str, table: str) -> int:

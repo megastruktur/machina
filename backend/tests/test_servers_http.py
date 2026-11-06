@@ -99,31 +99,15 @@ def _alembic_config() -> AlembicConfig:
 def _reset_fixture_db(url: str) -> None:
     """Reset the DISPOSABLE fixture database to pre-bootstrap state.
 
-    The disposable database may carry ``public`` tables beyond this suite's
-    own era — from later migrations (``0008``+ conversations/agent tasks) or
-    from other suites sharing the same pytest process — so the reset
-    enumerates the actual tables of THIS database and drops each by name in
-    one statement: no wildcard, no ``CASCADE``, no constraint-disabling and
-    no product migration is involved. This mirrors the reviewed pattern in
-    ``tests/test_onboarding_http.py`` (the previous explicit ``0001``..
-    ``0007`` list went stale the moment the chain grew and made a shared
-    ``upgrade head`` fail with ``DuplicateTable``). The
-    ``server_observations_seq`` sequence is dropped explicitly because
-    ``0007`` owns it and does not drop it with its table.
+    Whole-schema reset (D09): FK-safe and immune to future revisions —
+    ``session_tags``/``job_tags`` reference ``tags``, and 0015's dropped
+    tables make any enumerated list stale. The ``dbos`` schema goes too so
+    a fresh worker bootstrap never inherits PARKED workflows.
     """
     with psycopg.connect(url) as conn:
-        names = [
-            row[0]
-            for row in conn.execute(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
-                "ORDER BY tablename"
-            ).fetchall()
-        ]
-        if names:
-            # One statement: FK constraints WITHIN the dropped set are fine.
-            list_sql = ", ".join(f'"{name}"' for name in names)
-            conn.execute(f"DROP TABLE IF EXISTS {list_sql}")
-        conn.execute("DROP SEQUENCE IF EXISTS server_observations_seq")
+        conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+        conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
         conn.commit()
 
 
@@ -481,34 +465,27 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("PATCH", "/api/v1/schedules/{schedule_id}"),
         ("DELETE", "/api/v1/schedules/{schedule_id}"),
         ("GET", "/api/v1/schedules/{schedule_id}/fires"),
-        # (06-chat-api: conversations + the conversation event stream.)
-        ("POST", "/api/v1/chat/messages"),
-        ("GET", "/api/v1/chat/runs"),
-        ("GET", "/api/v1/chat/runs/{run_id}"),
-        ("PATCH", "/api/v1/chat/runs/{run_id}"),
-        ("POST", "/api/v1/chat/runs/{run_id}/cancel"),
-        ("GET", "/api/v1/chat/runs/{run_id}/events"),
-        # (so-01-onboarding-probe reconciliation, NOT a new surface: these
-        # conversation/task read+steer routes already existed at base
-        # 9d786cf but were never pinned — the pin test failed there too.
-        # Pinned here so the table guards future additions again.)
-        ("GET", "/api/v1/chat/conversations"),
-        ("POST", "/api/v1/chat/conversations"),
-        ("GET", "/api/v1/chat/conversations/{conversation_id}"),
-        ("POST", "/api/v1/chat/conversations/{conversation_id}/messages"),
-        ("GET", "/api/v1/chat/conversations/{conversation_id}/messages"),
-        ("GET", "/api/v1/chat/conversations/{conversation_id}/events"),
-        ("GET", "/api/v1/chat/conversations/{conversation_id}/task"),
-        ("POST", "/api/v1/chat/conversations/{conversation_id}/steer"),
-        ("GET", "/api/v1/chat/tasks/{task_id}/items"),
-        ("GET", "/api/v1/chat/tasks/{task_id}/revisions"),
-        ("POST", "/api/v1/chat/tasks/{task_id}/revisions"),
-        ("GET", "/api/v1/chat/tasks/{task_id}/constraints"),
-        ("GET", "/api/v1/chat/tasks/{task_id}/evidence"),
-        ("POST", "/api/v1/chat/tasks/{task_id}/decisions"),
-        # (mai-wire-desktop/chat: the lazy-loaded single tool step read.)
-        ("GET", "/api/v1/chat/runs/{run_id}/steps/{seq}"),
-        # (06-model-api: stored connections/profiles/selection + probe.)
+        # (D06 session-first surface: the ONE agent vocabulary after the
+        # D09 coordinated deletion.)
+        ("GET", "/api/v1/agent-sessions"),
+        ("POST", "/api/v1/agent-sessions"),
+        ("GET", "/api/v1/agent-sessions/{session_id}"),
+        ("PATCH", "/api/v1/agent-sessions/{session_id}"),
+        ("GET", "/api/v1/agent-sessions/{session_id}/history"),
+        ("POST", "/api/v1/agent-sessions/{session_id}/turns"),
+        ("POST", "/api/v1/agent-sessions/{session_id}/control"),
+        ("GET", "/api/v1/agent-sessions/{session_id}/tags"),
+        ("POST", "/api/v1/agent-sessions/{session_id}/tags"),
+        ("DELETE", "/api/v1/agent-sessions/{session_id}/tags/{tag_id}"),
+        # (D09 history-tag cutover: the global catalog + the retained
+        # generic job-tag routes; session tags ride the agent-sessions
+        # surface above.)
+        ("GET", "/api/v1/tags"),
+        ("POST", "/api/v1/tags"),
+        ("DELETE", "/api/v1/tags/{tag_id}"),
+        ("GET", "/api/v1/jobs/runs/{run_id}/tags"),
+        ("POST", "/api/v1/jobs/runs/{run_id}/tags"),
+        ("DELETE", "/api/v1/jobs/runs/{run_id}/tags/{tag_id}"),
         ("GET", "/api/v1/models/connections"),
         ("GET", "/api/v1/models/connections/{name}"),
         ("PUT", "/api/v1/models/connections/{name}"),
