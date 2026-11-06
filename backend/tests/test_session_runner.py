@@ -2294,3 +2294,261 @@ def test_missing_facade_detail_boundary_contract(
     # the real durable write, never a ValidationError.
     for evidence in ("y" * (501 - len(prefix)), "🔐-détail—" * 100):
         assert len(_settle_and_read(evidence)) == 500
+
+
+# ---------------------------------------------------------------------------
+# 14. E1: authoritative terminal state across facade/session/workflow
+# ---------------------------------------------------------------------------
+
+
+def _wf_status(url: str, run_id: str) -> str | None:
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT status FROM dbos.workflow_status WHERE workflow_uuid = %s",
+            (run_id,),
+        ).fetchone()
+    return None if row is None else str(row[0]).upper()
+
+
+def _wf_output(url: str, run_id: str) -> dict | None:
+    """The workflow result through the SUPPORTED engine client (DBOS
+    serializes results — JSON or base64 pickle per its own policy)."""
+    client = EngineClient(url)
+    try:
+        handle = client._client.retrieve_workflow(run_id)  # noqa: SLF001
+        result = handle.get_result()
+    except Exception:  # noqa: BLE001 - terminal without a result
+        return None
+    finally:
+        client.close()
+    return result if isinstance(result, dict) else None
+
+
+def _facade_final(url: str, run_id: str) -> str | None:
+    with psycopg.connect(url) as conn:
+        rows = conn.execute(
+            "SELECT data FROM job_events WHERE run_id = %s ORDER BY seq",
+            (uuid.UUID(run_id),),
+        ).fetchall()
+    last = None
+    for (data,) in rows:
+        payload = data if isinstance(data, dict) else json.loads(data)
+        if "to" in payload or "to_state" in payload:
+            last = payload.get("to_state") or payload.get("to")
+    return str(last) if last is not None else None
+
+
+def _force_facade_terminal(url: str, run_id: str, target: str) -> None:
+    """One EXTERNAL legal transition (the recovery/API seam) while the
+    real worker is parked mid-round."""
+    from mai.database import create_app_engine
+    from mai.jobs.lifecycle import RunLifecycle, RunState
+
+    eng, sessions = create_app_engine(url)
+
+    async def _force() -> None:
+        await RunLifecycle(sessions).record_transition(
+            run_id, RunState[str(target).upper()]
+        )
+
+    try:
+        _run(_force())
+    finally:
+        _run(eng.dispose())
+
+
+def _run_terminal_states(url: str, session_id: str) -> list[tuple[str, object]]:
+    return [
+        (entry["payload"].get("state"), entry["payload"].get("reason_code"))
+        for entry in _read_session_entries(url, session_id)
+        if entry["kind"] == "run_state"
+    ]
+
+
+def _drive_to_terminal(
+    agent_url: str,
+    scenario: pathlib.Path,
+    *,
+    run_id: str,
+    session_id: str,
+    gate: str,
+    before_release,
+    baseline_calls: int = 0,
+) -> int:
+    """Park the real worker at the model gate, run the caller's
+    ``before_release`` side effect, release the gate and wait for the
+    workflow to land any terminal DBOS status. ``baseline_calls`` skips
+    model calls already in the shared journal (multi-phase scenarios).
+    Returns the model-call count at release time (no-rerun baseline)."""
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-e1")
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(run_id, session_id, client_request_id=str(uuid.uuid4()))
+            ),
+        )
+        _wait_until(
+            lambda: _journal_lines(scenario).count("model_call") > baseline_calls,
+            RUN_TIMEOUT,
+            "model to reach the gate",
+        )
+        calls_before = _journal_lines(scenario).count("model_call")
+        before_release()
+        (scenario / "gates" / gate).write_text("", encoding="utf-8")
+        _wait_until(
+            lambda: _wf_status(agent_url, run_id)
+            in ("SUCCESS", "ERROR", "CANCELLED"),
+            RUN_TIMEOUT,
+            "workflow to land a terminal status",
+        )
+        return calls_before
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+
+def test_e1_dropped_facade_at_success_settlement_lands_error_not_success(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E1/F1: a SUCCESS round whose settlement finds the facade missing
+    must land DBOS ERROR — never SUCCESS carrying a failed result — with
+    the session domain failed and zero re-execution."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(scenario, [{"gate": "g-e1f1", "then": {"text": "e1-round-ok"}}])
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    calls_before = _drive_to_terminal(
+        agent_url,
+        scenario,
+        run_id=run_id,
+        session_id=session_id,
+        gate="g-e1f1",
+        before_release=lambda: _drop_facade_row(agent_url, run_id),
+    )
+
+    assert _wf_status(agent_url, run_id) == "ERROR", _wf_status(agent_url, run_id)
+    assert _wf_output(agent_url, run_id) is None  # no SUCCESS result exists
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "failed"
+    failures = [
+        payload
+        for payload in _run_terminal_states(agent_url, session_id)
+        if payload[0] == "failed"
+    ]
+    assert failures, "the honest failed settlement must be durable"
+    assert failures[0][1] != "unexpected_failure"  # no corrupted reason
+    # Zero re-execution and no fabricated facade.
+    assert _journal_lines(scenario).count("model_call") == calls_before
+    assert not any(line.startswith("begin:") for line in _journal_lines(scenario))
+    with psycopg.connect(agent_url) as conn:
+        facades = conn.execute(
+            "SELECT COUNT(*) FROM job_runs WHERE run_id = %s",
+            (uuid.UUID(run_id),),
+        ).fetchone()[0]
+    assert facades == 0
+
+
+def test_e1_preterminal_failed_facade_realigned_consistently(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E1/F2: an externally FAILED facade (the recovery seam) meeting a
+    successful round must realign every authority to FAILED — through
+    the settlement, not a TERMINAL_IMMUTABLE crash and not a corrupted
+    ``unexpected_failure`` second pass."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(scenario, [{"gate": "g-e1f2", "then": {"text": "e1-round-ok-2"}}])
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    calls_before = _drive_to_terminal(
+        agent_url,
+        scenario,
+        run_id=run_id,
+        session_id=session_id,
+        gate="g-e1f2",
+        before_release=lambda: _force_facade_terminal(agent_url, run_id, "FAILED"),
+    )
+
+    assert _wf_status(agent_url, run_id) == "ERROR", _wf_status(agent_url, run_id)
+    assert _facade_final(agent_url, run_id) == "failed"
+    runs = _read_session_runs(agent_url, session_id)
+    assert len(runs) == 1 and runs[0]["state"] == "failed", runs
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "failed"
+    sequence = _run_terminal_states(agent_url, session_id)
+    assert sequence.count(("running", None)) == 1, sequence
+    # ONE failed settlement with an honest reason — never the crash
+    # handler's misclassified unexpected_failure, never a second pass.
+    failed_entries = [entry for entry in sequence if entry[0] == "failed"]
+    assert len(failed_entries) == 1, sequence
+    assert failed_entries[0][1] != "unexpected_failure", sequence
+    assert _journal_lines(scenario).count("model_call") == calls_before
+
+
+def test_e1_preterminal_cancelled_and_succeeded_facade_align_consistently(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """E1: preterminal CANCELLED and SUCCEEDED facades meeting a
+    successful round stay aligned in EVERY authority — the settled
+    result carries the facade's terminal value, the engine lands
+    CANCELLED for a cancelled facade, and SUCCESS for a succeeded one."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    baseline = 0
+    for gate, target, expected_status in (
+        ("g-e1c", "CANCELLED", "CANCELLED"),
+        ("g-e1s", "SUCCEEDED", "SUCCESS"),
+    ):
+        _script(scenario, [{"gate": gate, "then": {"text": f"round-{target}"}}])
+        session_id = _run(_make_session(factory))
+        run_id = str(uuid.uuid4())
+        _run(insert_run(run_id))
+        calls_before = _drive_to_terminal(
+            agent_url,
+            scenario,
+            run_id=run_id,
+            session_id=session_id,
+            gate=gate,
+            before_release=lambda target=target: _force_facade_terminal(
+                agent_url, run_id, target
+            ),
+            baseline_calls=baseline,
+        )
+        baseline = _journal_lines(scenario).count("model_call")
+        assert _wf_status(agent_url, run_id) == expected_status, (
+            target,
+            _wf_status(agent_url, run_id),
+        )
+        assert _facade_final(agent_url, run_id) == target.lower()
+        runs = _read_session_runs(agent_url, session_id)
+        assert len(runs) == 1 and runs[0]["state"] == target.lower(), runs
+        header = _read_sessions_row(agent_url, session_id)
+        assert header is not None and header["status"] in ("cancelled", "idle")
+        if expected_status == "SUCCESS":
+            output = _wf_output(agent_url, run_id)
+            assert output is not None and output.get("state") == "succeeded", output
+        else:
+            assert _wf_output(agent_url, run_id) is None
+        assert _journal_lines(scenario).count("model_call") == calls_before

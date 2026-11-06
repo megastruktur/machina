@@ -2565,6 +2565,12 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
                 SessionRunState.SUCCEEDED,
                 SessionStatus.IDLE,
             )
+        elif current is RunState.FAILED:
+            facade_state, session_state, header_status = (
+                RunState.FAILED,
+                SessionRunState.FAILED,
+                SessionStatus.FAILED,
+            )
     try:
         if current is not facade_state:
             executor.run(
@@ -2606,7 +2612,9 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
                 },
             )
         )
-    return json.dumps({"settled": state_value})
+    # E1: the settled value is the ALIGNED outcome (a preterminal facade
+    # realignment changes it), so facade/session/header/result agree.
+    return json.dumps({"settled": session_state.value})
 
 
 # --- the workflow ---------------------------------------------------------------------
@@ -2809,18 +2817,33 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             "reason": stopped_by,
         }
         settled = json.loads(_session_settled(payload_json, json.dumps(summary)))
-        if final_state == "cancelled":
+        settled_state = str(settled.get("settled", final_state))
+        # E1 (F1): the AUTHORITATIVE settlement outcome wins — the summary
+        # must never clobber it. When the settlement chose FAILED (e.g.
+        # the facade row missing at settlement, or a preterminal facade
+        # realignment) while the round itself completed, the engine must
+        # agree: ERROR, never a SUCCESS carrying a failed result.
+        if settled_state == "failed" and final_state != "failed":
+            raise SessionRunFailed("settlement_failed")
+        if settled_state == "cancelled":
             # The engine must land CANCELLED (the DBOS workflow status is
-            # the facade truth): settle the domain above, then surface the
-            # reviewed cancellation exception so the engine agrees.
+            # the facade truth). DBOS lands CANCELLED only for a RECORDED
+            # cancellation: the control seam records it externally, and a
+            # preterminal-CANCELLED facade realignment records it here
+            # through the supported in-context operation (checkpointed as
+            # a step) BEFORE the reviewed cancellation exception surfaces.
+            if final_state != "cancelled":
+                from dbos import DBOS
+
+                await DBOS.cancel_workflow_async(intent.run_id)
             raise dbos_error.DBOSWorkflowCancelledError(
                 "session run cancelled at a safe boundary"
             )
         return {
             "run_id": intent.run_id,
             "session_id": intent.session_id,
-            "state": str(settled.get("settled", final_state)),
-            **summary,
+            "state": settled_state,
+            **{k: v for k, v in summary.items() if k != "state"},
         }
     except SessionStageError as stage:
         _session_failed(
@@ -2852,6 +2875,11 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
         raise
     except dbos_error.DBOSWorkflowCancelledError:
         _session_cancelled(payload_json)
+        raise
+    except SessionRunFailed:
+        # E1: the classified engine-visible failure was ALREADY settled
+        # (stage handlers above, or the settlement-divergence guard):
+        # never settle twice, never reclassify as unexpected_failure.
         raise
     except SessionRunError:
         _session_failed(payload_json, "runner_error")
