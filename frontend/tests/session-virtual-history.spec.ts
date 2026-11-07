@@ -2040,6 +2040,63 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(gaps.proseToGroup).toBeLessThanOrEqual(8 + 0.5);
 		expect(gaps.insideGroup).toBeGreaterThanOrEqual(4 - 0.5);
 		expect(gaps.insideGroup).toBeLessThanOrEqual(4 + 0.5);
+
+		// ---- W3 fix round 1: the capability-summary → its FIRST result
+		// is the same 4px in-group step (contract >= 3.5px), measured
+		// from the OPEN group's summary visible content to the first
+		// inner result row. The old body padding-top squeezed this to
+		// 2px; the step is now a margin that padding cannot compress.
+		// ----
+		const summaryStep = await page.evaluate(() => {
+			const group = document.querySelector('[data-testid="turn-tool-group"]') as HTMLElement;
+			const summary = group.querySelector('.mai-tool-group__summary') as HTMLElement;
+			let summaryBottom = Number.NEGATIVE_INFINITY;
+			for (const el of Array.from(summary.querySelectorAll<HTMLElement>('*'))) {
+				if (el.offsetParent === null) continue;
+				const probe = el as HTMLElement & {
+					checkVisibility?: (options: unknown) => boolean;
+				};
+				if (
+					typeof probe.checkVisibility === 'function' &&
+					!probe.checkVisibility({ checkOpacity: false })
+				) {
+					continue;
+				}
+				const rect = el.getBoundingClientRect();
+				if (rect.width === 0 && rect.height === 0) continue;
+				summaryBottom = Math.max(summaryBottom, rect.bottom);
+			}
+			const firstResult = group
+				.querySelector('[data-testid="session-entry"]')!
+				.getBoundingClientRect();
+			return firstResult.top - summaryBottom;
+		});
+		expect(summaryStep).toBeGreaterThanOrEqual(3.5);
+		expect(summaryStep).toBeLessThanOrEqual(4.5);
+
+		// ---- W3 fix round 2: capability ids render in the repo's mono
+		// token (themed app: JetBrains Mono; harness fallback: the
+		// monospace generic), NOT the panel's sans stack, while the
+		// group label keeps its 13px / 600 hierarchy.
+		// ----
+		const typography = await page.evaluate(() => {
+			const group = document.querySelector('[data-testid="turn-tool-group"]') as HTMLElement;
+			const code = group.querySelector('.mai-tool-group__item code') as HTMLElement;
+			const label = group.querySelector('.mai-tool-group__label') as HTMLElement;
+			const codeStyle = getComputedStyle(code);
+			const labelStyle = getComputedStyle(label);
+			return {
+				codeFamily: codeStyle.fontFamily,
+				codeSize: codeStyle.fontSize,
+				labelFamily: labelStyle.fontFamily,
+				labelSize: labelStyle.fontSize,
+				labelWeight: labelStyle.fontWeight
+			};
+		});
+		expect(typography.codeFamily.toLowerCase()).toContain('mono');
+		expect(typography.codeFamily).not.toBe(typography.labelFamily);
+		expect(typography.labelSize).toBe('13px');
+		expect(typography.labelWeight).toBe('600');
 	});
 });
 

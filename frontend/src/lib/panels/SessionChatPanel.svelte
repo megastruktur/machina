@@ -1217,11 +1217,23 @@
 		gap: var(--mai-space-1, 4px);
 		align-items: baseline;
 	}
+	/* Capability ids are code identifiers: the repo's mono token, NOT
+	 * the panel's sans stack (W3 fix round — they computed to Rajdhani).
+	 * The label keeps 13px/600 and the badge keeps .mai-tool-status. */
+	.mai-tool-group__item code {
+		font-family: var(--mai-font-mono, monospace);
+	}
 	.mai-tool-group__body {
 		display: flex;
 		flex-direction: column;
+		/* The capability-summary → first result step is the 4px
+		 * in-group rhythm, measured from the summary's visible text to
+		 * the first result row — a MARGIN so no padding can compress
+		 * it (the old 2px body padding-top squeezed the step to 2px).
+		 * Result → result keeps the 4px flex gap above. */
+		margin-top: var(--mai-call-gap);
 		gap: var(--mai-call-gap);
-		padding: 2px 0 2px 10px;
+		padding: 0 0 2px 10px;
 	}
 	/* Delegation one-line summary: the short child-run id sits next to
 	   the title (the FULL id stays in the collapsed body). */
