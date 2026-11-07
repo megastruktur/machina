@@ -1160,6 +1160,122 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		await expect(logsRow).toContainText('Чек-лист логов');
 		await expect(logsRow).not.toContainText('\\u0427');
 	});
+
+	// CSJ-S1: scrolling to the bottom of a multi-entry Markdown session
+	// must NOT collapse the top spacer (flex-shrink: 0) or oscillate
+	// windowStart/scrollTop. The spacer preserves the virtual offset.
+	test('bottom scroll: spacer stays full height, zero oscillation', async ({ page }) => {
+		await gotoHarness(page);
+		let wire: { send(payload: string): void } | null = null;
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				wire = ws;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				// Seed enough entries to overflow the viewport and trigger
+				// windowing. Each entry is a multi-line Markdown block so
+				// offsetHeight > ENTRY_HEIGHT_ESTIMATE and the spacer matters.
+				for (let seq = 1; seq <= 30; seq += 1) {
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: null,
+								durable_source_id: `csj-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload: {
+									kind: 'assistant_message',
+									text: [
+										`## Entry ${seq}`,
+										'',
+										'Line one of the response.',
+										'Line two with **bold** text.',
+										'Line three with `inline code`.',
+										'',
+										'- item A',
+										'- item B',
+										'',
+										'Final paragraph.'
+									].join('\n'),
+									model_profile: 'fast',
+									tool_group_state: 'none'
+								}
+							}
+						})
+					);
+				}
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		const viewport = page.getByTestId('session-history-viewport');
+		await expect(viewport).toBeVisible();
+		// Wait for all 30 entries to land in the cache.
+		await expect
+			.poll(
+				async () => Number((await viewport.getAttribute('data-cached-count')) ?? '0'),
+				{ timeout: 10_000 }
+			)
+			.toBe(30);
+
+		// Scroll to the very bottom. This should push scrollTop past
+		// OVERSCAN_PX (480), advancing windowStart and mounting the top spacer.
+		await viewport.evaluate((node) => {
+			node.scrollTop = node.scrollHeight;
+		});
+		// Let the Svelte reactivity settle.
+		await page.waitForTimeout(300);
+
+		// The top spacer MUST have a non-zero height (flex-shrink: 0
+		// prevents collapse). If it collapsed to 0, scrollHeight would
+		// shrink, scrollTop would drop below OVERSCAN_PX, and windowStart
+		// would flip back — the infinite jitter loop.
+		const topSpacer = viewport.locator('.mai-session-chat__spacer').first();
+		const spacerHeight = await topSpacer.evaluate((node) => (node as HTMLElement).offsetHeight);
+		expect(spacerHeight).toBeGreaterThan(0);
+
+		// Capture stable state across animation frames to prove zero
+		// oscillation. If the spacer collapsed and remounted, scrollTop
+		// and dom-count would flicker between two values.
+		const samples: Array<{ scrollTop: number; scrollHeight: number; domCount: number }> = [];
+		for (let frame = 0; frame < 6; frame += 1) {
+			await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+			const sample = await viewport.evaluate((node) => ({
+				scrollTop: node.scrollTop,
+				scrollHeight: node.scrollHeight,
+				domCount: Number(node.getAttribute('data-dom-count') ?? '0')
+			}));
+			samples.push(sample);
+		}
+		// All samples must be identical — no jitter.
+		const first = samples[0];
+		for (const sample of samples) {
+			expect(sample.scrollTop).toBe(first.scrollTop);
+			expect(sample.scrollHeight).toBe(first.scrollHeight);
+			expect(sample.domCount).toBe(first.domCount);
+		}
+		// Seed precondition: the history must be deep enough that the
+		// bottom sits past the overscan window (scrollHeight > 1500px,
+		// scrollTop > OVERSCAN_PX = 480px, windowStart > 0).
+		expect(first.scrollHeight).toBeGreaterThan(1500);
+		// scrollTop must actually be past the overscan threshold (the
+		// condition that used to trigger the collapse).
+		expect(first.scrollTop).toBeGreaterThan(480);
+	});
 });
 
 // ---------------------------------------------------------------------------
