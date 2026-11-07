@@ -53,6 +53,7 @@
 	import Button from '../ui/Button.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 	import { Virtualizer, type VirtualizerHandle } from 'virtua/svelte';
+	import { buildTurnUnits, type TurnUnit } from './turnGroups.js';
 	import { tick, untrack } from 'svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
@@ -340,6 +341,20 @@
 			);
 		});
 	});
+
+	/**
+	 * CTR-W2: the render units handed to the virtualizer — standalone
+	 * rows or TURN GROUPS (an assistant lead + its contiguous
+	 * tool_result/delegation children; see ./turnGroups.ts for the
+	 * pure grouping rules). The virtualizer's data stays a FLAT list
+	 * keyed by each unit's LEADING seq: keys remain unique and stable
+	 * while entries append (a group's key is its lead's seq and never
+	 * changes), so measured rows, `shift`-compensated prepends and the
+	 * load-older flow keep working. Only a prepend can refold the
+	 * first visible orphan into a group — one keyed item replaced by
+	 * an earlier key, an ordinary keyed-data change for virtua.
+	 */
+	const turnUnits = $derived(buildTurnUnits(visibleEntries));
 
 	/** The run states that mean "the agent is working right now". */
 	const GENERATING_RUN_STATES: ReadonlySet<string> = new Set([
@@ -662,8 +677,8 @@
 				     which IS this viewport. -->
 				<Virtualizer
 					bind:this={virtualizerRef}
-					data={visibleEntries}
-					getKey={(entry) => entry.seq}
+					data={turnUnits}
+					getKey={(unit) => unit.key}
 					scrollRef={viewportEl ?? undefined}
 					shift={isPrepending}
 					startMargin={effectiveStartMargin}
@@ -691,7 +706,8 @@
 						}
 					}}
 				>
-					{#snippet children(entry)}
+					{#snippet children(unit: TurnUnit)}
+						{#snippet entryArticle(entry: ChannelEntry)}
 						<article
 							class="mai-session-entry"
 							data-testid="session-entry"
@@ -838,6 +854,30 @@
 							</p>
 						{/if}
 						</article>
+						{/snippet}
+						{#if unit.kind === 'group'}
+							<!-- CTR-W2: one turn group = the assistant lead's prose at
+							     the base indent + its tool/delegation children 16px
+							     deeper, with the 1px rail spanning the group's full
+							     height on its left edge. A childless lead renders as a
+							     plain row — no rail, no group container. -->
+							<div
+								class="mai-turn-group"
+								data-testid="turn-group"
+								data-turn-run-id={unit.runId}
+							>
+								{@render entryArticle(unit.lead)}
+								<div class="mai-turn-group__children">
+									{#each unit.children as child (child.seq)}
+										<div class="mai-turn-group__child" data-testid="turn-group-child">
+											{@render entryArticle(child)}
+										</div>
+									{/each}
+								</div>
+							</div>
+						{:else}
+							{@render entryArticle(unit.entry)}
+						{/if}
 					{/snippet}
 				</Virtualizer>
 			{/if}
@@ -1022,6 +1062,31 @@
 		padding-bottom: var(--mai-session-rhythm);
 		margin: 0;
 		box-sizing: content-box;
+	}
+	/* ---- turn groups (CTR-W2): an assistant turn + its children ---- */
+	.mai-turn-group {
+		position: relative;
+	}
+	/* The left rail: one 1px muted line on the group's left edge,
+	   spanning the group's FULL height (the lead prose + every child).
+	   It exists only for real groups — a childless lead renders as a
+	   plain row, so no rail appears without children. */
+	.mai-turn-group::before {
+		content: '';
+		position: absolute;
+		left: 0;
+		top: 0;
+		bottom: 0;
+		width: 1px;
+		background: var(--mai-color-border, rgba(0, 0, 0, 0.25));
+	}
+	/* Children (tool results, delegations) sit --mai-space-4 (16px)
+	   deeper than the group's content edge, so the parent/child
+	   relation reads at a glance. W3 may differentiate per child kind. */
+	.mai-turn-group__children {
+		display: flex;
+		flex-direction: column;
+		padding-left: var(--mai-space-4, 16px);
 	}
 	.mai-session-entry__text {
 		margin: 0;

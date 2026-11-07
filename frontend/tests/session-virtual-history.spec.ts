@@ -1481,6 +1481,233 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		// Evidence: every consecutive pair carries the full rhythm.
 		expect(visibleGaps.length).toBe(4);
 	});
+
+	// CTR-W2: turn grouping and hierarchy. A tool result / delegation
+	// that belongs to a loaded assistant turn renders as its CHILD —
+	// indented 16px (--mai-space-4) under a 1px rail spanning the
+	// group — while orphans (no matching assistant in the window) and
+	// unscoped rows stay top-level at the base indent. The rendered
+	// DOM order must equal seq order exactly: grouping nests, it never
+	// reorders.
+	test('turn grouping: children nest under their assistant turn with a rail', async ({
+		page
+	}) => {
+		const RUN_A = '11111111-1111-4111-8111-111111111112';
+		const RUN_B = '11111111-1111-4111-8111-111111111113';
+		const RUN_C = '11111111-1111-4111-8111-111111111114';
+		const RUN_D = '11111111-1111-4111-8111-111111111115';
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (
+					seq: number,
+					runId: string | null,
+					payload: Record<string, unknown>
+				) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: runId,
+								durable_source_id: `ctr2-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				committed(1, null, {
+					kind: 'user_message',
+					text: 'check the logs on alpha',
+					client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					source: 'api'
+				});
+				// RUN A's turn: the assistant declares one tool call; its
+				// matching result is the group's child.
+				committed(2, RUN_A, {
+					kind: 'assistant_message',
+					text: 'Checking the logs.',
+					model_profile: 'fast',
+					tool_group_state: 'none',
+					tool_calls: [
+						{
+							call_id: 'call-1',
+							tool_name: 'host_shell',
+							capability_id: 'host.shell',
+							args: {}
+						}
+					]
+				});
+				committed(3, RUN_A, {
+					kind: 'tool_result',
+					call_id: 'call-1',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'logs rotated',
+					error_code: null,
+					error_detail: null
+				});
+				// call-2 was never declared by any loaded assistant: an
+				// ORPHAN result — top-level, never dropped.
+				committed(4, RUN_A, {
+					kind: 'tool_result',
+					call_id: 'call-2',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'stale tail',
+					error_code: null,
+					error_detail: null
+				});
+				// RUN B's turn: no declared calls, but its delegation card
+				// (same run) is still the assistant's own action → child.
+				committed(5, RUN_B, {
+					kind: 'assistant_message',
+					text: 'Delegating the tail read.',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				committed(6, RUN_B, {
+					kind: 'delegation',
+					child_run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					child_session_id: null,
+					goal: 'read the rotated tails',
+					status: 'succeeded',
+					allowed_capabilities: ['host.logs'],
+					result_summary: 'tails read',
+					error_code: null
+				});
+				// RUN C has NO assistant message in the window: its
+				// delegation stays top-level (orphan).
+				committed(7, RUN_C, {
+					kind: 'delegation',
+					child_run_id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+					child_session_id: null,
+					goal: 'unrelated task',
+					status: 'succeeded',
+					allowed_capabilities: ['host.shell'],
+					result_summary: 'done',
+					error_code: null
+				});
+				// RUN D's assistant has no qualifying followers: a
+				// childless turn renders as a plain row — no rail.
+				committed(8, RUN_D, {
+					kind: 'assistant_message',
+					text: 'All done.',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				committed(9, null, {
+					kind: 'user_message',
+					text: 'thanks',
+					client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+					source: 'api'
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		// Nothing folds in this fixture: all nine entries render.
+		await expect(page.getByTestId('session-entry')).toHaveCount(9);
+		// A3: the rendered order equals seq order exactly — grouping
+		// nests children, it never reorders the stream.
+		const domSeqs = await page.evaluate(() =>
+			Array.from(
+				document.querySelectorAll('[data-testid="session-entry"]')
+			).map((row) => Number((row as HTMLElement).dataset.entrySeq))
+		);
+		expect(domSeqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+		// Exactly TWO groups: RUN A's turn (lead 2, child 3) and RUN B's
+		// turn (lead 5, child 6). Everything else stays top-level.
+		const groups = page.getByTestId('turn-group');
+		await expect(groups).toHaveCount(2);
+		await expect(groups.first()).toHaveAttribute('data-turn-run-id', RUN_A);
+		await expect(groups.nth(1)).toHaveAttribute('data-turn-run-id', RUN_B);
+		const childSeqs = await page.evaluate(() =>
+			Array.from(
+				document.querySelectorAll(
+					'[data-testid="turn-group-child"] [data-testid="session-entry"]'
+				)
+			).map((row) => Number((row as HTMLElement).dataset.entrySeq))
+		);
+		expect(childSeqs).toEqual([3, 6]);
+		// The delegation rows both render (grouped child + orphan).
+		await expect(page.getByTestId('entry-delegation')).toHaveCount(2);
+
+		// A1, measured: the child sits strictly deeper than the parent
+		// prose (16px, --mai-space-4) and the group carries a 1px rail.
+		const hierarchy = await page.evaluate(() => {
+			const group = document.querySelector('[data-testid="turn-group"]') as HTMLElement;
+			const prose = group
+				.querySelector('[data-testid="entry-assistant-message"]')!
+				.getBoundingClientRect();
+			const child = group
+				.querySelector('[data-testid="turn-group-child"]')!
+				.getBoundingClientRect();
+			const rail = getComputedStyle(group, '::before');
+			return {
+				indent: child.left - prose.left,
+				childDeeper: child.left > prose.left,
+				railWidth: rail.width,
+				railColor: rail.backgroundColor
+			};
+		});
+		expect(hierarchy.childDeeper).toBe(true);
+		expect(hierarchy.indent).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(hierarchy.indent).toBeLessThanOrEqual(16 + 0.5);
+		expect(hierarchy.railWidth).toBe('1px');
+		expect(hierarchy.railColor).not.toBe('rgba(0, 0, 0, 0)');
+
+		// A2, measured: the orphan result (seq 4), the orphan delegation
+		// (seq 7) and the childless assistant (seq 8) have NO group
+		// ancestor and sit at the BASE indent (same left as the seq 1
+		// user row) — never dropped, no rail.
+		const orphans = await page.evaluate(() => {
+			const rowOf = (seq: string) =>
+				document.querySelector(`[data-entry-seq="${seq}"]`) as HTMLElement | null;
+			const base = rowOf('1')!.getBoundingClientRect().left;
+			return {
+				toolGroupless: rowOf('4')!.closest('[data-testid="turn-group"]') === null,
+				delegationGroupless: rowOf('7')!.closest('[data-testid="turn-group"]') === null,
+				childlessGroupless: rowOf('8')!.closest('[data-testid="turn-group"]') === null,
+				toolLeft: rowOf('4')!.getBoundingClientRect().left,
+				delegationLeft: rowOf('7')!.getBoundingClientRect().left,
+				childlessLeft: rowOf('8')!.getBoundingClientRect().left,
+				base
+			};
+		});
+		expect(orphans.toolGroupless).toBe(true);
+		expect(orphans.delegationGroupless).toBe(true);
+		expect(orphans.childlessGroupless).toBe(true);
+		expect(orphans.toolLeft).toBeCloseTo(orphans.base, 1);
+		expect(orphans.delegationLeft).toBeCloseTo(orphans.base, 1);
+		expect(orphans.childlessLeft).toBeCloseTo(orphans.base, 1);
+	});
 });
 
 // ---------------------------------------------------------------------------
