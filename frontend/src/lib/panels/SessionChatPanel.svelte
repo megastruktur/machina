@@ -5,10 +5,10 @@
 	 *
 	 * Owns ONE visible session's bounded history surface:
 	 *  - the entry cache lives with the composed shell (≤400 committed
-	 *    entries — the shell merges channel deliveries + REST older pages
-	 *    and evicts); this component renders a WINDOWED slice of the
-	 *    FILTERED cache (≤80 DOM rows + measured spacers) so the DOM never
-	 *    mirrors the whole cache;
+ *    entries — the shell merges channel deliveries + REST older pages
+ *    and evicts); this component virtualizes the FILTERED cache with
+ *    `virtua/svelte`'s `Virtualizer` (measured, absolutely positioned
+ *    rows, windowed DOM) so the DOM never mirrors the whole cache;
 	 *  - the transcript is a CHAT, not an audit log: `run_state` entries
 	 *    and delegated child-run entries are filtered out of the rendered
 	 *    stream (S3) — run state drives the live generating indicator and
@@ -52,7 +52,8 @@
 	import type { components } from '../api/schema.generated.js';
 	import Button from '../ui/Button.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
-	import { untrack } from 'svelte';
+	import { Virtualizer, type VirtualizerHandle } from 'virtua/svelte';
+	import { tick, untrack } from 'svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
 
@@ -421,117 +422,55 @@
 		}
 	});
 
-	// --- virtualization (windowed DOM over the filtered cache) ----------------
-	const ENTRY_HEIGHT_ESTIMATE = 72;
-	const OVERSCAN_PX = 480;
-	const MAX_DOM_ROWS = 80;
-
-	let viewportHeight = $state(0);
-	let scrollTop = $state(0);
-	/** Measured row heights by seq (unmeasured rows use the estimate). */
-	let heights = new Map<number, number>();
-	/** Bumped whenever a measurement lands so offsets recompute. */
-	let measureVersion = $state(0);
-
-	// R08 F4: prune measured heights evicted from the bounded cache — the
-	// map must not grow with browsed history (tens of KB per 1k entries).
-	// Plain-map mutation is safe here: offsets recompute through
-	// `measureVersion`, never through the map itself.
-	$effect(() => {
-		const live = new Set(visibleEntries.map((entry) => Number(entry.seq)));
-		for (const seq of [...heights.keys()]) {
-			if (!live.has(seq)) heights.delete(seq);
-		}
-	});
-
-	function measure(node: HTMLElement, entry: ChannelEntry) {
-		let currentSeq = Number(entry.seq);
-		// Track dynamic height changes (<details> toggles, in-place
-		// updates) without subpixel jitter: only whole-pixel deltas
-		// re-measure and bump the offsets.
-		const sync = () => {
-			const height = node.offsetHeight;
-			const prev = heights.get(currentSeq);
-			if (height > 0 && (prev === undefined || Math.abs(prev - height) >= 1)) {
-				heights.set(currentSeq, height);
-				measureVersion += 1;
-			}
-		};
-		sync();
-		let ro: ResizeObserver | null = null;
-		if (typeof ResizeObserver !== 'undefined') {
-			ro = new ResizeObserver(() => sync());
-			ro.observe(node);
-		}
+	// --- virtualization (virtua over the filtered cache) ----------------------
+	/**
+	 * `virtua/svelte`'s `Virtualizer` owns the window: it measures every
+	 * mounted row (ResizeObserver), positions rows absolutely and mounts
+	 * only the rows near the viewport (+400px buffer), so the DOM never
+	 * mirrors the whole cache. `mountedDomCount` — tracked by the tiny
+	 * `trackMounted` action on each entry article — surfaces the live
+	 * mounted-row count to the E2E assertions through `data-dom-count`.
+	 */
+	let mountedDomCount = $state(0);
+	function trackMounted(_node: HTMLElement) {
+		mountedDomCount += 1;
 		return {
-			update(next: ChannelEntry) {
-				currentSeq = Number(next.seq);
-				sync();
-			},
 			destroy() {
-				ro?.disconnect();
+				mountedDomCount -= 1;
 			}
 		};
 	}
 
-	function heightOf(entry: ChannelEntry): number {
-		return heights.get(Number(entry.seq)) ?? ENTRY_HEIGHT_ESTIMATE;
-	}
+	/**
+	 * The "Load older" trigger occupies the top of the scroll container
+	 * before the virtualizer; virtua must know its height to keep its
+	 * scroll-offset math exact (`startMargin`).
+	 */
+	let olderHeaderHeight = $state(0);
+	const effectiveStartMargin = $derived(hasOlder ? olderHeaderHeight : 0);
 
-	function offsetOf(index: number): number {
-		let total = 0;
-		for (let i = 0; i < index && i < visibleEntries.length; i += 1) {
-			total += heightOf(visibleEntries[i]);
-		}
-		return total;
-	}
+	let virtualizerRef: VirtualizerHandle | null = $state(null);
 
-	const totalHeight = $derived.by(() => {
-		void measureVersion;
-		return offsetOf(visibleEntries.length);
-	});
-
-	/** The rendered window: first index whose offset enters the viewport. */
-	const windowStart = $derived.by(() => {
-		void measureVersion;
-		let cumulative = 0;
-		let start = 0;
-		const limit = Math.max(scrollTop - OVERSCAN_PX, 0);
-		for (let i = 0; i < visibleEntries.length; i += 1) {
-			if (cumulative >= limit) {
-				start = i;
-				break;
-			}
-			cumulative += heightOf(visibleEntries[i]);
-			start = i + 1;
-		}
-		return Math.min(start, visibleEntries.length);
-	});
-
-	const windowEnd = $derived.by(() => {
-		void measureVersion;
-		const startOffset = offsetOf(windowStart);
-		let cumulative = startOffset;
-		let count = 0;
-		for (let i = windowStart; i < visibleEntries.length; i += 1) {
-			if (cumulative >= scrollTop + viewportHeight + OVERSCAN_PX && count > 0) {
-				break;
-			}
-			cumulative += heightOf(visibleEntries[i]);
-			count += 1;
-			if (count >= MAX_DOM_ROWS) break;
-		}
-		return windowStart + count;
-	});
-
-	const renderedSlice = $derived(visibleEntries.slice(windowStart, windowEnd));
-	const topSpacerHeight = $derived.by(() => {
-		void measureVersion;
-		return offsetOf(windowStart);
-	});
-	const bottomSpacerHeight = $derived.by(() => {
-		void measureVersion;
-		return Math.max(totalHeight - offsetOf(windowEnd), 0);
+	/**
+	 * Detect an upward `before_seq` prepend — an older page landed at the
+	 * TOP of the filtered cache — for virtua's `shift` prop. True ONLY
+	 * for the update that prepends, so virtua compensates `scrollTop`
+	 * and the reader's position stays put; every other update (tail
+	 * append, cache eviction, session swap) keeps it false.
+	 */
+	let lastSeenFirstSeq: number | null = null;
+	let lastSeenSessionId: string | null = null;
+	const isPrepending = $derived.by(() => {
+		const sid = sessionId ?? null;
+		const first = visibleEntries.length > 0 ? Number(visibleEntries[0].seq) : null;
+		const prepending =
+			sid === lastSeenSessionId &&
+			lastSeenFirstSeq !== null &&
+			first !== null &&
+			first < lastSeenFirstSeq;
+		lastSeenSessionId = sid;
+		lastSeenFirstSeq = first;
+		return prepending;
 	});
 
 	const oldestSeq = $derived(
@@ -545,83 +484,68 @@
 
 	// --- scroll anchoring -----------------------------------------------------
 	let viewportEl: HTMLElement | null = $state(null);
-	let prevFirstSeq: number | null = null;
 	let prevLastSeq: number | null = null;
-	let prevScrollHeight = 0;
 	let anchoredToBottom = $state(true);
+
+	/** A session swap re-anchors to the NEW session's tail. */
+	$effect(() => {
+		void sessionId;
+		anchoredToBottom = true;
+	});
 
 	function onScroll(): void {
 		if (viewportEl === null) return;
-		scrollTop = viewportEl.scrollTop;
 		anchoredToBottom =
-			scrollTop + viewportEl.clientHeight >= viewportEl.scrollHeight - 4;
+			viewportEl.scrollTop + viewportEl.clientHeight >=
+			viewportEl.scrollHeight - 24;
 		// Demand-load older pages near the top (the shell deduplicates).
+		// `prevLastSeq !== null` keeps the initial-mount churn from
+		// firing a fetch before the first page has settled.
 		if (
-			scrollTop <= 64 &&
+			viewportEl.scrollTop <= 64 &&
 			hasOlder &&
 			!loadingOlder &&
-			visibleEntries.length > 0
+			prevLastSeq !== null
 		) {
 			onloadolder();
 		}
 	}
 
 	/**
-	 * Scroll anchoring (post-DOM): prepending older entries adjusts
-	 * `scrollTop` by the prepended height delta; following the tail keeps
-	 * the newest row visible. Runs after every entries change.
+	 * Follow the tail while anchored: a NEW committed tail —
+	 * `lastSeq > prevLastSeq` or the first page itself — extends the
+	 * transcript below the fold, so scroll to the bottom after the DOM
+	 * settles. untrack: scrolling at the bottom toggles
+	 * `anchoredToBottom`, which must NEVER re-run this effect.
 	 */
 	$effect(() => {
-		const firstSeq =
-			visibleEntries.length > 0 ? Number(visibleEntries[0].seq) : null;
 		const lastSeq =
 			visibleEntries.length > 0
 				? Number(visibleEntries[visibleEntries.length - 1].seq)
 				: null;
-		if (
-			viewportEl === null ||
-			visibleEntries.length === 0 ||
-			firstSeq === null ||
-			lastSeq === null
-		) {
-			prevFirstSeq = firstSeq;
-			prevLastSeq = lastSeq;
-			return;
-		}
-		const beforeFirst = prevFirstSeq;
-		const beforeLast = prevLastSeq;
-		const previousHeight = prevScrollHeight;
-		if (beforeFirst !== null && firstSeq < beforeFirst && previousHeight > 0) {
-			// Older entries PREPENDED: keep the reader's visual position.
-			viewportEl.scrollTop += viewportEl.scrollHeight - previousHeight;
-		} else if (
-			beforeFirst === null ||
-			(beforeLast !== null && lastSeq > beforeLast)
-		) {
-			// Newest entries appended: follow the tail when already at it.
-			// untrack: scrolling at the bottom toggles `anchoredToBottom`,
-			// which must NEVER re-run this entry-change effect.
-			if (untrack(() => anchoredToBottom)) {
+		const appended =
+			lastSeq !== null &&
+			(prevLastSeq === null || lastSeq > prevLastSeq);
+		prevLastSeq = lastSeq;
+		if (!appended) return;
+		if (!untrack(() => anchoredToBottom)) return;
+		void tick().then(() => {
+			if (viewportEl !== null && untrack(() => anchoredToBottom)) {
 				viewportEl.scrollTop = viewportEl.scrollHeight;
 			}
-		}
-		prevFirstSeq = firstSeq;
-		prevLastSeq = lastSeq;
-		prevScrollHeight = viewportEl.scrollHeight;
+		});
 	});
 
-	/** Initial focus + bottom anchor once the first page rendered. */
+	/** A drafts/generating change while anchored also follows the tail. */
 	$effect(() => {
-		if (
-			visibleEntries.length > 0 &&
-			prevScrollHeight === 0 &&
-			viewportEl !== null
-		) {
-			viewportEl.scrollTop = viewportEl.scrollHeight;
-			prevScrollHeight = viewportEl.scrollHeight;
-			prevFirstSeq = Number(visibleEntries[0].seq);
-			prevLastSeq = Number(visibleEntries[visibleEntries.length - 1].seq);
-		}
+		void drafts.length;
+		void generating;
+		if (!untrack(() => anchoredToBottom)) return;
+		void tick().then(() => {
+			if (viewportEl !== null && untrack(() => anchoredToBottom)) {
+				viewportEl.scrollTop = viewportEl.scrollHeight;
+			}
+		});
 	});
 
 	function onComposerKeydown(event: KeyboardEvent): void {
@@ -701,20 +625,19 @@
 		<div
 			class="mai-session-chat__viewport"
 			data-testid="session-history-viewport"
-			data-cached-count={visibleEntries.length}
-			data-dom-count={renderedSlice.length}
+			data-cached-count={entries.length}
+			data-dom-count={mountedDomCount}
 			data-oldest-seq={oldestSeq}
 			data-latest-seq={latestSeq}
-			data-has-older={hasOlder}
+			data-has-older={hasOlder ? 'true' : 'false'}
 			bind:this={viewportEl}
-			bind:clientHeight={viewportHeight}
 			onscroll={onScroll}
 			tabindex="0"
 			role="log"
 			aria-label="Session entry history"
 		>
 			{#if hasOlder || loadingOlder}
-				<div class="mai-session-chat__older">
+				<div class="mai-session-chat__older" bind:offsetHeight={olderHeaderHeight}>
 					<Button
 						variant="secondary"
 						size="sm"
@@ -728,160 +651,187 @@
 					</Button>
 				</div>
 			{/if}
-			<div class="mai-session-chat__spacer" style="height:{topSpacerHeight}px" aria-hidden="true"></div>
 			{#if visibleEntries.length === 0 && channelState !== 'connecting' && channelState !== 'reconnecting'}
 				<p class="mai-session-chat__state" data-testid="session-history-empty">
 					No committed entries yet — say something first.
 				</p>
 			{/if}
-			{#each renderedSlice as entry (entry.entry_id ?? entry.seq)}
-				<article
-					class="mai-session-entry mai-session-entry--{entry.payload.kind}"
-					data-testid="session-entry"
-					data-entry-kind={entry.payload.kind}
-					use:measure={entry}
+			{#if visibleEntries.length > 0}
+				<!-- scrollRef stays optional-typed: while viewportEl is still
+				     null (first mount) virtua observes the parent element,
+				     which IS this viewport. -->
+				<Virtualizer
+					bind:this={virtualizerRef}
+					data={visibleEntries}
+					getKey={(entry) => entry.seq}
+					scrollRef={viewportEl ?? undefined}
+					shift={isPrepending}
+					startMargin={effectiveStartMargin}
+					bufferSize={400}
+					itemProps={() => ({
+						// Padding lives on virtua's MEASURED item wrapper
+						// (border-box): its offsetHeight is exact and rows
+						// can never overlap.
+						style: { padding: '4px 10px', 'box-sizing': 'border-box' }
+					})}
+					onresize={() => {
+						// Measurements change the total height: while the
+						// reader is anchored to the tail, re-pin the scroll.
+						if (viewportEl !== null && anchoredToBottom && !loadingOlder) {
+							viewportEl.scrollTop = viewportEl.scrollHeight;
+						}
+					}}
 				>
-					{#if entry.payload.kind === 'user_message'}
-						<div class="mai-user-bubble" data-testid="entry-user-message">
-							<!-- The wrapper keeps the parent-scoped text styles: Svelte
+					{#snippet children(entry)}
+						<article
+							class="mai-session-entry"
+							data-testid="session-entry"
+							data-entry-seq={entry.seq}
+							data-entry-kind={entry.payload.kind}
+							use:trackMounted
+						>
+						{#if entry.payload.kind === 'user_message'}
+							<div class="mai-user-bubble" data-testid="entry-user-message">
+								<!-- The wrapper keeps the parent-scoped text styles: Svelte
 							     does NOT carry them through a class prop onto a child
 							     component's root (pruned as unused by the compiler). -->
-							<div class="mai-session-entry__text">
-								<MarkdownRenderer content={entry.payload.text} />
-							</div>
-						</div>
-					{:else if entry.payload.kind === 'assistant_message'}
-						<div class="mai-assistant-flow" data-testid="entry-assistant-message">
-							{#if entry.payload.text !== ''}
 								<div class="mai-session-entry__text">
-									<MarkdownRenderer content={entry.payload.text ?? ''} />
+									<MarkdownRenderer content={entry.payload.text} />
 								</div>
-							{/if}
-							{#if entry.payload.provider_artifacts !== undefined && entry.payload.provider_artifacts.length > 0}
-								<details class="mai-thinking-disclosure" data-testid="entry-thinking">
-									<summary>Ход мыслей</summary>
-									<div class="mai-thinking-disclosure__body">
-										{#each entry.payload.provider_artifacts as artifact}
-											<div class="mai-thinking-disclosure__line">
-												<MarkdownRenderer content={artifact.content} />
-											</div>
-										{/each}
-									</div>
-								</details>
-							{/if}
-							{#if entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
-								<!-- No hardcoded `open`: collapsed by default, matching
-								     the completed tool_result/delegation disclosures. -->
-								<details class="mai-tool-disclosure" data-testid="entry-tool-calls">
-									<summary>tool calls ({entry.payload.tool_calls.length})</summary>
-									<ul class="mai-tool-disclosure__list">
-										{#each entry.payload.tool_calls as call (call.call_id)}
-											<li class="mai-tool-disclosure__item" data-testid="entry-tool-call">
-												<code>{call.capability_id}</code>
-											</li>
-										{/each}
-									</ul>
-								</details>
-							{/if}
-						</div>
-					{:else if entry.payload.kind === 'tool_result'}
-						<details
-							class="mai-tool-disclosure"
-							data-testid="entry-tool-result"
-							open={toolDisclosureOpen('tool_result', entry.run_id ?? null, entry.payload.status)}
-						>
-							<summary class="mai-tool-disclosure__summary">
-								<code>{entry.payload.capability_id}</code>
-								<span
-									class="mai-tool-status"
-									class:mai-tool-status--warn={entry.payload.status === 'unknown_effect' || entry.payload.status === 'approval_required'}
-									class:mai-tool-status--bad={entry.payload.status === 'denied'}
-									data-testid="tool-status-badge"
-								>
-									{#if entry.payload.status === 'unknown_effect'}
-										Outcome unknown — effect not proven
-									{:else}
-										{entry.payload.status}
-									{/if}
-								</span>
-							</summary>
-							<div class="mai-tool-disclosure__body">
-								{#if entry.payload.output_preview !== null && entry.payload.output_preview !== undefined && entry.payload.output_preview !== ''}
-									{@const preview = formatToolOutputPreview(entry.payload.output_preview)}
-									{#if preview.markdown}
-										<div class="mai-tool-disclosure__output">
-											<MarkdownRenderer content={preview.text} />
-										</div>
-									{:else}
-										<p class="mai-tool-disclosure__output">{preview.text}</p>
-									{/if}
-								{/if}
-								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
-									<p class="mai-session-entry__error" data-testid="tool-error">
-										{entry.payload.error_code}: {entry.payload.error_detail ?? ''}
-									</p>
-								{/if}
 							</div>
-						</details>
-					{:else if entry.payload.kind === 'delegation'}
-						<details
-							class="mai-tool-disclosure mai-tool-disclosure--delegation"
-							data-testid="entry-delegation"
-							open={toolDisclosureOpen('delegation', entry.run_id ?? null, entry.payload.status)}
-						>
-							<summary class="mai-tool-disclosure__summary">
-								<span class="mai-tool-disclosure__title">delegation</span>
-								<span
-									class="mai-tool-status"
-									class:mai-tool-status--warn={entry.payload.status === 'queued' || entry.payload.status === 'running'}
-									class:mai-tool-status--bad={entry.payload.status === 'failed'}
-								>
-									{entry.payload.status}
-								</span>
-							</summary>
-							<div class="mai-tool-disclosure__body">
-								<p class="mai-tool-disclosure__meta">
-									child run <code>{entry.payload.child_run_id}</code>
-								</p>
-								{#if entry.payload.goal !== ''}
+						{:else if entry.payload.kind === 'assistant_message'}
+							<div class="mai-assistant-flow" data-testid="entry-assistant-message">
+								{#if entry.payload.text !== ''}
 									<div class="mai-session-entry__text">
-										<MarkdownRenderer content={entry.payload.goal} />
+										<MarkdownRenderer content={entry.payload.text ?? ''} />
 									</div>
 								{/if}
-								{#if entry.payload.result_summary !== null && entry.payload.result_summary !== undefined}
-									<div class="mai-tool-disclosure__output" data-testid="delegation-summary">
-										<MarkdownRenderer content={entry.payload.result_summary} />
-									</div>
+								{#if entry.payload.provider_artifacts !== undefined && entry.payload.provider_artifacts.length > 0}
+									<details class="mai-thinking-disclosure" data-testid="entry-thinking">
+										<summary>Ход мыслей</summary>
+										<div class="mai-thinking-disclosure__body">
+											{#each entry.payload.provider_artifacts as artifact}
+												<div class="mai-thinking-disclosure__line">
+													<MarkdownRenderer content={artifact.content} />
+												</div>
+											{/each}
+										</div>
+									</details>
 								{/if}
-								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
-									<p class="mai-session-entry__error">{entry.payload.error_code}</p>
+								{#if entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
+									<!-- No hardcoded `open`: collapsed by default, matching
+								     the completed tool_result/delegation disclosures. -->
+									<details class="mai-tool-disclosure" data-testid="entry-tool-calls">
+										<summary>tool calls ({entry.payload.tool_calls.length})</summary>
+										<ul class="mai-tool-disclosure__list">
+											{#each entry.payload.tool_calls as call (call.call_id)}
+												<li class="mai-tool-disclosure__item" data-testid="entry-tool-call">
+													<code>{call.capability_id}</code>
+												</li>
+											{/each}
+										</ul>
+									</details>
 								{/if}
 							</div>
-						</details>
-					{:else if entry.payload.kind === 'compaction'}
-						<div class="mai-compaction" data-testid="compaction-marker">
-							<span class="mai-compaction__label">
-								Compacted entries seq {entry.payload.from_seq}..{entry.payload.to_seq}
-							</span>
-							<details class="mai-tool-disclosure" data-testid="compaction-summary">
-								<summary>summary</summary>
-								<div class="mai-session-entry__text">
-									<MarkdownRenderer content={entry.payload.summary_text} />
+						{:else if entry.payload.kind === 'tool_result'}
+							<details
+								class="mai-tool-disclosure"
+								data-testid="entry-tool-result"
+								open={toolDisclosureOpen('tool_result', entry.run_id ?? null, entry.payload.status)}
+							>
+								<summary class="mai-tool-disclosure__summary">
+									<code>{entry.payload.capability_id}</code>
+									<span
+										class="mai-tool-status"
+										class:mai-tool-status--warn={entry.payload.status === 'unknown_effect' || entry.payload.status === 'approval_required'}
+										class:mai-tool-status--bad={entry.payload.status === 'denied'}
+										data-testid="tool-status-badge"
+									>
+										{#if entry.payload.status === 'unknown_effect'}
+											Outcome unknown — effect not proven
+										{:else}
+											{entry.payload.status}
+										{/if}
+									</span>
+								</summary>
+								<div class="mai-tool-disclosure__body">
+									{#if entry.payload.output_preview !== null && entry.payload.output_preview !== undefined && entry.payload.output_preview !== ''}
+										{@const preview = formatToolOutputPreview(entry.payload.output_preview)}
+										{#if preview.markdown}
+											<div class="mai-tool-disclosure__output">
+												<MarkdownRenderer content={preview.text} />
+											</div>
+										{:else}
+											<p class="mai-tool-disclosure__output">{preview.text}</p>
+										{/if}
+									{/if}
+									{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
+										<p class="mai-session-entry__error" data-testid="tool-error">
+											{entry.payload.error_code}: {entry.payload.error_detail ?? ''}
+										</p>
+									{/if}
 								</div>
 							</details>
-						</div>
-					{:else if entry.payload.kind === 'control'}
-						<p
-							class="mai-control-note"
-							data-testid="entry-control"
-							data-control-action={entry.payload.action}
-						>
-							{entry.payload.action}{#if entry.payload.note !== null && entry.payload.note !== undefined}: {entry.payload.note}{/if}
-						</p>
-					{/if}
-				</article>
-			{/each}
-			<div class="mai-session-chat__spacer" style="height:{bottomSpacerHeight}px" aria-hidden="true"></div>
+						{:else if entry.payload.kind === 'delegation'}
+							<details
+								class="mai-tool-disclosure mai-tool-disclosure--delegation"
+								data-testid="entry-delegation"
+								open={toolDisclosureOpen('delegation', entry.run_id ?? null, entry.payload.status)}
+							>
+								<summary class="mai-tool-disclosure__summary">
+									<span class="mai-tool-disclosure__title">delegation</span>
+									<span
+										class="mai-tool-status"
+										class:mai-tool-status--warn={entry.payload.status === 'queued' || entry.payload.status === 'running'}
+										class:mai-tool-status--bad={entry.payload.status === 'failed'}
+									>
+										{entry.payload.status}
+									</span>
+								</summary>
+								<div class="mai-tool-disclosure__body">
+									<p class="mai-tool-disclosure__meta">
+										child run <code>{entry.payload.child_run_id}</code>
+									</p>
+									{#if entry.payload.goal !== ''}
+										<div class="mai-session-entry__text">
+											<MarkdownRenderer content={entry.payload.goal} />
+										</div>
+									{/if}
+									{#if entry.payload.result_summary !== null && entry.payload.result_summary !== undefined}
+										<div class="mai-tool-disclosure__output" data-testid="delegation-summary">
+											<MarkdownRenderer content={entry.payload.result_summary} />
+										</div>
+									{/if}
+									{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
+										<p class="mai-session-entry__error">{entry.payload.error_code}</p>
+									{/if}
+								</div>
+							</details>
+						{:else if entry.payload.kind === 'compaction'}
+							<div class="mai-compaction" data-testid="compaction-marker">
+								<span class="mai-compaction__label">
+									Compacted entries seq {entry.payload.from_seq}..{entry.payload.to_seq}
+								</span>
+								<details class="mai-tool-disclosure" data-testid="compaction-summary">
+									<summary>summary</summary>
+									<div class="mai-session-entry__text">
+										<MarkdownRenderer content={entry.payload.summary_text} />
+									</div>
+								</details>
+							</div>
+						{:else if entry.payload.kind === 'control'}
+							<p
+								class="mai-control-note"
+								data-testid="entry-control"
+								data-control-action={entry.payload.action}
+							>
+								{entry.payload.action}{#if entry.payload.note !== null && entry.payload.note !== undefined}: {entry.payload.note}{/if}
+							</p>
+						{/if}
+						</article>
+					{/snippet}
+				</Virtualizer>
+			{/if}
 		</div>
 
 		{#if drafts.length > 0}
@@ -1028,15 +978,13 @@
 	.mai-session-chat__viewport {
 		flex: 1 1 auto;
 		min-height: 0;
+		/* virtua requires a BLOCK scroll container: its rows are absolutely
+		   positioned against the virtualizer root. */
+		display: block;
 		overflow-y: auto;
 		overflow-x: hidden;
-		outline: none;
-		display: flex;
-		flex-direction: column;
 		overflow-anchor: none;
-	}
-	.mai-session-chat__spacer {
-		flex: 0 0 auto;
+		outline: none;
 	}
 	.mai-session-chat__older {
 		display: flex;
@@ -1048,8 +996,10 @@
 	.mai-session-entry {
 		display: flex;
 		flex-direction: column;
-		padding: 3px 10px;
-		flex-shrink: 0;
+		/* The 4px 10px spacing lives on virtua's MEASURED item wrapper
+		   (itemProps, border-box) — a margin here would overflow the
+		   measured height and rows could overlap. */
+		margin: 0;
 	}
 	.mai-session-entry__text {
 		margin: 0;
