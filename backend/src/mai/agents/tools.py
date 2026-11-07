@@ -420,7 +420,12 @@ class ToolResult:
         )
 
     def to_json_str(self) -> str:
-        """Frozen-shape JSON text (stable key order; model-safe)."""
+        """Frozen-shape JSON text (stable key order; model-safe).
+
+        ``ensure_ascii=False``: Cyrillic (and any other non-ASCII output)
+        stays real UTF-8 — ASCII ``\\uXXXX`` escapes would leak into the
+        persisted ``output_preview`` and render unreadable in the chat.
+        """
         return json.dumps(
             {
                 "schema_version": self.schema_version,
@@ -452,7 +457,7 @@ class ToolResult:
                 else {"code": self.error_code, "detail": self.error_detail},
                 "projection": project_tool_result(self),
             },
-            ensure_ascii=True,
+            ensure_ascii=False,
             allow_nan=False,
         )
 

@@ -67,6 +67,8 @@ declare global {
 			channelState: string;
 			submitLog: Array<{ text: string }>;
 		};
+		/** XSS probe: stays undefined unless hostile markup executed. */
+		__maiPwned?: number;
 	}
 }
 
@@ -652,6 +654,260 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			'data-run-state',
 			'running'
 		);
+	});
+
+	// M1 (chat-markdown-fix): assistant prose renders through the XSS-safe
+	// MarkdownRenderer — Markdown structure becomes HTML, raw HTML escapes.
+	test('assistant markdown renders structured HTML and escapes raw HTML', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				ws.send(
+					JSON.stringify({
+						type: 'committed',
+						stream_id: 's1',
+						entry: {
+							schema_version: 1,
+							entry_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+							session_id: '11111111-1111-4111-8111-111111111111',
+							seq: 1,
+							run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+							durable_source_id: 'assistant-md',
+							created_at: '2026-01-01T00:00:00Z',
+							payload: {
+								kind: 'assistant_message',
+								text: [
+									'## Plan of record',
+									'',
+									'Do it **now** with `host.logs`:',
+									'',
+									'1. rotate logs',
+									'2. verify tails',
+									'',
+									'<script>window.__maiPwned = true</script>',
+									'',
+									'```bash',
+									'echo done',
+									'```',
+									'',
+									// M2 regression: fence info strings the old opener
+									// regex rejected ('c++', 'python title=demo') used
+									// to stall the parser in an infinite loop (empty
+									// paragraph, no line consumed). This test
+									// completing IS the no-hang proof.
+									'```c++',
+									'std::cout << "done";',
+									'```',
+									'',
+									'```python title=demo',
+									'print("hi")',
+									'```'
+								].join('\n'),
+								model_profile: 'fast',
+								tool_group_state: 'none',
+								tool_calls: [
+									{
+										call_id: 'call-1',
+										tool_name: 'host.logs',
+										capability_id: 'cap.logs',
+										args: {}
+									}
+								]
+							}
+						}
+					})
+				);
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		const message = page.getByTestId('entry-assistant-message');
+		await expect(message).toHaveCount(1);
+		// `##` renders as a STRUCTURED heading (level 2 → h4 in
+		// MarkdownRenderer's mapping), not a literal text row.
+		await expect(message.locator('h4')).toHaveText('Plan of record');
+		// Bold and inline code survive the inline pass inside the paragraph.
+		await expect(message.locator('strong')).toHaveText('now');
+		await expect(message.locator('code.mai-md__inline-code')).toHaveText('host.logs');
+		// The ordered list renders as ol/li rows.
+		await expect(message.locator('ol.mai-md__list--ol > li')).toHaveText([
+			'rotate logs',
+			'verify tails'
+		]);
+		// The fenced blocks render as pre > code (in document order).
+		await expect(message.locator('pre.mai-md__pre > code')).toHaveText([
+			'echo done',
+			'std::cout << "done";',
+			'print("hi")'
+		]);
+		// Fence info strings collapse to one sanitized language token:
+		// 'c++' survives, 'python title=demo' shows just `python`.
+		await expect(message.locator('.mai-md__code-head')).toHaveText([
+			'bash',
+			'c++',
+			'python'
+		]);
+		// Raw HTML can never become DOM: no script element exists, the
+		// payload survives as ESCAPED text, and nothing executed.
+		await expect(message.locator('script')).toHaveCount(0);
+		await expect(message).toContainText('<script>window.__maiPwned = true</script>');
+		expect(await page.evaluate(() => window.__maiPwned)).toBeUndefined();
+		// The tool calls disclosure is COLLAPSED by default (the hardcoded
+		// `open` attribute is gone — matches completed tool/delegation rows).
+		const toolCalls = page.getByTestId('entry-tool-calls');
+		await expect(toolCalls).toHaveCount(1);
+		expect(await toolCalls.getAttribute('open')).toBeNull();
+	});
+
+	// M2 (chat-markdown-fix): an EXECUTED session_delegate tool result
+	// folds away next to its delegation card, and historical \uXXXX-escaped
+	// output previews decode into readable UTF-8 text.
+	test('session_delegate result folds into the card and escaped previews decode', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (seq: number, payload: Record<string, unknown>) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: null,
+								durable_source_id: `m2-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				// The delegation card…
+				committed(1, {
+					kind: 'delegation',
+					child_run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					child_session_id: null,
+					goal: 'check the queue',
+					status: 'succeeded',
+					allowed_capabilities: ['session.delegate'],
+					result_summary: 'queue drained',
+					error_code: null
+				});
+				// …its now-redundant EXECUTED session_delegate tool result
+				// (the settlement document as raw JSON — folded away), a
+				// NOT-executed session_delegate row with a parseable
+				// \uXXXX-escaped summary doc (Markdown branch), and a
+				// non-delegate row whose preview is a TRUNCATED escaped
+				// string (decode fallback branch).
+				committed(2, {
+					kind: 'tool_result',
+					call_id: 'call-delegate-1',
+					tool_name: 'session_delegate',
+					capability_id: 'session_delegate',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: JSON.stringify({
+						child_run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+						status: 'succeeded',
+						summary: 'queue drained',
+						error_code: null
+					}),
+					error_code: null,
+					error_detail: null
+				});
+				committed(3, {
+					kind: 'tool_result',
+					call_id: 'call-delegate-2',
+					tool_name: 'session_delegate',
+					capability_id: 'session_delegate',
+					status: 'denied',
+					execution_status: 'failed',
+					domain_outcome: 'failure',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview:
+						'{"status":"failed","summary":"**\\u0427\\u0435\\u043a-\\u043b\\u0438\\u0441\\u0442** \\u043d\\u0435 \\u0432\\u044b\\u043f\\u043e\\u043b\\u043d\\u0435\\u043d","error_code":null}',
+					error_code: 'child_failed',
+					error_detail: null
+				});
+				committed(4, {
+					kind: 'tool_result',
+					call_id: 'call-logs-1',
+					tool_name: 'host.logs',
+					capability_id: 'host.logs',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview:
+						'\\u0427\\u0435\\u043a-\\u043b\\u0438\\u0441\\u0442 \\u043b\\u043e\\u0433\\u043e\\u0432:\\n1. rotate',
+					error_code: null,
+					error_detail: null
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		// (a) Exactly ONE transcript row for the delegation run: the card.
+		// The executed session_delegate tool result (raw JSON preview) is
+		// folded away — its `child_run_id` key never reaches the viewport.
+		await expect(page.getByTestId('entry-delegation')).toHaveCount(1);
+		await expect(page.getByTestId('entry-tool-result')).toHaveCount(2);
+		await expect(page.getByTestId('session-entry')).toHaveCount(3);
+		await expect(page.getByTestId('entry-delegation')).toContainText('queue drained');
+		await expect(page.getByTestId('session-history-viewport')).not.toContainText(
+			'child_run_id'
+		);
+
+		// (b) The surviving session_delegate row decodes its escaped JSON
+		// `summary` and renders it as Markdown — never literal \uXXXX.
+		const deniedRow = page
+			.getByTestId('entry-tool-result')
+			.filter({ hasText: 'session_delegate' });
+		await expect(deniedRow).toHaveCount(1);
+		await expect(deniedRow).toContainText('Чек-лист не выполнен');
+		await expect(deniedRow.locator('strong')).toHaveText('Чек-лист');
+		await expect(deniedRow).not.toContainText('\\u0427');
+
+		// The truncated non-JSON preview takes the decode fallback: real
+		// UTF-8 text, no escapes left.
+		const logsRow = page
+			.getByTestId('entry-tool-result')
+			.filter({ hasText: 'host.logs' });
+		await expect(logsRow).toHaveCount(1);
+		await expect(logsRow).toContainText('Чек-лист логов');
+		await expect(logsRow).not.toContainText('\\u0427');
 	});
 });
 
