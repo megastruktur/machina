@@ -43,11 +43,25 @@ from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
+from mai.agents.session_delegate import aupdate_entry_payload_by_source
+from mai.agents.session_runner import amark_tool_group_state
 from mai.api.app import create_app
 from mai.api.auth import SESSION_COOKIE
-from mai.contracts.sessions import EntryKind, SessionSourceKind, UserMessageEntry
+from mai.contracts.sessions import (
+    AssistantMessageEntry,
+    DelegationEntry,
+    EntryKind,
+    SessionRunState,
+    SessionSourceKind,
+    ToolCallItem,
+    UserMessageEntry,
+)
 from mai.database import create_app_engine
-from mai.session_store import aappend_entry
+from mai.session_store import (
+    aappend_entry,
+    acreate_root_run,
+    arecord_run_state,
+)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
@@ -862,6 +876,252 @@ async def test_notify_loss_is_recovered_by_listener_restart(
             committed = [f for f in got if f["type"] == "committed"]
             assert sorted(f["entry"]["seq"] for f in committed) == [1, 2]
             assert hub.reconnect_count > reconnects_before
+        assert hub.sink_count(session_id) == 0
+
+
+# ---------------------------------------------------------------------------
+# 4c. store-level writes wake an at_head connection (S1)
+# ---------------------------------------------------------------------------
+
+
+async def test_store_writes_wake_at_head_connection(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """S1 regression: STORE-level writes carry their own transactional
+    ``pg_notify``. An already-at_head WebSocket receives ``committed`` and
+    ``run_state`` frames in real time for ``aappend_entry`` and
+    ``arecord_run_state``, and the IN-PLACE updates
+    (``amark_tool_group_state``, ``aupdate_entry_payload_by_source``)
+    re-deliver the SAME seq with the refreshed payload — with NO manual
+    ``notify_session_committed`` call anywhere in this test.
+    """
+    import threading
+    import time
+
+    _, sessions = create_app_engine(migrated_url)
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = client.post(
+            "/api/v1/agent-sessions",
+            json={
+                "server_id": str(SERVER_A),
+                "source": "interactive",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers={"origin": ORIGIN, "x-csrf-token": jar["mai_csrf"]},
+            cookies=jar,
+        )
+        assert created.status_code in (200, 201), created.text
+        session_id = uuid.UUID(created.json()["session_id"])
+        hub = app_fixture.state.session_channel
+
+        frames: list[dict] = []
+        state = {"closed": False}
+
+        with client.websocket_connect(
+            _channel_url(session_id, SERVER_A),
+            cookies=jar,
+            headers={"origin": ORIGIN},
+        ) as websocket:
+            websocket.send_text(_hello(jar["mai_csrf"]))
+            hello_ok = websocket.receive_json()
+            assert hello_ok["type"] == "hello_ok"
+            snapshot = websocket.receive_json()
+            assert snapshot["type"] == "snapshot"
+            assert snapshot["entries"] == []
+            # The connection sits at the head of an EMPTY session: from
+            # here on, EVERY delivered frame is notify-driven — an at_head
+            # sink issues ZERO catch-up SQL on the coarse tick.
+
+            def drain() -> None:
+                while not state["closed"]:
+                    try:
+                        frames.append(websocket.receive_json())
+                    except Exception:
+                        return
+
+            drain_thread = threading.Thread(target=drain, daemon=True)
+            drain_thread.start()
+
+            def wait_for(what: str, predicate, timeout: float = 10.0):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    matches = [f for f in frames if predicate(f)]
+                    if matches:
+                        return matches
+                    time.sleep(0.02)
+                raise AssertionError(
+                    f"{what} not delivered in {timeout}s; "
+                    f"frames={[f['type'] for f in frames]} "
+                    f"notifies={hub.notify_count} "
+                    f"catchup={hub.catchup_query_count} "
+                    f"errors={hub.catchup_error_count}"
+                )
+
+            # 1) aappend_entry → committed frame, real time.
+            row = await aappend_entry(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                kind=EntryKind.USER_MESSAGE,
+                payload=UserMessageEntry(
+                    kind=EntryKind.USER_MESSAGE,
+                    text="store write",
+                    client_request_id=uuid.uuid4(),
+                    source=SessionSourceKind.API,
+                ).model_dump(mode="json"),
+                run_id=None,
+                durable_source_id="s1-user",
+            )
+            assert row.seq == 1
+            wait_for(
+                f"committed seq {row.seq} after aappend_entry",
+                lambda f: (
+                    f["type"] == "committed" and f["entry"]["seq"] == row.seq
+                ),
+            )
+
+            # 2) arecord_run_state → committed + run_state frames.
+            run_id = uuid.uuid4()
+            await acreate_root_run(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                run_id=run_id,
+                model_profile="test-profile",
+                client_request_id=uuid.uuid4(),
+                profile_revision=1,
+                prompt_revision=1,
+                requested_grants=[],
+            )
+            await arecord_run_state(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                run_id=run_id,
+                state=SessionRunState.RUNNING,
+            )
+            wait_for(
+                "committed run_state entry after arecord_run_state",
+                lambda f: (
+                    f["type"] == "committed"
+                    and f["entry"]["payload"]["kind"] == "run_state"
+                    and f["entry"]["payload"]["state"] == "running"
+                ),
+            )
+            wait_for(
+                "run_state frame after arecord_run_state",
+                lambda f: (
+                    f["type"] == "run_state"
+                    and f["state"] == "running"
+                    and f["run_id"] == str(run_id)
+                ),
+            )
+
+            # 3) amark_tool_group_state → the SAME seq re-delivered with
+            #    the flipped tool_group_state (in-place update).
+            assistant_row = await aappend_entry(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                kind=EntryKind.ASSISTANT_MESSAGE,
+                payload=AssistantMessageEntry(
+                    kind=EntryKind.ASSISTANT_MESSAGE,
+                    text="",
+                    tool_calls=[
+                        ToolCallItem(
+                            call_id="call-s1",
+                            tool_name="host.shell",
+                            capability_id="cap-shell",
+                            args={"command": "ls"},
+                        )
+                    ],
+                    model_profile="test-profile",
+                    tool_group_state="pending",
+                ).model_dump(mode="json"),
+                run_id=run_id,
+                durable_source_id="s1-assistant",
+            )
+            wait_for(
+                f"committed seq {assistant_row.seq} after aappend_entry",
+                lambda f: (
+                    f["type"] == "committed"
+                    and f["entry"]["seq"] == assistant_row.seq
+                ),
+            )
+            marked = await amark_tool_group_state(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                entry_id=assistant_row.entry_id,
+                tool_group_state="complete",
+            )
+            assert marked is True
+            refreshed = wait_for(
+                f"in-place tool_group_state refresh of seq "
+                f"{assistant_row.seq}",
+                lambda f: (
+                    f["type"] == "committed"
+                    and f["entry"]["seq"] == assistant_row.seq
+                    and f["entry"]["payload"]["tool_group_state"] == "complete"
+                ),
+            )
+            # The refresh carries the SAME durable identity: an update of
+            # the delivered entry, not a new one.
+            assert refreshed[0]["entry"]["durable_source_id"] == "s1-assistant"
+
+            # 4) aupdate_entry_payload_by_source → delegation completion
+            #    re-delivered in place.
+            delegation_payload = DelegationEntry(
+                kind=EntryKind.DELEGATION,
+                child_run_id=uuid.uuid4(),
+                goal="child goal",
+                status=SessionRunState.QUEUED,
+                allowed_capabilities=[],
+            ).model_dump(mode="json")
+            delegation_row = await aappend_entry(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                kind=EntryKind.DELEGATION,
+                payload=delegation_payload,
+                run_id=run_id,
+                durable_source_id="delegation:s1-call",
+            )
+            wait_for(
+                f"committed seq {delegation_row.seq} after aappend_entry",
+                lambda f: (
+                    f["type"] == "committed"
+                    and f["entry"]["seq"] == delegation_row.seq
+                ),
+            )
+            settled = await aupdate_entry_payload_by_source(
+                sessions,
+                session_id=session_id,
+                server_id=SERVER_A,
+                durable_source_id="delegation:s1-call",
+                payload={
+                    **delegation_payload,
+                    "status": SessionRunState.SUCCEEDED.value,
+                    "result_summary": "child settled",
+                },
+            )
+            assert settled is True
+            refreshed_delegation = wait_for(
+                f"in-place delegation refresh of seq {delegation_row.seq}",
+                lambda f: (
+                    f["type"] == "committed"
+                    and f["entry"]["seq"] == delegation_row.seq
+                    and f["entry"]["payload"]["status"] == "succeeded"
+                ),
+            )
+            assert (
+                refreshed_delegation[0]["entry"]["durable_source_id"]
+                == "delegation:s1-call"
+            )
+            state["closed"] = True
+        drain_thread.join(timeout=5)
         assert hub.sink_count(session_id) == 0
 
 

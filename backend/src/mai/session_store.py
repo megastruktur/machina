@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mai.contracts.session_channel import CHANNEL_NOTIFY_CHANNEL
 from mai.contracts.sessions import (
     HISTORY_PAGE_MAX_ENTRIES,
     INITIAL_TAIL_MAX_ENTRIES,
@@ -93,6 +94,7 @@ __all__ = [
     "SessionTagRow",
     "aappend_entry",
     "aattach_session_tag",
+    "anotify_entry_updated",
     "acreate_root_run",
     "acreate_run",
     "acreate_session",
@@ -704,7 +706,50 @@ async def _append_entry_tx(
         text("UPDATE sessions SET updated_at = now() WHERE session_id = :sid"),
         {"sid": session_id},
     )
+    # Transactional NOTIFY (S1): PostgreSQL holds it until COMMIT and
+    # drops it on ROLLBACK, so every committed entry — from the HTTP API
+    # and the DBOS worker alike — wakes the SessionChannelHub exactly
+    # when the entry becomes durable. Identity-only payload.
+    await tx.execute(
+        text("SELECT pg_notify(:channel, :payload)"),
+        {
+            "channel": CHANNEL_NOTIFY_CHANNEL,
+            "payload": json.dumps(
+                {"session_id": str(session_id), "latest_seq": int(seq)}
+            ),
+        },
+    )
     return _entry_row(inserted)
+
+
+async def anotify_entry_updated(
+    tx: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    seq: int,
+) -> None:
+    """Transactional in-place-update wakeup for the session channel.
+
+    Callers run their ``UPDATE session_entries ... RETURNING seq`` inside
+    an open transaction and invoke this with the returned ``seq``: the
+    NOTIFY is held until COMMIT (dropped on ROLLBACK), so the
+    SessionChannelHub re-reads the row only after it is durably updated.
+    The identity-only payload carries ``updated_seq`` so at-head
+    connections refresh the entry they already delivered.
+    """
+    await tx.execute(
+        text("SELECT pg_notify(:channel, :payload)"),
+        {
+            "channel": CHANNEL_NOTIFY_CHANNEL,
+            "payload": json.dumps(
+                {
+                    "session_id": str(session_id),
+                    "latest_seq": int(seq),
+                    "updated_seq": int(seq),
+                }
+            ),
+        },
+    )
 
 
 async def aappend_entry(

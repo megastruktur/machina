@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -63,7 +63,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mai.agents.budgets import BudgetError
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
-    SESSION_DELEGATE_CAPABILITY_ID,
     SESSION_DELEGATE_TOOL_NAME,
     aplan_session_delegation,
     aupdate_entry_payload_by_source,
@@ -92,7 +91,6 @@ from mai.contracts.sessions import (
     SessionRunState,
     SessionSourceKind,
     SessionStatus,
-    ToolCallItem,
     ToolResultEntry,
     assert_session_not_run,
 )
@@ -753,6 +751,8 @@ async def amark_tool_group_state(
                 )
             ]
         )
+    from mai.session_store import anotify_entry_updated
+
     async with sessions() as session:
         async with session.begin():
             updated = (
@@ -771,6 +771,7 @@ async def amark_tool_group_state(
                           AND e.session_id = :sid
                           AND e.entry_id = :eid
                           AND e.kind = 'assistant_message'
+                        RETURNING e.seq
                         """
                     ),
                     {
@@ -780,8 +781,16 @@ async def amark_tool_group_state(
                         "eid": entry_id,
                     },
                 )
-            ).rowcount
-            return bool(updated and updated > 0)
+            ).mappings().first()
+            if updated is None:
+                return False
+            # Transactional in-place-update wakeup (S1): the NOTIFY is
+            # held until COMMIT, so an at-head channel connection re-reads
+            # the updated row only after it is durably committed.
+            await anotify_entry_updated(
+                session, session_id=session_id, seq=int(updated["seq"])
+            )
+            return True
 
 
 async def aupdate_tool_result_payload(
@@ -801,6 +810,8 @@ async def aupdate_tool_result_payload(
     result per call (a second entry would poison native replay), and the
     durable log never claims an effect that stayed unproven.
     """
+    from mai.session_store import anotify_entry_updated
+
     async with sessions() as session:
         async with session.begin():
             updated = (
@@ -816,6 +827,7 @@ async def aupdate_tool_result_payload(
                           AND e.run_id = :rid
                           AND e.durable_source_id = :src
                           AND e.kind = 'tool_result'
+                        RETURNING e.seq
                         """
                     ),
                     {
@@ -826,8 +838,16 @@ async def aupdate_tool_result_payload(
                         "src": durable_source_id,
                     },
                 )
-            ).rowcount
-            return bool(updated and updated > 0)
+            ).mappings().first()
+            if updated is None:
+                return False
+            # Transactional in-place-update wakeup (S1): the NOTIFY is
+            # held until COMMIT, so an at-head channel connection re-reads
+            # the reconciled row only after it is durably committed.
+            await anotify_entry_updated(
+                session, session_id=session_id, seq=int(updated["seq"])
+            )
+            return True
 
 
 async def _drain_controls(
@@ -1716,7 +1736,9 @@ async def _settle_unknown_session(
 @DBOS.step(name="agents.session.read_step")
 @_safe_step_errors
 def _session_read_step(payload_json: str, run_id: str, call_json: str) -> str:
-    intent = parse_session_run_intent(payload_json)
+    # The parse IS the validation: fail closed on a malformed payload
+    # before the read executes (the parsed intent itself is unused here).
+    parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
     call = json.loads(call_json)
     row = executor.run(executor.steps.aread_step(run_id, int(call["seq"])))
