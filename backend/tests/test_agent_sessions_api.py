@@ -42,6 +42,8 @@ from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.contracts.sessions import EntryKind, SessionSourceKind, UserMessageEntry
 from mai.database import create_app_engine
 from mai.session_store import aappend_entry, acreate_run
+from mai.contracts.server import SCHEMA_VERSION
+from mai.tag_store import RESERVED_UNCLASSIFIED_TAG_ID
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
@@ -449,6 +451,176 @@ async def test_turn_admission_is_durable_and_idempotent(
         assert body2["run_id"] == body["run_id"]
         assert body2["entry_id"] == body["entry_id"]
         assert body2["deduplicated"] is True
+
+async def test_turn_admission_creates_execution_facade_with_real_binding(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """S2 (queued-chat hotfix): the admitted root run carries the retained
+    execution facade atomically — job_runs depth 0 with the REAL profile
+    binding (never fabricated 1/1) and exactly the profile-bound
+    capabilities as requested_grants (no widening), plus the mandatory
+    classification. Replay mutates nothing; a cross-server attempt writes
+    nothing."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    # A real server profile: revision 2 (created, then updated),
+    # prompt_revision 3, two capabilities — deliberately distinct values
+    # so the facade proves caller passthrough.
+    store = app_fixture.state.profiles
+    assert store is not None, "the app fixture wires the profile file store"
+
+    def profile_text(name: str) -> str:
+        return f"""\
+schema_version: {SCHEMA_VERSION}
+server_id: "{SERVER_A}"
+name: "{name}"
+prompt_revision: 3
+environment: linux_ssh
+ssh:
+  host: "198.51.100.10"
+  port: 22
+  user: "deploy"
+  host_key: "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
+  credential_ref: "MAI_SSH_KEY_BUILD_HOST"
+privilege: none
+capabilities:
+  - shell.exec
+  - files.read
+"""
+
+    store.write(SERVER_A, profile_text("s2-fixture"), expected_revision=0)
+    stored = store.write(
+        SERVER_A, profile_text("s2-fixture-renamed"), expected_revision=1
+    )
+    assert stored.revision == 2
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        key = str(uuid.uuid4())
+        first = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(session_id),
+                "text": "verify the execution facade",
+                "client_request_id": key,
+                "model_profile": "primary",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert first.status_code in (200, 201), first.text
+        body = first.json()
+        assert body["run_state"] == "queued"
+        run_id = uuid.UUID(body["run_id"])
+
+        with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+            run_row = conn.execute(
+                "SELECT state, parent_run_id, model_profile, client_request_id "
+                "FROM session_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            facade = conn.execute(
+                "SELECT server_id, depth, parent_run_id, profile_revision, "
+                "prompt_revision, model_profile, requested_grants "
+                "FROM job_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            tags = conn.execute(
+                "SELECT tag_id, assignment_source FROM job_tags "
+                "WHERE job_id = %s",
+                (run_id,),
+            ).fetchall()
+        assert run_row is not None and facade is not None
+        assert run_row["state"] == "queued"
+        assert run_row["parent_run_id"] is None
+        assert run_row["model_profile"] == "primary"
+        assert run_row["client_request_id"] == uuid.UUID(key)
+        assert facade["server_id"] == SERVER_A
+        assert facade["depth"] == 0  # a root, on the retained tree
+        assert facade["parent_run_id"] is None
+        assert facade["profile_revision"] == 2  # the stored profile revision
+        assert facade["prompt_revision"] == 3  # the document's prompt revision
+        assert facade["model_profile"] == "primary"
+        # No widening: exactly the profile-bound capabilities, sorted.
+        assert facade["requested_grants"] == ["files.read", "shell.exec"]
+        assert len(tags) == 1  # the 0011 mandatory classification
+        assert tags[0]["tag_id"] == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
+        assert tags[0]["assignment_source"] == "system"
+
+        # Replay: same ids, no duplicates, facade metadata NOT mutated.
+        second = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(session_id),
+                "text": "verify the execution facade",
+                "client_request_id": key,
+                "model_profile": "primary",
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert second.status_code in (200, 201), second.text
+        body2 = second.json()
+        assert body2["run_id"] == body["run_id"]
+        assert body2["entry_id"] == body["entry_id"]
+        assert body2["deduplicated"] is True
+        with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+            counts = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM session_runs "
+                "        WHERE run_id = %s) AS session_runs,"
+                "       (SELECT COUNT(*) FROM job_runs "
+                "        WHERE run_id = %s) AS job_runs,"
+                "       (SELECT COUNT(*) FROM job_tags "
+                "        WHERE job_id = %s) AS job_tags",
+                (run_id, run_id, run_id),
+            ).fetchone()
+            facade2 = conn.execute(
+                "SELECT profile_revision, prompt_revision, model_profile, "
+                "requested_grants FROM job_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+        assert (counts["session_runs"], counts["job_runs"], counts["job_tags"]) == (
+            1,
+            1,
+            1,
+        )
+        assert facade2["profile_revision"] == 2
+        assert facade2["prompt_revision"] == 3
+        assert facade2["model_profile"] == "primary"
+        assert facade2["requested_grants"] == ["files.read", "shell.exec"]
+
+        # Cross-server scope: the session stays value-free absent for
+        # server B and NOTHING is admitted through the wrong scope.
+        cross = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_B)},
+            json={
+                "session_id": str(session_id),
+                "text": "must never be admitted",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert cross.status_code == 404
+        assert cross.json()["error"]["code"] == "session_not_found"
+        with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+            after = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM session_runs "
+                "        WHERE session_id = %s) AS session_runs,"
+                "       (SELECT COUNT(*) FROM job_runs) AS job_runs_total,"
+                "       (SELECT COUNT(*) FROM session_entries "
+                "        WHERE session_id = %s) AS entries",
+                (session_id, session_id),
+            ).fetchone()
+        assert after["session_runs"] == 1
+        assert after["entries"] == 2  # user_message + queued run_state only
+        assert after["job_runs_total"] == 1  # the one facade, nothing added
 
 
 async def test_turn_admission_on_long_session_is_not_404(

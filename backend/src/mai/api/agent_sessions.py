@@ -120,7 +120,7 @@ from mai.session_channel import (
 from mai.session_store import (
     aappend_entry,
     aattach_session_tag,
-    acreate_run,
+    acreate_root_run,
     acreate_session,
     aget_session,
     alist_sessions,
@@ -647,14 +647,23 @@ async def submit_turn(
         document_ref=None,
         runbook_ref=None,
     )
-    await acreate_run(
+    # S2 (queued-chat hotfix): the reviewed root seam admits the run AND
+    # the retained execution facade (job_runs depth 0 + the mandatory
+    # classification) in ONE transaction BEFORE the enqueue, with the SAME
+    # binding the frozen intent carries — no fabricated revisions, no
+    # widened grants (requested_grants are exactly the profile-bound
+    # capabilities the context authorizes).
+    model_profile = payload.model_profile or "default"
+    await acreate_root_run(
         factory,
         session_id=session_id,
         server_id=server_id,
         run_id=run_id,
-        model_profile=payload.model_profile or "default",
+        model_profile=model_profile,
         client_request_id=payload.client_request_id,
-        parent_run_id=None,
+        profile_revision=profile_revision,
+        prompt_revision=prompt_revision,
+        requested_grants=capabilities,
     )
     await arecord_admission(
         factory,
