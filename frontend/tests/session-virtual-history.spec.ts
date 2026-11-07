@@ -67,6 +67,8 @@ declare global {
 			channelState: string;
 			submitLog: Array<{ text: string }>;
 		};
+		/** XSS probe: stays undefined unless hostile markup executed. */
+		__maiPwned?: number;
 	}
 }
 
@@ -652,6 +654,98 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			'data-run-state',
 			'running'
 		);
+	});
+
+	// M1 (chat-markdown-fix): assistant prose renders through the XSS-safe
+	// MarkdownRenderer — Markdown structure becomes HTML, raw HTML escapes.
+	test('assistant markdown renders structured HTML and escapes raw HTML', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				ws.send(
+					JSON.stringify({
+						type: 'committed',
+						stream_id: 's1',
+						entry: {
+							schema_version: 1,
+							entry_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+							session_id: '11111111-1111-4111-8111-111111111111',
+							seq: 1,
+							run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+							durable_source_id: 'assistant-md',
+							created_at: '2026-01-01T00:00:00Z',
+							payload: {
+								kind: 'assistant_message',
+								text: [
+									'## Plan of record',
+									'',
+									'Do it **now** with `host.logs`:',
+									'',
+									'1. rotate logs',
+									'2. verify tails',
+									'',
+									'<script>window.__maiPwned = true</script>',
+									'',
+									'```bash',
+									'echo done',
+									'```'
+								].join('\n'),
+								model_profile: 'fast',
+								tool_group_state: 'none',
+								tool_calls: [
+									{
+										call_id: 'call-1',
+										tool_name: 'host.logs',
+										capability_id: 'cap.logs',
+										args: {}
+									}
+								]
+							}
+						}
+					})
+				);
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		const message = page.getByTestId('entry-assistant-message');
+		await expect(message).toHaveCount(1);
+		// `##` renders as a STRUCTURED heading (level 2 → h4 in
+		// MarkdownRenderer's mapping), not a literal text row.
+		await expect(message.locator('h4')).toHaveText('Plan of record');
+		// Bold and inline code survive the inline pass inside the paragraph.
+		await expect(message.locator('strong')).toHaveText('now');
+		await expect(message.locator('code.mai-md__inline-code')).toHaveText('host.logs');
+		// The ordered list renders as ol/li rows.
+		await expect(message.locator('ol.mai-md__list--ol > li')).toHaveText([
+			'rotate logs',
+			'verify tails'
+		]);
+		// The fenced block renders as pre > code.
+		await expect(message.locator('pre.mai-md__pre > code')).toHaveText('echo done');
+		// Raw HTML can never become DOM: no script element exists, the
+		// payload survives as ESCAPED text, and nothing executed.
+		await expect(message.locator('script')).toHaveCount(0);
+		await expect(message).toContainText('<script>window.__maiPwned = true</script>');
+		expect(await page.evaluate(() => window.__maiPwned)).toBeUndefined();
+		// The tool calls disclosure is COLLAPSED by default (the hardcoded
+		// `open` attribute is gone — matches completed tool/delegation rows).
+		const toolCalls = page.getByTestId('entry-tool-calls');
+		await expect(toolCalls).toHaveCount(1);
+		expect(await toolCalls.getAttribute('open')).toBeNull();
 	});
 });
 

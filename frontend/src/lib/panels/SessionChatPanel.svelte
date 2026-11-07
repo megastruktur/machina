@@ -23,9 +23,12 @@
 	 *    assistant response here);
 	 *  - every entry kind renders from its typed payload — nothing is
 	 *    inferred as success (`unknown_effect` carries an explicit warning
-	 *    badge); thinking renders as a collapsed "Ход мыслей" disclosure
-	 *    and tools/delegations as compact disclosures that stay open while
-	 *    the outcome is unproven (or the fixture has no run scope);
+	 *    badge); message/thinking/delegation/compaction prose and the
+	 *    stream drafts render through the XSS-safe `MarkdownRenderer`
+	 *    (raw HTML escapes, structure formats); thinking renders as a
+	 *    collapsed "Ход мыслей" disclosure and tools/delegations as
+	 *    compact disclosures that stay open while the outcome is unproven
+	 *    (or the fixture has no run scope);
 	 *  - the composer admits turns through the typed session API; a
 	 *    resolved submit calls `onturnsubmitted` with the optimistic
 	 *    user entry + the response run state (S3) so the message and the
@@ -48,6 +51,7 @@
 	} from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import Button from '../ui/Button.svelte';
+	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
 
@@ -589,29 +593,36 @@
 				>
 					{#if entry.payload.kind === 'user_message'}
 						<div class="mai-user-bubble" data-testid="entry-user-message">
-							<p class="mai-session-entry__text">{entry.payload.text}</p>
+							<!-- The wrapper keeps the parent-scoped text styles: Svelte
+							     does NOT carry them through a class prop onto a child
+							     component's root (pruned as unused by the compiler). -->
+							<div class="mai-session-entry__text">
+								<MarkdownRenderer content={entry.payload.text} />
+							</div>
 						</div>
 					{:else if entry.payload.kind === 'assistant_message'}
 						<div class="mai-assistant-flow" data-testid="entry-assistant-message">
 							{#if entry.payload.text !== ''}
-								<p class="mai-session-entry__text">{entry.payload.text}</p>
+								<div class="mai-session-entry__text">
+									<MarkdownRenderer content={entry.payload.text ?? ''} />
+								</div>
 							{/if}
 							{#if entry.payload.provider_artifacts !== undefined && entry.payload.provider_artifacts.length > 0}
 								<details class="mai-thinking-disclosure" data-testid="entry-thinking">
 									<summary>Ход мыслей</summary>
 									<div class="mai-thinking-disclosure__body">
 										{#each entry.payload.provider_artifacts as artifact}
-											<p class="mai-thinking-disclosure__line">{artifact.content}</p>
+											<div class="mai-thinking-disclosure__line">
+												<MarkdownRenderer content={artifact.content} />
+											</div>
 										{/each}
 									</div>
 								</details>
 							{/if}
 							{#if entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
-								<details
-									class="mai-tool-disclosure"
-									data-testid="entry-tool-calls"
-									open
-								>
+								<!-- No hardcoded `open`: collapsed by default, matching
+								     the completed tool_result/delegation disclosures. -->
+								<details class="mai-tool-disclosure" data-testid="entry-tool-calls">
 									<summary>tool calls ({entry.payload.tool_calls.length})</summary>
 									<ul class="mai-tool-disclosure__list">
 										{#each entry.payload.tool_calls as call (call.call_id)}
@@ -676,12 +687,14 @@
 									child run <code>{entry.payload.child_run_id}</code>
 								</p>
 								{#if entry.payload.goal !== ''}
-									<p class="mai-session-entry__text">{entry.payload.goal}</p>
+									<div class="mai-session-entry__text">
+										<MarkdownRenderer content={entry.payload.goal} />
+									</div>
 								{/if}
 								{#if entry.payload.result_summary !== null && entry.payload.result_summary !== undefined}
-									<p class="mai-tool-disclosure__output" data-testid="delegation-summary">
-										{entry.payload.result_summary}
-									</p>
+									<div class="mai-tool-disclosure__output" data-testid="delegation-summary">
+										<MarkdownRenderer content={entry.payload.result_summary} />
+									</div>
 								{/if}
 								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
 									<p class="mai-session-entry__error">{entry.payload.error_code}</p>
@@ -695,7 +708,9 @@
 							</span>
 							<details class="mai-tool-disclosure" data-testid="compaction-summary">
 								<summary>summary</summary>
-								<p class="mai-session-entry__text">{entry.payload.summary_text}</p>
+								<div class="mai-session-entry__text">
+									<MarkdownRenderer content={entry.payload.summary_text} />
+								</div>
 							</details>
 						</div>
 					{:else if entry.payload.kind === 'control'}
@@ -715,9 +730,12 @@
 		{#if drafts.length > 0}
 			<div class="mai-session-chat__drafts" data-testid="session-stream-drafts">
 				{#each drafts as draft (draft.stream_id)}
-					<p class="mai-session-chat__draft" data-testid="session-stream-draft" data-stream-id={draft.stream_id}>
-						{draft.text.slice(-240)}
-					</p>
+					<!-- div, not p: the renderer's block-level root could not
+					     nest inside a p (the parser would hoist it out and the
+					     testid would lose its content). -->
+					<div class="mai-session-chat__draft" data-testid="session-stream-draft" data-stream-id={draft.stream_id}>
+						<MarkdownRenderer content={draft.text.slice(-240)} />
+					</div>
 				{/each}
 			</div>
 		{/if}
