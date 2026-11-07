@@ -262,16 +262,30 @@
 
 	/**
 	 * The rendered transcript: run_state entries drive the indicator and
-	 * the notice (never list rows), and delegated child-run entries fold
-	 * into their delegation card.
+	 * the notice (never list rows), delegated child-run entries fold
+	 * into their delegation card, and an EXECUTED `session_delegate`
+	 * tool_result folds away while a delegation card exists (M2) — the
+	 * card already renders the child's goal + result_summary, so the
+	 * tool result would only duplicate them as raw JSON. Without any
+	 * delegation card the tool result stays: it is then the only record
+	 * of the child's outcome.
 	 */
-	const visibleEntries = $derived(
-		entries.filter((entry) => {
+	const visibleEntries = $derived.by(() => {
+		const rows = entries.filter((entry) => {
 			if (entry.payload.kind === 'run_state') return false;
 			const runId = entry.run_id ?? null;
 			return runId === null || !childRunIds.has(String(runId));
-		})
-	);
+		});
+		if (childRunIds.size === 0) return rows;
+		return rows.filter((entry) => {
+			const payload = entry.payload;
+			return !(
+				payload.kind === 'tool_result' &&
+				payload.capability_id === 'session_delegate' &&
+				payload.status === 'executed'
+			);
+		});
+	});
 
 	/** The run states that mean "the agent is working right now". */
 	const GENERATING_RUN_STATES: ReadonlySet<string> = new Set([
@@ -524,6 +538,39 @@
 		if (kind === 'tool_result') return status !== 'executed';
 		return status !== 'succeeded';
 	}
+
+	/**
+	 * Decode a tool_result `output_preview` for display (M2):
+	 *
+	 *  - a JSON object with a non-empty string `summary` field (the
+	 *    delegation settlement document) renders that summary through
+	 *    MarkdownRenderer;
+	 *  - anything else decodes ASCII escapes: historical DB rows persist
+	 *    `json.dumps(..., ensure_ascii=True)` output, so `\uXXXX` sequences
+	 *    and `\n` pairs inside JSON / truncated-JSON strings become real
+	 *    UTF-8 text (`\u0427` → `Ч`) instead of raw escape noise.
+	 */
+	function formatToolOutputPreview(raw: string): { markdown: boolean; text: string } {
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (parsed !== null && typeof parsed === 'object' && 'summary' in parsed) {
+				const summary = (parsed as { summary: unknown }).summary;
+				if (typeof summary === 'string' && summary !== '') {
+					return { markdown: true, text: summary };
+				}
+			}
+		} catch {
+			// Not JSON — fall through to the escape decode.
+		}
+		const decoded = raw
+			// JSON \uXXXX escapes are BMP code units (surrogate pairs decode
+			// unit-by-unit), so per-escape fromCharCode is exact.
+			.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
+				String.fromCharCode(parseInt(hex, 16))
+			)
+			.replace(/\\n/g, '\n');
+		return { markdown: false, text: decoded };
+	}
 </script>
 
 <div class="mai-session-chat" data-testid="session-chat-panel">
@@ -657,7 +704,14 @@
 							</summary>
 							<div class="mai-tool-disclosure__body">
 								{#if entry.payload.output_preview !== null && entry.payload.output_preview !== undefined && entry.payload.output_preview !== ''}
-									<p class="mai-tool-disclosure__output">{entry.payload.output_preview}</p>
+									{@const preview = formatToolOutputPreview(entry.payload.output_preview)}
+									{#if preview.markdown}
+										<div class="mai-tool-disclosure__output">
+											<MarkdownRenderer content={preview.text} />
+										</div>
+									{:else}
+										<p class="mai-tool-disclosure__output">{preview.text}</p>
+									{/if}
 								{/if}
 								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
 									<p class="mai-session-entry__error" data-testid="tool-error">

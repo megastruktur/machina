@@ -78,10 +78,18 @@
 		while (i < lines.length) {
 			const line = lines[i] ?? '';
 
-			// Fenced code block: ```lang
-			const fenceMatch = line.match(/^\s*```([a-zA-Z0-9_-]*)\s*$/);
+			// Fenced code block: ```info — ANY opener line. The display
+			// language is the first whitespace-delimited info token,
+			// sanitized to [a-zA-Z0-9_+.#-]: ```c++ / ```python title=demo
+			// render as `c++` / `python` (and can never inject HTML).
+			const fenceMatch = line.match(/^\s*```(.*)$/);
 			if (fenceMatch) {
-				const lang = escapeHtml(fenceMatch[1] || 'text');
+				const lang = escapeHtml(
+					(fenceMatch[1]?.trim().split(/\s+/)[0] ?? '').replace(
+						/[^a-zA-Z0-9_+.#-]/g,
+						''
+					) || 'text'
+				);
 				const codeLines: string[] = [];
 				i += 1;
 				while (i < lines.length && !/^\s*```\s*$/.test(lines[i] ?? '')) {
@@ -197,6 +205,13 @@
 				!/^\s*\d+\.\s+/.test(lines[i] ?? '') &&
 				!/^\s*(?:---+|===+|\*\*\*+)\s*$/.test(lines[i] ?? '')
 			) {
+				paraLines.push(formatInline(escapeHtml(lines[i] ?? '')));
+				i += 1;
+			}
+			// Parser-progress guard: a line NO branch above consumed (the
+			// paragraph loop refuses it but never advanced past it) must
+			// never stall this loop — consume it as raw text instead.
+			if (paraLines.length === 0) {
 				paraLines.push(formatInline(escapeHtml(lines[i] ?? '')));
 				i += 1;
 			}

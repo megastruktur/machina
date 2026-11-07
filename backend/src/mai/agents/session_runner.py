@@ -2478,7 +2478,7 @@ def _session_child_settled(
             else f"child_{durable_state}"
         ),
     )
-    preview = json.dumps(summary_document)
+    preview = json.dumps(summary_document, ensure_ascii=False)
     if durable_state == "succeeded":
         status, execution, certainty, code = (
             "executed",
