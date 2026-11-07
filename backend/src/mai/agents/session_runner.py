@@ -597,6 +597,14 @@ async def _ensure_run_row(executor: SessionRunExecutor, intent: SessionRunIntent
             raise
 
 
+def _child_source_prefix(intent: SessionRunIntent) -> str:
+    """The child-run entry prefix (D05 isolation): a child run's durable
+    entry ids are namespaced under ``child:`` so they can never collide
+    with — or dedupe against — a parent run's entries sharing the session
+    log."""
+    return "child:" if intent.parent_run_id is not None else ""
+
+
 async def _append_user_turn(
     executor: SessionRunExecutor, intent: SessionRunIntent
 ) -> None:
@@ -628,7 +636,9 @@ async def _append_user_turn(
         kind=EntryKind.USER_MESSAGE,
         payload=payload,
         run_id=uuid.UUID(intent.run_id),
-        durable_source_id=f"turn:{intent.client_request_id}",
+        durable_source_id=(
+            f"{_child_source_prefix(intent)}turn:{intent.client_request_id}"
+        ),
     )
 
 
@@ -640,8 +650,16 @@ async def _record_session_state(
     reason_code: str | None = None,
     session_status: SessionStatus | None = None,
     detail: str | None = None,
+    source_suffix: str | None = None,
 ) -> None:
-    """The dual-authority state write: session domain + session header."""
+    """The dual-authority state write: session domain + session header.
+
+    ``source_suffix`` (e.g. the delegation call id) keeps recurring states
+    (``running -> waiting_child -> running``) as DISTINCT chronological
+    entries instead of deduplicating against the initial same-state entry;
+    child runs prefix their entries with ``child:`` so they never collide
+    with a parent run's entries.
+    """
     from mai.session_store import arecord_run_state
 
     await arecord_run_state(
@@ -652,6 +670,8 @@ async def _record_session_state(
         state=state,
         reason_code=reason_code,
         detail=detail,
+        source_prefix=_child_source_prefix(intent),
+        source_suffix=source_suffix,
     )
     if session_status is not None:
         await _set_session_status(executor, intent, session_status)
@@ -674,6 +694,45 @@ async def _set_session_status(
                     "server_id": uuid.UUID(intent.server_id),
                 },
             )
+
+
+async def _cleanup_pending_tool_groups(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+) -> int:
+    """Mark every still-``pending`` assistant tool group ``unresolved``.
+
+    A multi-tool round (e.g. ``[session_delegate, fixture_read, ...]``)
+    that fails on a LATER tool can never receive its remaining results,
+    so its ``assistant_message`` entry must not stay ``pending`` — the
+    honest terminal group state is ``unresolved`` (the frozen
+    ``amark_tool_group_state`` vocabulary, idempotent per entry).
+    """
+    session_id = uuid.UUID(intent.session_id)
+    run_id = uuid.UUID(intent.run_id)
+    async with executor.sessions() as session:
+        rows = (
+            await session.execute(
+                sql_text(
+                    "SELECT entry_id FROM session_entries "
+                    "WHERE session_id = :sid AND run_id = :rid "
+                    "AND kind = 'assistant_message' "
+                    "AND payload ->> 'tool_group_state' = 'pending'"
+                ),
+                {"sid": session_id, "rid": run_id},
+            )
+        ).all()
+    marked = 0
+    for row in rows:
+        if await amark_tool_group_state(
+            executor.sessions,
+            session_id=session_id,
+            server_id=uuid.UUID(intent.server_id),
+            entry_id=row[0],
+            tool_group_state="unresolved",
+        ):
+            marked += 1
+    return marked
 
 
 async def _persist_tool_result(
@@ -717,7 +776,10 @@ async def _persist_tool_result(
         kind=EntryKind.TOOL_RESULT,
         payload=payload.model_dump(mode="json"),
         run_id=uuid.UUID(intent.run_id),
-        durable_source_id=f"round:{round_index}:tool:{call['tool_call_id']}{suffix}",
+        durable_source_id=(
+            f"{_child_source_prefix(intent)}round:{round_index}:tool:"
+            f"{call['tool_call_id']}{suffix}"
+        ),
     )
 
 
@@ -1044,7 +1106,7 @@ async def _round_model(
         run_id=uuid.UUID(intent.run_id),
         model_profile=str(pins.get("profile", "")),
         provider=str(pins.get("connection", "")),
-        durable_prefix=f"round:{round_index}",
+        durable_prefix=f"{_child_source_prefix(intent)}round:{round_index}",
     )
     calls: list[dict[str, object]] = []
     assistant_entry_id: str | None = None
@@ -1178,7 +1240,11 @@ def _session_started(payload_json: str) -> str:
             executor,
             intent,
             SessionRunState.RUNNING,
-            session_status=SessionStatus.RUNNING,
+            # A child run NEVER flips the shared session header: the
+            # parent run owns ``sessions.status`` while it is active.
+            session_status=(
+                SessionStatus.RUNNING if intent.parent_run_id is None else None
+            ),
         )
     )
     executor.run(_append_user_turn(executor, intent))
@@ -1575,7 +1641,10 @@ async def _persist_projected_result(
         kind=EntryKind.TOOL_RESULT,
         payload=entry.model_dump(mode="json"),
         run_id=uuid.UUID(intent.run_id),
-        durable_source_id=f"round:{round_index}:tool:{entry.call_id}{suffix}",
+        durable_source_id=(
+            f"{_child_source_prefix(intent)}round:{round_index}:tool:"
+            f"{entry.call_id}{suffix}"
+        ),
     )
 
 
@@ -1859,7 +1928,10 @@ async def _repair_replayed_terminal_result(
         kind=EntryKind.TOOL_RESULT,
         payload=entry.model_dump(mode="json"),
         run_id=uuid.UUID(intent.run_id),
-        durable_source_id=f"round:{round_index}:tool:{entry.call_id}",
+        durable_source_id=(
+            f"{_child_source_prefix(intent)}round:{round_index}:tool:"
+            f"{entry.call_id}"
+        ),
     )
     return {
         "seq": seq,
@@ -2282,6 +2354,34 @@ def _session_delegation_execute(
     deadline_iso = (
         datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
     ).isoformat()
+    # The child run rows are persisted (the deterministic child id made the
+    # plan idempotent): the parent run now WAITS on the child. The
+    # chronological waiting_child -> running entries are keyed by the
+    # delegation call id (source_suffix) so a replay dedupes against
+    # itself, never against the parent's initial running entry.
+    executor.run(
+        _record_session_state(
+            executor,
+            intent,
+            SessionRunState.WAITING_CHILD,
+            reason_code=f"child:{plan['child_run_id']}",
+            session_status=(
+                SessionStatus.RUNNING if intent.parent_run_id is None else None
+            ),
+            source_suffix=str(call["tool_call_id"]),
+        )
+    )
+    executor.run(
+        _update_delegation_entry(
+            executor.sessions,
+            session_id=uuid.UUID(intent.session_id),
+            server_id=uuid.UUID(intent.server_id),
+            delegate_call_id=str(call["tool_call_id"]),
+            status=SessionRunState.RUNNING,
+            summary=None,
+            error_code=None,
+        )
+    )
     return json.dumps(
         {
             "seq": call["seq"],
@@ -2519,11 +2619,32 @@ def _session_child_settled(
     )
     executor.run(
         _update_delegation_entry(
+            executor.sessions,
+            session_id=uuid.UUID(intent.session_id),
+            server_id=uuid.UUID(intent.server_id),
+            delegate_call_id=str(call["tool_call_id"]),
+            status=(
+                SessionRunState.OUTCOME_UNKNOWN
+                if durable_state == "timeout"
+                else SessionRunState(durable_state)
+            ),
+            summary=str(summary_document.get("summary") or ""),
+            error_code=summary_document.get("error_code"),
+        )
+    )
+    # The parent resumes its OWN lifecycle while the delegation card keeps
+    # the child's terminal truth: the chronological resumed-running entry
+    # is keyed by the delegation call id (distinct from the parent's
+    # initial running entry).
+    executor.run(
+        _record_session_state(
             executor,
             intent,
-            delegate_call_id=str(call["tool_call_id"]),
-            child_state=durable_state,
-            summary_document=summary_document,
+            SessionRunState.RUNNING,
+            session_status=(
+                SessionStatus.RUNNING if intent.parent_run_id is None else None
+            ),
+            source_suffix=str(call["tool_call_id"]),
         )
     )
     return json.dumps(
@@ -2544,20 +2665,25 @@ def _session_child_settled(
 
 
 async def _update_delegation_entry(
-    executor: SessionRunExecutor,
-    intent: SessionRunIntent,
+    sessions: async_sessionmaker[AsyncSession],
     *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
     delegate_call_id: str,
-    child_state: str,
-    summary_document: Mapping[str, object],
+    status: SessionRunState,
+    summary: str | None,
+    error_code: str | None,
 ) -> None:
-    """Update the parent's ``DelegationEntry`` in place (idempotent)."""
+    """Update the parent's ``DelegationEntry`` in place (idempotent).
+
+    ``status`` follows the delegation lifecycle: ``queued`` at creation,
+    ``running`` while the parent waits on the child, terminal at
+    settlement.
+    """
     from mai.session_store import _lock_session
 
-    session_id = uuid.UUID(intent.session_id)
-    server_id = uuid.UUID(intent.server_id)
     durable_source_id = f"delegation:{delegate_call_id}"
-    async with executor.sessions() as session:
+    async with sessions() as session:
         async with session.begin():
             await _lock_session(session, session_id=session_id, server_id=server_id)
             row = (
@@ -2573,13 +2699,11 @@ async def _update_delegation_entry(
     if row is None:
         return
     payload = dict(row[0]) if not isinstance(row[0], str) else json.loads(row[0])
-    payload["status"] = (
-        "outcome_unknown" if child_state == "timeout" else child_state
-    )
-    payload["result_summary"] = str(summary_document.get("summary") or "")
-    payload["error_code"] = summary_document.get("error_code")
+    payload["status"] = status.value
+    payload["result_summary"] = summary
+    payload["error_code"] = error_code
     await aupdate_entry_payload_by_source(
-        executor.sessions,
+        sessions,
         session_id=session_id,
         server_id=server_id,
         durable_source_id=durable_source_id,
@@ -2682,7 +2806,10 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
                 SessionRunState.FAILED,
                 reason_code=str(summary.get("reason") or "bootstrap_run_row_missing"),
                 detail=_missing_facade_detail(summary, error),
-                session_status=SessionStatus.FAILED,
+                # A child run NEVER flips the shared session header.
+                session_status=(
+                    SessionStatus.FAILED if intent.parent_run_id is None else None
+                ),
             )
         )
         return json.dumps({"settled": "failed", "facade": "missing"})
@@ -2735,9 +2862,19 @@ def _session_settled(payload_json: str, summary_json: str) -> str:
             intent,
             session_state,
             reason_code=summary.get("reason"),
-            session_status=header_status,
+            # A child run NEVER flips the shared session header: a
+            # finishing child must not mark the session idle/failed while
+            # the parent run is still active.
+            session_status=(
+                header_status if intent.parent_run_id is None else None
+            ),
         )
     )
+    if session_state is not SessionRunState.SUCCEEDED:
+        # Honest terminal state for a multi-tool round that failed before
+        # every result landed: a still-``pending`` assistant tool group can
+        # never receive its remaining results — it becomes ``unresolved``.
+        executor.run(_cleanup_pending_tool_groups(executor, intent))
     # Terminal classification event (reviewed parity: agent.completed /
     # agent.failed carry the value-free outcome + reason).
     event_type = (
