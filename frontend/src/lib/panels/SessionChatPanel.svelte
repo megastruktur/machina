@@ -52,6 +52,7 @@
 	import type { components } from '../api/schema.generated.js';
 	import Button from '../ui/Button.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
+	import { untrack } from 'svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
 
@@ -444,11 +445,33 @@
 	});
 
 	function measure(node: HTMLElement, entry: ChannelEntry) {
-		const height = node.offsetHeight;
-		if (height > 0 && heights.get(Number(entry.seq)) !== height) {
-			heights.set(Number(entry.seq), height);
-			measureVersion += 1;
+		let currentSeq = Number(entry.seq);
+		// Track dynamic height changes (<details> toggles, in-place
+		// updates) without subpixel jitter: only whole-pixel deltas
+		// re-measure and bump the offsets.
+		const sync = () => {
+			const height = node.offsetHeight;
+			const prev = heights.get(currentSeq);
+			if (height > 0 && (prev === undefined || Math.abs(prev - height) >= 1)) {
+				heights.set(currentSeq, height);
+				measureVersion += 1;
+			}
+		};
+		sync();
+		let ro: ResizeObserver | null = null;
+		if (typeof ResizeObserver !== 'undefined') {
+			ro = new ResizeObserver(() => sync());
+			ro.observe(node);
 		}
+		return {
+			update(next: ChannelEntry) {
+				currentSeq = Number(next.seq);
+				sync();
+			},
+			destroy() {
+				ro?.disconnect();
+			}
+		};
 	}
 
 	function heightOf(entry: ChannelEntry): number {
@@ -522,8 +545,9 @@
 
 	// --- scroll anchoring -----------------------------------------------------
 	let viewportEl: HTMLElement | null = $state(null);
-	let prevFirstSeq = $state<number | null>(null);
-	let prevScrollHeight = $state(0);
+	let prevFirstSeq: number | null = null;
+	let prevLastSeq: number | null = null;
+	let prevScrollHeight = 0;
 	let anchoredToBottom = $state(true);
 
 	function onScroll(): void {
@@ -550,24 +574,39 @@
 	$effect(() => {
 		const firstSeq =
 			visibleEntries.length > 0 ? Number(visibleEntries[0].seq) : null;
+		const lastSeq =
+			visibleEntries.length > 0
+				? Number(visibleEntries[visibleEntries.length - 1].seq)
+				: null;
 		if (
 			viewportEl === null ||
 			visibleEntries.length === 0 ||
-			firstSeq === null
+			firstSeq === null ||
+			lastSeq === null
 		) {
 			prevFirstSeq = firstSeq;
+			prevLastSeq = lastSeq;
 			return;
 		}
-		const before = prevFirstSeq;
+		const beforeFirst = prevFirstSeq;
+		const beforeLast = prevLastSeq;
 		const previousHeight = prevScrollHeight;
-		if (before !== null && firstSeq < before && prevScrollHeight > 0) {
+		if (beforeFirst !== null && firstSeq < beforeFirst && previousHeight > 0) {
 			// Older entries PREPENDED: keep the reader's visual position.
 			viewportEl.scrollTop += viewportEl.scrollHeight - previousHeight;
-		} else if (before === null || firstSeq > before) {
+		} else if (
+			beforeFirst === null ||
+			(beforeLast !== null && lastSeq > beforeLast)
+		) {
 			// Newest entries appended: follow the tail when already at it.
-			if (anchoredToBottom) viewportEl.scrollTop = viewportEl.scrollHeight;
+			// untrack: scrolling at the bottom toggles `anchoredToBottom`,
+			// which must NEVER re-run this entry-change effect.
+			if (untrack(() => anchoredToBottom)) {
+				viewportEl.scrollTop = viewportEl.scrollHeight;
+			}
 		}
 		prevFirstSeq = firstSeq;
+		prevLastSeq = lastSeq;
 		prevScrollHeight = viewportEl.scrollHeight;
 	});
 
@@ -581,6 +620,7 @@
 			viewportEl.scrollTop = viewportEl.scrollHeight;
 			prevScrollHeight = viewportEl.scrollHeight;
 			prevFirstSeq = Number(visibleEntries[0].seq);
+			prevLastSeq = Number(visibleEntries[visibleEntries.length - 1].seq);
 		}
 	});
 
@@ -688,7 +728,7 @@
 					</Button>
 				</div>
 			{/if}
-			<div style="height:{topSpacerHeight}px" aria-hidden="true"></div>
+			<div class="mai-session-chat__spacer" style="height:{topSpacerHeight}px" aria-hidden="true"></div>
 			{#if visibleEntries.length === 0 && channelState !== 'connecting' && channelState !== 'reconnecting'}
 				<p class="mai-session-chat__state" data-testid="session-history-empty">
 					No committed entries yet — say something first.
@@ -841,7 +881,7 @@
 					{/if}
 				</article>
 			{/each}
-			<div style="height:{bottomSpacerHeight}px" aria-hidden="true"></div>
+			<div class="mai-session-chat__spacer" style="height:{bottomSpacerHeight}px" aria-hidden="true"></div>
 		</div>
 
 		{#if drafts.length > 0}
@@ -993,17 +1033,23 @@
 		outline: none;
 		display: flex;
 		flex-direction: column;
+		overflow-anchor: none;
+	}
+	.mai-session-chat__spacer {
+		flex: 0 0 auto;
 	}
 	.mai-session-chat__older {
 		display: flex;
 		justify-content: center;
 		padding: 4px 0;
+		flex-shrink: 0;
 	}
 	/* ---- entries: a chat stream, not an audit table (S3) ---------------- */
 	.mai-session-entry {
 		display: flex;
 		flex-direction: column;
 		padding: 3px 10px;
+		flex-shrink: 0;
 	}
 	.mai-session-entry__text {
 		margin: 0;
