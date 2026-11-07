@@ -1,13 +1,18 @@
 <script lang="ts">
 	/**
-	 * SessionChatPanel — the session-first virtualized entry view (D08).
+	 * SessionChatPanel — the session-first virtualized entry view (D08,
+	 * restyled S3).
 	 *
 	 * Owns ONE visible session's bounded history surface:
 	 *  - the entry cache lives with the composed shell (≤400 committed
 	 *    entries — the shell merges channel deliveries + REST older pages
-	 *    and evicts); this component renders a WINDOWED slice of that cache
-	 *    (≤80 DOM rows + measured spacers) so the DOM never mirrors the
-	 *    whole cache;
+	 *    and evicts); this component renders a WINDOWED slice of the
+	 *    FILTERED cache (≤80 DOM rows + measured spacers) so the DOM never
+	 *    mirrors the whole cache;
+	 *  - the transcript is a CHAT, not an audit log: `run_state` entries
+	 *    and delegated child-run entries are filtered out of the rendered
+	 *    stream (S3) — run state drives the live generating indicator and
+	 *    the terminal notice instead of list rows;
 	 *  - older pages load on demand (scroll-top or the keyboard-accessible
 	 *    "Load older" trigger) through the shell's single-flight
 	 *    `before_seq` fetcher — this component never issues duplicate
@@ -18,11 +23,13 @@
 	 *    assistant response here);
 	 *  - every entry kind renders from its typed payload — nothing is
 	 *    inferred as success (`unknown_effect` carries an explicit warning
-	 *    badge), delegations render as session/run-edge cards, compaction
-	 *    as an explicit marker banner;
-	 *  - the composer admits turns through the typed session API; control
-	 *    actions (steer/pause/cancel) are typed requests, never engine
-	 *    writes from the client.
+	 *    badge); thinking renders as a collapsed "Ход мыслей" disclosure
+	 *    and tools/delegations as compact disclosures that stay open while
+	 *    the outcome is unproven (or the fixture has no run scope);
+	 *  - the composer admits turns through the typed session API; a
+	 *    resolved submit calls `onturnsubmitted` with the optimistic
+	 *    user entry + the response run state (S3) so the message and the
+	 *    generating indicator appear immediately on Enter.
 	 *
 	 * Svelte 5 runes only (AGENTS.md §3); all state is instance-local. No
 	 * timers, no polling — the channel pushes, the user scrolls.
@@ -30,14 +37,22 @@
 
 	import type { PanelContext } from '../workspace/registry.js';
 	import type { SessionChatApi } from '../workspace/entries/06-session-chat.js';
-	import type { ChannelEntry } from '../chat/session_client.js';
-	import type { SessionStreamDraft } from '../chat/session_client.js';
-	import type { SessionChannelConnectionState } from '../chat/session_client.js';
+	import type {
+		ChannelEntry,
+		SessionStreamDraft,
+		SessionChannelConnectionState
+	} from '../chat/session_client.js';
+	import type {
+		SessionRunState,
+		SessionTurnSubmitOutcome
+	} from '../api/client.js';
 	import type { components } from '../api/schema.generated.js';
 	import Button from '../ui/Button.svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
-	type ToolCallItem = components['schemas']['ToolCallItem'];
+
+	/** The optimistic run-state mirror shape handed up from a submit. */
+	type TurnRunState = { run_id: string; state: SessionRunState };
 
 	type Props = {
 		panel: PanelContext;
@@ -57,6 +72,18 @@
 		onloadolder?: () => void;
 		/** A composer-created session: the shell attaches its channel. */
 		onsessionopened?: (sessionId: string, serverId: string | null) => void;
+		/**
+		 * S3 optimistic feedback: called right after `submitAgentSessionTurn`
+		 * resolves with the admitted turn's `user_message` entry and the
+		 * response's run state, so the shell can merge the entry into the
+		 * controller cache and light the generating indicator immediately.
+		 */
+		onturnsubmitted?: (entry: ChannelEntry, runState: TurnRunState) => void;
+		/**
+		 * The just-submitted turn's run state until the first committed
+		 * `run_state` entry arrives (server truth always wins).
+		 */
+		optimisticRunState?: TurnRunState | null;
 	};
 
 	let {
@@ -69,7 +96,9 @@
 		loadingOlder = false,
 		hasOlder = false,
 		onloadolder = () => {},
-		onsessionopened = () => {}
+		onsessionopened = () => {},
+		onturnsubmitted = () => {},
+		optimisticRunState = null
 	}: Props = $props();
 
 	/** Narrow the session API slice (fail closed like every panel). */
@@ -89,6 +118,31 @@
 	let controlBusy = $state<string | null>(null);
 	let controlProblem = $state<{ code: string; message: string } | null>(null);
 
+	/** Build the optimistic committed-view `user_message` entry (S3). */
+	function optimisticUserEntry(
+		outcome: SessionTurnSubmitOutcome,
+		clientRequestId: string,
+		text: string,
+		sid: string
+	): ChannelEntry {
+		const payload: EntryPayload = {
+			kind: 'user_message',
+			text,
+			client_request_id: clientRequestId,
+			source: 'interactive'
+		};
+		return {
+			schema_version: 1,
+			entry_id: outcome.entry_id,
+			session_id: sid,
+			seq: Number(outcome.seq),
+			run_id: outcome.run_id,
+			durable_source_id: `turn:${clientRequestId}`,
+			created_at: new Date().toISOString(),
+			payload
+		};
+	}
+
 	async function submitTurn(): Promise<void> {
 		const text = composerText.trim();
 		if (!api || submitting || text === '') return;
@@ -105,7 +159,7 @@
 					source: 'interactive',
 					client_request_id: clientRequestId
 				});
-				await api.submitAgentSessionTurn(
+				const outcome = await api.submitAgentSessionTurn(
 					created.session_id,
 					{
 						session_id: created.session_id,
@@ -114,9 +168,22 @@
 					},
 					scope
 				);
+				composerText = '';
+				// The shell attaches the channel SYNCHRONOUSLY inside this
+				// callback, so the optimistic merge below lands in the NEW
+				// session's controller cache.
 				onsessionopened(created.session_id, scope);
+				onturnsubmitted?.(
+					optimisticUserEntry(
+						outcome,
+						clientRequestId,
+						text,
+						created.session_id
+					),
+					{ run_id: String(outcome.run_id), state: outcome.run_state }
+				);
 			} else {
-				await api.submitAgentSessionTurn(
+				const outcome = await api.submitAgentSessionTurn(
 					sessionId,
 					{
 						session_id: sessionId,
@@ -125,13 +192,17 @@
 					},
 					serverId
 				);
+				composerText = '';
+				onturnsubmitted?.(
+					optimisticUserEntry(outcome, clientRequestId, text, sessionId),
+					{ run_id: String(outcome.run_id), state: outcome.run_state }
+				);
 			}
-			composerText = '';
 		} catch (error) {
-			const api2 = error as { code?: string; message?: string };
+			const apiError = error as { code?: string; message?: string };
 			submitProblem = {
-				code: api2.code ?? 'unavailable',
-				message: api2.message ?? 'The turn could not be admitted.'
+				code: apiError.code ?? 'unavailable',
+				message: apiError.message ?? 'The turn could not be admitted.'
 			};
 		} finally {
 			submitting = false;
@@ -156,32 +227,119 @@
 			);
 			if (action === 'steer') composerText = '';
 		} catch (error) {
-			const api2 = error as { code?: string; message?: string };
+			const apiError = error as { code?: string; message?: string };
 			controlProblem = {
-				code: api2.code ?? 'unavailable',
-				message: api2.message ?? 'The control request was refused.'
+				code: apiError.code ?? 'unavailable',
+				message: apiError.message ?? 'The control request was refused.'
 			};
 		} finally {
 			controlBusy = null;
 		}
 	}
 
-	// --- derived view model ---------------------------------------------------
+	// --- chat view model (S3) --------------------------------------------------
+	/**
+	 * The delegated child-run ids declared by `delegation` entries: the
+	 * child's own entries (its prompts/answers) are the delegation's
+	 * content, never top-level transcript rows — otherwise a delegated
+	 * subagent's user_message looks like the operator's own message and
+	 * its answer appears side by side with the parent's summary.
+	 */
+	const childRunIds = $derived.by(() => {
+		const ids = new Set<string>();
+		for (const entry of entries) {
+			if (entry.payload.kind === 'delegation') {
+				const childRun = String(entry.payload.child_run_id ?? '');
+				if (childRun !== '') ids.add(childRun);
+			}
+		}
+		return ids;
+	});
+
+	/**
+	 * The rendered transcript: run_state entries drive the indicator and
+	 * the notice (never list rows), and delegated child-run entries fold
+	 * into their delegation card.
+	 */
+	const visibleEntries = $derived(
+		entries.filter((entry) => {
+			if (entry.payload.kind === 'run_state') return false;
+			const runId = entry.run_id ?? null;
+			return runId === null || !childRunIds.has(String(runId));
+		})
+	);
+
+	/** The run states that mean "the agent is working right now". */
+	const GENERATING_RUN_STATES: ReadonlySet<string> = new Set([
+		'queued',
+		'running',
+		'waiting_child'
+	]);
+	/** The run states surfaced as a compact terminal inline notice. */
+	const NOTICE_RUN_STATES: ReadonlySet<string> = new Set([
+		'failed',
+		'cancelled',
+		'outcome_unknown',
+		'waiting_approval'
+	]);
+
 	/** The latest run-state entry's lifecycle value (server truth). */
-	const runState = $derived.by(() => {
+	const serverRunState = $derived.by<TurnRunState | null>(() => {
 		for (let i = entries.length - 1; i >= 0; i -= 1) {
-			const payload = entries[i].payload;
-			if (payload.kind === 'run_state') return String(payload.state);
+			const entry = entries[i];
+			const payload = entry.payload;
+			if (payload.kind === 'run_state') {
+				// The run identity lives on the ENTRY ENVELOPE (the payload
+				// carries only the transition state/reason).
+				return {
+					run_id: String(entry.run_id ?? ''),
+					state: payload.state as SessionRunState
+				};
+			}
 		}
 		return null;
 	});
-
-	const oldestSeq = $derived(entries.length > 0 ? Number(entries[0].seq) : 0);
-	const latestSeq = $derived(
-		entries.length > 0 ? Number(entries[entries.length - 1].seq) : 0
+	/** Server truth wins; the optimistic mirror fills the submit gap. */
+	const effectiveRunState = $derived(serverRunState ?? optimisticRunState);
+	/** The live generation indicator: working run, in-flight submit or a
+	 * still-streaming draft. */
+	const generating = $derived(
+		submitting ||
+			drafts.length > 0 ||
+			(effectiveRunState !== null &&
+				GENERATING_RUN_STATES.has(String(effectiveRunState.state)))
 	);
+	/** The compact terminal notice state (only when NOT generating). */
+	const terminalNotice = $derived.by<string | null>(() => {
+		if (generating || effectiveRunState === null) return null;
+		const state = String(effectiveRunState.state);
+		return NOTICE_RUN_STATES.has(state) ? state : null;
+	});
 
-	// --- virtualization (windowed DOM over the bounded cache) -----------------
+	const generatingLabel = $derived.by(() => {
+		if (drafts.length > 0 || submitting) return 'Generating…';
+		const state = String(effectiveRunState?.state ?? 'running');
+		if (state === 'queued') return 'Queued — the engine picked up the turn';
+		if (state === 'waiting_child') return 'Running delegated child…';
+		return 'Generating…';
+	});
+
+	const noticeLabel = $derived.by(() => {
+		switch (terminalNotice) {
+			case 'failed':
+				return 'The run failed.';
+			case 'cancelled':
+				return 'The run was cancelled.';
+			case 'outcome_unknown':
+				return 'The run outcome is unknown — reconcile before retrying.';
+			case 'waiting_approval':
+				return 'Waiting for approval.';
+			default:
+				return '';
+		}
+	});
+
+	// --- virtualization (windowed DOM over the filtered cache) ----------------
 	const ENTRY_HEIGHT_ESTIMATE = 72;
 	const OVERSCAN_PX = 480;
 	const MAX_DOM_ROWS = 80;
@@ -198,7 +356,7 @@
 	// Plain-map mutation is safe here: offsets recompute through
 	// `measureVersion`, never through the map itself.
 	$effect(() => {
-		const live = new Set(entries.map((entry) => Number(entry.seq)));
+		const live = new Set(visibleEntries.map((entry) => Number(entry.seq)));
 		for (const seq of [...heights.keys()]) {
 			if (!live.has(seq)) heights.delete(seq);
 		}
@@ -218,15 +376,15 @@
 
 	function offsetOf(index: number): number {
 		let total = 0;
-		for (let i = 0; i < index && i < entries.length; i += 1) {
-			total += heightOf(entries[i]);
+		for (let i = 0; i < index && i < visibleEntries.length; i += 1) {
+			total += heightOf(visibleEntries[i]);
 		}
 		return total;
 	}
 
 	const totalHeight = $derived.by(() => {
 		void measureVersion;
-		return offsetOf(entries.length);
+		return offsetOf(visibleEntries.length);
 	});
 
 	/** The rendered window: first index whose offset enters the viewport. */
@@ -235,15 +393,15 @@
 		let cumulative = 0;
 		let start = 0;
 		const limit = Math.max(scrollTop - OVERSCAN_PX, 0);
-		for (let i = 0; i < entries.length; i += 1) {
+		for (let i = 0; i < visibleEntries.length; i += 1) {
 			if (cumulative >= limit) {
 				start = i;
 				break;
 			}
-			cumulative += heightOf(entries[i]);
+			cumulative += heightOf(visibleEntries[i]);
 			start = i + 1;
 		}
-		return Math.min(start, entries.length);
+		return Math.min(start, visibleEntries.length);
 	});
 
 	const windowEnd = $derived.by(() => {
@@ -251,18 +409,18 @@
 		const startOffset = offsetOf(windowStart);
 		let cumulative = startOffset;
 		let count = 0;
-		for (let i = windowStart; i < entries.length; i += 1) {
+		for (let i = windowStart; i < visibleEntries.length; i += 1) {
 			if (cumulative >= scrollTop + viewportHeight + OVERSCAN_PX && count > 0) {
 				break;
 			}
-			cumulative += heightOf(entries[i]);
+			cumulative += heightOf(visibleEntries[i]);
 			count += 1;
 			if (count >= MAX_DOM_ROWS) break;
 		}
 		return windowStart + count;
 	});
 
-	const renderedSlice = $derived(entries.slice(windowStart, windowEnd));
+	const renderedSlice = $derived(visibleEntries.slice(windowStart, windowEnd));
 	const topSpacerHeight = $derived.by(() => {
 		void measureVersion;
 		return offsetOf(windowStart);
@@ -271,6 +429,15 @@
 		void measureVersion;
 		return Math.max(totalHeight - offsetOf(windowEnd), 0);
 	});
+
+	const oldestSeq = $derived(
+		visibleEntries.length > 0 ? Number(visibleEntries[0].seq) : 0
+	);
+	const latestSeq = $derived(
+		visibleEntries.length > 0
+			? Number(visibleEntries[visibleEntries.length - 1].seq)
+			: 0
+	);
 
 	// --- scroll anchoring -----------------------------------------------------
 	let viewportEl: HTMLElement | null = $state(null);
@@ -284,7 +451,12 @@
 		anchoredToBottom =
 			scrollTop + viewportEl.clientHeight >= viewportEl.scrollHeight - 4;
 		// Demand-load older pages near the top (the shell deduplicates).
-		if (scrollTop <= 64 && hasOlder && !loadingOlder && entries.length > 0) {
+		if (
+			scrollTop <= 64 &&
+			hasOlder &&
+			!loadingOlder &&
+			visibleEntries.length > 0
+		) {
 			onloadolder();
 		}
 	}
@@ -295,18 +467,19 @@
 	 * the newest row visible. Runs after every entries change.
 	 */
 	$effect(() => {
-		const firstSeq = entries.length > 0 ? Number(entries[0].seq) : null;
-		if (viewportEl === null || entries.length === 0 || firstSeq === null) {
+		const firstSeq =
+			visibleEntries.length > 0 ? Number(visibleEntries[0].seq) : null;
+		if (
+			viewportEl === null ||
+			visibleEntries.length === 0 ||
+			firstSeq === null
+		) {
 			prevFirstSeq = firstSeq;
 			return;
 		}
 		const before = prevFirstSeq;
 		const previousHeight = prevScrollHeight;
-		if (
-			before !== null &&
-			firstSeq < before &&
-			prevScrollHeight > 0
-		) {
+		if (before !== null && firstSeq < before && prevScrollHeight > 0) {
 			// Older entries PREPENDED: keep the reader's visual position.
 			viewportEl.scrollTop += viewportEl.scrollHeight - previousHeight;
 		} else if (before === null || firstSeq > before) {
@@ -319,10 +492,14 @@
 
 	/** Initial focus + bottom anchor once the first page rendered. */
 	$effect(() => {
-		if (entries.length > 0 && prevScrollHeight === 0 && viewportEl !== null) {
+		if (
+			visibleEntries.length > 0 &&
+			prevScrollHeight === 0 &&
+			viewportEl !== null
+		) {
 			viewportEl.scrollTop = viewportEl.scrollHeight;
 			prevScrollHeight = viewportEl.scrollHeight;
-			prevFirstSeq = Number(entries[0].seq);
+			prevFirstSeq = Number(visibleEntries[0].seq);
 		}
 	});
 
@@ -331,6 +508,17 @@
 			event.preventDefault();
 			void submitTurn();
 		}
+	}
+
+	/** A tool/delegation row whose outcome is NOT settled (open). */
+	function toolDisclosureOpen(
+		kind: 'tool_result' | 'delegation',
+		runId: string | null,
+		status: string
+	): boolean {
+		if (runId === null) return true; // fixture / out-of-run rows
+		if (kind === 'tool_result') return status !== 'executed';
+		return status !== 'succeeded';
 	}
 </script>
 
@@ -341,21 +529,11 @@
 		</div>
 	{:else}
 		<header class="mai-session-chat__header">
+			<!-- Refresh continuity (R2-3): the id stays in the DOM for the E2E
+			     assertions, visually silent — the chat is the surface now. -->
 			<span class="mai-session-chat__id" data-testid="session-header-id">
 				{sessionId === null ? 'new session' : `session ${sessionId.slice(0, 8)}…`}
 			</span>
-			<span
-				class="mai-session-chat__channel"
-				data-testid="session-channel-badge"
-				data-channel-state={channelState}
-			>
-				{channelState}
-			</span>
-			{#if runState !== null}
-				<span class="mai-session-chat__run" data-testid="session-run-state" data-run-state={runState}>
-					run: {runState}
-				</span>
-			{/if}
 			{#if channelState === 'resync'}
 				<span class="mai-session-chat__resync" role="status" data-testid="session-resync-note">
 					resync — reconciling with the server
@@ -369,7 +547,7 @@
 		<div
 			class="mai-session-chat__viewport"
 			data-testid="session-history-viewport"
-			data-cached-count={entries.length}
+			data-cached-count={visibleEntries.length}
 			data-dom-count={renderedSlice.length}
 			data-oldest-seq={oldestSeq}
 			data-latest-seq={latestSeq}
@@ -397,136 +575,137 @@
 				</div>
 			{/if}
 			<div style="height:{topSpacerHeight}px" aria-hidden="true"></div>
-			{#if entries.length === 0 && channelState !== 'connecting' && channelState !== 'reconnecting'}
+			{#if visibleEntries.length === 0 && channelState !== 'connecting' && channelState !== 'reconnecting'}
 				<p class="mai-session-chat__state" data-testid="session-history-empty">
 					No committed entries yet — say something first.
 				</p>
 			{/if}
-			{#each renderedSlice as entry (entry.entry_id)}
+			{#each renderedSlice as entry (entry.entry_id ?? entry.seq)}
 				<article
 					class="mai-session-entry mai-session-entry--{entry.payload.kind}"
 					data-testid="session-entry"
 					data-entry-kind={entry.payload.kind}
-					data-seq={entry.seq}
 					use:measure={entry}
 				>
-					<span class="mai-session-entry__seq">#{entry.seq}</span>
 					{#if entry.payload.kind === 'user_message'}
-						<div class="mai-session-entry__body" data-testid="entry-user-message">
-							<span class="mai-session-entry__badge mai-session-entry__badge--user">user</span>
+						<div class="mai-user-bubble" data-testid="entry-user-message">
 							<p class="mai-session-entry__text">{entry.payload.text}</p>
 						</div>
 					{:else if entry.payload.kind === 'assistant_message'}
-						<div class="mai-session-entry__body" data-testid="entry-assistant-message">
-							<span class="mai-session-entry__badge mai-session-entry__badge--assistant">assistant</span>
-							<span class="mai-session-entry__meta">{entry.payload.model_profile}</span>
-							<p class="mai-session-entry__text">{entry.payload.text}</p>
+						<div class="mai-assistant-flow" data-testid="entry-assistant-message">
+							{#if entry.payload.text !== ''}
+								<p class="mai-session-entry__text">{entry.payload.text}</p>
+							{/if}
 							{#if entry.payload.provider_artifacts !== undefined && entry.payload.provider_artifacts.length > 0}
-								<details class="mai-session-entry__reasoning" data-testid="entry-reasoning">
-									<summary>reasoning artifacts ({entry.payload.provider_artifacts.length})</summary>
-									{#each entry.payload.provider_artifacts as artifact}
-										<p class="mai-session-entry__meta">
-											{artifact.artifact_kind}
-											{#if typeof artifact.content === 'string'}
-												— {artifact.content.slice(0, 200)}
-											{/if}
-										</p>
-									{/each}
+								<details class="mai-thinking-disclosure" data-testid="entry-thinking">
+									<summary>Ход мыслей</summary>
+									<div class="mai-thinking-disclosure__body">
+										{#each entry.payload.provider_artifacts as artifact}
+											<p class="mai-thinking-disclosure__line">{artifact.content}</p>
+										{/each}
+									</div>
 								</details>
 							{/if}
 							{#if entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
-								<ul class="mai-session-entry__tools" data-testid="entry-tool-calls">
-									{#each entry.payload.tool_calls as call (call.call_id)}
-										<li data-testid="entry-tool-call" data-tool-status="pending">
-											<span class="mai-session-entry__badge mai-session-entry__badge--pending">pending</span>
-											<code>{call.capability_id}</code>
-											<span class="mai-session-entry__meta">{call.call_id}</span>
-										</li>
-									{/each}
-								</ul>
+								<details
+									class="mai-tool-disclosure"
+									data-testid="entry-tool-calls"
+									open
+								>
+									<summary>tool calls ({entry.payload.tool_calls.length})</summary>
+									<ul class="mai-tool-disclosure__list">
+										{#each entry.payload.tool_calls as call (call.call_id)}
+											<li class="mai-tool-disclosure__item" data-testid="entry-tool-call">
+												<code>{call.capability_id}</code>
+											</li>
+										{/each}
+									</ul>
+								</details>
 							{/if}
 						</div>
 					{:else if entry.payload.kind === 'tool_result'}
-						<div
-							class="mai-session-entry__body"
+						<details
+							class="mai-tool-disclosure"
 							data-testid="entry-tool-result"
-							data-tool-status={entry.payload.status}
-							data-domain-outcome={entry.payload.domain_outcome}
+							open={toolDisclosureOpen('tool_result', entry.run_id ?? null, entry.payload.status)}
 						>
-							<span
-								class="mai-session-entry__badge mai-session-entry__badge--{entry.payload.status}"
-								data-testid="tool-status-badge"
-							>
-								{#if entry.payload.status === 'unknown_effect'}
-									Outcome unknown — effect not proven
-								{:else}
-									{entry.payload.status}
+							<summary class="mai-tool-disclosure__summary">
+								<code>{entry.payload.capability_id}</code>
+								<span
+									class="mai-tool-status"
+									class:mai-tool-status--warn={entry.payload.status === 'unknown_effect' || entry.payload.status === 'approval_required'}
+									class:mai-tool-status--bad={entry.payload.status === 'denied'}
+									data-testid="tool-status-badge"
+								>
+									{#if entry.payload.status === 'unknown_effect'}
+										Outcome unknown — effect not proven
+									{:else}
+										{entry.payload.status}
+									{/if}
+								</span>
+							</summary>
+							<div class="mai-tool-disclosure__body">
+								{#if entry.payload.output_preview !== null && entry.payload.output_preview !== undefined && entry.payload.output_preview !== ''}
+									<p class="mai-tool-disclosure__output">{entry.payload.output_preview}</p>
 								{/if}
-							</span>
-							<code>{entry.payload.capability_id}</code>
-							<span class="mai-session-entry__meta">{entry.payload.call_id}</span>
-							{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
-								<p class="mai-session-entry__error" data-testid="tool-error">
-									{entry.payload.error_code}: {entry.payload.error_detail ?? ''}
-								</p>
-							{/if}
-						</div>
+								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
+									<p class="mai-session-entry__error" data-testid="tool-error">
+										{entry.payload.error_code}: {entry.payload.error_detail ?? ''}
+									</p>
+								{/if}
+							</div>
+						</details>
 					{:else if entry.payload.kind === 'delegation'}
-						<div
-							class="mai-session-entry__body mai-session-entry__delegation"
+						<details
+							class="mai-tool-disclosure mai-tool-disclosure--delegation"
 							data-testid="entry-delegation"
-							data-delegation-status={entry.payload.status}
+							open={toolDisclosureOpen('delegation', entry.run_id ?? null, entry.payload.status)}
 						>
-							<span class="mai-session-entry__badge mai-session-entry__badge--delegation">
-								delegation · {entry.payload.status}
-							</span>
-							<dl>
-								<dt>child session</dt>
-								<dd>{entry.payload.child_session_id ?? '—'}</dd>
-								<dt>child run</dt>
-								<dd>{entry.payload.child_run_id}</dd>
-							</dl>
-							{#if entry.payload.goal !== ''}
-								<p class="mai-session-entry__text">{entry.payload.goal}</p>
-							{/if}
-							{#if entry.payload.allowed_capabilities.length > 0}
-								<p class="mai-session-entry__meta">
-									capabilities: {entry.payload.allowed_capabilities.join(', ')}
+							<summary class="mai-tool-disclosure__summary">
+								<span class="mai-tool-disclosure__title">delegation</span>
+								<span
+									class="mai-tool-status"
+									class:mai-tool-status--warn={entry.payload.status === 'queued' || entry.payload.status === 'running'}
+									class:mai-tool-status--bad={entry.payload.status === 'failed'}
+								>
+									{entry.payload.status}
+								</span>
+							</summary>
+							<div class="mai-tool-disclosure__body">
+								<p class="mai-tool-disclosure__meta">
+									child run <code>{entry.payload.child_run_id}</code>
 								</p>
-							{/if}
-							{#if entry.payload.result_summary !== null && entry.payload.result_summary !== undefined}
-								<p class="mai-session-entry__meta" data-testid="delegation-summary">
-									{entry.payload.result_summary.slice(0, 240)}
-								</p>
-							{/if}
-							{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
-								<p class="mai-session-entry__error">{entry.payload.error_code}</p>
-							{/if}
-						</div>
+								{#if entry.payload.goal !== ''}
+									<p class="mai-session-entry__text">{entry.payload.goal}</p>
+								{/if}
+								{#if entry.payload.result_summary !== null && entry.payload.result_summary !== undefined}
+									<p class="mai-tool-disclosure__output" data-testid="delegation-summary">
+										{entry.payload.result_summary}
+									</p>
+								{/if}
+								{#if entry.payload.error_code !== null && entry.payload.error_code !== undefined}
+									<p class="mai-session-entry__error">{entry.payload.error_code}</p>
+								{/if}
+							</div>
+						</details>
 					{:else if entry.payload.kind === 'compaction'}
-						<div class="mai-session-entry__compaction" data-testid="compaction-marker">
-							<span>
+						<div class="mai-compaction" data-testid="compaction-marker">
+							<span class="mai-compaction__label">
 								Compacted entries seq {entry.payload.from_seq}..{entry.payload.to_seq}
 							</span>
-							<details data-testid="compaction-summary">
+							<details class="mai-tool-disclosure" data-testid="compaction-summary">
 								<summary>summary</summary>
 								<p class="mai-session-entry__text">{entry.payload.summary_text}</p>
 							</details>
 						</div>
-					{:else if entry.payload.kind === 'run_state'}
-						<div class="mai-session-entry__runstate" data-testid="entry-run-state" data-run-state={entry.payload.state}>
-							<span class="mai-session-entry__badge">{entry.payload.state}</span>
-							{#if entry.payload.reason_code !== null && entry.payload.reason_code !== undefined}
-								<span class="mai-session-entry__meta">{entry.payload.reason_code}</span>
-							{/if}
-						</div>
 					{:else if entry.payload.kind === 'control'}
-						<div class="mai-session-entry__control" data-testid="entry-control" data-control-action={entry.payload.action}>
-							<span class="mai-session-entry__badge">{entry.payload.action}</span>
-							{#if entry.payload.note !== null && entry.payload.note !== undefined}
-								<span class="mai-session-entry__meta">{entry.payload.note}</span>
-							{/if}
-						</div>
+						<p
+							class="mai-control-note"
+							data-testid="entry-control"
+							data-control-action={entry.payload.action}
+						>
+							{entry.payload.action}{#if entry.payload.note !== null && entry.payload.note !== undefined}: {entry.payload.note}{/if}
+						</p>
 					{/if}
 				</article>
 			{/each}
@@ -537,10 +716,29 @@
 			<div class="mai-session-chat__drafts" data-testid="session-stream-drafts">
 				{#each drafts as draft (draft.stream_id)}
 					<p class="mai-session-chat__draft" data-testid="session-stream-draft" data-stream-id={draft.stream_id}>
-						streaming… {draft.text.slice(-240)}
+						{draft.text.slice(-240)}
 					</p>
 				{/each}
 			</div>
+		{/if}
+
+		{#if generating}
+			<div class="mai-generating" data-testid="session-generating-indicator" data-run-state={String(effectiveRunState?.state ?? 'running')} role="status">
+				<span class="mai-generating__dots" aria-hidden="true">
+					<i></i><i></i><i></i>
+				</span>
+				<span class="mai-generating__bar" aria-hidden="true"></span>
+				<span class="mai-generating__label">{generatingLabel}</span>
+			</div>
+		{:else if terminalNotice !== null}
+			<p
+				class="mai-terminal-notice"
+				data-testid="session-terminal-notice"
+				data-run-state={terminalNotice}
+				role="status"
+			>
+				{noticeLabel}
+			</p>
 		{/if}
 
 		<footer class="mai-session-chat__composer">
@@ -633,13 +831,21 @@
 		flex-wrap: wrap;
 		gap: 8px;
 		align-items: center;
-		padding: 4px 8px;
+		padding: 2px 8px;
 		font-size: 0.75rem;
-		border-bottom: var(--mai-border-width, 1px) solid
-			var(--mai-color-border, transparent);
 	}
-	.mai-session-chat__channel {
-		font-weight: 600;
+	/* Refresh continuity (R2-3): present for the E2E assertions, visually
+	   silent — assistive technology still reads the active session id. */
+	.mai-session-chat__id {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		white-space: nowrap;
+		border: 0;
 	}
 	.mai-session-chat__resync {
 		color: var(--mai-color-warning, #b45309);
@@ -650,100 +856,232 @@
 		overflow-y: auto;
 		overflow-x: hidden;
 		outline: none;
+		display: flex;
+		flex-direction: column;
 	}
 	.mai-session-chat__older {
 		display: flex;
 		justify-content: center;
 		padding: 4px 0;
 	}
+	/* ---- entries: a chat stream, not an audit table (S3) ---------------- */
 	.mai-session-entry {
 		display: flex;
-		gap: 6px;
-		padding: 4px 8px;
-		border-bottom: var(--mai-border-width, 1px) solid
-			var(--mai-color-border, transparent);
-	}
-	.mai-session-entry__seq {
-		flex: none;
-		min-width: 3.2em;
-		font-size: 0.72rem;
-		color: var(--mai-color-muted, inherit);
-	}
-	.mai-session-entry__body {
-		display: flex;
 		flex-direction: column;
-		gap: 2px;
-		min-width: 0;
+		padding: 3px 10px;
 	}
 	.mai-session-entry__text {
 		margin: 0;
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
-	.mai-session-entry__meta {
-		font-size: 0.72rem;
-		color: var(--mai-color-muted, inherit);
-		overflow-wrap: anywhere;
-	}
-	.mai-session-entry__badge {
-		display: inline-block;
-		padding: 0 6px;
-		border-radius: 8px;
-		font-size: 0.7rem;
-		background: var(--mai-color-surface-raised, rgba(0, 0, 0, 0.06));
-	}
-	.mai-session-entry__badge--user {
-		background: var(--mai-color-brass, rgba(180, 83, 9, 0.18));
-	}
-	.mai-session-entry__badge--unknown_effect {
-		background: var(--mai-color-warning, #b45309);
-		color: #fff;
-	}
-	.mai-session-entry__badge--failed {
-		background: var(--mai-color-danger, #b3261e);
-		color: #fff;
-	}
-	.mai-session-entry__badge--denied {
-		background: var(--mai-color-muted, #666);
-		color: #fff;
-	}
 	.mai-session-entry__error {
 		margin: 0;
 		color: var(--mai-color-danger, #b3261e);
 		font-size: 0.75rem;
 	}
-	.mai-session-entry__tools {
-		margin: 2px 0 0;
-		padding: 0;
-		list-style: none;
+	/* User messages: right-aligned accent-tinted bubbles (S3). */
+	.mai-user-bubble {
+		align-self: flex-end;
+		max-width: 82%;
+		margin-left: auto;
+		padding: 6px 10px;
+		border-radius: 14px;
+		background: color-mix(
+			in oklch,
+			var(--mai-color-accent, #b45309) 16%,
+			var(--mai-color-bg-elevated, rgba(0, 0, 0, 0.04))
+		);
 	}
-	.mai-session-entry__delegation dl {
-		display: grid;
-		grid-template-columns: auto auto;
-		gap: 0 10px;
-		margin: 2px 0;
-		font-size: 0.72rem;
+	/* Assistant messages: borderless prose straight on the canvas. */
+	.mai-assistant-flow {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
 	}
-	.mai-session-entry__delegation dt {
-		color: var(--mai-color-muted, inherit);
+	/* Thinking: collapsed "Ход мыслей", italic muted body (S3). */
+	.mai-thinking-disclosure {
+		font-size: 0.78rem;
 	}
-	.mai-session-entry__delegation dd {
+	.mai-thinking-disclosure summary {
+		cursor: pointer;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+	}
+	.mai-thinking-disclosure__body {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 2px 0 2px 10px;
+	}
+	.mai-thinking-disclosure__line {
 		margin: 0;
+		font-style: italic;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
-	.mai-session-entry__compaction {
-		padding: 4px 8px;
-		background: var(--mai-color-surface-raised, rgba(0, 0, 0, 0.05));
-		font-size: 0.75rem;
+	/* Tools + delegations: compact collapsed disclosures (S3). Open while
+	   the outcome is unproven (or the row has no run scope — the synthetic
+	   fixtures) so errors/refusals stay immediately visible. */
+	.mai-tool-disclosure {
+		font-size: 0.78rem;
+		border: none;
 	}
+	.mai-tool-disclosure summary {
+		display: flex;
+		gap: 8px;
+		align-items: baseline;
+		cursor: pointer;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+		list-style: revert;
+	}
+	.mai-tool-disclosure__summary {
+		flex-wrap: wrap;
+	}
+	.mai-tool-disclosure__body {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 2px 0 2px 10px;
+	}
+	.mai-tool-disclosure__list {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.mai-tool-disclosure__item code,
+	.mai-tool-disclosure__summary code {
+		font-size: 0.74rem;
+	}
+	.mai-tool-disclosure__meta {
+		margin: 0;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+		overflow-wrap: anywhere;
+	}
+	.mai-tool-disclosure__output {
+		margin: 0;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+		font-size: 0.76rem;
+	}
+	.mai-tool-status {
+		font-size: 0.7rem;
+		padding: 0 6px;
+		border-radius: 8px;
+		background: var(--mai-color-surface-raised, rgba(0, 0, 0, 0.06));
+	}
+	.mai-tool-status--warn {
+		background: var(--mai-color-warning, #b45309);
+		color: #fff;
+	}
+	.mai-tool-status--bad {
+		background: var(--mai-color-danger, #b3261e);
+		color: #fff;
+	}
+	.mai-compaction {
+		display: flex;
+		gap: 10px;
+		align-items: baseline;
+		flex-wrap: wrap;
+		padding: 4px 10px;
+		font-size: 0.75rem;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+	}
+	.mai-compaction__label {
+		font-weight: 600;
+	}
+	.mai-control-note {
+		margin: 0;
+		padding: 0 10px;
+		font-size: 0.75rem;
+		font-style: italic;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+	}
+	/* ---- live generation indicator (S3) ---------------------------------- */
+	.mai-generating {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding: 6px 12px 2px;
+	}
+	.mai-generating__dots {
+		display: inline-flex;
+		gap: 4px;
+	}
+	.mai-generating__dots i {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--mai-color-accent, #b45309);
+		animation: mai-generating-dot 1.1s ease-in-out infinite;
+	}
+	.mai-generating__dots i:nth-child(2) {
+		animation-delay: 0.18s;
+	}
+	.mai-generating__dots i:nth-child(3) {
+		animation-delay: 0.36s;
+	}
+	@keyframes mai-generating-dot {
+		0%,
+		100% {
+			opacity: 0.25;
+			transform: translateY(0);
+		}
+		50% {
+			opacity: 1;
+			transform: translateY(-2px);
+		}
+	}
+	.mai-generating__bar {
+		display: block;
+		height: 3px;
+		border-radius: 2px;
+		background: linear-gradient(
+			90deg,
+			color-mix(in oklch, var(--mai-color-accent, #b45309) 12%, transparent),
+			color-mix(in oklch, var(--mai-color-accent, #b45309) 55%, transparent) 45%,
+			color-mix(in oklch, var(--mai-color-accent, #b45309) 12%, transparent)
+		);
+		background-size: 220% 100%;
+		animation: mai-generating-shimmer 1.6s linear infinite;
+	}
+	@keyframes mai-generating-shimmer {
+		0% {
+			background-position: 120% 0;
+		}
+		100% {
+			background-position: -120% 0;
+		}
+	}
+	.mai-generating__label {
+		font-size: 0.72rem;
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.mai-generating__dots i,
+		.mai-generating__bar {
+			animation: none;
+		}
+	}
+	.mai-terminal-notice {
+		margin: 0;
+		padding: 6px 12px 2px;
+		font-size: 0.75rem;
+		color: var(--mai-color-warning, #b45309);
+	}
+	/* ---- drafts + composer ----------------------------------------------- */
 	.mai-session-chat__drafts {
-		padding: 2px 8px;
+		padding: 2px 12px;
 		border-top: 1px dashed var(--mai-color-border, transparent);
 	}
 	.mai-session-chat__draft {
 		margin: 0;
 		font-size: 0.78rem;
-		color: var(--mai-color-muted, inherit);
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
@@ -777,6 +1115,6 @@
 	}
 	.mai-session-chat__state {
 		padding: 8px;
-		color: var(--mai-color-muted, inherit);
+		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
 	}
 </style>
