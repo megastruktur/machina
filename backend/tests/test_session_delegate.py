@@ -42,6 +42,7 @@ import ast
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import uuid
@@ -56,6 +57,7 @@ from mai.agents.session_delegate import (
     SESSION_DELEGATE_TOOL_NAME,
     aplan_session_delegation,
     adescendant_count,
+    bounded_child_summary_document,
     child_run_id_for,
     delegate_tool_json_schema,
     narrow_child_capabilities,
@@ -69,7 +71,12 @@ from mai.agents.session_runner import (
     _plan_delegation,
     parse_session_run_intent,
 )
-from mai.contracts.sessions import SessionContractError, SessionSourceKind
+from mai.contracts.sessions import (
+    MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    EntryKind,
+    SessionContractError,
+    SessionSourceKind,
+)
 from mai.jobs.engine import EngineClient
 from mai.policy.evaluate import ParentScope, execution_context_from_json
 from mai.session_store import acreate_run, acreate_session
@@ -99,10 +106,12 @@ from test_session_runner import (  # noqa: F401 - harness reuse
     _make_session,
     _read_session_entries,
     _read_session_runs,
+    _read_sessions_row,
     _write_data_root,
     _write_model_root,
     _write_policy_files,
 )
+from mai.session_store import aappend_entry
 
 BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DELEGATE_HANDLER_MODULE_NAME = "session_delegate_scenario_handlers"
@@ -1591,6 +1600,399 @@ def test_delegate_arguments_bounds_fail_closed() -> None:
     schema = delegate_tool_json_schema()
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(_delegate_args())
+
+
+# ---------------------------------------------------------------------------
+# 4b. bounded child summary document (pure): JSON preview-budget guarantee
+# ---------------------------------------------------------------------------
+
+
+def test_bounded_child_summary_truncates_within_json_preview_budget() -> None:
+    """A >5000-char Cyrillic summary with newlines and quotes serializes to
+    a JSON document that ALWAYS fits ``MAX_TOOL_OUTPUT_PREVIEW_CHARS`` and
+    parses back with all four keys — the runner's
+    ``preview[:MAX_TOOL_OUTPUT_PREVIEW_CHARS]`` slice can never cut the
+    document mid-string."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-child")
+    body = 'Резюме подзадачи: "шаг выполнен"\nИтог: "готово".\n' * 120
+    assert len(body) > 5000
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="succeeded",
+        summary_text=body,
+        error_code=None,
+    )
+    serialized = json.dumps(document, ensure_ascii=False)
+    assert len(serialized) <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    parsed = json.loads(serialized)
+    assert set(parsed) == {"child_run_id", "status", "summary", "error_code"}
+    assert parsed["child_run_id"] == str(child_run_id)
+    assert parsed["status"] == "succeeded"
+    assert parsed["error_code"] is None
+    # Explicit, honest truncation marker at the END of the kept prefix.
+    assert re.search(r"\[truncated: \d+ chars omitted\]$", parsed["summary"])
+    assert parsed["summary"].startswith("Резюме подзадачи")
+
+
+def test_bounded_child_summary_short_summary_is_untouched() -> None:
+    """A short summary passes through untruncated (no marker) and still
+    round-trips within the preview budget."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-short")
+    summary_text = "Готово: сервис перезапущен.\nПроверка пройдена."
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="failed",
+        summary_text=summary_text,
+        error_code="child_failed",
+    )
+    assert document["summary"] == summary_text
+    assert "truncated" not in document["summary"]
+    serialized = json.dumps(document, ensure_ascii=False)
+    assert len(serialized) <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    assert json.loads(serialized) == document
+
+
+def test_bounded_child_summary_without_summary_text_round_trips() -> None:
+    """A missing child summary yields an empty ``summary`` field and the
+    document still serializes within the preview budget."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-none")
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="timeout",
+        summary_text=None,
+        error_code="delegation_timeout",
+    )
+    assert document == {
+        "child_run_id": str(child_run_id),
+        "status": "timeout",
+        "summary": "",
+        "error_code": "delegation_timeout",
+    }
+    assert (
+        len(json.dumps(document, ensure_ascii=False))
+        <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4c. delegation lifecycle isolation (real worker scenarios; DWF-S2)
+# ---------------------------------------------------------------------------
+
+
+def _compose_delegation_scenario(
+    factory: async_sessionmaker[AsyncSession],
+    scenario: pathlib.Path,
+    composition,
+    *,
+    parent_script: list[dict],
+    child_script: list[dict],
+) -> str:
+    """Write the scenario files + session row; the test owns the worker."""
+    composition()
+    _write_env_file(scenario)
+    _write_policy_files(scenario, grants=[{READ_CAP: True, PRIV_CAP: True}])
+    _script(scenario, parent=parent_script, child=child_script)
+    return _run(_make_session(factory))
+
+
+def _enqueue_parent_run(
+    client: EngineClient,
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    session_id: str,
+    parent_run_id: str,
+) -> None:
+    """Insert the facade row and start the parent session workflow."""
+    _run(insert_run(parent_run_id, requested_grants=(READ_CAP, PRIV_CAP)))
+    client.enqueue_run(
+        parent_run_id,
+        SESSION_HANDLER_NAME,
+        _canonical(
+            _intent_document(
+                parent_run_id,
+                session_id,
+                allowed=(READ_CAP, PRIV_CAP),
+                client_request_id=str(uuid.uuid4()),
+            )
+        ),
+    )
+
+
+def test_parent_waiting_child_lifecycle_and_child_isolation(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """The parent records ``running -> waiting_child -> running ->
+    succeeded`` in chronological seq order (per-call source suffixes), the
+    child run's entries are ALL namespaced under ``child:``, and a settled
+    child never flips the shared ``sessions.status`` (the parent's final
+    model round is gated AFTER the child settled: the header still reads
+    ``running`` there — the pre-fix settlement wrote ``idle``)."""
+    # The PARENT's final text round is gated: the child has fully settled
+    # when the gate is observed, so the header check sees the exact
+    # isolation window.
+    parent_script = [
+        _delegate_call_entry(
+            call_id="del-1", allowed=[READ_CAP], timeout_seconds=120.0
+        ),
+        {"gate": "parent-final-gate", "text": "parent saw the child settle"},
+    ]
+    child_script = [
+        _tool_call_entry(name="fixture_read", marker="m1", call_id="c-child"),
+        {"text": "child finished the delegated task"},
+    ]
+    session_id = _compose_delegation_scenario(
+        factory,
+        scenario,
+        composition,
+        parent_script=parent_script,
+        child_script=child_script,
+    )
+    parent_run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _enqueue_parent_run(
+            client, agent_url, factory, insert_run, session_id, parent_run_id
+        )
+        # Parent round 0 + child rounds 0 and 1 ran; the parent's final
+        # (gated) round is in flight — the child is FULLY settled here.
+        _wait_until(
+            lambda: _journal_lines(scenario).count("model_call") >= 4,
+            RUN_TIMEOUT,
+            "parent's gated final round",
+        )
+
+        # (b) child settlement did NOT flip the shared session header.
+        header = _read_sessions_row(agent_url, session_id)
+        assert header is not None and header["status"] == "running"
+
+        entries = _read_session_entries(agent_url, session_id)
+        parent_uuid = uuid.UUID(parent_run_id)
+        expected_child = child_run_id_for(
+            uuid.UUID(session_id), parent_uuid, "del-1"
+        )
+
+        # (a) parent lifecycle transitions, in seq order, keyed by the
+        # delegation call id so the resumed running is a DISTINCT entry.
+        parent_states = [
+            (str(e["payload"]["state"]), str(e["durable_source_id"]))
+            for e in entries
+            if e["run_id"] == parent_uuid and e["kind"] == "run_state"
+        ]
+        assert parent_states == [
+            ("running", "run_state:running"),
+            ("waiting_child", "run_state:waiting_child:del-1"),
+            ("running", "run_state:running:del-1"),
+        ]
+
+        # (c-prefix) every child-run entry is namespaced under ``child:``.
+        child_sources = [
+            str(e["durable_source_id"])
+            for e in entries
+            if e["run_id"] == expected_child
+        ]
+        assert child_sources, "child run appended its own entries"
+        assert all(src.startswith("child:") for src in child_sources)
+
+        # The delegation card already carries the child's terminal truth
+        # (the child settled before the parent's gated final round).
+        delegation = next(
+            e
+            for e in entries
+            if e["run_id"] == parent_uuid and e["kind"] == "delegation"
+        )
+        assert delegation["payload"]["status"] == "succeeded"
+
+        # Release the parent: the run settles succeeded and the header
+        # goes idle THROUGH THE PARENT's own settlement.
+        (scenario / "gates" / "parent-final-gate").write_text(
+            "go", encoding="utf-8"
+        )
+        _await_terminal(client, parent_run_id, "succeeded", RUN_TIMEOUT, "parent")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    entries = _read_session_entries(agent_url, session_id)
+    parent_uuid = uuid.UUID(parent_run_id)
+    parent_states = [
+        (str(e["payload"]["state"]), str(e["durable_source_id"]))
+        for e in entries
+        if e["run_id"] == parent_uuid and e["kind"] == "run_state"
+    ]
+    assert parent_states == [
+        ("running", "run_state:running"),
+        ("waiting_child", "run_state:waiting_child:del-1"),
+        ("running", "run_state:running:del-1"),
+        ("succeeded", "run_state:succeeded"),
+    ]
+    expected_child = child_run_id_for(uuid.UUID(session_id), parent_uuid, "del-1")
+    runs = _read_session_runs(agent_url, session_id)
+    child_row = next(row for row in runs if row["run_id"] == expected_child)
+    assert child_row["state"] == "succeeded"
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "idle"
+    delegation = next(
+        e
+        for e in entries
+        if e["run_id"] == parent_uuid and e["kind"] == "delegation"
+    )
+    assert delegation["payload"]["status"] == "succeeded"
+    # Exactly-once child effect; the parent's own tool never ran.
+    lines = _journal_lines(scenario)
+    assert lines.count("begin:fixture.read:m1") == 1, lines
+    assert lines.count("effect:fixture.read:m1") == 1, lines
+    assert "begin:fixture.read:m2" not in lines
+
+
+def test_paused_delegation_run_marks_pending_group_unresolved(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """A delegation round that aborts at the safe boundary (pause drained
+    before the SECOND tool) never strands its assistant entry in
+    ``tool_group_state == 'pending'``: settlement marks it ``unresolved``."""
+    # The parent's SECOND tool response parks on the MODEL gate: the pause
+    # control is injected while that model round is in flight (the child
+    # has already settled), so it drains at the per-call safe boundary
+    # AFTER the pending assistant entry exists and BEFORE the second tool
+    # dispatches.
+    parent_script = [
+        _delegate_call_entry(
+            call_id="del-1", allowed=[READ_CAP], timeout_seconds=120.0
+        ),
+        {
+            "gate": "p2-gate",
+            "then": {
+                "tool_call": {
+                    "name": "fixture_read",
+                    "args": {"marker": "m2"},
+                    "id": "c-p2",
+                }
+            },
+        },
+        {"text": "parent done"},
+    ]
+    child_script = [
+        _tool_call_entry(name="fixture_read", marker="m1", call_id="c-child"),
+        {"text": "child finished the delegated task"},
+    ]
+    session_id = _compose_delegation_scenario(
+        factory,
+        scenario,
+        composition,
+        parent_script=parent_script,
+        child_script=child_script,
+    )
+    parent_run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _enqueue_parent_run(
+            client, agent_url, factory, insert_run, session_id, parent_run_id
+        )
+        # Parent round 0 (delegate) + both child rounds ran; the parent's
+        # gated second-round response is in flight (4 model calls total).
+        _wait_until(
+            lambda: _journal_lines(scenario).count("model_call") >= 4,
+            RUN_TIMEOUT,
+            "parent's gated second round",
+        )
+        # Pause now: it will drain at the boundary BEFORE the second tool.
+        _run(
+            aappend_entry(
+                factory,
+                session_id=uuid.UUID(session_id),
+                server_id=uuid.UUID(SERVER_ID),
+                kind=EntryKind.CONTROL,
+                payload={
+                    "action": "pause",
+                    "client_request_id": str(uuid.uuid4()),
+                    "target_run_id": parent_run_id,
+                },
+                run_id=uuid.UUID(parent_run_id),
+                durable_source_id=f"ctl-pause-{uuid.uuid4()}",
+            )
+        )
+        (scenario / "gates" / "p2-gate").write_text("go", encoding="utf-8")
+        # A pause boundary-stop lands the DOMAIN truth (facade/session/
+        # header cancelled); the engine classifies the stopped workflow
+        # ERROR (the reviewed pause semantics — the harness pause test
+        # asserts the same domain postconditions, never engine state).
+        _wait_until(
+            lambda: (
+                (_read_sessions_row(agent_url, session_id) or {}).get("status")
+                == "cancelled"
+            )
+            and any(
+                e["kind"] == "run_state"
+                and str(e["payload"]["state"]) == "cancelled"
+                for e in _read_session_entries(agent_url, session_id)
+                if e["run_id"] == uuid.UUID(parent_run_id)
+            ),
+            RUN_TIMEOUT,
+            "the paused delegation settlement",
+        )
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    lines = _journal_lines(scenario)
+    # The pause drained BEFORE the second tool ever dispatched.
+    assert "begin:fixture.read:m2" not in lines, lines
+    # The child itself settled honestly (its truth is in the parent log).
+    assert lines.count("effect:fixture.read:m1") == 1, lines
+
+    entries = _read_session_entries(agent_url, session_id)
+    parent_uuid = uuid.UUID(parent_run_id)
+    parent_states = [
+        str(e["payload"]["state"])
+        for e in entries
+        if e["run_id"] == parent_uuid and e["kind"] == "run_state"
+    ]
+    assert parent_states == [
+        "running",
+        "waiting_child",
+        "running",
+        "cancelled",
+    ]
+
+    assistants = [
+        e
+        for e in entries
+        if e["run_id"] == parent_uuid and e["kind"] == "assistant_message"
+    ]
+    group_states: dict[str, str] = {}
+    for e in assistants:
+        state = str(e["payload"]["tool_group_state"])
+        for call in e["payload"].get("tool_calls", []) or []:
+            group_states[str(call["call_id"])] = state
+    # NO stranded pending group: the aborted fixture_read round resolved
+    # honestly to ``unresolved`` at settlement.
+    assert group_states.get("c-p2") == "unresolved", group_states
+    assert all(
+        str(e["payload"]["tool_group_state"]) != "pending" for e in assistants
+    ), group_states
+
+    # The delegation card kept the child's truth; the run is cancelled.
+    delegation = next(
+        e for e in entries if e["run_id"] == parent_uuid and e["kind"] == "delegation"
+    )
+    assert delegation["payload"]["status"] == "succeeded"
+    header = _read_sessions_row(agent_url, session_id)
+    assert header is not None and header["status"] == "cancelled"
 
 
 # ---------------------------------------------------------------------------

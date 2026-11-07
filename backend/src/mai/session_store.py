@@ -1450,15 +1450,21 @@ async def arecord_run_state(
     state: SessionRunState | str,
     reason_code: str | None = None,
     detail: str | None = None,
+    source_suffix: str | None = None,
+    source_prefix: str = "",
 ) -> None:
     """Update the run state AND append its ``run_state`` entry atomically.
 
     One run-state authority: the browser never derives run state from a
     connection. The appended entry deduplicates through the stable
-    ``run_state:<state>`` source id, so a repeated call with the same state
-    does not duplicate the entry. An unknown ``run_id`` inside the scoped
-    session fails closed with the value-free not-found code (field
-    ``run_id``).
+    ``[<source_prefix>]run_state:<state>[:<source_suffix>]`` source id, so a
+    repeated call with the same state does not duplicate the entry, while a
+    per-transition ``source_suffix`` (e.g. the delegation call id) lets the
+    SAME state recur chronologically instead of deduplicating against an
+    earlier same-state entry. ``source_prefix`` namespaces child-run
+    entries (``child:``) so they can never collide with a parent run's
+    entry. An unknown ``run_id`` inside the scoped session fails closed
+    with the value-free not-found code (field ``run_id``).
     """
     validated_state = _validated_state(state)
     if reason_code is not None and (
@@ -1473,6 +1479,11 @@ async def arecord_run_state(
                 )
             ]
         )
+    durable_source_id = (
+        f"{source_prefix}{_RUN_STATE_SOURCE_PREFIX}{validated_state.value}"
+    )
+    if source_suffix is not None:
+        durable_source_id = f"{durable_source_id}:{source_suffix}"
     async with sessions() as session:
         async with session.begin():
             await _lock_session(
@@ -1511,7 +1522,7 @@ async def arecord_run_state(
                     reason_code=reason_code,
                     detail=detail,
                 ).model_dump(mode="json"),
-                durable_source_id=f"{_RUN_STATE_SOURCE_PREFIX}{validated_state.value}",
+                durable_source_id=durable_source_id,
             )
 
 

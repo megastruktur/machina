@@ -252,9 +252,48 @@
 	const childRunIds = $derived.by(() => {
 		const ids = new Set<string>();
 		for (const entry of entries) {
-			if (entry.payload.kind === 'delegation') {
-				const childRun = String(entry.payload.child_run_id ?? '');
+			const payload = entry.payload;
+			// (a) The delegation card names the child run.
+			if (payload.kind === 'delegation') {
+				const childRun = String(payload.child_run_id ?? '');
 				if (childRun !== '') ids.add(childRun);
+			}
+			// (b) The parent's settled `session_delegate` tool_result echoes
+			// the child run id inside the bounded summary document — this
+			// works even when `output_preview` was truncated at the preview
+			// budget (`child_run_id` is the document's FIRST key) and even
+			// when the delegation CARD sits on an older history page
+			// (`before_seq` byte-budget truncation).
+			if (
+				payload.kind === 'tool_result' &&
+				(payload.capability_id === 'session_delegate' ||
+					payload.tool_name === 'session_delegate')
+			) {
+				const echoed = /"child_run_id"\s*:\s*"([^"]+)"/.exec(
+					String(payload.output_preview ?? '')
+				);
+				if (echoed !== null) ids.add(echoed[1]);
+			}
+			// (c) The parent's `waiting_child` run_state names the child.
+			if (
+				payload.kind === 'run_state' &&
+				typeof payload.reason_code === 'string' &&
+				payload.reason_code.startsWith('child:')
+			) {
+				const named = payload.reason_code.slice('child:'.length).trim();
+				if (named !== '') ids.add(named);
+			}
+			// (d) The child's OWN entries namespace their durable source
+			// ids (`child:turn:…`, `child:round:…`) — the envelope run id
+			// is the delegated child run.
+			const source = entry.durable_source_id;
+			if (
+				typeof source === 'string' &&
+				source.startsWith('child:') &&
+				entry.run_id != null &&
+				String(entry.run_id) !== ''
+			) {
+				ids.add(String(entry.run_id));
 			}
 		}
 		return ids;
@@ -271,12 +310,25 @@
 	 * of the child's outcome.
 	 */
 	const visibleEntries = $derived.by(() => {
+		// The executed delegate tool_result folds away only while the
+		// delegation CARD is in the window: without the card the tool
+		// result is the only record of the child's outcome.
+		const hasDelegationCard = entries.some(
+			(entry) => entry.payload.kind === 'delegation'
+		);
 		const rows = entries.filter((entry) => {
 			if (entry.payload.kind === 'run_state') return false;
+			// Child-run entries namespace their durable source ids — they
+			// fold into the delegation card even when the card itself sits
+			// on an older history page.
+			const source = entry.durable_source_id;
+			if (typeof source === 'string' && source.startsWith('child:')) {
+				return false;
+			}
 			const runId = entry.run_id ?? null;
 			return runId === null || !childRunIds.has(String(runId));
 		});
-		if (childRunIds.size === 0) return rows;
+		if (!hasDelegationCard || childRunIds.size === 0) return rows;
 		return rows.filter((entry) => {
 			const payload = entry.payload;
 			return !(
@@ -301,12 +353,23 @@
 		'waiting_approval'
 	]);
 
-	/** The latest run-state entry's lifecycle value (server truth). */
+	/** The latest PARENT run-state entry's lifecycle value (server truth). */
 	const serverRunState = $derived.by<TurnRunState | null>(() => {
 		for (let i = entries.length - 1; i >= 0; i -= 1) {
 			const entry = entries[i];
 			const payload = entry.payload;
 			if (payload.kind === 'run_state') {
+				// A delegated CHILD settling never drives the parent surface:
+				// its `succeeded` transition folds into the delegation card
+				// and must not turn off the parent's "Running delegated
+				// child…" indicator while the parent is still active.
+				const source = entry.durable_source_id;
+				if (
+					childRunIds.has(String(entry.run_id ?? '')) ||
+					(typeof source === 'string' && source.startsWith('child:'))
+				) {
+					continue;
+				}
 				// The run identity lives on the ENTRY ENVELOPE (the payload
 				// carries only the transition state/reason).
 				return {
