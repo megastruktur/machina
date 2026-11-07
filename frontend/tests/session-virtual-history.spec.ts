@@ -152,7 +152,12 @@ function render() {
 	const committed = controller
 		? controller
 				.entries()
-				.map((e) => ({ seq: e.seq, run_id: e.run_id, payload: e.payload }))
+				.map((e) => ({
+					seq: e.seq,
+					run_id: e.run_id,
+					durable_source_id: e.durable_source_id,
+					payload: e.payload
+				}))
 		: [];
 	// S3 reconciliation: an optimistic entry disappears once the committed
 	// truth with the same seq arrives (the shell's controller merge does
@@ -566,6 +571,252 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		);
 		// The notice is compact: it adds NO transcript rows.
 		await expect(page.getByTestId('session-entry')).toHaveCount(2);
+	});
+
+	// DWF-S3: a child settling must NOT extinguish the parent's
+	// "Running delegated child…" indicator, and child entries namespace
+	// their durable source ids so they stay folded even when the
+	// delegation card sits on an OLDER history page.
+	test('child settlement keeps the parent waiting_child indicator until the parent settles', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		let wire: { send(payload: string): void } | null = null;
+		const PARENT_RUN = 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr';
+		const CHILD_RUN = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				wire = ws;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (
+					seq: number,
+					runId: string | null,
+					durableSourceId: string,
+					payload: Record<string, unknown>
+				) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: runId,
+								durable_source_id: durableSourceId,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				// The operator's own prompt (no run scope).
+				committed(1, null, 'turn:op-1', {
+					kind: 'user_message',
+					text: 'rotate the logs on alpha',
+					client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					source: 'api'
+				});
+				// The delegation card declares the child run id.
+				committed(2, null, 'delegation:del-1', {
+					kind: 'delegation',
+					child_run_id: CHILD_RUN,
+					child_session_id: null,
+					goal: 'collect the rotated log tails',
+					status: 'running',
+					allowed_capabilities: ['host.logs'],
+					result_summary: null,
+					error_code: null
+				});
+				// The parent WAITS on the child; the reason names it.
+				committed(3, PARENT_RUN, 'run_state:waiting_child:del-1', {
+					kind: 'run_state',
+					state: 'waiting_child',
+					reason_code: `child:${CHILD_RUN}`,
+					detail: null
+				});
+				// The child's own entries: child:-namespaced durable ids.
+				committed(4, CHILD_RUN, 'child:turn:bbbb', {
+					kind: 'user_message',
+					text: 'child: collect the rotated log tails',
+					client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+					source: 'runbook'
+				});
+				committed(5, CHILD_RUN, 'child:round:0', {
+					kind: 'assistant_message',
+					text: 'child: done — logs rotated',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				// THE CHILD SETTLES FIRST (its own run scope).
+				committed(6, CHILD_RUN, 'child:run_state:succeeded', {
+					kind: 'run_state',
+					state: 'succeeded',
+					reason_code: null,
+					detail: null
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		// Transcript rows: the operator prompt + the delegation card ONLY
+		// (child entries folded; run_state never a row).
+		await expect(page.getByTestId('session-entry')).toHaveCount(2);
+		await expect(page.getByTestId('entry-user-message')).toHaveCount(1);
+		await expect(
+			page.getByTestId('entry-user-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
+		await expect(
+			page.getByTestId('entry-assistant-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
+		// The CHILD's succeeded transition must NOT drive the parent
+		// surface: the indicator stays on the parent's waiting_child…
+		await expect(page.getByTestId('session-generating-indicator')).toBeVisible();
+		await expect(page.getByTestId('session-generating-indicator')).toHaveAttribute(
+			'data-run-state',
+			'waiting_child'
+		);
+		await expect(page.getByTestId('session-generating-indicator')).toContainText(
+			'Running delegated child…'
+		);
+		// …until the PARENT ITSELF settles succeeded: then it goes quiet.
+		wire!.send(
+			JSON.stringify({
+				type: 'committed',
+				stream_id: 's1',
+				entry: {
+					schema_version: 1,
+					entry_id: 'cccccccc-cccc-4ccc-8ccc-000000000007',
+					session_id: '11111111-1111-4111-8111-111111111111',
+					seq: 7,
+					run_id: PARENT_RUN,
+					durable_source_id: 'run_state:succeeded',
+					created_at: '2026-01-01T00:00:00Z',
+					payload: {
+						kind: 'run_state',
+						state: 'succeeded',
+						reason_code: null,
+						detail: null
+					}
+				}
+			})
+		);
+		await expect(page.getByTestId('session-generating-indicator')).toHaveCount(0);
+		await expect(page.getByTestId('session-terminal-notice')).toHaveCount(0);
+	});
+
+	test('child entries stay hidden when the delegation card is on an older page', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		const PARENT_RUN = 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr';
+		const CHILD_RUN = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (
+					seq: number,
+					runId: string | null,
+					durableSourceId: string,
+					payload: Record<string, unknown>
+				) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: runId,
+								durable_source_id: durableSourceId,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				// The loaded page STARTS AFTER the delegation card (the
+				// 64 KiB byte-budget put it on an older before_seq page): the
+				// parent's settled session_delegate tool_result carries the
+				// child identity inside its bounded summary document.
+				committed(
+					11,
+					PARENT_RUN,
+					'round:0:tool:del-1:delegation',
+					{
+						kind: 'tool_result',
+						call_id: 'del-1',
+						tool_name: 'session_delegate',
+						capability_id: 'session_delegate',
+						status: 'executed',
+						execution_status: 'succeeded',
+						domain_outcome: 'success',
+						effect_certainty: 'certain',
+						payload_hash: 'hash-del-1',
+						output_preview: JSON.stringify({
+							child_run_id: CHILD_RUN,
+							status: 'succeeded',
+							summary: 'child: logs rotated on alpha',
+							error_code: null
+						})
+					}
+				);
+				// The child's OWN entries leak into THIS page…
+				committed(12, CHILD_RUN, 'child:turn:cccc', {
+					kind: 'user_message',
+					text: 'child: collect the rotated log tails',
+					client_request_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+					source: 'runbook'
+				});
+				committed(13, CHILD_RUN, 'child:round:0', {
+					kind: 'assistant_message',
+					text: 'child: done — logs rotated',
+					model_profile: 'fast',
+					tool_group_state: 'complete'
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		// No delegation card in the window: the executed tool_result STAYS
+		// (it is the only record of the child's outcome here).
+		await expect(page.getByTestId('session-entry')).toHaveCount(1);
+		await expect(page.getByTestId('entry-tool-result')).toHaveCount(1);
+		await expect(page.getByTestId('entry-tool-result')).toContainText(
+			'child: logs rotated on alpha'
+		);
+		// …while the child's prompt never looks like the operator's
+		// message and the child's answer is not duplicated into the
+		// parent stream (hidden via the echoed child_run_id AND their
+		// child:-prefixed durable source ids).
+		await expect(page.getByTestId('entry-user-message')).toHaveCount(0);
+		await expect(
+			page.getByTestId('entry-user-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
+		await expect(
+			page.getByTestId('entry-assistant-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
 	});
 
 	test('a resolved submit surfaces the user message and indicator immediately', async ({
