@@ -442,7 +442,7 @@ export type Provider = string;
  */
 export type ArtifactKind = "summary" | "signature" | "opaque_ref";
 /**
- * Bounded artifact payload or reference token
+ * Bounded artifact payload or reference token; prose with tab/newline/carriage-return, never control characters
  */
 export type Content = string;
 /**

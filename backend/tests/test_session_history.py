@@ -77,6 +77,7 @@ from mai.contracts.sessions import (
     ControlActionKind,
     ControlEntry,
     EntryKind,
+    MAX_SUMMARY_TEXT_CHARS,
     ProviderReasoningArtifact,
     SessionContractError,
     SessionEntryView,
@@ -202,7 +203,7 @@ async def test_cross_run_continuation_through_real_agent_and_store(
     )
     sid = session_row.session_id
     run_1 = uuid.UUID(int=0x101)
-    run_2 = uuid.UUID(int=0x102)
+    uuid.UUID(int=0x102)
 
     run1_model = _ScriptedModel(
         [
@@ -265,7 +266,7 @@ async def test_cross_run_continuation_through_real_agent_and_store(
 
     run2_model = _ScriptedModel([_response(TextPart("continued happily"))])
     agent_2 = run2_model.agent()
-    with capture_run_messages() as run2_messages:
+    with capture_run_messages():
         await agent_2.run(
             "and now summarize", message_history=list(history.messages)
         )
@@ -511,6 +512,60 @@ async def test_thinking_part_capture_and_compat_rehydration() -> None:
     assert payload.provider_artifacts[0].provider == "anthropic"
 
 
+def test_thinking_capture_is_summary_bounded_and_control_sanitized() -> None:
+    """S2: capture no longer truncates thinking summaries at the old
+    128-char identity bound (the summary contract bounds them), strips the
+    control characters the durable contract rejects BEFORE the bound, and
+    slices anything past the summary bound with an honest hard cut."""
+    long_summary = "reasoning step; " * 40  # 640 chars > 128
+    ts = _EPOCH_TEST
+    drafts = extract_entries_from_run_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content=f"pre\x00{long_summary}\x07",
+                        provider_name="anthropic",
+                    ),
+                    TextPart("public answer"),
+                ],
+                timestamp=ts,
+                usage=RequestUsage(),
+            )
+        ],
+        session_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        model_profile="claude-sonnet",
+        provider="anthropic",
+    )
+    artifact = drafts[0].payload.provider_artifacts[0]
+    assert artifact.artifact_kind == "summary"
+    # Control characters stripped, the full summary text kept (no 128 cut).
+    assert artifact.content == f"pre{long_summary}"
+    assert len(artifact.content) > 128
+    # Past the summary bound the capture slices (the bound itself is the
+    # summary contract, not the identity bound).
+    huge = "y" * (MAX_SUMMARY_TEXT_CHARS + 500)
+    drafts_huge = extract_entries_from_run_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content=huge, provider_name="anthropic"),
+                    TextPart("answer"),
+                ],
+                timestamp=ts,
+                usage=RequestUsage(),
+            )
+        ],
+        session_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        model_profile="claude-sonnet",
+        provider="anthropic",
+    )
+    huge_artifact = drafts_huge[0].payload.provider_artifacts[0]
+    assert len(huge_artifact.content) == MAX_SUMMARY_TEXT_CHARS
+
+
 # ---------------------------------------------------------------------------
 # 3. crash / pending groups and orphan results (R01 O1)
 # ---------------------------------------------------------------------------
@@ -539,7 +594,7 @@ async def test_pending_group_and_orphan_never_poison_native_replay(
     sid = session_row.session_id
     run_id = uuid.UUID(int=0x401)
 
-    user = await apersist_run_exchange(
+    await apersist_run_exchange(
         factory,
         new_messages=[
             ModelRequest(
@@ -560,7 +615,7 @@ async def test_pending_group_and_orphan_never_poison_native_replay(
     )
     # Crash window: the assistant called TWO tools, only ONE result landed
     # (the worker crashed before the second dispatch completed).
-    assistant = await apersist_run_exchange(
+    await apersist_run_exchange(
         factory,
         new_messages=[
             _response(
@@ -584,7 +639,7 @@ async def test_pending_group_and_orphan_never_poison_native_replay(
         provider=PROVIDER,
         durable_prefix="run:a",
     )
-    one_result = await apersist_run_exchange(
+    await apersist_run_exchange(
         factory,
         new_messages=[
             ModelRequest(
@@ -617,7 +672,7 @@ async def test_pending_group_and_orphan_never_poison_native_replay(
         durable_prefix="run:r",
     )
     # A waiting-approval window: the assistant text only, calls parked.
-    approval_parked = await apersist_run_exchange(
+    await apersist_run_exchange(
         factory,
         new_messages=[
             _response(

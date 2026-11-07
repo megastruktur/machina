@@ -51,13 +51,12 @@ from pydantic_ai.tools import Tool as PydanticTool
 from sqlalchemy import text as sql_text
 
 from mai.agents.output_safety import project_text, redact_text
-from mai.agents.budgets import BudgetLedger, check_fanout, check_nesting
+from mai.agents.budgets import check_fanout, check_nesting
 from mai.contracts.sessions import (
     MAX_ALLOWED_CAPABILITIES,
     MAX_CONTEXT_REFS,
     MAX_DELEGATION_TIMEOUT_SECONDS,
     MAX_DELEGATION_TOOL_CALLS,
-    MAX_DELEGATION_ROUNDS,
     MAX_SUMMARY_TEXT_CHARS,
     DelegationSpec,
     EntryKind,
@@ -65,7 +64,6 @@ from mai.contracts.sessions import (
     SessionErrorCode,
     SessionFieldError,
     SessionRunState,
-    ToolResultEntry,
 )
 from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 
@@ -699,6 +697,8 @@ async def aupdate_entry_payload_by_source(
     payload: dict[str, object],
 ) -> bool:
     """Update one keyed session entry's payload in place (idempotent)."""
+    from mai.session_store import anotify_entry_updated
+
     async with sessions() as session:
         async with session.begin():
             updated = (
@@ -712,6 +712,7 @@ async def aupdate_entry_payload_by_source(
                           AND s.server_id = :server_id
                           AND e.session_id = :sid
                           AND e.durable_source_id = :src
+                        RETURNING e.seq
                         """
                     ),
                     {
@@ -721,8 +722,17 @@ async def aupdate_entry_payload_by_source(
                         "src": durable_source_id,
                     },
                 )
-            ).rowcount
-            return bool(updated and updated > 0)
+            ).mappings().first()
+            if updated is None:
+                return False
+            # Transactional in-place-update wakeup (S1): the NOTIFY is
+            # held until COMMIT, so an at-head channel connection re-reads
+            # the updated row only after it is durably committed (e.g.
+            # delegation completion).
+            await anotify_entry_updated(
+                session, session_id=session_id, seq=int(updated["seq"])
+            )
+            return True
 
 
 def build_child_intent_document(

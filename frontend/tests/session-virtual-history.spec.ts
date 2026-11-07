@@ -105,8 +105,10 @@ import ${JSON.stringify(TOKENS)};
 
 const state = {
 	entries: [],
+	optimisticEntries: [],
 	drafts: [],
 	channelState: 'closed',
+	optimisticRunState: null,
 	submitLog: []
 };
 window.__maiVirtual = state;
@@ -145,7 +147,22 @@ const panelContext = {
 let controller = null;
 let app = null;
 function render() {
-	state.entries = controller ? controller.entries().map((e) => ({ seq: e.seq, payload: e.payload })) : [];
+	const committed = controller
+		? controller
+				.entries()
+				.map((e) => ({ seq: e.seq, run_id: e.run_id, payload: e.payload }))
+		: [];
+	// S3 reconciliation: an optimistic entry disappears once the committed
+	// truth with the same seq arrives (the shell's controller merge does
+	// this via the seq/entry_id dedup).
+	const knownSeqs = new Set(committed.map((e) => String(e.seq)));
+	const pending = state.optimisticEntries.filter(
+		(e) => !knownSeqs.has(String(e.seq))
+	);
+	state.entries = [...committed, ...pending];
+	if (committed.some((e) => e.payload.kind === 'run_state')) {
+		state.optimisticRunState = null;
+	}
 	state.drafts = controller ? controller.streamDrafts().map((d) => ({ stream_id: d.stream_id, text: d.text })) : [];
 	state.channelState = controller ? controller.connectionState() : 'closed';
 	if (app !== null) unmount(app);
@@ -158,7 +175,19 @@ function render() {
 			drafts: state.drafts,
 			channelState: state.channelState,
 			loadingOlder: false,
-			hasOlder: false
+			hasOlder: false,
+			optimisticRunState: state.optimisticRunState,
+			onturnsubmitted: (entry, runState) => {
+				// The shell's S3 optimistic merge, in miniature: the resolved
+				// submit lands in the visible cache immediately and drives
+				// the generating indicator until server truth arrives.
+				state.optimisticEntries.push({
+					seq: entry.seq,
+					payload: entry.payload
+				});
+				state.optimisticRunState = runState;
+				render();
+			}
 		}
 	});
 }
@@ -379,6 +408,250 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		await expect(page.getByTestId('session-stream-draft')).toContainText('volatile only');
 		// …and the committed assistant log stays EMPTY (no phantom entry).
 		await expect(page.getByTestId('entry-assistant-message')).toHaveCount(0);
+		// S3: the in-flight stream drives the live generating indicator.
+		await expect(page.getByTestId('session-generating-indicator')).toBeVisible();
+	});
+
+	// ---------------------------------------------------------------------------
+	// S3: run_state + delegated child-run entries never become chat rows
+	// ---------------------------------------------------------------------------
+
+	test('run_state drives the indicator; delegated child runs fold into the card', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		let wire: { send(payload: string): void } | null = null;
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				wire = ws;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (
+					seq: number,
+					runId: string | null,
+					payload: Record<string, unknown>
+				) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: runId,
+								durable_source_id: `src-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				// The operator's own prompt (no run scope).
+				committed(1, null, {
+					kind: 'user_message',
+					text: 'rotate the logs on alpha',
+					client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					source: 'api'
+				});
+				// The delegation card declares the child run id.
+				committed(2, null, {
+					kind: 'delegation',
+					child_run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					child_session_id: null,
+					goal: 'collect the rotated log tails',
+					status: 'succeeded',
+					allowed_capabilities: ['host.logs'],
+					result_summary: 'logs rotated',
+					error_code: null
+				});
+				// run_state: lifecycle fact, never a transcript row.
+				committed(3, 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr', {
+					kind: 'run_state',
+					state: 'running',
+					reason_code: null,
+					detail: null
+				});
+				// The delegated CHILD's own entries (its prompt + answer) —
+				// they fold into the delegation card, never the top level.
+				committed(
+					4,
+					'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					{
+						kind: 'user_message',
+						text: 'child: collect the rotated log tails',
+						client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+						source: 'runbook'
+					}
+				);
+				committed(
+					5,
+					'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					{
+						kind: 'assistant_message',
+						text: 'child: done — logs rotated',
+						model_profile: 'fast',
+						tool_group_state: 'none'
+					}
+				);
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+		// Exactly TWO transcript rows: the operator prompt + the delegation.
+		await expect(page.getByTestId('session-entry')).toHaveCount(2);
+		await expect(page.getByTestId('entry-user-message')).toHaveCount(1);
+		await expect(page.getByTestId('entry-user-message')).toContainText(
+			'rotate the logs on alpha'
+		);
+		// run_state entries are NOT transcript rows…
+		await expect(page.getByTestId('entry-run-state')).toHaveCount(0);
+		// …they drive the live generating indicator instead.
+		await expect(page.getByTestId('session-generating-indicator')).toBeVisible();
+		await expect(page.getByTestId('session-generating-indicator')).toHaveAttribute(
+			'data-run-state',
+			'running'
+		);
+		// The delegated child's prompt never looks like a user message and
+		// the child's answer is not duplicated into the parent stream.
+		await expect(
+			page.getByTestId('entry-user-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
+		await expect(
+			page.getByTestId('entry-assistant-message').filter({ hasText: 'child:' })
+		).toHaveCount(0);
+		// The delegation card carries the child run identity (open — no run
+		// scope on the fixture row).
+		await expect(page.getByTestId('entry-delegation')).toContainText(
+			'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+		);
+		// Terminal truth replaces the indicator with the compact inline
+		// notice — but ONLY for failed/cancelled/outcome_unknown/
+		// waiting_approval: a healthy succeeded run just goes quiet.
+		const runStateEntry = (seq: number, state: string) =>
+			wire!.send(
+				JSON.stringify({
+					type: 'committed',
+					stream_id: 's1',
+					entry: {
+						schema_version: 1,
+						entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						seq,
+						run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+						durable_source_id: `run-state-${state}`,
+						created_at: '2026-01-01T00:00:00Z',
+						payload: { kind: 'run_state', state, reason_code: null, detail: null }
+					}
+				})
+			);
+		runStateEntry(6, 'succeeded');
+		await expect(page.getByTestId('session-generating-indicator')).toHaveCount(0);
+		await expect(page.getByTestId('session-terminal-notice')).toHaveCount(0);
+		runStateEntry(7, 'failed');
+		await expect(page.getByTestId('session-terminal-notice')).toBeVisible();
+		await expect(page.getByTestId('session-terminal-notice')).toHaveAttribute(
+			'data-run-state',
+			'failed'
+		);
+		// The notice is compact: it adds NO transcript rows.
+		await expect(page.getByTestId('session-entry')).toHaveCount(2);
+	});
+
+	test('a resolved submit surfaces the user message and indicator immediately', async ({
+		page
+	}) => {
+		await gotoHarness(page);
+		let wire: { send(payload: string): void } | null = null;
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				wire = ws;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+		// Empty start: no rows, no indicator.
+		await expect(page.getByTestId('session-entry')).toHaveCount(0);
+		await expect(page.getByTestId('session-generating-indicator')).toHaveCount(0);
+
+		// Enter admits the turn; the mocked API resolves instantly.
+		await page.getByTestId('session-composer-input').fill('cap the database now');
+		await page.getByTestId('session-composer-submit').click();
+
+		// S3 optimistic feedback: the user's message AND the generating
+		// indicator appear immediately (no waiting for the channel frame).
+		await expect(page.getByTestId('entry-user-message')).toContainText(
+			'cap the database now'
+		);
+		await expect(page.getByTestId('session-generating-indicator')).toBeVisible();
+		await expect(page.getByTestId('session-generating-indicator')).toHaveAttribute(
+			'data-run-state',
+			'queued'
+		);
+
+		// Committed truth reconciles the optimistic copy (same seq) and the
+		// server run_state takes over the indicator.
+		wire!.send(
+			JSON.stringify({
+				type: 'committed',
+				stream_id: 's1',
+				entry: {
+					schema_version: 1,
+					entry_id: 'cccccccc-cccc-4ccc-8ccc-000000000001',
+					session_id: '11111111-1111-4111-8111-111111111111',
+					seq: 1,
+					run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+					durable_source_id: 'turn-optimistic',
+					created_at: '2026-01-01T00:00:00Z',
+					payload: {
+						kind: 'user_message',
+						text: 'cap the database now',
+						client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+						source: 'interactive'
+					}
+				}
+			})
+		);
+		wire!.send(
+			JSON.stringify({
+				type: 'committed',
+				stream_id: 's1',
+				entry: {
+					schema_version: 1,
+					entry_id: 'cccccccc-cccc-4ccc-8ccc-000000000002',
+					session_id: '11111111-1111-4111-8111-111111111111',
+					seq: 2,
+					run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+					durable_source_id: 'run-state-running',
+					created_at: '2026-01-01T00:00:01Z',
+					payload: { kind: 'run_state', state: 'running', reason_code: null, detail: null }
+				}
+			})
+		);
+		await expect(page.getByTestId('session-entry')).toHaveCount(1);
+		await expect(page.getByTestId('entry-user-message')).toHaveCount(1);
+		await expect(page.getByTestId('session-generating-indicator')).toHaveAttribute(
+			'data-run-state',
+			'running'
+		);
 	});
 });
 
@@ -391,6 +664,12 @@ test.describe('live backend (gated)', () => {
 		process.env.MAI_E2E_SESSION_BACKEND !== '1',
 		'requires MAI_E2E_SESSION_BACKEND=1 and the disposable Postgres fixture'
 	);
+	// Live-shell wiring: Playwright starts the config webServer on
+	// 127.0.0.1:4173 (baseURL). The runner exports MAI_PREVIEW_API_PROXY so
+	// THAT preview proxies same-origin /api (REST + WebSocket) to the
+	// uvicorn spawned in beforeAll below — the shell boots LIVE on :4173.
+	// Any preview already squatting on :4173 was started WITHOUT the proxy
+	// env and would serve the offline fixture shell instead.
 
 	let uvicorn: { kill(): void } | null = null;
 	let preview: { kill(): void } | null = null;

@@ -61,6 +61,8 @@ __all__ = [
     "MAX_ENTRY_TEXT_CHARS",
     "MAX_PAGE_BYTES",
     "MAX_TOOL_OUTPUT_PREVIEW_CHARS",
+    "SAFE_TEXT_PATTERN",
+    "UNSAFE_TEXT_CLASS",
     "HISTORY_PAGE_MAX_ENTRIES",
     "INITIAL_TAIL_MAX_ENTRIES",
     "SESSION_LIST_DEFAULT_LIMIT",
@@ -167,6 +169,14 @@ MAX_DETAIL_CHARS: Final[int] = 500
 
 #: Compaction summaries, delegation goals and bounded child result summaries.
 MAX_SUMMARY_TEXT_CHARS: Final[int] = 4_000
+
+#: Safe durable text: printable Unicode plus tab/newline/carriage-return.
+#: Other C0/C1 control characters are rejected at the contract boundary —
+#: summaries, thinking content and notes are prose, never binary or
+#: terminal noise (the pattern is written negated-and-anchored so any
+#: regex binding — ``search`` or ``fullmatch`` — enforces the same set).
+UNSAFE_TEXT_CLASS: Final[str] = r"\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f"
+SAFE_TEXT_PATTERN: Final[str] = f"^[^{UNSAFE_TEXT_CLASS}]*$"
 
 #: Session titles.
 MAX_TITLE_CHARS: Final[int] = 240
@@ -445,8 +455,16 @@ class ProviderReasoningArtifact(BaseModel):
         description="Artifact class: bounded summary, provider signature or "
         "opaque reference token",
     )
-    content: IdentityStr = Field(
-        description="Bounded artifact payload or reference token",
+    content: Annotated[
+        str,
+        StringConstraints(
+            min_length=1,
+            max_length=MAX_SUMMARY_TEXT_CHARS,
+            pattern=SAFE_TEXT_PATTERN,
+        ),
+    ] = Field(
+        description="Bounded artifact payload or reference token; prose with "
+        "tab/newline/carriage-return, never control characters",
     )
     redacted: bool = Field(
         default=False,

@@ -255,6 +255,7 @@
 		type SessionStreamDraft
 	} from '../chat/session_client.js';
 	import type { ChannelEntry } from '../chat/session_client.js';
+	import type { SessionRunState } from '$lib/api/client.js';
 	import { DOCS_PANEL_KIND, docsServices } from './entries/07-web-docs.js';
 	import { EXECUTION_PANEL_KIND, executionServices } from './entries/05-web-execution.js';
 	import { JOBS_PANEL_KIND, browserRunEventStream, jobsServices, type JobsApi } from './entries/05-web-jobs.js';
@@ -874,8 +875,6 @@
 	let activeSessionChannel = $state<SessionChannelController | null>(null);
 	/** Honest connection state mirror for the dock surface. */
 	let channelState = $state<SessionChannelConnectionState>('closed');
-	/** Committed entries delivered by the channel (bounded mirror). */
-	let channelEntries = $state<readonly number[]>([]);
 	/**
 	 * The visible session's bounded entry cache (D08): the channel mirror
 	 * (≤400, controller-evicted) MERGED with REST before_seq older pages —
@@ -884,6 +883,40 @@
 	let sessionEntries = $state<ChannelEntry[]>([]);
 	/** The visible session's volatile streaming drafts (channel mirror). */
 	let sessionDrafts = $state<SessionStreamDraft[]>([]);
+	/**
+	 * The optimistic run state of the JUST-submitted turn (S3): between
+	 * the submit resolution and the first committed ``run_state`` entry,
+	 * the generating indicator would otherwise have nothing to show. The
+	 * derived server truth always wins once a run_state entry lands.
+	 */
+	let optimisticRunState = $state<{
+		run_id: string;
+		state: SessionRunState;
+	} | null>(null);
+
+	/**
+	 * S3 optimistic turn feedback: the panel calls this right after
+	 * ``submitAgentSessionTurn`` resolves with the admitted turn's
+	 * ``user_message`` entry + the response's run state, so the user's
+	 * message and the generating indicator appear immediately on Enter.
+	 * The entry merges into the SAME bounded controller cache the channel
+	 * feeds (the committed frame later reconciles by seq/entry_id).
+	 */
+	function handleTurnSubmitted(
+		entry: ChannelEntry,
+		runState: { run_id: string; state: SessionRunState }
+	): void {
+		if (!live) return;
+		if (activeSessionChannel !== null) {
+			activeSessionChannel.mergeExternalEntries([entry]);
+		} else {
+			const merged = [...sessionEntries, entry]
+				.sort((one, two) => Number(one.seq) - Number(two.seq))
+				.slice(-400);
+			sessionEntries = merged;
+		}
+		optimisticRunState = runState;
+	}
 	/** Single-flight guard + exhaustion flag for older-page loads. */
 	let loadingOlderEntries = $state(false);
 	let olderEntriesExhausted = $state(false);
@@ -899,7 +932,7 @@
 		activeSessionId = sessionId;
 		activeSessionServerId = serverId;
 		channelState = 'connecting';
-		channelEntries = [];
+		optimisticRunState = null;
 		// The refresh-continuity pointer (D08, R2-3): ONLY the opaque
 		// session/server ids — never transcript content.
 		try {
@@ -916,10 +949,14 @@
 			handlers: {
 				onConnectionState: (next) => (channelState = next),
 				onCommittedEntriesChanged: (entries) => {
-					channelEntries = entries.map((entry) => entry.seq);
 					// The bounded cache mirror (D08): the controller already
 					// deduped + evicted to ≤400.
 					sessionEntries = [...entries];
+					// S3: committed server truth replaces the optimistic
+					// mirror the moment any run_state entry lands.
+					if (entries.some((entry) => entry.payload.kind === 'run_state')) {
+						optimisticRunState = null;
+					}
 				},
 				onStreamDraftChanged: () => {
 					sessionDrafts = [...(activeSessionChannel?.streamDrafts() ?? [])];
@@ -938,9 +975,9 @@
 		activeSessionId = null;
 		activeSessionServerId = null;
 		channelState = 'closed';
-		channelEntries = [];
 		sessionEntries = [];
 		sessionDrafts = [];
+		optimisticRunState = null;
 		olderEntriesExhausted = false;
 		try {
 			sessionStorage.removeItem(SESSION_POINTER_KEY);
@@ -1482,23 +1519,6 @@
 				{dockCollapsed ? 'Chat dock ▲' : 'Chat dock ▼'}
 			</button>
 		</div>
-		{#if live}
-			<div
-				class="mai-desktop-shell__dock-channel"
-				data-testid="session-channel-state"
-				data-channel-state={channelState}
-				data-active-session={activeSessionId ?? ''}
-			>
-				{#if activeSessionId !== null}
-					<span>session {activeSessionId.slice(0, 8)}… · channel {channelState}</span>
-					{#if channelEntries.length > 0}
-						<span> · committed through seq {channelEntries[channelEntries.length - 1]}</span>
-					{/if}
-				{:else}
-					<span>no session open</span>
-				{/if}
-			</div>
-		{/if}
 		<div class="mai-desktop-shell__dock-body" id="mai-bottom-chat-dock-body">
 			<!-- D09: the session-first virtualized surface is THE dock; the
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
@@ -1513,9 +1533,11 @@
 				channelState={channelState}
 				loadingOlder={loadingOlderEntries}
 				hasOlder={sessionHasOlder}
+				optimisticRunState={optimisticRunState}
 				onloadolder={() => void loadOlderEntries()}
 				onsessionopened={(sessionId, serverId) =>
 					openActiveSession(sessionId, serverId)}
+				onturnsubmitted={handleTurnSubmitted}
 			/>
 		</div>
 	</section>
@@ -1654,15 +1676,6 @@
 	   lower stacking level (`z-index: 5`) than `.mai-desktop-shell__desktop`
 	   (`z-index: 20`) so opened workspace windows always stack in front of
 	   the chat dock instead of being hidden behind it. */
-	.mai-desktop-shell__dock-channel {
-		display: flex;
-		gap: 6px;
-		padding: 2px var(--mai-space-2);
-		font-size: 0.72rem;
-		color: var(--mai-color-muted, inherit);
-		border-bottom: var(--mai-border-width) solid var(--mai-color-border, transparent);
-	}
-
 	.mai-desktop-shell__dock {
 		position: absolute;
 		bottom: var(--mai-space-2);

@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -61,9 +61,9 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.budgets import BudgetError
+from mai.agents.output_safety import project_text
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
-    SESSION_DELEGATE_CAPABILITY_ID,
     SESSION_DELEGATE_TOOL_NAME,
     aplan_session_delegation,
     aupdate_entry_payload_by_source,
@@ -71,6 +71,7 @@ from mai.agents.session_delegate import (
     build_deferring_delegate_tool,
 )
 from mai.agents.session_history import (
+    _bound_with_marker,
     abuild_session_model_history,
     apersist_run_exchange,
     assert_tool_result_honesty,
@@ -79,6 +80,8 @@ from mai.agents.tools import BridgeError, CapabilityToolBridge, ToolResult
 from mai.contracts.sessions import (
     MAX_DETAIL_CHARS,
     MAX_ENTRY_TEXT_CHARS,
+    MAX_ERROR_DETAIL_CHARS,
+    MAX_TOOL_OUTPUT_PREVIEW_CHARS,
     AssistantMessageEntry,
     ControlActionKind,
     DocumentAttachRef,
@@ -92,7 +95,6 @@ from mai.contracts.sessions import (
     SessionRunState,
     SessionSourceKind,
     SessionStatus,
-    ToolCallItem,
     ToolResultEntry,
     assert_session_not_run,
 )
@@ -753,6 +755,8 @@ async def amark_tool_group_state(
                 )
             ]
         )
+    from mai.session_store import anotify_entry_updated
+
     async with sessions() as session:
         async with session.begin():
             updated = (
@@ -771,6 +775,7 @@ async def amark_tool_group_state(
                           AND e.session_id = :sid
                           AND e.entry_id = :eid
                           AND e.kind = 'assistant_message'
+                        RETURNING e.seq
                         """
                     ),
                     {
@@ -780,8 +785,16 @@ async def amark_tool_group_state(
                         "eid": entry_id,
                     },
                 )
-            ).rowcount
-            return bool(updated and updated > 0)
+            ).mappings().first()
+            if updated is None:
+                return False
+            # Transactional in-place-update wakeup (S1): the NOTIFY is
+            # held until COMMIT, so an at-head channel connection re-reads
+            # the updated row only after it is durably committed.
+            await anotify_entry_updated(
+                session, session_id=session_id, seq=int(updated["seq"])
+            )
+            return True
 
 
 async def aupdate_tool_result_payload(
@@ -801,6 +814,8 @@ async def aupdate_tool_result_payload(
     result per call (a second entry would poison native replay), and the
     durable log never claims an effect that stayed unproven.
     """
+    from mai.session_store import anotify_entry_updated
+
     async with sessions() as session:
         async with session.begin():
             updated = (
@@ -816,6 +831,7 @@ async def aupdate_tool_result_payload(
                           AND e.run_id = :rid
                           AND e.durable_source_id = :src
                           AND e.kind = 'tool_result'
+                        RETURNING e.seq
                         """
                     ),
                     {
@@ -826,8 +842,16 @@ async def aupdate_tool_result_payload(
                         "src": durable_source_id,
                     },
                 )
-            ).rowcount
-            return bool(updated and updated > 0)
+            ).mappings().first()
+            if updated is None:
+                return False
+            # Transactional in-place-update wakeup (S1): the NOTIFY is
+            # held until COMMIT, so an at-head channel connection re-reads
+            # the reconciled row only after it is durably committed.
+            await anotify_entry_updated(
+                session, session_id=session_id, seq=int(updated["seq"])
+            )
+            return True
 
 
 async def _drain_controls(
@@ -1450,6 +1474,24 @@ def _entry_from_bridge_outcome(outcome: Any, call_id: str) -> ToolResultEntry:
         execution_status = ExecutionStatus.FAILED
         effect_certainty = EffectCertainty.CERTAIN
         domain = DomainOutcome.FAILURE
+    # Redact FIRST, then bound WITH the explicit truncation marker (S2
+    # criterion 1): a bridge receipt may carry the dispatcher's full output
+    # budget (`host.logs` with output_budget=4096 exceeds the 4,000-char
+    # preview bound), and an unbounded preview crashed the whole run with a
+    # Pydantic ValidationError. error_detail is value-free but still
+    # bounded to its own contract cap; emptiness keeps the field ``None``.
+    output_preview: str | None = None
+    if tool_result.output_text:
+        safe_output = project_text(tool_result.output_text)
+        output_preview = _bound_with_marker(
+            safe_output, MAX_TOOL_OUTPUT_PREVIEW_CHARS
+        )[0]
+    error_detail: str | None = None
+    if tool_result.error_detail:
+        safe_detail = project_text(tool_result.error_detail)
+        error_detail = _bound_with_marker(
+            safe_detail, MAX_ERROR_DETAIL_CHARS
+        )[0]
     entry = ToolResultEntry(
         kind=EntryKind.TOOL_RESULT,
         call_id=call_id,
@@ -1460,9 +1502,9 @@ def _entry_from_bridge_outcome(outcome: Any, call_id: str) -> ToolResultEntry:
         domain_outcome=domain,
         effect_certainty=effect_certainty,
         payload_hash=tool_result.payload_hash,
-        output_preview=tool_result.output_text,
+        output_preview=output_preview,
         error_code=tool_result.error_code,
-        error_detail=tool_result.error_detail,
+        error_detail=error_detail,
         approval_id=tool_result.approval_id,
     )
     assert_tool_result_honesty(entry)
@@ -1716,7 +1758,9 @@ async def _settle_unknown_session(
 @DBOS.step(name="agents.session.read_step")
 @_safe_step_errors
 def _session_read_step(payload_json: str, run_id: str, call_json: str) -> str:
-    intent = parse_session_run_intent(payload_json)
+    # The parse IS the validation: fail closed on a malformed payload
+    # before the read executes (the parsed intent itself is unused here).
+    parse_session_run_intent(payload_json)
     executor = _resolve_session_run()
     call = json.loads(call_json)
     row = executor.run(executor.steps.aread_step(run_id, int(call["seq"])))
@@ -2435,8 +2479,6 @@ def _session_child_settled(
         ),
     )
     preview = json.dumps(summary_document)
-    from mai.contracts.sessions import MAX_TOOL_OUTPUT_PREVIEW_CHARS
-
     if durable_state == "succeeded":
         status, execution, certainty, code = (
             "executed",

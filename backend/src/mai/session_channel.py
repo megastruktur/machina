@@ -37,7 +37,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from mai.contracts.session_channel import (
@@ -70,8 +69,12 @@ COARSE_TICK_SECONDS: Final[float] = 5.0
 #: NOTIFY reconnect backoff cap (seconds; 0.5 → 1 → 2 → 4 … capped here).
 NOTIFY_RECONNECT_MAX_SECONDS: Final[float] = 30.0
 
-#: The wakeup payload vocabulary (identity only).
-_NOTIFY_KEYS: Final[frozenset[str]] = frozenset({"session_id", "latest_seq"})
+#: The wakeup payload vocabulary (identity only). ``updated_seq`` marks an
+#: IN-PLACE entry update (same ``seq``, new payload): at-head connections
+#: re-read that single entry and refresh what they already delivered.
+_NOTIFY_KEYS: Final[frozenset[str]] = frozenset(
+    {"session_id", "latest_seq", "updated_seq"}
+)
 
 
 @dataclass
@@ -169,6 +172,11 @@ class SessionChannelHub:
         self._sessions: dict[uuid.UUID, dict[uuid.UUID, SessionSink]] = {}
         self._wake = asyncio.Event()
         self._pending_notify_sessions: set[uuid.UUID] = set()
+        #: In-place entry updates awaiting delivery (S1): per session, the
+        #: ``updated_seq`` values from notify payloads whose entries may
+        #: already sit at or behind a sink's cursor. Consumed (and re-read)
+        #: by the catch-up; dropped when the session's last sink leaves.
+        self._pending_updated_seqs: dict[uuid.UUID, set[int]] = {}
         self._listen_task: asyncio.Task[None] | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -209,6 +217,7 @@ class SessionChannelHub:
                 await raw.close()
         self._raw_connection = None
         self._sessions.clear()
+        self._pending_updated_seqs.clear()
 
     # -- fanout ---------------------------------------------------------------
 
@@ -230,6 +239,10 @@ class SessionChannelHub:
             session_sinks.pop(sink.connection_id, None)
             if not session_sinks:
                 self._sessions.pop(sink.session_id, None)
+                # No subscribers left: the pending in-place updates die
+                # with the fanout (a future subscriber re-snapshots the
+                # durable store, which already holds the updated rows).
+                self._pending_updated_seqs.pop(sink.session_id, None)
         sink.closed = True
 
     def sink_count(self, session_id: uuid.UUID | None = None) -> int:
@@ -319,6 +332,24 @@ class SessionChannelHub:
         def _restart() -> None:
             if self._listen_task is not None:
                 self._listen_task.cancel()
+            # Close the PREVIOUS LISTEN connection before the new listener
+            # overwrites ``_raw_connection`` (S1): the cancelled task's
+            # error path leaves the connection open on purpose (stop()
+            # owns its close), so a restart here would otherwise leak one
+            # pooled connection per restart. The close is async — it hops
+            # onto the hub's loop as its own task, before the fresh
+            # listener task is spawned.
+            stale = getattr(self, "_raw_connection", None)
+            self._raw_connection = None
+            if stale is not None:
+
+                async def _close_stale() -> None:
+                    with contextlib.suppress(Exception):
+                        await stale.close()
+
+                self._loop.create_task(
+                    _close_stale(), name="session-channel-stale-listen-close"
+                )
             self._listen_task = self._loop.create_task(
                 self._listen_loop(), name="session-channel-listen"
             )
@@ -340,6 +371,19 @@ class SessionChannelHub:
             return
         self.notify_count += 1
         self._pending_notify_sessions.add(session_id)
+        updated_raw = document.get("updated_seq")
+        if updated_raw is not None:
+            # An IN-PLACE entry update (same seq, new payload): remember
+            # the seq so the catch-up re-reads it for sinks whose cursor
+            # already passed it (at-head connections refresh in place).
+            try:
+                updated_seq = int(updated_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return
+            if updated_seq < 1:
+                return
+            seqs = self._pending_updated_seqs.setdefault(session_id, set())
+            seqs.add(updated_seq)
         self._wake.set()
 
     # -- the delivery loop (bounded catch-up + coarse tick) -------------------
@@ -357,7 +401,22 @@ class SessionChannelHub:
             # NO per-tick session seeding here: a subscribed-but-idle
             # session at the head issues ZERO SQL until a NOTIFY (socket
             # wake), a reconnect, or a partial catch-up page says otherwise.
-            await self._catch_up_all()
+            try:
+                await self._catch_up_all()
+            except Exception as _error:
+                # One poisoned pass never kills the delivery loop (S1: a
+                # fanout fault surfaced exactly this way): the failure
+                # stays observable (bounded counter) and the loop retries
+                # on the next wakeup/tick — never silent.
+                self.catchup_error_count += 1
+                import sys as _sys
+
+                print(
+                    f"session channel: catch-up pass failed: "
+                    f"{type(_error).__name__}: {_error}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
 
     async def _catch_up_all(self) -> None:
         # Only sessions with WORK to do are queried: a NOTIFY named the
@@ -422,6 +481,7 @@ class SessionChannelHub:
             for sink in sinks:
                 if not sink.replaying:
                     sink.at_head = True  # nothing behind: the head
+            await self._deliver_in_place_updates(session_id, server_id, sinks)
             return
         entries = list(page.items)
         at_head = not bool(page.has_more)
@@ -435,12 +495,82 @@ class SessionChannelHub:
                     continue
                 sink.offer(_committed_frame(session_id, stream_id, entry))
                 if entry.payload.kind.value == "run_state":
-                    sink.offer(
-                        _run_state_frame(entry)
-                    )
+                    run_state = _run_state_frame(entry)
+                    if run_state is not None:
+                        sink.offer(run_state)
                 cursor = entry.seq
             sink.delivered_through = max(cursor, sink.delivered_through or 0)
             sink.at_head = at_head
+        await self._deliver_in_place_updates(session_id, server_id, sinks)
+
+    async def _deliver_in_place_updates(
+        self,
+        session_id: uuid.UUID,
+        server_id: uuid.UUID,
+        sinks: list[SessionSink],
+    ) -> None:
+        """Re-read entries updated IN PLACE and re-offer them as committed
+        frames (S1). An at-head sink's cursor already passed the updated
+        seq, so the page catch-up (``seq > cursor``) never sees it again;
+        the single-entry re-read refreshes the client's ``committedBySeq``
+        in place (tool-group flips, tool-result reconciliation, delegation
+        completion). Sinks behind the seq read the updated row during
+        their normal page catch-up, so they are not re-offered here.
+        """
+        pending = self._pending_updated_seqs.get(session_id)
+        if not pending:
+            return
+        captured = sorted(pending)
+        # Consume exactly the captured seqs; a notify landing during the
+        # reads below stays pending for the next wakeup.
+        pending.difference_update(captured)
+        for seq in captured:
+            targets = [
+                sink
+                for sink in sinks
+                if not sink.replaying and (sink.delivered_through or 0) >= seq
+            ]
+            if not targets:
+                # Nobody has delivered the pre-update row: a behind sink
+                # catches it on its page read, a replaying sink through
+                # its route replay, a future subscriber via snapshot.
+                continue
+            try:
+                page = await self._entry_reader(
+                    session_id=session_id,
+                    server_id=server_id,
+                    after_seq=(seq - 1 if seq > 1 else None),
+                    limit=1,
+                )
+                self.catchup_query_count += 1
+            except Exception as _error:
+                # A transient store failure stays observable (bounded
+                # counter) and RETRIES on the next wakeup: the seq stays
+                # pending — never silent.
+                self.catchup_error_count += 1
+                import sys as _sys
+
+                print(
+                    f"session channel: in-place update re-read failed: "
+                    f"{type(_error).__name__}: {_error}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+                self._pending_updated_seqs.setdefault(session_id, set()).add(
+                    seq
+                )
+                continue
+            entry = None
+            if page is not None and getattr(page, "items", None):
+                for candidate in page.items:
+                    if candidate.seq == seq:
+                        entry = candidate
+                        break
+            if entry is None:
+                continue  # stale notify: nothing left to refresh
+            for sink in targets:
+                stream_id = f"stream:{sink.connection_id}"
+                sink.offer(_committed_frame(session_id, stream_id, entry))
 
 
 def _committed_frame(
@@ -451,12 +581,18 @@ def _committed_frame(
     return ServerCommittedFrame(stream_id=stream_id, entry=entry)
 
 
-def _run_state_frame(entry: Any) -> ServerChannelFrame:
+def _run_state_frame(entry: Any) -> ServerChannelFrame | None:
     from mai.contracts.session_channel import ServerRunStateFrame
 
+    # The transition's run identity lives on the ENTRY ENVELOPE, not the
+    # payload (``RunStateEntry`` carries state/reason only). A run-scoped
+    # entry always names its run; without one there is no frame to send
+    # (the committed frame still carries the entry itself).
+    if entry.run_id is None:
+        return None
     payload = entry.payload
     return ServerRunStateFrame(
-        run_id=uuid.UUID(str(payload.run_id)),
+        run_id=uuid.UUID(str(entry.run_id)),
         state=payload.state,
         reason_code=payload.reason_code,
     )

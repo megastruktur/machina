@@ -1817,6 +1817,7 @@ def _in_process_executor(factory: async_sessionmaker[AsyncSession], tmp: pathlib
     from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
     from mai.credentials.env import EnvResolver
     from mai.plugins.registry import CapabilityRegistry, parse_descriptor
+    from mai.policy.evaluate import Policy
 
     descriptor = parse_descriptor(
         {
@@ -2895,3 +2896,111 @@ def test_e1_preterminal_cancelled_and_succeeded_facade_align_consistently(
         else:
             assert _wf_output(agent_url, run_id) is None
         assert _journal_lines(scenario).count("model_call") == calls_before
+
+
+# ---------------------------------------------------------------------------
+# S2: bridge-receipt projection is redacted and bounded BEFORE the entry
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_outcome_oversized_output_bounded_with_marker_s2() -> None:
+    """S2 criterion 1: a bridge receipt carrying the dispatcher's full
+    output budget (``host.logs`` output_budget=4096 > the 4,000-char
+    preview bound) projects onto ``ToolResultEntry`` WITHOUT a Pydantic
+    ``ValidationError``; the preview keeps the explicit truncation marker,
+    secret-shaped tokens are redacted before the cut, and an oversized
+    error detail stays inside its own contract cap."""
+    import dataclasses
+
+    from mai.agents.output_safety import project_text
+    from mai.agents.session_history import (
+        TRUNCATION_MARKER_TEMPLATE,
+        _bound_with_marker,
+    )
+    from mai.agents.session_runner import _entry_from_bridge_outcome
+    from mai.agents.tools import ToolResult
+    from mai.capabilities.dispatch import (
+        BoundedOutput,
+        DispatchOutcome,
+        EFFECT_EXECUTED,
+    )
+    from mai.contracts.sessions import (
+        MAX_ERROR_DETAIL_CHARS,
+        MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    )
+
+    secret = "sk-s2regression0123456789xyz"
+    big_output = (
+        f"audit head {secret}\n" + "log line\n" * 470
+    )  # > the 4,000-char preview bound
+    outcome = DispatchOutcome(
+        op_id=uuid.uuid4(),
+        ts=datetime.now(timezone.utc),
+        capability_id="host.logs",
+        server_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        principal="fixture",
+        mode="interactive",
+        allowed=True,
+        reason="allow",
+        policy_revision=1,
+        effect_class=None,
+        payload_hash="a" * 64,
+        effect=EFFECT_EXECUTED,
+        approval_id=None,
+        approval_spent=False,
+        approval_code=None,
+        executor_ok=True,
+        credential_references=(),
+        output=BoundedOutput(text=big_output, truncated=False, omitted_bytes=0),
+        error_type=None,
+    )
+    entry = _entry_from_bridge_outcome(outcome, "call-s2")
+    assert entry.status == "executed"
+    assert entry.output_preview is not None
+    # Redaction runs first; the honest marker-bound preview fits the
+    # contract bound exactly.
+    safe_output = project_text(big_output)
+    expected_preview, preview_truncated, preview_omitted = _bound_with_marker(
+        safe_output, MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    )
+    assert preview_truncated and preview_omitted > 0
+    assert entry.output_preview == expected_preview
+    assert len(entry.output_preview) == MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    assert (
+        TRUNCATION_MARKER_TEMPLATE.format(omitted=preview_omitted)
+        in entry.output_preview
+    )
+    # Secret-shaped tokens are redacted BEFORE the cut: the kept head
+    # cannot leak the key even though it sat inside the kept prefix.
+    assert secret not in entry.output_preview
+
+    # error_detail is bounded to its own contract cap (defensive seam: a
+    # receipt projection that someday carries detail text can never
+    # overflow the entry contract).
+    denied_outcome = dataclasses.replace(
+        outcome,
+        effect="not_attempted",
+        allowed=False,
+        reason="policy_denied",
+        executor_ok=None,
+        output=None,
+    )
+    base = ToolResult.from_outcome(denied_outcome)
+    long_detail = "d" * 400  # > MAX_ERROR_DETAIL_CHARS (200)
+    original_from_outcome = ToolResult.from_outcome
+
+    def _with_detail(outcome_obj: object) -> ToolResult:
+        return dataclasses.replace(base, error_detail=long_detail)
+
+    try:
+        ToolResult.from_outcome = classmethod(  # type: ignore[method-assign]
+            lambda cls, o: _with_detail(o)
+        )
+        denied_entry = _entry_from_bridge_outcome(denied_outcome, "call-s2d")
+    finally:
+        ToolResult.from_outcome = original_from_outcome  # type: ignore[method-assign]
+    assert denied_entry.status == "denied"
+    assert denied_entry.error_detail is not None
+    assert len(denied_entry.error_detail) == MAX_ERROR_DETAIL_CHARS
+    assert long_detail not in denied_entry.error_detail
