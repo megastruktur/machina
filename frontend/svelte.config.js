@@ -12,10 +12,18 @@ const config = {
 	},
 
 	vitePlugin: {
-		// Third-party legacy Svelte 4 packages in node_modules (e.g. lucide-svelte@1.0.1
-		// using $$props) opt out of forced runes mode via dynamicCompileOptions.
-		dynamicCompileOptions({ filename }) {
-			if (filename.includes('node_modules')) {
+		// Third-party legacy Svelte 4 packages in node_modules (e.g.
+		// lucide-svelte@1.0.1 using $$props) opt out of forced runes mode
+		// via dynamicCompileOptions — but ONLY files with actual legacy
+		// syntax (`$$props` / `export let` / `$:`). Forcing runes:false on
+		// Svelte 5 runes packages (virtua@0.54) mis-compiles their
+		// $props/$state runes into legacy store auto-subscriptions and
+		// crashes with "props is not defined" at runtime (CVM-S1).
+		dynamicCompileOptions({ filename, code }) {
+			if (
+				filename.includes('node_modules') &&
+				/\$\$props|\$\$restProps|\$\$slots|export\s+let|\$:\s/.test(code)
+			) {
 				return { runes: false };
 			}
 		}
