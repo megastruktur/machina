@@ -1333,6 +1333,154 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			expect(sample.domCount).toBe(first.domCount);
 		}
 	});
+
+	// CTR-W1: the transcript's vertical rhythm. virtua measures each row
+	// wrapper's CONTENT box (contentRect); spacing outside that box
+	// (wrapper vertical padding, article margin) is invisible to the
+	// layout, so deployed rows touched end-to-end (0px visible gaps,
+	// measured live). The rhythm now lives on the article
+	// (.mai-session-entry padding-bottom, --mai-session-rhythm: 12px).
+	// Proof by geometry, not eyeballing: consecutive rows keep a uniform
+	// visible CONTENT gap of 12px and their border boxes never intersect.
+	test('vertical rhythm: consecutive rows keep a 12px visible content gap', async ({ page }) => {
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (seq: number, payload: Record<string, unknown>) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: null,
+								durable_source_id: `ctr-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				// A realistic flat turn: user prompt, assistant prose, a
+				// tool result, closing prose, next user prompt — every W1
+				// row kind participates in the rhythm.
+				committed(1, {
+					kind: 'user_message',
+					text: 'rotate the logs on alpha',
+					client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					source: 'api'
+				});
+				committed(2, {
+					kind: 'assistant_message',
+					text: 'Rotating the logs now.',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				committed(3, {
+					kind: 'tool_result',
+					call_id: 'call-1',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'logs rotated',
+					error_code: null,
+					error_detail: null
+				});
+				committed(4, {
+					kind: 'assistant_message',
+					text: 'Done — logs rotated.',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				committed(5, {
+					kind: 'user_message',
+					text: 'thanks',
+					client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+					source: 'api'
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		// Short transcript, no virtualized windowing: all five rows mount.
+		await expect(page.getByTestId('session-entry')).toHaveCount(5);
+		// Let virtua's ResizeObserver measurements settle.
+		await page.waitForTimeout(300);
+
+		type RowGeometry = {
+			seq: number;
+			borderTop: number;
+			borderBottom: number;
+			contentTop: number;
+			contentBottom: number;
+		};
+		const rows = await page.evaluate((): RowGeometry[] => {
+			const articles = Array.from(
+				document.querySelectorAll('[data-testid="session-entry"]')
+			) as HTMLElement[];
+			return articles.map((row): RowGeometry => {
+				// The VISIBLE content extent: the union of the painted
+				// descendant rectangles — independent of where
+				// padding/margin live, so the assertion cannot be
+				// satisfied by merely moving padding onto the wrapper.
+				let contentTop = Number.POSITIVE_INFINITY;
+				let contentBottom = Number.NEGATIVE_INFINITY;
+				for (const el of Array.from(row.querySelectorAll<HTMLElement>('*'))) {
+					if (el.offsetParent === null) continue; // hidden <details> body
+					const rect = el.getBoundingClientRect();
+					if (rect.width === 0 && rect.height === 0) continue;
+					contentTop = Math.min(contentTop, rect.top);
+					contentBottom = Math.max(contentBottom, rect.bottom);
+				}
+				const box = row.getBoundingClientRect();
+				return {
+					seq: Number(row.dataset.entrySeq ?? '0'),
+					borderTop: box.top,
+					borderBottom: box.bottom,
+					contentTop,
+					contentBottom
+				};
+			});
+		});
+		expect(rows.length).toBe(5);
+
+		const visibleGaps: number[] = [];
+		for (let i = 0; i + 1 < rows.length; i += 1) {
+			const current = rows[i]!;
+			const next = rows[i + 1]!;
+			// DOM order follows seq order (nothing folds in this fixture).
+			expect(next.seq).toBe(current.seq + 1);
+			// A2: border boxes never intersect — no overlap at all.
+			const borderGap = next.borderTop - current.borderBottom;
+			expect(borderGap).toBeGreaterThanOrEqual(-0.5);
+			// A1: the VISIBLE content gap — at least 4px, target the
+			// 12px rhythm token (tolerance only for layout rounding).
+			const visibleGap = next.contentTop - current.contentBottom;
+			expect(visibleGap).toBeGreaterThanOrEqual(4);
+			expect(visibleGap).toBeGreaterThanOrEqual(12 - 0.5);
+			expect(visibleGap).toBeLessThanOrEqual(12 + 0.5);
+			visibleGaps.push(visibleGap);
+		}
+		// Evidence: every consecutive pair carries the full rhythm.
+		expect(visibleGaps.length).toBe(4);
+	});
 });
 
 // ---------------------------------------------------------------------------

@@ -669,10 +669,19 @@
 					startMargin={effectiveStartMargin}
 					bufferSize={400}
 					itemProps={() => ({
-						// Padding lives on virtua's MEASURED item wrapper
-						// (border-box): its offsetHeight is exact and rows
-						// can never overlap.
-						style: { padding: '4px 10px', 'box-sizing': 'border-box' }
+						// HORIZONTAL padding ONLY. virtua measures this
+						// wrapper via a ResizeObserver reading the CONTENT
+						// box (contentRect), never the border box: vertical
+						// padding here is invisible to the layout — offsets
+						// advance by the content height while the painted
+						// box stays taller, so rows overlapped by exactly
+						// the wrapper's vertical padding (measured 0px gaps
+						// on the live deployment). The vertical rhythm
+						// therefore lives on the article (.mai-session-entry
+						// padding-bottom), INSIDE the measured content box.
+						// box-sizing stays explicit so a future padding edit
+						// here cannot silently reintroduce the overlap.
+						style: { padding: '0 10px', 'box-sizing': 'border-box' }
 					})}
 					onresize={() => {
 						// Measurements change the total height: while the
@@ -994,12 +1003,25 @@
 	}
 	/* ---- entries: a chat stream, not an audit table (S3) ---------------- */
 	.mai-session-entry {
+		/* CTR-W1: the ONE vertical-rhythm token — every consecutive
+		   transcript row keeps this visible content gap. W3 will
+		   differentiate the gap per row kind (turn boundary vs inside
+		   a tool group) starting from this token; do not fork the
+		   value. */
+		--mai-session-rhythm: 12px;
 		display: flex;
 		flex-direction: column;
-		/* The 4px 10px spacing lives on virtua's MEASURED item wrapper
-		   (itemProps, border-box) — a margin here would overflow the
-		   measured height and rows could overlap. */
+		/* The vertical rhythm lives HERE, as padding INSIDE virtua's
+		   measured content box (the wrapper's ResizeObserver reads its
+		   contentRect): padding-bottom advances the measured height
+		   together with the painted box, so rows never overlap. A
+		   margin would fall OUTSIDE the measured height and
+		   reintroduce the overlap; the wrapper itself must stay
+		   vertical-padding-free (see itemProps). box-sizing explicit:
+		   the padding must stay outside the declared content box. */
+		padding-bottom: var(--mai-session-rhythm);
 		margin: 0;
+		box-sizing: content-box;
 	}
 	.mai-session-entry__text {
 		margin: 0;
