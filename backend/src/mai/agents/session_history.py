@@ -55,6 +55,7 @@ replaces. Every byte bound comes from frozen contract constants.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -89,6 +90,7 @@ from mai.contracts.sessions import (
     MAX_IDENTITY_CHARS,
     MAX_SUMMARY_TEXT_CHARS,
     MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    UNSAFE_TEXT_CLASS,
     AssistantMessageEntry,
     CompactionEntry,
     ControlActionKind,
@@ -200,8 +202,18 @@ _COMPACTION_ANCHOR_PREFIX: Final[str] = (
 )
 
 #: Artifact content bound for entry-level references (the DB artifact row
-#: carries up to 20000 chars; the entry reference stays identity-sized).
-_ARTIFACT_REF_CONTENT_MAX_CHARS: Final[int] = MAX_IDENTITY_CHARS
+#: carries up to 20000 chars; the entry reference is bound by the summary
+#: contract so thinking summaries reach the chat UI without the old
+#: identity-sized 128-char truncation).
+_ARTIFACT_REF_CONTENT_MAX_CHARS: Final[int] = MAX_SUMMARY_TEXT_CHARS
+
+#: Provider thinking/signature content is sanitized to the contract's
+#: safe-text set BEFORE capture (provider text is untrusted; the durable
+#: contract rejects control characters). The rejected class IS the
+#: contract's own ``UNSAFE_TEXT_CLASS`` — one source of truth.
+_PROVIDER_TEXT_CONTROL_RE: Final[re.Pattern[str]] = re.compile(
+    f"[{UNSAFE_TEXT_CLASS}]"
+)
 
 #: Raw non-JSON tool-call arguments bound (fail-safe normalization).
 _ARGS_RAW_MAX_CHARS: Final[int] = MAX_IDENTITY_CHARS
@@ -547,6 +559,11 @@ def extract_entries_from_run_messages(
                 elif isinstance(part, ThinkingPart):
                     kind = "signature" if part.signature else "summary"
                     content = part.signature or part.content
+                    # Provider text is untrusted: strip the control
+                    # characters the durable contract rejects BEFORE the
+                    # bound, so capture can never crash on malformed
+                    # reasoning content.
+                    content = _PROVIDER_TEXT_CONTROL_RE.sub("", content)
                     artifacts.append(
                         ProviderReasoningArtifact(
                             provider=provider,

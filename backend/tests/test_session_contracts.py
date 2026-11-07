@@ -49,7 +49,9 @@ from mai.contracts.sessions import (
     HISTORY_PAGE_MAX_ENTRIES,
     MAX_ENTRY_TEXT_CHARS,
     MAX_PAGE_BYTES,
+    MAX_SUMMARY_TEXT_CHARS,
     MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    SAFE_TEXT_PATTERN,
     SESSION_LIST_DEFAULT_LIMIT,
     SESSION_LIST_MAX_LIMIT,
     SCHEMA_VERSION,
@@ -977,6 +979,50 @@ def test_provider_reasoning_artifacts_are_explicit_and_bounded() -> None:
             artifact_kind="raw_chain_of_thought",  # not a safe artifact class
             content="synthetic",
         )
+
+
+def test_provider_reasoning_artifact_content_is_summary_bounded_safe_prose() -> None:
+    """S2: thinking content is bound by the summary contract (not the old
+    128-char identity bound) and rejects empty, oversized and
+    control-character payloads."""
+    long_summary = "reasoning step; " * 249 + "end"  # 3987 chars, > 128
+    artifact = ProviderReasoningArtifact(
+        provider="openai",
+        artifact_kind="summary",
+        content=long_summary,
+    )
+    assert len(artifact.content) > 128
+    # Prose whitespace (newline / tab / carriage-return) stays legal.
+    prose = ProviderReasoningArtifact(
+        provider="openai",
+        artifact_kind="summary",
+        content="line one\nline two\tindented\rlast",
+    )
+    assert "\n" in prose.content and "\t" in prose.content
+    # Empty is rejected (was implicit before via IdentityStr; explicit now).
+    with pytest.raises(ValidationError):
+        ProviderReasoningArtifact(
+            provider="openai",
+            artifact_kind="summary",
+            content="",
+        )
+    # One char past the summary bound is rejected.
+    with pytest.raises(ValidationError):
+        ProviderReasoningArtifact(
+            provider="openai",
+            artifact_kind="summary",
+            content="x" * (MAX_SUMMARY_TEXT_CHARS + 1),
+        )
+    # C0/C1 control characters (beyond tab/newline/CR) are rejected.
+    for bad in ("bad\x00control", "bad\x07bell", "bad\x1besc", "bad\x7fdel", "bad\x85nel"):
+        with pytest.raises(ValidationError):
+            ProviderReasoningArtifact(
+                provider="openai",
+                artifact_kind="summary",
+                content=bad,
+            )
+    # The enforced set is exactly the documented contract pattern.
+    assert "x00" in SAFE_TEXT_PATTERN
 
 
 def test_forbidden_authority_fields_are_unrepresentable() -> None:

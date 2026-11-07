@@ -4532,7 +4532,7 @@ export interface components {
             artifact_kind: "summary" | "signature" | "opaque_ref";
             /**
              * Content
-             * @description Bounded artifact payload or reference token
+             * @description Bounded artifact payload or reference token; prose with tab/newline/carriage-return, never control characters
              */
             content: string;
             /**

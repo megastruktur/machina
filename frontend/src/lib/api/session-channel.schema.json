@@ -559,9 +559,10 @@
               "type": "string"
             },
             "content": {
-              "description": "Bounded artifact payload or reference token",
-              "maxLength": 128,
+              "description": "Bounded artifact payload or reference token; prose with tab/newline/carriage-return, never control characters",
+              "maxLength": 4000,
               "minLength": 1,
+              "pattern": "^[^\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u0080-\\u009f]*$",
               "title": "Content",
               "type": "string"
             },
@@ -2045,9 +2046,10 @@
               "type": "string"
             },
             "content": {
-              "description": "Bounded artifact payload or reference token",
-              "maxLength": 128,
+              "description": "Bounded artifact payload or reference token; prose with tab/newline/carriage-return, never control characters",
+              "maxLength": 4000,
               "minLength": 1,
+              "pattern": "^[^\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u0080-\\u009f]*$",
               "title": "Content",
               "type": "string"
             },
@@ -3473,9 +3475,10 @@
           "type": "string"
         },
         "content": {
-          "description": "Bounded artifact payload or reference token",
-          "maxLength": 128,
+          "description": "Bounded artifact payload or reference token; prose with tab/newline/carriage-return, never control characters",
+          "maxLength": 4000,
           "minLength": 1,
+          "pattern": "^[^\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u0080-\\u009f]*$",
           "title": "Content",
           "type": "string"
         },

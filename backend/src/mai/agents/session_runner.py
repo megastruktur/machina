@@ -61,6 +61,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.budgets import BudgetError
+from mai.agents.output_safety import project_text
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
     SESSION_DELEGATE_TOOL_NAME,
@@ -70,6 +71,7 @@ from mai.agents.session_delegate import (
     build_deferring_delegate_tool,
 )
 from mai.agents.session_history import (
+    _bound_with_marker,
     abuild_session_model_history,
     apersist_run_exchange,
     assert_tool_result_honesty,
@@ -78,6 +80,8 @@ from mai.agents.tools import BridgeError, CapabilityToolBridge, ToolResult
 from mai.contracts.sessions import (
     MAX_DETAIL_CHARS,
     MAX_ENTRY_TEXT_CHARS,
+    MAX_ERROR_DETAIL_CHARS,
+    MAX_TOOL_OUTPUT_PREVIEW_CHARS,
     AssistantMessageEntry,
     ControlActionKind,
     DocumentAttachRef,
@@ -1470,6 +1474,24 @@ def _entry_from_bridge_outcome(outcome: Any, call_id: str) -> ToolResultEntry:
         execution_status = ExecutionStatus.FAILED
         effect_certainty = EffectCertainty.CERTAIN
         domain = DomainOutcome.FAILURE
+    # Redact FIRST, then bound WITH the explicit truncation marker (S2
+    # criterion 1): a bridge receipt may carry the dispatcher's full output
+    # budget (`host.logs` with output_budget=4096 exceeds the 4,000-char
+    # preview bound), and an unbounded preview crashed the whole run with a
+    # Pydantic ValidationError. error_detail is value-free but still
+    # bounded to its own contract cap; emptiness keeps the field ``None``.
+    output_preview: str | None = None
+    if tool_result.output_text:
+        safe_output = project_text(tool_result.output_text)
+        output_preview = _bound_with_marker(
+            safe_output, MAX_TOOL_OUTPUT_PREVIEW_CHARS
+        )[0]
+    error_detail: str | None = None
+    if tool_result.error_detail:
+        safe_detail = project_text(tool_result.error_detail)
+        error_detail = _bound_with_marker(
+            safe_detail, MAX_ERROR_DETAIL_CHARS
+        )[0]
     entry = ToolResultEntry(
         kind=EntryKind.TOOL_RESULT,
         call_id=call_id,
@@ -1480,9 +1502,9 @@ def _entry_from_bridge_outcome(outcome: Any, call_id: str) -> ToolResultEntry:
         domain_outcome=domain,
         effect_certainty=effect_certainty,
         payload_hash=tool_result.payload_hash,
-        output_preview=tool_result.output_text,
+        output_preview=output_preview,
         error_code=tool_result.error_code,
-        error_detail=tool_result.error_detail,
+        error_detail=error_detail,
         approval_id=tool_result.approval_id,
     )
     assert_tool_result_honesty(entry)
@@ -2457,8 +2479,6 @@ def _session_child_settled(
         ),
     )
     preview = json.dumps(summary_document)
-    from mai.contracts.sessions import MAX_TOOL_OUTPUT_PREVIEW_CHARS
-
     if durable_state == "succeeded":
         status, execution, certainty, code = (
             "executed",
