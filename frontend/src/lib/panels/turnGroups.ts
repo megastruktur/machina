@@ -96,3 +96,84 @@ export function buildTurnUnits(rows: readonly ChannelEntry[]): TurnUnit[] {
 	}
 	return units;
 }
+
+/**
+ * CTR-W3: one capability/status word pair in a tool group's summary.
+ * `unsettled` marks an unproven outcome (warn styling + open body).
+ */
+export type ToolSummaryItem = {
+	capabilityId: string;
+	status: string;
+	unsettled: boolean;
+};
+
+/**
+ * CTR-W3: a group's children split into RENDER SEGMENTS, in seq order:
+ * each maximal run of consecutive `tool_result` rows becomes ONE
+ * `tools` segment — rendered as a single collapsed disclosure whose
+ * summary carries every capability and its status WORD — while a
+ * `delegation` stays its own one-line row. Segment order always equals
+ * seq order, so a delegation interleaved between two results of the
+ * same round splits the disclosure rather than reordering the DOM.
+ */
+export type TurnChildSegment =
+	| { kind: 'tools'; entries: ChannelEntry[]; summary: ToolSummaryItem[] }
+	| { kind: 'row'; entry: ChannelEntry };
+
+export function buildTurnChildSegments(
+	lead: ChannelEntry,
+	children: readonly ChannelEntry[]
+): TurnChildSegment[] {
+	const segments: TurnChildSegment[] = [];
+	const runs: ChannelEntry[][] = [];
+	for (const child of children) {
+		if (child.payload.kind !== 'tool_result') {
+			segments.push({ kind: 'row', entry: child });
+			continue;
+		}
+		const last = segments[segments.length - 1];
+		if (last !== undefined && last.kind === 'tools') {
+			last.entries.push(child);
+		} else {
+			const entries: ChannelEntry[] = [child];
+			segments.push({ kind: 'tools', entries, summary: [] });
+			runs.push(entries);
+		}
+	}
+	if (runs.length === 0) return segments;
+	// The summary joins the lead's DECLARED calls (ordered) with the
+	// results: a settled call shows its result's status; a declared
+	// call with no result anywhere is honestly `pending` and attaches
+	// to the first tools run (the round is still settling there).
+	const settledCalls = new Set<string>();
+	for (const run of runs) {
+		for (const result of run) {
+			const callId = result.payload.kind === 'tool_result' ? result.payload.call_id : null;
+			if (typeof callId === 'string') settledCalls.add(callId);
+		}
+	}
+	const declared =
+		lead.payload.kind === 'assistant_message' ? (lead.payload.tool_calls ?? []) : [];
+	for (const segment of segments) {
+		if (segment.kind !== 'tools') continue;
+		const items: ToolSummaryItem[] = [];
+		for (const call of declared) {
+			const result = segment.entries.find(
+				(entry) =>
+					entry.payload.kind === 'tool_result' && entry.payload.call_id === call.call_id
+			);
+			if (result === undefined && (settledCalls.has(call.call_id) || runs[0] !== segment.entries)) {
+				// Its result lives in another run, or the pending slot
+				// belongs to the first run only.
+				continue;
+			}
+			const status =
+				result !== undefined && result.payload.kind === 'tool_result'
+					? String(result.payload.status)
+					: 'pending';
+			items.push({ capabilityId: call.capability_id, status, unsettled: status !== 'executed' });
+		}
+		segment.summary = items;
+	}
+	return segments;
+}

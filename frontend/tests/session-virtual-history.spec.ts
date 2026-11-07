@@ -1298,10 +1298,11 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		// Fixture proof: the final message towers over the viewport.
 		expect(tail.height).toBeGreaterThan(1200);
 		expect(tail.inView).toBe(true);
-		// Bottom-anchored: its bottom edge reaches the viewport bottom
-		// (the item wrapper's 4px padding is the only gap).
+		// Bottom-anchored: its bottom edge reaches the viewport bottom.
+		// CTR-W3: the only slack below the final assistant prose is the
+		// article's trailing turn-gap rhythm (--mai-turn-gap, 16px).
 		expect(tail.bottomGap).toBeGreaterThanOrEqual(-2);
-		expect(tail.bottomGap).toBeLessThanOrEqual(12);
+		expect(tail.bottomGap).toBeLessThanOrEqual(16);
 
 		// The virtualized window stays bounded even with the tall tail.
 		const domCount = Number((await viewport.getAttribute('data-dom-count')) ?? '0');
@@ -1338,11 +1339,12 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 	// wrapper's CONTENT box (contentRect); spacing outside that box
 	// (wrapper vertical padding, article margin) is invisible to the
 	// layout, so deployed rows touched end-to-end (0px visible gaps,
-	// measured live). The rhythm now lives on the article
-	// (.mai-session-entry padding-bottom, --mai-session-rhythm: 12px).
-	// Proof by geometry, not eyeballing: consecutive rows keep a uniform
-	// visible CONTENT gap of 12px and their border boxes never intersect.
-	test('vertical rhythm: consecutive rows keep a 12px visible content gap', async ({ page }) => {
+	// measured live). The rhythm lives on the article's padding-bottom,
+	// scaled per relation since CTR-W3 (turn 16 / tool 8 / call 4 /
+	// base 12 — the token block on .mai-session-chat).
+	// Proof by geometry, not eyeballing: this unscoped fixture's four
+	// consecutive pairs keep their scale gaps and never intersect.
+	test('vertical rhythm: consecutive rows keep the per-relation scale gaps', async ({ page }) => {
 		await gotoHarness(page);
 		await page.routeWebSocket(/\/channel/, (ws) => {
 			ws.onMessage((data) => {
@@ -1440,10 +1442,23 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 				// descendant rectangles — independent of where
 				// padding/margin live, so the assertion cannot be
 				// satisfied by merely moving padding onto the wrapper.
+				// Hidden <details> bodies need checkVisibility: Chromium
+				// keeps LAYOUT for closed-details content, so their rects
+				// are real and offsetParent alone does not exclude them.
 				let contentTop = Number.POSITIVE_INFINITY;
 				let contentBottom = Number.NEGATIVE_INFINITY;
+				const isVisible = (el: HTMLElement): boolean => {
+					if (el.offsetParent === null) return false;
+					const probe = el as HTMLElement & {
+						checkVisibility?: (options: unknown) => boolean;
+					};
+					if (typeof probe.checkVisibility === 'function') {
+						return probe.checkVisibility({ checkOpacity: false });
+					}
+					return true;
+				};
 				for (const el of Array.from(row.querySelectorAll<HTMLElement>('*'))) {
-					if (el.offsetParent === null) continue; // hidden <details> body
+					if (!isVisible(el)) continue;
 					const rect = el.getBoundingClientRect();
 					if (rect.width === 0 && rect.height === 0) continue;
 					contentTop = Math.min(contentTop, rect.top);
@@ -1461,6 +1476,11 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		});
 		expect(rows.length).toBe(5);
 
+		// CTR-W3 per-relation scale for this unscoped fixture: user→16,
+		// assistant(standalone)→16, orphan tool result→12 (base),
+		// assistant→16. Gaps are the PREVIOUS row's trailing rhythm
+		// (the lead has no group here — no tool group joins it).
+		const expectedGaps = [16, 16, 12, 16];
 		const visibleGaps: number[] = [];
 		for (let i = 0; i + 1 < rows.length; i += 1) {
 			const current = rows[i]!;
@@ -1470,15 +1490,14 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			// A2: border boxes never intersect — no overlap at all.
 			const borderGap = next.borderTop - current.borderBottom;
 			expect(borderGap).toBeGreaterThanOrEqual(-0.5);
-			// A1: the VISIBLE content gap — at least 4px, target the
-			// 12px rhythm token (tolerance only for layout rounding).
+			// A1: the VISIBLE content gap — at least 4px, on the W3 scale.
 			const visibleGap = next.contentTop - current.contentBottom;
 			expect(visibleGap).toBeGreaterThanOrEqual(4);
-			expect(visibleGap).toBeGreaterThanOrEqual(12 - 0.5);
-			expect(visibleGap).toBeLessThanOrEqual(12 + 0.5);
+			expect(visibleGap).toBeGreaterThanOrEqual(expectedGaps[i]! - 0.5);
+			expect(visibleGap).toBeLessThanOrEqual(expectedGaps[i]! + 0.5);
 			visibleGaps.push(visibleGap);
 		}
-		// Evidence: every consecutive pair carries the full rhythm.
+		// Evidence: every consecutive pair carries its scale step.
 		expect(visibleGaps.length).toBe(4);
 	});
 
@@ -1642,12 +1661,24 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		);
 		expect(domSeqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
-		// Exactly TWO groups: RUN A's turn (lead 2, child 3) and RUN B's
-		// turn (lead 5, child 6). Everything else stays top-level.
+		// Exactly TWO groups: RUN A's turn (lead 2, tool child 3) and
+		// RUN B's turn (lead 5, delegation child 6). Everything else
+		// stays top-level. CTR-W3: the tool child lives inside the
+		// group's ONE collapsed tool-group disclosure (turn-tool-group);
+		// turn-group-child now marks the delegation child only.
 		const groups = page.getByTestId('turn-group');
 		await expect(groups).toHaveCount(2);
 		await expect(groups.first()).toHaveAttribute('data-turn-run-id', RUN_A);
 		await expect(groups.nth(1)).toHaveAttribute('data-turn-run-id', RUN_B);
+		await expect(page.getByTestId('turn-tool-group')).toHaveCount(1);
+		const toolChildSeqs = await page.evaluate(() =>
+			Array.from(
+				document.querySelectorAll(
+					'[data-testid="turn-tool-group"] [data-testid="session-entry"]'
+				)
+			).map((row) => Number((row as HTMLElement).dataset.entrySeq))
+		);
+		expect(toolChildSeqs).toEqual([3]);
 		const childSeqs = await page.evaluate(() =>
 			Array.from(
 				document.querySelectorAll(
@@ -1655,31 +1686,40 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 				)
 			).map((row) => Number((row as HTMLElement).dataset.entrySeq))
 		);
-		expect(childSeqs).toEqual([3, 6]);
+		expect(childSeqs).toEqual([6]);
 		// The delegation rows both render (grouped child + orphan).
 		await expect(page.getByTestId('entry-delegation')).toHaveCount(2);
 
-		// A1, measured: the child sits strictly deeper than the parent
-		// prose (16px, --mai-space-4) and the group carries a 1px rail.
+		// A1, measured: both child kinds sit strictly deeper than their
+		// parent prose (16px, --mai-space-4) and the group carries a
+		// 1px rail.
 		const hierarchy = await page.evaluate(() => {
-			const group = document.querySelector('[data-testid="turn-group"]') as HTMLElement;
-			const prose = group
+			const groupA = document.querySelector('[data-testid="turn-group"]') as HTMLElement;
+			const proseA = groupA
 				.querySelector('[data-testid="entry-assistant-message"]')!
 				.getBoundingClientRect();
-			const child = group
+			const toolGroup = groupA
+				.querySelector('[data-testid="turn-tool-group"]')!
+				.getBoundingClientRect();
+			const groupB = document.querySelectorAll('[data-testid="turn-group"]')[1] as HTMLElement;
+			const proseB = groupB
+				.querySelector('[data-testid="entry-assistant-message"]')!
+				.getBoundingClientRect();
+			const delegationChild = groupB
 				.querySelector('[data-testid="turn-group-child"]')!
 				.getBoundingClientRect();
-			const rail = getComputedStyle(group, '::before');
+			const rail = getComputedStyle(groupA, '::before');
 			return {
-				indent: child.left - prose.left,
-				childDeeper: child.left > prose.left,
+				toolIndent: toolGroup.left - proseA.left,
+				delegationIndent: delegationChild.left - proseB.left,
 				railWidth: rail.width,
 				railColor: rail.backgroundColor
 			};
 		});
-		expect(hierarchy.childDeeper).toBe(true);
-		expect(hierarchy.indent).toBeGreaterThanOrEqual(16 - 0.5);
-		expect(hierarchy.indent).toBeLessThanOrEqual(16 + 0.5);
+		expect(hierarchy.toolIndent).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(hierarchy.toolIndent).toBeLessThanOrEqual(16 + 0.5);
+		expect(hierarchy.delegationIndent).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(hierarchy.delegationIndent).toBeLessThanOrEqual(16 + 0.5);
 		expect(hierarchy.railWidth).toBe('1px');
 		expect(hierarchy.railColor).not.toBe('rgba(0, 0, 0, 0)');
 
@@ -1707,6 +1747,299 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(orphans.toolLeft).toBeCloseTo(orphans.base, 1);
 		expect(orphans.delegationLeft).toBeCloseTo(orphans.base, 1);
 		expect(orphans.childlessLeft).toBeCloseTo(orphans.base, 1);
+	});
+
+	// CTR-W3: collapsed tool group, typed summary, folded delegation.
+	// A turn's whole tool activity is ONE disclosure row whose summary
+	// lists every capability + its status WORD; settled rounds collapse,
+	// unproven outcomes stay open; a delegation collapses to a one-line
+	// summary (child run + status) so its goal/result_summary can never
+	// inflate the chat flow (a live delegation card measured 1616px).
+	// The per-relation rhythm (turn 16 / prose↔group 8 / in-group 4)
+	// is measured on the same rendered fixture.
+	test('tool groups collapse behind a typed summary; delegations fold away', async ({ page }) => {
+		const RUN_A = '21111111-1111-4111-8111-111111111112';
+		const RUN_B = '21111111-1111-4111-8111-111111111113';
+		const RUN_C = '21111111-1111-4111-8111-111111111114';
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				const committed = (
+					seq: number,
+					runId: string | null,
+					payload: Record<string, unknown>
+				) =>
+					ws.send(
+						JSON.stringify({
+							type: 'committed',
+							stream_id: 's1',
+							entry: {
+								schema_version: 1,
+								entry_id: `cccccccc-cccc-4ccc-8ccc-${String(seq).padStart(12, '0')}`,
+								session_id: '11111111-1111-4111-8111-111111111111',
+								seq,
+								run_id: runId,
+								durable_source_id: `ctr3-${seq}`,
+								created_at: '2026-01-01T00:00:00Z',
+								payload
+							}
+						})
+					);
+				committed(1, null, {
+					kind: 'user_message',
+					text: 'run the migration',
+					client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					source: 'api'
+				});
+				// RUN A declares TWO calls: one executes, one is denied —
+				// the summary must show both capabilities + both words,
+				// and the unproven denial keeps the group OPEN.
+				committed(2, RUN_A, {
+					kind: 'assistant_message',
+					text: 'Migrating now.',
+					model_profile: 'fast',
+					tool_group_state: 'pending',
+					tool_calls: [
+						{ call_id: 'call-1', tool_name: 'docs_retrieve', capability_id: 'docs.retrieve', args: {} },
+						{ call_id: 'call-2', tool_name: 'host_shell', capability_id: 'host.shell', args: {} }
+					]
+				});
+				committed(3, RUN_A, {
+					kind: 'tool_result',
+					call_id: 'call-1',
+					tool_name: 'docs_retrieve',
+					capability_id: 'docs.retrieve',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'row 42 migrated',
+					error_code: null,
+					error_detail: null
+				});
+				committed(4, RUN_A, {
+					kind: 'tool_result',
+					call_id: 'call-2',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'denied',
+					execution_status: 'succeeded',
+					domain_outcome: 'failure',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: null,
+					error_code: 'denied_by_policy',
+					error_detail: 'capability not granted'
+				});
+				// RUN B: a delegation whose goal/summary are LONG — the
+				// collapsed card must stay a small one-line row.
+				committed(5, RUN_B, {
+					kind: 'assistant_message',
+					text: 'Delegating the verification.',
+					model_profile: 'fast',
+					tool_group_state: 'none'
+				});
+				committed(6, RUN_B, {
+					kind: 'delegation',
+					child_run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+					child_session_id: null,
+					goal: 'VERIFY-GOAL-TOKEN ' + 'verify every migrated row, re-read the tails, and reconcile the ledger. '.repeat(12),
+					status: 'succeeded',
+					allowed_capabilities: ['host.logs'],
+					result_summary: 'VERIFY-SUMMARY-TOKEN ' + 'all rows verified, tails match, ledger reconciled with zero drift. '.repeat(12),
+					error_code: null
+				});
+				committed(7, null, {
+					kind: 'user_message',
+					text: 'thanks',
+					client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+					source: 'api'
+				});
+				// RUN C: a fully settled round — its tool group must be
+				// COLLAPSED by default.
+				committed(8, RUN_C, {
+					kind: 'assistant_message',
+					text: 'Checking the logs.',
+					model_profile: 'fast',
+					tool_group_state: 'none',
+					tool_calls: [
+						{ call_id: 'call-3', tool_name: 'host_logs', capability_id: 'host.logs', args: {} }
+					]
+				});
+				committed(9, RUN_C, {
+					kind: 'tool_result',
+					call_id: 'call-3',
+					tool_name: 'host_logs',
+					capability_id: 'host.logs',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'tail ok',
+					error_code: null,
+					error_detail: null
+				});
+				// Out-of-run (fixture) rows: executed collapses now — the
+				// null-run case no longer dumps raw output into the flow.
+				committed(10, null, {
+					kind: 'tool_result',
+					call_id: 'call-x',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'executed',
+					execution_status: 'succeeded',
+					domain_outcome: 'success',
+					effect_certainty: 'certain',
+					payload_hash: null,
+					output_preview: 'fixture output',
+					error_code: null,
+					error_detail: null
+				});
+				committed(11, null, {
+					kind: 'tool_result',
+					call_id: 'call-y',
+					tool_name: 'host_shell',
+					capability_id: 'host.shell',
+					status: 'unknown_effect',
+					execution_status: 'outcome_unknown',
+					domain_outcome: 'unknown',
+					effect_certainty: 'uncertain',
+					payload_hash: null,
+					output_preview: 'effect not proven',
+					error_code: null,
+					error_detail: null
+				});
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+
+		await expect(page.getByTestId('session-entry')).toHaveCount(11);
+		const domSeqs = await page.evaluate(() =>
+			Array.from(
+				document.querySelectorAll('[data-testid="session-entry"]')
+			).map((row) => Number((row as HTMLElement).dataset.entrySeq))
+		);
+		expect(domSeqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+		// ---- A1/A4: ONE tool-group row for the two-call turn, summary
+		// carrying BOTH capabilities and BOTH status words. --------------
+		const toolGroups = page.getByTestId('turn-tool-group');
+		await expect(toolGroups).toHaveCount(2);
+		const summaryA = await toolGroups.first().evaluate((node) => node.textContent ?? '');
+		expect(summaryA).toContain('docs.retrieve');
+		expect(summaryA).toContain('host.shell');
+		expect(summaryA).toContain('executed');
+		expect(summaryA).toContain('denied');
+		// ONE group row for the turn: both result articles live inside
+		// the single disclosure body.
+		const insideA = await toolGroups
+			.first()
+			.evaluate((node) => node.querySelectorAll('[data-testid="session-entry"]').length);
+		expect(insideA).toBe(2);
+
+		// ---- A2: settled collapses, unproven stays open. ----------------
+		// RUN A holds a denial → the group is OPEN (visible without a
+		// click), while the settled inner executed row stays collapsed.
+		expect(await toolGroups.first().getAttribute('open')).not.toBeNull();
+		const innerExecuted = toolGroups
+			.first()
+			.locator('[data-entry-seq="3"] > details');
+		expect(await innerExecuted.getAttribute('open')).toBeNull();
+		// RUN C fully settled → collapsed.
+		expect(await toolGroups.nth(1).getAttribute('open')).toBeNull();
+		// Fixture (null-run) rows: executed collapses; unknown_effect opens.
+		expect(
+			await page.locator('[data-entry-seq="10"] > details').getAttribute('open')
+		).toBeNull();
+		expect(
+			await page.locator('[data-entry-seq="11"] > details').getAttribute('open')
+		).not.toBeNull();
+
+		// ---- A3: the delegation folds away behind a one-line summary. --
+		const delegation = page.locator('[data-entry-seq="6"] > details');
+		expect(await delegation.getAttribute('open')).toBeNull();
+		const folded = await delegation.evaluate((raw) => {
+			const node = raw as HTMLElement;
+			return {
+				height: node.getBoundingClientRect().height,
+				// innerText EXCLUDES the hidden body: the goal/summary
+				// must not render into the chat flow; textContent keeps
+				// them reachable (no information loss).
+				visibleText: node.innerText,
+				domText: node.textContent ?? ''
+			};
+		});
+		expect(folded.height).toBeLessThan(120);
+		expect(folded.visibleText).not.toContain('VERIFY-GOAL-TOKEN');
+		expect(folded.visibleText).not.toContain('VERIFY-SUMMARY-TOKEN');
+		expect(folded.domText).toContain('VERIFY-GOAL-TOKEN');
+		expect(folded.domText).toContain('VERIFY-SUMMARY-TOKEN');
+		// The one-line summary carries the child run id + status word.
+		expect(folded.visibleText).toContain('dddddddd');
+		expect(folded.visibleText).toContain('succeeded');
+
+		// ---- A5: the per-relation rhythm, measured on real rects. ------
+		const gaps = await page.evaluate(() => {
+			const rowOf = (seq: string) =>
+				document.querySelector(`[data-entry-seq="${seq}"]`) as HTMLElement;
+			// The union of painted descendant rects = the visible content
+			// extent. checkVisibility excludes closed-<details> bodies:
+			// Chromium keeps their LAYOUT, so their rects are real and
+			// offsetParent alone does not exclude them.
+			const contentBottomOf = (root: Element) => {
+				let bottom = Number.NEGATIVE_INFINITY;
+				for (const el of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+					if (el.offsetParent === null) continue;
+					const probe = el as HTMLElement & {
+						checkVisibility?: (options: unknown) => boolean;
+					};
+					if (
+						typeof probe.checkVisibility === 'function' &&
+						!probe.checkVisibility({ checkOpacity: false })
+					) {
+						continue;
+					}
+					const rect = el.getBoundingClientRect();
+					if (rect.width === 0 && rect.height === 0) continue;
+					bottom = Math.max(bottom, rect.bottom);
+				}
+				return bottom;
+			};
+			const user1 = rowOf('1');
+			const prose2 = rowOf('2').querySelector('[data-testid="entry-assistant-message"]')!;
+			const toolGroupA = document.querySelector('[data-testid="turn-tool-group"]') as HTMLElement;
+			const result3 = rowOf('3');
+			const result4 = rowOf('4');
+			return {
+				// user turn ↔ assistant turn (16px)
+				userToAssistant:
+					prose2.getBoundingClientRect().top - contentBottomOf(user1),
+				// assistant prose ↔ its own tool group (8px)
+				proseToGroup: toolGroupA.getBoundingClientRect().top - contentBottomOf(prose2),
+				// inside the tool group: capability ↔ its result (4px)
+				insideGroup:
+					result4.getBoundingClientRect().top - contentBottomOf(result3)
+			};
+		});
+		expect(gaps.userToAssistant).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(gaps.userToAssistant).toBeLessThanOrEqual(16 + 0.5);
+		expect(gaps.proseToGroup).toBeGreaterThanOrEqual(8 - 0.5);
+		expect(gaps.proseToGroup).toBeLessThanOrEqual(8 + 0.5);
+		expect(gaps.insideGroup).toBeGreaterThanOrEqual(4 - 0.5);
+		expect(gaps.insideGroup).toBeLessThanOrEqual(4 + 0.5);
 	});
 });
 

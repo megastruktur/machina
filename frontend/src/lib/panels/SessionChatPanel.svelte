@@ -53,7 +53,11 @@
 	import Button from '../ui/Button.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
 	import { Virtualizer, type VirtualizerHandle } from 'virtua/svelte';
-	import { buildTurnUnits, type TurnUnit } from './turnGroups.js';
+	import {
+		buildTurnChildSegments,
+		buildTurnUnits,
+		type TurnUnit
+	} from './turnGroups.js';
 	import { tick, untrack } from 'svelte';
 
 	type EntryPayload = components['schemas']['SessionEntryView']['payload'];
@@ -570,16 +574,18 @@
 		}
 	}
 
-	/** A tool/delegation row whose outcome is NOT settled (open). */
-	function toolDisclosureOpen(
-		kind: 'tool_result' | 'delegation',
-		runId: string | null,
-		status: string
-	): boolean {
-		if (runId === null) return true; // fixture / out-of-run rows
-		if (kind === 'tool_result') return status !== 'executed';
-		return status !== 'succeeded';
-	}
+	/**
+	 * CTR-W3 disclosure defaults (C08 rule 6 honesty):
+	 *  - a tool_result whose outcome is NOT settled (denied /
+	 *    approval_required / unknown_effect) renders OPEN — an unproven
+	 *    outcome must stay visible without a click;
+	 *  - a settled (`executed`) result — and the fixture/out-of-run case
+	 *    (runId === null) — renders COLLAPSED: raw output no longer
+	 *    dumps into the chat flow, it is one click away;
+	 *  - a delegation always renders COLLAPSED behind a one-line
+	 *    summary (child run + status WORD) — its goal/result_summary
+	 *    live in the body and must never inflate the chat flow.
+	 */
 
 	/**
 	 * Decode a tool_result `output_preview` for display (M2):
@@ -707,7 +713,7 @@
 					}}
 				>
 					{#snippet children(unit: TurnUnit)}
-						{#snippet entryArticle(entry: ChannelEntry)}
+						{#snippet entryArticle(entry: ChannelEntry, suppressToolCalls = false)}
 						<article
 							class="mai-session-entry"
 							data-testid="session-entry"
@@ -743,11 +749,27 @@
 										</div>
 									</details>
 								{/if}
-								{#if entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
-									<!-- No hardcoded `open`: collapsed by default, matching
-								     the completed tool_result/delegation disclosures. -->
-									<details class="mai-tool-disclosure" data-testid="entry-tool-calls">
-										<summary>tool calls ({entry.payload.tool_calls.length})</summary>
+								{#if !suppressToolCalls && entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
+									<!-- CTR-W3: the standalone (ungrouped) declared-calls
+									     disclosure — summary lists the capabilities, no
+									     fabricated status (no result is in this window). In a
+									     turn group this is suppressed: the group's ONE
+									     tool-group disclosure carries capability + result
+									     status. No hardcoded `open`: collapsed by default. -->
+									<details
+										class="mai-tool-disclosure mai-tool-group"
+										data-testid="entry-tool-calls"
+									>
+										<summary class="mai-tool-group__summary">
+											<span class="mai-tool-group__label">
+												tool calls ({entry.payload.tool_calls.length})
+											</span>
+											{#each entry.payload.tool_calls as call (call.call_id)}
+												<span class="mai-tool-group__item">
+													<code>{call.capability_id}</code>
+												</span>
+											{/each}
+										</summary>
 										<ul class="mai-tool-disclosure__list">
 											{#each entry.payload.tool_calls as call (call.call_id)}
 												<li class="mai-tool-disclosure__item" data-testid="entry-tool-call">
@@ -762,7 +784,7 @@
 							<details
 								class="mai-tool-disclosure"
 								data-testid="entry-tool-result"
-								open={toolDisclosureOpen('tool_result', entry.run_id ?? null, entry.payload.status)}
+								open={entry.payload.status !== 'executed'}
 							>
 								<summary class="mai-tool-disclosure__summary">
 									<code>{entry.payload.capability_id}</code>
@@ -798,17 +820,26 @@
 								</div>
 							</details>
 						{:else if entry.payload.kind === 'delegation'}
+							<!-- CTR-W3: no `open` binding — ALWAYS collapsed by default.
+							     The one-line summary (child run + status WORD) is the
+							     whole visible card; goal/result_summary/error stay in
+							     the body behind one click (a live delegation card was
+							     measured at 1616px tall — it must never inflate the
+							     chat flow). Native <details> toggling still works. -->
 							<details
 								class="mai-tool-disclosure mai-tool-disclosure--delegation"
 								data-testid="entry-delegation"
-								open={toolDisclosureOpen('delegation', entry.run_id ?? null, entry.payload.status)}
 							>
 								<summary class="mai-tool-disclosure__summary">
 									<span class="mai-tool-disclosure__title">delegation</span>
+									<code class="mai-tool-disclosure__child" data-testid="delegation-child-id">
+										{entry.payload.child_run_id.slice(0, 8)}
+									</code>
 									<span
 										class="mai-tool-status"
 										class:mai-tool-status--warn={entry.payload.status === 'queued' || entry.payload.status === 'running'}
 										class:mai-tool-status--bad={entry.payload.status === 'failed'}
+										data-testid="tool-status-badge"
 									>
 										{entry.payload.status}
 									</span>
@@ -856,22 +887,66 @@
 						</article>
 						{/snippet}
 						{#if unit.kind === 'group'}
-							<!-- CTR-W2: one turn group = the assistant lead's prose at
-							     the base indent + its tool/delegation children 16px
-							     deeper, with the 1px rail spanning the group's full
-							     height on its left edge. A childless lead renders as a
-							     plain row — no rail, no group container. -->
+							<!-- CTR-W2/W3: one turn group = the assistant lead's prose at
+							     the base indent + its tool activity and delegations 16px
+							     deeper, with the 1px rail spanning the group's full height
+							     on its left edge. A childless lead renders as a plain row —
+							     no rail, no group container. CTR-W3: each run of tool
+							     results is ONE collapsed disclosure whose summary carries
+							     every capability + status WORD; raw outputs live inside. -->
+							{@const segments = buildTurnChildSegments(unit.lead, unit.children)}
+							{@const hasToolChildren = segments.some(
+								(segment) => segment.kind === 'tools'
+							)}
 							<div
 								class="mai-turn-group"
 								data-testid="turn-group"
 								data-turn-run-id={unit.runId}
 							>
-								{@render entryArticle(unit.lead)}
+								{@render entryArticle(unit.lead, hasToolChildren)}
 								<div class="mai-turn-group__children">
-									{#each unit.children as child (child.seq)}
-										<div class="mai-turn-group__child" data-testid="turn-group-child">
-											{@render entryArticle(child)}
-										</div>
+									{#each segments as segment, segmentIndex (segmentIndex)}
+										{#if segment.kind === 'tools'}
+											<!-- Open ONLY while some outcome is unproven (C08
+							     rule 6): a denied/unknown/approval-pending result must
+							     stay visible without a click; settled rounds collapse. -->
+											<details
+												class="mai-tool-disclosure mai-tool-group"
+												data-testid="turn-tool-group"
+												open={segment.entries.some(
+													(child) =>
+														child.payload.kind === 'tool_result' &&
+														child.payload.status !== 'executed'
+												)}
+											>
+												<summary class="mai-tool-group__summary">
+													<span class="mai-tool-group__label">tools</span>
+													{#each segment.summary as item, itemIndex (itemIndex)}
+														<span class="mai-tool-group__item">
+															<code>{item.capabilityId}</code>
+															<span
+																class="mai-tool-status"
+																class:mai-tool-status--warn={item.unsettled &&
+																	item.status !== 'denied'}
+																class:mai-tool-status--bad={item.status === 'denied'}
+																data-testid="tool-status-badge"
+															>
+																{item.status}
+															</span>
+														</span>
+													{/each}
+												</summary>
+												<div class="mai-tool-group__body">
+													{#each segment.entries as child (child.seq)}
+														{@render entryArticle(child)}
+													{/each}
+												</div>
+											</details>
+										{:else}
+											<div class="mai-turn-group__child" data-testid="turn-group-child">
+												{@render entryArticle(segment.entry)}
+											</div>
+										{/if}
 									{/each}
 								</div>
 							</div>
@@ -1000,6 +1075,25 @@
 		min-height: 0;
 		overflow: hidden;
 	}
+	/*
+	 * CTR rhythm scale (8px grid, PLAN §3.1) — the ONE place that owns
+	 * every vertical gap in the transcript:
+	 *   --mai-turn-gap        16px  user ↔ assistant turn boundary
+	 *   --mai-tool-gap         8px  assistant prose ↔ its own tool group
+	 *   --mai-call-gap         4px  inside a tool group (capability ↔
+	 *                                its result; tool group ↔ delegation)
+	 *   --mai-session-rhythm  12px  base gap for rows outside a turn
+	 *                                relation (orphan results/delegations,
+	 *                                compaction, control notes)
+	 * Plus the CTR-W3 group label size (13px / 600 — PLAN §3.2).
+	 */
+	.mai-session-chat {
+		--mai-turn-gap: 16px;
+		--mai-tool-gap: 8px;
+		--mai-call-gap: 4px;
+		--mai-session-rhythm: 12px;
+		--mai-tool-label-size: 0.8125rem;
+	}
 	.mai-session-chat__header {
 		display: flex;
 		flex-wrap: wrap;
@@ -1043,12 +1137,6 @@
 	}
 	/* ---- entries: a chat stream, not an audit table (S3) ---------------- */
 	.mai-session-entry {
-		/* CTR-W1: the ONE vertical-rhythm token — every consecutive
-		   transcript row keeps this visible content gap. W3 will
-		   differentiate the gap per row kind (turn boundary vs inside
-		   a tool group) starting from this token; do not fork the
-		   value. */
-		--mai-session-rhythm: 12px;
 		display: flex;
 		flex-direction: column;
 		/* The vertical rhythm lives HERE, as padding INSIDE virtua's
@@ -1058,10 +1146,32 @@
 		   margin would fall OUTSIDE the measured height and
 		   reintroduce the overlap; the wrapper itself must stay
 		   vertical-padding-free (see itemProps). box-sizing explicit:
-		   the padding must stay outside the declared content box. */
+		   the padding must stay outside the declared content box.
+		   CTR-W3: the VALUES live once on .mai-session-chat (the
+		   rhythm-scale token block above); the base gap applies to
+		   rows outside a turn relation, the kind rules below refine
+		   it per relation. */
 		padding-bottom: var(--mai-session-rhythm);
 		margin: 0;
 		box-sizing: content-box;
+	}
+	/* CTR-W3 per-relation gaps: a user or standalone-assistant row ends
+	   at a TURN boundary; a group lead's prose meets its own tool
+	   activity tighter. Specificity: the group override below beats
+	   these; the zero rules after it beat the base. */
+	.mai-session-entry[data-entry-kind='user_message'],
+	.mai-session-entry[data-entry-kind='assistant_message'] {
+		padding-bottom: var(--mai-turn-gap);
+	}
+	.mai-turn-group {
+		padding-bottom: var(--mai-turn-gap);
+	}
+	.mai-turn-group > .mai-session-entry[data-entry-kind='assistant_message'] {
+		padding-bottom: var(--mai-tool-gap);
+	}
+	.mai-turn-group__child .mai-session-entry,
+	.mai-tool-group__body .mai-session-entry {
+		padding-bottom: 0;
 	}
 	/* ---- turn groups (CTR-W2): an assistant turn + its children ---- */
 	.mai-turn-group {
@@ -1080,13 +1190,43 @@
 		width: 1px;
 		background: var(--mai-color-border, rgba(0, 0, 0, 0.25));
 	}
-	/* Children (tool results, delegations) sit --mai-space-4 (16px)
+	/* Children (tool groups, delegations) sit --mai-space-4 (16px)
 	   deeper than the group's content edge, so the parent/child
-	   relation reads at a glance. W3 may differentiate per child kind. */
+	   relation reads at a glance. CTR-W3: the 4px gap between sibling
+	   children IS the "inside a tool group" rhythm step. */
 	.mai-turn-group__children {
 		display: flex;
 		flex-direction: column;
+		gap: var(--mai-call-gap);
 		padding-left: var(--mai-space-4, 16px);
+	}
+	/* ---- CTR-W3: the collapsed tool group + typed summary --------------- */
+	.mai-tool-group__summary {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-2, 8px);
+		align-items: baseline;
+	}
+	.mai-tool-group__label {
+		font-size: var(--mai-tool-label-size, 0.8125rem);
+		font-weight: 600;
+	}
+	.mai-tool-group__item {
+		display: inline-flex;
+		flex-wrap: wrap;
+		gap: var(--mai-space-1, 4px);
+		align-items: baseline;
+	}
+	.mai-tool-group__body {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-call-gap);
+		padding: 2px 0 2px 10px;
+	}
+	/* Delegation one-line summary: the short child-run id sits next to
+	   the title (the FULL id stays in the collapsed body). */
+	.mai-tool-disclosure__child {
+		font-size: var(--mai-text-xs, 0.75rem);
 	}
 	.mai-session-entry__text {
 		margin: 0;
