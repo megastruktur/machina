@@ -42,6 +42,7 @@ import ast
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import uuid
@@ -56,6 +57,7 @@ from mai.agents.session_delegate import (
     SESSION_DELEGATE_TOOL_NAME,
     aplan_session_delegation,
     adescendant_count,
+    bounded_child_summary_document,
     child_run_id_for,
     delegate_tool_json_schema,
     narrow_child_capabilities,
@@ -69,7 +71,11 @@ from mai.agents.session_runner import (
     _plan_delegation,
     parse_session_run_intent,
 )
-from mai.contracts.sessions import SessionContractError, SessionSourceKind
+from mai.contracts.sessions import (
+    MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    SessionContractError,
+    SessionSourceKind,
+)
 from mai.jobs.engine import EngineClient
 from mai.policy.evaluate import ParentScope, execution_context_from_json
 from mai.session_store import acreate_run, acreate_session
@@ -1591,6 +1597,78 @@ def test_delegate_arguments_bounds_fail_closed() -> None:
     schema = delegate_tool_json_schema()
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(_delegate_args())
+
+
+# ---------------------------------------------------------------------------
+# 4b. bounded child summary document (pure): JSON preview-budget guarantee
+# ---------------------------------------------------------------------------
+
+
+def test_bounded_child_summary_truncates_within_json_preview_budget() -> None:
+    """A >5000-char Cyrillic summary with newlines and quotes serializes to
+    a JSON document that ALWAYS fits ``MAX_TOOL_OUTPUT_PREVIEW_CHARS`` and
+    parses back with all four keys — the runner's
+    ``preview[:MAX_TOOL_OUTPUT_PREVIEW_CHARS]`` slice can never cut the
+    document mid-string."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-child")
+    body = 'Резюме подзадачи: "шаг выполнен"\nИтог: "готово".\n' * 120
+    assert len(body) > 5000
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="succeeded",
+        summary_text=body,
+        error_code=None,
+    )
+    serialized = json.dumps(document, ensure_ascii=False)
+    assert len(serialized) <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    parsed = json.loads(serialized)
+    assert set(parsed) == {"child_run_id", "status", "summary", "error_code"}
+    assert parsed["child_run_id"] == str(child_run_id)
+    assert parsed["status"] == "succeeded"
+    assert parsed["error_code"] is None
+    # Explicit, honest truncation marker at the END of the kept prefix.
+    assert re.search(r"\[truncated: \d+ chars omitted\]$", parsed["summary"])
+    assert parsed["summary"].startswith("Резюме подзадачи")
+
+
+def test_bounded_child_summary_short_summary_is_untouched() -> None:
+    """A short summary passes through untruncated (no marker) and still
+    round-trips within the preview budget."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-short")
+    summary_text = "Готово: сервис перезапущен.\nПроверка пройдена."
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="failed",
+        summary_text=summary_text,
+        error_code="child_failed",
+    )
+    assert document["summary"] == summary_text
+    assert "truncated" not in document["summary"]
+    serialized = json.dumps(document, ensure_ascii=False)
+    assert len(serialized) <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    assert json.loads(serialized) == document
+
+
+def test_bounded_child_summary_without_summary_text_round_trips() -> None:
+    """A missing child summary yields an empty ``summary`` field and the
+    document still serializes within the preview budget."""
+    child_run_id = uuid.uuid5(uuid.NAMESPACE_URL, "dwf-s1-none")
+    document = bounded_child_summary_document(
+        child_run_id=child_run_id,
+        child_status="timeout",
+        summary_text=None,
+        error_code="delegation_timeout",
+    )
+    assert document == {
+        "child_run_id": str(child_run_id),
+        "status": "timeout",
+        "summary": "",
+        "error_code": "delegation_timeout",
+    }
+    assert (
+        len(json.dumps(document, ensure_ascii=False))
+        <= MAX_TOOL_OUTPUT_PREVIEW_CHARS
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ from mai.contracts.sessions import (
     MAX_DELEGATION_TIMEOUT_SECONDS,
     MAX_DELEGATION_TOOL_CALLS,
     MAX_SUMMARY_TEXT_CHARS,
+    MAX_TOOL_OUTPUT_PREVIEW_CHARS,
     DelegationSpec,
     EntryKind,
     SessionContractError,
@@ -108,6 +109,12 @@ _CHILD_ID_NAMESPACE: Final[uuid.UUID] = uuid.UUID(
 #: Bounded child-summary char budget (the parent's tool result preview).
 _CHILD_SUMMARY_MAX_CHARS: Final[int] = MAX_SUMMARY_TEXT_CHARS
 
+#: The explicit truncation suffix inside a cut child summary (wire honesty:
+#: the parent can always tell the preview was shortened, and by how much).
+_CHILD_SUMMARY_TRUNCATION_MARKER: Final[str] = (
+    "[truncated: {omitted} chars omitted]"
+)
+
 #: Ancestor/descendant walk guard (bounded, fail-closed).
 _MAX_WALK_DEPTH: Final[int] = 8
 
@@ -137,7 +144,10 @@ def delegate_tool_json_schema() -> dict[str, object]:
                 "minLength": 1,
                 "maxLength": _MAX_GOAL_CHARS,
                 "description": (
-                    "Bounded explicit goal handed to the child execution"
+                    "Bounded explicit goal for the INTERNAL subordinate child"
+                    " run of the CURRENT Machina session: executed on the SAME"
+                    " server with a narrowed subset of this run's"
+                    " allowed_capabilities; never an external agent/profile"
                 ),
             },
             "context_refs": {
@@ -187,6 +197,9 @@ def build_deferring_delegate_tool() -> PydanticTool:
     step performs the delegation, exactly like the capability tools
     (C06 rule 4 — deferral is a transport mechanism, never an
     authorization boundary). A child surface NEVER receives this tool.
+    The child is an INTERNAL subordinate run of the current Machina
+    session (same server, narrowed capability subset) — never an
+    external agent/profile invocation.
     """
 
     def _defer(**_payload: Any) -> Any:
@@ -196,8 +209,12 @@ def build_deferring_delegate_tool() -> PydanticTool:
         _defer,
         name=SESSION_DELEGATE_TOOL_NAME,
         description=(
-            "Delegate a bounded sub-task to a real child execution with "
-            "narrowed authority; returns a bounded child summary."
+            "Delegate a bounded sub-task to an INTERNAL subordinate child"
+            " run of the current Machina session: a real child execution on"
+            " the SAME server with a NARROWED subset of this run's"
+            " allowed_capabilities. It never contacts external agent systems"
+            " or profiles (e.g. Hermes profiles) or other servers; returns a"
+            " bounded child summary."
         ),
         json_schema=delegate_tool_json_schema(),
     )
@@ -807,15 +824,65 @@ def bounded_child_summary_document(
     summary_text: str | None,
     error_code: str | None,
 ) -> dict[str, object]:
-    """The bounded, redacted parent-facing summary document."""
+    """The bounded, redacted parent-facing summary document.
+
+    GUARANTEE: ``json.dumps(document, ensure_ascii=False)`` NEVER exceeds
+    ``MAX_TOOL_OUTPUT_PREVIEW_CHARS`` characters. The runner settles the
+    delegation with ``preview[:MAX_TOOL_OUTPUT_PREVIEW_CHARS]``, so an
+    oversized document would be cut mid-string and hand the parent
+    unparseable JSON. Redaction runs FIRST (a cut can never split a
+    secret); when the redacted summary must be shortened to fit the
+    serialized budget, an explicit ``[truncated: N chars omitted]``
+    suffix ends the ``summary`` field and the kept prefix shrinks until
+    the escaped JSON fits (escaping — ``\\n``, ``\\"``, ``\\\\`` — can
+    double a character's serialized width, so the fit is checked on the
+    serialized document, never on the raw character count).
+    """
     safe_summary = ""
     if summary_text:
         safe_summary = project_text(
             redact_text(summary_text), max_chars=_CHILD_SUMMARY_MAX_CHARS
         )
+
+    def document(summary: str) -> dict[str, object]:
+        return {
+            "child_run_id": str(child_run_id),
+            "status": child_status,
+            "summary": summary,
+            "error_code": error_code,
+        }
+
+    def serialized(summary: str) -> str:
+        return json.dumps(document(summary), ensure_ascii=False)
+
+    summary = safe_summary
+    if len(serialized(summary)) > MAX_TOOL_OUTPUT_PREVIEW_CHARS:
+        # The JSON wrapper (keys, run id, status, error code) plus escaping
+        # pushes the document over the preview budget: cut the kept prefix
+        # until body + explicit truncation marker serialize within budget.
+        keep = len(safe_summary)
+        while True:
+            omitted = len(safe_summary) - keep
+            marker = (
+                "\n" + _CHILD_SUMMARY_TRUNCATION_MARKER.format(omitted=omitted)
+            )
+            overshoot = (
+                len(serialized(safe_summary[:keep] + marker))
+                - MAX_TOOL_OUTPUT_PREVIEW_CHARS
+            )
+            if overshoot <= 0:
+                summary = safe_summary[:keep] + marker
+                break
+            # JSON string escaping is per-character, so every removed
+            # character frees at least one serialized character: ``keep``
+            # strictly decreases and the loop reaches a fitting document
+            # (at ``keep == 0`` the fixed overhead + marker alone is far
+            # below the budget).
+            keep = max(0, keep - overshoot)
+
     return {
         "child_run_id": str(child_run_id),
         "status": child_status,
-        "summary": safe_summary[:_CHILD_SUMMARY_MAX_CHARS],
+        "summary": summary,
         "error_code": error_code,
     }
