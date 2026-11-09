@@ -69,8 +69,15 @@ from mai.api.auth import (
     _require_session,
     render_error_envelope,
 )
+from mai.api.capability_defaults import (
+    dedup_preserving_order,
+    plugin_capability_ids,
+    resolve_default_capabilities,
+)
 from mai.api.history_tags import EntityTagView
 from mai.auth.sessions import hash_token
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
+from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.contracts.session_channel import (
     CHANNEL_PROTOCOL_VERSION,
     MAX_CHANNEL_SNAPSHOT_ENTRIES,
@@ -111,6 +118,7 @@ from mai.contracts.sessions import (
     UserMessageEntry,
 )
 from mai.contracts.tags import EntityTagPreview, EntityTagPreviewView
+from mai.policy.config import GrantConfigStore
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.session_channel import (
     SessionChannelHub,
@@ -155,6 +163,60 @@ _REPLAY_PAGE_BUDGET: Final[int] = 20
 
 #: General Consult: the zero server UUID has no profile binding.
 _GENERAL_SERVER: Final[uuid.UUID] = uuid.UUID(int=0)
+
+#: Capabilities the worker's grant bootstrap never auto-grants to the
+#: General pseudo-server (``jobs/worker.py`` ``_read_grants``): host
+#: effects, document retrieval and the HTTP service probe reach a server
+#: only through its profile or an explicit grant-store entry, and the
+#: pseudo-server has neither unless the grant store names it.
+_GENERAL_EXCLUDED_AUTO_CAPABILITIES: Final[frozenset[str]] = frozenset(
+    {
+        "host.shell",
+        "host.file_read",
+        "host.logs",
+        "docs.retrieve",
+        "service.http",
+    }
+)
+
+
+def _general_consult_capabilities(request: Request) -> tuple[str, ...]:
+    """The General Consult pseudo-server's admitted capability surface,
+    kept in exact parity with the worker's auto-grant bootstrap
+    (``jobs/worker.py`` ``_read_grants`` enrols the zero UUID):
+    explicit grant-store entries naming the pseudo-server, enabled
+    GLOBAL plugin bindings, the internal-API and history-tag
+    vocabularies, and controller-side web research. Unlike
+    :func:`resolve_default_capabilities` (the server-chat and runbook
+    admission resolver), the built-in controller defaults
+    (``docs.retrieve``/``service.http``/``host.logs``) and every host
+    surface are withheld unless the grant store explicitly names the
+    pseudo-server. Degradations mirror the worker: an unusable store
+    contributes nothing — never an error, never a widening."""
+    explicit: list[str] = []
+    grants_store = getattr(request.app.state, "grants", None)
+    if isinstance(grants_store, GrantConfigStore):
+        try:
+            for capability_id, servers in grants_store.read().grants.items():
+                if _GENERAL_SERVER in servers:
+                    explicit.append(capability_id)
+        except Exception:
+            pass
+    resolved = list(explicit)
+    resolved.extend(
+        plugin_capability_ids(
+            getattr(request.app.state, "plugins", None), _GENERAL_SERVER
+        )
+    )
+    resolved.extend(INTERNAL_API_CAPABILITY_IDS)
+    resolved.extend(TAGS_CAPABILITY_IDS)
+    resolved.extend(("web.search", "web.read"))
+    return tuple(
+        capability_id
+        for capability_id in dedup_preserving_order(resolved)
+        if capability_id not in _GENERAL_EXCLUDED_AUTO_CAPABILITIES
+        or capability_id in explicit
+    )
 
 
 # --- shared helpers ------------------------------------------------------------------
@@ -356,34 +418,33 @@ def _profile_binding(
     request: Request, server_id: uuid.UUID
 ) -> tuple[int, int, tuple[str, ...]]:
     """``(profile_revision, prompt_revision, capabilities)`` from the
-    canonical profile; the profile-less General Consult scope pins
-    revisions to 1 with no capabilities. An unusable source degrades to
-    fewer capabilities — never an error."""
+    canonical profile, resolved through the SAME reviewed default
+    resolver as runbook admission (:func:`resolve_default_capabilities`):
+    grant-store grants, the canonical profile's capabilities, enabled
+    per-server AND global plugin bindings, the internal-API surface and
+    the built-in controller defaults — deduplicated in that documented
+    order. The profile-less General Consult scope pins revisions to 1
+    and admits the worker pseudo-server grant surface instead
+    (:func:`_general_consult_capabilities`). An unusable source degrades
+    to fewer capabilities — never an error."""
     if server_id == _GENERAL_SERVER:
-        return 1, 1, ()
+        return 1, 1, _general_consult_capabilities(request)
     store = getattr(request.app.state, "profiles", None)
     if store is None:
-        return 1, 1, ()
+        return 1, 1, tuple(
+            resolve_default_capabilities(request, server_id, ())
+        )
     try:
         stored = store.read(server_id)
     except Exception:
-        return 1, 1, ()
+        return 1, 1, tuple(
+            resolve_default_capabilities(request, server_id, ())
+        )
     from mai.contracts.server import parse_server_profile_text
 
     profile = parse_server_profile_text(stored.text)
-    grants_store = getattr(request.app.state, "grants", None)
-    granted: set[str] = set()
-    if grants_store is not None:
-        try:
-            for capability_id, servers in grants_store.read().grants.items():
-                if server_id in servers:
-                    granted.add(capability_id)
-        except Exception:
-            pass
     capabilities = tuple(
-        dict.fromkeys(
-            cap for cap in (*profile.capabilities, *sorted(granted)) if cap
-        )
+        resolve_default_capabilities(request, server_id, profile.capabilities)
     )
     return int(stored.revision), int(profile.prompt_revision), capabilities
 
@@ -651,7 +712,7 @@ async def submit_turn(
     # the retained execution facade (job_runs depth 0 + the mandatory
     # classification) in ONE transaction BEFORE the enqueue, with the SAME
     # binding the frozen intent carries — no fabricated revisions, no
-    # widened grants (requested_grants are exactly the profile-bound
+    # widened grants (requested_grants are exactly the resolved admission
     # capabilities the context authorizes).
     model_profile = payload.model_profile or "default"
     await acreate_root_run(

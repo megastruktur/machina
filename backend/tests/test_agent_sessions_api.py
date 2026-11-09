@@ -1487,12 +1487,18 @@ async def test_resolved_capabilities_deduplicate_in_documented_order(
         expected_revision=0,
     )
     admitted = _profile_capabilities(app_fixture, SERVER_A)
+    # web.search and host.logs recur in BUILTIN_DEFAULT_CAPABILITIES but
+    # first occurrence wins: they stay at their grant-store positions and
+    # collapse OUT of the built-in tail.
     assert admitted == (
         "host.logs",
         "web.search",
         "files.read",
         *INTERNAL_API_CAPABILITY_IDS,
-        *BUILTIN_DEFAULT_CAPABILITIES,
+        "docs.retrieve",
+        "web.read",
+        "service.http",
+        *TAGS_CAPABILITY_IDS,
     )
     assert len(set(admitted)) == len(admitted)
 
@@ -1574,12 +1580,14 @@ async def test_server_bridge_exposes_only_registered_admitted_tools(
         dispatcher=_fixture_dispatcher(registry),
         context=context,
     )
-    # host.shell: granted AND registered → exposed. secret.list and
-    # app.discover: registered but the admission never grants/binds them
-    # here (no plugin binding, no explicit grant) → NOT exposed.
-    assert bridge.enabled_capabilities == ("host.shell",)
+    # host.shell: granted AND registered → exposed (grant-store first).
+    # app.discover: ALWAYS in the internal-API admission vocabulary AND
+    # registered here → exposed. secret.list: registered but never
+    # bound/granted for SERVER_A → NOT exposed.
+    assert bridge.enabled_capabilities == ("host.shell", "app.discover")
     assert [tool.name for tool in bridge.tools] == [
-        tool_name_for("host.shell")
+        tool_name_for("host.shell"),
+        tool_name_for("app.discover"),
     ]
 
 
