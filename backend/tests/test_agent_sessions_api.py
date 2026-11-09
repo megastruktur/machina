@@ -35,12 +35,40 @@ import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
+from starlette.requests import Request as StarletteRequest
 from starlette.testclient import TestClient
 
+from mai.agents.tools import CapabilityToolBridge, tool_name_for
+from mai.api.agent_sessions import _profile_binding
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.api.capability_defaults import BUILTIN_DEFAULT_CAPABILITIES
+from mai.capabilities.dispatch import (
+    CapabilityCall,
+    CapabilityDispatcher,
+    ExecutorResult,
+)
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
+from mai.capabilities.host_shell import descriptor as host_shell_descriptor
+from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.contracts.sessions import EntryKind, SessionSourceKind, UserMessageEntry
+from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
+from mai.plugins.builtin_onepassword import (
+    CONFIG_SCHEMA as ONEPASSWORD_CONFIG_SCHEMA,
+    PLUGIN_NAME as ONEPASSWORD_PLUGIN,
+    SECRET_GET_CAPABILITY,
+    SECRET_LIST_CAPABILITY,
+    SECRET_STORE_CAPABILITY,
+)
+from mai.plugins.registry import CapabilityRegistry, parse_descriptor
+from mai.policy.approvals import ApprovalStore
+from mai.policy.evaluate import (
+    ExecutionContext,
+    Policy,
+    PolicyMode,
+    effective_child_grants,
+)
 from mai.session_store import aappend_entry, acreate_run
 from mai.contracts.server import SCHEMA_VERSION
 from mai.tag_store import RESERVED_UNCLASSIFIED_TAG_ID
@@ -457,12 +485,28 @@ async def test_turn_admission_creates_execution_facade_with_real_binding(
 ) -> None:
     """S2 (queued-chat hotfix): the admitted root run carries the retained
     execution facade atomically — job_runs depth 0 with the REAL profile
-    binding (never fabricated 1/1) and exactly the profile-bound
-    capabilities as requested_grants (no widening), plus the mandatory
-    classification. Replay mutates nothing; a cross-server attempt writes
-    nothing."""
+    binding (never fabricated 1/1) and exactly the RESOLVED admission set
+    (CAP-1: grant-store grants + profile capabilities + internal API +
+    built-in defaults, deduplicated) as requested_grants (no widening),
+    plus the mandatory classification. Replay mutates nothing; a
+    cross-server attempt writes nothing."""
     import psycopg
     from psycopg.rows import dict_row
+
+    # A normal grant-store entry naming SERVER_A: the resolved admission
+    # set must include it ahead of the profile capabilities.
+    app_fixture.state.grants.write(
+        {
+            "policy": {"revision": 1, "denied_capabilities": []},
+            "grants": [
+                {
+                    "capability_id": "host.shell",
+                    "server_ids": [str(SERVER_A)],
+                }
+            ],
+        },
+        expected_revision=0,
+    )
 
     # A real server profile: revision 2 (created, then updated),
     # prompt_revision 3, two capabilities — deliberately distinct values
@@ -545,8 +589,21 @@ capabilities:
         assert facade["profile_revision"] == 2  # the stored profile revision
         assert facade["prompt_revision"] == 3  # the document's prompt revision
         assert facade["model_profile"] == "primary"
-        # No widening: exactly the profile-bound capabilities, sorted.
-        assert facade["requested_grants"] == ["files.read", "shell.exec"]
+        # No widening: exactly the RESOLVED admission set. Documented
+        # resolver dedup order: grant-store grants first (canonical
+        # sorted order), then the profile capability slugs, then the
+        # internal-API vocabulary, then the built-in defaults. The
+        # facade persists the same set in the store's canonical sorted
+        # form (json.dumps(sorted(...))).
+        admitted = _profile_capabilities(app_fixture, SERVER_A)
+        assert admitted == (
+            "host.shell",
+            "shell.exec",
+            "files.read",
+            *INTERNAL_API_CAPABILITY_IDS,
+            *BUILTIN_DEFAULT_CAPABILITIES,
+        )
+        assert facade["requested_grants"] == sorted(admitted)
         assert len(tags) == 1  # the 0011 mandatory classification
         assert tags[0]["tag_id"] == uuid.UUID(RESERVED_UNCLASSIFIED_TAG_ID)
         assert tags[0]["assignment_source"] == "system"
@@ -592,7 +649,7 @@ capabilities:
         assert facade2["profile_revision"] == 2
         assert facade2["prompt_revision"] == 3
         assert facade2["model_profile"] == "primary"
-        assert facade2["requested_grants"] == ["files.read", "shell.exec"]
+        assert facade2["requested_grants"] == sorted(admitted)
 
         # Cross-server scope: the session stays value-free absent for
         # server B and NOTHING is admitted through the wrong scope.
@@ -1072,3 +1129,478 @@ async def test_openapi_route_presence(app_fixture: FastAPI) -> None:
     assert "/api/v1/agent-sessions/{session_id}/control" in paths
     # D09: the old chat surface is GONE — no /api/v1/chat/** route remains.
     assert not any(path.startswith("/api/v1/chat") for path in paths)
+
+
+# ---------------------------------------------------------------------------
+# 8. capability restoration (CAP-1): admission resolver parity + bridge
+# ---------------------------------------------------------------------------
+
+#: General Consult: the zero server UUID (the worker's pseudo-server).
+GENERAL_SERVER = uuid.UUID(int=0)
+
+
+def _profile_capabilities(
+    app: FastAPI, server_id: uuid.UUID
+) -> tuple[str, ...]:
+    """The admission helper's resolved capability tuple for one scope,
+    in the documented dedup order."""
+    request = StarletteRequest({"type": "http", "app": app})
+    _, _, capabilities = _profile_binding(request, server_id)
+    return capabilities
+
+
+def _write_onepassword_config(store: Any, *, enabled: bool) -> None:
+    """Synthetic onepassword connection config (fixture vault names only,
+    no production configuration and no secret values)."""
+    store.write_config(
+        ONEPASSWORD_PLUGIN,
+        (
+            "schema_version: 1\n"
+            f'plugin: "{ONEPASSWORD_PLUGIN}"\n'
+            f"enabled: {'true' if enabled else 'false'}\n"
+            "credential_refs:\n"
+            '  - "OP_SERVICE_ACCOUNT_TOKEN"\n'
+            'config: {"default_vault": "fixture-vault", '
+            '"allowed_vaults": ["fixture-vault"]}\n'
+        ),
+        expected_revision=0,
+        config_schema=ONEPASSWORD_CONFIG_SCHEMA,
+    )
+
+
+def _bind_capabilities(
+    store: Any, server_id: uuid.UUID, capabilities: tuple[str, ...]
+) -> None:
+    """One synthetic plugin grant binding for the fixture plugin."""
+    caps_yaml = "\n".join(f'  - "{cap}"' for cap in capabilities)
+    store.write_binding(
+        ONEPASSWORD_PLUGIN,
+        server_id,
+        (
+            "schema_version: 1\n"
+            f'plugin: "{ONEPASSWORD_PLUGIN}"\n'
+            f'server_id: "{server_id}"\n'
+            "capabilities:\n"
+            f"{caps_yaml}\n"
+        ),
+        expected_revision=0,
+    )
+
+
+def _grant(
+    server_ids: list[uuid.UUID], capability_id: str
+) -> dict[str, object]:
+    return {
+        "capability_id": capability_id,
+        "server_ids": [str(sid) for sid in server_ids],
+    }
+
+
+def _write_grants(store: Any, entries: list[dict[str, object]]) -> None:
+    """One synthetic grant-store revision below the fixture data root."""
+    store.write(
+        {
+            "policy": {"revision": 1, "denied_capabilities": []},
+            "grants": entries,
+        },
+        expected_revision=0,
+    )
+
+
+def _profile_yaml(
+    server_id: uuid.UUID, name: str, capabilities: tuple[str, ...]
+) -> str:
+    caps_yaml = "\n".join(f"  - {cap}" for cap in capabilities)
+    return f"""\
+schema_version: {SCHEMA_VERSION}
+server_id: "{server_id}"
+name: "{name}"
+prompt_revision: 3
+environment: linux_ssh
+ssh:
+  host: "198.51.100.10"
+  port: 22
+  user: "deploy"
+  host_key: "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
+  credential_ref: "MAI_SSH_KEY_BUILD_HOST"
+privilege: none
+capabilities:
+{caps_yaml}
+"""
+
+
+def _turn(
+    client: TestClient,
+    jar: dict[str, str],
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Admit one user turn through the REAL API route."""
+    response = client.post(
+        f"/api/v1/agent-sessions/{session_id}/turns",
+        params={"server_id": str(server_id)},
+        json={
+            "session_id": str(session_id),
+            "text": "exercise the capability seam",
+            "client_request_id": str(uuid.uuid4()),
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert response.status_code in (200, 201), response.text
+    return response.json()
+
+
+def _facade_grants(migrated_url: str, run_id: uuid.UUID) -> list[str]:
+    """The persisted job facade's requested_grants (the durable truth)."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT requested_grants FROM job_runs WHERE run_id = %s",
+            (run_id,),
+        ).fetchone()
+    assert row is not None, "the admitted run must persist the facade"
+    return row["requested_grants"]
+
+
+def _bridge_descriptor(identifier: str) -> dict[str, object]:
+    """A registry-shaped read descriptor for a non-plugin capability."""
+    return {
+        "identifier": identifier,
+        "version": "1.0.0",
+        "config_schema": None,
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [],
+            "properties": {},
+        },
+        "output_schema": {"type": "object"},
+        "execution_environments": ["controller"],
+        "effect_class": "read",
+        "resource_scope": [],
+        "required_grants": [],
+    }
+
+
+def _refusing_executor():
+    async def _execute(call: CapabilityCall) -> ExecutorResult:
+        raise AssertionError(f"executor invoked for a surface test: {call}")
+
+    return _execute
+
+
+def _fixture_dispatcher(registry: CapabilityRegistry) -> CapabilityDispatcher:
+    """A real dispatcher over a never-dialed approval store; only the
+    bridge's tool-surface composition is under test here."""
+    _, sessions = create_app_engine(
+        "postgresql://unused:unused@127.0.0.1:1/unused"
+    )
+
+    def _unused_env() -> EnvResolver:
+        import tempfile
+
+        path = Path(tempfile.mkdtemp()) / "fixture.env"
+        path.write_text("# fixture env: no secrets\n")
+        return EnvResolver(path)
+
+    return CapabilityDispatcher(
+        registry=registry,
+        approvals=ApprovalStore(sessions),
+        grants=lambda: {},
+        policy=lambda: Policy(revision=1, denied_capabilities=frozenset()),
+        adopted=lambda server_id: True,
+        credentials=_unused_env,
+        executor=_refusing_executor(),
+        output_budget_bytes=64 * 1024,
+    )
+
+
+async def test_general_consult_surface_matches_worker_pseudo_server_grants(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """General Consult must admit the worker pseudo-server grant surface
+    (worker.py ``_read_grants`` enrols the zero UUID): an enabled GLOBAL
+    plugin binding exposes its capabilities, alongside the internal-API,
+    history-tag and web-research vocabularies — and NEVER the built-in
+    server defaults (docs.retrieve, service.http, host.*) that the worker
+    never auto-grants to the pseudo-server. The route freezes exactly the
+    resolved tuple into the persisted job facade."""
+    _write_onepassword_config(app_fixture.state.plugins, enabled=True)
+    _bind_capabilities(
+        app_fixture.state.plugins,
+        GENERAL_SERVER,
+        ("secret.get", "secret.list"),
+    )
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, GENERAL_SERVER)
+        session_id = uuid.UUID(created["session_id"])
+        body = _turn(client, jar, session_id, GENERAL_SERVER)
+        persisted = _facade_grants(migrated_url, uuid.UUID(body["run_id"]))
+
+        admitted = _profile_capabilities(app_fixture, GENERAL_SERVER)
+        # Documented dedup order: explicit grants (none), then binding
+        # capability order, then internal API, then tags, then web
+        # research — deduplicated, General's profile tuple stays ().
+        assert admitted == (
+            "secret.get",
+            "secret.list",
+            *INTERNAL_API_CAPABILITY_IDS,
+            *TAGS_CAPABILITY_IDS,
+            "web.search",
+            "web.read",
+        )
+        assert len(set(admitted)) == len(admitted)
+        assert not (
+            {"docs.retrieve", "service.http", "host.logs", "host.shell",
+             "host.file_read"}
+            & set(admitted)
+        )
+        # The route froze EXACTLY this tuple: the facade stores the same
+        # set, sorted by the store's canonical json.dumps(sorted(...)).
+        assert persisted == sorted(admitted)
+
+
+async def test_server_chat_resolves_grants_profile_and_both_binding_scopes(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """Server chat admits grant-store grants + profile capabilities +
+    BOTH binding scopes (server-specific AND global) + the same reviewed
+    defaults as runbook admission, in the documented dedup order. A
+    cross-server binding and another server's profile never leak."""
+    plugins = app_fixture.state.plugins
+    _write_onepassword_config(plugins, enabled=True)
+    _bind_capabilities(plugins, GENERAL_SERVER, ("secret.list",))
+    _bind_capabilities(plugins, SERVER_A, ("secret.get",))
+    _write_grants(app_fixture.state.grants, [_grant([SERVER_A], "host.shell")])
+    app_fixture.state.profiles.write(
+        SERVER_A,
+        _profile_yaml(SERVER_A, "binding-scope", ("shell.exec", "files.read")),
+        expected_revision=0,
+    )
+
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        a_session = uuid.UUID(
+            _create_session(client, jar, SERVER_A)["session_id"]
+        )
+        b_session = uuid.UUID(
+            _create_session(client, jar, SERVER_B)["session_id"]
+        )
+
+        a_admitted = _profile_capabilities(app_fixture, SERVER_A)
+        assert a_admitted == (
+            "host.shell",
+            "shell.exec",
+            "files.read",
+            "secret.list",
+            "secret.get",
+            *INTERNAL_API_CAPABILITY_IDS,
+            *BUILTIN_DEFAULT_CAPABILITIES,
+        )
+        b_admitted = _profile_capabilities(app_fixture, SERVER_B)
+        assert "secret.get" not in b_admitted  # server-A binding never leaks
+        assert "shell.exec" not in b_admitted  # server A's profile not B's
+        assert "secret.list" in b_admitted  # the GLOBAL binding does
+
+        a_persisted = _facade_grants(
+            migrated_url,
+            uuid.UUID(_turn(client, jar, a_session, SERVER_A)["run_id"]),
+        )
+        b_persisted = _facade_grants(
+            migrated_url,
+            uuid.UUID(_turn(client, jar, b_session, SERVER_B)["run_id"]),
+        )
+        assert a_persisted == sorted(a_admitted)
+        assert b_persisted == sorted(b_admitted)
+        assert "secret.get" not in b_persisted
+        assert "host.shell" not in b_persisted
+
+
+async def test_disabled_plugin_binding_fails_closed(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """A stored-but-DISABLED plugin contributes nothing to any admitted
+    surface, even with a standing global grant binding."""
+    _write_onepassword_config(app_fixture.state.plugins, enabled=False)
+    _bind_capabilities(
+        app_fixture.state.plugins, GENERAL_SERVER, ("secret.list",)
+    )
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, GENERAL_SERVER)
+        session_id = uuid.UUID(created["session_id"])
+        body = _turn(client, jar, session_id, GENERAL_SERVER)
+        persisted = _facade_grants(migrated_url, uuid.UUID(body["run_id"]))
+        admitted = _profile_capabilities(app_fixture, GENERAL_SERVER)
+        assert "secret.list" not in admitted
+        assert "secret.list" not in persisted
+        assert "secret.get" not in admitted
+
+
+async def test_general_excludes_host_surface_unless_explicitly_granted(
+    app_fixture: FastAPI, migrated_url: str
+) -> None:
+    """Worker parity (plan §A): a global PLUGIN binding naming a host
+    capability does NOT admit it for the pseudo-server; only an explicit
+    GRANT-STORE entry naming the zero UUID re-includes it."""
+    plugins = app_fixture.state.plugins
+    _write_onepassword_config(plugins, enabled=True)
+    _bind_capabilities(plugins, GENERAL_SERVER, ("host.shell",))
+    _write_grants(
+        app_fixture.state.grants,
+        [_grant([GENERAL_SERVER], "docs.retrieve")],
+    )
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        created = _create_session(client, jar, GENERAL_SERVER)
+        session_id = uuid.UUID(created["session_id"])
+        body = _turn(client, jar, session_id, GENERAL_SERVER)
+        persisted = _facade_grants(migrated_url, uuid.UUID(body["run_id"]))
+        admitted = _profile_capabilities(app_fixture, GENERAL_SERVER)
+        # The explicit grant-store entry re-includes docs.retrieve first.
+        assert admitted[0] == "docs.retrieve"
+        assert "docs.retrieve" in persisted
+        # The plugin-bound host capability stays excluded for General.
+        assert "host.shell" not in admitted
+        assert "host.shell" not in persisted
+
+
+async def test_resolved_capabilities_deduplicate_in_documented_order(
+    app_fixture: FastAPI,
+) -> None:
+    """The resolver's documented order: grant-store entries first
+    (canonical sorted order), then profile capabilities, then plugin
+    bindings, then the internal API and the built-in defaults — first
+    occurrence wins, so built-in duplicates collapse into the earlier
+    source's position."""
+    _write_grants(
+        app_fixture.state.grants,
+        [_grant([SERVER_A], "web.search"), _grant([SERVER_A], "host.logs")],
+    )
+    app_fixture.state.profiles.write(
+        SERVER_A,
+        _profile_yaml(SERVER_A, "dedup-order", ("files.read",)),
+        expected_revision=0,
+    )
+    admitted = _profile_capabilities(app_fixture, SERVER_A)
+    assert admitted == (
+        "host.logs",
+        "web.search",
+        "files.read",
+        *INTERNAL_API_CAPABILITY_IDS,
+        *BUILTIN_DEFAULT_CAPABILITIES,
+    )
+    assert len(set(admitted)) == len(admitted)
+
+
+async def test_general_bridge_exposes_only_registered_admitted_tools(
+    app_fixture: FastAPI,
+) -> None:
+    """A REAL CapabilityToolBridge over the admitted General context
+    exposes exactly registered ∩ allowed: the two bound secret tools —
+    not the unbound (though registered) secret.store and not the
+    withheld server defaults (registered here as a fixture descriptor)."""
+    _write_onepassword_config(app_fixture.state.plugins, enabled=True)
+    _bind_capabilities(
+        app_fixture.state.plugins,
+        GENERAL_SERVER,
+        ("secret.get", "secret.list"),
+    )
+    admitted = _profile_capabilities(app_fixture, GENERAL_SERVER)
+    registry = CapabilityRegistry()
+    for document in (
+        SECRET_LIST_CAPABILITY,
+        SECRET_GET_CAPABILITY,
+        SECRET_STORE_CAPABILITY,
+        _bridge_descriptor("docs.retrieve"),
+    ):
+        registry.register(parse_descriptor(document))
+    context = ExecutionContext(
+        principal="fixture-admin",
+        server_id=GENERAL_SERVER,
+        run_id=uuid.uuid5(uuid.UUID(int=0), "bridge-fixture"),
+        parent_scope=None,
+        profile_revision="1",
+        prompt_revision="1",
+        credential_references=(),
+        allowed_capabilities=admitted,
+        mode=PolicyMode.DELEGATED,
+    )
+    bridge = CapabilityToolBridge(
+        registry=registry,
+        dispatcher=_fixture_dispatcher(registry),
+        context=context,
+    )
+    assert bridge.enabled_capabilities == ("secret.get", "secret.list")
+    assert [tool.name for tool in bridge.tools] == [
+        tool_name_for("secret.get"),
+        tool_name_for("secret.list"),
+    ]
+    # Registered but NOT admitted: no tool, no descriptor.
+    assert bridge.descriptor_for("secret.store") is None
+    assert bridge.descriptor_for("docs.retrieve") is None
+
+
+async def test_server_bridge_exposes_only_registered_admitted_tools(
+    app_fixture: FastAPI,
+) -> None:
+    """Server-chat bridge: the granted-and-registered host tool is
+    exposed; an admitted-but-unregistered plugin capability and an
+    admitted-but-unregistered internal capability expose nothing."""
+    _write_grants(app_fixture.state.grants, [_grant([SERVER_A], "host.shell")])
+    admitted = _profile_capabilities(app_fixture, SERVER_A)
+    assert "host.shell" in admitted
+    registry = CapabilityRegistry()
+    registry.register(host_shell_descriptor())
+    registry.register(parse_descriptor(SECRET_LIST_CAPABILITY))
+    registry.register(parse_descriptor(_bridge_descriptor("app.discover")))
+    context = ExecutionContext(
+        principal="fixture-admin",
+        server_id=SERVER_A,
+        run_id=uuid.uuid5(uuid.UUID(int=0), "bridge-fixture-server"),
+        parent_scope=None,
+        profile_revision="1",
+        prompt_revision="1",
+        credential_references=(),
+        allowed_capabilities=admitted,
+        mode=PolicyMode.DELEGATED,
+    )
+    bridge = CapabilityToolBridge(
+        registry=registry,
+        dispatcher=_fixture_dispatcher(registry),
+        context=context,
+    )
+    # host.shell: granted AND registered → exposed. secret.list and
+    # app.discover: registered but the admission never grants/binds them
+    # here (no plugin binding, no explicit grant) → NOT exposed.
+    assert bridge.enabled_capabilities == ("host.shell",)
+    assert [tool.name for tool in bridge.tools] == [
+        tool_name_for("host.shell")
+    ]
+
+
+async def test_delegation_narrows_the_admitted_surface(
+    app_fixture: FastAPI,
+) -> None:
+    """Delegation stays a narrowing operation (C03 rule 3): the child
+    effective set is child ∩ parent — a child run can never re-introduce
+    a capability the admitted tuple withholds."""
+    _write_onepassword_config(app_fixture.state.plugins, enabled=True)
+    _bind_capabilities(
+        app_fixture.state.plugins, GENERAL_SERVER, ("secret.list",)
+    )
+    admitted = _profile_capabilities(app_fixture, GENERAL_SERVER)
+    parent = {cap: frozenset({GENERAL_SERVER}) for cap in admitted}
+    child = dict(parent)
+    child["host.shell"] = frozenset({GENERAL_SERVER})  # attempted widening
+    child["secret.store"] = frozenset({GENERAL_SERVER})
+    effective = effective_child_grants(parent, child)
+    assert set(effective) <= set(parent)
+    assert "host.shell" not in effective
+    assert "secret.store" not in effective
+    assert "secret.list" in effective
+    assert "web.search" in effective
