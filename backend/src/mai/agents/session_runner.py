@@ -142,8 +142,8 @@ HANDLER_NAME: Final[str] = "agent.session_run"
 #: Payload schema version; consumers fail closed on any other value.
 RUN_PAYLOAD_VERSION_SESSION: Final[int] = 1
 
-DEFAULT_MAX_ROUNDS: Final[int] = 16
-MAX_MAX_ROUNDS: Final[int] = 32
+DEFAULT_MAX_ROUNDS: Final[int] = 90
+MAX_MAX_ROUNDS: Final[int] = 90
 
 DEFAULT_APPROVAL_WAIT_SECONDS: Final[float] = 3600.0
 MAX_APPROVAL_WAIT_SECONDS: Final[float] = 86_400.0

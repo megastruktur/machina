@@ -34,8 +34,10 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 
+from mai.agents.session_runner import parse_session_run_intent
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
+from mai.contracts.sessions import SessionSourceKind
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 CATALOGUE = BACKEND_ROOT.parent / "catalogue" / "example-http.yaml"
@@ -1496,6 +1498,43 @@ class TestRunbookSessionExecution:
             assert payload["runbook_ref"]["runbook_id"] == runbook_id
             assert "verify" in payload["text"]
             assert entries[1]["kind"] == "run_state"
+
+    async def test_execute_pins_ninety_rounds_on_the_enqueued_intent(
+        self,
+        apps_app: FastAPI,
+        jar: dict[str, str],
+        server_a: uuid.UUID,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The runbook-execution seam enqueues a SessionRunIntent pinned to
+        the 90-round root budget: captured at the REAL ``enqueue_run`` seam
+        (the payload the engine would receive), parsed through the strict
+        shared parser — no DBOS payload storage is consulted or invented."""
+        recovery = apps_app.state.job_recovery
+        assert recovery is not None
+        captured: list[str] = []
+        original = recovery.client.enqueue_run
+
+        def _capture(run_id: str, handler_name: str, payload_json: str) -> None:
+            captured.append(payload_json)
+            original(run_id, handler_name, payload_json)
+
+        monkeypatch.setattr(recovery.client, "enqueue_run", _capture)
+        runbook_id = await self._seed_catalog(apps_app, jar)
+        created = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(server_a)}/{runbook_id}/execute",
+            json_body={"action": "verify"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+        assert len(captured) == 1
+        intent = parse_session_run_intent(captured[0])
+        assert intent.max_rounds == 90
+        assert intent.source == SessionSourceKind.RUNBOOK
+        assert intent.run_id == created.json()["run_id"]
 
     async def test_execute_persists_custom_instructions_on_catalog_staging(
         self, apps_app: FastAPI, jar: dict[str, str], server_a: uuid.UUID

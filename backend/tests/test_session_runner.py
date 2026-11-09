@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mai.agents.model_store import ModelConfigStore
 from mai.agents.session_runner import (
     HANDLER_NAME as SESSION_HANDLER_NAME,
+    SessionStageError,
     asubmit_session_control,
     parse_session_run_intent,
 )
@@ -1547,6 +1548,28 @@ def test_session_runner_has_zero_old_imports() -> None:
                 if alias.name.startswith(_FORBIDDEN_IMPORT_PREFIXES):
                     found.append(alias.name)
     assert found == [], found
+
+
+def test_parse_session_run_intent_round_budget_bounds() -> None:
+    """The shared parser pins the 90-round root budget: an explicit 90 is
+    accepted, an omitted ``max_rounds`` defaults to 90, and 91 fails
+    closed with ``invalid_max_rounds`` (the delegate CHILD guardrail
+    1..8 is a separate parser, untouched)."""
+    session_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    accepted = parse_session_run_intent(
+        _canonical(_intent_document(run_id, session_id, max_rounds=90))
+    )
+    assert accepted.max_rounds == 90
+    defaulted = parse_session_run_intent(
+        _canonical(_intent_document(run_id, session_id, max_rounds=None))
+    )
+    assert defaulted.max_rounds == 90
+    with pytest.raises(SessionStageError) as over:
+        parse_session_run_intent(
+            _canonical(_intent_document(run_id, session_id, max_rounds=91))
+        )
+    assert over.value.reason == "invalid_max_rounds"
 
 
 # ---------------------------------------------------------------------------

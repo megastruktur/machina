@@ -2431,7 +2431,7 @@ async def execute_runbook(
         source=SessionSourceKind.RUNBOOK,
         connection=None,
         profile=model_profile,
-        max_rounds=12,
+        max_rounds=90,
         approval_wait_seconds=3600.0,
         reconcile_wait_seconds=300.0,
         wait_poll_seconds=0.5,

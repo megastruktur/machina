@@ -39,6 +39,7 @@ from pydantic_ai.messages import UserPromptPart
 from starlette.requests import Request as StarletteRequest
 from starlette.testclient import TestClient
 
+from mai.agents.session_runner import parse_session_run_intent
 from mai.agents.tools import CapabilityToolBridge, tool_name_for
 from mai.api.agent_sessions import _profile_binding
 from mai.api.app import create_app
@@ -486,6 +487,49 @@ async def test_turn_admission_is_durable_and_idempotent(
         assert body2["run_id"] == body["run_id"]
         assert body2["entry_id"] == body["entry_id"]
         assert body2["deduplicated"] is True
+
+
+async def test_turn_admission_pins_ninety_rounds_on_the_enqueued_intent(
+    app_fixture: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chat-turn seam enqueues a SessionRunIntent pinned to the
+    90-round root budget: captured at the REAL ``enqueue_run`` seam (the
+    payload the engine would receive), parsed through the strict shared
+    parser — no DBOS payload storage is consulted or invented."""
+    with TestClient(app_fixture) as client:
+        recovery = client.app.state.job_recovery
+        assert recovery is not None
+        captured: list[str] = []
+        original = recovery.client.enqueue_run
+
+        def _capture(run_id: str, handler_name: str, payload_json: str) -> None:
+            captured.append(payload_json)
+            original(run_id, handler_name, payload_json)
+
+        monkeypatch.setattr(recovery.client, "enqueue_run", _capture)
+        jar = _login(client)
+        created = _create_session(client, jar, SERVER_A)
+        session_id = uuid.UUID(created["session_id"])
+        first = client.post(
+            f"/api/v1/agent-sessions/{session_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(session_id),
+                "text": "pin the round budget",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert first.status_code in (200, 201), first.text
+        body = first.json()
+        assert len(captured) == 1
+        intent = parse_session_run_intent(captured[0])
+        assert intent.max_rounds == 90
+        assert intent.source == SessionSourceKind.API
+        assert intent.run_id == body["run_id"]
+
 
 async def test_turn_admission_creates_execution_facade_with_real_binding(
     app_fixture: FastAPI, migrated_url: str
