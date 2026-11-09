@@ -106,6 +106,14 @@ services:
       # Bundled metasearch provider (C07 rule 7): internal SearXNG service.
       MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
       MAI_SEED_BUILTIN_SKILLS: "1"
+      # op CLI (secret tools) redirect — docs/ops/op-daemon-socket-decision.md
+      # (t_e8178c8f): HOME is the data-root volume, so every op session
+      # re-creates a dead .config/op/op-daemon.sock in MAI_DATA_ROOT and the
+      # canonical backup refuses it (C02 rule 3). op 2.42.0 honors
+      # XDG_CONFIG_HOME (probe-verified 2026-11-09); /tmp is the correct
+      # ephemeral home for a daemon socket, and op's config file
+      # auto-regenerates (no secret values in it).
+      XDG_CONFIG_HOME: /tmp/op-xdg
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path
@@ -156,6 +164,9 @@ services:
       MAI_HINDSIGHT_URL: "http://hindsight:8888"
       MAI_SEARXNG_URL: "${MAI_SEARXNG_URL:-http://searxng:8080}"
       MAI_SEED_BUILTIN_SKILLS: "1"
+      # Same op CLI redirect as mai-api (docs/ops/op-daemon-socket-decision.md):
+      # keep .config/op out of the shared data-root volume.
+      XDG_CONFIG_HOME: /tmp/op-xdg
     volumes:
       - mai-data:/var/lib/mai
       # Credential source for EnvResolver: read-only, absolute host path.
