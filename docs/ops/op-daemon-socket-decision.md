@@ -1,6 +1,6 @@
 # Decision: op-daemon.sock must not live in MAI_DATA_ROOT (t_e8178c8f)
 
-Date: 2026-11-09 · Owner: devops · Status: DECIDED (apply at next compose change window)
+Date: 2026-11-09 · Owner: devops · Status: LANDED on master (1b3df47, mirror synced) — activates at the next Komodo DeployStack of `machina`
 
 ## Problem
 
@@ -41,6 +41,10 @@ NOT by changing HOME (the app may use HOME for other paths):
   stays all-regular, canonical backup never trips on it again.
 - Apply together with the next compose change that triggers a Komodo
   DeployStack — no dedicated deploy for this alone.
+- Landed 2026-11-09: master 1b3df47 (compose.yaml env for mai-api +
+  mai-worker), GitHub pushed, Forgejo mirror synced (token minted/pushed/
+  provably revoked, 0 residual rows). The next DeployStack activates it —
+  post-deploy verification per t_ca7abe1f.
 - After the redirect is deployed, optionally remove the leftover regular
   file `.config/op/config` from the data root (harmless either way).
 
