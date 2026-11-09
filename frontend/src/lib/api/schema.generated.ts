@@ -2032,7 +2032,11 @@ export interface paths {
         /**
          * Create Session
          * @description Idempotent session create: the client idempotency key derives the
-         *     session identity, so a retry converges on the same row.
+         *     session identity, so a retry converges on the same row. Optional
+         *     ``service_id`` (SCOPE-1) is validated against the SAME-server Service
+         *     Map BEFORE the insert, refused for General Consult, and fixed at
+         *     creation — an existing session is never rebound; a replayed key with a
+         *     DIFFERENT scope is an honest 409.
          */
         post: operations["create_session_api_v1_agent_sessions_post"];
         delete?: never;
@@ -5141,6 +5145,27 @@ export interface components {
             verify: string;
         };
         /**
+         * ServiceRef
+         * @description Interactive service-scope provenance (SCOPE-2): the canonical
+         *     adopted-service identity plus the bounded current display name at
+         *     admission. This is interactive scope provenance, NOT a
+         *     :class:`RunbookRef` and never labelled runbook execution; turn bodies
+         *     can never inject it.
+         */
+        ServiceRef: {
+            /**
+             * Service Id
+             * Format: uuid
+             * @description Canonical Service Map application identity the session is scoped to
+             */
+            service_id: string;
+            /**
+             * Name
+             * @description Bounded current display name at admission; NULL when the map entry is unavailable (the context renders the deterministic unavailable fallback instead of borrowing a name)
+             */
+            name?: string | null;
+        };
+        /**
          * SessionControlRequest
          * @description One deterministic control request (sfc_RESEARCH §6: steer/pause/
          *     cancel/approve/deny/reconcile acknowledge real state; no planner prose,
@@ -5241,6 +5266,11 @@ export interface components {
              */
             model_profile?: string | null;
             /**
+             * Service Id
+             * @description Optional adopted-service scope for the new session (SCOPE-1): validated against the SAME-server Service Map at admission; refused for General Consult or an unknown/cross-server service; an existing session can never be rebound
+             */
+            service_id?: string | null;
+            /**
              * Client Request Id
              * Format: uuid
              * @description Client idempotency key; retries return the same admission
@@ -5274,6 +5304,16 @@ export interface components {
              * @description User-assigned session title, when set
              */
             title?: string | null;
+            /**
+             * Service Id
+             * @description Optional adopted-service scope of this session (SCOPE-1: the canonical Service Map identity validated at creation; NULL for unscoped and legacy sessions)
+             */
+            service_id?: string | null;
+            /**
+             * Service Name
+             * @description Current SAME-server Service Map name of the linked service; NULL when the entry is unmapped or was deleted — the client reports an unavailable name instead of borrowing one
+             */
+            service_name?: string | null;
             /**
              * Active Run Id
              * @description Subordinate run currently executing, when one exists
@@ -5521,6 +5561,16 @@ export interface components {
              * @description User-assigned session title, when set
              */
             title?: string | null;
+            /**
+             * Service Id
+             * @description Optional adopted-service scope of this session (SCOPE-1: the canonical Service Map identity validated at creation; NULL for unscoped and legacy sessions)
+             */
+            service_id?: string | null;
+            /**
+             * Service Name
+             * @description Current SAME-server Service Map name of the linked service; NULL when the entry is unmapped or was deleted — the client reports an unavailable name instead of borrowing one
+             */
+            service_name?: string | null;
             /**
              * Active Run Id
              * @description Subordinate run currently executing, when one exists
@@ -6138,6 +6188,8 @@ export interface components {
             document_ref?: components["schemas"]["DocumentAttachRef"] | null;
             /** @description Runbook provenance when the turn was a runbook execution */
             runbook_ref?: components["schemas"]["RunbookRef"] | null;
+            /** @description Interactive service-scope provenance when the session is service-bound (SCOPE-2; server-derived, never a turn-body authority); the FIRST entry's persisted text already carries the full service map section */
+            service_ref?: components["schemas"]["ServiceRef"] | null;
         };
         /** ValidationError */
         ValidationError: {

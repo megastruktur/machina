@@ -79,6 +79,7 @@ from typing import TYPE_CHECKING
 
 from mai.applications.service_map import INSTRUCTION_KEYS, ServiceMapEntry
 from mai.contracts.server import ServerProfile, parse_server_profile_text
+from mai.contracts.sessions import SERVICE_MAP_SECTION_HEADER
 from mai.profiles.files import ProfileFileStore
 
 if TYPE_CHECKING:  # pragma: no cover - annotation-only import
@@ -772,7 +773,7 @@ def format_service_map_section(entries: Iterable[ServiceMapEntry]) -> str:
     conversation. The global catalogue knowledge and the per-server
     custom instructions ALWAYS travel together.
     """
-    lines = ["", "## Service map context (@service tags)", ""]
+    lines = ["", SERVICE_MAP_SECTION_HEADER, ""]
     for entry in entries:
         lines.append(
             f"### {entry.name} — category `{entry.category}`, "

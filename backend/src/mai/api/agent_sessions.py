@@ -57,6 +57,7 @@ from starlette.status import (
     HTTP_409_CONFLICT,
 )
 
+from mai.agents.context import format_service_map_section
 from mai.agents.session_runner import (
     HANDLER_NAME,
     SessionRunIntent,
@@ -69,8 +70,15 @@ from mai.api.auth import (
     _require_session,
     render_error_envelope,
 )
+from mai.api.capability_defaults import (
+    dedup_preserving_order,
+    plugin_capability_ids,
+    resolve_default_capabilities,
+)
 from mai.api.history_tags import EntityTagView
 from mai.auth.sessions import hash_token
+from mai.capabilities.history_tags import TAGS_CAPABILITY_IDS
+from mai.capabilities.internal_api import INTERNAL_API_CAPABILITY_IDS
 from mai.contracts.session_channel import (
     CHANNEL_PROTOCOL_VERSION,
     MAX_CHANNEL_SNAPSHOT_ENTRIES,
@@ -89,9 +97,12 @@ from mai.contracts.session_channel import (
 )
 from mai.contracts.sessions import (
     HISTORY_PAGE_MAX_ENTRIES,
+    MAX_ENTRY_TEXT_CHARS,
+    MAX_SERVICE_REF_NAME_CHARS,
     SESSION_LIST_DEFAULT_LIMIT,
     SESSION_LIST_MAX_LIMIT,
     EntryKind,
+    ServiceRef,
     SessionContractError,
     SessionControlRequest,
     SessionControlResponse,
@@ -111,6 +122,7 @@ from mai.contracts.sessions import (
     UserMessageEntry,
 )
 from mai.contracts.tags import EntityTagPreview, EntityTagPreviewView
+from mai.policy.config import GrantConfigStore
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.session_channel import (
     SessionChannelHub,
@@ -155,6 +167,60 @@ _REPLAY_PAGE_BUDGET: Final[int] = 20
 
 #: General Consult: the zero server UUID has no profile binding.
 _GENERAL_SERVER: Final[uuid.UUID] = uuid.UUID(int=0)
+
+#: Capabilities the worker's grant bootstrap never auto-grants to the
+#: General pseudo-server (``jobs/worker.py`` ``_read_grants``): host
+#: effects, document retrieval and the HTTP service probe reach a server
+#: only through its profile or an explicit grant-store entry, and the
+#: pseudo-server has neither unless the grant store names it.
+_GENERAL_EXCLUDED_AUTO_CAPABILITIES: Final[frozenset[str]] = frozenset(
+    {
+        "host.shell",
+        "host.file_read",
+        "host.logs",
+        "docs.retrieve",
+        "service.http",
+    }
+)
+
+
+def _general_consult_capabilities(request: Request) -> tuple[str, ...]:
+    """The General Consult pseudo-server's admitted capability surface,
+    kept in exact parity with the worker's auto-grant bootstrap
+    (``jobs/worker.py`` ``_read_grants`` enrols the zero UUID):
+    explicit grant-store entries naming the pseudo-server, enabled
+    GLOBAL plugin bindings, the internal-API and history-tag
+    vocabularies, and controller-side web research. Unlike
+    :func:`resolve_default_capabilities` (the server-chat and runbook
+    admission resolver), the built-in controller defaults
+    (``docs.retrieve``/``service.http``/``host.logs``) and every host
+    surface are withheld unless the grant store explicitly names the
+    pseudo-server. Degradations mirror the worker: an unusable store
+    contributes nothing — never an error, never a widening."""
+    explicit: list[str] = []
+    grants_store = getattr(request.app.state, "grants", None)
+    if isinstance(grants_store, GrantConfigStore):
+        try:
+            for capability_id, servers in grants_store.read().grants.items():
+                if _GENERAL_SERVER in servers:
+                    explicit.append(capability_id)
+        except Exception:
+            pass
+    resolved = list(explicit)
+    resolved.extend(
+        plugin_capability_ids(
+            getattr(request.app.state, "plugins", None), _GENERAL_SERVER
+        )
+    )
+    resolved.extend(INTERNAL_API_CAPABILITY_IDS)
+    resolved.extend(TAGS_CAPABILITY_IDS)
+    resolved.extend(("web.search", "web.read"))
+    return tuple(
+        capability_id
+        for capability_id in dedup_preserving_order(resolved)
+        if capability_id not in _GENERAL_EXCLUDED_AUTO_CAPABILITIES
+        or capability_id in explicit
+    )
 
 
 # --- shared helpers ------------------------------------------------------------------
@@ -242,14 +308,24 @@ def _tag_error(request: Request, exc: TagStoreError) -> Response:
 
 
 def _summary_row(
-    row: Any, tag_preview: EntityTagPreview | None = None
+    row: Any,
+    tag_preview: EntityTagPreview | None = None,
+    service: tuple[uuid.UUID | None, str | None] = (None, None),
 ) -> SessionSummary:
     """Project one ``SessionRow`` onto the safe summary (never content).
     ``tag_preview`` rides additively (D07-fix1 N5) so drawer session rows
-    render HistoryTags without a second round trip."""
+    render HistoryTags without a second round trip; ``service`` is the
+    ``(service_id, service_name)`` scope projection (SCOPE-1): the stored
+    column identity, the legacy runbook_ref identity for NULL-service
+    RUNBOOK rows, and the SAME-server map name — or None name when the map
+    entry is missing/deleted (the client reports an unavailable name; it
+    never borrows another server's label)."""
+    service_id, service_name = service
     return SessionSummary(
         session_id=row.session_id,
         server_id=row.server_id,
+        service_id=service_id,
+        service_name=service_name,
         source=SessionSourceKind(str(row.source)),
         status=SessionStatus(str(row.status)),
         title=row.title,
@@ -282,8 +358,198 @@ async def _tag_previews(
         return {}
 
 
+def _resolve_service_names(
+    request: Request,
+    pairs: Sequence[tuple[uuid.UUID, uuid.UUID]],
+) -> dict[tuple[uuid.UUID, uuid.UUID], str | None]:
+    """Current SAME-server Service Map names for ``(server, service)``
+    pairs. One ``list_entries`` read per distinct server; an unreadable or
+    missing map degrades to None names (unavailable), never to a borrowed
+    label from another server."""
+    store = getattr(request.app.state, "service_map", None)
+    if store is None or not pairs:
+        return {pair: None for pair in pairs}
+    by_server: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for server_id, service_id in pairs:
+        by_server.setdefault(server_id, set()).add(service_id)
+    names: dict[tuple[uuid.UUID, uuid.UUID], str | None] = {}
+    for server_id, service_ids in by_server.items():
+        try:
+            entries = store.list_entries(server_id)
+        except Exception:
+            names.update({(server_id, sid): None for sid in service_ids})
+            continue
+        index = {entry.application_id: entry.name for entry in entries}
+        names.update(
+            {(server_id, sid): index.get(str(sid)) for sid in service_ids}
+        )
+    return names
+
+
+async def _last_service_ref_name(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+) -> str | None:
+    """The last persisted service_ref display name (SCOPE-2): ONE bounded
+    newest-first query, used ONLY when the map entry was deleted, so the
+    follow-on identity stays honest instead of borrowing another server's
+    label. Names are admission-bounded; the read re-caps defensively."""
+    async with factory() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT payload->'service_ref'->>'name' AS name
+                    FROM session_entries
+                    WHERE session_id = :sid
+                      AND kind = 'user_message'
+                      AND payload->'service_ref'->>'name' IS NOT NULL
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).first()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])[:MAX_SERVICE_REF_NAME_CHARS]
+
+
+async def _is_first_user_entry(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+) -> bool:
+    """One bounded COUNT: does this session have ANY committed user entry
+    yet? Decides the first-full vs compact follow-on service material."""
+    async with factory() as session:
+        count = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT COUNT(*) FROM session_entries
+                    WHERE session_id = :sid AND kind = 'user_message'
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).scalar_one()
+    return int(count) == 0
+
+
+async def _service_scope_for_turn(
+    factory: async_sessionmaker[AsyncSession],
+    request: Request,
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    service_id: uuid.UUID | None,
+) -> tuple[Any | None, ServiceRef | None]:
+    """The turn's immutable session scope (SCOPE-2). The stored
+    ``sessions.service_id`` is the ONLY authority — the turn body can never
+    inject or rebind it. A deleted map entry ADMITS the turn with the
+    persisted identity (last persisted name if safely available; the
+    deterministic unavailable fallback renders at model context); it never
+    borrows another server's name or injects a fresh runbook."""
+    if service_id is None:
+        return None, None
+    store = getattr(request.app.state, "service_map", None)
+    entry = None
+    if store is not None:
+        try:
+            entry = store.get_entry(server_id, service_id)
+        except Exception:
+            entry = None  # an unreadable map degrades to identity-only
+    if entry is not None:
+        return entry, ServiceRef(service_id=service_id, name=entry.name)
+    stored_name = await _last_service_ref_name(factory, session_id=session_id)
+    return None, ServiceRef(service_id=service_id, name=stored_name)
+
+
+async def _legacy_runbook_service_ids(
+    factory: async_sessionmaker[AsyncSession],
+    session_ids: Sequence[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Backfill is PROJECTION-ONLY (chat-recovery §B): for legacy
+    NULL-service RUNBOOK sessions, ONE bounded query reads each session's
+    FIRST non-null ``runbook_ref`` user entry (``ORDER BY seq LIMIT 1`` per
+    session via ``DISTINCT ON``; the page ids bound the scan). No writes, no
+    guesses for interactive history."""
+    if not session_ids:
+        return {}
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT DISTINCT ON (session_id)
+                           session_id,
+                           (payload->'runbook_ref'->>'service_id')
+                               AS service_id
+                    FROM session_entries
+                    WHERE session_id = ANY(:sids)
+                      AND kind = 'user_message'
+                      AND payload->'runbook_ref'->>'service_id' IS NOT NULL
+                    ORDER BY session_id, seq
+                    """
+                ),
+                {"sids": list(session_ids)},
+            )
+        ).mappings().all()
+    return {
+        uuid.UUID(str(row["session_id"])): uuid.UUID(str(row["service_id"]))
+        for row in rows
+    }
+
+
+async def _service_scope_projection(
+    factory: async_sessionmaker[AsyncSession],
+    request: Request,
+    rows: Sequence[Any],
+) -> dict[uuid.UUID, tuple[uuid.UUID | None, str | None]]:
+    """One page's ``session_id -> (service_id, service_name)`` projection.
+
+    Stored non-NULL ``sessions.service_id`` wins; a legacy NULL-service
+    RUNBOOK row falls back to its first non-null ``runbook_ref`` user entry
+    (the bounded projection-only query). Names resolve from the SAME-server
+    map only; an unavailable or deleted entry projects a null name (wire
+    honesty) and never mutates the session row."""
+    stored = {
+        row.session_id: (row.server_id, row.service_id)
+        for row in rows
+        if row.service_id is not None
+    }
+    legacy_candidates = [
+        row.session_id
+        for row in rows
+        if row.service_id is None
+        and str(row.source) == SessionSourceKind.RUNBOOK.value
+    ]
+    legacy = await _legacy_runbook_service_ids(factory, legacy_candidates)
+    pairs: list[tuple[uuid.UUID, uuid.UUID]] = [
+        *stored.values(),
+        *(
+            (row.server_id, legacy[row.session_id])
+            for row in rows
+            if row.session_id in legacy
+        ),
+    ]
+    names = _resolve_service_names(request, pairs)
+    projection: dict[uuid.UUID, tuple[uuid.UUID | None, str | None]] = {}
+    for row in rows:
+        service_id = row.service_id or legacy.get(row.session_id)
+        projection[row.session_id] = (
+            service_id,
+            None if service_id is None else names.get((row.server_id, service_id)),
+        )
+    return projection
+
+
 async def _detail_of(
     factory: async_sessionmaker[AsyncSession],
+    request: Request,
     *,
     session_id: uuid.UUID,
     server_id: uuid.UUID,
@@ -298,7 +564,12 @@ async def _detail_of(
     if row is None:
         return None
     previews = await _tag_previews(factory, [session_id], server_id=server_id)
-    summary = _summary_row(row, previews.get(session_id))
+    service_scope = await _service_scope_projection(factory, request, [row])
+    summary = _summary_row(
+        row,
+        previews.get(session_id),
+        service_scope.get(session_id, (None, None)),
+    )
     async with factory() as session:
         async with session.begin():
             aggregates = (
@@ -356,34 +627,33 @@ def _profile_binding(
     request: Request, server_id: uuid.UUID
 ) -> tuple[int, int, tuple[str, ...]]:
     """``(profile_revision, prompt_revision, capabilities)`` from the
-    canonical profile; the profile-less General Consult scope pins
-    revisions to 1 with no capabilities. An unusable source degrades to
-    fewer capabilities — never an error."""
+    canonical profile, resolved through the SAME reviewed default
+    resolver as runbook admission (:func:`resolve_default_capabilities`):
+    grant-store grants, the canonical profile's capabilities, enabled
+    per-server AND global plugin bindings, the internal-API surface and
+    the built-in controller defaults — deduplicated in that documented
+    order. The profile-less General Consult scope pins revisions to 1
+    and admits the worker pseudo-server grant surface instead
+    (:func:`_general_consult_capabilities`). An unusable source degrades
+    to fewer capabilities — never an error."""
     if server_id == _GENERAL_SERVER:
-        return 1, 1, ()
+        return 1, 1, _general_consult_capabilities(request)
     store = getattr(request.app.state, "profiles", None)
     if store is None:
-        return 1, 1, ()
+        return 1, 1, tuple(
+            resolve_default_capabilities(request, server_id, ())
+        )
     try:
         stored = store.read(server_id)
     except Exception:
-        return 1, 1, ()
+        return 1, 1, tuple(
+            resolve_default_capabilities(request, server_id, ())
+        )
     from mai.contracts.server import parse_server_profile_text
 
     profile = parse_server_profile_text(stored.text)
-    grants_store = getattr(request.app.state, "grants", None)
-    granted: set[str] = set()
-    if grants_store is not None:
-        try:
-            for capability_id, servers in grants_store.read().grants.items():
-                if server_id in servers:
-                    granted.add(capability_id)
-        except Exception:
-            pass
     capabilities = tuple(
-        dict.fromkeys(
-            cap for cap in (*profile.capabilities, *sorted(granted)) if cap
-        )
+        resolve_default_capabilities(request, server_id, profile.capabilities)
     )
     return int(stored.revision), int(profile.prompt_revision), capabilities
 
@@ -466,9 +736,15 @@ async def list_sessions(
     previews = await _tag_previews(
         factory, [row.session_id for row in rows], server_id=server_id
     )
+    service_scope = await _service_scope_projection(factory, request, rows)
     return SessionListPage(
         items=[
-            _summary_row(row, previews.get(row.session_id)) for row in rows
+            _summary_row(
+                row,
+                previews.get(row.session_id),
+                service_scope.get(row.session_id, (None, None)),
+            )
+            for row in rows
         ],
         limit=limit,
         offset=offset,
@@ -482,11 +758,23 @@ async def create_session(
     request: Request, payload: SessionCreateRequest
 ) -> Response | SessionDetail:
     """Idempotent session create: the client idempotency key derives the
-    session identity, so a retry converges on the same row."""
+    session identity, so a retry converges on the same row. Optional
+    ``service_id`` (SCOPE-1) is validated against the SAME-server Service
+    Map BEFORE the insert, refused for General Consult, and fixed at
+    creation — an existing session is never rebound; a replayed key with a
+    DIFFERENT scope is an honest 409."""
     await _require_session(request)
     _require_allowed_origin(request)
     _require_csrf(request)
     factory = _factory(request)
+    try:
+        validated_service_id = await _validated_service_id(request, payload)
+    except SessionScopeValidationError as exc:
+        return _bad_request(
+            request,
+            SessionErrorCode.FORBIDDEN_FIELD.value,
+            str(exc),
+        )
     derived_id = uuid.uuid5(
         uuid.UUID(int=0), f"agent-session:{payload.client_request_id}"
     )
@@ -497,6 +785,7 @@ async def create_session(
             source=payload.source,
             title=payload.title,
             session_id=derived_id,
+            service_id=validated_service_id,
         )
     except SessionContractError:
         pass  # a replayed key: converge on the existing (scope-checked) row
@@ -508,11 +797,52 @@ async def create_session(
         ).lower():
             raise
     detail = await _detail_of(
-        factory, session_id=derived_id, server_id=payload.server_id
+        factory, request, session_id=derived_id, server_id=payload.server_id
     )
     if detail is None:
         return _not_found(request)
+    # Idempotent replay scope conflict: the SAME client request id always
+    # converges on the SAME service scope; anything else is rejected.
+    if detail.service_id != validated_service_id:
+        return render_error_envelope(
+            request,
+            HTTP_409_CONFLICT,
+            SessionErrorCode.SESSION_SCOPE_CONFLICT.value,
+            "this client request id was already admitted with a different "
+            "service scope",
+        )
     return detail
+
+
+async def _validated_service_id(
+    request: Request, payload: SessionCreateRequest
+) -> uuid.UUID | None:
+    """SCOPE-1 create-time validation: a service scope requires a
+    non-General server and a SAME-server Service Map entry. Bounded
+    value-free rejection — never a disclosure of foreign map contents, and
+    never an arbitrary client string stored."""
+    if payload.service_id is None:
+        return None
+    if payload.server_id == _GENERAL_SERVER:
+        raise SessionScopeValidationError(
+            "service scope requires a non-General server session"
+        )
+    store = getattr(request.app.state, "service_map", None)
+    if store is not None:
+        try:
+            entry = store.get_entry(payload.server_id, payload.service_id)
+        except Exception:
+            entry = None  # an unreadable map admits nothing (fail closed)
+        if entry is not None:
+            return uuid.UUID(entry.application_id)
+    raise SessionScopeValidationError(
+        "service_id is not a mapped service on this server"
+    )
+
+
+class SessionScopeValidationError(ValueError):
+    """Bounded create-time service-scope rejection (rendered as a 400
+    ``forbidden_field`` on ``service_id``)."""
 
 
 @router.get("/{session_id}", response_model=SessionDetail)
@@ -528,7 +858,7 @@ async def get_session_detail(
     await _require_session(request)
     factory = _factory(request)
     detail = await _detail_of(
-        factory, session_id=session_id, server_id=server_id
+        factory, request, session_id=session_id, server_id=server_id
     )
     if detail is None:
         return _not_found(request)
@@ -651,7 +981,7 @@ async def submit_turn(
     # the retained execution facade (job_runs depth 0 + the mandatory
     # classification) in ONE transaction BEFORE the enqueue, with the SAME
     # binding the frozen intent carries — no fabricated revisions, no
-    # widened grants (requested_grants are exactly the profile-bound
+    # widened grants (requested_grants are exactly the resolved admission
     # capabilities the context authorizes).
     model_profile = payload.model_profile or "default"
     await acreate_root_run(
@@ -673,11 +1003,41 @@ async def submit_turn(
         source=SessionSourceKind.API,
         run_id=run_id,
     )
+    # SCOPE-2: the session's stored service scope is the ONLY authority for
+    # this turn (no per-turn client scope input). The FIRST service-bound
+    # user entry persists the full validated Service Map section + prompt
+    # (untrusted user content, never system/runbook execution; an over-
+    # budget combination is an honest rejection, never clipped); follow-on
+    # entries carry only the compact identity in their service_ref.
+    service_entry, service_ref = await _service_scope_for_turn(
+        factory,
+        request,
+        session_id=session_id,
+        server_id=server_id,
+        service_id=row.service_id,
+    )
+    entry_text = payload.text
+    if (
+        row.service_id is not None
+        and service_entry is not None
+        and await _is_first_user_entry(factory, session_id=session_id)
+    ):
+        entry_text = payload.text + format_service_map_section(
+            [service_entry]
+        )
+        if len(entry_text) > MAX_ENTRY_TEXT_CHARS:
+            return _bad_request(
+                request,
+                SessionErrorCode.BYTE_BUDGET_EXCEEDED.value,
+                "the service context exceeds the bounded turn size; "
+                "shorten the message",
+            )
     user_entry = UserMessageEntry(
         kind=EntryKind.USER_MESSAGE,
-        text=payload.text,
+        text=entry_text,
         client_request_id=payload.client_request_id,
         source=SessionSourceKind.API,
+        service_ref=service_ref,
     )
     # aappend_entry returns the durable SessionEntryRow and is idempotent on
     # durable_source_id: a replayed client_request_id gets the ORIGINAL
@@ -817,7 +1177,7 @@ async def rename_session(
             )
         return _not_found(request)
     detail = await _detail_of(
-        factory, session_id=row.session_id, server_id=row.server_id
+        factory, request, session_id=row.session_id, server_id=row.server_id
     )
     if detail is None:
         return _not_found(request)

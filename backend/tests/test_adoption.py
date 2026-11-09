@@ -101,6 +101,7 @@ REVISION_IDS = (
     "0013",
     "0014",
     "0015",
+    "0016",
 )
 
 # The exact public application schema at the 0015 head: the 0007 set plus

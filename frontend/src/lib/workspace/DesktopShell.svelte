@@ -17,7 +17,7 @@
 	 * PanelHost resolves components through a lazy loader inside a
 	 * client-only effect, so the server render stays the empty D4 shell.
 	 */
-	import { createRawSnippet } from 'svelte';
+	import { createRawSnippet, untrack } from 'svelte';
 	import {
 		createPanelRegistry,
 		singletonInstanceKey,
@@ -717,13 +717,79 @@
 	// narrowing fails closed and renders the honest not-wired state.
 	// ---------------------------------------------------------------------
 
-	/** Fixture services offered by the dock's `@service` autocomplete. */
-	const DOCK_AVAILABLE_SERVICES: readonly SessionChatServiceOption[] = Object.freeze([
-		{ name: 'enshrouded', category: 'games' },
-		{ name: 'nginx', category: 'web' },
-		{ name: 'postgres', category: 'databases' },
-		{ name: 'backups', category: 'maintenance' }
-	]);
+	// SCOPE-3: the dock's @service options are the REAL same-server Service
+	// Map page (ApplicationsApi.listAdopted, bounded envelope). No fixtures:
+	// loading/empty/error are honest states; "Load more" continues the page.
+	let dockServices = $state<readonly SessionChatServiceOption[]>([]);
+	let dockServicesLoading = $state(false);
+	let dockServicesError = $state<string | null>(null);
+	let dockServicesHasMore = $state(false);
+	let dockServicesOffset = $state(0);
+	const DOCK_SERVICES_PAGE_LIMIT = 10;
+
+	async function loadDockServices(reset: boolean): Promise<void> {
+		if (!live || dockServicesLoading) return;
+		// General Consult has no per-server Service Map: an empty honest
+		// state instead of a doomed request against the zero UUID.
+		if (selectedServerId === '00000000-0000-0000-0000-000000000000') {
+			dockServices = [];
+			dockServicesError = null;
+			dockServicesHasMore = false;
+			dockServicesOffset = 0;
+			return;
+		}
+		dockServicesLoading = true;
+		if (reset) {
+			dockServicesError = null;
+			dockServicesOffset = 0;
+		}
+		try {
+			const offset = reset ? 0 : dockServicesOffset;
+			const page = await api.listAdoptedApplications(selectedServerId, {
+				limit: DOCK_SERVICES_PAGE_LIMIT,
+				offset
+			});
+			const options: SessionChatServiceOption[] = (page.applications ?? []).map(
+				(application) => ({
+					application_id: application.application_id,
+					name: application.name,
+					...(application.category ? { category: application.category } : {})
+				})
+			);
+			dockServices = reset
+				? options
+				: [
+						...dockServices.filter(
+							(existing) =>
+								!options.some(
+									(next) => next.application_id === existing.application_id
+								)
+						),
+						...options
+					];
+			dockServicesOffset = offset + options.length;
+			dockServicesHasMore = dockServicesOffset < page.total;
+		} catch (error) {
+			const apiError = error as { code?: string; message?: string };
+			dockServicesError =
+				apiError.message ?? 'The adopted services could not be loaded.';
+			if (reset) dockServices = [];
+		} finally {
+			dockServicesLoading = false;
+		}
+	}
+
+	// The draft scope is the active/new-chat scope: reload the bounded
+	// first page whenever it changes (mount path is browser-only).
+	$effect(() => {
+		const scope = selectedServerId;
+		const isLive = live;
+		untrack(() => {
+			if (isLive) void loadDockServices(true);
+		});
+		// scope/isLive are the tracked dependencies.
+		void scope;
+	});
 
 
 	/** Dock composer visibility: compact bar vs the full transcript dock. */
@@ -1024,7 +1090,13 @@
 			// exactly ONE controller exists, and only while a session is open.
 			...(live ? { channel: activeSessionChannel } : {}),
 			serverOptions,
-			availableServices: DOCK_AVAILABLE_SERVICES
+			// SCOPE-3: the REAL same-server Service Map page with its honest
+			// bounded continuation (no fixture services anywhere).
+			availableServices: dockServices,
+			servicesLoading: dockServicesLoading,
+			servicesError: dockServicesError,
+			servicesHasMore: dockServicesHasMore,
+			loadMoreServices: () => void loadDockServices(false)
 		},
 		onCleanup: () => () => {}
 	});
@@ -1524,10 +1596,15 @@
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
 			     live session the panel renders its honest empty/create state;
 			     offline it fails closed on the unwired bag. -->
+			<!-- SCOPE-3: the read scope is the ACTIVE session's OWN stored
+			     server (restored reloads included) — never the drawer's
+			     selection; the draft/create scope stays the selection. -->
 			<SessionChatPanel
 				panel={dockPanel}
 				sessionId={activeSessionId}
-				serverId={selectedServerId}
+				serverId={activeSessionId === null
+					? selectedServerId
+					: activeSessionServerId ?? selectedServerId}
 				entries={sessionEntries}
 				drafts={sessionDrafts}
 				channelState={channelState}
