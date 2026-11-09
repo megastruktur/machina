@@ -1287,3 +1287,144 @@ async def test_idle_tick_issues_zero_catchup_sql(
             # Ticks advanced; ZERO catch-up SQL was issued at the head.
             assert hub.tick_count > ticks_before
             assert hub.catchup_query_count == queries_before
+
+
+# ---------------------------------------------------------------------------
+# 7. MissingGreenlet ownership: app-pool resets run inside greenlet_spawn
+# ---------------------------------------------------------------------------
+
+
+def _in_greenlet() -> bool:
+    """greenlet 3.5.6 ships no ``greenlet.util.greenlet.in_greenlet``;
+    the equivalent predicate: only a NON-main greenlet (``parent`` set)
+    runs inside ``greenlet_spawn``. The plain asyncio loop thread runs
+    in the main greenlet, so a pool reset seen there is the defect."""
+    import greenlet
+
+    return greenlet.getcurrent().parent is not None
+
+
+class _SyncListener:
+    """A REAL PostgreSQL LISTEN subscriber on its own psycopg socket
+    (autocommit): proves NOTIFY delivery, not just absence of error."""
+
+    def __init__(self, url: str) -> None:
+        import psycopg
+
+        self._conn = psycopg.connect(url, autocommit=True)
+        from mai.contracts.session_channel import CHANNEL_NOTIFY_CHANNEL
+
+        self._conn.execute(f'LISTEN "{CHANNEL_NOTIFY_CHANNEL}"')
+
+    def wait_payload(self, timeout: float = 5.0) -> str | None:
+        for notify in self._conn.notifies(stop_after=1, timeout=timeout):
+            return notify.payload
+        return None
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _attach_reset_recorder(engine: AsyncEngine) -> list[bool]:
+    """Record ``in_greenlet`` for every app-pool reset-on-return."""
+    from sqlalchemy import event
+
+    observed: list[bool] = []
+
+    def _on_reset(
+        dbapi_conn: object, record: object, reset_state: object
+    ) -> None:
+        observed.append(_in_greenlet())
+
+    event.listens_for(engine.sync_engine, "reset")(_on_reset)
+    return observed
+
+
+async def test_notify_session_committed_reset_runs_in_greenlet(
+    migrated_url: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The committed-wakeup publisher must own its connection close.
+
+    Pre-fix (``await raw.close()`` on a sync-closing _ConnectionFairy)
+    the pool reset/rollback ran OUTSIDE greenlet_spawn on the loop
+    thread: one pooled connection killed per turn (MissingGreenlet).
+    The fix routes checkin through ``engine.connect()`` (AsyncConnection
+    closes in greenlet_spawn) with an AUTOCOMMIT execution option.
+    """
+    from mai.session_channel import notify_session_committed
+
+    engine, _sessionmaker = create_app_engine(migrated_url)
+    reset_states = _attach_reset_recorder(engine)
+    listener = _SyncListener(migrated_url)
+    try:
+        session_id = uuid.uuid4()
+        await notify_session_committed(engine, session_id, 4242)
+        # REAL autocommit NOTIFY delivery through the server socket.
+        payload = listener.wait_payload(timeout=5.0)
+        assert payload == json.dumps(
+            {"session_id": str(session_id), "latest_seq": 4242}
+        )
+        # Every reset observed BEFORE the explicit dispose teardown ran
+        # inside greenlet_spawn (dispose's own teardown reset is excluded
+        # explicitly; nothing else is filtered).
+        resets_before_teardown = list(reset_states)
+        assert resets_before_teardown, "notify checkin must reset the fairy"
+        assert all(resets_before_teardown), resets_before_teardown
+        assert "MissingGreenlet" not in capfd.readouterr().err
+    finally:
+        listener.close()
+        await engine.dispose()
+
+
+async def test_hub_start_stop_reset_runs_in_greenlet(
+    migrated_url: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Hub stop() must close the long-lived LISTEN fairy from the owning
+    lifecycle task THROUGH greenlet_spawn, including the common case of
+    stopping while the listener task is parked inside ``driver.notifies()``.
+
+    Pre-fix, ``SessionChannelHub.stop()`` ran ``await raw.close()`` with
+    the fairy's reset off-greenlet (shutdown borrower, MissingGreenlet).
+    """
+    from types import SimpleNamespace
+
+    import asyncio
+
+    from mai.session_channel import (
+        SessionChannelHub,
+        notify_session_committed,
+    )
+
+    async def _entry_reader(*_a: object, **_k: object) -> object:
+        return SimpleNamespace(items=[], has_more=False)
+
+    engine, _sessionmaker = create_app_engine(migrated_url)
+    reset_states = _attach_reset_recorder(engine)
+    hub = SessionChannelHub(
+        entry_reader=_entry_reader, coarse_tick_seconds=0.05
+    )
+    hub.start(engine)
+    try:
+        # The listener actually subscribed: wait for its LISTEN round-trip.
+        import time as time_mod
+
+        deadline = time_mod.monotonic() + 5.0
+        while hub.reconnect_count < 1 and time_mod.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert hub.reconnect_count >= 1
+        # A server-pushed NOTIFY is decoded by the live listener.
+        await notify_session_committed(engine, uuid.uuid4(), 7)
+        deadline = time_mod.monotonic() + 5.0
+        while hub.notify_count < 1 and time_mod.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert hub.notify_count >= 1
+        # Stop while the listener task is parked inside driver.notifies().
+        await hub.stop()
+        assert hub._listen_task is not None
+        assert hub._listen_task.done()
+        resets_before_teardown = list(reset_states)
+        assert resets_before_teardown, "hub lifecycle must reset its fairies"
+        assert all(resets_before_teardown), resets_before_teardown
+        assert "MissingGreenlet" not in capfd.readouterr().err
+    finally:
+        await engine.dispose()

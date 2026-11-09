@@ -37,7 +37,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.util.concurrency import greenlet_spawn
 
 from mai.contracts.session_channel import (
     CHANNEL_NOTIFY_CHANNEL,
@@ -210,11 +212,19 @@ class SessionChannelHub:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         # The dedicated LISTEN connection closes OUTSIDE the cancelled
-        # listener task (an await in a cancelled task cannot run).
+        # listener task (an await in a cancelled task cannot run). The
+        # fairy's .close() is SYNC: a bare ``await raw.close()`` ran the
+        # pool reset/rollback OFF greenlet_spawn (MissingGreenlet + one
+        # killed pooled connection per stop). greenlet_spawn supplies
+        # the SQLAlchemy greenlet provider ON this owning loop, so the
+        # reset's await_() hops back to the loop that owns the pool.
+        # A detached to_thread/queue worker would NOT work: a plain
+        # thread has no event loop, so the async rollback re-raises
+        # MissingGreenlet there.
         raw = getattr(self, "_raw_connection", None)
         if raw is not None:
             with contextlib.suppress(Exception):
-                await raw.close()
+                await greenlet_spawn(raw.close)
         self._raw_connection = None
         self._sessions.clear()
         self._pending_updated_seqs.clear()
@@ -314,8 +324,10 @@ class SessionChannelHub:
             except Exception:
                 self.reconnect_count += 1
                 if raw is not None:
+                    # Same ownership rule as stop(): the fairy's reset
+                    # must run inside greenlet_spawn (this loop).
                     with contextlib.suppress(Exception):
-                        await raw.close()
+                        await greenlet_spawn(raw.close)
                     self._raw_connection = None
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, NOTIFY_RECONNECT_MAX_SECONDS)
@@ -345,7 +357,7 @@ class SessionChannelHub:
 
                 async def _close_stale() -> None:
                     with contextlib.suppress(Exception):
-                        await stale.close()
+                        await greenlet_spawn(stale.close)
 
                 self._loop.create_task(
                     _close_stale(), name="session-channel-stale-listen-close"
@@ -614,20 +626,21 @@ async def notify_session_committed(
     payload = json.dumps(
         {"session_id": str(session_id), "latest_seq": int(latest_seq)}
     )
-    # The wakeup goes through a RAW autocommit driver connection (the
-    # listener's own pattern): setting isolation on a live async
-    # connection is ignored, and a transactional pg_notify would die in
-    # the rollback at close — the wakeup would NEVER fire.
-    raw = await engine.raw_connection()
-    try:
-        driver = raw.driver_connection
-        await driver.set_autocommit(True)
-        await driver.execute(
-            "SELECT pg_notify(%s, %s)", (CHANNEL_NOTIFY_CHANNEL, payload)
+    # The wakeup must reach PostgreSQL OUTSIDE any transaction: a
+    # transactional pg_notify would die in the rollback at close — the
+    # wakeup would NEVER fire. The AUTOCOMMIT execution option is set
+    # BEFORE first use (isolation changes on a live connection are
+    # ignored). The AsyncConnection context manager owns the checkin:
+    # its close runs through greenlet_spawn, so the pool reset/rollback
+    # executes ON the greenlet — the pre-fix raw-fairy
+    # ``await raw.close()`` reset OFF greenlet_spawn (MissingGreenlet)
+    # and killed one pooled connection per turn.
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(
+            sql_text("SELECT pg_notify(:chan, :payload)"),
+            {"chan": CHANNEL_NOTIFY_CHANNEL, "payload": payload},
         )
-    finally:
-        with contextlib.suppress(Exception):
-            await raw.close()
 
 
 # -- re-export for typing convenience -------------------------------------------
