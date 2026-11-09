@@ -388,7 +388,36 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     native_plugin_owners: dict[str, object] = {}
     mcp_cache: dict[tuple[str, str, tuple[str, ...]], McpServerRuntime] = {}
 
-    async def _sync_plugin_capabilities() -> None:
+    def _sync_native_plugin_capabilities() -> None:
+        """Register enabled native plugins' descriptors at composition
+        time — BEFORE any ``CapabilityToolBridge`` reads this registry.
+
+        Why eager (first-admission exposure): the bridge exposes exactly
+        granted ∩ registered and deliberately skips granted-but-absent
+        ids ("nothing to expose"); the lazy fallback only ran inside the
+        composite executor AFTER a dispatch named the missing capability
+        — which a freshly granted, never-exposed plugin can never
+        produce. Registering before ``SessionRunExecutor`` construction
+        makes a fresh grant visible on the FIRST tool bridge.
+
+        Scope: the native lane only, fully synchronous (entry-point
+        scan + module imports, no event loop, no network). MCP servers
+        keep their lazy discovery in :func:`_sync_plugin_capabilities`:
+        no broad network dialing at worker startup.
+
+        Why a broken optional plugin cannot block unrelated host tools:
+        host capabilities are registered BEFORE this lane runs, so a
+        plugin failure can only omit that plugin's descriptors, never
+        remove or block already-registered host tools; inside discovery
+        each plugin loads fail-closed per plugin (a bad installation
+        records a rejection and skips itself, not the runtime or its
+        siblings); and the lane-level guard below preserves the existing
+        best-effort semantics — a store-level composition error degrades
+        to the unchanged lazy dispatch fallback instead of aborting
+        worker startup. No credential resolution happens here: secret
+        values still resolve per actual plugin call in the composite
+        executor.
+        """
         try:
             native_reg = CapabilityRegistry()
             native_rt = NativePluginRuntime(
@@ -407,6 +436,9 @@ def _configure_default_agent_runtime(database_url: str) -> None:
                     native_plugin_owners[desc.identifier] = loaded
         except Exception:
             pass
+
+    async def _sync_plugin_capabilities() -> None:
+        _sync_native_plugin_capabilities()
         try:
             for mcp_cfg in server_plugins(plugin_store):
                 granted = granted_capability_ids(plugin_store, mcp_cfg.plugin)
@@ -644,6 +676,13 @@ def _configure_default_agent_runtime(database_url: str) -> None:
             fallback.chmod(0o600)
         return EnvResolver(fallback)
 
+    # First-admission plugin exposure: the registry MUST already hold
+    # the enabled native plugins' descriptors when the dispatcher /
+    # SessionRunExecutor (and thus the first CapabilityToolBridge) is
+    # composed. Synchronous, no event loop, no network — only the
+    # native lane runs here; MCP discovery stays lazy inside
+    # _composite_executor, which keeps its dispatch-time fallback.
+    _sync_native_plugin_capabilities()
     dispatcher = CapabilityDispatcher(
         registry=registry,
         approvals=ApprovalStore(sessions),
