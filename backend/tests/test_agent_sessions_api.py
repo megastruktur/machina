@@ -35,11 +35,13 @@ import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
+from pydantic_ai.messages import UserPromptPart
 from starlette.testclient import TestClient
 
 from mai.api.app import create_app
 from mai.api.auth import CSRF_COOKIE, SESSION_COOKIE
 from mai.contracts.sessions import (
+    SERVICE_MAP_SECTION_HEADER,
     EntryKind,
     RunbookRef,
     SessionSourceKind,
@@ -1351,3 +1353,253 @@ async def test_legacy_runbook_session_projects_service_scope(
             (legacy_id,),
         ).fetchone()
     assert row is not None and row["service_id"] is None
+
+
+async def test_service_bound_turns_first_full_then_compact_identity(
+    app_fixture: FastAPI,
+    migrated_url: str,
+) -> None:
+    """SCOPE-2: the FIRST service-bound user entry persists the full
+    validated Service Map section + prompt (with its service_ref); a
+    follow-on entry carries only the compact service_ref and NO duplicated
+    section; the model-context projection gives turn 2 the identity
+    prefix; an unbound chat gets neither section nor ref. Turn bodies carry
+    no scope authority."""
+    from mai.agents.session_history import build_native_model_history
+    from mai.database import create_app_engine as _engine
+    from mai.session_store import aread_session_history
+
+    engine, engine_sessions = _engine(migrated_url)
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        store = app_fixture.state.service_map
+        store.upsert_entry(
+            SERVER_A,
+            name="nginx-proxy",
+            application_id=SERVICE_ALPHA,
+            description="reverse proxy for the edge host",
+            custom_instructions="use the compose project on the edge host",
+            instructions={"install": "docker compose up -d"},
+        )
+        created = client.post(
+            "/api/v1/agent-sessions",
+            json=_create_session_body(SERVER_A, service_id=SERVICE_ALPHA),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status_code == 201, created.text
+        scoped_id = uuid.UUID(created.json()["session_id"])
+        for text in ("check the proxy logs", "and now restart it"):
+            turn = client.post(
+                f"/api/v1/agent-sessions/{scoped_id}/turns",
+                params={"server_id": str(SERVER_A)},
+                json={
+                    "session_id": str(scoped_id),
+                    "text": text,
+                    "client_request_id": str(uuid.uuid4()),
+                },
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert turn.status_code in (200, 201), turn.text
+        # Unbound chat: a plain session with one turn.
+        plain = _create_session(client, jar, SERVER_A)
+        plain_id = uuid.UUID(plain["session_id"])
+        turn = client.post(
+            f"/api/v1/agent-sessions/{plain_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(plain_id),
+                "text": "plain question",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert turn.status_code in (200, 201), turn.text
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            """
+            SELECT session_id, seq, payload FROM session_entries
+            WHERE session_id IN (%s, %s) AND kind = 'user_message'
+            ORDER BY session_id, seq
+            """,
+            (scoped_id, plain_id),
+        ).fetchall()
+    scoped_rows = [row for row in rows if row["session_id"] == scoped_id]
+    plain_rows = [row for row in rows if row["session_id"] == plain_id]
+    assert len(scoped_rows) == 2 and len(plain_rows) == 1
+    first, second = scoped_rows[0]["payload"], scoped_rows[1]["payload"]
+    # FIRST entry: full persisted material, service_ref attached.
+    assert first["text"].startswith("check the proxy logs")
+    assert SERVICE_MAP_SECTION_HEADER in first["text"]
+    assert "nginx-proxy" in first["text"]
+    assert "reverse proxy for the edge host" in first["text"]
+    assert "use the compose project on the edge host" in first["text"]
+    assert "docker compose up -d" in first["text"]
+    assert first["service_ref"] == {
+        "service_id": str(SERVICE_ALPHA),
+        "name": "nginx-proxy",
+    }
+    assert first["runbook_ref"] is None
+    # FOLLOW-ON entry: compact identity, NO duplicated full section.
+    assert second["text"] == "and now restart it"
+    assert SERVICE_MAP_SECTION_HEADER not in second["text"]
+    assert second["service_ref"] == {
+        "service_id": str(SERVICE_ALPHA),
+        "name": "nginx-proxy",
+    }
+    # Unbound chat stays entirely scope-free.
+    assert plain_rows[0]["payload"]["service_ref"] is None
+    assert SERVICE_MAP_SECTION_HEADER not in plain_rows[0]["payload"]["text"]
+
+    # Model-context projection: first entry renders as-is (the material is
+    # already in its text), the follow-on gains the compact prefix.
+    page = await aread_session_history(
+        engine_sessions,
+        session_id=scoped_id,
+        server_id=SERVER_A,
+        limit=10,
+    )
+    native = build_native_model_history(
+        list(page.items),
+        provider="openai",
+        model_profile="default",
+    )
+    prompts = [
+        part.content
+        for message in native.messages
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert prompts[0].startswith("check the proxy logs")
+    assert "[service scope:" not in prompts[0]
+    assert prompts[1] == (
+        f"[service scope: @nginx-proxy ({SERVICE_ALPHA})]\nand now restart it"
+    )
+    await engine.dispose()
+
+
+async def test_deleted_map_entry_turns_keep_identity(
+    app_fixture: FastAPI,
+    migrated_url: str,
+) -> None:
+    """A deleted map entry must not brick turns: the persisted identity and
+    the last persisted name ride along (header service_name goes null);
+    a session deleted before its FIRST turn admits with the deterministic
+    unavailable fallback; another server's name is never borrowed."""
+    with TestClient(app_fixture) as client:
+        jar = _login(client)
+        store = app_fixture.state.service_map
+        store.upsert_entry(
+            SERVER_A, name="nginx-proxy", application_id=SERVICE_ALPHA
+        )
+        created = client.post(
+            "/api/v1/agent-sessions",
+            json=_create_session_body(SERVER_A, service_id=SERVICE_ALPHA),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        scoped_id = uuid.UUID(created.json()["session_id"])
+        first = client.post(
+            f"/api/v1/agent-sessions/{scoped_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(scoped_id),
+                "text": "check the proxy logs",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert first.status_code in (200, 201), first.text
+        created2 = client.post(
+            "/api/v1/agent-sessions",
+            json=_create_session_body(SERVER_A, service_id=SERVICE_ALPHA),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created2.status_code == 201, created2.text
+        scoped2 = uuid.UUID(created2.json()["session_id"])
+        # The operator deletes the map entry; BOTH sessions keep working
+        # (a create-time service_id now refuses, turn-time identity stays).
+        assert store.delete_entry(SERVER_A, SERVICE_ALPHA) is True
+        # A DIFFERENT server maps the same name: never borrowed.
+        store.upsert_entry(SERVER_B, name="nginx-proxy", application_id=SERVICE_BETA)
+
+        second = client.post(
+            f"/api/v1/agent-sessions/{scoped_id}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(scoped_id),
+                "text": "and now restart it",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert second.status_code in (200, 201), second.text
+        detail = client.get(
+            f"/api/v1/agent-sessions/{scoped_id}",
+            params={"server_id": str(SERVER_A)},
+            cookies=jar,
+        )
+        assert detail.json()["service_id"] == str(SERVICE_ALPHA)
+        assert detail.json()["service_name"] is None
+
+        # Deleted BEFORE scoped2's first turn: identity-only admission.
+        turn = client.post(
+            f"/api/v1/agent-sessions/{scoped2}/turns",
+            params={"server_id": str(SERVER_A)},
+            json={
+                "session_id": str(scoped2),
+                "text": "hello",
+                "client_request_id": str(uuid.uuid4()),
+            },
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert turn.status_code in (200, 201), turn.text
+        # Create-time scope refuses the deleted identity (SCOPE-1 rule),
+        # while the admitted turns above keep working — no bricking.
+        rejected = client.post(
+            "/api/v1/agent-sessions",
+            json=_create_session_body(SERVER_A, service_id=SERVICE_ALPHA),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert rejected.status_code == 400, rejected.text
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(migrated_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            """
+            SELECT session_id, seq, payload FROM session_entries
+            WHERE session_id IN (%s, %s) AND kind = 'user_message'
+            ORDER BY session_id, seq
+            """,
+            (scoped_id, scoped2),
+        ).fetchall()
+    first_session = [r for r in rows if r["session_id"] == scoped_id]
+    second_session = [r for r in rows if r["session_id"] == scoped2]
+    # Follow-on after deletion: the LAST PERSISTED name rides along.
+    follow = first_session[1]["payload"]
+    assert follow["text"] == "and now restart it"
+    assert SERVICE_MAP_SECTION_HEADER not in follow["text"]
+    assert follow["service_ref"] == {
+        "service_id": str(SERVICE_ALPHA),
+        "name": "nginx-proxy",
+    }
+    # First turn after deletion: no name available — identity only.
+    orphan = second_session[0]["payload"]
+    assert orphan["service_ref"] == {
+        "service_id": str(SERVICE_ALPHA),
+        "name": None,
+    }
+    assert SERVICE_MAP_SECTION_HEADER not in orphan["text"]

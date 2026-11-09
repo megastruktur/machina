@@ -191,6 +191,14 @@ MAX_SERVICE_NAME_CHARS: Final[int] = 200
 MAX_SERVICE_REF_PREFIX_CHARS: Final[int] = 512
 MAX_SERVICE_REF_NAME_CHARS: Final[int] = 200
 
+#: The stable first-line marker of the full Service Map section (SCOPE-2):
+#: the FIRST service-bound user entry persists this header inside its text,
+#: so model-context assembly skips the compact identity prefix there (the
+#: full material already carries the identity) while follow-on entries get
+#: the compact prefix. Single-sourced here; ``mai.agents.context`` renders
+#: it and ``mai.agents.session_history`` detects it.
+SERVICE_MAP_SECTION_HEADER: Final[str] = "## Service map context (@service tags)"
+
 #: Tool calls per assistant message / provider artifacts per message.
 MAX_TOOL_CALLS: Final[int] = 16
 MAX_PROVIDER_ARTIFACTS: Final[int] = 8
@@ -419,6 +427,28 @@ class RunbookRef(BaseModel):
     )
 
 
+class ServiceRef(BaseModel):
+    """Interactive service-scope provenance (SCOPE-2): the canonical
+    adopted-service identity plus the bounded current display name at
+    admission. This is interactive scope provenance, NOT a
+    :class:`RunbookRef` and never labelled runbook execution; turn bodies
+    can never inject it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    service_id: uuid.UUID = Field(
+        description="Canonical Service Map application identity the session "
+        "is scoped to",
+    )
+    name: str | None = Field(
+        default=None,
+        max_length=MAX_SERVICE_REF_NAME_CHARS,
+        description="Bounded current display name at admission; NULL when "
+        "the map entry is unavailable (the context renders the "
+        "deterministic unavailable fallback instead of borrowing a name)",
+    )
+
+
 class ToolCallItem(BaseModel):
     """One structured assistant tool-call part (sfc_RESEARCH §2 assistant
     entries carry ordered safe text and structured tool-call parts)."""
@@ -514,6 +544,13 @@ class UserMessageEntry(BaseModel):
     runbook_ref: RunbookRef | None = Field(
         default=None,
         description="Runbook provenance when the turn was a runbook execution",
+    )
+    service_ref: ServiceRef | None = Field(
+        default=None,
+        description="Interactive service-scope provenance when the session "
+        "is service-bound (SCOPE-2; server-derived, never a turn-body "
+        "authority); the FIRST entry's persisted text already carries the "
+        "full service map section",
     )
 
 

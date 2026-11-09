@@ -88,8 +88,10 @@ from mai.contracts.sessions import (
     MAX_ENTRY_TEXT_CHARS,
     MAX_HASH_CHARS,
     MAX_IDENTITY_CHARS,
+    MAX_SERVICE_REF_PREFIX_CHARS,
     MAX_SUMMARY_TEXT_CHARS,
     MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    SERVICE_MAP_SECTION_HEADER,
     UNSAFE_TEXT_CLASS,
     AssistantMessageEntry,
     CompactionEntry,
@@ -1057,6 +1059,26 @@ def _compaction_anchor(compaction: CompactionEntry) -> ModelRequest:
     )
 
 
+def _service_scope_prefix(payload: UserMessageEntry) -> str | None:
+    """The compact follow-on identity prefix (SCOPE-2, fixed vocabulary,
+    inside the reviewed 512-char prefix cap).
+
+    The FIRST service-bound entry is skipped: its persisted text already
+    carries the full Service Map section (identity included), so a second
+    prefix would duplicate material. An unavailable name renders the
+    deterministic bounded fallback — the identity survives a deleted map
+    entry without borrowing another server's label."""
+    ref = payload.service_ref
+    if ref is None:
+        return None
+    if SERVICE_MAP_SECTION_HEADER in payload.text:
+        return None
+    if ref.name:
+        return f"[service scope: @{ref.name} ({ref.service_id})]"
+    short = str(ref.service_id)[:8]
+    return f"[service scope: @application-{short} (unavailable) id {ref.service_id}]"
+
+
 def _user_prompt_content(payload: UserMessageEntry) -> str:
     text = payload.text
     prefixes: list[str] = []
@@ -1069,9 +1091,12 @@ def _user_prompt_content(payload: UserMessageEntry) -> str:
             f"[runbook execution: service {payload.runbook_ref.service_id} "
             f"runbook {payload.runbook_ref.runbook_id}]"
         )
+    service_prefix = _service_scope_prefix(payload)
+    if service_prefix is not None:
+        prefixes.append(service_prefix)
     if not prefixes:
         return text
-    bounded_prefix = "\n".join(prefixes)[:512]
+    bounded_prefix = "\n".join(prefixes)[:MAX_SERVICE_REF_PREFIX_CHARS]
     return bounded_prefix + "\n" + text
 
 

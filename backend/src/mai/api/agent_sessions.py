@@ -57,6 +57,7 @@ from starlette.status import (
     HTTP_409_CONFLICT,
 )
 
+from mai.agents.context import format_service_map_section
 from mai.agents.session_runner import (
     HANDLER_NAME,
     SessionRunIntent,
@@ -89,9 +90,12 @@ from mai.contracts.session_channel import (
 )
 from mai.contracts.sessions import (
     HISTORY_PAGE_MAX_ENTRIES,
+    MAX_ENTRY_TEXT_CHARS,
+    MAX_SERVICE_REF_NAME_CHARS,
     SESSION_LIST_DEFAULT_LIMIT,
     SESSION_LIST_MAX_LIMIT,
     EntryKind,
+    ServiceRef,
     SessionContractError,
     SessionControlRequest,
     SessionControlResponse,
@@ -318,6 +322,88 @@ def _resolve_service_names(
             {(server_id, sid): index.get(str(sid)) for sid in service_ids}
         )
     return names
+
+
+async def _last_service_ref_name(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+) -> str | None:
+    """The last persisted service_ref display name (SCOPE-2): ONE bounded
+    newest-first query, used ONLY when the map entry was deleted, so the
+    follow-on identity stays honest instead of borrowing another server's
+    label. Names are admission-bounded; the read re-caps defensively."""
+    async with factory() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT payload->'service_ref'->>'name' AS name
+                    FROM session_entries
+                    WHERE session_id = :sid
+                      AND kind = 'user_message'
+                      AND payload->'service_ref'->>'name' IS NOT NULL
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).first()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])[:MAX_SERVICE_REF_NAME_CHARS]
+
+
+async def _is_first_user_entry(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+) -> bool:
+    """One bounded COUNT: does this session have ANY committed user entry
+    yet? Decides the first-full vs compact follow-on service material."""
+    async with factory() as session:
+        count = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT COUNT(*) FROM session_entries
+                    WHERE session_id = :sid AND kind = 'user_message'
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).scalar_one()
+    return int(count) == 0
+
+
+async def _service_scope_for_turn(
+    factory: async_sessionmaker[AsyncSession],
+    request: Request,
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    service_id: uuid.UUID | None,
+) -> tuple[Any | None, ServiceRef | None]:
+    """The turn's immutable session scope (SCOPE-2). The stored
+    ``sessions.service_id`` is the ONLY authority — the turn body can never
+    inject or rebind it. A deleted map entry ADMITS the turn with the
+    persisted identity (last persisted name if safely available; the
+    deterministic unavailable fallback renders at model context); it never
+    borrows another server's name or injects a fresh runbook."""
+    if service_id is None:
+        return None, None
+    store = getattr(request.app.state, "service_map", None)
+    entry = None
+    if store is not None:
+        try:
+            entry = store.get_entry(server_id, service_id)
+        except Exception:
+            entry = None  # an unreadable map degrades to identity-only
+    if entry is not None:
+        return entry, ServiceRef(service_id=service_id, name=entry.name)
+    stored_name = await _last_service_ref_name(factory, session_id=session_id)
+    return None, ServiceRef(service_id=service_id, name=stored_name)
 
 
 async def _legacy_runbook_service_ids(
@@ -856,11 +942,41 @@ async def submit_turn(
         source=SessionSourceKind.API,
         run_id=run_id,
     )
+    # SCOPE-2: the session's stored service scope is the ONLY authority for
+    # this turn (no per-turn client scope input). The FIRST service-bound
+    # user entry persists the full validated Service Map section + prompt
+    # (untrusted user content, never system/runbook execution; an over-
+    # budget combination is an honest rejection, never clipped); follow-on
+    # entries carry only the compact identity in their service_ref.
+    service_entry, service_ref = await _service_scope_for_turn(
+        factory,
+        request,
+        session_id=session_id,
+        server_id=server_id,
+        service_id=row.service_id,
+    )
+    entry_text = payload.text
+    if (
+        row.service_id is not None
+        and service_entry is not None
+        and await _is_first_user_entry(factory, session_id=session_id)
+    ):
+        entry_text = payload.text + format_service_map_section(
+            [service_entry]
+        )
+        if len(entry_text) > MAX_ENTRY_TEXT_CHARS:
+            return _bad_request(
+                request,
+                SessionErrorCode.BYTE_BUDGET_EXCEEDED.value,
+                "the service context exceeds the bounded turn size; "
+                "shorten the message",
+            )
     user_entry = UserMessageEntry(
         kind=EntryKind.USER_MESSAGE,
-        text=payload.text,
+        text=entry_text,
         client_request_id=payload.client_request_id,
         source=SessionSourceKind.API,
+        service_ref=service_ref,
     )
     # aappend_entry returns the durable SessionEntryRow and is idempotent on
     # durable_source_id: a replayed client_request_id gets the ORIGINAL
