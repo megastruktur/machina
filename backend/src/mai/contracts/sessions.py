@@ -181,6 +181,16 @@ SAFE_TEXT_PATTERN: Final[str] = f"^[^{UNSAFE_TEXT_CLASS}]*$"
 #: Session titles.
 MAX_TITLE_CHARS: Final[int] = 240
 
+#: Service-scope display names (mirrors the Service Map ``MAX_NAME_CHARS``
+#: admission bound; the projection never widens it).
+MAX_SERVICE_NAME_CHARS: Final[int] = 200
+
+#: Compact per-entry service identity prefix (SCOPE-2 follow-on entries):
+#: `[service scope: @<name> (<uuid>)]` stays inside the reviewed 512-char
+#: user-prompt prefix cap.
+MAX_SERVICE_REF_PREFIX_CHARS: Final[int] = 512
+MAX_SERVICE_REF_NAME_CHARS: Final[int] = 200
+
 #: Tool calls per assistant message / provider artifacts per message.
 MAX_TOOL_CALLS: Final[int] = 16
 MAX_PROVIDER_ARTIFACTS: Final[int] = 8
@@ -295,6 +305,7 @@ class SessionErrorCode(StrEnum):
     INVALID_PAGINATION = "invalid_pagination"
     BYTE_BUDGET_EXCEEDED = "byte_budget_exceeded"
     FORBIDDEN_FIELD = "forbidden_field"
+    SESSION_SCOPE_CONFLICT = "session_scope_conflict"
 
 
 # --- rejection plumbing (server-contract pattern: value-free errors) -----------
@@ -946,6 +957,19 @@ class SessionSummary(BaseModel):
         max_length=MAX_TITLE_CHARS,
         description="User-assigned session title, when set",
     )
+    service_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional adopted-service scope of this session "
+        "(SCOPE-1: the canonical Service Map identity validated at "
+        "creation; NULL for unscoped and legacy sessions)",
+    )
+    service_name: str | None = Field(
+        default=None,
+        max_length=MAX_SERVICE_NAME_CHARS,
+        description="Current SAME-server Service Map name of the linked "
+        "service; NULL when the entry is unmapped or was deleted — the "
+        "client reports an unavailable name instead of borrowing one",
+    )
     active_run_id: uuid.UUID | None = Field(
         default=None,
         description="Subordinate run currently executing, when one exists",
@@ -1361,6 +1385,13 @@ class SessionCreateRequest(BaseModel):
     model_profile: IdentityStr | None = Field(
         default=None,
         description="Preferred model profile identity for the session runs",
+    )
+    service_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional adopted-service scope for the new session "
+        "(SCOPE-1): validated against the SAME-server Service Map at "
+        "admission; refused for General Consult or an unknown/cross-server "
+        "service; an existing session can never be rebound",
     )
     client_request_id: uuid.UUID = Field(
         description="Client idempotency key; retries return the same admission",

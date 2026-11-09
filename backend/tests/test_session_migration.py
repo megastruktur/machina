@@ -485,7 +485,9 @@ def test_destructive_cutover_is_installed_at_head_and_spares_generic(
 
     The DDL list is the exact one authored + proven at D02 (single source
     ``mai.migrations``); this test proves the installed revision: head is
-    ``0015``, the obsolete tables are absent, the conversation-only
+    ``0016`` (0016 is the additive SCOPE-1 service-scope column; the
+    destructive 0015 cutover stays installed beneath it), the obsolete
+    tables are absent, the conversation-only
     trigger functions are dropped, the generic trigger surface survives,
     and the unrelated generic rows still execute.
     """
@@ -520,9 +522,10 @@ def test_destructive_cutover_is_installed_at_head_and_spares_generic(
         _restore_migration_env(saved)
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
-        # The chain head IS the destructive revision.
+        # The chain head IS the current linear revision (0016 = additive
+        # SCOPE-1 service-scope column above the installed 0015 cutover).
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert version is not None and version[0] == "0015", version
+        assert version is not None and version[0] == "0016", version
 
         for table in OBSOLETE_TABLES:
             assert not _table_exists(migrated_url, table), table
@@ -597,4 +600,188 @@ def test_destructive_cutover_is_installed_at_head_and_spares_generic(
                 """
             ).fetchone()[0]
             >= 1
+        )
+
+
+# --- SCOPE-1: additive nullable sessions.service_id (0016) ---------------------
+
+SCOPE_SESSION_LEGACY = uuid.UUID("5d5349b2-0001-4001-8001-00000000c001")
+SCOPE_SESSION_SCOPED = uuid.UUID("5d5349b2-0002-4002-8002-00000000c002")
+SCOPE_SERVICE_ID = uuid.UUID("3f9d2c4e-0001-4001-8001-00000000d001")
+
+
+def _sessions_columns(url: str) -> dict[str, tuple[str, str]]:
+    """``column_name -> (data_type, is_nullable)`` for ``public.sessions``."""
+    with psycopg.connect(url) as conn:
+        return {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'sessions'
+                """
+            ).fetchall()
+        }
+
+
+def test_0016_seeded_upgrade_preserves_null_and_fresh_parity(
+    migrated_url: str,
+) -> None:
+    """Real 0015→0016 upgrade on a SEEDED fixture: legacy rows keep their
+    NULL ``service_id``, the column is a nullable bare UUID (no FK, no
+    index, no default), and a schema built from ZERO at head is
+    column-for-column identical to the upgraded one."""
+    saved = _set_migration_env(migrated_url)
+    try:
+        _rebuild_at(migrated_url, "0015")
+        assert "service_id" not in _sessions_columns(migrated_url)
+        with psycopg.connect(migrated_url) as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO sessions
+                        (session_id, server_id, source, status)
+                    VALUES (%s, %s, 'runbook', 'idle'),
+                           (%s, %s, 'interactive', 'idle')
+                    """,
+                    (
+                        SCOPE_SESSION_LEGACY,
+                        str(SERVER_A),
+                        SCOPE_SESSION_SCOPED,
+                        str(SERVER_A),
+                    ),
+                )
+        command.upgrade(_alembic_config(), "head")
+    finally:
+        _restore_migration_env(saved)
+
+    upgraded = _sessions_columns(migrated_url)
+    assert upgraded["service_id"] == ("uuid", "YES")
+    with psycopg.connect(migrated_url) as conn:
+        # Seeded 0015 rows survive with NULL service_id (no backfill).
+        rows = conn.execute(
+            """
+            SELECT session_id, service_id FROM sessions
+            WHERE session_id IN (%s, %s)
+            """,
+            (SCOPE_SESSION_LEGACY, SCOPE_SESSION_SCOPED),
+        ).fetchall()
+        assert {tuple(row) for row in rows} == {
+            (SCOPE_SESSION_LEGACY, None),
+            (SCOPE_SESSION_SCOPED, None),
+        }
+        # No FK on the column (the map is a confined JSON store, not a
+        # relational target) and no service index in this feature.
+        fks = conn.execute(
+            """
+            SELECT COUNT(*) FROM pg_constraint
+            WHERE contype = 'f'
+              AND conrelid = 'public.sessions'::regclass
+              AND conname LIKE '%service%'
+            """
+        ).fetchone()
+        assert fks is not None and fks[0] == 0
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'sessions'
+                """
+            ).fetchall()
+        }
+        assert not any("service" in name for name in indexes)
+
+    # Fresh-from-zero parity: a second disposable database at head has the
+    # EXACT same sessions column set (linear chain == upgraded schema).
+    parity_url = migrated_url.rsplit("/", 1)[0] + "/mcr_scope_parity_0016"
+    saved = _set_migration_env(migrated_url)
+    admin_url = migrated_url.rsplit("/", 1)[0] + "/postgres"
+    fresh: dict[str, tuple[str, str]] = {}
+    try:
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            conn.execute("DROP DATABASE IF EXISTS mcr_scope_parity_0016")
+            conn.execute("CREATE DATABASE mcr_scope_parity_0016")
+        os.environ["MAI_DATABASE_URL"] = parity_url
+        command.upgrade(_alembic_config(), "head")
+        fresh = _sessions_columns(parity_url)
+    finally:
+        _restore_migration_env(saved)
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            conn.execute("DROP DATABASE IF EXISTS mcr_scope_parity_0016")
+
+    assert fresh == upgraded
+
+
+def test_0016_downgrade_drops_only_service_column(migrated_url: str) -> None:
+    """0016→0015 drops ONLY ``sessions.service_id``; every other sessions
+    column and the seeded row survive; re-upgrade accepts a service write."""
+    saved = _set_migration_env(migrated_url)
+    columns_after_downgrade: dict[str, tuple[str, str]] = {}
+    row_after_downgrade: list[tuple[uuid.UUID]] = []
+    try:
+        _rebuild_at(migrated_url, "0015")
+        with psycopg.connect(migrated_url) as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO sessions
+                        (session_id, server_id, source, status)
+                    VALUES (%s, %s, 'runbook', 'idle')
+                    """,
+                    (SCOPE_SESSION_LEGACY, str(SERVER_A)),
+                )
+        command.upgrade(_alembic_config(), "head")
+        with psycopg.connect(migrated_url) as conn:
+            with conn.transaction():
+                conn.execute(
+                    "UPDATE sessions SET service_id = %s WHERE session_id = %s",
+                    (SCOPE_SERVICE_ID, SCOPE_SESSION_LEGACY),
+                )
+        command.downgrade(_alembic_config(), "0015")
+        columns_after_downgrade = _sessions_columns(migrated_url)
+        with psycopg.connect(migrated_url) as conn:
+            row_after_downgrade = conn.execute(
+                "SELECT session_id FROM sessions WHERE session_id = %s",
+                (SCOPE_SESSION_LEGACY,),
+            ).fetchall()
+        # A re-upgrade accepts a service write again (the column is back).
+        command.upgrade(_alembic_config(), "head")
+    finally:
+        _restore_migration_env(saved)
+        # Leave the fixture at head for later tests.
+        again = _set_migration_env(migrated_url)
+        try:
+            command.upgrade(_alembic_config(), "head")
+        finally:
+            _restore_migration_env(again)
+
+    columns = columns_after_downgrade
+    assert "service_id" not in columns
+    for retained in (
+        "session_id",
+        "server_id",
+        "source",
+        "status",
+        "title",
+        "created_at",
+        "updated_at",
+    ):
+        assert retained in columns, retained
+    assert [tuple(row) for row in row_after_downgrade] == [
+        (SCOPE_SESSION_LEGACY,)
+    ]
+    with psycopg.connect(migrated_url) as conn:
+        with conn.transaction():
+            conn.execute(
+                "UPDATE sessions SET service_id = %s WHERE session_id = %s",
+                (SCOPE_SERVICE_ID, SCOPE_SESSION_LEGACY),
+            )
+        assert (
+            conn.execute(
+                "SELECT service_id FROM sessions WHERE session_id = %s",
+                (SCOPE_SESSION_LEGACY,),
+            ).fetchone()[0]
+            == SCOPE_SERVICE_ID
         )

@@ -242,14 +242,24 @@ def _tag_error(request: Request, exc: TagStoreError) -> Response:
 
 
 def _summary_row(
-    row: Any, tag_preview: EntityTagPreview | None = None
+    row: Any,
+    tag_preview: EntityTagPreview | None = None,
+    service: tuple[uuid.UUID | None, str | None] = (None, None),
 ) -> SessionSummary:
     """Project one ``SessionRow`` onto the safe summary (never content).
     ``tag_preview`` rides additively (D07-fix1 N5) so drawer session rows
-    render HistoryTags without a second round trip."""
+    render HistoryTags without a second round trip; ``service`` is the
+    ``(service_id, service_name)`` scope projection (SCOPE-1): the stored
+    column identity, the legacy runbook_ref identity for NULL-service
+    RUNBOOK rows, and the SAME-server map name — or None name when the map
+    entry is missing/deleted (the client reports an unavailable name; it
+    never borrows another server's label)."""
+    service_id, service_name = service
     return SessionSummary(
         session_id=row.session_id,
         server_id=row.server_id,
+        service_id=service_id,
+        service_name=service_name,
         source=SessionSourceKind(str(row.source)),
         status=SessionStatus(str(row.status)),
         title=row.title,
@@ -282,8 +292,116 @@ async def _tag_previews(
         return {}
 
 
+def _resolve_service_names(
+    request: Request,
+    pairs: Sequence[tuple[uuid.UUID, uuid.UUID]],
+) -> dict[tuple[uuid.UUID, uuid.UUID], str | None]:
+    """Current SAME-server Service Map names for ``(server, service)``
+    pairs. One ``list_entries`` read per distinct server; an unreadable or
+    missing map degrades to None names (unavailable), never to a borrowed
+    label from another server."""
+    store = getattr(request.app.state, "service_map", None)
+    if store is None or not pairs:
+        return {pair: None for pair in pairs}
+    by_server: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for server_id, service_id in pairs:
+        by_server.setdefault(server_id, set()).add(service_id)
+    names: dict[tuple[uuid.UUID, uuid.UUID], str | None] = {}
+    for server_id, service_ids in by_server.items():
+        try:
+            entries = store.list_entries(server_id)
+        except Exception:
+            names.update({(server_id, sid): None for sid in service_ids})
+            continue
+        index = {entry.application_id: entry.name for entry in entries}
+        names.update(
+            {(server_id, sid): index.get(str(sid)) for sid in service_ids}
+        )
+    return names
+
+
+async def _legacy_runbook_service_ids(
+    factory: async_sessionmaker[AsyncSession],
+    session_ids: Sequence[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Backfill is PROJECTION-ONLY (chat-recovery §B): for legacy
+    NULL-service RUNBOOK sessions, ONE bounded query reads each session's
+    FIRST non-null ``runbook_ref`` user entry (``ORDER BY seq LIMIT 1`` per
+    session via ``DISTINCT ON``; the page ids bound the scan). No writes, no
+    guesses for interactive history."""
+    if not session_ids:
+        return {}
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT DISTINCT ON (session_id)
+                           session_id,
+                           (payload->'runbook_ref'->>'service_id')
+                               AS service_id
+                    FROM session_entries
+                    WHERE session_id = ANY(:sids)
+                      AND kind = 'user_message'
+                      AND payload->'runbook_ref'->>'service_id' IS NOT NULL
+                    ORDER BY session_id, seq
+                    """
+                ),
+                {"sids": list(session_ids)},
+            )
+        ).mappings().all()
+    return {
+        uuid.UUID(str(row["session_id"])): uuid.UUID(str(row["service_id"]))
+        for row in rows
+    }
+
+
+async def _service_scope_projection(
+    factory: async_sessionmaker[AsyncSession],
+    request: Request,
+    rows: Sequence[Any],
+) -> dict[uuid.UUID, tuple[uuid.UUID | None, str | None]]:
+    """One page's ``session_id -> (service_id, service_name)`` projection.
+
+    Stored non-NULL ``sessions.service_id`` wins; a legacy NULL-service
+    RUNBOOK row falls back to its first non-null ``runbook_ref`` user entry
+    (the bounded projection-only query). Names resolve from the SAME-server
+    map only; an unavailable or deleted entry projects a null name (wire
+    honesty) and never mutates the session row."""
+    stored = {
+        row.session_id: (row.server_id, row.service_id)
+        for row in rows
+        if row.service_id is not None
+    }
+    legacy_candidates = [
+        row.session_id
+        for row in rows
+        if row.service_id is None
+        and str(row.source) == SessionSourceKind.RUNBOOK.value
+    ]
+    legacy = await _legacy_runbook_service_ids(factory, legacy_candidates)
+    pairs: list[tuple[uuid.UUID, uuid.UUID]] = [
+        *stored.values(),
+        *(
+            (row.server_id, legacy[row.session_id])
+            for row in rows
+            if row.session_id in legacy
+        ),
+    ]
+    names = _resolve_service_names(request, pairs)
+    projection: dict[uuid.UUID, tuple[uuid.UUID | None, str | None]] = {}
+    for row in rows:
+        service_id = row.service_id or legacy.get(row.session_id)
+        projection[row.session_id] = (
+            service_id,
+            None if service_id is None else names.get((row.server_id, service_id)),
+        )
+    return projection
+
+
 async def _detail_of(
     factory: async_sessionmaker[AsyncSession],
+    request: Request,
     *,
     session_id: uuid.UUID,
     server_id: uuid.UUID,
@@ -298,7 +416,12 @@ async def _detail_of(
     if row is None:
         return None
     previews = await _tag_previews(factory, [session_id], server_id=server_id)
-    summary = _summary_row(row, previews.get(session_id))
+    service_scope = await _service_scope_projection(factory, request, [row])
+    summary = _summary_row(
+        row,
+        previews.get(session_id),
+        service_scope.get(session_id, (None, None)),
+    )
     async with factory() as session:
         async with session.begin():
             aggregates = (
@@ -466,9 +589,15 @@ async def list_sessions(
     previews = await _tag_previews(
         factory, [row.session_id for row in rows], server_id=server_id
     )
+    service_scope = await _service_scope_projection(factory, request, rows)
     return SessionListPage(
         items=[
-            _summary_row(row, previews.get(row.session_id)) for row in rows
+            _summary_row(
+                row,
+                previews.get(row.session_id),
+                service_scope.get(row.session_id, (None, None)),
+            )
+            for row in rows
         ],
         limit=limit,
         offset=offset,
@@ -482,11 +611,23 @@ async def create_session(
     request: Request, payload: SessionCreateRequest
 ) -> Response | SessionDetail:
     """Idempotent session create: the client idempotency key derives the
-    session identity, so a retry converges on the same row."""
+    session identity, so a retry converges on the same row. Optional
+    ``service_id`` (SCOPE-1) is validated against the SAME-server Service
+    Map BEFORE the insert, refused for General Consult, and fixed at
+    creation — an existing session is never rebound; a replayed key with a
+    DIFFERENT scope is an honest 409."""
     await _require_session(request)
     _require_allowed_origin(request)
     _require_csrf(request)
     factory = _factory(request)
+    try:
+        validated_service_id = await _validated_service_id(request, payload)
+    except SessionScopeValidationError as exc:
+        return _bad_request(
+            request,
+            SessionErrorCode.FORBIDDEN_FIELD.value,
+            str(exc),
+        )
     derived_id = uuid.uuid5(
         uuid.UUID(int=0), f"agent-session:{payload.client_request_id}"
     )
@@ -497,6 +638,7 @@ async def create_session(
             source=payload.source,
             title=payload.title,
             session_id=derived_id,
+            service_id=validated_service_id,
         )
     except SessionContractError:
         pass  # a replayed key: converge on the existing (scope-checked) row
@@ -508,11 +650,52 @@ async def create_session(
         ).lower():
             raise
     detail = await _detail_of(
-        factory, session_id=derived_id, server_id=payload.server_id
+        factory, request, session_id=derived_id, server_id=payload.server_id
     )
     if detail is None:
         return _not_found(request)
+    # Idempotent replay scope conflict: the SAME client request id always
+    # converges on the SAME service scope; anything else is rejected.
+    if detail.service_id != validated_service_id:
+        return render_error_envelope(
+            request,
+            HTTP_409_CONFLICT,
+            SessionErrorCode.SESSION_SCOPE_CONFLICT.value,
+            "this client request id was already admitted with a different "
+            "service scope",
+        )
     return detail
+
+
+async def _validated_service_id(
+    request: Request, payload: SessionCreateRequest
+) -> uuid.UUID | None:
+    """SCOPE-1 create-time validation: a service scope requires a
+    non-General server and a SAME-server Service Map entry. Bounded
+    value-free rejection — never a disclosure of foreign map contents, and
+    never an arbitrary client string stored."""
+    if payload.service_id is None:
+        return None
+    if payload.server_id == _GENERAL_SERVER:
+        raise SessionScopeValidationError(
+            "service scope requires a non-General server session"
+        )
+    store = getattr(request.app.state, "service_map", None)
+    if store is not None:
+        try:
+            entry = store.get_entry(payload.server_id, payload.service_id)
+        except Exception:
+            entry = None  # an unreadable map admits nothing (fail closed)
+        if entry is not None:
+            return uuid.UUID(entry.application_id)
+    raise SessionScopeValidationError(
+        "service_id is not a mapped service on this server"
+    )
+
+
+class SessionScopeValidationError(ValueError):
+    """Bounded create-time service-scope rejection (rendered as a 400
+    ``forbidden_field`` on ``service_id``)."""
 
 
 @router.get("/{session_id}", response_model=SessionDetail)
@@ -528,7 +711,7 @@ async def get_session_detail(
     await _require_session(request)
     factory = _factory(request)
     detail = await _detail_of(
-        factory, session_id=session_id, server_id=server_id
+        factory, request, session_id=session_id, server_id=server_id
     )
     if detail is None:
         return _not_found(request)
@@ -817,7 +1000,7 @@ async def rename_session(
             )
         return _not_found(request)
     detail = await _detail_of(
-        factory, session_id=row.session_id, server_id=row.server_id
+        factory, request, session_id=row.session_id, server_id=row.server_id
     )
     if detail is None:
         return _not_found(request)

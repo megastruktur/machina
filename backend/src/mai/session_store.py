@@ -158,6 +158,7 @@ class SessionRow:
 
     session_id: uuid.UUID
     server_id: uuid.UUID
+    service_id: uuid.UUID | None
     source: str
     status: str
     title: str | None
@@ -378,6 +379,7 @@ def _session_row(row: Mapping[str, object]) -> SessionRow:
     return SessionRow(
         session_id=row["session_id"],  # type: ignore[arg-type]
         server_id=row["server_id"],  # type: ignore[arg-type]
+        service_id=row.get("service_id"),  # type: ignore[arg-type]
         source=row["source"],  # type: ignore[arg-type]
         status=row["status"],  # type: ignore[arg-type]
         title=row["title"],  # type: ignore[arg-type]
@@ -393,12 +395,16 @@ async def acreate_session(
     source: SessionSourceKind | str,
     title: str | None = None,
     session_id: uuid.UUID | None = None,
+    service_id: uuid.UUID | None = None,
 ) -> SessionRow:
     """Create one session row; ``source`` validated against D01 vocabulary.
 
     ``session_id`` is a trusted-producer key (the admission surface owns
     identity allocation); a duplicate id is a caller contract fault and
-    surfaces as the schema's unique violation.
+    surfaces as the schema's unique violation. ``service_id`` is the
+    optional adopted-service scope (SCOPE-1): already validated against the
+    SAME-server Service Map by the admission surface, stored in the SAME
+    transaction (never a follow-up write).
     """
     validated_source = _validated_source(source)
     validated_title = _validated_title(title)
@@ -410,16 +416,19 @@ async def acreate_session(
                     text(
                         """
                         INSERT INTO sessions
-                            (session_id, server_id, source, status, title)
+                            (session_id, server_id, service_id, source,
+                             status, title)
                         VALUES
-                            (:sid, :server_id, :source, 'idle', :title)
-                        RETURNING session_id, server_id, source, status,
-                                  title, created_at, updated_at
+                            (:sid, :server_id, :service_id, :source, 'idle',
+                             :title)
+                        RETURNING session_id, server_id, service_id, source,
+                                  status, title, created_at, updated_at
                         """
                     ),
                     {
                         "sid": new_id,
                         "server_id": server_id,
+                        "service_id": service_id,
                         "source": validated_source,
                         "title": validated_title,
                     },
@@ -440,8 +449,8 @@ async def aget_session(
             await session.execute(
                 text(
                     """
-                    SELECT session_id, server_id, source, status, title,
-                           created_at, updated_at
+                    SELECT session_id, server_id, service_id, source, status,
+                           title, created_at, updated_at
                     FROM sessions
                     WHERE session_id = :sid
                     """
@@ -522,8 +531,8 @@ async def alist_sessions(
             await session.execute(
                 text(
                     f"""
-                    SELECT session_id, server_id, source, status, title,
-                           created_at, updated_at
+                    SELECT session_id, server_id, service_id, source, status,
+                           title, created_at, updated_at
                     FROM sessions
                     {predicate}
                     ORDER BY updated_at DESC, session_id
@@ -2020,8 +2029,8 @@ async def arename_session(
             await session.execute(
                 text(
                     """
-                    SELECT session_id, server_id, source, status, title,
-                           created_at, updated_at
+                    SELECT session_id, server_id, service_id, source, status,
+                           title, created_at, updated_at
                     FROM sessions
                     WHERE session_id = :sid
                     """
