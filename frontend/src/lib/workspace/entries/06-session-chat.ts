@@ -56,6 +56,8 @@ export interface ChatServerOption {
 
 /** One mapped/discovered service offered by the draft-mode `@service` autocomplete. */
 export interface SessionChatServiceOption {
+	/** Canonical Service Map application identity (SCOPE-3): submitted at CREATE. */
+	readonly application_id: string;
 	readonly name: string;
 	readonly category?: string;
 }
@@ -159,6 +161,12 @@ export interface SessionChatServices {
 	readonly serverOptions?: readonly ChatServerOption[];
 	/** Mapped/discovered services for the draft-mode `@service` autocomplete. */
 	readonly availableServices?: readonly SessionChatServiceOption[];
+	/** Honest slice states (SCOPE-3): bounded same-server page loader. */
+	readonly servicesLoading?: boolean;
+	readonly servicesError?: string | null;
+	readonly servicesHasMore?: boolean;
+	/** The bounded page continuation (never an unbounded loader). */
+	readonly loadMoreServices?: () => void;
 }
 
 /** The feature entry for composition into the app's one panel registry. */

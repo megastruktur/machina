@@ -49,6 +49,9 @@
 		SessionRunState,
 		SessionTurnSubmitOutcome
 	} from '../api/client.js';
+	import type { AgentSessionView } from '../api/client.js';
+	import type { SessionChatServiceOption } from '../workspace/entries/06-session-chat.js';
+	import { GLOBAL_CONSULT_SERVER_ID } from '../workspace/entries/06-session-chat.js';
 	import type { components } from '../api/schema.generated.js';
 	import Button from '../ui/Button.svelte';
 	import MarkdownRenderer from '../ui/MarkdownRenderer.svelte';
@@ -122,8 +125,113 @@
 	});
 	const usable = $derived(api !== null);
 
+	// --- @service slice states (SCOPE-3; structural narrowing fails closed) ---
+	const serviceOptions = $derived.by<readonly SessionChatServiceOption[]>(() => {
+		const candidate: unknown = panel.services.availableServices;
+		if (!Array.isArray(candidate)) return [];
+		return candidate.filter(
+			(item): item is SessionChatServiceOption =>
+				typeof item === 'object' &&
+				item !== null &&
+				typeof (item as SessionChatServiceOption).application_id === 'string' &&
+				typeof (item as SessionChatServiceOption).name === 'string'
+		);
+	});
+	const servicesLoading = $derived(panel.services.servicesLoading === true);
+	const servicesError = $derived(
+		typeof panel.services.servicesError === 'string'
+			? panel.services.servicesError
+			: null
+	);
+	const servicesHasMore = $derived(panel.services.servicesHasMore === true);
+	const loadMoreServices = $derived.by(() => {
+		const candidate: unknown = panel.services.loadMoreServices;
+		return typeof candidate === 'function' ? candidate : () => {};
+	});
+
+	// --- session header scope (SCOPE-3) --------------------------------------
+	/**
+	 * The ACTIVE session's stored header truth: the chips render the
+	 * session's OWN server + service scope (reloaded/restored state), never
+	 * the drawer's selection and never a borrowed name. One bounded read
+	 * per visible session; failure renders the honest unavailable state.
+	 */
+	let sessionDetail = $state<AgentSessionView | null>(null);
+	let sessionDetailState = $state<'idle' | 'loading' | 'ready' | 'error'>(
+		'idle'
+	);
+	$effect(() => {
+		const sid = sessionId;
+		const scope = serverId;
+		if (!api || sid === null || typeof api.readAgentSession !== 'function') {
+			// No read seam (e.g. a minimal scripted bag): the chips fail
+			// closed to absent instead of throwing or fabricating a scope.
+			sessionDetail = null;
+			sessionDetailState = 'idle';
+			return;
+		}
+		let stale = false;
+		sessionDetailState = 'loading';
+		sessionDetail = null;
+		untrack(() => {
+			void api
+				.readAgentSession(sid, scope)
+				.then((detail) => {
+					if (stale) return;
+					sessionDetail = detail;
+					sessionDetailState = 'ready';
+				})
+				.catch(() => {
+					if (stale) return;
+					sessionDetailState = 'error';
+				});
+		});
+		return () => {
+			stale = true;
+		};
+	});
+
+	/** The stored server id the chips render (never the drawer selection). */
+	const activeServerId = $derived(sessionDetail?.server_id ?? serverId ?? null);
+	const serverOptionsList = $derived.by<readonly { id: string; label: string }[]>(
+		() => {
+			const candidate: unknown = panel.services.serverOptions;
+			if (!Array.isArray(candidate)) return [];
+			return candidate.filter(
+				(item): item is { id: string; label: string } =>
+					typeof item === 'object' &&
+					item !== null &&
+					typeof (item as { id?: unknown }).id === 'string' &&
+					typeof (item as { label?: unknown }).label === 'string'
+			);
+		}
+	);
+	const serverChip = $derived.by<string | null>(() => {
+		if (sessionDetailState === 'loading') return 'Server: …';
+		if (sessionDetailState === 'error') return 'Server unavailable';
+		const id = activeServerId;
+		if (id === null || id === '') return null;
+		if (id === GLOBAL_CONSULT_SERVER_ID) return 'General Consult';
+		const label = serverOptionsList.find((option) => option.id === id)?.label;
+		// Unknown enrolled name: the short UUID IS the honest fallback —
+		// never a guessed label.
+		return label !== undefined ? `Server: ${label}` : `Server: ${id.slice(0, 8)}…`;
+	});
+	const serviceChip = $derived.by<string | null>(() => {
+		const detail = sessionDetail;
+		if (detail?.service_id == null) return null;
+		const name = detail.service_name;
+		return name !== null && name !== undefined && name !== ''
+			? `Service: @${name}`
+			: `Service: @${detail.service_id.slice(0, 8)}… (unavailable)`;
+	});
+
 	// --- composer + controls -------------------------------------------------
 	let composerText = $state('');
+	/** The draft @service selection (SCOPE-3): committed at CREATE only —
+	 * an existing session can never be rebound, so the picker disappears
+	 * once a session is open and the linked chip becomes read-only. */
+	let selectedServiceId = $state('');
 	let submitting = $state(false);
 	let submitProblem = $state<{ code: string; message: string } | null>(null);
 	let controlBusy = $state<string | null>(null);
@@ -163,12 +271,15 @@
 		try {
 			if (sessionId === null) {
 				// Create-on-submit: the explicit first turn mints the session
-				// and the shell attaches its channel.
+				// and the shell attaches its channel. The draft @service
+				// selection (validated same-server application_id) commits
+				// HERE — turn requests themselves stay scope-free.
 				const scope = serverId ?? '00000000-0000-0000-0000-000000000000';
 				const created = await api.createAgentSession({
 					server_id: scope,
 					source: 'interactive',
-					client_request_id: clientRequestId
+					client_request_id: clientRequestId,
+					service_id: selectedServiceId === '' ? null : selectedServiceId
 				});
 				const outcome = await api.submitAgentSessionTurn(
 					created.session_id,
@@ -180,6 +291,7 @@
 					scope
 				);
 				composerText = '';
+				selectedServiceId = '';
 				// The shell attaches the channel SYNCHRONOUSLY inside this
 				// callback, so the optimistic merge below lands in the NEW
 				// session's controller cache.
@@ -633,6 +745,22 @@
 			<span class="mai-session-chat__id" data-testid="session-header-id">
 				{sessionId === null ? 'new session' : `session ${sessionId.slice(0, 8)}…`}
 			</span>
+			{#if serverChip !== null}
+				<span class="mai-session-chat__scope" data-testid="session-header-server">
+					{serverChip}
+				</span>
+			{/if}
+			{#if serviceChip !== null}
+				<span
+					class="mai-session-chat__scope"
+					data-testid="session-header-service"
+					title={serviceChip.endsWith('(unavailable)')
+						? 'The linked service map entry is unavailable.'
+						: undefined}
+				>
+					{serviceChip}
+				</span>
+			{/if}
 			{#if channelState === 'resync'}
 				<span class="mai-session-chat__resync" role="status" data-testid="session-resync-note">
 					resync — reconciling with the server
@@ -1001,6 +1129,65 @@
 					{controlProblem.code}: {controlProblem.message}
 				</p>
 			{/if}
+			{#if sessionId === null}
+				<!-- SCOPE-3: the @service picker exists ONLY for a NEW session —
+				     an existing session's linked chip (header) is read-only and
+				     can never be rebound through the composer. -->
+				<div class="mai-session-chat__service-row" data-testid="session-service-picker">
+					{#if servicesLoading}
+						<span
+							class="mai-session-chat__service-state"
+							data-testid="session-services-loading"
+						>
+							Loading services…
+						</span>
+					{:else if servicesError !== null}
+						<span
+							class="mai-session-chat__service-state"
+							role="alert"
+							data-testid="session-services-error"
+						>
+							Services unavailable: {servicesError}
+						</span>
+					{:else if serviceOptions.length === 0}
+						<span
+							class="mai-session-chat__service-state"
+							data-testid="session-services-empty"
+						>
+							No adopted services on this server.
+						</span>
+					{:else}
+						<label class="mai-session-chat__service-label">
+							@service
+							<select
+								class="mai-session-chat__service-select"
+								data-testid="session-service-select"
+								bind:value={selectedServiceId}
+								disabled={submitting}
+							>
+								<option value="">— none —</option>
+								{#each serviceOptions as option (option.application_id)}
+									<option value={option.application_id}>
+										{option.name}{option.category ? ` · ${option.category}` : ''}
+									</option>
+								{/each}
+							</select>
+						</label>
+						{#if servicesHasMore}
+							<Button
+								variant="secondary"
+								size="sm"
+								tabindex={0}
+								loading={servicesLoading}
+								data-testid="session-services-load-more"
+								onclick={() => loadMoreServices()}
+							>
+								Load more
+							</Button>
+						{/if}
+					{/if}
+				</div>
+			{/if}
 			<div class="mai-session-chat__composer-row">
 				<textarea
 					class="mai-session-chat__input"
@@ -1101,6 +1288,38 @@
 		align-items: center;
 		padding: 2px 8px;
 		font-size: 0.75rem;
+	}
+	/* SCOPE-3 chips: compact, wrap-safe at 360px (long names wrap inside
+	   the chip instead of pushing the header wide). */
+	.mai-session-chat__scope {
+		max-width: 100%;
+		overflow-wrap: anywhere;
+		padding: 1px 6px;
+		border: 1px solid var(--border, currentColor);
+		border-radius: 999px;
+		white-space: normal;
+	}
+	.mai-session-chat__service-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+		padding: 0 8px 2px;
+		font-size: 0.75rem;
+	}
+	.mai-session-chat__service-label {
+		display: inline-flex;
+		gap: 4px;
+		align-items: center;
+		min-width: 0;
+	}
+	.mai-session-chat__service-select {
+		max-width: 100%;
+		min-width: 0;
+		font: inherit;
+	}
+	.mai-session-chat__service-state {
+		overflow-wrap: anywhere;
 	}
 	/* Refresh continuity (R2-3): present for the E2E assertions, visually
 	   silent — assistive technology still reads the active session id. */
