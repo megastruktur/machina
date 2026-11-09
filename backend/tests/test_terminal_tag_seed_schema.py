@@ -236,11 +236,12 @@ def test_upgrade_preserves_same_name_user_tags_and_is_idempotent(
         }
 
         # A second upgrade at the tip is a no-op: nothing duplicated or
-        # overwritten, the version stays at the chain head (0015 since D09).
+        # overwritten, the version stays at the chain head (0016 since the
+        # additive SCOPE-1 column; the 0012 seed rows survive unchanged).
         command.upgrade(_alembic_config(), "head")
         with psycopg.connect(url) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert version == ("0015",)
+        assert version == ("0016",)
         assert _fetchall(url, "SELECT count(*) FROM tags")[0][0] == 4
         assert _fetchall(
             url,

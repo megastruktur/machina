@@ -102,6 +102,7 @@ REVISION_IDS = (
     "0013",
     "0014",
     "0015",
+    "0016",
 )
 
 # The exact public application schema at the tip — nothing else, in
