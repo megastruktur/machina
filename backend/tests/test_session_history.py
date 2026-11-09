@@ -78,7 +78,9 @@ from mai.contracts.sessions import (
     ControlEntry,
     EntryKind,
     MAX_SUMMARY_TEXT_CHARS,
+    SERVICE_MAP_SECTION_HEADER,
     ProviderReasoningArtifact,
+    ServiceRef,
     SessionContractError,
     SessionEntryView,
     SessionSourceKind,
@@ -1310,3 +1312,212 @@ def test_projector_and_bridge_have_zero_old_imports() -> None:
     module = importlib.import_module("mai.agents.session_history")
     assert not hasattr(module, "TieredCompaction")
     assert not hasattr(module, "pydantic_ai_harness")
+
+
+# ---------------------------------------------------------------------------
+# SCOPE-2: compact service identity in the model context
+# ---------------------------------------------------------------------------
+
+_SCOPE_SERVICE = uuid.UUID("3f9d2c4e-0001-4001-8001-00000000d001")
+
+
+def _scoped_user_entry(
+    payload: UserMessageEntry,
+    n: int,
+    *,
+    seq: int,
+    sid: uuid.UUID,
+) -> SessionEntryView:
+    return SessionEntryView(
+        entry_id=uuid.UUID(int=0x6000 + n),
+        session_id=sid,
+        seq=seq,
+        run_id=None,
+        durable_source_id=f"scope-src-{n}",
+        created_at=_EPOCH_TEST,
+        payload=payload,
+    )
+
+
+def test_first_service_entry_skips_prefix_follow_ons_carry_identity(
+) -> None:
+    """The FIRST service-bound entry's persisted text already carries the
+    full Service Map section (identity included): no second prefix. A
+    follow-on entry gets the compact `[service scope: …]` prefix only —
+    never a duplicated full runbook; an unbound chat gets no prefix."""
+    sid = uuid.uuid4()
+    full_text = (
+        "check the proxy logs\n"
+        + SERVICE_MAP_SECTION_HEADER
+        + "\n### nginx-proxy (id ...)"
+    )
+    first = build_native_model_history(
+        [
+            _scoped_user_entry(
+                UserMessageEntry(
+                    kind=EntryKind.USER_MESSAGE,
+                    text=full_text,
+                    client_request_id=uuid.uuid4(),
+                    source=SessionSourceKind.API,
+                    service_ref=ServiceRef(
+                        service_id=_SCOPE_SERVICE, name="nginx-proxy"
+                    ),
+                ),
+                1,
+                seq=1,
+                sid=sid,
+            )
+        ],
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    first_content = first.messages[0].parts[0].content
+    assert first_content == full_text
+    assert "[service scope:" not in first_content
+
+    follow = build_native_model_history(
+        [
+            _scoped_user_entry(
+                UserMessageEntry(
+                    kind=EntryKind.USER_MESSAGE,
+                    text="and restart it please",
+                    client_request_id=uuid.uuid4(),
+                    source=SessionSourceKind.API,
+                    service_ref=ServiceRef(
+                        service_id=_SCOPE_SERVICE, name="nginx-proxy"
+                    ),
+                ),
+                2,
+                seq=2,
+                sid=sid,
+            )
+        ],
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    follow_content = follow.messages[0].parts[0].content
+    assert follow_content == (
+        f"[service scope: @nginx-proxy ({_SCOPE_SERVICE})]\n"
+        "and restart it please"
+    )
+
+    # Deleted map entry, no persisted name: deterministic bounded fallback.
+    deleted = build_native_model_history(
+        [
+            _scoped_user_entry(
+                UserMessageEntry(
+                    kind=EntryKind.USER_MESSAGE,
+                    text="still there?",
+                    client_request_id=uuid.uuid4(),
+                    source=SessionSourceKind.API,
+                    service_ref=ServiceRef(
+                        service_id=_SCOPE_SERVICE, name=None
+                    ),
+                ),
+                3,
+                seq=3,
+                sid=sid,
+            )
+        ],
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    deleted_content = deleted.messages[0].parts[0].content
+    assert deleted_content.startswith(
+        f"[service scope: @application-{str(_SCOPE_SERVICE)[:8]} "
+        f"(unavailable) id {_SCOPE_SERVICE}]"
+    )
+
+    # Unbound chat: no prefix, byte-identical user text.
+    unbound = build_native_model_history(
+        [
+            _scoped_user_entry(
+                UserMessageEntry(
+                    kind=EntryKind.USER_MESSAGE,
+                    text="plain question",
+                    client_request_id=uuid.uuid4(),
+                    source=SessionSourceKind.API,
+                ),
+                4,
+                seq=4,
+                sid=sid,
+            )
+        ],
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    assert unbound.messages[0].parts[0].content == "plain question"
+
+
+def test_compaction_retains_service_identity_for_later_turns() -> None:
+    """After a compaction supersedes the first (full-material) entry, a
+    later service-bound turn still replays with its compact identity — the
+    session never silently becomes unscoped."""
+    sid = uuid.uuid4()
+    entries = [
+        _scoped_user_entry(
+            UserMessageEntry(
+                kind=EntryKind.USER_MESSAGE,
+                text="check the proxy logs\n"
+                + SERVICE_MAP_SECTION_HEADER
+                + "\n### nginx-proxy",
+                client_request_id=uuid.uuid4(),
+                source=SessionSourceKind.API,
+                service_ref=ServiceRef(
+                    service_id=_SCOPE_SERVICE, name="nginx-proxy"
+                ),
+            ),
+            1,
+            seq=1,
+            sid=sid,
+        ),
+        SessionEntryView(
+            entry_id=uuid.UUID(int=0x6100),
+            session_id=sid,
+            seq=2,
+            run_id=None,
+            durable_source_id="scope-compaction-1",
+            created_at=_EPOCH_TEST,
+            payload=CompactionEntry(
+                kind=EntryKind.COMPACTION,
+                compaction_id=uuid.UUID(int=0x6101),
+                from_seq=1,
+                to_seq=1,
+                summary_text="Earlier: the operator asked about the proxy.",
+                model_profile=MODEL_PROFILE,
+            ),
+        ),
+        _scoped_user_entry(
+            UserMessageEntry(
+                kind=EntryKind.USER_MESSAGE,
+                text="and now restart it",
+                client_request_id=uuid.uuid4(),
+                source=SessionSourceKind.API,
+                service_ref=ServiceRef(
+                    service_id=_SCOPE_SERVICE, name="nginx-proxy"
+                ),
+            ),
+            2,
+            seq=3,
+            sid=sid,
+        ),
+    ]
+    history = build_native_model_history(
+        entries,
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    # Superseded first entry leaves the window; the anchor + the scoped
+    # follow-on carry the identity forward.
+    assert history.superseded_by_compaction == 1
+    kinds = [type(part) for message in history.messages for part in message.parts]
+    assert SystemPromptPart in kinds
+    scoped = [
+        part.content
+        for message in history.messages
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert scoped == [
+        f"[service scope: @nginx-proxy ({_SCOPE_SERVICE})]\nand now restart it"
+    ]
