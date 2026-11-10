@@ -162,6 +162,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     from mai.jobs.resource_locks import ResourceLockService
     from mai.knowledge.index import GatewayEmbedder
     from mai.knowledge.documents import DocumentStore
+    from mai.knowledge.index import ScopeIndexer
     from mai.knowledge.retrieve import (
         DocumentRetrievalCapability,
         ScopeRetriever,
@@ -311,6 +312,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     app_manifest_store: ApplicationManifestStore | None = None
     app_adoption_service: ApplicationAdoption | None = None
     app_doc_service: ApplicationDocService | None = None
+    doc_indexer: ScopeIndexer | None = None
     service_map_store: ServiceMapStore | None = None
     try:
         app_manifest_store = ApplicationManifestStore(data_root)
@@ -319,9 +321,14 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         app_manifest_store = None
         app_adoption_service = None
     try:
-        app_doc_service = ApplicationDocService(DocumentStore(data_root))
+        doc_store_inst = DocumentStore(data_root)
+        app_doc_service = ApplicationDocService(doc_store_inst)
+        doc_indexer = ScopeIndexer(
+            sessions, doc_store_inst, _DynamicEmbedder()  # type: ignore[arg-type]
+        )
     except Exception:
         app_doc_service = None
+        doc_indexer = None
     try:
         service_map_store = ServiceMapStore(data_root / "service_map")
     except Exception:
@@ -340,6 +347,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         session_factory=sessions,
         data_root=data_root,
         env_resolver=lambda: _resolve_env(),
+        doc_indexer=doc_indexer,
     )
     for desc in internal_api.descriptors:
         registry.register(desc)

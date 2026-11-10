@@ -887,6 +887,10 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
         "app.list_catalog",
         "app.upsert_catalog_runbook",
         "app.delete_catalog_runbook",
+        "docs.list",
+        "docs.read",
+        "docs.upsert",
+        "docs.delete",
     ):
         desc = assert_agent_ready_descriptor(by_id[cap_id])
         assert len(str(desc.input_schema["description"])) >= 30
@@ -902,9 +906,11 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
     assert "limit" in list_adopted_props and "offset" in list_adopted_props
     list_catalog_props: Any = by_id["app.list_catalog"].input_schema["properties"]
     assert "limit" in list_catalog_props and "offset" in list_catalog_props
+    docs_list_props: Any = by_id["docs.list"].input_schema["properties"]
+    assert "limit" in docs_list_props and "offset" in docs_list_props
     upsert_catalog_props: Any = by_id["app.upsert_catalog_runbook"].input_schema["properties"]
     assert "install" in upsert_catalog_props["instructions"]["properties"]
-    assert len(INTERNAL_API_CAPABILITY_IDS) == 10
+    assert len(INTERNAL_API_CAPABILITY_IDS) == 14
 
 
 async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
@@ -1586,5 +1592,153 @@ async def test_catalog_tools_and_adopt_inherits_catalog_with_custom_instructions
     )
     assert stored_entry is not None
     assert stored_entry.custom_instructions.startswith("Compose dir /opt/immich; upgraded")
+
+
+async def test_docs_agent_tools_crud_pagination_and_title_upsert(
+    tmp_path: Path,
+) -> None:
+    """Verify docs.upsert, docs.list, docs.read, and docs.delete agent tools."""
+    from unittest.mock import MagicMock
+    from mai.applications.document import ApplicationDocService
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.knowledge.documents import DocumentStore
+
+    doc_store = DocumentStore(tmp_path)
+    composition = build_internal_api_capabilities(
+        applications=MagicMock(),
+        adoption=MagicMock(),
+        docs=ApplicationDocService(doc_store),
+        service_map=_store(tmp_path),
+        data_root=tmp_path,
+    )
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    ctx = _context(
+        ("docs.list", "docs.read", "docs.upsert", "docs.delete"),
+        server_id=SERVER_A,
+    )
+    upsert_exec = composition.executors["docs.upsert"]
+    list_exec = composition.executors["docs.list"]
+    read_exec = composition.executors["docs.read"]
+    delete_exec = composition.executors["docs.delete"]
+
+    # 1. Create a document in 'docs' namespace with title + content
+    res1 = await upsert_exec(
+        _call(
+            "docs.upsert",
+            {
+                "title": "PostgreSQL Backup Architecture",
+                "content": "Nightly pg_dumpall to /mnt/nas/backups/postgres.",
+                "namespace": "docs",
+                "verification": "verified",
+            },
+            ctx,
+        )
+    )
+    assert res1.ok is True, res1.output
+    doc1 = json.loads(res1.output)
+    assert doc1["status"] == "ok"
+    assert doc1["revision"] == 1
+    assert doc1["namespace"] == "docs"
+    assert doc1["verification"] == "verified"
+    assert doc1["title"] == "PostgreSQL Backup Architecture"
+    assert doc1["citation"] == f"docs:{doc1['doc_id']}#r1"
+    doc1_id = doc1["doc_id"]
+
+    # 2. Upsert again with the SAME title and no doc_id -> updates revision to 2
+    res1_update = await upsert_exec(
+        _call(
+            "docs.upsert",
+            {
+                "title": "PostgreSQL Backup Architecture",
+                "content": "Nightly pg_dumpall + ZFS snapshot at 03:00 UTC.",
+                "namespace": "docs",
+                "verification": "verified",
+            },
+            ctx,
+        )
+    )
+    assert res1_update.ok is True, res1_update.output
+    doc1_v2 = json.loads(res1_update.output)
+    assert doc1_v2["doc_id"] == doc1_id
+    assert doc1_v2["revision"] == 2
+
+    # 3. Create an operational runbook in 'runbooks' namespace
+    res2 = await upsert_exec(
+        _call(
+            "docs.upsert",
+            {
+                "title": "Rotate WireGuard Keys",
+                "content": "1. Generate keypair\n2. Restart wg-quick@wg0",
+                "namespace": "runbooks",
+            },
+            ctx,
+        )
+    )
+    assert res2.ok is True, res2.output
+    doc2 = json.loads(res2.output)
+    assert doc2["namespace"] == "runbooks"
+    assert doc2["verification"] == "unverified"
+
+    # 4. List documents with pagination and filters
+    list_all = json.loads(
+        (await list_exec(_call("docs.list", {"limit": 1, "offset": 0}, ctx))).output
+    )
+    assert list_all["status"] == "ok"
+    assert list_all["total"] == 2
+    assert list_all["limit"] == 1
+    assert list_all["offset"] == 0
+    assert list_all["has_more"] is True
+    assert len(list_all["documents"]) == 1
+
+    list_filtered = json.loads(
+        (
+            await list_exec(
+                _call("docs.list", {"query": "zfs snapshot", "namespace": "docs"}, ctx)
+            )
+        ).output
+    )
+    assert list_filtered["total"] == 1
+    assert list_filtered["documents"][0]["doc_id"] == doc1_id
+    assert list_filtered["documents"][0]["revision"] == 2
+
+    # 5. Read full document via docs.read
+    read_res = await read_exec(
+        _call("docs.read", {"doc_id": doc1_id, "namespace": "docs"}, ctx)
+    )
+    assert read_res.ok is True, read_res.output
+    read_env = json.loads(read_res.output)
+    assert read_env["doc_id"] == doc1_id
+    assert read_env["revision"] == 2
+    assert "# PostgreSQL Backup Architecture" in read_env["content"]
+    assert "ZFS snapshot" in read_env["content"]
+    assert read_env["truncated"] is False
+
+    # 6. Delete document via docs.delete and confirm removal
+    del_res = await delete_exec(
+        _call("docs.delete", {"doc_id": doc1_id, "namespace": "docs"}, ctx)
+    )
+    assert del_res.ok is True, del_res.output
+    del_env = json.loads(del_res.output)
+    assert del_env["deleted"] is True
+    assert del_env["revision"] == 2
+
+    list_after = json.loads(
+        (await list_exec(_call("docs.list", {}, ctx))).output
+    )
+    assert list_after["total"] == 1
+    assert list_after["documents"][0]["doc_id"] == doc2["doc_id"]
+
 
 

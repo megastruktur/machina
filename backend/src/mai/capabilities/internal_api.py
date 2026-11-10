@@ -84,6 +84,7 @@ if TYPE_CHECKING:  # composition-time types only; no runtime import cycles
         ApplicationManifestStore,
     )
     from mai.applications.service_map import ServiceMapStore
+    from mai.knowledge.index import ScopeIndexer
 
 # ---------------------------------------------------------------------------
 # Capability identifiers (frozen vocabulary)
@@ -97,6 +98,10 @@ APP_DELETE_MAP_ENTRY_CAPABILITY: Final = "app.delete_map_entry"
 APP_LIST_CATALOG_CAPABILITY: Final = "app.list_catalog"
 APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY: Final = "app.upsert_catalog_runbook"
 APP_DELETE_CATALOG_RUNBOOK_CAPABILITY: Final = "app.delete_catalog_runbook"
+DOCS_LIST_CAPABILITY: Final = "docs.list"
+DOCS_READ_CAPABILITY: Final = "docs.read"
+DOCS_UPSERT_CAPABILITY: Final = "docs.upsert"
+DOCS_DELETE_CAPABILITY: Final = "docs.delete"
 
 #: The internal-API capability set the chat agent exposes by default across
 #: both pinned-server conversations and General Consult (the UI/agent surface
@@ -111,6 +116,10 @@ INTERNAL_API_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     APP_LIST_CATALOG_CAPABILITY,
     APP_UPSERT_CATALOG_RUNBOOK_CAPABILITY,
     APP_DELETE_CATALOG_RUNBOOK_CAPABILITY,
+    DOCS_LIST_CAPABILITY,
+    DOCS_READ_CAPABILITY,
+    DOCS_UPSERT_CAPABILITY,
+    DOCS_DELETE_CAPABILITY,
     CHAT_READ_CAPABILITY,
 )
 
@@ -1212,6 +1221,233 @@ class AppDeleteMapEntryPayload(BaseModel):
     )
 
 
+class DocsListPayload(BaseModel):
+    """List canonical Markdown documents and runbooks stored in the Documents section."""
+
+    model_config = {"extra": "forbid"}
+
+    scope: Literal["server", "shared"] = Field(
+        default="server",
+        description=(
+            "Target document scope: 'server' (pinned conversation server or "
+            "server_id) or 'shared' (fleet-wide shared documents store)."
+        ),
+    )
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override when scope='server'. "
+            "Omit when the conversation is already pinned to a server."
+        ),
+    )
+    app_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical application UUID to filter documents scoped "
+            "to a specific adopted application on the server."
+        ),
+    )
+    namespace: Literal["docs", "runbooks"] | None = Field(
+        default=None,
+        description=(
+            "Optional collection filter: 'docs' (documentation, notes, "
+            "incidents) or 'runbooks' (operational procedures). Omit for both."
+        ),
+    )
+    query: str | None = Field(
+        default=None,
+        description=(
+            "Optional case-insensitive substring filter matched against "
+            "document title, Markdown content, origin, or doc_id."
+        ),
+    )
+    limit: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Maximum number of documents to return in one page (1..100, default 25).",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Zero-based pagination offset for the document list (default 0).",
+    )
+
+
+class DocsReadPayload(BaseModel):
+    """Read the full hash-verified Markdown content and metadata of one canonical document."""
+
+    model_config = {"extra": "forbid"}
+
+    doc_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "Canonical UUID of the document to read (obtained from docs.list "
+            "or docs.retrieve)."
+        ),
+    )
+    namespace: Literal["docs", "runbooks"] = Field(
+        default="docs",
+        description=(
+            "Document collection namespace: 'docs' or 'runbooks' (default 'docs')."
+        ),
+    )
+    scope: Literal["server", "shared"] = Field(
+        default="server",
+        description=(
+            "Target document scope: 'server' (pinned conversation server or "
+            "server_id) or 'shared' (fleet-wide shared documents store)."
+        ),
+    )
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override when scope='server'. "
+            "Omit when the conversation is already pinned to a server."
+        ),
+    )
+    app_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical application UUID when reading an "
+            "application-scoped document on the server."
+        ),
+    )
+    max_chars: int = Field(
+        default=32000,
+        ge=256,
+        le=48000,
+        description=(
+            "Maximum number of Markdown characters to return in content "
+            "(256..48000, default 32000)."
+        ),
+    )
+
+
+class DocsUpsertPayload(BaseModel):
+    """Create or update a canonical Markdown document or runbook in the Documents section."""
+
+    model_config = {"extra": "forbid"}
+
+    doc_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical UUID of an existing document to update. "
+            "Omit to create a new document (or update an existing document "
+            "with the same Markdown title in the same scope and namespace)."
+        ),
+    )
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Optional document title. If content does not start with a '# ' "
+            "Markdown heading, this title is prepended as '# <title>'."
+        ),
+    )
+    content: str = Field(
+        min_length=1,
+        max_length=200000,
+        description=(
+            "Full Markdown body of the document or operational runbook to "
+            "store in the canonical Documents store."
+        ),
+    )
+    namespace: Literal["docs", "runbooks"] = Field(
+        default="docs",
+        description=(
+            "Target collection namespace: 'docs' (general documentation, "
+            "architecture notes, incidents) or 'runbooks' (operational procedures)."
+        ),
+    )
+    scope: Literal["server", "shared"] = Field(
+        default="server",
+        description=(
+            "Target document scope: 'server' for the pinned/specified server, "
+            "or 'shared' for fleet-wide shared documentation."
+        ),
+    )
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override when scope='server'. "
+            "Omit when the conversation is already pinned to a server."
+        ),
+    )
+    app_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical application UUID to scope the document to a "
+            "specific adopted application on the server."
+        ),
+    )
+    verification: Literal["unverified", "verified", "hypothesis"] = Field(
+        default="unverified",
+        description=(
+            "Verification status: 'verified' (proven by host execution), "
+            "'hypothesis' (unconfirmed theory/workaround), or 'unverified' "
+            "(authored reference or note)."
+        ),
+    )
+    expected_revision: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional optimistic concurrency revision check. When omitted on "
+            "update, the current stored revision is resolved automatically."
+        ),
+    )
+
+
+class DocsDeletePayload(BaseModel):
+    """Delete a canonical Markdown document or runbook from the Documents section."""
+
+    model_config = {"extra": "forbid"}
+
+    doc_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="Canonical UUID of the document to delete (from docs.list).",
+    )
+    namespace: Literal["docs", "runbooks"] = Field(
+        default="docs",
+        description=(
+            "Document collection namespace: 'docs' or 'runbooks' (default 'docs')."
+        ),
+    )
+    scope: Literal["server", "shared"] = Field(
+        default="server",
+        description=(
+            "Target document scope: 'server' (pinned conversation server or "
+            "server_id) or 'shared' (fleet-wide shared documents store)."
+        ),
+    )
+    server_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical server UUID override when scope='server'. "
+            "Omit when the conversation is already pinned to a server."
+        ),
+    )
+    app_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional canonical application UUID when deleting an "
+            "application-scoped document on the server."
+        ),
+    )
+    expected_revision: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional expected revision; auto-resolved from the current "
+            "stored document when omitted."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # The shared composition builder (app.py + worker.py consume the SAME result)
 # ---------------------------------------------------------------------------
@@ -1258,6 +1494,7 @@ def build_internal_api_capabilities(
     session_factory: Callable[[], Any] | None = None,
     data_root: Any | None = None,
     env_resolver: Callable[[], Any] | None = None,
+    doc_indexer: "ScopeIndexer | None" = None,
 ) -> InternalApiComposition:
     """Build every ``app.*`` descriptor + executor over the composed state.
 
@@ -2150,6 +2387,491 @@ def build_internal_api_capabilities(
 
     operations.append(_app_delete_catalog_runbook)
 
+    # -- docs.* helpers & capabilities -----------------------------------------
+
+    def _resolve_doc_store() -> DocumentStore:
+        store_attr = getattr(docs, "_store", None)
+        if isinstance(store_attr, DocumentStore):
+            return store_attr
+        if data_root is not None:
+            try:
+                return DocumentStore(Path(data_root))
+            except Exception as exc:
+                raise InternalApiError(
+                    "unavailable",
+                    f"documents store is unavailable: {type(exc).__name__}",
+                ) from None
+        raise InternalApiError(
+            "unavailable", "documents service is unavailable"
+        )
+
+    def _resolve_doc_scope(
+        call: CapabilityCall, payload: Mapping[str, Any], capability_id: str
+    ) -> tuple[str, uuid.UUID | None, uuid.UUID | None]:
+        raw_scope = payload.get("scope", "server")
+        scope = str(raw_scope).strip() if raw_scope is not None else "server"
+        if scope not in ("server", "shared"):
+            raise InternalApiError(
+                "invalid_request",
+                f"{capability_id}: scope must be 'server' or 'shared'",
+            )
+        raw_app_id = payload.get("app_id")
+        parsed_app_id: uuid.UUID | None = None
+        if isinstance(raw_app_id, str) and raw_app_id.strip():
+            if scope == "shared":
+                raise InternalApiError(
+                    "invalid_request",
+                    f"{capability_id}: app_id cannot be used with scope='shared'",
+                )
+            try:
+                parsed_app_id = uuid.UUID(raw_app_id.strip())
+            except ValueError:
+                raise InternalApiError(
+                    "invalid_request",
+                    f"{capability_id}: app_id must be a canonical UUID",
+                ) from None
+            if parsed_app_id == uuid.UUID(int=0):
+                raise InternalApiError(
+                    "invalid_request",
+                    f"{capability_id}: app_id must be a non-zero canonical UUID",
+                )
+        if scope == "shared":
+            return "shared", None, None
+        target_server_id = _resolve_server_id(call, payload, capability_id)
+        return "server", target_server_id, parsed_app_id
+
+    def _extract_doc_title(text: str) -> str:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                heading = stripped.lstrip("#").strip()
+                if heading:
+                    return heading[:160]
+            return stripped[:160]
+        return "Untitled"
+
+    def _map_doc_store_error(exc: DocumentStoreError) -> InternalApiError:
+        if exc.code is DocumentStoreErrorCode.NOT_FOUND:
+            return InternalApiError("not_found", str(exc))
+        if exc.code in (
+            DocumentStoreErrorCode.STALE_REVISION,
+            DocumentStoreErrorCode.TOMBSTONE_CONFLICT,
+        ):
+            return InternalApiError("conflict", str(exc))
+        return InternalApiError("invalid_request", str(exc))
+
+    async def _best_effort_reconcile(
+        doc_store: DocumentStore,
+        *,
+        server_id: uuid.UUID | None,
+        app_id: uuid.UUID | None,
+        doc_id: uuid.UUID,
+        namespace: DocumentNamespace,
+    ) -> str:
+        if doc_indexer is not None:
+            try:
+                await doc_indexer.reconcile_scope(
+                    server_id=server_id, app_id=app_id
+                )
+            except Exception:
+                pass
+        try:
+            pending_ids = {
+                intent.doc_id
+                for intent in doc_store.read_intents(
+                    server_id=server_id,
+                    app_id=app_id,
+                    namespace=namespace,
+                )
+            }
+        except Exception:
+            return "pending"
+        return "pending" if doc_id in pending_ids else "indexed"
+
+    # -- docs.list -------------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=DOCS_LIST_CAPABILITY,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["docs", "runbooks"],
+        environments=["controller"],
+        payload_model=DocsListPayload,
+        description=(
+            "List canonical Markdown documents and operational runbooks stored "
+            "in the Documents section for the target server (or shared store) "
+            "with bounded pagination and optional namespace/query filters."
+        ),
+    )
+    async def _docs_list(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        doc_store = _resolve_doc_store()
+        scope, target_server_id, target_app_id = _resolve_doc_scope(
+            call, payload, DOCS_LIST_CAPABILITY
+        )
+        raw_ns = payload.get("namespace")
+        ns_filter: DocumentNamespace | None = None
+        if isinstance(raw_ns, str) and raw_ns.strip():
+            ns_filter = DocumentNamespace(raw_ns.strip())
+        try:
+            stored_docs = doc_store.list_documents(
+                server_id=target_server_id,
+                app_id=target_app_id,
+                namespace=ns_filter,
+            )
+            pending_keys = {
+                (intent.namespace.value, intent.doc_id)
+                for intent in doc_store.read_intents(
+                    server_id=target_server_id,
+                    app_id=target_app_id,
+                    namespace=ns_filter,
+                )
+            }
+        except DocumentStoreError as exc:
+            raise _map_doc_store_error(exc) from None
+
+        raw_query = payload.get("query")
+        needle = (
+            raw_query.strip().lower()
+            if isinstance(raw_query, str) and raw_query.strip()
+            else ""
+        )
+        matched: list[dict[str, Any]] = []
+        for item in stored_docs:
+            title = _extract_doc_title(item.text)
+            if needle:
+                haystack = (
+                    f"{title}\n{item.text}\n{item.origin}\n{item.doc_id}"
+                ).lower()
+                if needle not in haystack:
+                    continue
+            matched.append(
+                {
+                    "doc_id": str(item.doc_id),
+                    "namespace": item.namespace.value,
+                    "title": title,
+                    "revision": item.revision,
+                    "sha256": item.sha256,
+                    "citation": f"{item.namespace.value}:{item.doc_id}#r{item.revision}",
+                    "source_kind": item.source_kind.value,
+                    "origin": item.origin,
+                    "origin_revision": item.origin_revision,
+                    "verification": item.verification.value,
+                    "index_pending": (item.namespace.value, item.doc_id)
+                    in pending_keys,
+                }
+            )
+        total = len(matched)
+        eff_limit = int(payload.get("limit", 25))
+        eff_offset = int(payload.get("offset", 0))
+        sliced = matched[eff_offset : eff_offset + eff_limit]
+        return {
+            "scope": scope,
+            "server_id": str(target_server_id)
+            if target_server_id is not None
+            else None,
+            "app_id": str(target_app_id)
+            if target_app_id is not None
+            else None,
+            "namespace": ns_filter.value if ns_filter is not None else None,
+            "documents": sliced,
+            "total": total,
+            "limit": eff_limit,
+            "offset": eff_offset,
+            "has_more": (eff_offset + len(sliced)) < total,
+        }
+
+    operations.append(_docs_list)
+
+    # -- docs.read -------------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=DOCS_READ_CAPABILITY,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["docs", "runbooks"],
+        environments=["controller"],
+        payload_model=DocsReadPayload,
+        description=(
+            "Read the full hash-verified Markdown content and metadata of one "
+            "canonical document or runbook from the Documents section by doc_id."
+        ),
+    )
+    async def _docs_read(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        doc_store = _resolve_doc_store()
+        scope, target_server_id, target_app_id = _resolve_doc_scope(
+            call, payload, DOCS_READ_CAPABILITY
+        )
+        try:
+            parsed_doc_id = uuid.UUID(str(payload["doc_id"]).strip())
+        except ValueError:
+            raise InternalApiError(
+                "invalid_request",
+                "docs.read: doc_id must be a canonical UUID string",
+            ) from None
+        ns = DocumentNamespace(str(payload.get("namespace", "docs")).strip())
+        try:
+            stored = doc_store.read(
+                parsed_doc_id,
+                server_id=target_server_id,
+                app_id=target_app_id,
+                namespace=ns,
+            )
+        except DocumentStoreError as exc:
+            raise _map_doc_store_error(exc) from None
+        max_chars = int(payload.get("max_chars", 32000))
+        content = stored.text[:max_chars]
+        return {
+            "doc_id": str(stored.doc_id),
+            "scope": scope,
+            "server_id": str(target_server_id)
+            if target_server_id is not None
+            else None,
+            "app_id": str(target_app_id)
+            if target_app_id is not None
+            else None,
+            "namespace": stored.namespace.value,
+            "title": _extract_doc_title(stored.text),
+            "revision": stored.revision,
+            "sha256": stored.sha256,
+            "citation": f"{stored.namespace.value}:{stored.doc_id}#r{stored.revision}",
+            "source_kind": stored.source_kind.value,
+            "origin": stored.origin,
+            "origin_revision": stored.origin_revision,
+            "verification": stored.verification.value,
+            "content": content,
+            "total_chars": len(stored.text),
+            "truncated": len(stored.text) > max_chars,
+        }
+
+    operations.append(_docs_read)
+
+    # -- docs.upsert -----------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=DOCS_UPSERT_CAPABILITY,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["docs", "runbooks"],
+        environments=["controller"],
+        payload_model=DocsUpsertPayload,
+        description=(
+            "Create or update a canonical Markdown document or operational "
+            "runbook in the Documents section (server, application, or shared "
+            "scope), recording its verification status and queueing indexing."
+        ),
+    )
+    async def _docs_upsert(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        doc_store = _resolve_doc_store()
+        scope, target_server_id, target_app_id = _resolve_doc_scope(
+            call, payload, DOCS_UPSERT_CAPABILITY
+        )
+        ns = DocumentNamespace(str(payload.get("namespace", "docs")).strip())
+        verification = VerificationStatus(
+            str(payload.get("verification", "unverified")).strip()
+        )
+        raw_title = payload.get("title")
+        title_str = (
+            raw_title.strip()
+            if isinstance(raw_title, str) and raw_title.strip()
+            else None
+        )
+        body_text = str(payload["content"]).strip()
+        if title_str is not None and not body_text.startswith("#"):
+            markdown_text = f"# {title_str}\n\n{body_text}\n"
+        else:
+            markdown_text = body_text + ("\n" if not body_text.endswith("\n") else "")
+
+        resolved_title = title_str or _extract_doc_title(markdown_text)
+        raw_doc_id = payload.get("doc_id")
+        raw_expected_rev = payload.get("expected_revision")
+        target_doc_id: uuid.UUID | None = None
+        expected_rev: int | None = (
+            int(raw_expected_rev) if raw_expected_rev is not None else None
+        )
+
+        if isinstance(raw_doc_id, str) and raw_doc_id.strip():
+            try:
+                target_doc_id = uuid.UUID(raw_doc_id.strip())
+            except ValueError:
+                raise InternalApiError(
+                    "invalid_request",
+                    "docs.upsert: doc_id must be a canonical UUID string",
+                ) from None
+            if expected_rev is None:
+                try:
+                    existing = doc_store.read(
+                        target_doc_id,
+                        server_id=target_server_id,
+                        app_id=target_app_id,
+                        namespace=ns,
+                    )
+                    expected_rev = existing.revision
+                except DocumentStoreError as exc:
+                    if exc.code is DocumentStoreErrorCode.NOT_FOUND:
+                        expected_rev = 0
+                    else:
+                        raise _map_doc_store_error(exc) from None
+        else:
+            # Match by normalized title in the same scope + namespace when
+            # expected_revision was not explicitly pinned to 0.
+            if expected_rev in (None, 0):
+                try:
+                    existing_docs = doc_store.list_documents(
+                        server_id=target_server_id,
+                        app_id=target_app_id,
+                        namespace=ns,
+                    )
+                except DocumentStoreError as exc:
+                    raise _map_doc_store_error(exc) from None
+                if expected_rev is None and resolved_title:
+                    norm_title = resolved_title.strip().lower()
+                    for candidate in existing_docs:
+                        if (
+                            _extract_doc_title(candidate.text).strip().lower()
+                            == norm_title
+                        ):
+                            target_doc_id = candidate.doc_id
+                            expected_rev = candidate.revision
+                            break
+            if target_doc_id is None:
+                target_doc_id = uuid.uuid4()
+                if expected_rev is None:
+                    expected_rev = 0
+        eff_expected_rev = expected_rev if expected_rev is not None else 0
+
+        try:
+            stored = doc_store.write(
+                target_doc_id,
+                markdown_text,
+                server_id=target_server_id,
+                app_id=target_app_id,
+                namespace=ns,
+                expected_revision=eff_expected_rev,
+                source_kind=SourceKind.AUTHORED,
+                origin="agent",
+                origin_revision=f"r{eff_expected_rev + 1}",
+                verification=verification,
+            )
+        except DocumentStoreError as exc:
+            raise _map_doc_store_error(exc) from None
+
+        index_status = await _best_effort_reconcile(
+            doc_store,
+            server_id=target_server_id,
+            app_id=target_app_id,
+            doc_id=stored.doc_id,
+            namespace=stored.namespace,
+        )
+        return {
+            "doc_id": str(stored.doc_id),
+            "scope": scope,
+            "server_id": str(target_server_id)
+            if target_server_id is not None
+            else None,
+            "app_id": str(target_app_id)
+            if target_app_id is not None
+            else None,
+            "namespace": stored.namespace.value,
+            "title": _extract_doc_title(stored.text),
+            "revision": stored.revision,
+            "sha256": stored.sha256,
+            "citation": f"{stored.namespace.value}:{stored.doc_id}#r{stored.revision}",
+            "source_kind": stored.source_kind.value,
+            "origin": stored.origin,
+            "origin_revision": stored.origin_revision,
+            "verification": stored.verification.value,
+            "index_status": index_status,
+        }
+
+    operations.append(_docs_upsert)
+
+    # -- docs.delete -----------------------------------------------------------
+
+    @internal_api_tool(
+        capability_id=DOCS_DELETE_CAPABILITY,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["docs", "runbooks"],
+        environments=["controller"],
+        payload_model=DocsDeletePayload,
+        description=(
+            "Delete a canonical Markdown document or operational runbook from "
+            "the Documents section by doc_id and record a durable tombstone."
+        ),
+    )
+    async def _docs_delete(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        doc_store = _resolve_doc_store()
+        scope, target_server_id, target_app_id = _resolve_doc_scope(
+            call, payload, DOCS_DELETE_CAPABILITY
+        )
+        try:
+            parsed_doc_id = uuid.UUID(str(payload["doc_id"]).strip())
+        except ValueError:
+            raise InternalApiError(
+                "invalid_request",
+                "docs.delete: doc_id must be a canonical UUID string",
+            ) from None
+        ns = DocumentNamespace(str(payload.get("namespace", "docs")).strip())
+        raw_expected_rev = payload.get("expected_revision")
+        if raw_expected_rev is not None:
+            expected_rev = int(raw_expected_rev)
+        else:
+            try:
+                existing = doc_store.read(
+                    parsed_doc_id,
+                    server_id=target_server_id,
+                    app_id=target_app_id,
+                    namespace=ns,
+                )
+            except DocumentStoreError as exc:
+                raise _map_doc_store_error(exc) from None
+            expected_rev = existing.revision
+
+        try:
+            intent = doc_store.delete(
+                parsed_doc_id,
+                server_id=target_server_id,
+                app_id=target_app_id,
+                namespace=ns,
+                expected_revision=expected_rev,
+            )
+        except DocumentStoreError as exc:
+            raise _map_doc_store_error(exc) from None
+
+        index_status = await _best_effort_reconcile(
+            doc_store,
+            server_id=target_server_id,
+            app_id=target_app_id,
+            doc_id=parsed_doc_id,
+            namespace=ns,
+        )
+        return {
+            "doc_id": str(parsed_doc_id),
+            "scope": scope,
+            "server_id": str(target_server_id)
+            if target_server_id is not None
+            else None,
+            "app_id": str(target_app_id)
+            if target_app_id is not None
+            else None,
+            "namespace": ns.value,
+            "deleted": True,
+            "revision": intent.revision,
+            "index_status": index_status,
+        }
+
+    operations.append(_docs_delete)
+
     # -- registration ----------------------------------------------------------
 
     registry = CapabilityRegistry()
@@ -2185,6 +2907,14 @@ __all__ = [
     "AppListCatalogPayload",
     "AppUnadoptPayload",
     "AppUpsertCatalogRunbookPayload",
+    "DOCS_DELETE_CAPABILITY",
+    "DOCS_LIST_CAPABILITY",
+    "DOCS_READ_CAPABILITY",
+    "DOCS_UPSERT_CAPABILITY",
+    "DocsDeletePayload",
+    "DocsListPayload",
+    "DocsReadPayload",
+    "DocsUpsertPayload",
     "INTERNAL_API_CAPABILITY_IDS",
     "InternalApiComposition",
     "InternalApiError",

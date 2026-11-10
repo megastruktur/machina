@@ -356,6 +356,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             session_factory=app.state.session_factory,
             data_root=resolve_profiles_root(app.state.env),
             env_resolver=lambda: app.state.credentials,
+            doc_indexer=(
+                app.state.knowledge.indexer
+                if app.state.knowledge is not None
+                else None
+            ),
         )
         # History-tag tools (W4D; D09 job-only): the composition seam —
         # the ``tags.*`` surface joins the one ``app.state.internal_api``

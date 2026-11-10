@@ -691,6 +691,58 @@ class DocumentStore:
         intents.sort(key=lambda item: (item.revision, str(item.doc_id)))
         return intents
 
+    def list_documents(
+        self,
+        *,
+        server_id: uuid.UUID | None = None,
+        app_id: uuid.UUID | None = None,
+        namespace: DocumentNamespace | None = None,
+    ) -> list[StoredDocument]:
+        """Return live canonical documents of one scope (one or all namespaces)."""
+        if namespace is not None and not isinstance(namespace, DocumentNamespace):
+            raise DocumentStoreError(
+                DocumentStoreErrorCode.INVALID_NAMESPACE,
+                "namespace must be a DocumentNamespace member or None",
+            )
+        server_id, app_id, scope_rel = self._scope(
+            server_id=server_id, app_id=app_id
+        )
+        scope_dir = self._confined(scope_rel)
+        if not scope_dir.is_dir():
+            return []
+        namespaces = (
+            (namespace,)
+            if namespace is not None
+            else (DocumentNamespace.DOCS, DocumentNamespace.RUNBOOKS)
+        )
+        documents: list[StoredDocument] = []
+        for ns in namespaces:
+            ns_dir = scope_dir / ns.value
+            if not ns_dir.is_dir():
+                continue
+            for md_path in sorted(ns_dir.glob(f"*{DOC_SUFFIX}")):
+                stem = md_path.name[: -len(DOC_SUFFIX)]
+                try:
+                    doc_id = uuid.UUID(stem)
+                except ValueError:
+                    continue
+                if str(doc_id) != stem:
+                    continue
+                try:
+                    stored = self.read(
+                        doc_id,
+                        server_id=server_id,
+                        app_id=app_id,
+                        namespace=ns,
+                    )
+                except DocumentStoreError:
+                    continue
+                documents.append(stored)
+        documents.sort(
+            key=lambda item: (item.namespace.value, str(item.doc_id))
+        )
+        return documents
+
     def purge_intent(
         self,
         doc_id: uuid.UUID,

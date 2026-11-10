@@ -38,7 +38,7 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import Field from '../ui/Field.svelte';
-	import { BookOpen, FilePlus, FolderOpen, ScrollText, Search, Send } from 'lucide-svelte';
+	import { BookOpen, FolderOpen, ScrollText, Search, Send } from 'lucide-svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
 	import type {
 		ChatSubmit,
@@ -49,7 +49,6 @@
 		DocumentListItem,
 		DocumentPage,
 		DocumentView,
-		GenerateView,
 		IndexStatus,
 		RetrievalBody,
 		RetrievalExcerpt,
@@ -74,7 +73,6 @@
 				'retrieve',
 				'readIndex',
 				'reconcileIndex',
-				'generateDocument',
 				'runResearch'
 			] as const
 		) {
@@ -118,8 +116,6 @@
 	 * bounded quote; the truncation is stated IN the message, never hidden.
 	 */
 	const MAX_ATTACH_CHARS = 2000;
-	/** Local textarea guard for the pasted evidence JSON (display-only). */
-	const MAX_EVIDENCE_CHARS = 65536;
 
 	/** Frozen request version of the deep-research payload vocabulary. */
 	const RESEARCH_REQUEST_VERSION = 1;
@@ -128,7 +124,6 @@
 		{ id: 'library', label: 'Library', icon: FolderOpen },
 		{ id: 'search', label: 'Search', icon: Search },
 		{ id: 'index', label: 'Index', icon: Send },
-		{ id: 'generate', label: 'Generate', icon: FilePlus },
 		{ id: 'research', label: 'Research', icon: BookOpen }
 	] as const);
 	type TabId = (typeof TABS)[number]['id'];
@@ -479,59 +474,6 @@
 			};
 		} finally {
 			if (!disposed) reconcileBusy = false;
-		}
-	}
-
-	// --- generation (run evidence → runbook/incident; C07 rule 5) --------------
-
-	let evidenceText = $state('');
-	let generateBusy = $state(false);
-	let generateView = $state<GenerateView | null>(null);
-	let generateProblem = $state<{ code: string; message: string } | null>(null);
-	let generateFields = $state<Record<string, string>>({});
-
-	async function runGenerate(preview: boolean): Promise<void> {
-		if (api === null || generateBusy) return;
-		let evidence: Record<string, unknown> | null = null;
-		const errors: Record<string, string> = {};
-		const raw = evidenceText.trim();
-		if (raw === '') {
-			errors.evidence = 'Run-evidence JSON is required.';
-		} else if (raw.length > MAX_EVIDENCE_CHARS) {
-			errors.evidence = `The evidence document is bounded to ${MAX_EVIDENCE_CHARS} characters.`;
-		} else {
-			try {
-				const parsed: unknown = JSON.parse(raw);
-				if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-					errors.evidence = 'The evidence must be one JSON object.';
-				} else {
-					evidence = parsed as Record<string, unknown>;
-				}
-			} catch {
-				errors.evidence = 'The evidence is not valid JSON.';
-			}
-		}
-		generateFields = errors;
-		if (evidence === null) return;
-		generateBusy = true;
-		generateProblem = null;
-		try {
-			const view = await api.generateDocument({ evidence, preview });
-			if (disposed) return;
-			generateView = view;
-			if (!preview) {
-				void loadLibrary();
-				void loadIndex();
-			}
-		} catch (error) {
-			if (disposed) return;
-			const code = codeOf(error) ?? 'unavailable';
-			generateProblem = {
-				code,
-				message: friendlyText(code, messageOf(error) ?? 'The generation could not run.')
-			};
-		} finally {
-			if (!disposed) generateBusy = false;
 		}
 	}
 
@@ -1034,92 +976,6 @@
 					</div>
 				{/if}
 			</section>
-		{:else if tab === 'generate'}
-			<section class="mai-docs__section" aria-label="Generate from run evidence" data-testid="docs-generate">
-				<div class="mai-docs__section-head">
-					<h4>Generate</h4>
-					<span class="mai-docs__meta">
-						One settled run-evidence document (v=1) → preview or commit (C07 rule 5).
-					</span>
-				</div>
-				<div class="mai-docs__form">
-					<label class="mai-docs__label" for="{uid}-evidence">Run evidence (JSON)</label>
-					<textarea
-						id="{uid}-evidence"
-						class="mai-docs__textarea"
-						bind:value={evidenceText}
-						rows={8}
-						data-testid="generate-evidence"
-					></textarea>
-					{#if generateFields.evidence}
-						<p class="mai-docs__field-error" role="alert">{generateFields.evidence}</p>
-					{/if}
-					<div class="mai-docs__actions">
-						<Button
-							variant="secondary"
-							onclick={() => runGenerate(true)}
-							loading={generateBusy}
-							data-testid="generate-preview"
-						>
-							Preview
-						</Button>
-						<Button
-							onclick={() => runGenerate(false)}
-							loading={generateBusy}
-							data-testid="generate-commit"
-						>
-							Commit as canonical document
-						</Button>
-					</div>
-				</div>
-				{#if generateProblem !== null}
-					<div
-						class="mai-docs__state mai-docs__state--error"
-						role="alert"
-						data-testid="generate-error"
-						data-error-code={generateProblem.code}
-					>
-						<p>{generateProblem.message}</p>
-					</div>
-				{/if}
-				{#if generateView !== null}
-					{#if generateView.preview}
-						<div class="mai-docs__subsection" data-testid="generate-preview-view">
-							<h5>Preview (nothing was written)</h5>
-							<p class="mai-docs__meta" data-testid="generate-preview-classification">
-								{generateView.classification} · {generateView.namespace} ·
-								{generateView.verification}
-							</p>
-							<pre class="mai-docs__content" data-testid="generate-preview-content">
-{generateView.content}</pre
-							>
-						</div>
-					{:else}
-						<div class="mai-docs__subsection" data-testid="generate-commit-view">
-							<h5>Committed</h5>
-							<p class="mai-docs__meta" data-testid="generate-commit-citation">
-								{generateView.doc.citation} · {generateView.classification} ·
-								{generateView.verification}
-							</p>
-							{#if generateView.reindex === null}
-								<p class="mai-docs__note" data-testid="generate-reindex-null">
-									Reindex outcome: none recorded — the index seam is not wired on this surface;
-									the durable intent converges on the next reconcile.
-								</p>
-							{:else}
-								<ul class="mai-docs__rows" data-testid="generate-reindex-list">
-									{#each generateView.reindex as outcome (outcome.doc_id + ':' + outcome.op)}
-										<li class="mai-docs__meta" data-testid="generate-reindex-row">
-											{outcome.namespace}:{shortId(outcome.doc_id)} · {outcome.status}
-											{outcome.code === null ? '' : ` · code ${outcome.code}`}
-										</li>
-									{/each}
-								</ul>
-							{/if}
-						</div>
-					{/if}
-				{/if}
-			</section>
 		{:else if tab === 'research'}
 			<section class="mai-docs__section" aria-label="Deep research" data-testid="docs-research">
 				<div class="mai-docs__section-head">
@@ -1589,12 +1445,6 @@
 		font-family: var(--mai-font-mono);
 		font-size: var(--mai-text-sm);
 		transition: border-color var(--mai-motion-fast) ease;
-	}
-
-	.mai-docs__field-error {
-		margin: 0;
-		color: var(--mai-status-danger-text);
-		font-size: var(--mai-text-xs);
 	}
 
 	/* Honest states: dashed neutral for pending/empty, solid status for errors. */

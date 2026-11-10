@@ -378,8 +378,8 @@ export interface DocsApi {
 	readIndex(serverId: string): Promise<IndexStatus>;
 	/** POST /api/v1/docs/index/reconcile — run one scope's outbox now. */
 	reconcileIndex(payload: ReconcileBody): Promise<ReconcileReport>;
-	/** POST /api/v1/docs/generate — preview/commit run-evidence document. */
-	generateDocument(payload: GenerateBody): Promise<GenerateView>;
+	/** POST /api/v1/docs/generate — preview/commit run-evidence document (system-only). */
+	generateDocument?(payload: GenerateBody): Promise<GenerateView>;
 	/** POST /api/v1/docs/research — one bounded deep-research pass. */
 	runResearch(payload: ResearchBody): Promise<ResearchReport>;
 }
