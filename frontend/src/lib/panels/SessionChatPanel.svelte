@@ -237,6 +237,44 @@
 	let controlBusy = $state<string | null>(null);
 	let controlProblem = $state<{ code: string; message: string } | null>(null);
 
+	// --- CCC S2: hero (create) vs active layout ------------------------------
+	/** Hero = no session yet: ONLY the centered composer (picker + textarea
+	 * + Send). Everything transcript-ish is active-state chrome. */
+	const isHero = $derived(sessionId === null);
+
+	/** Honest motion budget: reduced-motion users get instant layout
+	 * switches — the spacer flex transition is compiled out via class. */
+	let motionReduced = $state(false);
+	$effect(() => {
+		motionReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+	});
+
+	/** CCC S2: the composer auto-grows with its text — a 2-row baseline, a
+	 * ~6-row cap, internal scroll beyond (manual resize is gone). */
+	let composerInputEl: HTMLTextAreaElement | null = $state(null);
+	const COMPOSER_BASE_ROWS = 2;
+	const COMPOSER_MAX_ROWS = 6;
+	function fitComposer(): void {
+		const el = composerInputEl;
+		if (el === null) return;
+		el.style.height = 'auto';
+		const style = getComputedStyle(el);
+		const lineHeight = parseFloat(style.lineHeight);
+		const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+		const unit = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : 12;
+		const min = unit * COMPOSER_BASE_ROWS + padY;
+		const max = unit * COMPOSER_MAX_ROWS + padY;
+		el.style.height = `${Math.min(Math.max(el.scrollHeight, min), max)}px`;
+		el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+	}
+	$effect(() => {
+		// Text changes re-fit; the hero→active switch changes the composer's
+		// width (max-width), so re-fit on it too.
+		void composerText;
+		void isHero;
+		fitComposer();
+	});
+
 	/** Build the optimistic committed-view `user_message` entry (S3). */
 	function optimisticUserEntry(
 		outcome: SessionTurnSubmitOutcome,
@@ -733,12 +771,27 @@
 	}
 </script>
 
-<div class="mai-session-chat" data-testid="session-chat-panel">
+<div
+	class="mai-session-chat"
+	class:mai-session-chat--hero={isHero}
+	class:mai-session-chat--reduced-motion={motionReduced}
+	data-state={isHero ? 'hero' : 'active'}
+	data-testid="session-chat-panel"
+>
 	{#if !usable}
 		<div class="mai-session-chat__state" role="alert" data-testid="session-config-error">
 			<p>This panel was opened without its session services.</p>
 		</div>
 	{:else}
+
+		<!-- CCC S2 hero/active: the composer footer is ONE DOM node in both
+		     states — the hero→active switch never remounts it, so focus and
+		     the live draft survive the transition. The two spacers grow to
+		     center the composer in hero and collapse (animated flex-grow)
+		     while the active chrome — header, viewport, notices — takes
+		     their place. -->
+		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
+		{#if !isHero}
 		<header class="mai-session-chat__header">
 			<!-- Refresh continuity (R2-3): the id stays in the DOM for the E2E
 			     assertions, visually silent — the chat is the surface now. -->
@@ -1117,8 +1170,12 @@
 				{noticeLabel}
 			</p>
 		{/if}
+		{/if}
 
-		<footer class="mai-session-chat__composer">
+		<footer
+			class="mai-session-chat__composer"
+			class:mai-session-chat__composer--hero={isHero}
+		>
 			{#if submitProblem !== null}
 				<p class="mai-session-chat__problem" role="alert" data-testid="session-submit-error">
 					{submitProblem.code}: {submitProblem.message}
@@ -1196,9 +1253,9 @@
 						? 'Describe the task — a session is created on submit'
 						: 'Admit a turn to the visible session'}
 					bind:value={composerText}
+					bind:this={composerInputEl}
 					onkeydown={onComposerKeydown}
 					rows="2"
-					disabled={submitting}
 				></textarea>
 				<Button
 					variant="primary"
@@ -1211,42 +1268,45 @@
 					Send
 				</Button>
 			</div>
-			<div class="mai-session-chat__controls">
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || composerText.trim() === '' || controlBusy !== null}
-					loading={controlBusy === 'steer'}
-					data-testid="session-control-steer"
-					onclick={() => void runControl('steer')}
-				>
-					Steer
-				</Button>
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || controlBusy !== null}
-					loading={controlBusy === 'pause'}
-					data-testid="session-control-pause"
-					onclick={() => void runControl('pause')}
-				>
-					Pause
-				</Button>
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || controlBusy !== null}
-					loading={controlBusy === 'cancel'}
-					data-testid="session-control-cancel"
-					onclick={() => void runControl('cancel')}
-				>
-					Cancel
-				</Button>
-			</div>
+			{#if !isHero}
+				<div class="mai-session-chat__controls">
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || composerText.trim() === '' || controlBusy !== null}
+						loading={controlBusy === 'steer'}
+						data-testid="session-control-steer"
+						onclick={() => void runControl('steer')}
+					>
+						Steer
+					</Button>
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || controlBusy !== null}
+						loading={controlBusy === 'pause'}
+						data-testid="session-control-pause"
+						onclick={() => void runControl('pause')}
+					>
+						Pause
+					</Button>
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || controlBusy !== null}
+						loading={controlBusy === 'cancel'}
+						data-testid="session-control-cancel"
+						onclick={() => void runControl('cancel')}
+					>
+						Cancel
+					</Button>
+				</div>
+			{/if}
 		</footer>
+		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
 	{/if}
 </div>
 
@@ -1280,6 +1340,35 @@
 		--mai-call-gap: 4px;
 		--mai-session-rhythm: 12px;
 		--mai-tool-label-size: 0.8125rem;
+	}
+
+	/* ---- CCC S2: hero (create) vs active (session) layout ----------------
+	 * The composer footer is ONE DOM node in both states. In hero the two
+	 * spacers grow (flex 1 1 0) and center it vertically; the active
+	 * chrome — header, viewport, notices — renders between the collapsed
+	 * spacers instead. The hero→active switch animates the spacers'
+	 * flex-grow (240ms) so the composer slides to the bottom while the
+	 * transcript expands into the freed space; reduced-motion compiles
+	 * the transition out entirely (class + matchMedia agree). */
+	.mai-session-chat__spacer {
+		flex: 0 1 0;
+		min-height: 0;
+		transition: none;
+	}
+	.mai-session-chat--hero .mai-session-chat__spacer {
+		flex: 1 1 0;
+	}
+	.mai-session-chat:not(.mai-session-chat--reduced-motion) .mai-session-chat__spacer {
+		transition: flex-grow 240ms ease;
+	}
+	/* Hero composer: a bounded, centered prompt block — no border against
+	 * nothing, a touch more breathing room than the active footer. */
+	.mai-session-chat--hero .mai-session-chat__composer {
+		width: 100%;
+		max-width: 640px;
+		margin-inline: auto;
+		border-top-color: transparent;
+		padding: 10px 12px;
 	}
 	.mai-session-chat__header {
 		display: flex;
@@ -1690,7 +1779,10 @@
 	.mai-session-chat__input {
 		flex: 1 1 auto;
 		min-width: 0;
-		resize: vertical;
+		/* CCC S2: auto-grow (2-row baseline → ~6-row cap, see fitComposer)
+		   replaces the manual resize handle; overflow flips on past the cap. */
+		resize: none;
+		overflow-y: hidden;
 		font: inherit;
 	}
 	.mai-session-chat__controls {
