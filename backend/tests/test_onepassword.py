@@ -429,6 +429,7 @@ def test_child_environment_is_scrubbed_to_documented_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bin_dir = _install_fake_op(tmp_path)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     provider = _env_lane(monkeypatch, bin_dir)
     provider.resolve(REFERENCE)
     for record in _invocations(bin_dir):
@@ -441,6 +442,45 @@ def test_child_environment_is_scrubbed_to_documented_keys(
         else:
             assert env_keys == {"PATH", "HOME", ENV_TOKEN_KEY}
         assert DECOY_SENTINEL not in json.dumps(record)
+
+
+def test_child_environment_passes_xdg_config_home_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compose-level op config redirect reaches the child (t_8168ffeb).
+
+    Without this passthrough a controller running under
+    ``XDG_CONFIG_HOME=/tmp/op-xdg`` still spawns ``op`` with the default
+    config path, and op re-creates ``op-daemon.sock`` under
+    ``$HOME/.config/op/`` — dead sockets inside the canonical data root.
+    """
+    bin_dir = _install_fake_op(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/tmp/op-xdg-probe")
+    provider = _env_lane(monkeypatch, bin_dir)
+    provider.resolve(REFERENCE)
+    records = _invocations(bin_dir)
+    assert records, "the resolver must have spawned the fake op"
+    for record in records:
+        env_keys = set(record["env_keys"])  # type: ignore[arg-type]
+        # The scrub stays minimal: the redirect rides along, nothing else
+        # from the ambient environment does.
+        if record["argv"] == ["--version"]:
+            assert env_keys - {"LC_CTYPE"} == {
+                "PATH",
+                "HOME",
+                "XDG_CONFIG_HOME",
+            }
+        else:
+            assert env_keys - {"LC_CTYPE"} == {
+                "PATH",
+                "HOME",
+                "XDG_CONFIG_HOME",
+                ENV_TOKEN_KEY,
+            }
+        assert "XDG_CONFIG_HOME" in env_keys
+    # The redirect is a path, never secret material; the ambient decoy
+    # still never reaches the child.
+    assert DECOY_SENTINEL not in json.dumps(records)
 
 
 def test_hostile_stderr_token_echo_is_scrubbed_env_lane(

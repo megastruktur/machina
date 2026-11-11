@@ -50,9 +50,11 @@ output budgets: accepted ``stdout`` is capped and over-budget output fails
 closed (``output_too_large`` — a silently truncated credential would be a
 correctness landmine), ``stderr`` contributes only a bounded,
 token-scrubbed head to error details. The child
-environment is scrubbed to exactly ``PATH``, ``HOME`` and (for
-authenticated calls) the token key — no other ambient variable reaches the
-CLI. Residual limit,
+environment is scrubbed to exactly ``PATH``, ``HOME``,
+``XDG_CONFIG_HOME`` (only when the controller process itself sets it —
+the compose-level redirect of op's config/socket root away from a
+persistent volume) and (for authenticated calls) the token key — no
+other ambient variable reaches the CLI. Residual limit,
 owned honestly: between spawn and the timeout, a hostile ``op`` binary
 could write unbounded bytes to the temp capture files; ``op`` is
 EULA-licensed host software outside the threat model, and the budget
@@ -195,6 +197,16 @@ _TOKEN_ENV_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 #: The one child-environment key carrying the token (documented op auth
 #: variable), independent of which parent lane supplied the value.
 _CHILD_TOKEN_KEY = "OP_SERVICE_ACCOUNT_TOKEN"
+
+#: Ambient keys passed through to the ``op`` child verbatim besides the
+#: token. ``PATH``/``HOME`` locate the binary and home; ``XDG_CONFIG_HOME``
+#: is a path-only redirect (never secret material): when the controller
+#: redirects op's config root away from a persistent volume (compose
+#: ``XDG_CONFIG_HOME``), the child must see it or op 2.x writes its
+#: ``op-daemon.sock`` under ``$HOME/.config/op/`` — dead sockets in the
+#: canonical data root (finding t_8168ffeb). Unset in the parent means
+#: unset in the child (no invented values).
+_CHILD_PASSTHROUGH_KEYS = ("PATH", "HOME", "XDG_CONFIG_HOME")
 
 
 class OnePasswordErrorCode(StrEnum):
@@ -908,9 +920,12 @@ class OnePasswordResolver:
         return SecretValue(value)
 
     def _child_env(self, token: SecretValue | None) -> dict[str, str]:
-        """Scrubbed child environment: PATH, HOME and the token key only."""
+        """Scrubbed child environment: ``PATH``, ``HOME``,
+        ``XDG_CONFIG_HOME`` (when the parent sets it) and the token key
+        only — every other ambient variable is dropped.
+        """
         env: dict[str, str] = {}
-        for key in ("PATH", "HOME"):
+        for key in _CHILD_PASSTHROUGH_KEYS:
             value = os.environ.get(key)
             if value is not None:
                 env[key] = value

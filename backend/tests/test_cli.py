@@ -22,10 +22,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -106,6 +109,22 @@ def _provisioned_root(
     assert _bootstrap(root, profile) == 0
     capsys.readouterr()  # drain the bootstrap success line
     return root, profile
+
+
+def _provisioned_short_root(capsys: pytest.CaptureFixture[str]) -> tuple[Path, Path]:
+    """A bootstrapped data root under a SHORT temporary base path.
+
+    AF_UNIX ``sun_path`` is capped at 108 bytes; the pytest tmp tree can
+    exceed that, so unix-socket tests provision their data root under the
+    system temp base instead. Returns ``(root, base)`` — the caller owns
+    ``base`` cleanup (``shutil.rmtree``).
+    """
+    base = Path(tempfile.mkdtemp(prefix="mai-skt-", dir="/tmp" if os.path.isdir("/tmp") else None))
+    root = base / "r"
+    profile = _write_profile(base / "p.yaml")
+    assert _bootstrap(root, profile) == 0
+    capsys.readouterr()  # drain the bootstrap success line
+    return root, base
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +722,69 @@ class TestBackupRestore:
         assert _err_of(capsys)["code"] == "unexpected_entry"
         assert not archive.exists()
         assert link.is_symlink() and outside.exists()
+
+    def test_backup_skips_a_dead_unix_socket_and_reports_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """t_8168ffeb: a stale op-daemon.sock (daemon exited, nothing
+        listening) is skipped, not refused — the data root's steady state
+        after container-restart cycles must stay backupable."""
+        root, base = _provisioned_short_root(capsys)
+        try:
+            stale = root / "op-daemon.sock"  # top level: sun_path limit
+            maker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            maker.bind(str(stale))
+            maker.close()  # socket file remains, nothing listens: dead
+            archive = tmp_path / "backup.tar.gz"
+            assert main(["backup", "--data-root", str(root), "--output", str(archive)]) == 0
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["skipped_dead_sockets"] == ["op-daemon.sock"]
+            assert payload["entries"] == 2  # profile + meta only
+            with tarfile.open(archive) as bundle:
+                names = bundle.getnames()
+                manifest = json.loads(bundle.extractfile("manifest.json").read())  # type: ignore[union-attr]
+            assert "op-daemon.sock" not in names
+            assert "manifest.json" in names
+            # A dead socket is skipped in place, never removed by the backup.
+            assert stale.is_socket()
+            # The manifest records the skip so restore-time audits see it.
+            assert manifest["skipped_dead_sockets"] == ["op-daemon.sock"]
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_backup_refuses_a_live_unix_socket(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A LIVE daemon's socket (a listener accepts the probe) is an
+        operational fact the operator must see — backup still refuses."""
+        root, base = _provisioned_short_root(capsys)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(root / "op-daemon.sock"))
+        server.listen(1)
+        try:
+            archive = tmp_path / "backup.tar.gz"
+            assert main(["backup", "--data-root", str(root), "--output", str(archive)]) == 1
+            error = _err_of(capsys)
+            assert error["code"] == "unexpected_entry"
+            assert "op-daemon.sock" in str(error["message"])
+            assert not archive.exists()
+            assert (root / "op-daemon.sock").is_socket()
+        finally:
+            server.close()
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_backup_refuses_a_fifo_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """FIFOs are not sockets and carry no liveness semantics — the
+        non-regular refusal (C02 rule 3) keeps refusing them."""
+        root, _ = _provisioned_root(tmp_path, capsys)
+        fifo = root / "servers" / str(SERVER_ID) / "pipe"
+        os.mkfifo(fifo)
+        archive = tmp_path / "backup.tar.gz"
+        assert main(["backup", "--data-root", str(root), "--output", str(archive)]) == 1
+        assert _err_of(capsys)["code"] == "unexpected_entry"
+        assert not archive.exists()
 
     def test_restore_refuses_a_dirty_target_without_mutation(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

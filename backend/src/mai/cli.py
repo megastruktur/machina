@@ -78,6 +78,8 @@ import io
 import json
 import os
 import shutil
+import socket
+import stat
 import sys
 import tarfile
 import tempfile
@@ -445,13 +447,54 @@ def _cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _collect_regular_files(root: Path) -> list[tuple[Path, str]]:
-    """Every regular file below root as (path, archive-relative name).
+def _is_live_unix_socket(path: Path) -> bool | None:
+    """Liveness probe for a unix-socket file (``connect``-based, never
+    blocking — FIFOs and other non-regular entries are never probed).
+
+    Returns ``True`` when a listener accepts the connection (live daemon),
+    ``False`` for the two unambiguous stale signatures (``ECONNREFUSED``,
+    ``ENOENT`` — the socket file exists but nothing is listening, the
+    steady state of e.g. the 1Password CLI's ``op-daemon.sock`` after its
+    daemon exited), and ``None`` for anything indeterminate (a permission
+    error, a vanished file mid-probe) — indeterminate is treated as live
+    by the caller: fail closed, the operator investigates.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(info.st_mode):
+        return None
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return None
+    else:
+        return True
+    finally:
+        client.close()
+
+
+def _collect_regular_files(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
+    """Every regular file below root as (path, archive-relative name),
+    plus the dead unix-socket files skipped along the way.
 
     Refuses symbolic links and non-regular entries: a backup must never
-    follow an escape alias out of the canonical tree (C02 rule 3).
+    follow an escape alias out of the canonical tree (C02 rule 3). One
+    deliberate exception (t_8168ffeb): a unix-socket file with NO live
+    listener is skipped, not refused — it is an empty inode whose daemon
+    exited (the 1Password CLI leaves ``op-daemon.sock`` behind in
+    container-restart cycles), it carries no restorable data, and refusing
+    it wedges every backup of a steady-state data root. A socket with a
+    LIVE listener is still refused (``unexpected_entry``): an active
+    daemon mid-backup is an operational fact the operator must see, and
+    FIFOs/devices/directories-as-files are refused unchanged.
     """
     collected: list[tuple[Path, str]] = []
+    skipped_sockets: list[str] = []
     for current, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(current)
         for name in sorted(dirnames):
@@ -464,17 +507,20 @@ def _collect_regular_files(root: Path) -> list[tuple[Path, str]]:
         for name in sorted(filenames):
             path = here / name
             if path.is_symlink() or not path.is_file():
+                if _is_live_unix_socket(path) is False:
+                    skipped_sockets.append(path.relative_to(root).as_posix())
+                    continue
                 raise ProfileFileError(
                     CliErrorCode.UNEXPECTED_ENTRY,
                     f"non-regular entry in data root: {path.relative_to(root)}",
                 )
             collected.append((path, path.relative_to(root).as_posix()))
-    return collected
+    return collected, skipped_sockets
 
 
 def _write_archive(root: Path, output: Path) -> int:
     try:
-        files = _collect_regular_files(root)
+        files, skipped_sockets = _collect_regular_files(root)
     except ProfileFileError as exc:
         return _fail(exc.code.value, exc.detail)
     manifest = {
@@ -483,6 +529,7 @@ def _write_archive(root: Path, output: Path) -> int:
             {"path": rel, "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             for path, rel in files
         ],
+        "skipped_dead_sockets": sorted(skipped_sockets),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, staging = tempfile.mkstemp(prefix=".mai-backup-", dir=output.parent)
@@ -512,6 +559,7 @@ def _write_archive(root: Path, output: Path) -> int:
             "entries": len(files),
             "bytes": output.stat().st_size,
             "sha256": digest,
+            "skipped_dead_sockets": sorted(skipped_sockets),
         }
     )
     return 0

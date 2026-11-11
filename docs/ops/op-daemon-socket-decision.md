@@ -1,6 +1,7 @@
-# Decision: op-daemon.sock must not live in MAI_DATA_ROOT (t_e8178c8f)
+# Decision: op-daemon.sock must not live in MAI_DATA_ROOT (t_e8178c8f, amended by t_8168ffeb)
 
 Date: 2026-11-09 · Owner: devops · Status: LANDED on master (1b3df47, mirror synced) — activates at the next Komodo DeployStack of `machina`
+Amended: 2026-11-11 (t_8168ffeb) — the compose env alone was INSUFFICIENT; see "Second finding" below.
 
 ## Problem
 
@@ -50,11 +51,62 @@ NOT by changing HOME (the app may use HOME for other paths):
 
 ## Guard in the meantime
 
-Pre-deploy backup operators: if `backup` refuses with `unexpected_entry` on
-`.config/op/op-daemon.sock`, verify no listener
+SUPERSEDED by the t_8168ffeb fix (below): `mai.cli backup` now skips dead
+unix sockets itself, so the manual rm dance is no longer needed. Kept for
+history: pre-deploy backup operators were told to verify no listener
 (`docker exec <api|worker> grep op-daemon /proc/net/unix` — empty = dead)
-and `sudo rm` the socket, then re-run. Removal is safe only with an empty
+and `sudo rm` the socket, then re-run. Removal was safe only with an empty
 grep result in BOTH containers.
+
+## Second finding (t_8168ffeb, 2026-11-11): the compose redirect alone was insufficient
+
+**Symptom recurrence.** The socket reappeared at
+`.config/op/op-daemon.sock` (mtime 2026-11-10T10:02:21Z) despite
+`XDG_CONFIG_HOME=/tmp/op-xdg` confirmed present in both containers, and
+`/tmp/op-xdg` was never even created inside them — the redirect never
+absorbed anything. It blocked the 3a42472 release backup (third
+occurrence).
+
+**True root cause.** The backend does not inherit the compose env when it
+spawns `op`: `OnePasswordClient._child_env`
+(backend/src/mai/credentials/onepassword.py) deliberately scrubbed the
+child environment to exactly `PATH`, `HOME` and the token key — a
+documented security boundary (C03 rule 6) — and `XDG_CONFIG_HOME` was
+dropped with it. Every backend-driven `op` invocation (secret tools, op
+plugin lane) therefore ran with the DEFAULT config path
+`$HOME/.config/op/`, and since `HOME=/var/lib/mai` IS the `machina_mai-data`
+volume, op re-created its daemon socket there on every session. The
+2026-11-09 "op honors XDG" probe passed because `docker exec` inherits the
+compose environment — it probed a different execution path than the
+backend's own spawn.
+
+**Fix A (creator honors the redirect).** `_child_env` now passes
+`XDG_CONFIG_HOME` through when the controller process itself has it set
+(compose sets it; unset stays unset — no invented values). It is a
+path-only value, never secret material, so the scrub boundary is intact.
+After the next backend image deploy, backend-spawned `op` writes its
+socket under `/tmp/op-xdg/op/` (container-local, wiped on restart) and the
+data root never sees it again.
+
+**Fix B (producer tolerance, active immediately on the host).**
+`python -m mai.cli backup` liveness-probes unix-socket entries in the
+data root: a DEAD socket (connect → ECONNREFUSED/ENOENT — nothing
+listening, the steady state after a daemon/container exit) is SKIPPED and
+recorded in the archive manifest (`skipped_dead_sockets`) and the summary
+line; a LIVE socket (connect succeeds) is still refused
+(`unexpected_entry`) — an active daemon mid-backup is an operational fact
+the operator must see. Symlinks, FIFOs, devices: refused unchanged
+(C02 rule 3). Proven live 2026-11-11: canonical
+`scripts/backup-restore.sh backup` + `verify` both exit 0 with a dead
+socket planted at the exact original volume path
+(`machina-sockfix-proof-20261111T184017Z.tar.gz`, members=5, manifest
+records the skip).
+
+**Deployment note.** Fix B is host-side and effective now (the script's
+venv is an editable checkout). Fix A rides the next backend image build +
+Komodo DeployStack — no dedicated deploy for this alone (same policy as
+the original decision). Until that deploy, the socket may still
+occasionally appear in the volume; backups proceed regardless (Fix B).
 
 ## Verification of the canonical path (2026-11-09, post-removal)
 
