@@ -1598,6 +1598,8 @@
 				onsessionopened={(sessionId, serverId) =>
 					openActiveSession(sessionId, serverId)}
 				onturnsubmitted={handleTurnSubmitted}
+				selectedServerId={selectedServerId}
+				onserverchange={(serverId) => (selectedServerId = serverId)}
 			/>
 		</div>
 	</section>

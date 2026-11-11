@@ -47,7 +47,8 @@ declare global {
 		__scope?: {
 			sessionId: string | null;
 			serverId: string | null;
-			services: Record<string, unknown>;
+			selectedServerId: string | null;
+			serverChangeLog: string[];
 			detail: Record<string, unknown> | null;
 			detailError: boolean;
 			createLog: Array<Record<string, unknown>>;
@@ -66,6 +67,8 @@ import ${JSON.stringify(TOKENS)};
 const state = {
 	sessionId: null,
 	serverId: null,
+	selectedServerId: null,
+	serverChangeLog: [],
 	services: {},
 	detail: null,
 	detailError: false,
@@ -148,6 +151,14 @@ async function render() {
 			},
 			sessionId: state.sessionId,
 			serverId: state.serverId,
+			selectedServerId: state.selectedServerId,
+			onserverchange: (serverId) => {
+				// The shell seam: the strip's select writes the shell's
+				// VISIBLE selection (persist + service reload live there).
+				state.serverChangeLog.push(serverId);
+				state.selectedServerId = serverId;
+				void render();
+			},
 			onsessionopened: (sessionId, serverId) => {
 				// The shell attaches the channel + swaps the visible session
 				// synchronously; the linked chip then renders from the stored
@@ -450,8 +461,69 @@ test.describe('composer @service picker (new sessions only)', () => {
 	});
 });
 
+test.describe('unified scope strip (CCC S3)', () => {
+	const SERVER_B_ID = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+
+	test('hero: the server chip is the interactive shell selection', async ({ page }) => {
+		await gotoHarness(page);
+		await page.evaluate(({ serverId, betaId }) => {
+			return window.__mount!({
+				serverId,
+				selectedServerId: serverId,
+				services: {
+					serverOptions: [
+						{ id: serverId, label: 'alpha-host' },
+						{ id: betaId, label: 'beta-host' }
+					],
+					availableServices: []
+				}
+			});
+		}, { serverId: SERVER_A_ID, betaId: SERVER_B_ID });
+		const select = page.getByTestId('chat-scope-server-select');
+		await expect(page.getByTestId('chat-scope-strip')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-server')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-service')).toBeVisible();
+		await expect(select).toHaveValue(SERVER_A_ID);
+		// The draft @service picker rides the strip's service slot.
+		await expect(page.getByTestId('session-service-picker')).toBeVisible();
+		await select.selectOption(SERVER_B_ID);
+		// The write-back reaches the shell seam…
+		await expect
+			.poll(() => page.evaluate(() => window.__scope!.serverChangeLog))
+			.toEqual([SERVER_B_ID]);
+		// …and the new selection round-trips into the chip's select.
+		await expect(select).toHaveValue(SERVER_B_ID);
+	});
+
+	test('active: the strip is READ-ONLY stored scope — no interactive select', async ({ page }) => {
+		await gotoHarness(page);
+		await page.evaluate(({ serverId, serviceId }) => {
+			return window.__mount!({
+				sessionId: '11111111-1111-4111-8111-111111111111',
+				serverId,
+				selectedServerId: 'ffffffff-0000-4000-8000-00000000000f',
+				detail: {
+					server_id: serverId,
+					service_id: serviceId,
+					service_name: 'nginx-proxy'
+				},
+				services: { serverOptions: [{ id: serverId, label: 'alpha-host' }] }
+			});
+		}, { serverId: SERVER_A_ID, serviceId: SERVICE_ID });
+		// The chips render the STORED scope through the strip slots — never
+		// the passed drawer selection (ffffff…).
+		const strip = page.getByTestId('chat-scope-strip');
+		await expect(strip).toBeVisible();
+		await expect(strip.getByTestId('session-header-server')).toHaveText('Server: alpha-host');
+		await expect(strip.getByTestId('session-header-service')).toHaveText('Service: @nginx-proxy');
+		// A live session can never be rebound through the strip.
+		await expect(page.getByTestId('chat-scope-server-select')).toHaveCount(0);
+		await expect(page.getByTestId('session-service-select')).toHaveCount(0);
+	});
+});
+
 test.describe('360x640 bounds', () => {
-	test('long service names wrap inside the chip with zero horizontal overflow', async ({
+	test('360x640: the strip holds one row, the service chip truncates first, zero overflow', async ({
 		page
 	}) => {
 		await page.setViewportSize({ width: 360, height: 640 });
@@ -473,9 +545,30 @@ test.describe('360x640 bounds', () => {
 				}
 			});
 		}, { serverId: SERVER_A_ID, serviceId: SERVICE_ID, name: longName });
+		// The full stored text stays in the DOM (title tooltip + AT).
 		await expect(page.getByTestId('session-header-service')).toContainText(
 			`@${longName.slice(0, 20)}`
 		);
+		// CCC S3: the strip is ONE row — both slots share a top edge, the
+		// service chip is ellipsized (scrollWidth > clientWidth) with the
+		// full scope on its title tooltip.
+		const stripGeo = await page.evaluate(() => {
+			const server = document.querySelector('[data-testid="session-header-server"]')!;
+			const service = document.querySelector('[data-testid="session-header-service"]')!;
+			const serverBox = server.getBoundingClientRect();
+			const serviceBox = service.getBoundingClientRect();
+			return {
+				oneRow: Math.abs(serverBox.top - serviceBox.top) < 1,
+				serviceTruncated: service.scrollWidth > service.clientWidth,
+				serviceTitle: service.getAttribute('title'),
+				serverTitle: document
+					.querySelector('[data-testid="chat-scope-server"]')
+					?.getAttribute('title')
+			};
+		});
+		expect(stripGeo.oneRow).toBe(true);
+		expect(stripGeo.serviceTruncated).toBe(true);
+		expect(stripGeo.serviceTitle).toContain(longName.slice(0, 8));
 		const overflow = await page.evaluate(() => ({
 			scroll: document.documentElement.scrollWidth,
 			client: document.documentElement.clientWidth

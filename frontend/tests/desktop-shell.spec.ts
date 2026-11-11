@@ -927,3 +927,247 @@ test('opened windows stack ABOVE the centered chat column and unauthorized live 
 	);
 	expect(topElementIsInsideFrame).toBe(true);
 });
+
+test('CCC S3 wiring: strip drives the shell selection; history opens stored scope; New Chat returns to hero', async ({
+	page
+}) => {
+	// Offline-safe scripted live bag (the reviewed live-nav pattern): the
+	// readable `mai_csrf` cookie attaches the live composition, every
+	// needed route is mocked, the channel is a scripted WebSocket.
+	const SERVER_BETA_ID = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+	const SERVICE_ID = '3f9d2c4e-0001-4001-8001-00000000d001';
+	const SESSION_ID = '55555555-5555-4555-8555-555555555555';
+	const profileFor = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: { host: `${name}.example`, port: 22, user: 'mai', host_key: 'k', credential_ref: 'MAI_SSH_KEY' },
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [profileFor(SERVER_ALPHA_ID, 'Server Alpha'), profileFor(SERVER_BETA_ID, 'Server Beta')]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ profiles: [{ schema_version: 1, name: 'glm53flash', connection: 'litellm', model: 'z-ai-coding/glm-5.3-flash' }] })
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ schema_version: 1, connection: 'litellm', profile: 'glm53flash' })
+		})
+	);
+	// Draft @service options: Alpha adopts nginx-proxy, Beta adopts grafana
+	// — the reload proof distinguishes them.
+	await page.route('**/api/v1/servers/*/applications**', (route) => {
+		const serverId = new URL(route.request().url()).pathname.split('/')[4];
+		const name = serverId === SERVER_BETA_ID ? 'grafana' : 'nginx-proxy';
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				server_id: serverId,
+				applications: [
+					{
+						application_id: `${SERVICE_ID}-${name}`,
+						server_id: serverId,
+						name,
+						origin: 'manual',
+						revision: 1
+					}
+				],
+				limit: 10,
+				offset: 0,
+				total: 1
+			})
+		});
+	});
+	// The agent-session family: list (drawer), detail (stored chips),
+	// history (the transcript page).
+	await page.route('**/api/v1/agent-sessions**', (route) => {
+		const url = new URL(route.request().url());
+		const segments = url.pathname.split('/');
+		const json = (body: unknown) =>
+			route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+		if (segments.length === 4) {
+			// GET /api/v1/agent-sessions — the drawer's bounded first page.
+			return json({
+				items: [
+					{
+						session_id: SESSION_ID,
+						server_id: SERVER_ALPHA_ID,
+						source: 'interactive',
+						status: 'idle',
+						title: 'wiring proof',
+						latest_seq: 1,
+						total_entries: 1,
+						compaction_count: 0,
+						created_at: '2026-01-01T00:00:00Z',
+						updated_at: '2026-01-01T00:00:00Z',
+						service_id: SERVICE_ID,
+						service_name: 'nginx-proxy',
+						tag_preview: null
+					}
+				],
+				limit: 10,
+				offset: 0,
+				total: 1,
+				has_more: false
+			});
+		}
+		if (segments.at(-1) === 'history') {
+			return json({
+				items: [
+					{
+						schema_version: 1,
+						entry_id: 'eeeeeeee-eeee-4eee-8eee-000000000001',
+						session_id: SESSION_ID,
+						seq: 1,
+						run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+						durable_source_id: 'turn:wiring',
+						created_at: '2026-01-01T00:00:00Z',
+						payload: {
+							kind: 'user_message',
+							text: 'hello from the wiring proof',
+							client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+							source: 'interactive'
+						}
+					}
+				],
+				limit: 30,
+				offset: 0,
+				total: 1,
+				has_more: false,
+				has_older: false,
+				oldest_seq: 1,
+				latest_seq: 1,
+				byte_size: 96,
+				truncated_by_bytes: false,
+				next_before_seq: null
+			});
+		}
+		// GET /api/v1/agent-sessions/{id} — the STORED scope (SCOPE-3).
+		return json({
+			session_id: SESSION_ID,
+			server_id: SERVER_ALPHA_ID,
+			service_id: SERVICE_ID,
+			service_name: 'nginx-proxy',
+			source: 'interactive',
+			status: 'idle',
+			title: 'wiring proof',
+			latest_seq: 1,
+			total_entries: 1,
+			compaction_count: 0,
+			created_at: '2026-01-01T00:00:00Z',
+			updated_at: '2026-01-01T00:00:00Z'
+		});
+	});
+	// The session channel: scripted hello handshake + the bounded snapshot.
+	await page.routeWebSocket(/\/api\/v1\/agent-sessions\/.+\/channel/, (ws) => {
+		ws.onMessage((data) => {
+			if (!String(data).includes('"hello"')) return;
+			ws.send(
+				JSON.stringify({
+					type: 'hello_ok',
+					protocol_version: 1,
+					session_id: SESSION_ID,
+					server_id: SERVER_ALPHA_ID,
+					stream_id: 'wiring-s1',
+					latest_seq: 1
+				})
+			);
+			// The server's bounded truth follows the handshake: one
+			// committed user turn.
+			ws.send(
+				JSON.stringify({
+					type: 'snapshot',
+					stream_id: 'wiring-s1',
+					entries: [
+						{
+							schema_version: 1,
+							entry_id: 'eeeeeeee-eeee-4eee-8eee-000000000001',
+							session_id: SESSION_ID,
+							seq: 1,
+							run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+							durable_source_id: 'turn:wiring',
+							created_at: '2026-01-01T00:00:00Z',
+							payload: {
+								kind: 'user_message',
+								text: 'hello from the wiring proof',
+								client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+								source: 'interactive'
+							}
+						}
+					]
+				})
+			);
+		});
+	});
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	const column = page.getByTestId('bottom-chat-dock');
+	const panel = column.getByTestId('session-chat-panel');
+
+	// HERO: the strip is the interactive draft scope — the server select
+	// carries the shell's selection and Alpha's services load into the
+	// draft @service picker.
+	await expect(panel).toHaveAttribute('data-state', 'hero');
+	const serverSelect = page.getByTestId('chat-scope-server-select');
+	await expect(serverSelect).toHaveValue(SERVER_ALPHA_ID);
+	await expect(page.getByTestId('session-service-select')).toHaveValue('');
+	await expect(page.getByTestId('session-service-select')).toContainText('nginx-proxy');
+
+	// The drawer's history row opens THAT session → ACTIVE with its OWN
+	// stored scope and transcript.
+	await page.getByTestId('drawer-history-item').first().click();
+	await expect(panel).toHaveAttribute('data-state', 'active');
+	await expect(page.getByTestId('session-header-server')).toHaveText('Server: Server Alpha');
+	await expect(page.getByTestId('session-header-service')).toHaveText('Service: @nginx-proxy');
+	await expect(page.getByTestId('entry-user-message')).toContainText('hello from the wiring proof');
+
+	// A selection change while ACTIVE never rebinds the session: the strip
+	// has no interactive select and the chips keep the stored scope.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect(page.getByTestId('session-header-server')).toHaveText('Server: Server Alpha');
+	await expect(page.getByTestId('chat-scope-server-select')).toHaveCount(0);
+	expect(
+		await page.evaluate(() => window.localStorage.getItem('mai.workspace.selected-server.v1'))
+	).toBe(SERVER_BETA_ID);
+
+	// + New Chat returns the column to HERO: the draft scope strip, no
+	// transcript, and the composer focused for the next first turn.
+	await page.getByTestId('drawer-new-chat').click();
+	await expect(panel).toHaveAttribute('data-state', 'hero');
+	await expect(page.getByTestId('session-history-viewport')).toHaveCount(0);
+	await expect(page.getByTestId('entry-user-message')).toHaveCount(0);
+	// The draft scope follows the drawer selection (Beta): the strip select
+	// reads Beta and the draft service options reloaded for Beta.
+	await expect(serverSelect).toHaveValue(SERVER_BETA_ID);
+	await expect(page.getByTestId('session-service-select')).toContainText('grafana');
+	const composerFocused = await panel.evaluate(
+		(el) => el.querySelector('textarea') === document.activeElement
+	);
+	expect(composerFocused).toBe(true);
+});

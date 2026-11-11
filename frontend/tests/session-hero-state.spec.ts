@@ -88,8 +88,10 @@ function heroHost(): string {
 
 	const api = {
 		readAgentSession: async (sid: string, scope: string | null) => ({
+			// The stored detail names its OWN server (General Consult when
+			// the caller sends no scope pin) — never a borrowed selection.
 			session_id: sid,
-			server_id: scope ?? serverId,
+			server_id: scope ?? '00000000-0000-0000-0000-000000000000',
 			service_id: null,
 			service_name: null,
 			source: 'interactive',
@@ -285,6 +287,14 @@ test.describe('hero state (no session)', () => {
 			'Describe the task — a session is created on submit'
 		);
 		await expect(page.getByTestId('session-composer-submit')).toBeVisible();
+		// CCC S3: the unified scope strip carries the hero scope — the
+		// server slot (static here: this bag enrolls no options; an
+		// interactive select over enrolled options is proven by the scope
+		// suite) and the draft @service picker in the service slot.
+		await expect(page.getByTestId('chat-scope-strip')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-server')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-service')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-server-select')).toHaveCount(0);
 		// …and NOTHING else renders.
 		await expect(page.getByTestId('session-history-viewport')).toHaveCount(0);
 		await expect(page.getByTestId('session-control-steer')).toHaveCount(0);
@@ -396,6 +406,11 @@ test.describe('hero → active transition', () => {
 		await expect(page.getByTestId('session-header-id')).toBeVisible();
 		await expect(page.getByTestId('session-control-steer')).toBeVisible();
 		await expect(page.getByTestId('session-service-picker')).toHaveCount(0);
+		// CCC S3: the active strip renders the stored read-only scope
+		// (this bag's detail read yields the session's own server id).
+		await expect(page.getByTestId('chat-scope-strip')).toBeVisible();
+		await expect(page.getByTestId('chat-scope-server')).toContainText('General Consult');
+		await expect(page.getByTestId('chat-scope-service')).toHaveCount(0);
 		await expect(page.getByTestId('session-history-empty')).toBeVisible();
 	});
 });

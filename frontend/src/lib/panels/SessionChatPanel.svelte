@@ -98,6 +98,16 @@
 		 * `run_state` entry arrives (server truth always wins).
 		 */
 		optimisticRunState?: TurnRunState | null;
+		/**
+		 * CCC S3: the shell's VISIBLE server selection — the SAME state the
+		 * HUD selector and the server tree use. Drives the hero strip's
+		 * interactive server chip; read-only scope in active comes from the
+		 * session's OWN stored detail instead.
+		 */
+		selectedServerId?: string | null;
+		/** The shell-side selection write-back (persists + reloads the draft
+		 * service options through the shell's existing effects). */
+		onserverchange?: (serverId: string) => void;
 	};
 
 	let {
@@ -112,7 +122,9 @@
 		onloadolder = () => {},
 		onsessionopened = () => {},
 		onturnsubmitted = () => {},
-		optimisticRunState = null
+		optimisticRunState = null,
+		selectedServerId = null,
+		onserverchange = () => {}
 	}: Props = $props();
 
 	/** Narrow the session API slice (fail closed like every panel). */
@@ -798,22 +810,32 @@
 			<span class="mai-session-chat__id" data-testid="session-header-id">
 				{sessionId === null ? 'new session' : `session ${sessionId.slice(0, 8)}…`}
 			</span>
+		<!-- CCC S3: the unified scope strip — READ-ONLY in active, rendered
+		     from the session's OWN stored detail (SCOPE-3: never the
+		     drawer's selection, never a borrowed label). The chips keep
+		     their S2 testids; the strip slots carry the strip testids. -->
+		<div class="mai-scope-strip" data-testid="chat-scope-strip">
 			{#if serverChip !== null}
-				<span class="mai-session-chat__scope" data-testid="session-header-server">
-					{serverChip}
+				<span class="mai-scope-strip__slot" data-testid="chat-scope-server" title={serverChip}>
+					<span class="mai-session-chat__scope" data-testid="session-header-server">
+						{serverChip}
+					</span>
 				</span>
 			{/if}
 			{#if serviceChip !== null}
-				<span
-					class="mai-session-chat__scope"
-					data-testid="session-header-service"
-					title={serviceChip.endsWith('(unavailable)')
-						? 'The linked service map entry is unavailable.'
-						: undefined}
-				>
-					{serviceChip}
+				<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
+					<span
+						class="mai-session-chat__scope"
+						data-testid="session-header-service"
+						title={serviceChip.endsWith('(unavailable)')
+							? 'The linked service map entry is unavailable.'
+							: serviceChip}
+					>
+						{serviceChip}
+					</span>
 				</span>
 			{/if}
+		</div>
 			{#if channelState === 'resync'}
 				<span class="mai-session-chat__resync" role="status" data-testid="session-resync-note">
 					resync — reconciling with the server
@@ -1186,65 +1208,102 @@
 					{controlProblem.code}: {controlProblem.message}
 				</p>
 			{/if}
-			{#if sessionId === null}
-				<!-- SCOPE-3: the @service picker exists ONLY for a NEW session —
-				     an existing session's linked chip (header) is read-only and
-				     can never be rebound through the composer. -->
-				<div class="mai-session-chat__service-row" data-testid="session-service-picker">
-					{#if servicesLoading}
-						<span
-							class="mai-session-chat__service-state"
-							data-testid="session-services-loading"
-						>
-							Loading services…
-						</span>
-					{:else if servicesError !== null}
-						<span
-							class="mai-session-chat__service-state"
-							role="alert"
-							data-testid="session-services-error"
-						>
-							Services unavailable: {servicesError}
-						</span>
-					{:else if serviceOptions.length === 0}
-						<span
-							class="mai-session-chat__service-state"
-							data-testid="session-services-empty"
-						>
-							No adopted services on this server.
-						</span>
-					{:else}
-						<label class="mai-session-chat__service-label">
-							@service
+		{#if isHero}
+			<!-- CCC S3: the unified scope strip — INTERACTIVE in hero. The
+			     server chip selects the shell's VISIBLE selection (the same
+			     state the HUD/tree use, written back through onserverchange);
+			     the service chip is the draft @service picker (SCOPE-3:
+			     committed at CREATE only, honest loading/empty/error/Load
+			     more preserved). -->
+			<div class="mai-scope-strip" data-testid="chat-scope-strip">
+				<span class="mai-scope-strip__slot" data-testid="chat-scope-server">
+					{#if serverOptionsList.length > 0}
+						<label class="mai-scope-strip__label" title="Server scope for the new session">
+							<span aria-hidden="true">⚙</span>
 							<select
-								class="mai-session-chat__service-select"
-								data-testid="session-service-select"
-								bind:value={selectedServiceId}
-								disabled={submitting}
+								class="mai-scope-strip__select"
+								data-testid="chat-scope-server-select"
+								value={selectedServerId ?? ''}
+								onchange={(event) => onserverchange(event.currentTarget.value)}
 							>
-								<option value="">— none —</option>
-								{#each serviceOptions as option (option.application_id)}
-									<option value={option.application_id}>
-										{option.name}{option.category ? ` · ${option.category}` : ''}
-									</option>
+								{#each serverOptionsList as option (option.id)}
+									<option value={option.id}>{option.label}</option>
 								{/each}
 							</select>
 						</label>
-						{#if servicesHasMore}
-							<Button
-								variant="secondary"
-								size="sm"
-								tabindex={0}
-								loading={servicesLoading}
-								data-testid="session-services-load-more"
-								onclick={() => loadMoreServices()}
-							>
-								Load more
-							</Button>
-						{/if}
+					{:else}
+						<!-- No enrolled options: the honest static chip (never a
+						     fabricated interactive choice). -->
+						<span
+							class="mai-session-chat__scope"
+							title={selectedServerId === null ? 'No server selected' : selectedServerId}
+						>
+							⚙ {selectedServerId === null
+								? 'no server'
+								: selectedServerId === GLOBAL_CONSULT_SERVER_ID
+									? 'General Consult'
+									: `Server: ${selectedServerId.slice(0, 8)}…`}
+						</span>
 					{/if}
-				</div>
-			{/if}
+				</span>
+				<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
+					<div class="mai-session-chat__service-row" data-testid="session-service-picker">
+						{#if servicesLoading}
+							<span
+								class="mai-session-chat__service-state"
+								data-testid="session-services-loading"
+							>
+								Loading services…
+							</span>
+						{:else if servicesError !== null}
+							<span
+								class="mai-session-chat__service-state"
+								role="alert"
+								data-testid="session-services-error"
+							>
+								Services unavailable: {servicesError}
+							</span>
+						{:else if serviceOptions.length === 0}
+							<span
+								class="mai-session-chat__service-state"
+								data-testid="session-services-empty"
+							>
+								No adopted services on this server.
+							</span>
+						{:else}
+							<label class="mai-session-chat__service-label">
+								@service
+								<select
+									class="mai-session-chat__service-select"
+									data-testid="session-service-select"
+									bind:value={selectedServiceId}
+									disabled={submitting}
+								>
+									<option value="">— none —</option>
+									{#each serviceOptions as option (option.application_id)}
+										<option value={option.application_id}>
+											{option.name}{option.category ? ` · ${option.category}` : ''}
+										</option>
+									{/each}
+								</select>
+							</label>
+							{#if servicesHasMore}
+								<Button
+									variant="secondary"
+									size="sm"
+									tabindex={0}
+									loading={servicesLoading}
+									data-testid="session-services-load-more"
+									onclick={() => loadMoreServices()}
+								>
+									Load more
+								</Button>
+							{/if}
+						{/if}
+					</div>
+				</span>
+			</div>
+		{/if}
 			<div class="mai-session-chat__composer-row">
 				<textarea
 					class="mai-session-chat__input"
@@ -1369,6 +1428,68 @@
 		margin-inline: auto;
 		border-top-color: transparent;
 		padding: 10px 12px;
+	}
+
+	/* ---- CCC S3: the unified scope strip -----------------------------------
+	 * Mechanicus-minimal: mono-adjacent small text, the existing chip pill
+	 * (brass border token), ⚙ sigil for the server slot, @ for service.
+	 * Desktop wraps; pocket viewports (≤720px) hold ONE row — the service
+	 * slot yields first, ellipsized, with the full text on the title
+	 * tooltip. No glass anywhere. */
+	.mai-scope-strip {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		align-items: center;
+		min-width: 0;
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.75rem;
+	}
+	.mai-scope-strip__slot {
+		display: inline-flex;
+		align-items: center;
+		min-width: 0;
+	}
+	.mai-scope-strip__slot--service {
+		flex: 0 1 auto;
+	}
+	.mai-scope-strip__label {
+		display: inline-flex;
+		gap: 4px;
+		align-items: center;
+		min-width: 0;
+	}
+	.mai-scope-strip__select {
+		max-width: 100%;
+		min-width: 0;
+		font: inherit;
+	}
+	@media (max-width: 720px) {
+		.mai-scope-strip {
+			flex-wrap: nowrap;
+			overflow: hidden;
+		}
+		.mai-scope-strip__slot {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		/* The server slot keeps a bounded share; the service slot takes the
+		 * remainder and truncates FIRST. */
+		.mai-scope-strip__slot:not(.mai-scope-strip__slot--service) {
+			flex: 0 0 auto;
+			max-width: 60%;
+		}
+		.mai-scope-strip__slot--service {
+			flex: 1 1 auto;
+		}
+		.mai-scope-strip__slot .mai-session-chat__scope,
+		.mai-scope-strip__slot .mai-session-chat__service-label,
+		.mai-scope-strip__slot .mai-session-chat__service-row {
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
 	}
 	.mai-session-chat__header {
 		display: flex;
