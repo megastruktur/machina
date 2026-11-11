@@ -249,18 +249,12 @@
 	let controlBusy = $state<string | null>(null);
 	let controlProblem = $state<{ code: string; message: string } | null>(null);
 
-	// --- CCC S2 / CSP P1: hero (create) vs active layout ---------------------
-	/** Hero = no session yet: ONLY the bottom-anchored composer (picker +
-	 * textarea + Send) under a calm empty surface. Everything transcript-ish
-	 * is active-state chrome. */
+	// --- CCC S2 / CSP P1 / CHC H1: hero (create) vs active layout -------------
+	/** Hero = no session yet: ONLY the compact card's composer block
+	 * (scope strip + textarea + Send) — the SHELL sizes and centers the
+	 * card (see DesktopShell's dock-body); everything transcript-ish is
+	 * active-state chrome. */
 	const isHero = $derived(sessionId === null);
-
-	/** Honest motion budget: reduced-motion users get instant layout
-	 * switches — the spacer flex transition is compiled out via class. */
-	let motionReduced = $state(false);
-	$effect(() => {
-		motionReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-	});
 
 	/** CCC S2: the composer auto-grows with its text — a 2-row baseline, a
 	 * ~6-row cap, internal scroll beyond (manual resize is gone). */
@@ -787,7 +781,6 @@
 <div
 	class="mai-session-chat"
 	class:mai-session-chat--hero={isHero}
-	class:mai-session-chat--reduced-motion={motionReduced}
 	data-state={isHero ? 'hero' : 'active'}
 	data-testid="session-chat-panel"
 >
@@ -797,15 +790,15 @@
 		</div>
 	{:else}
 
-		<!-- CSP P1 hero/active: the composer footer is ONE DOM node in both
-		     states and always the LAST flex child — pinned to the true
-		     bottom; the hero→active switch never remounts it, so focus and
-		     the live draft survive the transition. In hero the single top
-		     spacer grows (flex:1) into the calm empty surface above the
-		     composer; on hero→active its flex-grow animates down to 0
-		     while the text background — header, viewport, notices —
-		     unfolds into the freed space (spacer CSS below). -->
-		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
+	<!-- CSP P1 / CHC H1: the composer footer is ONE DOM node in both
+	     states and always the LAST flex child — pinned to the true
+	     bottom; the hero→active switch never remounts it, so focus and
+	     the live draft survive the transition. The shell's card wraps
+	     this panel: in hero it hugs the composer alone (there is NO
+	     internal spacer, so the compact card never shows a tall empty
+	     region); in active the transcript chrome — header, viewport,
+	     notices — renders above the composer inside the full-height
+	     card, and the shell animates the card's growth (CHC H1). -->
 		{#if !isHero}
 		<header class="mai-session-chat__header">
 			<!-- Refresh continuity (R2-3): the id stays in the DOM for the E2E
@@ -1375,12 +1368,14 @@
 	.mai-session-chat {
 		display: flex;
 		flex-direction: column;
-		/* CSP P1: the panel fills its stretched host. The chain gives a
-		   DEFINITE height — the dock column is absolute top/bottom and
-		   .mai-desktop-shell__dock-body is flex:1/min-height:0 — so
-		   height:100% resolves and the transcript viewport stays the
-		   flex:1/min-height:0 scroll container virtua needs (the old
-		   min(32rem, …) cap from the retired dock envelope is gone). */
+		/* CSP P1 / CHC H1: in ACTIVE the panel fills the shell's blended
+		   card — the dock column is absolute top/bottom and the card
+		   (.mai-desktop-shell__dock-body) has the explicit height:100%
+		   the shell's WAAPI growth animates — so height:100% resolves
+		   (definite, per-frame during the growth) and the transcript
+		   viewport stays the flex:1/min-height:0 scroll container virtua
+		   needs. In HERO the panel is content-sized (below) so the card
+		   hugs ONLY the composer. */
 		height: 100%;
 		min-height: 0;
 		overflow: hidden;
@@ -1405,26 +1400,18 @@
 		--mai-tool-label-size: 0.8125rem;
 	}
 
-	/* ---- CSP P1: hero (create) vs active (session) layout -----------------
+	/* ---- CSP P1 / CHC H1: hero (create) vs active (session) layout -------
 	 * The composer footer is ONE DOM node in both states and always the
-	 * LAST flex child — pinned to the TRUE bottom edge. In hero the
-	 * single top spacer grows (flex 1 1 0) into the calm empty surface
-	 * above the composer; in active the transcript chrome — header,
-	 * viewport, notices — renders between the spacer and the composer
-	 * instead. The hero→active switch animates the spacer's flex-grow
-	 * (240ms ease) down to 0 so the text background unfolds to full
-	 * height while the composer stays at the bottom; reduced-motion
-	 * compiles the transition out entirely (class + matchMedia agree). */
-	.mai-session-chat__spacer {
-		flex: 0 1 0;
-		min-height: 0;
-		transition: none;
-	}
-	.mai-session-chat--hero .mai-session-chat__spacer {
-		flex: 1 1 0;
-	}
-	.mai-session-chat:not(.mai-session-chat--reduced-motion) .mai-session-chat__spacer {
-		transition: flex-grow 240ms ease;
+	 * LAST flex child — pinned to the TRUE bottom edge of the card. In
+	 * hero the panel is CONTENT-SIZED (no internal spacer exists), so
+	 * the shell's compact card holds only the composer; in active the
+	 * transcript chrome — header, viewport, notices — renders above the
+	 * composer inside the full-height card. The compact→full GROWTH is
+	 * the SHELL's WAAPI card animation (DesktopShell, ~240ms ease;
+	 * reduced-motion instant — tokens.css also compiles CSS transitions
+	 * out under reduce). */
+	.mai-session-chat--hero {
+		height: auto;
 	}
 	/* Hero composer: a bounded, horizontally centered prompt block pinned
 	 * at the bottom — no border against nothing, a touch more breathing
