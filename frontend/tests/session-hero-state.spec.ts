@@ -502,33 +502,41 @@ test.describe('hero → active transition', () => {
 			.poll(() => page.evaluate(() => window.__hero!.sessionId))
 			.toBe(CREATED_SESSION_ID);
 
-		// CHC H1: the GROWTH is a real WAAPI card animation (~240ms ease)
-		// whose height is INTERMEDIATE right after the flip — strictly
-		// between the compact hero height and the full column height.
-		// Two rAFs land ~1-2 frames into the 240ms window, before any
-		// assertion polling could eat the animation.
+		// CHC H1 (FV D1): the GROWTH is a real WAAPI card animation (240ms
+		// ease). Deterministic mid-growth proof: PAUSE the animation and
+		// SEEK it to a FIXED phase (60ms of 240 — CSS `ease` is ~35%
+		// progress there, maximally inside both bounds; pausing alone
+		// would still sample a machine-dependent phase, since `ease` is
+		// already ~72% progress by 100ms). The paused, seeked height is
+		// stable — strictly between the compact hero height and the full
+		// column height — and the animation is RESUMED afterwards.
 		const growth = await page.evaluate(async () => {
 			const card = document.querySelector('.chc-dock__card')!;
-			const firstFrame = Promise.withResolvers<void>();
-			requestAnimationFrame(() => firstFrame.resolve());
-			await firstFrame.promise;
-			const secondFrame = Promise.withResolvers<number>();
-			requestAnimationFrame(() =>
-				secondFrame.resolve(card.getBoundingClientRect().height)
-			);
-			const height = await secondFrame.promise;
+			// One rAF guarantees the WAAPI animation exists before pausing.
+			const frame = Promise.withResolvers<void>();
+			requestAnimationFrame(() => frame.resolve());
+			await frame.promise;
+			const animation = card.getAnimations()[0];
+			animation?.pause();
+			if (animation) animation.currentTime = 60;
 			return {
-				height,
-				timings: card
-					.getAnimations()
-					.map((animation) => animation.effect?.getTiming() ?? null)
+				height: card.getBoundingClientRect().height,
+				playState: animation?.playState ?? null,
+				currentTime: animation?.currentTime ?? null,
+				timing: animation?.effect?.getTiming() ?? null
 			};
 		});
-		expect(growth.timings.length).toBeGreaterThanOrEqual(1);
-		expect(growth.timings[0]?.duration).toBe(240);
-		expect(growth.timings[0]?.easing).toBe('ease');
+		expect(growth.playState).toBe('paused');
+		expect(growth.currentTime).toBe(60);
+		expect(growth.timing?.duration).toBe(240);
+		expect(growth.timing?.easing).toBe('ease');
 		expect(growth.height).toBeGreaterThan(heroGeo.card.height + 4);
 		expect(growth.height).toBeLessThan(heroGeo.dock.height - 200);
+		// Resume the paused growth so the settle assertions below watch
+		// the animation run out to the resting full-height card.
+		await page.evaluate(
+			() => document.querySelector('.chc-dock__card')!.getAnimations()[0]?.play()
+		);
 
 		// Same DOM node (marked), still holding focus; the draft was
 		// cleared by the submit exactly as before.
