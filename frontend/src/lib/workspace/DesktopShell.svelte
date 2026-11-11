@@ -792,8 +792,7 @@
 	});
 
 
-	/** Dock composer visibility: compact bar vs the full transcript dock. */
-	let dockCollapsed = $state(false);
+	/** The centered chat column root (focus target for chat intents). */
 	let dockEl: HTMLElement | null = null;
 	let drawerCollapsed = $state(false);
 
@@ -1101,10 +1100,9 @@
 		onCleanup: () => () => {}
 	});
 
-	/** `open-chat` focuses and expands the dock instead of a second window. */
+	/** `open-chat` focuses the column's composer instead of a second window. */
 	function focusChatDock(): void {
-		dockCollapsed = false;
-		status = 'Chat dock focused.';
+		status = 'Chat column focused.';
 		const compose = dockEl?.querySelector('textarea');
 		if (compose instanceof HTMLTextAreaElement) compose.focus();
 	}
@@ -1563,36 +1561,21 @@
 		{/each}
 	</div>
 
-	<!-- The Always-Visible Bottom Chat Dock: SessionChatPanel lives here
+	<!-- The Centered Chat Column (CCC S1): SessionChatPanel lives here
 	     persistently — never a registry window (no data-panel-kind, no
-	     workspace state). Collapsing hides the body visually so the mounted
-	     panel (and its draft) survives; the fixture desktop drives it with
-	     the unwired bag and performs zero API requests. -->
+	     workspace state). The column is centered in the stage, stretched
+	     between the stage paddings, and width-bounded so the spatial
+	     canvas stays visible on both sides; opened windows keep stacking
+	     above it. The fixture desktop drives it with the unwired bag and
+	     performs zero API requests. -->
 	<section
 		class="mai-desktop-shell__dock"
-		class:mai-desktop-shell__dock--collapsed={dockCollapsed}
 		data-testid="bottom-chat-dock"
-		aria-label="Chat dock"
+		aria-label="Chat column"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-chrome">
-			<!-- The ONE dock disclosure control (moved out of the deleted
-			     legacy ChatPanel at D09): collapsing hides the dock body so the
-			     mounted panel (and its drafts) survive untouched. -->
-			<button
-				type="button"
-				class="mai-desktop-shell__dock-toggle"
-				data-testid="bottom-chat-dock-toggle"
-				aria-expanded={!dockCollapsed}
-				aria-label={dockCollapsed ? 'Expand chat dock' : 'Collapse chat dock'}
-				aria-controls="mai-bottom-chat-dock-body"
-				onclick={() => (dockCollapsed = !dockCollapsed)}
-			>
-				{dockCollapsed ? 'Chat dock ▲' : 'Chat dock ▼'}
-			</button>
-		</div>
-		<div class="mai-desktop-shell__dock-body" id="mai-bottom-chat-dock-body">
-			<!-- D09: the session-first virtualized surface is THE dock; the
+		<div class="mai-desktop-shell__dock-body">
+			<!-- D09: the session-first virtualized surface is THE column; the
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
 			     live session the panel renders its honest empty/create state;
 			     offline it fails closed on the unwired bag. -->
@@ -1728,11 +1711,11 @@
 	}
 
 	/* Transparent spatial line-grid canvas: no solid/overlay fill; only
-	   floating windows, the SideDrawer, and the Chat Dock render solid.
-	   `z-index: 20` places the window canvas ABOVE the bottom chat dock
-	   (`z-index: 5`) so opened windows always render on top of the chat dock,
-	   while `pointer-events: none` on the empty canvas lets clicks on empty
-	   space pass through to the chat dock underneath. */
+	   floating windows, the SideDrawer, and the Chat Column render solid.
+	   `z-index: 20` places the window canvas ABOVE the centered chat
+	   column (`z-index: 5`) so opened windows always render on top of it,
+	   while `pointer-events: none` on the empty canvas lets clicks on
+	   empty space pass through to the column underneath. */
 	.mai-desktop-shell__desktop {
 		position: relative;
 		z-index: 20;
@@ -1748,80 +1731,47 @@
 		pointer-events: auto;
 	}
 
-	/* Odyssey-Style Floating Center-Bottom Chat Pill: floats above the bottom
-	   of the spatial canvas without pushing the document height. Kept at a
-	   lower stacking level (`z-index: 5`) than `.mai-desktop-shell__desktop`
-	   (`z-index: 20`) so opened workspace windows always stack in front of
-	   the chat dock instead of being hidden behind it. */
+	/* The Centered Chat Column (CCC S1): absolutely centered in the stage
+	   and stretched between its paddings — out of flow, so the spatial
+	   canvas keeps its geometry and opened windows keep stacking ABOVE
+	   the column (`z-index: 5` under the canvas's `z-index: 20`).
+	   Restrained solid Mechanicus surface: no glass, no backdrop blur.
+	   The width is DETERMINISTIC, never content-driven, and bounded so
+	   the canvas stays visible on both sides; the page-padding floor
+	   keeps the column inside the stage at every width. */
 	.mai-desktop-shell__dock {
 		position: absolute;
-		bottom: var(--mai-space-2);
-		/* Right-anchored HUD: the dock hugs the shell's right edge instead of
-		 * deriving its OFFSET from the stage width (R-24c: the offset math
-		 * pushed a crushed 48px dock to the viewport's right edge). The WIDTH
-		 * stays stage-relative on purpose: the pocket overlay drawer (see
-		 * SideDrawer) keeps the stage at full shell width when expanded, and
-		 * a collapsed in-flow rail makes the dock yield to the rail. */
-		left: auto;
-		right: var(--mai-space-3);
-		transform: none;
-		width: min(860px, calc(100% - 2 * var(--mai-space-4)));
+		top: var(--mai-space-2);
+		bottom: var(--mai-space-3);
+		left: 0;
+		right: 0;
+		margin-inline: auto;
+		width: min(880px, 72%, calc(100% - 2 * var(--mai-space-3)));
+		min-height: 0;
 		z-index: 5;
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-space-1);
 		padding: var(--mai-hud-pad-y) var(--mai-hud-pad-x);
-		background: var(--mai-surface-glass, var(--mai-color-surface));
-		backdrop-filter: var(--mai-blur-glass);
-		-webkit-backdrop-filter: var(--mai-blur-glass);
+		background: var(--mai-color-surface-raised);
 		border: var(--mai-border-width) solid var(--mai-color-border-strong);
 		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
 		box-shadow: var(--mai-shadow-float);
 	}
 
-	/* Minimized spotlight pill: collapsed, the dock shrinks from the wide
-	   composer slab to a slim floating pill on the same anchor. The width is
-	   DETERMINISTIC, not content-driven: nested percentage/flex chains
-	   contribute ~0 during intrinsic sizing, so `width: auto` collapsed to a
-	   30px sliver whose controls painted far beyond it (R-24c), and the live
-	   timer would jitter the width every second. A fixed slim cap keeps one
-	   stable row at 1280 and 360; the launcher label ellipsizes instead of
-	   widening the pill, and `overflow: hidden` clips so no control can ever
-	   paint outside the border or the viewport. */
-	.mai-desktop-shell__dock--collapsed {
-		width: min(420px, calc(100% - 2 * var(--mai-space-4)));
-		border-radius: 999px;
-		padding: 6px 14px;
-		overflow: hidden;
+	/* Pocket viewports (CCC S1): the bounded column yields its side
+	   margins and becomes the stage minus the page padding — the chat
+	   owns the stage instead of a crushed sliver beside it. */
+	@media (max-width: 720px) {
+		.mai-desktop-shell__dock {
+			width: calc(100% - 2 * var(--mai-space-3));
+		}
 	}
 
 	.mai-desktop-shell__dock-body {
-		overflow: visible;
+		flex: 1 1 auto;
+		min-height: 0;
 		min-width: 0;
-	}
-
-	.mai-desktop-shell__dock-chrome {
-		display: flex;
-		justify-content: flex-end;
-		padding: var(--mai-space-1) var(--mai-space-2) 0;
-	}
-
-	.mai-desktop-shell__dock-toggle {
-		font: inherit;
-		font-size: 12px;
-		line-height: 1;
-		padding: 4px 10px;
-		border-radius: 999px;
-		border: 1px solid var(--mai-border, transparent);
-		background: var(--mai-surface, transparent);
-		color: inherit;
-		cursor: pointer;
-	}
-
-	/* Collapsed: the body is visually hidden (the mounted panel and its
-	   drafts survive) and the chrome row is the only painted surface. */
-	.mai-desktop-shell__dock--collapsed .mai-desktop-shell__dock-body {
-		display: none;
+		overflow: visible;
 	}
 
 	.mai-desktop-shell__taskbar {
