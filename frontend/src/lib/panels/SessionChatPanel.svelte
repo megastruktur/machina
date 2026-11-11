@@ -98,6 +98,16 @@
 		 * `run_state` entry arrives (server truth always wins).
 		 */
 		optimisticRunState?: TurnRunState | null;
+		/**
+		 * CCC S3: the shell's VISIBLE server selection — the SAME state the
+		 * HUD selector and the server tree use. Drives the hero strip's
+		 * interactive server chip; read-only scope in active comes from the
+		 * session's OWN stored detail instead.
+		 */
+		selectedServerId?: string | null;
+		/** The shell-side selection write-back (persists + reloads the draft
+		 * service options through the shell's existing effects). */
+		onserverchange?: (serverId: string) => void;
 	};
 
 	let {
@@ -112,7 +122,9 @@
 		onloadolder = () => {},
 		onsessionopened = () => {},
 		onturnsubmitted = () => {},
-		optimisticRunState = null
+		optimisticRunState = null,
+		selectedServerId = null,
+		onserverchange = () => {}
 	}: Props = $props();
 
 	/** Narrow the session API slice (fail closed like every panel). */
@@ -236,6 +248,44 @@
 	let submitProblem = $state<{ code: string; message: string } | null>(null);
 	let controlBusy = $state<string | null>(null);
 	let controlProblem = $state<{ code: string; message: string } | null>(null);
+
+	// --- CCC S2: hero (create) vs active layout ------------------------------
+	/** Hero = no session yet: ONLY the centered composer (picker + textarea
+	 * + Send). Everything transcript-ish is active-state chrome. */
+	const isHero = $derived(sessionId === null);
+
+	/** Honest motion budget: reduced-motion users get instant layout
+	 * switches — the spacer flex transition is compiled out via class. */
+	let motionReduced = $state(false);
+	$effect(() => {
+		motionReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+	});
+
+	/** CCC S2: the composer auto-grows with its text — a 2-row baseline, a
+	 * ~6-row cap, internal scroll beyond (manual resize is gone). */
+	let composerInputEl: HTMLTextAreaElement | null = $state(null);
+	const COMPOSER_BASE_ROWS = 2;
+	const COMPOSER_MAX_ROWS = 6;
+	function fitComposer(): void {
+		const el = composerInputEl;
+		if (el === null) return;
+		el.style.height = 'auto';
+		const style = getComputedStyle(el);
+		const lineHeight = parseFloat(style.lineHeight);
+		const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+		const unit = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : 12;
+		const min = unit * COMPOSER_BASE_ROWS + padY;
+		const max = unit * COMPOSER_MAX_ROWS + padY;
+		el.style.height = `${Math.min(Math.max(el.scrollHeight, min), max)}px`;
+		el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+	}
+	$effect(() => {
+		// Text changes re-fit; the hero→active switch changes the composer's
+		// width (max-width), so re-fit on it too.
+		void composerText;
+		void isHero;
+		fitComposer();
+	});
 
 	/** Build the optimistic committed-view `user_message` entry (S3). */
 	function optimisticUserEntry(
@@ -733,34 +783,59 @@
 	}
 </script>
 
-<div class="mai-session-chat" data-testid="session-chat-panel">
+<div
+	class="mai-session-chat"
+	class:mai-session-chat--hero={isHero}
+	class:mai-session-chat--reduced-motion={motionReduced}
+	data-state={isHero ? 'hero' : 'active'}
+	data-testid="session-chat-panel"
+>
 	{#if !usable}
 		<div class="mai-session-chat__state" role="alert" data-testid="session-config-error">
 			<p>This panel was opened without its session services.</p>
 		</div>
 	{:else}
+
+		<!-- CCC S2 hero/active: the composer footer is ONE DOM node in both
+		     states — the hero→active switch never remounts it, so focus and
+		     the live draft survive the transition. The two spacers grow to
+		     center the composer in hero and collapse (animated flex-grow)
+		     while the active chrome — header, viewport, notices — takes
+		     their place. -->
+		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
+		{#if !isHero}
 		<header class="mai-session-chat__header">
 			<!-- Refresh continuity (R2-3): the id stays in the DOM for the E2E
 			     assertions, visually silent — the chat is the surface now. -->
 			<span class="mai-session-chat__id" data-testid="session-header-id">
 				{sessionId === null ? 'new session' : `session ${sessionId.slice(0, 8)}…`}
 			</span>
+		<!-- CCC S3: the unified scope strip — READ-ONLY in active, rendered
+		     from the session's OWN stored detail (SCOPE-3: never the
+		     drawer's selection, never a borrowed label). The chips keep
+		     their S2 testids; the strip slots carry the strip testids. -->
+		<div class="mai-scope-strip" data-testid="chat-scope-strip">
 			{#if serverChip !== null}
-				<span class="mai-session-chat__scope" data-testid="session-header-server">
-					{serverChip}
+				<span class="mai-scope-strip__slot" data-testid="chat-scope-server" title={serverChip}>
+					<span class="mai-session-chat__scope" data-testid="session-header-server">
+						{serverChip}
+					</span>
 				</span>
 			{/if}
 			{#if serviceChip !== null}
-				<span
-					class="mai-session-chat__scope"
-					data-testid="session-header-service"
-					title={serviceChip.endsWith('(unavailable)')
-						? 'The linked service map entry is unavailable.'
-						: undefined}
-				>
-					{serviceChip}
+				<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
+					<span
+						class="mai-session-chat__scope"
+						data-testid="session-header-service"
+						title={serviceChip.endsWith('(unavailable)')
+							? 'The linked service map entry is unavailable.'
+							: serviceChip}
+					>
+						{serviceChip}
+					</span>
 				</span>
 			{/if}
+		</div>
 			{#if channelState === 'resync'}
 				<span class="mai-session-chat__resync" role="status" data-testid="session-resync-note">
 					resync — reconciling with the server
@@ -1117,8 +1192,12 @@
 				{noticeLabel}
 			</p>
 		{/if}
+		{/if}
 
-		<footer class="mai-session-chat__composer">
+		<footer
+			class="mai-session-chat__composer"
+			class:mai-session-chat__composer--hero={isHero}
+		>
 			{#if submitProblem !== null}
 				<p class="mai-session-chat__problem" role="alert" data-testid="session-submit-error">
 					{submitProblem.code}: {submitProblem.message}
@@ -1129,65 +1208,102 @@
 					{controlProblem.code}: {controlProblem.message}
 				</p>
 			{/if}
-			{#if sessionId === null}
-				<!-- SCOPE-3: the @service picker exists ONLY for a NEW session —
-				     an existing session's linked chip (header) is read-only and
-				     can never be rebound through the composer. -->
-				<div class="mai-session-chat__service-row" data-testid="session-service-picker">
-					{#if servicesLoading}
-						<span
-							class="mai-session-chat__service-state"
-							data-testid="session-services-loading"
-						>
-							Loading services…
-						</span>
-					{:else if servicesError !== null}
-						<span
-							class="mai-session-chat__service-state"
-							role="alert"
-							data-testid="session-services-error"
-						>
-							Services unavailable: {servicesError}
-						</span>
-					{:else if serviceOptions.length === 0}
-						<span
-							class="mai-session-chat__service-state"
-							data-testid="session-services-empty"
-						>
-							No adopted services on this server.
-						</span>
-					{:else}
-						<label class="mai-session-chat__service-label">
-							@service
+		{#if isHero}
+			<!-- CCC S3: the unified scope strip — INTERACTIVE in hero. The
+			     server chip selects the shell's VISIBLE selection (the same
+			     state the HUD/tree use, written back through onserverchange);
+			     the service chip is the draft @service picker (SCOPE-3:
+			     committed at CREATE only, honest loading/empty/error/Load
+			     more preserved). -->
+			<div class="mai-scope-strip" data-testid="chat-scope-strip">
+				<span class="mai-scope-strip__slot" data-testid="chat-scope-server">
+					{#if serverOptionsList.length > 0}
+						<label class="mai-scope-strip__label" title="Server scope for the new session">
+							<span aria-hidden="true">⚙</span>
 							<select
-								class="mai-session-chat__service-select"
-								data-testid="session-service-select"
-								bind:value={selectedServiceId}
-								disabled={submitting}
+								class="mai-scope-strip__select"
+								data-testid="chat-scope-server-select"
+								value={selectedServerId ?? ''}
+								onchange={(event) => onserverchange(event.currentTarget.value)}
 							>
-								<option value="">— none —</option>
-								{#each serviceOptions as option (option.application_id)}
-									<option value={option.application_id}>
-										{option.name}{option.category ? ` · ${option.category}` : ''}
-									</option>
+								{#each serverOptionsList as option (option.id)}
+									<option value={option.id}>{option.label}</option>
 								{/each}
 							</select>
 						</label>
-						{#if servicesHasMore}
-							<Button
-								variant="secondary"
-								size="sm"
-								tabindex={0}
-								loading={servicesLoading}
-								data-testid="session-services-load-more"
-								onclick={() => loadMoreServices()}
-							>
-								Load more
-							</Button>
-						{/if}
+					{:else}
+						<!-- No enrolled options: the honest static chip (never a
+						     fabricated interactive choice). -->
+						<span
+							class="mai-session-chat__scope"
+							title={selectedServerId === null ? 'No server selected' : selectedServerId}
+						>
+							⚙ {selectedServerId === null
+								? 'no server'
+								: selectedServerId === GLOBAL_CONSULT_SERVER_ID
+									? 'General Consult'
+									: `Server: ${selectedServerId.slice(0, 8)}…`}
+						</span>
 					{/if}
-				</div>
-			{/if}
+				</span>
+				<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
+					<div class="mai-session-chat__service-row" data-testid="session-service-picker">
+						{#if servicesLoading}
+							<span
+								class="mai-session-chat__service-state"
+								data-testid="session-services-loading"
+							>
+								Loading services…
+							</span>
+						{:else if servicesError !== null}
+							<span
+								class="mai-session-chat__service-state"
+								role="alert"
+								data-testid="session-services-error"
+							>
+								Services unavailable: {servicesError}
+							</span>
+						{:else if serviceOptions.length === 0}
+							<span
+								class="mai-session-chat__service-state"
+								data-testid="session-services-empty"
+							>
+								No adopted services on this server.
+							</span>
+						{:else}
+							<label class="mai-session-chat__service-label">
+								@service
+								<select
+									class="mai-session-chat__service-select"
+									data-testid="session-service-select"
+									bind:value={selectedServiceId}
+									disabled={submitting}
+								>
+									<option value="">— none —</option>
+									{#each serviceOptions as option (option.application_id)}
+										<option value={option.application_id}>
+											{option.name}{option.category ? ` · ${option.category}` : ''}
+										</option>
+									{/each}
+								</select>
+							</label>
+							{#if servicesHasMore}
+								<Button
+									variant="secondary"
+									size="sm"
+									tabindex={0}
+									loading={servicesLoading}
+									data-testid="session-services-load-more"
+									onclick={() => loadMoreServices()}
+								>
+									Load more
+								</Button>
+							{/if}
+						{/if}
+					</div>
+				</span>
+			</div>
+		{/if}
 			<div class="mai-session-chat__composer-row">
 				<textarea
 					class="mai-session-chat__input"
@@ -1196,9 +1312,9 @@
 						? 'Describe the task — a session is created on submit'
 						: 'Admit a turn to the visible session'}
 					bind:value={composerText}
+					bind:this={composerInputEl}
 					onkeydown={onComposerKeydown}
 					rows="2"
-					disabled={submitting}
 				></textarea>
 				<Button
 					variant="primary"
@@ -1211,42 +1327,45 @@
 					Send
 				</Button>
 			</div>
-			<div class="mai-session-chat__controls">
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || composerText.trim() === '' || controlBusy !== null}
-					loading={controlBusy === 'steer'}
-					data-testid="session-control-steer"
-					onclick={() => void runControl('steer')}
-				>
-					Steer
-				</Button>
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || controlBusy !== null}
-					loading={controlBusy === 'pause'}
-					data-testid="session-control-pause"
-					onclick={() => void runControl('pause')}
-				>
-					Pause
-				</Button>
-				<Button
-					variant="secondary"
-					size="sm"
-					tabindex={0}
-					disabled={sessionId === null || controlBusy !== null}
-					loading={controlBusy === 'cancel'}
-					data-testid="session-control-cancel"
-					onclick={() => void runControl('cancel')}
-				>
-					Cancel
-				</Button>
-			</div>
+			{#if !isHero}
+				<div class="mai-session-chat__controls">
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || composerText.trim() === '' || controlBusy !== null}
+						loading={controlBusy === 'steer'}
+						data-testid="session-control-steer"
+						onclick={() => void runControl('steer')}
+					>
+						Steer
+					</Button>
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || controlBusy !== null}
+						loading={controlBusy === 'pause'}
+						data-testid="session-control-pause"
+						onclick={() => void runControl('pause')}
+					>
+						Pause
+					</Button>
+					<Button
+						variant="secondary"
+						size="sm"
+						tabindex={0}
+						disabled={sessionId === null || controlBusy !== null}
+						loading={controlBusy === 'cancel'}
+						data-testid="session-control-cancel"
+						onclick={() => void runControl('cancel')}
+					>
+						Cancel
+					</Button>
+				</div>
+			{/if}
 		</footer>
+		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
 	{/if}
 </div>
 
@@ -1280,6 +1399,97 @@
 		--mai-call-gap: 4px;
 		--mai-session-rhythm: 12px;
 		--mai-tool-label-size: 0.8125rem;
+	}
+
+	/* ---- CCC S2: hero (create) vs active (session) layout ----------------
+	 * The composer footer is ONE DOM node in both states. In hero the two
+	 * spacers grow (flex 1 1 0) and center it vertically; the active
+	 * chrome — header, viewport, notices — renders between the collapsed
+	 * spacers instead. The hero→active switch animates the spacers'
+	 * flex-grow (240ms) so the composer slides to the bottom while the
+	 * transcript expands into the freed space; reduced-motion compiles
+	 * the transition out entirely (class + matchMedia agree). */
+	.mai-session-chat__spacer {
+		flex: 0 1 0;
+		min-height: 0;
+		transition: none;
+	}
+	.mai-session-chat--hero .mai-session-chat__spacer {
+		flex: 1 1 0;
+	}
+	.mai-session-chat:not(.mai-session-chat--reduced-motion) .mai-session-chat__spacer {
+		transition: flex-grow 240ms ease;
+	}
+	/* Hero composer: a bounded, centered prompt block — no border against
+	 * nothing, a touch more breathing room than the active footer. */
+	.mai-session-chat--hero .mai-session-chat__composer {
+		width: 100%;
+		max-width: 640px;
+		margin-inline: auto;
+		border-top-color: transparent;
+		padding: 10px 12px;
+	}
+
+	/* ---- CCC S3: the unified scope strip -----------------------------------
+	 * Mechanicus-minimal: mono-adjacent small text, the existing chip pill
+	 * (brass border token), ⚙ sigil for the server slot, @ for service.
+	 * Desktop wraps; pocket viewports (≤720px) hold ONE row — the service
+	 * slot yields first, ellipsized, with the full text on the title
+	 * tooltip. No glass anywhere. */
+	.mai-scope-strip {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		align-items: center;
+		min-width: 0;
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.75rem;
+	}
+	.mai-scope-strip__slot {
+		display: inline-flex;
+		align-items: center;
+		min-width: 0;
+	}
+	.mai-scope-strip__slot--service {
+		flex: 0 1 auto;
+	}
+	.mai-scope-strip__label {
+		display: inline-flex;
+		gap: 4px;
+		align-items: center;
+		min-width: 0;
+	}
+	.mai-scope-strip__select {
+		max-width: 100%;
+		min-width: 0;
+		font: inherit;
+	}
+	@media (max-width: 720px) {
+		.mai-scope-strip {
+			flex-wrap: nowrap;
+			overflow: hidden;
+		}
+		.mai-scope-strip__slot {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		/* The server slot keeps a bounded share; the service slot takes the
+		 * remainder and truncates FIRST. */
+		.mai-scope-strip__slot:not(.mai-scope-strip__slot--service) {
+			flex: 0 0 auto;
+			max-width: 60%;
+		}
+		.mai-scope-strip__slot--service {
+			flex: 1 1 auto;
+		}
+		.mai-scope-strip__slot .mai-session-chat__scope,
+		.mai-scope-strip__slot .mai-session-chat__service-label,
+		.mai-scope-strip__slot .mai-session-chat__service-row {
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
 	}
 	.mai-session-chat__header {
 		display: flex;
@@ -1690,7 +1900,10 @@
 	.mai-session-chat__input {
 		flex: 1 1 auto;
 		min-width: 0;
-		resize: vertical;
+		/* CCC S2: auto-grow (2-row baseline → ~6-row cap, see fitComposer)
+		   replaces the manual resize handle; overflow flips on past the cap. */
+		resize: none;
+		overflow-y: hidden;
 		font: inherit;
 	}
 	.mai-session-chat__controls {

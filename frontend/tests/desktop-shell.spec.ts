@@ -740,128 +740,118 @@ test('live jobs panel resolves the pinned server name through the real compositi
 	expect(profileReads).toBeGreaterThanOrEqual(1);
 });
 
-test('the bottom chat dock is always visible, honest offline, and performs no API requests', async ({
+test('the chat column is always visible, honest offline, and performs no API requests', async ({
 	page
 }) => {
 	const urls: string[] = [];
 	page.on('request', (request) => urls.push(request.url()));
 
 	await page.goto('/');
-	const dock = page.getByTestId('bottom-chat-dock');
-	await expect(dock).toBeVisible();
-	// The dock is NOT a registry window: no panel kind, no window frame.
-	expect(await dock.getAttribute('data-panel-kind')).toBeNull();
-	await expect(dock.locator('.mai-window-frame')).toHaveCount(0);
+	const column = page.getByTestId('bottom-chat-dock');
+	await expect(column).toBeVisible();
+	// The column is NOT a registry window: no panel kind, no window frame.
+	expect(await column.getAttribute('data-panel-kind')).toBeNull();
+	await expect(column.locator('.mai-window-frame')).toHaveCount(0);
 	await expect(frame(page, 'chat')).toHaveCount(0);
 
-	// D09: the session panel IS the dock. Offline the service bag carries
+	// D09: the session panel IS the column. Offline the service bag carries
 	// no session methods, so the panel's structural narrowing fails closed
 	// with the honest alert — never a fabricated composer or transcript.
-	await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
-	await expect(dock.getByTestId('session-config-error')).toBeVisible();
-
-	// The dock disclosure lives in the dock chrome now (moved out of the
-	// deleted ChatPanel): collapsing hides the body; the mounted panel
-	// survives, so re-expanding shows the SAME honest state.
-	const launcher = dock.getByTestId('bottom-chat-dock-toggle');
-	await expect(launcher).toHaveAttribute('aria-expanded', 'true');
-	await launcher.click();
-	await expect(dock).toBeVisible();
-	await expect(dock.getByTestId('session-chat-panel')).toBeHidden();
-	await expect(launcher).toHaveAttribute('aria-expanded', 'false');
-	await launcher.click();
-	await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
-
-	// The drawer's New Chat focuses the dock without any effect offline.
+	await expect(column.getByTestId('session-chat-panel')).toBeVisible();
+	await expect(column.getByTestId('session-config-error')).toBeVisible();
+	// The drawer's New Chat focuses the column without any effect offline.
 	await page.getByTestId('drawer-new-chat').click();
-	await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
+	await expect(column.getByTestId('session-chat-panel')).toBeVisible();
 
 	expect(urls.filter((url) => url.includes('/api'))).toEqual([]);
 });
 
 for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) {
-	test(`offline dock ${viewport.width}: honest panel, contained, no overflow`, async ({page}) => {
+	test(`offline chat column ${viewport.width}: honest panel, centered, stretched, contained`, async ({page}) => {
 		await page.setViewportSize(viewport);
 		const requests: string[] = [];
 		page.on('request', r => requests.push(r.url()));
 		await page.goto('/');
 		// Existing user-controlled shell navigation, not a geometry override.
 		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
-		const dock = page.getByTestId('bottom-chat-dock');
+		const column = page.getByTestId('bottom-chat-dock');
 		// The session panel renders its honest unwired state offline (D09:
 		// the legacy in-memory composer is deleted, composer reachability at
 		// both viewports is proven against the REAL backend by the
 		// session-virtual-history suite).
-		await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
-		await expect(dock.getByTestId('session-config-error')).toBeVisible();
-		for (const id of ['bottom-chat-dock-toggle', 'session-chat-panel']) {
-			const box = await dock.getByTestId(id).boundingBox();
-			expect(box, id).not.toBeNull();
-			expect(box!.y, `${id} top`).toBeGreaterThanOrEqual(0);
-			expect(box!.y + box!.height, `${id} bottom`).toBeLessThanOrEqual(viewport.height);
-			expect(box!.x + box!.width, `${id} right`).toBeLessThanOrEqual(viewport.width);
-		}
-		expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
-		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
-	});
-	test(`collapsed dock ${viewport.width}: one launcher row, contained, restores panel on expand`, async ({page}) => {
-		await page.setViewportSize(viewport);
-		const requests: string[] = [];
-		page.on('request', r => requests.push(r.url()));
-		await page.goto('/');
-		// Existing user-controlled shell navigation, not a geometry override.
-		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
-		const dock = page.getByTestId('bottom-chat-dock');
-		await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
+		await expect(column.getByTestId('session-chat-panel')).toBeVisible();
+		await expect(column.getByTestId('session-config-error')).toBeVisible();
 
-		await dock.getByTestId('bottom-chat-dock-toggle').click();
-		await expect(dock.getByTestId('session-chat-panel')).toBeHidden();
-
-		// ONE restore control with an honest disclosure name; nothing else
-		// is clickable inside the collapsed dock.
-		const launcher = dock.getByTestId('bottom-chat-dock-toggle');
-		await expect(launcher).toHaveCount(1);
-		await expect(dock.locator('button:visible')).toHaveCount(1);
-		await expect(launcher).toHaveAttribute('aria-expanded', 'false');
-		await expect(launcher).toHaveAttribute('aria-label', 'Expand chat dock');
-
-		// Geometry: a slim single-row pill, every painted element inside the
-		// dock border and inside the viewport.
+		// Geometry (CCC S1): the column is centered in the stage, its width
+		// bounded, and its height stretched between the stage paddings.
 		const geo = await page.evaluate(() => {
-			const dockEl = document.querySelector('[data-testid="bottom-chat-dock"]')!;
-			const dr = dockEl.getBoundingClientRect();
-			const boxes = [...dockEl.querySelectorAll('*')]
-				.filter((el) => el.getClientRects().length > 0)
-				.map((el) => {
-					const r = el.getBoundingClientRect();
-					return { x: r.x, y: r.y, right: r.right, bottom: r.bottom };
-				});
-			const doc = document.documentElement;
+			const stage = document.querySelector('[data-testid="desktop"]')!.parentElement!;
+			const columnEl = document.querySelector('[data-testid="bottom-chat-dock"]')!;
+			const sr = stage.getBoundingClientRect();
+			const cr = columnEl.getBoundingClientRect();
+			const sc = getComputedStyle(stage);
 			return {
-				dock: { x: dr.x, y: dr.y, right: dr.right, bottom: dr.bottom, h: dr.height },
-				boxes,
-				scrollW: doc.scrollWidth,
-				vw: doc.clientWidth,
-				vh: doc.clientHeight
+				stage: {
+					x: sr.x,
+					y: sr.y,
+					width: sr.width,
+					height: sr.height,
+					padTop: parseFloat(sc.paddingTop),
+					padBottom: parseFloat(sc.paddingBottom),
+					padSide: parseFloat(sc.paddingLeft)
+				},
+				column: {
+					x: cr.x,
+					y: cr.y,
+					right: cr.right,
+					bottom: cr.bottom,
+					width: cr.width,
+					height: cr.height
+				},
+				scrollW: document.documentElement.scrollWidth
 			};
 		});
-		expect(geo.boxes.length).toBeGreaterThan(0);
-		for (const b of geo.boxes) {
-			expect(b.right).toBeLessThanOrEqual(geo.vw);
-			expect(b.x).toBeGreaterThanOrEqual(0);
-			expect(b.bottom).toBeLessThanOrEqual(geo.vh);
-			expect(b.y).toBeGreaterThanOrEqual(0);
-			expect(b.right, 'within dock right edge').toBeLessThanOrEqual(geo.dock.right + 1);
-			expect(b.bottom, 'within dock bottom edge').toBeLessThanOrEqual(geo.dock.bottom + 1);
-			expect(b.x, 'within dock left edge').toBeGreaterThanOrEqual(geo.dock.x - 1);
-			expect(b.y, 'within dock top edge').toBeGreaterThanOrEqual(geo.dock.y - 1);
-		}
-		expect(geo.scrollW).toBeLessThanOrEqual(viewport.width);
 
-		// Expansion restores the SAME honest panel untouched.
-		await launcher.click();
-		await expect(dock.getByTestId('session-chat-panel')).toBeVisible();
-		await expect(dock.getByTestId('session-config-error')).toBeVisible();
+		// Centered: the column's horizontal center matches the stage's
+		// (the stage, not the viewport — the drawer rail offsets the stage).
+		const columnCenter = geo.column.x + geo.column.width / 2;
+		const stageCenter = geo.stage.x + geo.stage.width / 2;
+		expect(Math.abs(columnCenter - stageCenter), 'column centered in stage').toBeLessThanOrEqual(1);
+
+		// Width bounded (CCC S1): strictly narrower than the stage — canvas
+		// visible on both sides — capped at 880px at desktop width; on
+		// pocket viewports the column is the stage minus page padding.
+		expect(geo.column.width).toBeLessThan(geo.stage.width);
+		if (viewport.width === 1280) {
+			expect(geo.column.width).toBeLessThanOrEqual(880);
+		} else {
+			expect(
+				Math.abs(geo.column.width - (geo.stage.width - 2 * geo.stage.padSide)),
+				'pocket width = stage minus page padding'
+			).toBeLessThanOrEqual(1);
+		}
+
+		// Height stretched between the stage paddings (top → bottom page
+		// padding): the column fills the available stage height exactly.
+		expect(
+			Math.abs(geo.column.y - (geo.stage.y + geo.stage.padTop)),
+			'column top at stage content top'
+		).toBeLessThanOrEqual(1);
+		expect(
+			Math.abs(geo.column.height - (geo.stage.height - geo.stage.padTop - geo.stage.padBottom)),
+			'column fills stage height minus paddings'
+		).toBeLessThanOrEqual(1);
+
+		// Contained: nothing paints outside the viewport and no horizontal
+		// page overflow at either viewport.
+		const panelBox = await column.getByTestId('session-chat-panel').boundingBox();
+		expect(panelBox).not.toBeNull();
+		expect(panelBox!.y).toBeGreaterThanOrEqual(0);
+		expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(viewport.height);
+		expect(panelBox!.x + panelBox!.width).toBeLessThanOrEqual(viewport.width);
+		expect(geo.column.right).toBeLessThanOrEqual(viewport.width);
+		expect(geo.column.bottom).toBeLessThanOrEqual(viewport.height);
+		expect(geo.scrollW).toBeLessThanOrEqual(viewport.width);
 		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
 	});
 }
@@ -881,20 +871,20 @@ test('drawer Chat History is honestly empty offline (no fabricated rows)', async
 	await expect(drawerSection.getByTestId('drawer-history-load-more')).toHaveCount(0);
 });
 
-test('opened windows stack ABOVE the bottom chat dock and unauthorized live session redirects to /login', async ({
+test('opened windows stack ABOVE the centered chat column and unauthorized live session redirects to /login', async ({
 	page
 }) => {
 	await page.setViewportSize({ width: 1280, height: 800 });
 	await page.goto('/');
 
-	const dock = page.getByTestId('bottom-chat-dock');
+	const column = page.getByTestId('bottom-chat-dock');
 	await openPanel(page, NOTES);
 	const notes = frame(page, NOTES);
 
-	// The desktop canvas (`z-index: 20`) sits above the bottom chat dock
-	// (`z-index: 5`), so any opened window renders on top of the chat dock,
-	// while empty canvas space has `pointer-events: none` so the dock stays
-	// interactive underneath.
+	// The desktop canvas (`z-index: 20`) sits above the centered chat
+	// column (`z-index: 5`), so any opened window renders on top of the
+	// column, while empty canvas space has `pointer-events: none` so the
+	// column stays interactive underneath.
 	const stacking = await page.evaluate(() => {
 		const desktopEl = document.querySelector('[data-testid="desktop"]');
 		const dockEl = document.querySelector('[data-testid="bottom-chat-dock"]');
@@ -910,23 +900,24 @@ test('opened windows stack ABOVE the bottom chat dock and unauthorized live sess
 	expect(stacking.desktopPointer).toBe('none');
 	expect(stacking.framePointer).toBe('auto');
 
-	// Drag the window directly over the bottom chat dock and verify hit-testing
-	// lands inside the window frame rather than being covered by the chat dock.
-	const dockBox = await dock.boundingBox();
+	// Drag the window directly over the centered chat column and verify
+	// hit-testing lands inside the window frame rather than being covered
+	// by the column.
+	const columnBox = await column.boundingBox();
 	const bar = notes.locator('.mai-window-frame__titlebar');
 	const barBox = await bar.boundingBox();
-	expect(dockBox).not.toBeNull();
+	expect(columnBox).not.toBeNull();
 	expect(barBox).not.toBeNull();
 
 	await page.mouse.move(barBox!.x + barBox!.width / 2, barBox!.y + barBox!.height / 2);
 	await page.mouse.down();
-	await page.mouse.move(dockBox!.x + dockBox!.width / 2, dockBox!.y + 20, { steps: 5 });
+	await page.mouse.move(columnBox!.x + columnBox!.width / 2, columnBox!.y + 20, { steps: 5 });
 	await page.mouse.up();
 
 	const updatedBox = await notes.boundingBox();
 	expect(updatedBox).not.toBeNull();
-	const overlapX = Math.max(updatedBox!.x, dockBox!.x) + 40;
-	const overlapY = Math.max(updatedBox!.y, dockBox!.y) + 20;
+	const overlapX = Math.max(updatedBox!.x, columnBox!.x) + 40;
+	const overlapY = Math.max(updatedBox!.y, columnBox!.y) + 20;
 	const topElementIsInsideFrame = await page.evaluate(
 		([x, y]) => {
 			const hit = document.elementFromPoint(x, y);
@@ -935,4 +926,248 @@ test('opened windows stack ABOVE the bottom chat dock and unauthorized live sess
 		[overlapX, overlapY] as const
 	);
 	expect(topElementIsInsideFrame).toBe(true);
+});
+
+test('CCC S3 wiring: strip drives the shell selection; history opens stored scope; New Chat returns to hero', async ({
+	page
+}) => {
+	// Offline-safe scripted live bag (the reviewed live-nav pattern): the
+	// readable `mai_csrf` cookie attaches the live composition, every
+	// needed route is mocked, the channel is a scripted WebSocket.
+	const SERVER_BETA_ID = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+	const SERVICE_ID = '3f9d2c4e-0001-4001-8001-00000000d001';
+	const SESSION_ID = '55555555-5555-4555-8555-555555555555';
+	const profileFor = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: { host: `${name}.example`, port: 22, user: 'mai', host_key: 'k', credential_ref: 'MAI_SSH_KEY' },
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [profileFor(SERVER_ALPHA_ID, 'Server Alpha'), profileFor(SERVER_BETA_ID, 'Server Beta')]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ profiles: [{ schema_version: 1, name: 'glm53flash', connection: 'litellm', model: 'z-ai-coding/glm-5.3-flash' }] })
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ schema_version: 1, connection: 'litellm', profile: 'glm53flash' })
+		})
+	);
+	// Draft @service options: Alpha adopts nginx-proxy, Beta adopts grafana
+	// — the reload proof distinguishes them.
+	await page.route('**/api/v1/servers/*/applications**', (route) => {
+		const serverId = new URL(route.request().url()).pathname.split('/')[4];
+		const name = serverId === SERVER_BETA_ID ? 'grafana' : 'nginx-proxy';
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				server_id: serverId,
+				applications: [
+					{
+						application_id: `${SERVICE_ID}-${name}`,
+						server_id: serverId,
+						name,
+						origin: 'manual',
+						revision: 1
+					}
+				],
+				limit: 10,
+				offset: 0,
+				total: 1
+			})
+		});
+	});
+	// The agent-session family: list (drawer), detail (stored chips),
+	// history (the transcript page).
+	await page.route('**/api/v1/agent-sessions**', (route) => {
+		const url = new URL(route.request().url());
+		const segments = url.pathname.split('/');
+		const json = (body: unknown) =>
+			route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+		if (segments.length === 4) {
+			// GET /api/v1/agent-sessions — the drawer's bounded first page.
+			return json({
+				items: [
+					{
+						session_id: SESSION_ID,
+						server_id: SERVER_ALPHA_ID,
+						source: 'interactive',
+						status: 'idle',
+						title: 'wiring proof',
+						latest_seq: 1,
+						total_entries: 1,
+						compaction_count: 0,
+						created_at: '2026-01-01T00:00:00Z',
+						updated_at: '2026-01-01T00:00:00Z',
+						service_id: SERVICE_ID,
+						service_name: 'nginx-proxy',
+						tag_preview: null
+					}
+				],
+				limit: 10,
+				offset: 0,
+				total: 1,
+				has_more: false
+			});
+		}
+		if (segments.at(-1) === 'history') {
+			return json({
+				items: [
+					{
+						schema_version: 1,
+						entry_id: 'eeeeeeee-eeee-4eee-8eee-000000000001',
+						session_id: SESSION_ID,
+						seq: 1,
+						run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+						durable_source_id: 'turn:wiring',
+						created_at: '2026-01-01T00:00:00Z',
+						payload: {
+							kind: 'user_message',
+							text: 'hello from the wiring proof',
+							client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+							source: 'interactive'
+						}
+					}
+				],
+				limit: 30,
+				offset: 0,
+				total: 1,
+				has_more: false,
+				has_older: false,
+				oldest_seq: 1,
+				latest_seq: 1,
+				byte_size: 96,
+				truncated_by_bytes: false,
+				next_before_seq: null
+			});
+		}
+		// GET /api/v1/agent-sessions/{id} — the STORED scope (SCOPE-3).
+		return json({
+			session_id: SESSION_ID,
+			server_id: SERVER_ALPHA_ID,
+			service_id: SERVICE_ID,
+			service_name: 'nginx-proxy',
+			source: 'interactive',
+			status: 'idle',
+			title: 'wiring proof',
+			latest_seq: 1,
+			total_entries: 1,
+			compaction_count: 0,
+			created_at: '2026-01-01T00:00:00Z',
+			updated_at: '2026-01-01T00:00:00Z'
+		});
+	});
+	// The session channel: scripted hello handshake + the bounded snapshot.
+	await page.routeWebSocket(/\/api\/v1\/agent-sessions\/.+\/channel/, (ws) => {
+		ws.onMessage((data) => {
+			if (!String(data).includes('"hello"')) return;
+			ws.send(
+				JSON.stringify({
+					type: 'hello_ok',
+					protocol_version: 1,
+					session_id: SESSION_ID,
+					server_id: SERVER_ALPHA_ID,
+					stream_id: 'wiring-s1',
+					latest_seq: 1
+				})
+			);
+			// The server's bounded truth follows the handshake: one
+			// committed user turn.
+			ws.send(
+				JSON.stringify({
+					type: 'snapshot',
+					stream_id: 'wiring-s1',
+					entries: [
+						{
+							schema_version: 1,
+							entry_id: 'eeeeeeee-eeee-4eee-8eee-000000000001',
+							session_id: SESSION_ID,
+							seq: 1,
+							run_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+							durable_source_id: 'turn:wiring',
+							created_at: '2026-01-01T00:00:00Z',
+							payload: {
+								kind: 'user_message',
+								text: 'hello from the wiring proof',
+								client_request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+								source: 'interactive'
+							}
+						}
+					]
+				})
+			);
+		});
+	});
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	const column = page.getByTestId('bottom-chat-dock');
+	const panel = column.getByTestId('session-chat-panel');
+
+	// HERO: the strip is the interactive draft scope — the server select
+	// carries the shell's selection and Alpha's services load into the
+	// draft @service picker.
+	await expect(panel).toHaveAttribute('data-state', 'hero');
+	const serverSelect = page.getByTestId('chat-scope-server-select');
+	await expect(serverSelect).toHaveValue(SERVER_ALPHA_ID);
+	await expect(page.getByTestId('session-service-select')).toHaveValue('');
+	await expect(page.getByTestId('session-service-select')).toContainText('nginx-proxy');
+
+	// The drawer's history row opens THAT session → ACTIVE with its OWN
+	// stored scope and transcript.
+	await page.getByTestId('drawer-history-item').first().click();
+	await expect(panel).toHaveAttribute('data-state', 'active');
+	await expect(page.getByTestId('session-header-server')).toHaveText('Server: Server Alpha');
+	await expect(page.getByTestId('session-header-service')).toHaveText('Service: @nginx-proxy');
+	await expect(page.getByTestId('entry-user-message')).toContainText('hello from the wiring proof');
+
+	// A selection change while ACTIVE never rebinds the session: the strip
+	// has no interactive select and the chips keep the stored scope.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect(page.getByTestId('session-header-server')).toHaveText('Server: Server Alpha');
+	await expect(page.getByTestId('chat-scope-server-select')).toHaveCount(0);
+	expect(
+		await page.evaluate(() => window.localStorage.getItem('mai.workspace.selected-server.v1'))
+	).toBe(SERVER_BETA_ID);
+
+	// + New Chat returns the column to HERO: the draft scope strip, no
+	// transcript, and the composer focused for the next first turn.
+	await page.getByTestId('drawer-new-chat').click();
+	await expect(panel).toHaveAttribute('data-state', 'hero');
+	await expect(page.getByTestId('session-history-viewport')).toHaveCount(0);
+	await expect(page.getByTestId('entry-user-message')).toHaveCount(0);
+	// The draft scope follows the drawer selection (Beta): the strip select
+	// reads Beta and the draft service options reloaded for Beta.
+	await expect(serverSelect).toHaveValue(SERVER_BETA_ID);
+	await expect(page.getByTestId('session-service-select')).toContainText('grafana');
+	const composerFocused = await panel.evaluate(
+		(el) => el.querySelector('textarea') === document.activeElement
+	);
+	expect(composerFocused).toBe(true);
 });
