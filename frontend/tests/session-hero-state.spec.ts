@@ -3,21 +3,25 @@ import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 /**
- * session-hero-state.spec.ts — CCC S2 proofs: SessionChatPanel's two
- * presentation states inside the centered column.
+ * session-hero-state.spec.ts — CCC S2/CSP P1 proofs: SessionChatPanel's
+ * two presentation states inside the stretched full-height column.
  *
- * 1. HERO (sessionId === null): ONLY the centered composer — the @service
- *    picker row, the auto-growing textarea (honest placeholder) and Send.
- *    No transcript viewport, no Steer/Pause/Cancel, no generating
- *    indicator, no session-id chrome; the composer block is centered in
- *    the panel.
+ * 1. HERO (sessionId === null): ONLY the bottom-anchored composer — the
+ *    @service picker row, the auto-growing textarea (honest placeholder)
+ *    and Send — pinned to the panel's TRUE bottom edge, with the single
+ *    top spacer as the calm empty surface above it. No transcript
+ *    viewport, no Steer/Pause/Cancel, no generating indicator, no
+ *    session-id chrome; the composer is NOT vertically centered.
  * 2. HERO → ACTIVE: submitting through the scripted bag (create + first
  *    turn) swaps to the active layout WITHOUT remounting the composer —
  *    the SAME DOM textarea keeps its mark and focus, the draft is cleared
  *    by the submit, and the optimistic user entry + generating indicator
- *    + control buttons appear.
- * 3. ACTIVE directly: a provided sessionId renders the active layout from
- *    the first client render (no hero flash for a loaded session).
+ *    + control buttons appear. The text background UNFOLDS: the spacer's
+ *    flex-grow transition starts tall and collapses to 0 while the
+ *    viewport fills the panel (full height, NOT the old 32rem cap).
+ * 3. ACTIVE directly: a provided sessionId renders the ACTIVE layout
+ *    full-height from the first client render — collapsed spacer,
+ *    filling viewport, bottom composer (no hero flash, no unfold).
  * 4. Motion honesty: the hero→active spacer transition is a CSS
  *    flex-grow transition (~240ms) that compiles out entirely under
  *    prefers-reduced-motion: reduce — no transition, no animation.
@@ -53,6 +57,14 @@ declare global {
 		};
 		__presetSession?: string;
 		__mount?(patch: Record<string, unknown>): void;
+		/** CSP P1: written by a transitionstart listener installed BEFORE
+		 * the hero→active flip — proves the spacer flex-grow unfold ran
+		 * and captures the spacer height at the transition's start. */
+		__heroUnfold?: {
+			started: boolean;
+			property: string;
+			startHeight: number | null;
+		};
 	}
 }
 
@@ -249,11 +261,14 @@ test.beforeAll(async () => {
 });
 
 async function gotoHarness(page: Page): Promise<void> {
+	// CSP P1: #app carries a DEFINITE height (like the stretched
+	// .mai-desktop-shell__dock-body host) so the full-height panel and its
+	// flex:1 viewport behave exactly as in the real shell.
 	const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="${FIXTURE_URL}demo.css"></head>
-<body style="margin:0"><div id="app"></div>
+<body style="margin:0"><div id="app" style="height:100dvh"></div>
 <script type="module" src="${FIXTURE_URL}demo.js"><\/script></body></html>`;
 	await page.route('**/*', (route: Route) => {
 		const requestUrl = new URL(route.request().url());
@@ -270,7 +285,7 @@ async function gotoHarness(page: Page): Promise<void> {
 }
 
 test.describe('hero state (no session)', () => {
-	test('renders ONLY the centered composer — no viewport, controls, indicator, or header chrome', async ({
+	test('renders ONLY the bottom-anchored composer — no viewport, controls, indicator, or header chrome', async ({
 		page
 	}) => {
 		await page.setViewportSize({ width: 1280, height: 720 });
@@ -303,20 +318,40 @@ test.describe('hero state (no session)', () => {
 		await expect(page.getByTestId('session-generating-indicator')).toHaveCount(0);
 		await expect(page.getByTestId('session-header-id')).toHaveCount(0);
 
-		// Centered: the composer block's center ≈ the panel's center (the
-		// two hero spacers are symmetric).
-		const centers = await page.evaluate(() => {
+		// Bottom-anchored (CSP P1): the composer sits at the panel's TRUE
+		// bottom edge, horizontally centered, with the single top spacer
+		// as the calm empty surface above it — NOT vertically centered.
+		const geo = await page.evaluate(() => {
 			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
 			const composerEl = document.querySelector('.mai-session-chat__composer')!;
+			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
 			const pr = panelEl.getBoundingClientRect();
 			const cr = composerEl.getBoundingClientRect();
+			const sr = spacerEl.getBoundingClientRect();
 			return {
-				panel: { cx: pr.x + pr.width / 2, cy: pr.y + pr.height / 2 },
-				composer: { cx: cr.x + cr.width / 2, cy: cr.y + cr.height / 2 }
+				panel: {
+					cx: pr.x + pr.width / 2,
+					cy: pr.top + pr.height / 2,
+					top: pr.top,
+					bottom: pr.bottom,
+					height: pr.height
+				},
+				composer: {
+					cx: cr.x + cr.width / 2,
+					cy: cr.top + cr.height / 2,
+					top: cr.top,
+					bottom: cr.bottom
+				},
+				spacer: { top: sr.top, bottom: sr.bottom, height: sr.height }
 			};
 		});
-		expect(Math.abs(centers.composer.cx - centers.panel.cx)).toBeLessThanOrEqual(2);
-		expect(Math.abs(centers.composer.cy - centers.panel.cy)).toBeLessThanOrEqual(2);
+		expect(geo.panel.height).toBeGreaterThan(512);
+		expect(Math.abs(geo.composer.cx - geo.panel.cx)).toBeLessThanOrEqual(2);
+		expect(Math.abs(geo.composer.bottom - geo.panel.bottom)).toBeLessThanOrEqual(2);
+		expect(geo.composer.cy - geo.panel.cy).toBeGreaterThan(100);
+		expect(Math.abs(geo.spacer.top - geo.panel.top)).toBeLessThanOrEqual(1);
+		expect(Math.abs(geo.spacer.bottom - geo.composer.top)).toBeLessThanOrEqual(1);
+		expect(geo.spacer.height).toBeGreaterThan(geo.panel.height / 2);
 	});
 
 	test('the textarea auto-grows modestly and caps at ~6 rows with internal scroll', async ({
@@ -352,6 +387,22 @@ test.describe('hero → active transition', () => {
 		await input.evaluate((el) => el.setAttribute('data-hero-mark', 'survivor'));
 		await input.click();
 		await page.keyboard.type('launch the probe');
+		// CSP P1: record the spacer state the moment the unfold transition
+		// STARTS — the listener goes in BEFORE the hero→active flip, and
+		// transitionstart fires before any animated frame, so startHeight
+		// is deterministic (the spacer is still tall).
+		await page.evaluate(() => {
+			const spacer = document.querySelector('.mai-session-chat__spacer')!;
+			window.__heroUnfold = { started: false, property: '', startHeight: null };
+			const onUnfoldStart = (event: TransitionEvent): void => {
+				if (event.propertyName !== 'flex-grow') return;
+				const record = window.__heroUnfold!;
+				record.started = true;
+				record.property = event.propertyName;
+				record.startHeight = spacer.getBoundingClientRect().height;
+			};
+			spacer.addEventListener('transitionstart', onUnfoldStart as EventListener);
+		});
 		await page.keyboard.press('Enter');
 
 		// Active layout: viewport, optimistic entry, indicator, controls.
@@ -385,6 +436,38 @@ test.describe('hero → active transition', () => {
 			() => document.activeElement?.getAttribute('data-testid') ?? null
 		);
 		expect(focused).toBe('session-composer-input');
+
+		// CSP P1: the text background UNFOLDS to full height — the spacer's
+		// flex-grow transition started while the spacer was still tall and
+		// collapsed to zero as the viewport took the freed space; the panel
+		// settles FULL-HEIGHT (not the old 32rem/512px cap) with the
+		// composer pinned to the bottom edge. 240ms transition + margin.
+		await page.waitForTimeout(450);
+		const unfolded = await page.evaluate(() => {
+			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
+			const hostEl = document.getElementById('app')!;
+			const viewportEl = document.querySelector('[data-testid="session-history-viewport"]')!;
+			const composerEl = document.querySelector('.mai-session-chat__composer')!;
+			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
+			const pr = panelEl.getBoundingClientRect();
+			return {
+				unfold: window.__heroUnfold ?? null,
+				panelHeight: pr.height,
+				panelBottom: pr.bottom,
+				hostHeight: hostEl.getBoundingClientRect().height,
+				viewportHeight: viewportEl.getBoundingClientRect().height,
+				composerBottom: composerEl.getBoundingClientRect().bottom,
+				spacerHeight: spacerEl.getBoundingClientRect().height
+			};
+		});
+		expect(unfolded.unfold?.started).toBe(true);
+		expect(unfolded.unfold?.property).toBe('flex-grow');
+		expect(unfolded.unfold?.startHeight ?? 0).toBeGreaterThan(60);
+		expect(unfolded.spacerHeight).toBeLessThanOrEqual(1);
+		expect(Math.abs(unfolded.panelHeight - unfolded.hostHeight)).toBeLessThanOrEqual(1);
+		expect(unfolded.panelHeight).toBeGreaterThan(512);
+		expect(unfolded.viewportHeight).toBeGreaterThan(400);
+		expect(Math.abs(unfolded.composerBottom - unfolded.panelBottom)).toBeLessThanOrEqual(2);
 	});
 
 	test('a provided sessionId renders the active layout directly (no hero flash)', async ({
@@ -412,6 +495,30 @@ test.describe('hero → active transition', () => {
 		await expect(page.getByTestId('chat-scope-server')).toContainText('General Consult');
 		await expect(page.getByTestId('chat-scope-service')).toHaveCount(0);
 		await expect(page.getByTestId('session-history-empty')).toBeVisible();
+
+		// CSP P1: a loaded session renders ACTIVE FULL-HEIGHT directly —
+		// collapsed spacer, viewport already filling the panel, composer at
+		// the bottom (no hero flash, no unfold animation on load).
+		const loaded = await page.evaluate(() => {
+			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
+			const viewportEl = document.querySelector('[data-testid="session-history-viewport"]')!;
+			const composerEl = document.querySelector('.mai-session-chat__composer')!;
+			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
+			const pr = panelEl.getBoundingClientRect();
+			return {
+				panelHeight: pr.height,
+				panelBottom: pr.bottom,
+				hostHeight: document.getElementById('app')!.getBoundingClientRect().height,
+				viewportHeight: viewportEl.getBoundingClientRect().height,
+				composerBottom: composerEl.getBoundingClientRect().bottom,
+				spacerHeight: spacerEl.getBoundingClientRect().height
+			};
+		});
+		expect(Math.abs(loaded.panelHeight - loaded.hostHeight)).toBeLessThanOrEqual(1);
+		expect(loaded.panelHeight).toBeGreaterThan(512);
+		expect(loaded.viewportHeight).toBeGreaterThan(400);
+		expect(Math.abs(loaded.composerBottom - loaded.panelBottom)).toBeLessThanOrEqual(2);
+		expect(loaded.spacerHeight).toBeLessThanOrEqual(1);
 	});
 });
 

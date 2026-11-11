@@ -1737,7 +1737,10 @@
 	   and stretched between its paddings — out of flow, so the spatial
 	   canvas keeps its geometry and opened windows keep stacking ABOVE
 	   the column (`z-index: 5` under the canvas's `z-index: 20`).
-	   Restrained solid Mechanicus surface: no glass, no backdrop blur.
+	   CSP P2 blended surface: near-canvas solid (--mai-color-surface),
+	   one quiet steel hairline, NO float shadow and NO brass on the
+	   frame — no glass, no backdrop blur; the Mechanicus character
+	   (typography, sigils, brass chips/buttons) lives INSIDE the column.
 	   The width is DETERMINISTIC, never content-driven, and bounded so
 	   the canvas stays visible on both sides; the page-padding floor
 	   keeps the column inside the stage at every width. */
@@ -1754,10 +1757,10 @@
 		display: flex;
 		flex-direction: column;
 		padding: var(--mai-hud-pad-y) var(--mai-hud-pad-x);
-		background: var(--mai-color-surface-raised);
-		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
-		box-shadow: var(--mai-shadow-float);
+		box-shadow: none;
 	}
 
 	/* Pocket viewports (CCC S1): the bounded column yields its side

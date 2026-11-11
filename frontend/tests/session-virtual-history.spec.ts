@@ -275,11 +275,14 @@ test.beforeAll(async () => {
 });
 
 async function gotoHarness(page: Page): Promise<void> {
+	// CSP P1: #app carries a DEFINITE height (like the stretched
+	// .mai-desktop-shell__dock-body host) — the full-height panel keeps its
+	// viewport the overflow scroll container virtua demand-load needs.
 	const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="${FIXTURE_URL}demo.css"></head>
-<body style="margin:0"><div id="app"></div>
+<body style="margin:0"><div id="app" style="height:100dvh"></div>
 <script type="module" src="${FIXTURE_URL}demo.js"><\/script></body></html>`;
 	await page.route('**/*', (route: Route) => {
 		const requestUrl = new URL(route.request().url());
