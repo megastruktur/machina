@@ -3,33 +3,19 @@ import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 /**
- * session-hero-state.spec.ts — CCC S2/CSP P1 proofs: SessionChatPanel's
- * two presentation states inside the stretched full-height column.
+ * session-hero-state.spec.ts — CCC S2/CSP P1/CHC H1 proofs: the hero
+ * (no session) surface is a COMPACT card that hugs ONLY the composer and
+ * is centered in the stage; submitting the first turn flips the SAME
+ * surface (one composer DOM node — focus + draft survive) to the
+ * full-height active layout with the transcript above the bottom-pinned
+ * input, animated by the shell's ~240ms card growth (reduced-motion:
+ * instant); a provided sessionId renders active full-height directly.
  *
- * 1. HERO (sessionId === null): ONLY the bottom-anchored composer — the
- *    @service picker row, the auto-growing textarea (honest placeholder)
- *    and Send — pinned to the panel's TRUE bottom edge, with the single
- *    top spacer as the calm empty surface above it. No transcript
- *    viewport, no Steer/Pause/Cancel, no generating indicator, no
- *    session-id chrome; the composer is NOT vertically centered.
- * 2. HERO → ACTIVE: submitting through the scripted bag (create + first
- *    turn) swaps to the active layout WITHOUT remounting the composer —
- *    the SAME DOM textarea keeps its mark and focus, the draft is cleared
- *    by the submit, and the optimistic user entry + generating indicator
- *    + control buttons appear. The text background UNFOLDS: the spacer's
- *    flex-grow transition starts tall and collapses to 0 while the
- *    viewport fills the panel (full height, NOT the old 32rem cap).
- * 3. ACTIVE directly: a provided sessionId renders the ACTIVE layout
- *    full-height from the first client render — collapsed spacer,
- *    filling viewport, bottom composer (no hero flash, no unfold).
- * 4. Motion honesty: the hero→active spacer transition is a CSS
- *    flex-grow transition (~240ms) that compiles out entirely under
- *    prefers-reduced-motion: reduce — no transition, no animation.
- * 5. 360×640: the hero composer fits without overflow.
- *
- * Deterministic component harness (the reviewed session-service-scope
- * pattern): the REAL SessionChatPanel over a scripted bag with REACTIVE
- * props — the shell's session swap is a prop update, never a remount.
+ * The harness mirrors the shell's dock structure (transparent
+ * `.chc-dock` positioning box + blended `.chc-dock__card` surface +
+ * WAAPI growth effects) exactly as DesktopShell ships it — the real
+ * shell's own card geometry is proven by desktop-shell.spec.ts against
+ * the production route.
  */
 
 const FRONTEND_ROOT = new URL('../', import.meta.url).pathname;
@@ -57,22 +43,15 @@ declare global {
 		};
 		__presetSession?: string;
 		__mount?(patch: Record<string, unknown>): void;
-		/** CSP P1: written by a transitionstart listener installed BEFORE
-		 * the hero→active flip — proves the spacer flex-grow unfold ran
-		 * and captures the spacer height at the transition's start. */
-		__heroUnfold?: {
-			started: boolean;
-			property: string;
-			startHeight: number | null;
-		};
 	}
 }
 
 /**
  * The harness host: a Svelte 5 runes component (compiled from a virtual
- * `.svelte` module) holding the bag + reactive state. Prop updates flow
- * into the mounted SessionChatPanel — exactly how the shell swaps the
- * visible session (no unmount/remount, so the composer DOM survives).
+ * `.svelte` module) holding the bag + reactive state, wrapping the panel
+ * in the shell-mirroring dock card. Prop updates flow into the mounted
+ * SessionChatPanel — exactly how the shell swaps the visible session
+ * (no unmount/remount, so the composer DOM survives).
  */
 function heroHost(): string {
 	return `
@@ -163,41 +142,125 @@ function heroHost(): string {
 		if (typeof nextSession === 'string' || nextSession === null) sessionId = nextSession;
 		if (typeof nextServer === 'string' || nextServer === null) serverId = nextServer;
 	};
+
+	// --- CHC H1 mirror of DesktopShell's dock card growth -------------------
+	// The SHELL owns this logic; the mirror keeps the fixture honest so
+	// the growth proofs exercise the same mechanism the route ships.
+	let cardEl: HTMLElement | null = null;
+	let motionReduced = $state(false);
+	$effect(() => {
+		const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const apply = () => (motionReduced = query.matches);
+		apply();
+		query.addEventListener('change', apply);
+		return () => query.removeEventListener('change', apply);
+	});
+	const CARD_GROWTH_MS = 240;
+	let cardFlipFrom: DOMRect | null = null;
+	let wasHero: boolean | null = null;
+	$effect.pre(() => {
+		const hero = sessionId === null;
+		if (wasHero === true && !hero && cardEl !== null) {
+			cardFlipFrom = cardEl.getBoundingClientRect();
+		}
+		wasHero = hero;
+	});
+	let cardAnimation: Animation | null = null;
+	$effect(() => {
+		void sessionId;
+		const card = cardEl;
+		const from = cardFlipFrom;
+		cardFlipFrom = null;
+		if (card === null || from === null || motionReduced) return;
+		const to = card.getBoundingClientRect();
+		if (Math.abs(to.height - from.height) < 2) return;
+		cardAnimation?.cancel();
+		cardAnimation = card.animate(
+			[{ height: \`\${from.height}px\` }, { height: \`\${to.height}px\` }],
+			{ duration: CARD_GROWTH_MS, easing: 'ease' }
+		);
+	});
 </script>
 
-<SessionChatPanel
-	panel={{
-		descriptor: {
-			schema_version: 1,
-			window_id: 'hero-harness',
-			panel_kind: 'chat',
-			scope: { kind: 'server', server_id: '00000000-0000-0000-0000-000000000000' },
-			geometry: { x: 0, y: 0, width: 0, height: 0 },
-			presentation: 'normal',
-			z: 0,
-			title_override: null
-		},
-		scope: { kind: 'server', server_id: '00000000-0000-0000-0000-000000000000' },
-		services: { api, serverOptions: [], availableServices: [] },
-		onCleanup: () => () => {}
-	}}
-	sessionId={sessionId}
-	serverId={serverId}
-	entries={optimisticEntries}
-	optimisticRunState={optimisticRunState}
-	onsessionopened={(sid, scope) => {
-		// The shell attaches the channel + swaps the visible session
-		// synchronously — a reactive prop update, not a remount.
-		sessionId = sid;
-		serverId = scope;
-	}}
-	onturnsubmitted={(entry, runState) => {
-		// The shell's optimistic merge, in miniature: the resolved submit
-		// lands in the visible cache and drives the indicator.
-		optimisticEntries = [...optimisticEntries, entry];
-		optimisticRunState = runState;
-	}}
-/>
+<div class="chc-dock" class:chc-dock--hero={sessionId === null}>
+	<div class="chc-dock__card" bind:this={cardEl}>
+		<SessionChatPanel
+			panel={{
+				descriptor: {
+					schema_version: 1,
+					window_id: 'hero-harness',
+					panel_kind: 'chat',
+					scope: { kind: 'server', server_id: '00000000-0000-0000-0000-000000000000' },
+					geometry: { x: 0, y: 0, width: 0, height: 0 },
+					presentation: 'normal',
+					z: 0,
+					title_override: null
+				},
+				scope: { kind: 'server', server_id: '00000000-0000-0000-0000-000000000000' },
+				services: { api, serverOptions: [], availableServices: [] },
+				onCleanup: () => () => {}
+			}}
+			sessionId={sessionId}
+			serverId={serverId}
+			entries={optimisticEntries}
+			optimisticRunState={optimisticRunState}
+			onsessionopened={(sid, scope) => {
+				// The shell attaches the channel + swaps the visible session
+				// synchronously — a reactive prop update, not a remount.
+				sessionId = sid;
+				serverId = scope;
+			}}
+			onturnsubmitted={(entry, runState) => {
+				// The shell's optimistic merge, in miniature: the resolved submit
+				// lands in the visible cache and drives the indicator.
+				optimisticEntries = [...optimisticEntries, entry];
+				optimisticRunState = runState;
+			}}
+		/>
+	</div>
+</div>
+
+<style>
+	/* Mirror of DesktopShell's .mai-desktop-shell__dock: the transparent
+	   absolute positioning host (stage-inset, width-bounded). */
+	.chc-dock {
+		position: absolute;
+		top: var(--mai-space-2);
+		bottom: var(--mai-space-3);
+		left: 0;
+		right: 0;
+		margin-inline: auto;
+		width: min(880px, 72%, calc(100% - 2 * var(--mai-space-3)));
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		padding: var(--mai-hud-pad-y) var(--mai-hud-pad-x);
+		pointer-events: none;
+	}
+	@media (max-width: 720px) {
+		.chc-dock {
+			width: calc(100% - 2 * var(--mai-space-3));
+		}
+	}
+	/* Mirror of .mai-desktop-shell__dock-body: the blended CARD — active
+	   fills (explicit height:100%, what the growth animates), hero hugs
+	   the composer and centers via auto block margins. */
+	.chc-dock__card {
+		pointer-events: auto;
+		flex: 0 0 auto;
+		margin-block: auto;
+		height: 100%;
+		min-height: 0;
+		min-width: 0;
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
+		box-shadow: none;
+	}
+	.chc-dock--hero .chc-dock__card {
+		height: auto;
+	}
+</style>
 `;
 }
 
@@ -261,14 +324,14 @@ test.beforeAll(async () => {
 });
 
 async function gotoHarness(page: Page): Promise<void> {
-	// CSP P1: #app carries a DEFINITE height (like the stretched
-	// .mai-desktop-shell__dock-body host) so the full-height panel and its
-	// flex:1 viewport behave exactly as in the real shell.
+	// CHC H1: #app is the STAGE (definite height, positioning context)
+	// exactly like .mai-desktop-shell__stage; the harness dock card
+	// inside it behaves like the shell's column card.
 	const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="${FIXTURE_URL}demo.css"></head>
-<body style="margin:0"><div id="app" style="height:100dvh"></div>
+<body style="margin:0"><div id="app" style="height:100dvh; position:relative"></div>
 <script type="module" src="${FIXTURE_URL}demo.js"><\/script></body></html>`;
 	await page.route('**/*', (route: Route) => {
 		const requestUrl = new URL(route.request().url());
@@ -284,8 +347,52 @@ async function gotoHarness(page: Page): Promise<void> {
 	await page.goto(FIXTURE_URL);
 }
 
+type CardGeometry = {
+	dock: { top: number; bottom: number; height: number; width: number; cx: number; contentTop: number; contentBottom: number };
+	card: { top: number; bottom: number; height: number; width: number; cx: number; cy: number };
+	panel: { height: number };
+	composer: { height: number; bottom: number; cx: number };
+};
+
+async function cardGeometry(page: Page): Promise<CardGeometry> {
+	return page.evaluate(() => {
+		const dockEl = document.querySelector('.chc-dock')!;
+		const cardEl = document.querySelector('.chc-dock__card')!;
+		const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
+		const composerEl = document.querySelector('.mai-session-chat__composer')!;
+		const dc = getComputedStyle(dockEl);
+		const dr = dockEl.getBoundingClientRect();
+		const cr = cardEl.getBoundingClientRect();
+		const pr = panelEl.getBoundingClientRect();
+		const mr = composerEl.getBoundingClientRect();
+		const padTop = parseFloat(dc.paddingTop);
+		const padBottom = parseFloat(dc.paddingBottom);
+		return {
+			dock: {
+				top: dr.top,
+				bottom: dr.bottom,
+				height: dr.height,
+				width: dr.width,
+				cx: dr.x + dr.width / 2,
+				contentTop: dr.top + padTop,
+				contentBottom: dr.bottom - padBottom
+			},
+			card: {
+				top: cr.top,
+				bottom: cr.bottom,
+				height: cr.height,
+				width: cr.width,
+				cx: cr.x + cr.width / 2,
+				cy: cr.top + cr.height / 2
+			},
+			panel: { height: pr.height },
+			composer: { height: mr.height, bottom: mr.bottom, cx: mr.x + mr.width / 2 }
+		};
+	});
+}
+
 test.describe('hero state (no session)', () => {
-	test('renders ONLY the bottom-anchored composer — no viewport, controls, indicator, or header chrome', async ({
+	test('renders a COMPACT centered card hugging ONLY the composer — no full-height slab', async ({
 		page
 	}) => {
 		await page.setViewportSize({ width: 1280, height: 720 });
@@ -318,40 +425,21 @@ test.describe('hero state (no session)', () => {
 		await expect(page.getByTestId('session-generating-indicator')).toHaveCount(0);
 		await expect(page.getByTestId('session-header-id')).toHaveCount(0);
 
-		// Bottom-anchored (CSP P1): the composer sits at the panel's TRUE
-		// bottom edge, horizontally centered, with the single top spacer
-		// as the calm empty surface above it — NOT vertically centered.
-		const geo = await page.evaluate(() => {
-			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
-			const composerEl = document.querySelector('.mai-session-chat__composer')!;
-			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
-			const pr = panelEl.getBoundingClientRect();
-			const cr = composerEl.getBoundingClientRect();
-			const sr = spacerEl.getBoundingClientRect();
-			return {
-				panel: {
-					cx: pr.x + pr.width / 2,
-					cy: pr.top + pr.height / 2,
-					top: pr.top,
-					bottom: pr.bottom,
-					height: pr.height
-				},
-				composer: {
-					cx: cr.x + cr.width / 2,
-					cy: cr.top + cr.height / 2,
-					top: cr.top,
-					bottom: cr.bottom
-				},
-				spacer: { top: sr.top, bottom: sr.bottom, height: sr.height }
-			};
-		});
-		expect(geo.panel.height).toBeGreaterThan(512);
-		expect(Math.abs(geo.composer.cx - geo.panel.cx)).toBeLessThanOrEqual(2);
-		expect(Math.abs(geo.composer.bottom - geo.panel.bottom)).toBeLessThanOrEqual(2);
-		expect(geo.composer.cy - geo.panel.cy).toBeGreaterThan(100);
-		expect(Math.abs(geo.spacer.top - geo.panel.top)).toBeLessThanOrEqual(1);
-		expect(Math.abs(geo.spacer.bottom - geo.composer.top)).toBeLessThanOrEqual(1);
-		expect(geo.spacer.height).toBeGreaterThan(geo.panel.height / 2);
+		// CHC H1: the blended CARD is COMPACT — its height is the composer
+		// block's height (panel + card border), NOT the host height — and
+		// it is CENTERED in the stage (equal space above and below), with
+		// the input at the card's bottom edge.
+		const geo = await cardGeometry(page);
+		expect(Math.abs(geo.card.height - geo.composer.height)).toBeLessThanOrEqual(4);
+		expect(geo.card.height).toBeLessThan(geo.dock.height / 2);
+		expect(geo.card.height).toBeLessThan(320);
+		expect(
+			Math.abs(geo.card.top - geo.dock.contentTop - (geo.dock.contentBottom - geo.card.bottom)),
+			'card vertically centered in the column'
+		).toBeLessThanOrEqual(1.5);
+		expect(Math.abs(geo.card.cx - geo.dock.cx)).toBeLessThanOrEqual(1);
+		expect(geo.card.top).toBeGreaterThan(geo.dock.top + 100);
+		expect(Math.abs(geo.composer.bottom - (geo.card.bottom - 1))).toBeLessThanOrEqual(2);
 	});
 
 	test('the textarea auto-grows modestly and caps at ~6 rows with internal scroll', async ({
@@ -379,30 +467,17 @@ test.describe('hero state (no session)', () => {
 });
 
 test.describe('hero → active transition', () => {
-	test('first submit switches to active without remounting the composer', async ({ page }) => {
+	test('first submit GROWS the card to full height without remounting the composer', async ({
+		page
+	}) => {
 		await gotoHarness(page);
 		const input = page.getByTestId('session-composer-input');
 		await expect(input).toBeVisible();
+		const heroGeo = await cardGeometry(page);
 		// Mark the live DOM node: the SAME textarea must survive the switch.
 		await input.evaluate((el) => el.setAttribute('data-hero-mark', 'survivor'));
 		await input.click();
 		await page.keyboard.type('launch the probe');
-		// CSP P1: record the spacer state the moment the unfold transition
-		// STARTS — the listener goes in BEFORE the hero→active flip, and
-		// transitionstart fires before any animated frame, so startHeight
-		// is deterministic (the spacer is still tall).
-		await page.evaluate(() => {
-			const spacer = document.querySelector('.mai-session-chat__spacer')!;
-			window.__heroUnfold = { started: false, property: '', startHeight: null };
-			const onUnfoldStart = (event: TransitionEvent): void => {
-				if (event.propertyName !== 'flex-grow') return;
-				const record = window.__heroUnfold!;
-				record.started = true;
-				record.property = event.propertyName;
-				record.startHeight = spacer.getBoundingClientRect().height;
-			};
-			spacer.addEventListener('transitionstart', onUnfoldStart as EventListener);
-		});
 		await page.keyboard.press('Enter');
 
 		// Active layout: viewport, optimistic entry, indicator, controls.
@@ -427,6 +502,34 @@ test.describe('hero → active transition', () => {
 			.poll(() => page.evaluate(() => window.__hero!.sessionId))
 			.toBe(CREATED_SESSION_ID);
 
+		// CHC H1: the GROWTH is a real WAAPI card animation (~240ms ease)
+		// whose height is INTERMEDIATE right after the flip — strictly
+		// between the compact hero height and the full column height.
+		// Two rAFs land ~1-2 frames into the 240ms window, before any
+		// assertion polling could eat the animation.
+		const growth = await page.evaluate(async () => {
+			const card = document.querySelector('.chc-dock__card')!;
+			const firstFrame = Promise.withResolvers<void>();
+			requestAnimationFrame(() => firstFrame.resolve());
+			await firstFrame.promise;
+			const secondFrame = Promise.withResolvers<number>();
+			requestAnimationFrame(() =>
+				secondFrame.resolve(card.getBoundingClientRect().height)
+			);
+			const height = await secondFrame.promise;
+			return {
+				height,
+				timings: card
+					.getAnimations()
+					.map((animation) => animation.effect?.getTiming() ?? null)
+			};
+		});
+		expect(growth.timings.length).toBeGreaterThanOrEqual(1);
+		expect(growth.timings[0]?.duration).toBe(240);
+		expect(growth.timings[0]?.easing).toBe('ease');
+		expect(growth.height).toBeGreaterThan(heroGeo.card.height + 4);
+		expect(growth.height).toBeLessThan(heroGeo.dock.height - 200);
+
 		// Same DOM node (marked), still holding focus; the draft was
 		// cleared by the submit exactly as before.
 		const survivor = page.getByTestId('session-composer-input');
@@ -437,37 +540,33 @@ test.describe('hero → active transition', () => {
 		);
 		expect(focused).toBe('session-composer-input');
 
-		// CSP P1: the text background UNFOLDS to full height — the spacer's
-		// flex-grow transition started while the spacer was still tall and
-		// collapsed to zero as the viewport took the freed space; the panel
-		// settles FULL-HEIGHT (not the old 32rem/512px cap) with the
-		// composer pinned to the bottom edge. 240ms transition + margin.
+		// After the growth settles (~240ms + margin): the card fills the
+		// column exactly, the viewport owns the freed height, and the
+		// composer sits at the TRUE bottom edge of the full card.
 		await page.waitForTimeout(450);
-		const unfolded = await page.evaluate(() => {
-			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
-			const hostEl = document.getElementById('app')!;
+		const settled = await page.evaluate(() => {
+			const cardEl = document.querySelector('.chc-dock__card')!;
+			const dockEl = document.querySelector('.chc-dock')!;
 			const viewportEl = document.querySelector('[data-testid="session-history-viewport"]')!;
 			const composerEl = document.querySelector('.mai-session-chat__composer')!;
-			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
-			const pr = panelEl.getBoundingClientRect();
+			const cr = cardEl.getBoundingClientRect();
+			const dr = dockEl.getBoundingClientRect();
+			const dc = getComputedStyle(dockEl);
 			return {
-				unfold: window.__heroUnfold ?? null,
-				panelHeight: pr.height,
-				panelBottom: pr.bottom,
-				hostHeight: hostEl.getBoundingClientRect().height,
+				cardHeight: cr.height,
+				cardBottom: cr.bottom,
+				columnHeight:
+					dr.height - parseFloat(dc.paddingTop) - parseFloat(dc.paddingBottom),
 				viewportHeight: viewportEl.getBoundingClientRect().height,
 				composerBottom: composerEl.getBoundingClientRect().bottom,
-				spacerHeight: spacerEl.getBoundingClientRect().height
+				runningAnimations: cardEl.getAnimations().length
 			};
 		});
-		expect(unfolded.unfold?.started).toBe(true);
-		expect(unfolded.unfold?.property).toBe('flex-grow');
-		expect(unfolded.unfold?.startHeight ?? 0).toBeGreaterThan(60);
-		expect(unfolded.spacerHeight).toBeLessThanOrEqual(1);
-		expect(Math.abs(unfolded.panelHeight - unfolded.hostHeight)).toBeLessThanOrEqual(1);
-		expect(unfolded.panelHeight).toBeGreaterThan(512);
-		expect(unfolded.viewportHeight).toBeGreaterThan(400);
-		expect(Math.abs(unfolded.composerBottom - unfolded.panelBottom)).toBeLessThanOrEqual(2);
+		expect(settled.runningAnimations).toBe(0);
+		expect(Math.abs(settled.cardHeight - settled.columnHeight)).toBeLessThanOrEqual(2);
+		expect(settled.cardHeight).toBeGreaterThan(512);
+		expect(settled.viewportHeight).toBeGreaterThan(400);
+		expect(Math.abs(settled.composerBottom - settled.cardBottom)).toBeLessThanOrEqual(2);
 	});
 
 	test('a provided sessionId renders the active layout directly (no hero flash)', async ({
@@ -496,56 +595,66 @@ test.describe('hero → active transition', () => {
 		await expect(page.getByTestId('chat-scope-service')).toHaveCount(0);
 		await expect(page.getByTestId('session-history-empty')).toBeVisible();
 
-		// CSP P1: a loaded session renders ACTIVE FULL-HEIGHT directly —
-		// collapsed spacer, viewport already filling the panel, composer at
-		// the bottom (no hero flash, no unfold animation on load).
+		// CHC H1: a loaded session renders ACTIVE FULL-HEIGHT directly —
+		// the card already fills the column with the composer at the
+		// bottom; no growth animation runs on load (no hero flash).
 		const loaded = await page.evaluate(() => {
-			const panelEl = document.querySelector('[data-testid="session-chat-panel"]')!;
+			const cardEl = document.querySelector('.chc-dock__card')!;
+			const dockEl = document.querySelector('.chc-dock')!;
 			const viewportEl = document.querySelector('[data-testid="session-history-viewport"]')!;
 			const composerEl = document.querySelector('.mai-session-chat__composer')!;
-			const spacerEl = document.querySelector('.mai-session-chat__spacer')!;
-			const pr = panelEl.getBoundingClientRect();
+			const cr = cardEl.getBoundingClientRect();
+			const dr = dockEl.getBoundingClientRect();
+			const dc = getComputedStyle(dockEl);
 			return {
-				panelHeight: pr.height,
-				panelBottom: pr.bottom,
-				hostHeight: document.getElementById('app')!.getBoundingClientRect().height,
+				cardHeight: cr.height,
+				cardBottom: cr.bottom,
+				columnHeight:
+					dr.height - parseFloat(dc.paddingTop) - parseFloat(dc.paddingBottom),
 				viewportHeight: viewportEl.getBoundingClientRect().height,
 				composerBottom: composerEl.getBoundingClientRect().bottom,
-				spacerHeight: spacerEl.getBoundingClientRect().height
+				animations: cardEl.getAnimations().length
 			};
 		});
-		expect(Math.abs(loaded.panelHeight - loaded.hostHeight)).toBeLessThanOrEqual(1);
-		expect(loaded.panelHeight).toBeGreaterThan(512);
+		expect(loaded.animations).toBe(0);
+		expect(Math.abs(loaded.cardHeight - loaded.columnHeight)).toBeLessThanOrEqual(2);
+		expect(loaded.cardHeight).toBeGreaterThan(512);
 		expect(loaded.viewportHeight).toBeGreaterThan(400);
-		expect(Math.abs(loaded.composerBottom - loaded.panelBottom)).toBeLessThanOrEqual(2);
-		expect(loaded.spacerHeight).toBeLessThanOrEqual(1);
+		expect(Math.abs(loaded.composerBottom - loaded.cardBottom)).toBeLessThanOrEqual(2);
 	});
 });
 
 test.describe('motion honesty', () => {
-	test('the spacer transition exists by default and compiles out under reduced motion', async ({
+	test('the ~240ms card growth runs by default and is INSTANT under reduced motion', async ({
 		page
 	}) => {
-		// Default: the hero→active transition is a real (bounded) CSS
-		// flex-grow transition on the layout spacers.
-		await gotoHarness(page);
-		const withMotion = await page.evaluate(() => {
-			const spacer = document.querySelector('.mai-session-chat__spacer')!;
-			const cs = getComputedStyle(spacer);
-			return { duration: cs.transitionDuration, property: cs.transitionProperty };
-		});
-		expect(parseFloat(withMotion.duration)).toBeGreaterThan(0);
-		expect(withMotion.property).toContain('flex-grow');
-
-		// Reduced motion: NO effective transition and NO animation anywhere
-		// in the panel — the layout switch is instant. (tokens.css forces
-		// 0.01ms !important durations under reduce; anything under 1ms IS
-		// "no transition" for an observer. Durations normalize ms → s.)
+		// Default: the growth is the WAAPI animation proven mid-flight by
+		// the transition suite; under reduce the flip must be INSTANT —
+		// no Web Animations on the card and no CSS transition/animation
+		// anywhere in the harness (tokens.css forces 0.01ms !important
+		// durations under reduce; anything under 1ms IS "no transition"
+		// for an observer. Durations normalize ms → s.).
 		await page.emulateMedia({ reducedMotion: 'reduce' });
 		await gotoHarness(page);
-		const reduced = await page.evaluate(() => {
-			const panel = document.querySelector('[data-testid="session-chat-panel"]')!;
-			const animated = [...panel.querySelectorAll('*')]
+		await expect(page.getByTestId('session-composer-input')).toBeVisible();
+		await page.getByTestId('session-composer-input').click();
+		await page.keyboard.type('quiet launch');
+		await page.keyboard.press('Enter');
+		await expect(page.getByTestId('session-chat-panel')).toHaveAttribute(
+			'data-state',
+			'active'
+		);
+		const reduced = await page.evaluate(async () => {
+			const cardEl = document.querySelector('.chc-dock__card')!;
+			const dockEl = document.querySelector('.chc-dock')!;
+			const frame = Promise.withResolvers<void>();
+			requestAnimationFrame(() => frame.resolve());
+			await frame.promise;
+			const cr = cardEl.getBoundingClientRect();
+			const dr = dockEl.getBoundingClientRect();
+			const dc = getComputedStyle(dockEl);
+			const root = document.getElementById('app')!;
+			const animated = [...root.querySelectorAll('*'), root]
 				.filter((el) => {
 					const cs = getComputedStyle(el);
 					const raw = cs.transitionDuration;
@@ -555,21 +664,22 @@ test.describe('motion honesty', () => {
 					);
 				})
 				.map((el) => el.getAttribute('class') ?? el.tagName);
-			const spacer = panel.querySelector('.mai-session-chat__spacer')!;
-			const spacerRaw = getComputedStyle(spacer).transitionDuration;
 			return {
-				spacerDuration: spacerRaw,
-				spacerSeconds: parseFloat(spacerRaw) * (spacerRaw.includes('ms') ? 0.001 : 1),
+				cardHeight: cr.height,
+				columnHeight:
+					dr.height - parseFloat(dc.paddingTop) - parseFloat(dc.paddingBottom),
+				cardAnimations: cardEl.getAnimations().length,
 				animated
 			};
 		});
-		expect(reduced.spacerSeconds).toBeLessThan(0.001);
+		expect(reduced.cardAnimations).toBe(0);
+		expect(Math.abs(reduced.cardHeight - reduced.columnHeight)).toBeLessThanOrEqual(2);
 		expect(reduced.animated).toEqual([]);
 	});
 });
 
 test.describe('360x640 bounds', () => {
-	test('the hero composer fits without overflow', async ({ page }) => {
+	test('the compact hero card fits without overflow', async ({ page }) => {
 		await page.setViewportSize({ width: 360, height: 640 });
 		await gotoHarness(page);
 		await expect(page.getByTestId('session-composer-input')).toBeVisible();
@@ -577,15 +687,20 @@ test.describe('360x640 bounds', () => {
 			const input = document
 				.querySelector('[data-testid="session-composer-input"]')!
 				.getBoundingClientRect();
+			const card = document.querySelector('.chc-dock__card')!.getBoundingClientRect();
 			return {
 				scroll: document.documentElement.scrollWidth,
 				client: document.documentElement.clientWidth,
 				inputRight: input.right,
-				inputBottom: input.bottom
+				inputBottom: input.bottom,
+				cardBottom: card.bottom,
+				cardHeight: card.height
 			};
 		});
 		expect(overflow.scroll).toBeLessThanOrEqual(overflow.client);
 		expect(overflow.inputRight).toBeLessThanOrEqual(360);
 		expect(overflow.inputBottom).toBeLessThanOrEqual(640);
+		expect(overflow.cardBottom).toBeLessThanOrEqual(640);
+		expect(overflow.cardHeight).toBeLessThan(320);
 	});
 });

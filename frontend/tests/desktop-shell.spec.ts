@@ -767,13 +767,26 @@ test('the chat column is always visible, honest offline, and performs no API req
 });
 
 for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) {
-	test(`offline chat column ${viewport.width}: honest panel, centered, stretched, contained`, async ({page}) => {
+	test(`offline chat column ${viewport.width}: honest panel, compact centered hero card, contained`, async ({page}) => {
 		await page.setViewportSize(viewport);
 		const requests: string[] = [];
 		page.on('request', r => requests.push(r.url()));
 		await page.goto('/');
 		// Existing user-controlled shell navigation, not a geometry override.
-		if (viewport.width === 360) await page.getByTestId('side-drawer-toggle').click();
+		if (viewport.width === 360) {
+			await page.getByTestId('side-drawer-toggle').click();
+			// The drawer rail ANIMATES its width/flex-basis down to 3.25rem;
+			// the hero card is content-sized, so its height is only stable
+			// once the rail settles (mid-animation the narrower stage wraps
+			// the honest panel's text taller). Poll for the settled rail.
+			await expect
+				.poll(() =>
+					page.evaluate(
+						() => document.querySelector('.mai-side-drawer')!.getBoundingClientRect().width
+					)
+				)
+				.toBeLessThanOrEqual(53);
+		}
 		const column = page.getByTestId('bottom-chat-dock');
 		// The session panel renders its honest unwired state offline (D09:
 		// the legacy in-memory composer is deleted, composer reachability at
@@ -782,14 +795,21 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 		await expect(column.getByTestId('session-chat-panel')).toBeVisible();
 		await expect(column.getByTestId('session-config-error')).toBeVisible();
 
-		// Geometry (CCC S1): the column is centered in the stage, its width
-		// bounded, and its height stretched between the stage paddings.
+		// Geometry (CCC S1 / CHC H1): the column BOX stays centered in the
+		// stage, width-bounded and stretched between the stage paddings —
+		// but it is now the transparent positioning host; the blended CARD
+		// (dock-body) is COMPACT and centered inside it in hero (no
+		// session): the surface hugs the honest panel, never a full-height
+		// empty slab.
 		const geo = await page.evaluate(() => {
 			const stage = document.querySelector('[data-testid="desktop"]')!.parentElement!;
 			const columnEl = document.querySelector('[data-testid="bottom-chat-dock"]')!;
+			const cardEl = columnEl.querySelector('.mai-desktop-shell__dock-body')!;
 			const sr = stage.getBoundingClientRect();
 			const cr = columnEl.getBoundingClientRect();
 			const sc = getComputedStyle(stage);
+			const cc = getComputedStyle(columnEl);
+			const cd = cardEl.getBoundingClientRect();
 			return {
 				stage: {
 					x: sr.x,
@@ -806,11 +826,24 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 					right: cr.right,
 					bottom: cr.bottom,
 					width: cr.width,
-					height: cr.height
+					height: cr.height,
+					padTop: parseFloat(cc.paddingTop),
+					padBottom: parseFloat(cc.paddingBottom),
+					padX: parseFloat(cc.paddingLeft),
+					isHero: columnEl.classList.contains('mai-desktop-shell__dock--hero')
+				},
+				card: {
+					top: cd.top,
+					bottom: cd.bottom,
+					height: cd.height,
+					width: cd.width
 				},
 				scrollW: document.documentElement.scrollWidth
 			};
 		});
+
+		// Hero state class drives the compact card (CHC H1).
+		expect(geo.column.isHero).toBe(true);
 
 		// Centered: the column's horizontal center matches the stage's
 		// (the stage, not the viewport — the drawer rail offsets the stage).
@@ -831,8 +864,8 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 			).toBeLessThanOrEqual(1);
 		}
 
-		// Height stretched between the stage paddings (top → bottom page
-		// padding): the column fills the available stage height exactly.
+		// The column BOX still stretches between the stage paddings (top →
+		// bottom page padding) — it is the positioning host.
 		expect(
 			Math.abs(geo.column.y - (geo.stage.y + geo.stage.padTop)),
 			'column top at stage content top'
@@ -841,6 +874,21 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 			Math.abs(geo.column.height - (geo.stage.height - geo.stage.padTop - geo.stage.padBottom)),
 			'column fills stage height minus paddings'
 		).toBeLessThanOrEqual(1);
+
+		// CHC H1: in hero the CARD is compact (a small fraction of the
+		// column, hugging the honest panel — never a full-height slab) and
+		// vertically centered inside the column's content box.
+		const contentTop = geo.column.y + geo.column.padTop;
+		const contentBottom = geo.column.bottom - geo.column.padBottom;
+		expect(geo.card.height).toBeLessThan((contentBottom - contentTop) / 2);
+		expect(
+			Math.abs(geo.card.top - contentTop - (contentBottom - geo.card.bottom)),
+			'hero card vertically centered in the column'
+		).toBeLessThanOrEqual(1.5);
+		expect(
+			Math.abs(geo.card.width - (geo.column.width - 2 * geo.column.padX)),
+			'hero card fills the column content width'
+		).toBeLessThanOrEqual(2);
 
 		// Contained: nothing paints outside the viewport and no horizontal
 		// page overflow at either viewport.
@@ -855,6 +903,23 @@ for (const viewport of [{width: 1280, height: 800}, {width: 360, height: 640}]) 
 		expect(requests.filter(url => url.includes('/api'))).toEqual([]);
 	});
 }
+
+test('the chat column carries the reduced-motion state class only under reduce (CHC H1)', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const column = page.getByTestId('bottom-chat-dock');
+	await expect(column).toBeVisible();
+	// Default motion: hero state class present, no reduced-motion gate.
+	await expect(column).toHaveClass(/mai-desktop-shell__dock--hero/);
+	await expect(column).not.toHaveClass(/mai-desktop-shell__dock--reduced-motion/);
+	// Reduced motion: the class flips with the media query — the shell's
+	// WAAPI card growth is gated on this state (instant switch instead).
+	await page.emulateMedia({ reducedMotion: 'reduce' });
+	await expect(column).toHaveClass(/mai-desktop-shell__dock--reduced-motion/);
+	await expect(column).toHaveClass(/mai-desktop-shell__dock--hero/);
+});
 
 test('drawer Chat History is honestly empty offline (no fabricated rows)', async ({
 	page

@@ -794,6 +794,12 @@
 
 	/** The centered chat column root (focus target for chat intents). */
 	let dockEl: HTMLElement | null = null;
+	/**
+	 * CHC H1: the column's blended CARD (`.mai-desktop-shell__dock-body`)
+	 * — the surface that hugs the composer in hero and grows to full
+	 * column height in active.
+	 */
+	let dockBodyEl: HTMLElement | null = null;
 	let drawerCollapsed = $state(false);
 
 	// --- Session-first drawer history (D07; F4 pagination, F3 channel) -------
@@ -1062,6 +1068,68 @@
 			Number(sessionEntries[0].seq) > 1
 	);
 
+	// --- CHC H1: hero compact card ↔ active full-height growth ---------------
+	/**
+	 * Honest motion budget: reduced-motion users get the INSTANT layout
+	 * switch — the WAAPI card growth is skipped entirely (tokens.css
+	 * already compiles CSS transitions out under reduce; Web Animations
+	 * are not covered by that rule, so the gate is explicit here).
+	 */
+	let shellMotionReduced = $state(false);
+	$effect(() => {
+		const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const apply = () => (shellMotionReduced = query.matches);
+		apply();
+		query.addEventListener('change', apply);
+		return () => query.removeEventListener('change', apply);
+	});
+
+	/** The hero→active card growth budget (CHC H1). */
+	const DOCK_CARD_GROWTH_MS = 240;
+	/**
+	 * The card's rect captured in `$effect.pre` — BEFORE the hero→active
+	 * DOM flip applies, i.e. while the card still hugs the composer — so
+	 * the growth can start from the exact compact geometry. `null` unless
+	 * the previous rendered state was hero (a session mounted straight to
+	 * active renders full-height directly: no flash, no animation).
+	 */
+	let dockCardFlipFrom: DOMRect | null = null;
+	let dockWasHero: boolean | null = null;
+	$effect.pre(() => {
+		const hero = activeSessionId === null;
+		if (dockWasHero === true && !hero && dockBodyEl !== null) {
+			dockCardFlipFrom = dockBodyEl.getBoundingClientRect();
+		}
+		dockWasHero = hero;
+	});
+
+	/**
+	 * After the flip settles: animate the card from the captured hero
+	 * rect to its new resting rect (~240ms ease, symmetric — the card's
+	 * auto block margins keep it centered while it grows). Pure-CSS
+	 * `auto ↔ 100%` heights are not interpolable, hence WAAPI; the panel
+	 * inside reflows per frame (its viewport is the flex:1 scroll
+	 * container), so the transcript unfolds above the bottom-pinned
+	 * composer as the surface grows.
+	 */
+	let dockCardAnimation: Animation | null = null;
+	$effect(() => {
+		void activeSessionId;
+		const card = dockBodyEl;
+		const from = dockCardFlipFrom;
+		dockCardFlipFrom = null;
+		if (card === null || from === null || shellMotionReduced) return;
+		const to = card.getBoundingClientRect();
+		if (Math.abs(to.height - from.height) < 2) return;
+		dockCardAnimation?.cancel();
+		dockCardAnimation = card.animate(
+			[
+				{ height: `${from.height}px` },
+				{ height: `${to.height}px` }
+			],
+			{ duration: DOCK_CARD_GROWTH_MS, easing: 'ease' }
+		);
+	});
 	/**
 	 * The dock's explicit panel context — a server scope following the
 	 * launcher's visible selection (read at submit time, never a hidden
@@ -1561,20 +1629,26 @@
 		{/each}
 	</div>
 
-	<!-- The Centered Chat Column (CCC S1): SessionChatPanel lives here
-	     persistently — never a registry window (no data-panel-kind, no
-	     workspace state). The column is centered in the stage, stretched
-	     between the stage paddings, and width-bounded so the spatial
-	     canvas stays visible on both sides; opened windows keep stacking
-	     above it. The fixture desktop drives it with the unwired bag and
-	     performs zero API requests. -->
+	<!-- The Centered Chat Column (CCC S1 / CHC H1): SessionChatPanel lives
+	     here persistently — never a registry window (no data-panel-kind,
+	     no workspace state). The column is centered in the stage and
+	     width-bounded so the spatial canvas stays visible on both sides;
+	     opened windows keep stacking above it. CHC H1: the column box is
+	     the transparent positioning host — the blended CARD (dock-body)
+	     hugs ONLY the composer in hero (sessionId null, centered by its
+	     auto block margins) and grows to the full column height when a
+	     chat starts or loads; the hero→active growth is the shell's WAAPI
+	     effect above (reduced motion: instant). The fixture desktop
+	     drives it with the unwired bag and performs zero API requests. -->
 	<section
 		class="mai-desktop-shell__dock"
+		class:mai-desktop-shell__dock--hero={activeSessionId === null}
+		class:mai-desktop-shell__dock--reduced-motion={shellMotionReduced}
 		data-testid="bottom-chat-dock"
 		aria-label="Chat column"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-body">
+		<div class="mai-desktop-shell__dock-body" bind:this={dockBodyEl}>
 			<!-- D09: the session-first virtualized surface is THE column; the
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
 			     live session the panel renders its honest empty/create state;
@@ -1737,13 +1811,13 @@
 	   and stretched between its paddings — out of flow, so the spatial
 	   canvas keeps its geometry and opened windows keep stacking ABOVE
 	   the column (`z-index: 5` under the canvas's `z-index: 20`).
-	   CSP P2 blended surface: near-canvas solid (--mai-color-surface),
-	   one quiet steel hairline, NO float shadow and NO brass on the
-	   frame — no glass, no backdrop blur; the Mechanicus character
-	   (typography, sigils, brass chips/buttons) lives INSIDE the column.
-	   The width is DETERMINISTIC, never content-driven, and bounded so
-	   the canvas stays visible on both sides; the page-padding floor
-	   keeps the column inside the stage at every width. */
+	   CHC H1: this box is now the TRANSPARENT positioning host — the
+	   blended surface lives on the card (dock-body) below so it can hug
+	   the composer in hero. `pointer-events: none` keeps empty-stage
+	   clicks honest: only the card (auto) is interactive. The width is
+	   DETERMINISTIC, never content-driven, and bounded so the canvas
+	   stays visible on both sides; the page-padding floor keeps the
+	   column inside the stage at every width. */
 	.mai-desktop-shell__dock {
 		position: absolute;
 		top: var(--mai-space-2);
@@ -1757,10 +1831,7 @@
 		display: flex;
 		flex-direction: column;
 		padding: var(--mai-hud-pad-y) var(--mai-hud-pad-x);
-		background: var(--mai-color-surface);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
-		box-shadow: none;
+		pointer-events: none;
 	}
 
 	/* Pocket viewports (CCC S1): the bounded column yields its side
@@ -1772,11 +1843,29 @@
 		}
 	}
 
+	/* CHC H1 — the blended CARD. CSP P2 surface: near-canvas solid
+	   (--mai-color-surface), one quiet steel hairline, NO float shadow
+	   and NO brass on the frame — no glass, no backdrop blur; the
+	   Mechanicus character (typography, sigils, brass chips/buttons)
+	   lives INSIDE the card. Active: `height: 100%` fills the column
+	   (NOT flex-grow — the explicit height is what the shell's WAAPI
+	   growth animates). Hero: `height: auto` hugs ONLY the composer and
+	   the auto block margins center it in the column, so the visible
+	   surface is a compact centered card — never a full-height slab. */
 	.mai-desktop-shell__dock-body {
-		flex: 1 1 auto;
+		pointer-events: auto;
+		flex: 0 0 auto;
+		margin-block: auto;
+		height: 100%;
 		min-height: 0;
 		min-width: 0;
-		overflow: visible;
+		background: var(--mai-color-surface);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
+		box-shadow: none;
+	}
+	.mai-desktop-shell__dock--hero .mai-desktop-shell__dock-body {
+		height: auto;
 	}
 
 	.mai-desktop-shell__taskbar {
