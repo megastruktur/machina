@@ -249,9 +249,10 @@
 	let controlBusy = $state<string | null>(null);
 	let controlProblem = $state<{ code: string; message: string } | null>(null);
 
-	// --- CCC S2: hero (create) vs active layout ------------------------------
-	/** Hero = no session yet: ONLY the centered composer (picker + textarea
-	 * + Send). Everything transcript-ish is active-state chrome. */
+	// --- CCC S2 / CSP P1: hero (create) vs active layout ---------------------
+	/** Hero = no session yet: ONLY the bottom-anchored composer (picker +
+	 * textarea + Send) under a calm empty surface. Everything transcript-ish
+	 * is active-state chrome. */
 	const isHero = $derived(sessionId === null);
 
 	/** Honest motion budget: reduced-motion users get instant layout
@@ -796,12 +797,14 @@
 		</div>
 	{:else}
 
-		<!-- CCC S2 hero/active: the composer footer is ONE DOM node in both
-		     states — the hero→active switch never remounts it, so focus and
-		     the live draft survive the transition. The two spacers grow to
-		     center the composer in hero and collapse (animated flex-grow)
-		     while the active chrome — header, viewport, notices — takes
-		     their place. -->
+		<!-- CSP P1 hero/active: the composer footer is ONE DOM node in both
+		     states and always the LAST flex child — pinned to the true
+		     bottom; the hero→active switch never remounts it, so focus and
+		     the live draft survive the transition. In hero the single top
+		     spacer grows (flex:1) into the calm empty surface above the
+		     composer; on hero→active its flex-grow animates down to 0
+		     while the text background — header, viewport, notices —
+		     unfolds into the freed space (spacer CSS below). -->
 		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
 		{#if !isHero}
 		<header class="mai-session-chat__header">
@@ -1365,7 +1368,6 @@
 				</div>
 			{/if}
 		</footer>
-		<div class="mai-session-chat__spacer" aria-hidden="true"></div>
 	{/if}
 </div>
 
@@ -1373,11 +1375,13 @@
 	.mai-session-chat {
 		display: flex;
 		flex-direction: column;
-		/* Same docked envelope as ChatPanel's `.mai-chat__body` bound: the
-		   dock host is position:absolute with auto height, so `height:100%`
-		   would grow to intrinsic content height and the history viewport
-		   would never overflow (no scroll events, no demand-load). */
-		height: min(32rem, calc(100dvh - 10rem));
+		/* CSP P1: the panel fills its stretched host. The chain gives a
+		   DEFINITE height — the dock column is absolute top/bottom and
+		   .mai-desktop-shell__dock-body is flex:1/min-height:0 — so
+		   height:100% resolves and the transcript viewport stays the
+		   flex:1/min-height:0 scroll container virtua needs (the old
+		   min(32rem, …) cap from the retired dock envelope is gone). */
+		height: 100%;
 		min-height: 0;
 		overflow: hidden;
 	}
@@ -1401,14 +1405,16 @@
 		--mai-tool-label-size: 0.8125rem;
 	}
 
-	/* ---- CCC S2: hero (create) vs active (session) layout ----------------
-	 * The composer footer is ONE DOM node in both states. In hero the two
-	 * spacers grow (flex 1 1 0) and center it vertically; the active
-	 * chrome — header, viewport, notices — renders between the collapsed
-	 * spacers instead. The hero→active switch animates the spacers'
-	 * flex-grow (240ms) so the composer slides to the bottom while the
-	 * transcript expands into the freed space; reduced-motion compiles
-	 * the transition out entirely (class + matchMedia agree). */
+	/* ---- CSP P1: hero (create) vs active (session) layout -----------------
+	 * The composer footer is ONE DOM node in both states and always the
+	 * LAST flex child — pinned to the TRUE bottom edge. In hero the
+	 * single top spacer grows (flex 1 1 0) into the calm empty surface
+	 * above the composer; in active the transcript chrome — header,
+	 * viewport, notices — renders between the spacer and the composer
+	 * instead. The hero→active switch animates the spacer's flex-grow
+	 * (240ms ease) down to 0 so the text background unfolds to full
+	 * height while the composer stays at the bottom; reduced-motion
+	 * compiles the transition out entirely (class + matchMedia agree). */
 	.mai-session-chat__spacer {
 		flex: 0 1 0;
 		min-height: 0;
@@ -1420,8 +1426,9 @@
 	.mai-session-chat:not(.mai-session-chat--reduced-motion) .mai-session-chat__spacer {
 		transition: flex-grow 240ms ease;
 	}
-	/* Hero composer: a bounded, centered prompt block — no border against
-	 * nothing, a touch more breathing room than the active footer. */
+	/* Hero composer: a bounded, horizontally centered prompt block pinned
+	 * at the bottom — no border against nothing, a touch more breathing
+	 * room than the active footer. */
 	.mai-session-chat--hero .mai-session-chat__composer {
 		width: 100%;
 		max-width: 640px;
