@@ -77,6 +77,7 @@ from mai.contracts.sessions import (
     ControlActionKind,
     ControlEntry,
     EntryKind,
+    MAX_ENTRY_TEXT_CHARS,
     MAX_SUMMARY_TEXT_CHARS,
     SERVICE_MAP_SECTION_HEADER,
     ProviderReasoningArtifact,
@@ -91,7 +92,11 @@ from mai.contracts.sessions import (
 )
 from mai.contracts.tool_results import DomainOutcome, EffectCertainty, ExecutionStatus
 from mai.database import create_app_engine
-from mai.session_store import acreate_session, aread_session_history
+from mai.session_store import (
+    _validated_payload,
+    acreate_session,
+    aread_session_history,
+)
 
 BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1]
 ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
@@ -566,6 +571,147 @@ def test_thinking_capture_is_summary_bounded_and_control_sanitized() -> None:
     )
     huge_artifact = drafts_huge[0].payload.provider_artifacts[0]
     assert len(huge_artifact.content) == MAX_SUMMARY_TEXT_CHARS
+
+
+def test_assistant_capture_fits_entry_budget_cyrillic() -> None:
+    """2026-11-12 incident regression: the budget is CHARACTERS, not
+    escaped ASCII. The incident shape (a 2 500-char Cyrillic final answer
+    plus a 1 400-char thinking artifact — 23 629 serialized chars under
+    ``ensure_ascii=True``) must pass through capture untouched and the
+    store's payload validator must accept the draft."""
+    ts = _EPOCH_TEST
+    drafts = extract_entries_from_run_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="рассуждение " * 117,  # ~1 400 chars
+                        provider_name="openai",
+                    ),
+                    TextPart("итоговый отчёт " * 179),  # ~2 500 chars
+                ],
+                timestamp=ts,
+                usage=RequestUsage(),
+            )
+        ],
+        session_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    payload = drafts[0].payload
+    serialized = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)
+    assert len(serialized) <= MAX_ENTRY_TEXT_CHARS
+    # nothing needed trimming at this size: the answer survived whole
+    assert payload.text == "итоговый отчёт " * 179
+    assert "[truncated:" not in payload.provider_artifacts[0].content
+    _validated_payload(payload.model_dump(mode="json"))  # store accepts
+
+
+def test_assistant_capture_bounds_overbudget_draft_honestly() -> None:
+    """An over-budget assistant draft is bounded BEFORE it is returned and
+    never raises for size reasons: provider artifacts shrink from the LAST
+    one backwards with explicit truncation markers (whole artifacts drop
+    when even a marked tail no longer fits), then the text bounds to the
+    remaining budget; tool_calls are the replay contract and stay intact."""
+    ts = _EPOCH_TEST
+
+    def _draft(parts: list) -> AssistantMessageEntry:
+        response = extract_entries_from_run_messages(
+            [ModelResponse(parts=parts, timestamp=ts, usage=RequestUsage())],
+            session_id=uuid.uuid4(),
+            run_id=uuid.uuid4(),
+            model_profile=MODEL_PROFILE,
+            provider=PROVIDER,
+        )
+        assert len(response) == 1
+        return response[0].payload
+
+    def _chars(payload: AssistantMessageEntry) -> int:
+        return len(json.dumps(payload.model_dump(mode="json"), ensure_ascii=False))
+
+    # (a) artifacts trim first, from the LAST backwards, with a marker:
+    # the answer text survives whole and the store accepts the draft.
+    payload = _draft(
+        [
+            ThinkingPart(
+                content="рассуждение " * 117,  # ~1 400 chars
+                provider_name=PROVIDER,
+            ),
+            TextPart("я" * 19_000),
+        ]
+    )
+    assert _chars(payload) <= MAX_ENTRY_TEXT_CHARS
+    assert payload.text == "я" * 19_000
+    assert "[truncated:" in payload.provider_artifacts[0].content
+    assert len(payload.provider_artifacts[0].content) > 700  # real tail
+    _validated_payload(payload.model_dump(mode="json"))
+
+    # (a2) two artifacts: the LAST one is damaged at least as much as the
+    # first (trimming runs backwards).
+    payload = _draft(
+        [
+            ThinkingPart(content="а" * MAX_SUMMARY_TEXT_CHARS, provider_name=PROVIDER),
+            ThinkingPart(content="б" * MAX_SUMMARY_TEXT_CHARS, provider_name=PROVIDER),
+            TextPart("в" * 15_000),
+        ]
+    )
+    assert _chars(payload) <= MAX_ENTRY_TEXT_CHARS
+    assert payload.text == "в" * 15_000
+    kept = [len(a.content) for a in payload.provider_artifacts]
+    assert kept[-1] <= kept[0]
+
+    # (b) text bounds to the remaining budget with a marker; tool_calls
+    # stay intact and the store accepts the draft.
+    payload = _draft(
+        [
+            TextPart("я" * 19_950),
+            ToolCallPart(tool_name="host.shell", args={"cmd": "ls -la"}, tool_call_id="call-1"),
+        ]
+    )
+    assert _chars(payload) <= MAX_ENTRY_TEXT_CHARS
+    assert payload.text.startswith("яяя") and "[truncated:" in payload.text
+    assert len(payload.text) > 19_000  # a real tail, not the minimal marker
+    assert payload.tool_calls[0].call_id == "call-1"
+    assert payload.tool_calls[0].args == {"cmd": "ls -la"}
+    _validated_payload(payload.model_dump(mode="json"))
+
+    # (b2) oversized calls crowd artifacts and text out entirely: the
+    # artifacts drop, the text shrinks to an honestly marked tail, and the
+    # calls themselves are preserved verbatim.
+    payload = _draft(
+        [
+            ThinkingPart(content="рассуждение " * 100, provider_name=PROVIDER),
+            TextPart("я" * 5_000),
+            ToolCallPart(tool_name="host.shell", args={"blob": "z" * 19_000}, tool_call_id="call-2"),
+        ]
+    )
+    assert _chars(payload) <= MAX_ENTRY_TEXT_CHARS
+    assert payload.provider_artifacts == []
+    assert "[truncated:" in payload.text and 0 < len(payload.text) < 5_000
+    assert payload.tool_calls[0].args == {"blob": "z" * 19_000}
+    _validated_payload(payload.model_dump(mode="json"))
+
+    # A model answer longer than the contract's 20k-char text field (an
+    # 8k-token Cyrillic answer can exceed it) no longer fails capture
+    # construction: it arrives honestly marked and within the budget.
+    payload = _draft([TextPart("с" * 30_000)])
+    assert _chars(payload) <= MAX_ENTRY_TEXT_CHARS
+    assert "[truncated:" in payload.text and len(payload.text) > 19_000
+    _validated_payload(payload.model_dump(mode="json"))
+
+    # Pathological calls that alone exceed the budget are NOT masked here:
+    # capture still returns them intact and the store's fail-closed
+    # rejection stays the authority.
+    payload = _draft(
+        [
+            TextPart("я" * 500),
+            ToolCallPart(tool_name="host.shell", args={"blob": "z" * 19_980}, tool_call_id="call-3"),
+        ]
+    )
+    assert payload.tool_calls[0].args == {"blob": "z" * 19_980}
+    with pytest.raises(SessionContractError):
+        _validated_payload(payload.model_dump(mode="json"))
 
 
 # ---------------------------------------------------------------------------

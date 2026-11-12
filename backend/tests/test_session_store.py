@@ -344,6 +344,35 @@ async def test_aborted_append_consumes_no_sequence(
     )
     assert replay.entry_id == second.entry_id and replay.seq == 2
 
+async def test_entry_payload_budget_counts_chars_not_escaped_ascii() -> None:
+    """2026-11-12 incident regression: ``_validated_payload`` measures the
+    entry budget in CHARACTERS (``ensure_ascii=False`` — the pydantic
+    ``max_length`` unit). A 19k-char Cyrillic answer must not inflate to
+    ~114k escaped-ASCII characters and reject the persist AFTER the model
+    already succeeded; the over-budget rejection itself is unchanged."""
+    from mai.contracts.sessions import MAX_ENTRY_TEXT_CHARS, AssistantMessageEntry
+    from mai.session_store import _validated_payload
+
+    def _assistant(text: str) -> dict[str, object]:
+        return AssistantMessageEntry(
+            kind=EntryKind.ASSISTANT_MESSAGE,
+            text=text,
+            model_profile="default",
+        ).model_dump(mode="json")
+
+    # Cyrillic at 19k chars passes and stays unescaped in the document...
+    serialized = _validated_payload(_assistant("д" * 19_000))
+    assert len(serialized) <= MAX_ENTRY_TEXT_CHARS
+    assert "д" * 100 in serialized and "\\u" not in serialized
+    # ...ASCII near the cap behaves identically...
+    assert len(_validated_payload(_assistant("x" * 19_000))) <= MAX_ENTRY_TEXT_CHARS
+    # ...and the over-budget rejection path is unchanged: 19 950 chars fit
+    # the pydantic field but the serialized envelope still crosses the cap.
+    with pytest.raises(SessionContractError) as err:
+        _validated_payload(_assistant("x" * 19_950))
+    # value-free summary: the field path + code, never content
+    assert err.value.fields == {"payload": "forbidden_field"}
+
 
 # ---------------------------------------------------------------------------
 # 4. 10,000-entry bounds
