@@ -230,6 +230,14 @@ export type ServiceId = string;
  */
 export type RunbookId = string;
 /**
+ * Canonical Service Map application identity the session is scoped to
+ */
+export type ServiceId1 = string;
+/**
+ * Bounded current display name at admission; NULL when the map entry is unavailable (the context renders the deterministic unavailable fallback instead of borrowing a name)
+ */
+export type Name = string | null;
+/**
  * Discriminator: this payload is an assistant message entry
  */
 export type Kind1 = "assistant_message";
@@ -928,6 +936,10 @@ export interface UserMessageEntry {
    * Runbook provenance when the turn was a runbook execution
    */
   runbook_ref?: RunbookRef | null;
+  /**
+   * Interactive service-scope provenance when the session is service-bound (SCOPE-2; server-derived, never a turn-body authority); the FIRST entry's persisted text already carries the full service map section
+   */
+  service_ref?: ServiceRef | null;
 }
 /**
  * Provenance reference of a document-attach admission (sfc_INTENT §8):
@@ -947,6 +959,17 @@ export interface DocumentAttachRef {
 export interface RunbookRef {
   service_id: ServiceId;
   runbook_id: RunbookId;
+}
+/**
+ * Interactive service-scope provenance (SCOPE-2): the canonical
+ * adopted-service identity plus the bounded current display name at
+ * admission. This is interactive scope provenance, NOT a
+ * :class:`RunbookRef` and never labelled runbook execution; turn bodies
+ * can never inject it.
+ */
+export interface ServiceRef {
+  service_id: ServiceId1;
+  name?: Name;
 }
 /**
  * One assistant model response (sfc_RESEARCH §2): bounded safe text
