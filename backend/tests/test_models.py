@@ -470,6 +470,25 @@ def test_settings_payload_is_exactly_the_selected_allowlist() -> None:
     assert dict(model_settings(bare)) == {}
 
 
+def test_settings_enforce_declared_output_limit_as_max_tokens() -> None:
+    """A profile's declared ``output_limit`` reaches the wire as
+    ``max_tokens`` when the profile sets no explicit cap; an explicit
+    ``max_tokens`` always wins (2026-11-12: glm53flash declared 8192 but
+    nothing enforced the cap on the wire)."""
+    capped = parse_profile(
+        {**_PROFILE_DOC, "max_tokens": None, "output_limit": 8192}
+    )
+    assert model_settings(capped)["max_tokens"] == 8192
+    explicit = parse_profile(
+        {**_PROFILE_DOC, "max_tokens": 1000, "output_limit": 8192}
+    )
+    assert model_settings(explicit)["max_tokens"] == 1000
+    bare = parse_profile(
+        {"schema_version": 1, "name": "p", "connection": "c", "model": "m"}
+    )
+    assert "max_tokens" not in dict(model_settings(bare))
+
+
 def test_built_model_carries_profile_identity_and_settings() -> None:
     with _ControlledEndpoint(
         lambda body, headers: (200, _completion("test-model", "hi"))

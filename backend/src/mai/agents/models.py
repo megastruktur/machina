@@ -827,7 +827,9 @@ def model_settings(profile: ModelProfile) -> OpenAIChatModelSettings:
     """The PydanticAI settings payload for a profile (allowlisted keys only).
 
     ``None`` fields are omitted: nothing is invented on the wire beyond what
-    the profile explicitly selects.
+    the profile explicitly selects. A declared ``output_limit`` without an
+    explicit ``max_tokens`` is enforced as ``max_tokens`` (the explicit
+    ``max_tokens`` always wins) so the declared output cap reaches the wire.
     """
     settings: OpenAIChatModelSettings = OpenAIChatModelSettings()
     if profile.temperature is not None:
@@ -838,6 +840,8 @@ def model_settings(profile: ModelProfile) -> OpenAIChatModelSettings:
         settings["seed"] = profile.seed
     if profile.max_tokens is not None:
         settings["max_tokens"] = profile.max_tokens
+    elif profile.output_limit is not None:
+        settings["max_tokens"] = profile.output_limit
     if profile.reasoning_effort is not None:
         settings["openai_reasoning_effort"] = profile.reasoning_effort
     return settings

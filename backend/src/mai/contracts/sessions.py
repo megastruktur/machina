@@ -474,7 +474,11 @@ class ToolCallItem(BaseModel):
 
     @model_validator(mode="after")
     def _args_are_bounded(self) -> "ToolCallItem":
-        if len(json.dumps(self.args)) > MAX_ENTRY_TEXT_CHARS:
+        # The budget is CHARACTERS, never escaped ASCII (the same
+        # discipline as the session-store entry budget): counting
+        # ``\uXXXX`` escapes would reject Cyrillic tool args at ~1/6 of
+        # the real budget (2026-11-12 incident follow-up).
+        if len(json.dumps(self.args, ensure_ascii=False)) > MAX_ENTRY_TEXT_CHARS:
             raise ValueError(
                 "tool-call arguments exceed the bounded entry payload budget"
             )
