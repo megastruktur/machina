@@ -329,7 +329,11 @@ def _validated_payload(payload: object) -> str:
                 )
             ]
         )
-    serialized = json.dumps(dict(payload))
+    # The budget is CHARACTERS (the pydantic ``max_length`` unit), never
+    # escaped ASCII: ``ensure_ascii=True`` would inflate every Cyrillic
+    # char to a 6-char ``\uXXXX`` escape and reject a long Russian final
+    # answer AFTER the model already succeeded (2026-11-12 incident).
+    serialized = json.dumps(dict(payload), ensure_ascii=False)
     if len(serialized) > MAX_ENTRY_TEXT_CHARS:
         raise SessionContractError(
             [

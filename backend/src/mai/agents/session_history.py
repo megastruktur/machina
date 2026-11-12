@@ -499,6 +499,121 @@ def _envelope_bytes(envelope: Mapping[str, object]) -> int:
 # --- capture: native run messages -> durable session entries -----------------------
 
 
+#: Floor for the minimal honestly-marked assistant text kept when nothing
+#: else fits the entry budget (the truncation marker plus a body char).
+_MIN_MARKED_TEXT_CHARS: Final[int] = 64
+
+
+def _assistant_chars(payload: AssistantMessageEntry) -> int:
+    """Serialized assistant-draft size in the store's budget characters
+    (``ensure_ascii=False`` — the exact measurement ``_validated_payload``
+    applies, so a Cyrillic char is one char, never six)."""
+    return len(json.dumps(payload.model_dump(mode="json"), ensure_ascii=False))
+
+
+def _assistant_artifact_wrapper_chars(artifact: ProviderReasoningArtifact) -> int:
+    """Serialized size of one artifact EXCLUDING its content (the fixed
+    JSON wrapper the content allowance must also pay for)."""
+    empty = artifact.model_copy(update={"content": ""})
+    return len(json.dumps(empty.model_dump(mode="json"), ensure_ascii=False))
+
+
+def _bounded_assistant_payload(
+    payload: AssistantMessageEntry,
+) -> AssistantMessageEntry:
+    """Bound one assistant draft to the per-entry character budget BEFORE
+    it is returned, so a finished long answer can never fail the whole
+    persist (2026-11-12 incident: the run died AFTER the model succeeded).
+
+    Provider artifacts shrink from the LAST one backwards with explicit
+    truncation markers — whole artifacts drop when the remaining allowance
+    cannot carry a marked tail — then the text bounds to whatever budget
+    remains (at minimum a small marked text). ``tool_calls`` are the
+    replay contract and stay intact; never raises for size reasons. When
+    the calls alone exceed the budget, the store's fail-closed rejection
+    stays the authority."""
+    budget = MAX_ENTRY_TEXT_CHARS
+
+    def _over(candidate: AssistantMessageEntry) -> bool:
+        return _assistant_chars(candidate) > budget
+
+    def _largest_marked_fit(
+        text: str,
+        allowance: int,
+        build: Callable[[str], AssistantMessageEntry],
+    ) -> AssistantMessageEntry | None:
+        """The largest honestly-marked bound of ``text`` whose ``build``
+        result fits the budget, or ``None`` when nothing fits.
+
+        A character allowance is optimistic by the JSON escape overhead
+        (quotes/backslashes/the marker's own newline), so every miss pays
+        the EXACT measured overage and retries; the allowance strictly
+        shrinks, so the loop terminates."""
+        while allowance > 0:
+            bounded_text, _, _ = _bound_with_marker(text, allowance)
+            candidate = build(bounded_text)
+            if not _over(candidate):
+                return candidate
+            overage = _assistant_chars(candidate) - budget
+            if overage >= allowance:
+                return None
+            allowance -= overage
+        return None
+
+    if not _over(payload):
+        return payload
+
+    bounded = payload
+    # (a) shrink provider artifacts from the LAST one backwards, dropping
+    # whole artifacts when even a marked tail no longer fits
+    while bounded.provider_artifacts and _over(bounded):
+        last = bounded.provider_artifacts[-1]
+        rest = bounded.provider_artifacts[:-1]
+        without_last = bounded.model_copy(update={"provider_artifacts": rest})
+
+        def _with_content(content: str) -> AssistantMessageEntry:
+            return without_last.model_copy(
+                update={
+                    "provider_artifacts": [
+                        *rest,
+                        last.model_copy(update={"content": content}),
+                    ]
+                }
+            )
+
+        # the allowance feeds the CONTENT bound, so the artifact's own JSON
+        # wrapper (provider/kind/quotes) must leave the budget first
+        allowance = (
+            budget
+            - _assistant_chars(without_last)
+            - _assistant_artifact_wrapper_chars(last)
+        )
+        bounded = (
+            _largest_marked_fit(last.content, allowance, _with_content)
+            or without_last
+        )
+    # (b) bound the text to the remaining budget (artifacts are exhausted
+    # here); keep at least a minimal marked text when nothing else fits
+    if _over(bounded):
+        without_text = bounded.model_copy(update={"text": ""})
+
+        def _with_text(text: str) -> AssistantMessageEntry:
+            return without_text.model_copy(update={"text": text})
+
+        allowance = budget - _assistant_chars(without_text)
+        bounded = (
+            _largest_marked_fit(bounded.text, allowance, _with_text)
+            or without_text.model_copy(
+                update={
+                    "text": _bound_with_marker(
+                        payload.text, _MIN_MARKED_TEXT_CHARS
+                    )[0]
+                }
+            )
+        )
+    return bounded
+
+
 def extract_entries_from_run_messages(
     new_messages: Sequence[ModelMessage],
     *,
@@ -518,8 +633,13 @@ def extract_entries_from_run_messages(
     API — verified — and therefore cannot occur here). ``ThinkingPart``
     content becomes bounded :class:`ProviderReasoningArtifact` references on
     the assistant entry; :func:`apersist_run_exchange` additionally persists
-    the full artifact row. An assistant message whose calls are not all
-    answered within this exchange stays ``tool_group_state="pending"``
+    the full artifact row. The assistant draft itself is bounded to the
+    per-entry character budget before it is returned
+    (:func:`_bounded_assistant_payload`: artifacts shrink last-first with
+    explicit truncation markers, then the text; tool_calls stay intact),
+    so a finished long answer can never fail the persist. An assistant
+    message whose calls are not all answered within this exchange stays
+    ``tool_group_state="pending"``
     (deferred/approval-required or crash window) — durable first, replay
     safety enforced at projection time by the atomic-group partition.
     Deterministic ``(run_id, durable_source_id, kind)`` ids make the persist
@@ -546,6 +666,10 @@ def extract_entries_from_run_messages(
             text = "".join(
                 part.content for part in message.parts if isinstance(part, TextPart)
             )
+            # The contract's text field is a hard 20k chars: a longer model
+            # answer would fail AssistantMessageEntry construction itself,
+            # so the assembly is honestly marked-bounded first.
+            text = _bound_with_marker(text, MAX_ENTRY_TEXT_CHARS)[0]
             tool_calls: list[ToolCallItem] = []
             artifacts: list[ProviderReasoningArtifact] = []
             for part in message.parts:
@@ -575,13 +699,15 @@ def extract_entries_from_run_messages(
                     )
             if not text and not tool_calls and not artifacts:
                 continue  # a partless response carries nothing durable
-            payload = AssistantMessageEntry(
-                kind=EntryKind.ASSISTANT_MESSAGE,
-                text=text,
-                tool_calls=tool_calls,
-                model_profile=model_profile,
-                provider_artifacts=artifacts,
-                tool_group_state="pending" if tool_calls else "none",
+            payload = _bounded_assistant_payload(
+                AssistantMessageEntry(
+                    kind=EntryKind.ASSISTANT_MESSAGE,
+                    text=text,
+                    tool_calls=tool_calls,
+                    model_profile=model_profile,
+                    provider_artifacts=artifacts,
+                    tool_group_state="pending" if tool_calls else "none",
+                )
             )
             assistant_draft = _draft(payload, f"{durable_prefix}:{index}")
             drafts.append(assistant_draft)
