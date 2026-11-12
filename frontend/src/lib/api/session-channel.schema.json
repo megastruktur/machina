@@ -1074,6 +1074,37 @@
           "title": "ServerSnapshotFrame",
           "type": "object"
         },
+        "ServiceRef": {
+          "additionalProperties": false,
+          "description": "Interactive service-scope provenance (SCOPE-2): the canonical\nadopted-service identity plus the bounded current display name at\nadmission. This is interactive scope provenance, NOT a\n:class:`RunbookRef` and never labelled runbook execution; turn bodies\ncan never inject it.",
+          "properties": {
+            "service_id": {
+              "description": "Canonical Service Map application identity the session is scoped to",
+              "format": "uuid",
+              "title": "Service Id",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded current display name at admission; NULL when the map entry is unavailable (the context renders the deterministic unavailable fallback instead of borrowing a name)",
+              "title": "Name"
+            }
+          },
+          "required": [
+            "service_id"
+          ],
+          "title": "ServiceRef",
+          "type": "object"
+        },
         "SessionEntryView": {
           "additionalProperties": false,
           "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
@@ -1458,6 +1489,18 @@
               ],
               "default": null,
               "description": "Runbook provenance when the turn was a runbook execution"
+            },
+            "service_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ServiceRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Interactive service-scope provenance when the session is service-bound (SCOPE-2; server-derived, never a turn-body authority); the FIRST entry's persisted text already carries the full service map section"
             }
           },
           "required": [
@@ -2561,6 +2604,37 @@
           "title": "ServerSnapshotFrame",
           "type": "object"
         },
+        "ServiceRef": {
+          "additionalProperties": false,
+          "description": "Interactive service-scope provenance (SCOPE-2): the canonical\nadopted-service identity plus the bounded current display name at\nadmission. This is interactive scope provenance, NOT a\n:class:`RunbookRef` and never labelled runbook execution; turn bodies\ncan never inject it.",
+          "properties": {
+            "service_id": {
+              "description": "Canonical Service Map application identity the session is scoped to",
+              "format": "uuid",
+              "title": "Service Id",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Bounded current display name at admission; NULL when the map entry is unavailable (the context renders the deterministic unavailable fallback instead of borrowing a name)",
+              "title": "Name"
+            }
+          },
+          "required": [
+            "service_id"
+          ],
+          "title": "ServiceRef",
+          "type": "object"
+        },
         "SessionEntryView": {
           "additionalProperties": false,
           "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
@@ -2945,6 +3019,18 @@
               ],
               "default": null,
               "description": "Runbook provenance when the turn was a runbook execution"
+            },
+            "service_ref": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ServiceRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Interactive service-scope provenance when the session is service-bound (SCOPE-2; server-derived, never a turn-body authority); the FIRST entry's persisted text already carries the full service map section"
             }
           },
           "required": [
@@ -3990,6 +4076,37 @@
       "title": "ServerSnapshotFrame",
       "type": "object"
     },
+    "ServiceRef": {
+      "additionalProperties": false,
+      "description": "Interactive service-scope provenance (SCOPE-2): the canonical\nadopted-service identity plus the bounded current display name at\nadmission. This is interactive scope provenance, NOT a\n:class:`RunbookRef` and never labelled runbook execution; turn bodies\ncan never inject it.",
+      "properties": {
+        "service_id": {
+          "description": "Canonical Service Map application identity the session is scoped to",
+          "format": "uuid",
+          "title": "Service Id",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounded current display name at admission; NULL when the map entry is unavailable (the context renders the deterministic unavailable fallback instead of borrowing a name)",
+          "title": "Name"
+        }
+      },
+      "required": [
+        "service_id"
+      ],
+      "title": "ServiceRef",
+      "type": "object"
+    },
     "SessionEntryView": {
       "additionalProperties": false,
       "description": "One committed domain entry as projected to every consumer (sfc_PLAN\nD01): versioned envelope identity plus the discriminated payload. The\ntrusted session writer is the sole producer; clients never assign\n``seq`` or entry identity.",
@@ -4374,6 +4491,18 @@
           ],
           "default": null,
           "description": "Runbook provenance when the turn was a runbook execution"
+        },
+        "service_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Interactive service-scope provenance when the session is service-bound (SCOPE-2; server-derived, never a turn-body authority); the FIRST entry's persisted text already carries the full service map section"
         }
       },
       "required": [
