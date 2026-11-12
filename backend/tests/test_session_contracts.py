@@ -942,6 +942,27 @@ def test_entry_and_payload_bounds_fail_closed() -> None:
         EntryCursor(seq=0)
 
 
+def test_tool_call_args_budget_counts_chars_not_escapes() -> None:
+    """Cyrillic tool args are measured in CHARACTERS (ensure_ascii=False),
+    never 6-char ``\\uXXXX`` escapes: ~19 000 chars of Cyrillic fits the
+    entry budget that escape counting would cut at ~1/6 (2026-11-12
+    incident follow-up; same discipline as the session-store budget)."""
+    item = ToolCallItem(
+        call_id="call-1",
+        tool_name="host.shell",
+        capability_id="host.shell",
+        args={"текст": "ф" * 19_000},
+    )
+    assert len(item.args["текст"]) == 19_000
+    with pytest.raises(ValidationError):  # genuinely over the char budget
+        ToolCallItem(
+            call_id="call-1",
+            tool_name="host.shell",
+            capability_id="host.shell",
+            args={"текст": "ф" * (MAX_ENTRY_TEXT_CHARS + 1)},
+        )
+
+
 def test_compaction_record_enforces_range_order() -> None:
     record = SessionCompactionRecord(
         compaction_id=_request_id(1),

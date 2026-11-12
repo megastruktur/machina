@@ -1572,6 +1572,51 @@ def test_parse_session_run_intent_round_budget_bounds() -> None:
     assert over.value.reason == "invalid_max_rounds"
 
 
+def test_contract_rejection_detail_is_value_free() -> None:
+    """A contract-rejected settlement names WHICH rule fired as sorted,
+    deduplicated ``contract:code:field`` pairs only — bounded to
+    ``MAX_DETAIL_CHARS`` — so operators skip the DBOS pickle; field
+    values and messages never enter the detail (C01 rule 3), and an
+    exception without classified errors settles detail-less (previous
+    behavior)."""
+    from mai.agents.session_runner import _contract_rejection_detail
+    from mai.contracts.sessions import (
+        MAX_DETAIL_CHARS,
+        SessionContractError,
+        SessionFieldError,
+    )
+
+    error = SessionContractError(
+        [
+            SessionFieldError(
+                "forbidden_field",
+                "payload",
+                "entry payload exceeds the bounded entry budget",
+            ),
+            SessionFieldError(
+                "forbidden_field",
+                "payload",
+                "duplicate identity carrying a secret sk-SENTINEL value",
+            ),
+            SessionFieldError("invalid_field", "tool_calls", "bad shape"),
+        ]
+    )
+    detail = _contract_rejection_detail(error)
+    assert detail == "contract:forbidden_field:payload,invalid_field:tool_calls"
+    assert len(detail) <= MAX_DETAIL_CHARS
+    assert "SENTINEL" not in detail and "budget" not in detail
+
+    many = SessionContractError(
+        [
+            SessionFieldError("forbidden_field", f"field-{n}", "value-free")
+            for n in range(100)
+        ]
+    )
+    assert len(_contract_rejection_detail(many)) == MAX_DETAIL_CHARS
+
+    assert _contract_rejection_detail(SessionContractError([])) is None
+
+
 # ---------------------------------------------------------------------------
 # R04 fix-round focused tests (M1-M4)
 # ---------------------------------------------------------------------------

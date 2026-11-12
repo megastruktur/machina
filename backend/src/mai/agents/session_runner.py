@@ -3134,8 +3134,12 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
             payload_json, stage.reason, detail=getattr(stage, "evidence", None)
         )
         raise SessionRunFailed(stage.reason) from None
-    except SessionContractError:
-        _session_failed(payload_json, "contract_rejected")
+    except SessionContractError as error:
+        _session_failed(
+            payload_json,
+            "contract_rejected",
+            detail=_contract_rejection_detail(error),
+        )
         raise SessionRunFailed("contract_rejected") from None
     except (dbos_error.DBOSAwaitedWorkflowCancelledError, dbos_error.DBOSException) as cancelled:
         # Engine-side cancellation landed (facade request_cancel): the
@@ -3196,6 +3200,20 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
         # workflow boundary (DBOS pickles it into workflow sinks) — the
         # safe classified failure surfaces instead, cause detached.
         raise SessionRunFailed("unexpected_failure") from None
+
+
+def _contract_rejection_detail(error: SessionContractError) -> str | None:
+    """The bounded VALUE-FREE detail for a contract-rejected settlement.
+
+    Operators see WHICH contract rule fired (``contract:code:field``
+    pairs, deduplicated and sorted) without DBOS pickle excavation;
+    field values and messages never enter the detail (C01 rule 3). An
+    exception without classified errors settles detail-less as before.
+    """
+    identities = sorted({f"{e.code}:{e.field}" for e in error.errors})
+    if not identities:
+        return None
+    return ("contract:" + ",".join(identities))[:MAX_DETAIL_CHARS]
 
 
 def _session_failed(payload_json: str, reason: str, *, detail: str | None = None) -> str:
