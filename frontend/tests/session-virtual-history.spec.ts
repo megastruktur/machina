@@ -1666,8 +1666,8 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 
 		// Exactly TWO groups: RUN A's turn (lead 2, tool child 3) and
 		// RUN B's turn (lead 5, delegation child 6). Everything else
-		// stays top-level. CTR-W3: the tool child lives inside the
-		// group's ONE collapsed tool-group disclosure (turn-tool-group);
+		// stays top-level. TSP T1: the tool child lives inside the
+		// group's direct vertical tool stack (turn-tool-group);
 		// turn-group-child now marks the delegation child only.
 		const groups = page.getByTestId('turn-group');
 		await expect(groups).toHaveCount(2);
@@ -1766,15 +1766,18 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(orphans.childlessLeft).toBeCloseTo(orphans.base, 1);
 	});
 
-	// CTR-W3: collapsed tool group, typed summary, folded delegation.
-	// A turn's whole tool activity is ONE disclosure row whose summary
-	// lists every capability + its status WORD; settled rounds collapse,
-	// unproven outcomes stay open; a delegation collapses to a one-line
-	// summary (child run + status) so its goal/result_summary can never
-	// inflate the chat flow (a live delegation card measured 1616px).
-	// The per-relation rhythm (turn 16 / prose↔group 8 / in-group 4)
-	// is measured on the same rendered fixture.
-	test('tool groups collapse behind a typed summary; delegations fold away', async ({ page }) => {
+	// TSP T1: the direct vertical tool-call stack, 1-click details.
+	// A turn's tool activity renders as a plain vertical flex column —
+	// NO outer group <details>: every tool-call button is immediately
+	// visible, and ONE click on a button expands THAT call's own
+	// details (settled `executed` calls start collapsed as compact
+	// buttons; denied/unknown_effect stay open so errors/refusals are
+	// visible without a click, C08 rule 6). A delegation still collapses
+	// to a one-line summary so its goal/result_summary can never inflate
+	// the chat flow (a live delegation card measured 1616px). The
+	// per-relation rhythm (turn 16 / prose↔stack 16 / in-stack 4) is
+	// measured on the same rendered fixture.
+	test('tool calls render as a direct vertical stack; one click expands details; delegations fold away', async ({ page }) => {
 		const RUN_A = '21111111-1111-4111-8111-111111111112';
 		const RUN_B = '21111111-1111-4111-8111-111111111113';
 		const RUN_C = '21111111-1111-4111-8111-111111111114';
@@ -1820,8 +1823,8 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 					source: 'api'
 				});
 				// RUN A declares TWO calls: one executes, one is denied —
-				// the summary must show both capabilities + both words,
-				// and the unproven denial keeps the group OPEN.
+				// both buttons must stack visibly, the denial starting
+				// OPEN with its error immediately readable.
 				committed(2, RUN_A, {
 					kind: 'assistant_message',
 					text: 'Migrating now.',
@@ -1884,8 +1887,8 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 					client_request_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
 					source: 'api'
 				});
-				// RUN C: a fully settled round — its tool group must be
-				// COLLAPSED by default.
+				// RUN C: a fully settled round — its one tool button
+				// starts COLLAPSED and must expand on a single click.
 				committed(8, RUN_C, {
 					kind: 'assistant_message',
 					text: 'Checking the logs.',
@@ -1951,32 +1954,54 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		);
 		expect(domSeqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
-		// ---- A1/A4: ONE tool-group row for the two-call turn, summary
-		// carrying BOTH capabilities and BOTH status words. --------------
+		// ---- A1: the tool stack is a DIRECT vertical container (a div,
+		// NOT an outer group <details>) holding the round's result rows —
+		// nothing hides behind a group-level disclosure. -----------------
 		const toolGroups = page.getByTestId('turn-tool-group');
 		await expect(toolGroups).toHaveCount(2);
-		const summaryA = await toolGroups.first().evaluate((node) => node.textContent ?? '');
-		expect(summaryA).toContain('docs.retrieve');
-		expect(summaryA).toContain('host.shell');
-		expect(summaryA).toContain('executed');
-		expect(summaryA).toContain('denied');
-		// ONE group row for the turn: both result articles live inside
-		// the single disclosure body.
+		expect(await toolGroups.first().evaluate((node) => node.tagName)).toBe('DIV');
+		const stackText = await toolGroups.first().evaluate((node) => node.textContent ?? '');
+		expect(stackText).toContain('docs.retrieve');
+		expect(stackText).toContain('executed');
+		expect(stackText).toContain('host.shell');
+		expect(stackText).toContain('denied');
+		// Both result articles of RUN A's two-call round live in the stack.
 		const insideA = await toolGroups
 			.first()
 			.evaluate((node) => node.querySelectorAll('[data-testid="session-entry"]').length);
 		expect(insideA).toBe(2);
 
-		// ---- A2: settled collapses, unproven stays open. ----------------
-		// RUN A holds a denial → the group is OPEN (visible without a
-		// click), while the settled inner executed row stays collapsed.
-		expect(await toolGroups.first().getAttribute('open')).not.toBeNull();
-		const innerExecuted = toolGroups
-			.first()
-			.locator('[data-entry-seq="3"] > details');
-		expect(await innerExecuted.getAttribute('open')).toBeNull();
-		// RUN C fully settled → collapsed.
-		expect(await toolGroups.nth(1).getAttribute('open')).toBeNull();
+		// ---- A2: both tool-call buttons are IMMEDIATELY visible,
+		// stacked vertically at the same left edge (no click needed). --
+		const button3 = page.locator('[data-entry-seq="3"] summary');
+		const button4 = page.locator('[data-entry-seq="4"] summary');
+		await expect(button3).toBeVisible();
+		await expect(button4).toBeVisible();
+		const stackGeometry = await page.evaluate(() => {
+			const b3 = document.querySelector('[data-entry-seq="3"] summary') as HTMLElement;
+			const b4 = document.querySelector('[data-entry-seq="4"] summary') as HTMLElement;
+			return {
+				top3: b3.getBoundingClientRect().top,
+				top4: b4.getBoundingClientRect().top,
+				left3: b3.getBoundingClientRect().left,
+				left4: b4.getBoundingClientRect().left
+			};
+		});
+		expect(stackGeometry.top4).toBeGreaterThan(stackGeometry.top3);
+		expect(Math.abs(stackGeometry.left3 - stackGeometry.left4)).toBeLessThanOrEqual(1);
+
+		// ---- A3: settled collapses, unproven auto-expands. docs.retrieve
+		// (seq 3, executed) starts collapsed — its output stays OUT of the
+		// visible text; host.shell (seq 4, denied) starts OPEN with the
+		// refusal immediately visible (C08 rule 6). ----------------------
+		const docsRetrieve = page.locator('[data-entry-seq="3"] > details');
+		expect(await docsRetrieve.getAttribute('open')).toBeNull();
+		expect(
+			await docsRetrieve.evaluate((node) => (node as HTMLElement).innerText)
+		).not.toContain('row 42 migrated');
+		const deniedShell = page.locator('[data-entry-seq="4"] > details');
+		expect(await deniedShell.getAttribute('open')).not.toBeNull();
+		await expect(deniedShell.getByTestId('tool-error')).toContainText('denied_by_policy');
 		// Fixture (null-run) rows: executed collapses; unknown_effect opens.
 		expect(
 			await page.locator('[data-entry-seq="10"] > details').getAttribute('open')
@@ -1985,7 +2010,19 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			await page.locator('[data-entry-seq="11"] > details').getAttribute('open')
 		).not.toBeNull();
 
-		// ---- A3: the delegation folds away behind a one-line summary. --
+		// ---- A4: ONE-CLICK details expansion. RUN C's settled host.logs
+		// (seq 9) starts collapsed with its output hidden; a SINGLE click
+		// on its button opens the details and `tail ok` is visible. -----
+		const logsResult = page.locator('[data-entry-seq="9"] > details');
+		expect(await logsResult.getAttribute('open')).toBeNull();
+		expect(
+			await logsResult.evaluate((node) => (node as HTMLElement).innerText)
+		).not.toContain('tail ok');
+		await page.locator('[data-entry-seq="9"] summary').click();
+		expect(await logsResult.getAttribute('open')).not.toBeNull();
+		await expect(logsResult).toContainText('tail ok');
+
+		// ---- A5: the delegation folds away behind a one-line summary. --
 		const delegation = page.locator('[data-entry-seq="6"] > details');
 		expect(await delegation.getAttribute('open')).toBeNull();
 		const folded = await delegation.evaluate((raw) => {
@@ -2008,7 +2045,7 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(folded.visibleText).toContain('dddddddd');
 		expect(folded.visibleText).toContain('succeeded');
 
-		// ---- A5: the per-relation rhythm, measured on real rects. ------
+		// ---- A6: the per-relation rhythm, measured on real rects. ------
 		const gaps = await page.evaluate(() => {
 			const rowOf = (seq: string) =>
 				document.querySelector(`[data-entry-seq="${seq}"]`) as HTMLElement;
@@ -2044,10 +2081,11 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 				// user turn ↔ assistant turn (16px)
 				userToAssistant:
 					prose2.getBoundingClientRect().top - contentBottomOf(user1),
-			// assistant prose ↔ its own tool group (16px = the lead's 8px
-			// padding-bottom + the children block's 8px margin-top, MCR S2)
+				// assistant prose ↔ its own tool stack (16px = the lead's 8px
+				// padding-bottom + the children block's 8px margin-top, MCR S2)
 				proseToGroup: toolGroupA.getBoundingClientRect().top - contentBottomOf(prose2),
-				// inside the tool group: capability ↔ its result (4px)
+				// inside the tool stack: sibling tool rows separated by the
+				// exact 4px flex gap (--mai-call-gap, TSP T1)
 				insideGroup:
 					result4.getBoundingClientRect().top - contentBottomOf(result3)
 			};
@@ -2059,62 +2097,120 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(gaps.insideGroup).toBeGreaterThanOrEqual(4 - 0.5);
 		expect(gaps.insideGroup).toBeLessThanOrEqual(4 + 0.5);
 
-		// ---- W3 fix round 1: the capability-summary → its FIRST result
-		// is the same 4px in-group step (contract >= 3.5px), measured
-		// from the OPEN group's summary visible content to the first
-		// inner result row. The old body padding-top squeezed this to
-		// 2px; the step is now a margin that padding cannot compress.
-		// ----
-		const summaryStep = await page.evaluate(() => {
-			const group = document.querySelector('[data-testid="turn-tool-group"]') as HTMLElement;
-			const summary = group.querySelector('.mai-tool-group__summary') as HTMLElement;
-			let summaryBottom = Number.NEGATIVE_INFINITY;
-			for (const el of Array.from(summary.querySelectorAll<HTMLElement>('*'))) {
-				if (el.offsetParent === null) continue;
-				const probe = el as HTMLElement & {
-					checkVisibility?: (options: unknown) => boolean;
-				};
-				if (
-					typeof probe.checkVisibility === 'function' &&
-					!probe.checkVisibility({ checkOpacity: false })
-				) {
-					continue;
-				}
-				const rect = el.getBoundingClientRect();
-				if (rect.width === 0 && rect.height === 0) continue;
-				summaryBottom = Math.max(summaryBottom, rect.bottom);
-			}
-			const firstResult = group
-				.querySelector('[data-testid="session-entry"]')!
-				.getBoundingClientRect();
-			return firstResult.top - summaryBottom;
-		});
-		expect(summaryStep).toBeGreaterThanOrEqual(3.5);
-		expect(summaryStep).toBeLessThanOrEqual(4.5);
-
-		// ---- W3 fix round 2: capability ids render in the repo's mono
-		// token (themed app: JetBrains Mono; harness fallback: the
-		// monospace generic), NOT the panel's sans stack, while the
-		// group label keeps its 13px / 600 hierarchy.
-		// ----
+		// ---- A7: the button bar's capability id renders in the repo's
+		// mono token (themed app: JetBrains Mono; harness fallback: the
+		// monospace generic), NOT the panel's sans stack, and the status
+		// badge carries the stamped 2px radius on the mono stack. -------
 		const typography = await page.evaluate(() => {
-			const group = document.querySelector('[data-testid="turn-tool-group"]') as HTMLElement;
-			const code = group.querySelector('.mai-tool-group__item code') as HTMLElement;
-			const label = group.querySelector('.mai-tool-group__label') as HTMLElement;
-			const codeStyle = getComputedStyle(code);
-			const labelStyle = getComputedStyle(label);
+			const row = document.querySelector('[data-entry-seq="3"]') as HTMLElement;
+			const button = row.querySelector('.mai-tool-disclosure__summary') as HTMLElement;
+			const code = button.querySelector('code') as HTMLElement;
+			const badge = button.querySelector('.mai-tool-status') as HTMLElement;
 			return {
-				codeFamily: codeStyle.fontFamily,
-				codeSize: codeStyle.fontSize,
-				labelFamily: labelStyle.fontFamily,
-				labelSize: labelStyle.fontSize,
-				labelWeight: labelStyle.fontWeight
+				codeFamily: getComputedStyle(code).fontFamily,
+				codeSize: getComputedStyle(code).fontSize,
+				badgeFamily: getComputedStyle(badge).fontFamily,
+				badgeRadius: getComputedStyle(badge).borderRadius,
+				rowFamily: getComputedStyle(row).fontFamily
 			};
 		});
 		expect(typography.codeFamily.toLowerCase()).toContain('mono');
-		expect(typography.codeFamily).not.toBe(typography.labelFamily);
-		expect(typography.labelSize).toBe('13px');
-		expect(typography.labelWeight).toBe('600');
+		expect(typography.codeFamily).not.toBe(typography.rowFamily);
+		expect(typography.codeSize).toBe('12px');
+		expect(typography.badgeFamily.toLowerCase()).toContain('mono');
+		expect(Number.parseFloat(typography.badgeRadius)).toBeLessThanOrEqual(2);
+	});
+
+	// TSP T1: the active chat's horizontal inner guide. Every
+	// active-chat region aligns to --mai-chat-pad-x: at desktop the base
+	// entry's left edge sits 24px inside the viewport's left edge; at
+	// ≤640px it sits 12px inside — with ZERO horizontal overflow at both
+	// sizes. (The virtua item wrapper keeps vertical padding 0 — the
+	// content-box measuring invariant — only the horizontal guide
+	// changed.)
+	test('active chat inner margin: 24px desktop guide, 12px at 360px, zero horizontal overflow', async ({
+		page
+	}) => {
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await gotoHarness(page);
+		await page.routeWebSocket(/\/channel/, (ws) => {
+			ws.onMessage((data) => {
+				if (!String(data).includes('"hello"')) return;
+				ws.send(
+					JSON.stringify({
+						type: 'hello_ok',
+						protocol_version: 1,
+						session_id: '11111111-1111-4111-8111-111111111111',
+						server_id: GLOBAL_SERVER_ID,
+						stream_id: 's1',
+						latest_seq: 0
+					})
+				);
+				ws.send(
+					JSON.stringify({
+						type: 'committed',
+						stream_id: 's1',
+						entry: {
+							schema_version: 1,
+							entry_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+							session_id: '11111111-1111-4111-8111-111111111111',
+							seq: 1,
+							run_id: null,
+							durable_source_id: 'tsp-pad-1',
+							created_at: '2026-01-01T00:00:00Z',
+							payload: {
+								kind: 'assistant_message',
+								text: 'Base row for the horizontal guide measurement.',
+								model_profile: 'fast',
+								tool_group_state: 'none'
+							}
+						}
+					})
+				);
+			});
+		});
+		await page.evaluate(() => window.__open!('11111111-1111-4111-8111-111111111111'));
+		await expect(page.getByTestId('session-entry')).toHaveCount(1);
+
+		const desktop = await page.evaluate(() => {
+			const viewport = document.querySelector(
+				'[data-testid="session-history-viewport"]'
+			) as HTMLElement;
+			const row = document.querySelector('[data-testid="session-entry"]') as HTMLElement;
+			return {
+				inset: row.getBoundingClientRect().left - viewport.getBoundingClientRect().left,
+				docScroll: document.documentElement.scrollWidth,
+				docClient: document.documentElement.clientWidth,
+				viewScroll: viewport.scrollWidth,
+				viewClient: viewport.clientWidth
+			};
+		});
+		expect(desktop.inset).toBeGreaterThanOrEqual(24 - 2);
+		expect(desktop.inset).toBeLessThanOrEqual(24 + 2);
+		expect(desktop.docScroll).toBeLessThanOrEqual(desktop.docClient);
+		expect(desktop.viewScroll).toBeLessThanOrEqual(desktop.viewClient);
+
+		// Pocket viewport: the guide collapses to 12px, still no overflow.
+		await page.setViewportSize({ width: 360, height: 640 });
+		// Let the media query + virtua's resize measurement settle.
+		await page.waitForTimeout(300);
+		const pocket = await page.evaluate(() => {
+			const viewport = document.querySelector(
+				'[data-testid="session-history-viewport"]'
+			) as HTMLElement;
+			const row = document.querySelector('[data-testid="session-entry"]') as HTMLElement;
+			return {
+				inset: row.getBoundingClientRect().left - viewport.getBoundingClientRect().left,
+				docScroll: document.documentElement.scrollWidth,
+				docClient: document.documentElement.clientWidth,
+				viewScroll: viewport.scrollWidth,
+				viewClient: viewport.clientWidth
+			};
+		});
+		expect(pocket.inset).toBeGreaterThanOrEqual(12 - 2);
+		expect(pocket.inset).toBeLessThanOrEqual(12 + 2);
+		expect(pocket.docScroll).toBeLessThanOrEqual(pocket.docClient);
+		expect(pocket.viewScroll).toBeLessThanOrEqual(pocket.viewClient);
 	});
 });
 
