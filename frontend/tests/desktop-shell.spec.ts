@@ -1116,6 +1116,73 @@ test('MCR S3: switching server-select live-refreshes the drawer history automati
 		.toEqual([SERVER_ALPHA_ID, 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60']);
 });
 
+test('MCR S4: collapsed tactical rail — compact header, accessible brand, working quick actions', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const drawer = page.getByTestId('side-drawer');
+
+	// Expanded: no rail exists.
+	await expect(page.getByTestId('side-drawer-rail')).toHaveCount(0);
+
+	// Collapse: the drawer shrinks to the 52px rail and the header stays
+	// COMPACT — the old one-char-per-line 716px brand tower is gone
+	// (the brand is sr-only: absolutely positioned, ~1px box).
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect
+		.poll(() => drawer.evaluate((el) => el.getBoundingClientRect().width))
+		.toBeLessThanOrEqual(53);
+	const headerBox = await page.evaluate(() => {
+		const header = document.querySelector('.mai-side-drawer__header')!;
+		const brand = document.querySelector('.mai-desktop-shell__drawer-brand')!;
+		return {
+			headerHeight: header.getBoundingClientRect().height,
+			brandPosition: getComputedStyle(brand).position,
+			brandWidth: brand.getBoundingClientRect().width,
+			scroll: document.documentElement.scrollWidth,
+			client: document.documentElement.clientWidth
+		};
+	});
+	expect(headerBox.headerHeight).toBeLessThanOrEqual(72);
+	expect(headerBox.brandPosition).toBe('absolute');
+	expect(headerBox.brandWidth).toBeLessThanOrEqual(2);
+	expect(headerBox.scroll).toBeLessThanOrEqual(headerBox.client);
+
+	// The h1 stays resolvable through the accessibility tree while collapsed.
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('Machina');
+
+	// The tactical rail exposes the quick actions + REAL registry launchers
+	// (offline = the fixture entries; Sign Out is live-only).
+	await expect(page.getByTestId('side-drawer-rail')).toBeVisible();
+	await expect(page.getByTestId('rail-new-chat')).toBeVisible();
+	await expect(page.getByTestId('rail-history')).toBeVisible();
+	await expect(page.getByTestId('rail-open-fixture-notes')).toBeVisible();
+	await expect(page.getByTestId('rail-open-fixture-prefs')).toBeVisible();
+	await expect(page.getByTestId('rail-sign-out')).toHaveCount(0);
+
+	// New Chat runs the SAME action as the drawer's + New Chat (offline
+	// proof: the shared status line, no session to reset).
+	await page.getByTestId('rail-new-chat').click();
+	await expect(page.getByTestId('desktop-status')).toHaveText('Chat column focused.');
+
+	// A rail launcher opens the REAL pinned window and lights the brass tick.
+	await page.getByTestId('rail-open-fixture-notes').click();
+	await expect(frame(page, NOTES)).toHaveCount(1);
+	await expect(frame(page, NOTES).locator('.mai-window-frame__title')).toHaveText(
+		'Notes — Server Alpha'
+	);
+	await expect(page.getByTestId('rail-open-fixture-notes')).toHaveClass(/mai-rail-btn--active/);
+
+	// Recent Chats expands the drawer back open; the rail disappears.
+	await page.getByTestId('rail-history').click();
+	await expect(page.getByTestId('side-drawer-rail')).toHaveCount(0);
+	await expect
+		.poll(() => drawer.evaluate((el) => el.getBoundingClientRect().width))
+		.toBeGreaterThan(53);
+	await expect(page.getByTestId('drawer-chat-section')).toBeVisible();
+});
+
 test('drawer Chat History is honestly empty offline (no fabricated rows)', async ({
 	page
 }) => {
