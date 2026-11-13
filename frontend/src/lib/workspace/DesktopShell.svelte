@@ -800,6 +800,19 @@
 	 * column height in active.
 	 */
 	let dockBodyEl: HTMLElement | null = null;
+
+	/**
+	 * MCR S2 — the workspace depth echelons: while any floating
+	 * WindowFrame is actually VISIBLE over the stage (minimized-only
+	 * windows occlude nothing), the recessed chat dataslate recedes a
+	 * further echelon (opacity/saturate) until the operator interacts
+	 * with it again — pointer over the card or keyboard focus inside
+	 * it (focus stays "interacting" until focus truly leaves the card).
+	 */
+	const hasVisibleWindows = $derived(
+		snapshot.windows.some((win) => win.presentation !== 'minimized')
+	);
+	let dockInteracting = $state(false);
 	let drawerCollapsed = $state(false);
 
 	// --- Session-first drawer history (D07; F4 pagination, F3 channel) -------
@@ -1644,11 +1657,33 @@
 		class="mai-desktop-shell__dock"
 		class:mai-desktop-shell__dock--hero={activeSessionId === null}
 		class:mai-desktop-shell__dock--reduced-motion={shellMotionReduced}
+		class:mai-desktop-shell__dock--receded={hasVisibleWindows && !dockInteracting}
 		data-testid="bottom-chat-dock"
 		aria-label="Chat column"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-body" bind:this={dockBodyEl}>
+		<!-- svelte-ignore a11y_no_static_element_interactions:
+		     the pointer/focus handlers drive a purely VISUAL depth effect
+		     (the MCR S2 auto-recede), not an interaction — keyboard users
+		     reach the same result through focusin/focusout, and the card
+		     keeps its ordinary content semantics (no widget role fits). -->
+		<div
+			class="mai-desktop-shell__dock-body"
+			bind:this={dockBodyEl}
+			onfocusin={() => (dockInteracting = true)}
+			onfocusout={(event) => {
+				const next = event.relatedTarget;
+				if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
+					dockInteracting = false;
+				}
+			}}
+			onpointerenter={() => (dockInteracting = true)}
+			onpointerleave={() => {
+				if (!(dockBodyEl?.contains(document.activeElement) ?? false)) {
+					dockInteracting = false;
+				}
+			}}
+		>
 			<!-- D09: the session-first virtualized surface is THE column; the
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
 			     live session the panel renders its honest empty/create state;
@@ -1863,9 +1898,31 @@
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
 		box-shadow: none;
+		/* MCR S2: the auto-recede flip eases on the base motion token —
+		   the global prefers-reduced-motion rule compiles it out. */
+		transition:
+			opacity var(--mai-motion-base) ease,
+			filter var(--mai-motion-base) ease;
 	}
 	.mai-desktop-shell__dock--hero .mai-desktop-shell__dock-body {
 		height: auto;
+	}
+	/* MCR S2 — three depth echelons: calm tactical grid canvas, the
+	   RECESSED active chat dataslate (sunken surface, quieted hairline
+	   — floating WindowFrames on --mai-color-surface #12161c separate
+	   cleanly above it), and crisp raised plates inside. The hero card
+	   keeps the calm near-canvas surface. */
+	.mai-desktop-shell__dock:not(.mai-desktop-shell__dock--hero) .mai-desktop-shell__dock-body {
+		background: var(--mai-color-surface-sunken);
+		border-color: color-mix(in srgb, var(--mai-color-border) 65%, transparent);
+	}
+	/* Auto-recede: while a VISIBLE window floats above the workspace
+	   and the operator is not interacting with the chat (no pointer
+	   over the card, no focus inside it), the dataslate steps back a
+	   full echelon. */
+	.mai-desktop-shell__dock--receded .mai-desktop-shell__dock-body {
+		opacity: 0.42;
+		filter: saturate(0.75);
 	}
 
 	.mai-desktop-shell__taskbar {

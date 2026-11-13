@@ -71,8 +71,8 @@
 	--mai-surface-glass-header: #1a1114;
 	--mai-border-specular: rgb(255 255 255 / 0.06);
 	--mai-canvas-bg:
-		linear-gradient(to right, rgb(42 50 65 / 0.45) 1px, transparent 1px),
-		linear-gradient(to bottom, rgb(42 50 65 / 0.45) 1px, transparent 1px);
+		linear-gradient(to right, rgb(42 50 65 / 0.15) 1px, transparent 1px),
+		linear-gradient(to bottom, rgb(42 50 65 / 0.15) 1px, transparent 1px);
 	--mai-canvas-size: 32px 32px;
 
 	/* ---- Type ------------------------------------------------------------ */

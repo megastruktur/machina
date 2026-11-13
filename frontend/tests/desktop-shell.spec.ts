@@ -921,6 +921,44 @@ test('the chat column carries the reduced-motion state class only under reduce (
 	await expect(column).toHaveClass(/mai-desktop-shell__dock--hero/);
 });
 
+test('the chat dataslate recedes under open windows and returns on interaction (MCR S2)', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const dock = page.getByTestId('bottom-chat-dock');
+	const dockBody = dock.locator('.mai-desktop-shell__dock-body');
+
+	// Zero open windows: the dock card is fully present.
+	await expect(dockBody).toHaveCSS('opacity', '1');
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+
+	// A floating WindowFrame above the workspace recedes the dataslate
+	// a full echelon (the pointer is parked on the launcher, not the
+	// chat card).
+	await openPanel(page, NOTES);
+	await expect(dock).toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '0.42');
+
+	// Interacting with the chat card (pointer into the card) restores
+	// full presence while the window stays open.
+	await dockBody.click();
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '1');
+
+	// The pointer leaves the card (focus is not inside it either): the
+	// recede returns while the window still floats above the stage.
+	await page.mouse.move(2, 2);
+	await expect(dock).toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '0.42');
+
+	// Minimizing the last visible window removes the recede entirely.
+	await frame(page, NOTES).getByRole('button', { name: 'Minimize' }).click();
+	await expect(frame(page, NOTES)).toHaveCount(0);
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '1');
+});
+
 test('drawer Chat History is honestly empty offline (no fabricated rows)', async ({
 	page
 }) => {

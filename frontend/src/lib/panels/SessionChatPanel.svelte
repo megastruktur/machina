@@ -1777,28 +1777,22 @@
 	.mai-turn-group {
 		position: relative;
 	}
-	/* The left rail: one 1px muted line on the group's left edge,
-	   spanning the group's FULL height (the lead prose + every child).
-	   It exists only for real groups — a childless lead renders as a
-	   plain row, so no rail appears without children. */
-	.mai-turn-group::before {
-		content: '';
-		position: absolute;
-		left: 0;
-		top: 0;
-		bottom: 0;
-		width: 1px;
-		background: var(--mai-color-border, rgba(0, 0, 0, 0.25));
-	}
-	/* Children (tool groups, delegations) sit --mai-space-4 (16px)
-	   deeper than the group's content edge, so the parent/child
-	   relation reads at a glance. CTR-W3: the 4px gap between sibling
-	   children IS the "inside a tool group" rhythm step. */
+	/* MCR S2: the lead prose edge is CLEAN — no ::before rail, no
+	   border touching the assistant text anywhere. */
+	/* The vertical telemetry trace rail lives strictly on the CHILDREN:
+	   a 2px border at +2px with 12px inner breathing room, so tool
+	   groups and delegations sit 16px (2 + 2 + 12) deeper than the
+	   parent prose AND keep 12px clear of the rail. CTR-W3: the 4px gap
+	   between sibling children IS the "inside a tool group" rhythm
+	   step. */
 	.mai-turn-group__children {
 		display: flex;
 		flex-direction: column;
-		gap: var(--mai-call-gap);
-		padding-left: var(--mai-space-4, 16px);
+		gap: var(--mai-space-1, 4px);
+		margin-top: var(--mai-space-2, 8px);
+		margin-left: 2px;
+		border-left: 2px solid var(--mai-color-border, #2a3241);
+		padding-left: 12px;
 	}
 	/* ---- CTR-W3: the collapsed tool group + typed summary --------------- */
 	.mai-tool-group__summary {
@@ -1850,18 +1844,19 @@
 		color: var(--mai-color-danger, #b3261e);
 		font-size: 0.75rem;
 	}
-	/* User messages: right-aligned accent-tinted bubbles (S3). */
+	/* User messages (MCR S2): right-aligned STAMPED MECHANICUS plates —
+	   square dataslate on the raised surface token, a doubled
+	   brass-dim right edge as the stamp. No alien radii, no
+	   non-existent accent/bg-elevated tokens. */
 	.mai-user-bubble {
 		align-self: flex-end;
-		max-width: 82%;
+		max-width: min(82%, 42rem);
 		margin-left: auto;
-		padding: 6px 10px;
-		border-radius: 14px;
-		background: color-mix(
-			in oklch,
-			var(--mai-color-accent, #b45309) 16%,
-			var(--mai-color-bg-elevated, rgba(0, 0, 0, 0.04))
-		);
+		padding: 8px 12px;
+		border-radius: var(--mai-radius-md, 2px);
+		background: var(--mai-color-surface-raised, #181e27);
+		border: 1px solid var(--mai-color-border, #2a3241);
+		border-right: 2px solid var(--mai-color-brass-dim, #8a6a2f);
 	}
 	/* Assistant messages: borderless prose straight on the canvas. */
 	.mai-assistant-flow {
@@ -1877,11 +1872,16 @@
 		cursor: pointer;
 		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
 	}
+	/* MCR S2: the expanded reasoning body carries its own brass-dim
+	   rail at +2px with 10px of inner air — the text never touches a
+	   border. */
 	.mai-thinking-disclosure__body {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: 2px 0 2px 10px;
+		padding: 6px 0 4px 10px;
+		border-left: 2px solid var(--mai-color-brass-dim, #8a6a2f);
+		margin-left: 2px;
 	}
 	.mai-thinking-disclosure__line {
 		margin: 0;
@@ -1986,7 +1986,7 @@
 		width: 6px;
 		height: 6px;
 		border-radius: 50%;
-		background: var(--mai-color-accent, #b45309);
+		background: var(--mai-color-brass, #d4a853);
 		animation: mai-generating-dot 1.1s ease-in-out infinite;
 	}
 	.mai-generating__dots i:nth-child(2) {
@@ -2012,9 +2012,9 @@
 		border-radius: 2px;
 		background: linear-gradient(
 			90deg,
-			color-mix(in oklch, var(--mai-color-accent, #b45309) 12%, transparent),
-			color-mix(in oklch, var(--mai-color-accent, #b45309) 55%, transparent) 45%,
-			color-mix(in oklch, var(--mai-color-accent, #b45309) 12%, transparent)
+			color-mix(in oklch, var(--mai-color-brass, #d4a853) 12%, transparent),
+			color-mix(in oklch, var(--mai-color-brass, #d4a853) 55%, transparent) 45%,
+			color-mix(in oklch, var(--mai-color-brass, #d4a853) 12%, transparent)
 		);
 		background-size: 220% 100%;
 		animation: mai-generating-shimmer 1.6s linear infinite;
