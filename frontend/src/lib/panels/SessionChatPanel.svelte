@@ -901,7 +901,7 @@
 						// padding-bottom), INSIDE the measured content box.
 						// box-sizing stays explicit so a future padding edit
 						// here cannot silently reintroduce the overlap.
-						style: { padding: '0 10px', 'box-sizing': 'border-box' }
+						style: { padding: '0 var(--mai-chat-pad-x, 24px)', 'box-sizing': 'border-box' }
 					})}
 					onresize={() => {
 						// Measurements change the total height: while the
@@ -948,36 +948,21 @@
 										</div>
 									</details>
 								{/if}
-								{#if !suppressToolCalls && entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
-									<!-- CTR-W3: the standalone (ungrouped) declared-calls
-									     disclosure — summary lists the capabilities, no
-									     fabricated status (no result is in this window). In a
-									     turn group this is suppressed: the group's ONE
-									     tool-group disclosure carries capability + result
-									     status. No hardcoded `open`: collapsed by default. -->
-									<details
-										class="mai-tool-disclosure mai-tool-group"
-										data-testid="entry-tool-calls"
-									>
-										<summary class="mai-tool-group__summary">
-											<span class="mai-tool-group__label">
-												tool calls ({entry.payload.tool_calls.length})
-											</span>
-											{#each entry.payload.tool_calls as call (call.call_id)}
-												<span class="mai-tool-group__item">
-													<code>{call.capability_id}</code>
-												</span>
-											{/each}
-										</summary>
-										<ul class="mai-tool-disclosure__list">
-											{#each entry.payload.tool_calls as call (call.call_id)}
-												<li class="mai-tool-disclosure__item" data-testid="entry-tool-call">
-													<code>{call.capability_id}</code>
-												</li>
-											{/each}
-										</ul>
-									</details>
-								{/if}
+							{#if !suppressToolCalls && entry.payload.tool_calls !== undefined && entry.payload.tool_calls.length > 0}
+								<!-- TSP T1: the standalone (ungrouped) declared calls
+								     render as a DIRECT vertical stack — every call is
+								     immediately visible with an honest `called` badge
+								     (no result exists in this window; grouped calls
+								     live in the turn renderer's tool stack). -->
+								<div class="mai-tool-calls" data-testid="entry-tool-calls">
+									{#each entry.payload.tool_calls as call (call.call_id)}
+										<div class="mai-tool-pending" data-testid="entry-tool-call">
+											<code class="mai-tool-disclosure__cap">{call.capability_id}</code>
+											<span class="mai-tool-status" data-testid="tool-status-badge">called</span>
+										</div>
+									{/each}
+								</div>
+							{/if}
 							</div>
 						{:else if entry.payload.kind === 'tool_result'}
 							<details
@@ -1086,61 +1071,46 @@
 						</article>
 						{/snippet}
 						{#if unit.kind === 'group'}
-							<!-- CTR-W2/W3: one turn group = the assistant lead's prose at
-							     the base indent + its tool activity and delegations 16px
-							     deeper, with the 1px rail spanning the group's full height
-							     on its left edge. A childless lead renders as a plain row —
-							     no rail, no group container. CTR-W3: each run of tool
-							     results is ONE collapsed disclosure whose summary carries
-							     every capability + status WORD; raw outputs live inside. -->
-							{@const segments = buildTurnChildSegments(unit.lead, unit.children)}
-							{@const hasToolChildren = segments.some(
-								(segment) => segment.kind === 'tools'
-							)}
-							<div
-								class="mai-turn-group"
-								data-testid="turn-group"
-								data-turn-run-id={unit.runId}
-							>
-								{@render entryArticle(unit.lead, hasToolChildren)}
-								<div class="mai-turn-group__children">
-									{#each segments as segment, segmentIndex (segmentIndex)}
-										{#if segment.kind === 'tools'}
-											<!-- Open ONLY while some outcome is unproven (C08
-							     rule 6): a denied/unknown/approval-pending result must
-							     stay visible without a click; settled rounds collapse. -->
-											<details
-												class="mai-tool-disclosure mai-tool-group"
-												data-testid="turn-tool-group"
-												open={segment.entries.some(
-													(child) =>
-														child.payload.kind === 'tool_result' &&
-														child.payload.status !== 'executed'
-												)}
-											>
-												<summary class="mai-tool-group__summary">
-													<span class="mai-tool-group__label">tools</span>
-													{#each segment.summary as item, itemIndex (itemIndex)}
-														<span class="mai-tool-group__item">
-															<code>{item.capabilityId}</code>
-															<span
-																class="mai-tool-status"
-																class:mai-tool-status--warn={item.unsettled &&
-																	item.status !== 'denied'}
-																class:mai-tool-status--bad={item.status === 'denied'}
-																data-testid="tool-status-badge"
-															>
-																{item.status}
-															</span>
-														</span>
-													{/each}
-												</summary>
-												<div class="mai-tool-group__body">
-													{#each segment.entries as child (child.seq)}
-														{@render entryArticle(child)}
-													{/each}
+						<!-- CTR-W2: one turn group = the assistant lead's prose at
+						     the base indent + its tool activity and delegations 16px
+						     deeper, with the rail spanning the group's children on
+						     its left edge. A childless lead renders as a plain row —
+						     no rail, no group container. TSP T1: each run of tool
+						     results is a DIRECT vertical stack — no outer disclosure;
+						     one click on a tool-call button expands that call's own
+						     details. -->
+						{@const segments = buildTurnChildSegments(unit.lead, unit.children)}
+						{@const hasToolChildren = segments.some(
+							(segment) => segment.kind === 'tools'
+						)}
+						<div
+							class="mai-turn-group"
+							data-testid="turn-group"
+							data-turn-run-id={unit.runId}
+						>
+							{@render entryArticle(unit.lead, hasToolChildren)}
+							<div class="mai-turn-group__children">
+								{#each segments as segment, segmentIndex (segmentIndex)}
+									{#if segment.kind === 'tools'}
+										<!-- TSP T1: the tool stack is a plain flex column —
+										     NOT an outer <details>. Every tool-call button is
+										     immediately visible; each button's own details
+										     opens on ONE click. Settled `executed` calls start
+										     collapsed as compact buttons; denied /
+										     unknown_effect / approval_required start open so
+										     errors and refusals are visible without a click
+										     (C08 rule 6). -->
+										<div class="mai-tool-group" data-testid="turn-tool-group">
+											{#each segment.entries as child (child.seq)}
+												{@render entryArticle(child)}
+											{/each}
+											{#each segment.summary.filter((item) => item.status === 'pending') as pendingItem, pendingIdx (pendingIdx)}
+												<div class="mai-tool-pending" data-testid="entry-tool-pending">
+													<code class="mai-tool-disclosure__cap">{pendingItem.capabilityId}</code>
+													<span class="mai-tool-status mai-tool-status--warn" data-testid="tool-status-badge">pending</span>
 												</div>
-											</details>
+											{/each}
+										</div>
 										{:else}
 											<div class="mai-turn-group__child" data-testid="turn-group-child">
 												{@render entryArticle(segment.entry)}
@@ -1403,19 +1373,25 @@
 	 * every vertical gap in the transcript:
 	 *   --mai-turn-gap        16px  user ↔ assistant turn boundary
 	 *   --mai-tool-gap         8px  assistant prose ↔ its own tool group
-	 *   --mai-call-gap         4px  inside a tool group (capability ↔
-	 *                                its result; tool group ↔ delegation)
+	 *   --mai-call-gap         4px  between sibling tool calls in a
+	 *                                tool group (TSP T1: the flex gap)
 	 *   --mai-session-rhythm  12px  base gap for rows outside a turn
 	 *                                relation (orphan results/delegations,
 	 *                                compaction, control notes)
-	 * Plus the CTR-W3 group label size (13px / 600 — PLAN §3.2).
+	 * Plus the TSP T1 horizontal inner guide for every active-chat
+	 * region (24px desktop / 12px pocket).
 	 */
 	.mai-session-chat {
 		--mai-turn-gap: 16px;
 		--mai-tool-gap: 8px;
 		--mai-call-gap: 4px;
 		--mai-session-rhythm: 12px;
-		--mai-tool-label-size: 0.8125rem;
+		--mai-chat-pad-x: 24px;
+	}
+	@media (max-width: 640px) {
+		.mai-session-chat {
+			--mai-chat-pad-x: 12px;
+		}
 	}
 
 	/* ---- CSP P1 / CHC H1: hero (create) vs active (session) layout -------
@@ -1663,7 +1639,7 @@
 		flex-wrap: wrap;
 		gap: 8px;
 		align-items: center;
-		padding: 2px 8px;
+		padding: 6px var(--mai-chat-pad-x, 24px);
 		font-size: 0.75rem;
 	}
 	/* SCOPE-3 chips: compact, wrap-safe at 360px (long names wrap inside
@@ -1770,7 +1746,7 @@
 		padding-bottom: var(--mai-tool-gap);
 	}
 	.mai-turn-group__child .mai-session-entry,
-	.mai-tool-group__body .mai-session-entry {
+	.mai-tool-group .mai-session-entry {
 		padding-bottom: 0;
 	}
 	/* ---- turn groups (CTR-W2): an assistant turn + its children ---- */
@@ -1794,40 +1770,28 @@
 		border-left: 2px solid var(--mai-color-border, #2a3241);
 		padding-left: 12px;
 	}
-	/* ---- CTR-W3: the collapsed tool group + typed summary --------------- */
-	.mai-tool-group__summary {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--mai-space-2, 8px);
-		align-items: baseline;
-	}
-	.mai-tool-group__label {
-		font-size: var(--mai-tool-label-size, 0.8125rem);
-		font-weight: 600;
-	}
-	.mai-tool-group__item {
-		display: inline-flex;
-		flex-wrap: wrap;
-		gap: var(--mai-space-1, 4px);
-		align-items: baseline;
-	}
-	/* Capability ids are code identifiers: the repo's mono token, NOT
-	 * the panel's sans stack (W3 fix round — they computed to Rajdhani).
-	 * The label keeps 13px/600 and the badge keeps .mai-tool-status. */
-	.mai-tool-group__item code {
-		font-family: var(--mai-font-mono, monospace);
-	}
-	.mai-tool-group__body {
+	/* ---- TSP T1: the direct vertical tool-call stack ---------------------
+	 * The group is a plain flex column — NOT an outer <details>. Every
+	 * tool-call button renders immediately; the 4px between siblings is
+	 * the flex gap itself (their articles carry padding-bottom: 0 via
+	 * the zero rule above), so no base 12px rhythm can leak in. */
+	.mai-tool-group {
 		display: flex;
 		flex-direction: column;
-		/* The capability-summary → first result step is the 4px
-		 * in-group rhythm, measured from the summary's visible text to
-		 * the first result row — a MARGIN so no padding can compress
-		 * it (the old 2px body padding-top squeezed the step to 2px).
-		 * Result → result keeps the 4px flex gap above. */
-		margin-top: var(--mai-call-gap);
-		gap: var(--mai-call-gap);
-		padding: 0 0 2px 10px;
+		gap: var(--mai-call-gap, 4px);
+		min-width: 0;
+	}
+	/* The standalone (ungrouped) declared-call list: the same vertical
+	 * stack under a telemetry rail, so a settling round reads as its
+	 * own column of one-click rows. */
+	.mai-tool-calls {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-call-gap, 4px);
+		margin-top: 4px;
+		margin-left: 2px;
+		border-left: 2px solid var(--mai-color-border, #2a3241);
+		padding-left: 12px;
 	}
 	/* Delegation one-line summary: the short child-run id sits next to
 	   the title (the FULL id stays in the collapsed body). */
@@ -1905,26 +1869,71 @@
 		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
 		list-style: revert;
 	}
-	.mai-tool-disclosure__summary {
+	/* TSP T1: the tool-call summary (and its inert twin, the pending row)
+	 * is a stamped Mechanicus button bar — ONE click on it opens THAT
+	 * call's details directly. */
+	.mai-tool-disclosure > .mai-tool-disclosure__summary,
+	.mai-tool-pending {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		width: fit-content;
+		max-width: 100%;
+		min-height: 1.65rem;
+		padding: 2px 10px;
+		box-sizing: border-box;
+		background: var(--mai-color-surface-raised, #181e27);
+		border: 1px solid var(--mai-color-border, #2a3241);
+		border-radius: var(--mai-radius-sm, 2px);
+		cursor: pointer;
+		user-select: none;
+		color: var(--mai-color-text, #ece8de);
+		list-style: none;
+	}
+	.mai-tool-disclosure > .mai-tool-disclosure__summary {
 		flex-wrap: wrap;
+	}
+	.mai-tool-disclosure > .mai-tool-disclosure__summary::-webkit-details-marker {
+		display: none;
+	}
+	/* The chevron states the fold's truth at a glance. */
+	.mai-tool-disclosure > .mai-tool-disclosure__summary::before {
+		content: '▸';
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.7rem;
+		color: var(--mai-color-brass, #d4a853);
+		flex: 0 0 auto;
+	}
+	details.mai-tool-disclosure[open] > .mai-tool-disclosure__summary::before {
+		content: '▾';
+	}
+	.mai-tool-disclosure > .mai-tool-disclosure__summary:hover {
+		border-color: var(--mai-color-brass-dim, #8a6a2f);
+	}
+	details.mai-tool-disclosure[open] > .mai-tool-disclosure__summary {
+		border-left: 2px solid var(--mai-color-brass, #d4a853);
 	}
 	.mai-tool-disclosure__body {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: 2px 0 2px 10px;
+		margin-top: 4px;
+		padding: 6px 10px;
+		background: var(--mai-color-surface-sunken, #0e1217);
+		border: 1px solid
+			color-mix(in srgb, var(--mai-color-border, #2a3241) 70%, transparent);
+		border-left: 2px solid var(--mai-color-brass-dim, #8a6a2f);
+		border-radius: var(--mai-radius-sm, 2px);
 	}
-	.mai-tool-disclosure__list {
-		margin: 0;
-		padding: 0;
-		list-style: none;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	.mai-tool-disclosure__item code,
-	.mai-tool-disclosure__summary code {
-		font-size: 0.74rem;
+	/* Capability ids are code identifiers: the repo's mono token, NOT the
+	 * panel's sans stack — explicitly sized and wrap-anywhere so a long
+	 * id can never blow the bar past max-width. */
+	.mai-tool-disclosure__summary code,
+	.mai-tool-pending code {
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.75rem;
+		color: var(--mai-color-text, #ece8de);
+		overflow-wrap: anywhere;
 	}
 	.mai-tool-disclosure__meta {
 		margin: 0;
@@ -1939,9 +1948,10 @@
 		font-size: 0.76rem;
 	}
 	.mai-tool-status {
-		font-size: 0.7rem;
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.68rem;
 		padding: 0 6px;
-		border-radius: 8px;
+		border-radius: var(--mai-radius-sm, 2px);
 		background: var(--mai-color-surface-raised, rgba(0, 0, 0, 0.06));
 	}
 	.mai-tool-status--warn {
@@ -1976,7 +1986,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
-		padding: 6px 12px 2px;
+		padding: 6px var(--mai-chat-pad-x, 24px) 2px;
 	}
 	.mai-generating__dots {
 		display: inline-flex;
@@ -2039,13 +2049,13 @@
 	}
 	.mai-terminal-notice {
 		margin: 0;
-		padding: 6px 12px 2px;
+		padding: 6px var(--mai-chat-pad-x, 24px) 2px;
 		font-size: 0.75rem;
 		color: var(--mai-color-warning, #b45309);
 	}
 	/* ---- drafts + composer ----------------------------------------------- */
 	.mai-session-chat__drafts {
-		padding: 2px 12px;
+		padding: 4px var(--mai-chat-pad-x, 24px);
 		border-top: 1px dashed var(--mai-color-border, transparent);
 	}
 	.mai-session-chat__draft {
@@ -2055,10 +2065,12 @@
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
+	.mai-session-chat:not(.mai-session-chat--hero) .mai-session-chat__composer {
+		padding: 8px var(--mai-chat-pad-x, 24px);
+	}
 	.mai-session-chat__composer {
 		border-top: var(--mai-border-width, 1px) solid
 			var(--mai-color-border, transparent);
-		padding: 6px 8px;
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
@@ -2087,7 +2099,7 @@
 		font-size: 0.75rem;
 	}
 	.mai-session-chat__state {
-		padding: 8px;
+		padding: 12px var(--mai-chat-pad-x, 24px);
 		color: var(--mai-color-text-muted, var(--mai-color-muted, inherit));
 	}
 </style>
