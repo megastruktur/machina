@@ -351,7 +351,7 @@ type CardGeometry = {
 	dock: { top: number; bottom: number; height: number; width: number; cx: number; contentTop: number; contentBottom: number };
 	card: { top: number; bottom: number; height: number; width: number; cx: number; cy: number };
 	panel: { height: number };
-	composer: { height: number; bottom: number; cx: number };
+	composer: { height: number; bottom: number; cx: number; width: number };
 };
 
 async function cardGeometry(page: Page): Promise<CardGeometry> {
@@ -386,7 +386,12 @@ async function cardGeometry(page: Page): Promise<CardGeometry> {
 				cy: cr.top + cr.height / 2
 			},
 			panel: { height: pr.height },
-			composer: { height: mr.height, bottom: mr.bottom, cx: mr.x + mr.width / 2 }
+			composer: {
+				height: mr.height,
+				bottom: mr.bottom,
+				cx: mr.x + mr.width / 2,
+				width: mr.width
+			}
 		};
 	});
 }
@@ -417,6 +422,11 @@ test.describe('hero state (no session)', () => {
 		await expect(page.getByTestId('chat-scope-server')).toBeVisible();
 		await expect(page.getByTestId('chat-scope-service')).toBeVisible();
 		await expect(page.getByTestId('chat-scope-server-select')).toHaveCount(0);
+		// MCR S1: the Mechanicus directive plate header is hero-only chrome.
+		await expect(page.getByTestId('chat-hero-directive')).toBeVisible();
+		await expect(page.getByTestId('chat-hero-directive')).toContainText(
+			'COGITATOR DIRECTIVE // READY'
+		);
 		// …and NOTHING else renders.
 		await expect(page.getByTestId('session-history-viewport')).toHaveCount(0);
 		await expect(page.getByTestId('session-control-steer')).toHaveCount(0);
@@ -439,6 +449,9 @@ test.describe('hero state (no session)', () => {
 		).toBeLessThanOrEqual(1.5);
 		expect(Math.abs(geo.card.cx - geo.dock.cx)).toBeLessThanOrEqual(1);
 		expect(geo.card.top).toBeGreaterThan(geo.dock.top + 100);
+		// MCR S1: the composer is a FULL-WIDTH command plate — it fills the
+		// card's width (no 640px inner clamp, no dead side gutters).
+		expect(Math.abs(geo.card.width - geo.composer.width)).toBeLessThanOrEqual(4);
 		expect(Math.abs(geo.composer.bottom - (geo.card.bottom - 1))).toBeLessThanOrEqual(2);
 	});
 
@@ -466,6 +479,67 @@ test.describe('hero state (no session)', () => {
 	});
 });
 
+test.describe('hero command plate (MCR S1)', () => {
+	/** The full-width plate geometry: card/composer widths, the strip's
+	 * flush edges against the composer row, the one-row scope columns,
+	 * and horizontal containment. */
+	async function plateGeometry(page: Page) {
+		return page.evaluate(() => {
+			const strip = document.querySelector('[data-testid="chat-scope-strip"]')!;
+			const row = document.querySelector('.mai-session-chat__composer-row')!;
+			const server = document.querySelector('[data-testid="chat-scope-server"]')!;
+			const service = document.querySelector('[data-testid="chat-scope-service"]')!;
+			const card = document.querySelector('.chc-dock__card')!;
+			const composer = document.querySelector('.mai-session-chat__composer')!;
+			return {
+				cardWidth: card.getBoundingClientRect().width,
+				composerWidth: composer.getBoundingClientRect().width,
+				stripLeft: strip.getBoundingClientRect().left,
+				stripRight: strip.getBoundingClientRect().right,
+				rowLeft: row.getBoundingClientRect().left,
+				rowRight: row.getBoundingClientRect().right,
+				serverTop: server.getBoundingClientRect().top,
+				serviceTop: service.getBoundingClientRect().top,
+				scroll: document.documentElement.scrollWidth,
+				client: document.documentElement.clientWidth
+			};
+		});
+	}
+
+	test('1280x800: the composer and scope strip span the FULL card width on ONE row', async ({
+		page
+	}) => {
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await gotoHarness(page);
+		await expect(page.getByTestId('chat-hero-directive')).toBeVisible();
+		const geo = await plateGeometry(page);
+		// Full-width plate: the composer fills the card — no 640px inner
+		// clamp, no dead side gutters.
+		expect(Math.abs(geo.cardWidth - geo.composerWidth)).toBeLessThanOrEqual(4);
+		// The strip spans the composer's full inner width — flush (±2px)
+		// with the textarea + Send row on BOTH edges.
+		expect(Math.abs(geo.stripLeft - geo.rowLeft)).toBeLessThanOrEqual(2);
+		expect(Math.abs(geo.stripRight - geo.rowRight)).toBeLessThanOrEqual(2);
+		// The two scope columns share ONE row.
+		expect(Math.abs(geo.serverTop - geo.serviceTop)).toBeLessThanOrEqual(2);
+		// Zero horizontal overflow.
+		expect(geo.scroll).toBeLessThanOrEqual(geo.client);
+	});
+
+	test('360x640: both scope columns still share ONE row with zero overflow', async ({ page }) => {
+		await page.setViewportSize({ width: 360, height: 640 });
+		await gotoHarness(page);
+		await expect(page.getByTestId('chat-hero-directive')).toBeVisible();
+		const geo = await plateGeometry(page);
+		// The strip stays flush with the Send row's edges at pocket size.
+		expect(Math.abs(geo.stripLeft - geo.rowLeft)).toBeLessThanOrEqual(2);
+		expect(Math.abs(geo.stripRight - geo.rowRight)).toBeLessThanOrEqual(2);
+		// Both slots stay on ONE horizontal row — no wrap.
+		expect(Math.abs(geo.serverTop - geo.serviceTop)).toBeLessThanOrEqual(2);
+		expect(geo.scroll).toBeLessThanOrEqual(geo.client);
+	});
+});
+
 test.describe('hero → active transition', () => {
 	test('first submit GROWS the card to full height without remounting the composer', async ({
 		page
@@ -488,6 +562,8 @@ test.describe('hero → active transition', () => {
 		await expect(page.getByTestId('session-control-steer')).toBeVisible();
 		await expect(page.getByTestId('session-control-pause')).toBeVisible();
 		await expect(page.getByTestId('session-control-cancel')).toBeVisible();
+		// MCR S1: the directive plate header is hero-only chrome — gone.
+		await expect(page.getByTestId('chat-hero-directive')).toHaveCount(0);
 		// The committed session closes the draft picker (no silent rebind).
 		await expect(page.getByTestId('session-service-picker')).toHaveCount(0);
 
@@ -596,6 +672,8 @@ test.describe('hero → active transition', () => {
 		await expect(page.getByTestId('session-header-id')).toBeVisible();
 		await expect(page.getByTestId('session-control-steer')).toBeVisible();
 		await expect(page.getByTestId('session-service-picker')).toHaveCount(0);
+		// MCR S1: the directive plate header never renders in active.
+		await expect(page.getByTestId('chat-hero-directive')).toHaveCount(0);
 		// CCC S3: the active strip renders the stored read-only scope
 		// (this bag's detail read yields the session's own server id).
 		await expect(page.getByTestId('chat-scope-strip')).toBeVisible();

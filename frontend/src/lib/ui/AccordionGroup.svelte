@@ -19,6 +19,9 @@
 		badge?: string;
 		/** Whether the accordion body is expanded; bindable. */
 		open?: boolean;
+		/** MCR S3: mark this section as the active one (e.g. the selected
+		 * server) — paints ONLY a subtle 2px brass bar on the header. */
+		active?: boolean;
 		/** Optional callback when the header is toggled. */
 		ontoggle?: (open: boolean) => void;
 		/** Optional test id for the header toggle button. */
@@ -31,6 +34,7 @@
 		icon = '',
 		badge = '',
 		open = $bindable(true),
+		active = false,
 		ontoggle,
 		toggleTestId,
 		class: className = '',
@@ -44,7 +48,12 @@
 	}
 </script>
 
-<section {...rest} class="mai-accordion {className}" class:mai-accordion--open={open}>
+<section
+	{...rest}
+	class="mai-accordion {className}"
+	class:mai-accordion--open={open}
+	class:mai-accordion--active={active}
+>
 	<button
 		type="button"
 		class="mai-accordion__header"
@@ -59,7 +68,10 @@
 		{/if}
 		<span class="mai-accordion__title">{title}</span>
 		{#if badge}
-			<span class="mai-accordion__badge">{badge}</span>
+			<span
+				class="mai-accordion__badge"
+				class:mai-accordion__badge--active={badge === 'active'}
+			>{badge}</span>
 		{/if}
 	</button>
 	{#if open}
@@ -70,20 +82,19 @@
 </section>
 
 <style>
+	/* MCR S3: flush boxless drawer sections — a quiet hairline rule
+	   between sections, NO 4-sided boxes, NO raised slabs, NO gold
+	   open-box styling. */
 	.mai-accordion {
 		display: flex;
 		flex-direction: column;
-		background: var(--mai-color-surface-raised);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-left-width: var(--mai-chip-accent-width, 3px);
-		border-left-color: var(--mai-color-border);
-		border-radius: var(--mai-radius-md);
+		background: transparent;
+		border: none;
+		border-bottom: 1px solid
+			color-mix(in srgb, var(--mai-color-border) 60%, transparent);
+		border-radius: 0;
+		padding-bottom: var(--mai-space-2);
 		overflow: hidden;
-	}
-
-	.mai-accordion--open {
-		border-color: var(--mai-color-border-strong);
-		border-left-color: var(--mai-color-brass);
 	}
 
 	.mai-accordion__header {
@@ -91,21 +102,36 @@
 		align-items: center;
 		gap: var(--mai-space-2);
 		width: 100%;
-		min-height: 2rem;
-		padding: var(--mai-space-2) var(--mai-space-3);
-		font-family: var(--mai-font-sans);
-		font-size: var(--mai-text-sm);
-		font-weight: var(--mai-weight-semibold);
-		color: var(--mai-color-text);
+		min-height: 1.75rem;
+		padding: var(--mai-space-1) var(--mai-space-2);
+		font-family: var(--mai-font-mono);
+		font-size: 0.7rem;
+		font-weight: 600;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+		color: var(--mai-color-text-muted);
 		background: transparent;
 		border: none;
 		text-align: left;
 		cursor: pointer;
-		transition: background-color var(--mai-motion-fast) ease;
+		transition:
+			background-color var(--mai-motion-fast) ease,
+			color var(--mai-motion-fast) ease;
 	}
 
 	.mai-accordion__header:hover {
-		background: var(--mai-color-surface);
+		color: var(--mai-color-text);
+		background: color-mix(in srgb, var(--mai-color-surface-raised) 60%, transparent);
+	}
+
+	/* MCR S3 single-accent discipline: the ONLY open-state emphasis is
+	   text color; the active section adds ONLY a 2px brass left bar. */
+	.mai-accordion--open > .mai-accordion__header {
+		color: var(--mai-color-text);
+	}
+
+	.mai-accordion--active > .mai-accordion__header {
+		border-left: 2px solid var(--mai-color-brass);
 	}
 
 	.mai-accordion__chevron {
@@ -128,23 +154,27 @@
 		white-space: nowrap;
 	}
 
+	/* Quiet borderless mono counter — brass only for the active mark. */
 	.mai-accordion__badge {
 		flex: 0 0 auto;
-		padding: 1px var(--mai-space-2);
+		padding: 0 2px;
 		font-family: var(--mai-font-mono);
-		font-size: 0.7rem;
+		font-size: 0.66rem;
+		color: var(--mai-color-text-subtle);
+		background: transparent;
+		border: none;
+	}
+
+	.mai-accordion__badge--active {
 		color: var(--mai-color-brass);
-		background: var(--mai-color-bg);
-		border: var(--mai-border-width) solid var(--mai-color-border);
-		border-radius: var(--mai-radius-pill);
 	}
 
 	.mai-accordion__body {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: var(--mai-space-1) var(--mai-space-2) var(--mai-space-2);
-		border-top: var(--mai-border-width) solid var(--mai-color-border);
-		background: var(--mai-color-surface);
+		padding: 2px 0 0 var(--mai-space-1);
+		border-top: none;
+		background: transparent;
 	}
 </style>

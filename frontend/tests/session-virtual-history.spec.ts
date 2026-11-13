@@ -1693,11 +1693,14 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		// The delegation rows both render (grouped child + orphan).
 		await expect(page.getByTestId('entry-delegation')).toHaveCount(2);
 
-		// A1, measured: both child kinds sit strictly deeper than their
-		// parent prose (16px, --mai-space-4) and the group carries a
-		// 1px rail.
+		// A1, measured (MCR S2): the lead prose edge is CLEAN — the group
+		// draws NO ::before rail — and the telemetry trace lives strictly
+		// on .mai-turn-group__children: a 2px border at +2px with 12px
+		// of inner air, so both child kinds sit 16px (2 + 2 + 12) deeper
+		// than the parent prose and clear of the rail.
 		const hierarchy = await page.evaluate(() => {
 			const groupA = document.querySelector('[data-testid="turn-group"]') as HTMLElement;
+			const childrenA = groupA.querySelector('.mai-turn-group__children') as HTMLElement;
 			const proseA = groupA
 				.querySelector('[data-testid="entry-assistant-message"]')!
 				.getBoundingClientRect();
@@ -1711,20 +1714,31 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			const delegationChild = groupB
 				.querySelector('[data-testid="turn-group-child"]')!
 				.getBoundingClientRect();
-			const rail = getComputedStyle(groupA, '::before');
+			const pseudo = getComputedStyle(groupA, '::before');
+			const childrenStyle = getComputedStyle(childrenA);
+			const childrenLeft = childrenA.getBoundingClientRect().left;
+			const borderLeft = parseFloat(childrenStyle.borderLeftWidth);
 			return {
 				toolIndent: toolGroup.left - proseA.left,
 				delegationIndent: delegationChild.left - proseB.left,
-				railWidth: rail.width,
-				railColor: rail.backgroundColor
+				// No rail glued to the turn-group prose edge.
+				pseudoContent: pseudo.content,
+				pseudoWidth: pseudo.width,
+				// The telemetry rail geometry on the children block.
+				childrenBorderLeftWidth: childrenStyle.borderLeftWidth,
+				childrenPaddingLeft: childrenStyle.paddingLeft,
+				toolClearance: toolGroup.left - (childrenLeft + borderLeft)
 			};
 		});
+		expect(hierarchy.pseudoContent).toBe('none');
+		expect(['0px', 'auto']).toContain(hierarchy.pseudoWidth);
+		expect(hierarchy.childrenBorderLeftWidth).toBe('2px');
+		expect(hierarchy.childrenPaddingLeft).toBe('12px');
+		expect(hierarchy.toolClearance).toBeGreaterThanOrEqual(12);
 		expect(hierarchy.toolIndent).toBeGreaterThanOrEqual(16 - 0.5);
 		expect(hierarchy.toolIndent).toBeLessThanOrEqual(16 + 0.5);
 		expect(hierarchy.delegationIndent).toBeGreaterThanOrEqual(16 - 0.5);
 		expect(hierarchy.delegationIndent).toBeLessThanOrEqual(16 + 0.5);
-		expect(hierarchy.railWidth).toBe('1px');
-		expect(hierarchy.railColor).not.toBe('rgba(0, 0, 0, 0)');
 
 		// A2, measured: the orphan result (seq 4), the orphan delegation
 		// (seq 7) and the childless assistant (seq 8) have NO group
@@ -2030,7 +2044,8 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 				// user turn ↔ assistant turn (16px)
 				userToAssistant:
 					prose2.getBoundingClientRect().top - contentBottomOf(user1),
-				// assistant prose ↔ its own tool group (8px)
+			// assistant prose ↔ its own tool group (16px = the lead's 8px
+			// padding-bottom + the children block's 8px margin-top, MCR S2)
 				proseToGroup: toolGroupA.getBoundingClientRect().top - contentBottomOf(prose2),
 				// inside the tool group: capability ↔ its result (4px)
 				insideGroup:
@@ -2039,8 +2054,8 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		});
 		expect(gaps.userToAssistant).toBeGreaterThanOrEqual(16 - 0.5);
 		expect(gaps.userToAssistant).toBeLessThanOrEqual(16 + 0.5);
-		expect(gaps.proseToGroup).toBeGreaterThanOrEqual(8 - 0.5);
-		expect(gaps.proseToGroup).toBeLessThanOrEqual(8 + 0.5);
+		expect(gaps.proseToGroup).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(gaps.proseToGroup).toBeLessThanOrEqual(16 + 0.5);
 		expect(gaps.insideGroup).toBeGreaterThanOrEqual(4 - 0.5);
 		expect(gaps.insideGroup).toBeLessThanOrEqual(4 + 0.5);
 

@@ -466,7 +466,8 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 	// uir-u4: the Runbook Catalog entry lives under Global / Fleet only,
 	// never inside a server accordion, and opens with the global scope.
 	const runbooksItem = page.getByTestId('open-runbooks');
-	await expect(runbooksItem).toContainText('📖');
+	// MCR S3: the runbook glyph is the monochrome technical §.
+	await expect(runbooksItem).toContainText('§');
 	await expect(runbooksItem).toContainText('Open Runbook Catalog — Global');
 	await expect(page.getByTestId('open-runbooks-' + SERVER_ALPHA_ID)).toHaveCount(0);
 	await runbooksItem.click();
@@ -919,6 +920,267 @@ test('the chat column carries the reduced-motion state class only under reduce (
 	await page.emulateMedia({ reducedMotion: 'reduce' });
 	await expect(column).toHaveClass(/mai-desktop-shell__dock--reduced-motion/);
 	await expect(column).toHaveClass(/mai-desktop-shell__dock--hero/);
+});
+
+test('the chat dataslate recedes under open windows and returns on interaction (MCR S2)', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const dock = page.getByTestId('bottom-chat-dock');
+	const dockBody = dock.locator('.mai-desktop-shell__dock-body');
+
+	// Zero open windows: the dock card is fully present.
+	await expect(dockBody).toHaveCSS('opacity', '1');
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+
+	// A floating WindowFrame above the workspace recedes the dataslate
+	// a full echelon (the pointer is parked on the launcher, not the
+	// chat card).
+	await openPanel(page, NOTES);
+	await expect(dock).toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '0.42');
+
+	// Interacting with the chat card (pointer into the card) restores
+	// full presence while the window stays open.
+	await dockBody.click();
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '1');
+
+	// The pointer leaves the card (focus is not inside it either): the
+	// recede returns while the window still floats above the stage.
+	await page.mouse.move(2, 2);
+	await expect(dock).toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '0.42');
+
+	// Minimizing the last visible window removes the recede entirely.
+	await frame(page, NOTES).getByRole('button', { name: 'Minimize' }).click();
+	await expect(frame(page, NOTES)).toHaveCount(0);
+	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
+	await expect(dockBody).toHaveCSS('opacity', '1');
+});
+
+test('MCR S3: drawer accordion sections are flush and boxless; New Chat is calm secondary', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	await expect(page.getByTestId('drawer-chat-section')).toBeVisible();
+
+	// Every OPEN accordion section in the drawer paints NO 4-sided box:
+	// top/right/left borders are 0 (only the quiet bottom hairline rule
+	// between sections survives).
+	const sections = await page.evaluate(() =>
+		Array.from(document.querySelectorAll('.mai-accordion--open')).map((el) => {
+			const cs = getComputedStyle(el);
+			return {
+				top: cs.borderTopWidth,
+				right: cs.borderRightWidth,
+				left: cs.borderLeftWidth,
+				radius: cs.borderRadius
+			};
+		})
+	);
+	expect(sections.length).toBeGreaterThan(0);
+	for (const box of sections) {
+		expect(box.top).toBe('0px');
+		expect(box.right).toBe('0px');
+		expect(box.left).toBe('0px');
+		expect(box.radius).toBe('0px');
+	}
+
+	// The crimson primary variant belongs exclusively to the composer's
+	// Send: + New Chat is the calm secondary stamp.
+	const newChat = page.getByTestId('drawer-new-chat');
+	await expect(newChat).toHaveClass(/mai-button--secondary/);
+	await expect(newChat).not.toHaveClass(/mai-button--primary/);
+});
+
+test('MCR S3: switching server-select live-refreshes the drawer history automatically', async ({
+	page
+}) => {
+	// Live-attach probe + the same one-profile mock surface as the
+	// live-nav proof, but with BOTH fixture servers enrolled so the
+	// selector can switch scopes.
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	const serverProfile = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: {
+			host: 'alpha.example',
+			port: 22,
+			user: 'mai',
+			host_key: 'k',
+			credential_ref: 'MAI_SSH_KEY'
+		},
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [
+					serverProfile(SERVER_ALPHA_ID, 'Server Alpha'),
+					serverProfile('b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60', 'Server Beta')
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/servers/*/memory/status', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				status: 'ok',
+				code: null,
+				provider: 'hindsight',
+				operation: 'status',
+				api_version: 'v1.2.3',
+				error_type: null
+			})
+		})
+	);
+	await page.route('**/api/v1/applications/catalog**', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ runbooks: [], categories: [], limit: 10, offset: 0, total: 0 })
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [
+					{
+						schema_version: 1,
+						name: 'glm53flash',
+						connection: 'litellm',
+						model: 'z-ai-coding/glm-5.3-flash'
+					}
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				schema_version: 1,
+				connection: 'litellm',
+				profile: 'glm53flash'
+			})
+		})
+	);
+	const historyCalls: string[] = [];
+	await page.route('**/api/v1/agent-sessions**', (route) => {
+		historyCalls.push(new URL(route.request().url()).searchParams.get('server_id') ?? '');
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				items: [],
+				limit: 10,
+				offset: 0,
+				total: 0,
+				has_more: false
+			})
+		});
+	});
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	// The initial history page lands under Alpha exactly once.
+	await expect
+		.poll(() => historyCalls, { timeout: 10_000 })
+		.toEqual([SERVER_ALPHA_ID]);
+
+	// Switching the selector — WITHOUT touching any accordion — reloads
+	// the drawer history under Beta immediately.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect
+		.poll(() => historyCalls, { timeout: 10_000 })
+		.toEqual([SERVER_ALPHA_ID, 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60']);
+});
+
+test('MCR S4: collapsed tactical rail — compact header, accessible brand, working quick actions', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	const drawer = page.getByTestId('side-drawer');
+
+	// Expanded: no rail exists.
+	await expect(page.getByTestId('side-drawer-rail')).toHaveCount(0);
+
+	// Collapse: the drawer shrinks to the 52px rail and the header stays
+	// COMPACT — the old one-char-per-line 716px brand tower is gone
+	// (the brand is sr-only: absolutely positioned, ~1px box).
+	await page.getByTestId('side-drawer-toggle').click();
+	await expect
+		.poll(() => drawer.evaluate((el) => el.getBoundingClientRect().width))
+		.toBeLessThanOrEqual(53);
+	const headerBox = await page.evaluate(() => {
+		const header = document.querySelector('.mai-side-drawer__header')!;
+		const brand = document.querySelector('.mai-desktop-shell__drawer-brand')!;
+		return {
+			headerHeight: header.getBoundingClientRect().height,
+			brandPosition: getComputedStyle(brand).position,
+			brandWidth: brand.getBoundingClientRect().width,
+			scroll: document.documentElement.scrollWidth,
+			client: document.documentElement.clientWidth
+		};
+	});
+	expect(headerBox.headerHeight).toBeLessThanOrEqual(72);
+	expect(headerBox.brandPosition).toBe('absolute');
+	expect(headerBox.brandWidth).toBeLessThanOrEqual(2);
+	expect(headerBox.scroll).toBeLessThanOrEqual(headerBox.client);
+
+	// The h1 stays resolvable through the accessibility tree while collapsed.
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('Machina');
+
+	// The tactical rail exposes the quick actions + REAL registry launchers
+	// (offline = the fixture entries; Sign Out is live-only).
+	await expect(page.getByTestId('side-drawer-rail')).toBeVisible();
+	await expect(page.getByTestId('rail-new-chat')).toBeVisible();
+	await expect(page.getByTestId('rail-history')).toBeVisible();
+	await expect(page.getByTestId('rail-open-fixture-notes')).toBeVisible();
+	await expect(page.getByTestId('rail-open-fixture-prefs')).toBeVisible();
+	await expect(page.getByTestId('rail-sign-out')).toHaveCount(0);
+
+	// New Chat runs the SAME action as the drawer's + New Chat (offline
+	// proof: the shared status line, no session to reset).
+	await page.getByTestId('rail-new-chat').click();
+	await expect(page.getByTestId('desktop-status')).toHaveText('Chat column focused.');
+
+	// A rail launcher opens the REAL pinned window and lights the brass tick.
+	await page.getByTestId('rail-open-fixture-notes').click();
+	await expect(frame(page, NOTES)).toHaveCount(1);
+	await expect(frame(page, NOTES).locator('.mai-window-frame__title')).toHaveText(
+		'Notes — Server Alpha'
+	);
+	await expect(page.getByTestId('rail-open-fixture-notes')).toHaveClass(/mai-rail-btn--active/);
+
+	// Recent Chats expands the drawer back open; the rail disappears.
+	await page.getByTestId('rail-history').click();
+	await expect(page.getByTestId('side-drawer-rail')).toHaveCount(0);
+	await expect
+		.poll(() => drawer.evaluate((el) => el.getBoundingClientRect().width))
+		.toBeGreaterThan(53);
+	await expect(page.getByTestId('drawer-chat-section')).toBeVisible();
 });
 
 test('drawer Chat History is honestly empty offline (no fabricated rows)', async ({

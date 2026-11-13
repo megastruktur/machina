@@ -18,6 +18,9 @@
 		children?: Snippet;
 		/** Optional sticky bottom footer slot (status, sign in/out). */
 		footer?: Snippet;
+		/** MCR S4: collapsed-state tactical icon rail (quick actions);
+		 * rendered only while `collapsed` is true. */
+		rail?: Snippet;
 	};
 
 	let {
@@ -26,6 +29,7 @@
 		header,
 		children,
 		footer,
+		rail,
 		...rest
 	}: Props = $props();
 </script>
@@ -55,6 +59,14 @@
 	<div class="mai-side-drawer__body" hidden={collapsed}>
 		{@render children?.()}
 	</div>
+
+	{#if collapsed && rail}
+		<!-- MCR S4: the tactical icon rail replaces the dead collapsed
+		     column — quick actions live here, nothing else renders. -->
+		<div class="mai-side-drawer__rail" data-testid="side-drawer-rail">
+			{@render rail()}
+		</div>
+	{/if}
 
 	{#if footer}
 		<div class="mai-side-drawer__footer" hidden={collapsed}>
@@ -114,7 +126,20 @@
 
 	.mai-side-drawer--collapsed .mai-side-drawer__header {
 		justify-content: center;
-		padding: var(--mai-space-3) var(--mai-space-1);
+		padding: var(--mai-space-2) var(--mai-space-1);
+	}
+
+	/* MCR S4: the collapsed tactical icon rail — the ONLY body of the
+	   52px column; scrollable, centered, dead-simple. */
+	.mai-side-drawer__rail {
+		flex: 1 1 0%;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		padding: var(--mai-space-2) var(--mai-space-1);
+		gap: var(--mai-space-1);
+		overflow-y: auto;
 	}
 
 	.mai-side-drawer__toggle {

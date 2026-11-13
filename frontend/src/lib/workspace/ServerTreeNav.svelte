@@ -102,26 +102,28 @@
 		}
 	];
 
+	/* MCR S3: monochrome technical glyphs only — no colorful OS emoji
+	   in the rail; brass stays the single accent. */
 	const ICON_BY_KIND: Readonly<Record<string, string>> = {
 		applications: '◈',
-		'server-profile': '🖥',
+		'server-profile': '⬡',
 		jobs: '⏱',
 		execution: '⌨',
-		docs: '📄',
-		'knowledge-models': '🧠',
+		docs: '≡',
+		'knowledge-models': '◎',
 		'model-settings': '⚙',
-		'capability-policy': '🛡',
-		'plugin-forms': '🧩',
-		plugins: '🔌',
-		runbooks: '📖',
-		overview: '🌐',
+		'capability-policy': '⛨',
+		'plugin-forms': '❖',
+		plugins: '⌘',
+		runbooks: '§',
+		overview: '⊞',
 		'fixture-notes': '📝',
 		'fixture-prefs': '⚙',
 		'fixture-broken': '⚠'
 	};
 
 	function iconFor(kind: string): string {
-		return ICON_BY_KIND[kind] ?? '•';
+		return ICON_BY_KIND[kind] ?? '▸';
 	}
 
 	function categorizedFor(list: readonly PanelRegistryEntry[]): {
@@ -197,8 +199,9 @@
 			{@const isSelected = server.id === selectedServerId}
 			<AccordionGroup
 				title={server.label}
-				icon="🖥"
+				icon="⬡"
 				badge={isSelected ? 'active' : ''}
+				active={isSelected}
 				open={isServerExpanded(server.id)}
 				ontoggle={(next) => onServerExpanded(server.id, next)}
 				toggleTestId={'server-group-toggle-' + server.id}
@@ -224,7 +227,7 @@
 				{/each}
 				{#if live && onfocuschat}
 					<NavItem
-						icon="💬"
+						icon="▸"
 						label="Chat on this server"
 						srPrefix="Open "
 						srSuffix={' — ' + server.label}
@@ -243,7 +246,7 @@
 		<div class="mai-server-tree__section-head">
 			<span class="mai-server-tree__section-title">Global / Fleet</span>
 		</div>
-		<AccordionGroup title="Workspace & Fleet" icon="🌐" open={true}>
+		<AccordionGroup title="Workspace & Fleet" icon="⊞" open={true}>
 			{#each globalEntries as entry (entry.panel_kind)}
 				<NavItem
 					icon={iconFor(entry.panel_kind)}
@@ -290,6 +293,33 @@
 	.mai-server-tree__default-picker {
 		display: flex;
 		flex-direction: column;
+	}
+
+	/* MCR S3: the active-server selector is a quiet flush inline bar —
+	 * no raised control box; a hairline rule with mono type. The
+	 * overrides sit under the picker wrapper so they win Select's own
+	 * scoped control rules (hover/focus included) without touching the
+	 * shared primitive. */
+	.mai-server-tree__default-picker :global(.mai-select-field__control) {
+		border: none;
+		border-bottom: 1px solid
+			color-mix(in srgb, var(--mai-color-border) 60%, transparent);
+		border-radius: 0;
+		background: transparent;
+		font-family: var(--mai-font-mono);
+		font-size: 0.72rem;
+		letter-spacing: 0.04em;
+		color: var(--mai-color-text-muted);
+		padding: var(--mai-space-1) 1.4rem var(--mai-space-1) var(--mai-space-1);
+		min-height: 1.9rem;
+	}
+
+	.mai-server-tree__default-picker
+	:global(.mai-select-field__control:hover:not(:disabled)),
+	.mai-server-tree__default-picker :global(.mai-select-field__control:focus) {
+		border-bottom-color: var(--mai-color-brass);
+		background: color-mix(in srgb, var(--mai-color-surface-raised) 60%, transparent);
+		color: var(--mai-color-text);
 	}
 
 	.mai-server-tree__list {

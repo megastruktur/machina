@@ -550,9 +550,10 @@
 					: String(servers[0].server_id);
 				if (!exists) persistence.setSelectedServerId(selectedServerId);
 			}
-			// The session history loads under the RESOLVED server scope (an
-			// earlier call here filtered against the fixture default server).
-			void loadSessionHistory();
+			// MCR S3: the session history now loads through the reactive
+			// effect below — every live `selectedServerId` change (select,
+			// hero scope strip, tree, enrollment) refreshes the drawer under
+			// the resolved scope; no duplicate initial call here.
 			// Refresh continuity (R2-3): restore the active session pointer.
 			try {
 				const raw = sessionStorage.getItem(SESSION_POINTER_KEY);
@@ -800,6 +801,19 @@
 	 * column height in active.
 	 */
 	let dockBodyEl: HTMLElement | null = null;
+
+	/**
+	 * MCR S2 — the workspace depth echelons: while any floating
+	 * WindowFrame is actually VISIBLE over the stage (minimized-only
+	 * windows occlude nothing), the recessed chat dataslate recedes a
+	 * further echelon (opacity/saturate) until the operator interacts
+	 * with it again — pointer over the card or keyboard focus inside
+	 * it (focus stays "interacting" until focus truly leaves the card).
+	 */
+	const hasVisibleWindows = $derived(
+		snapshot.windows.some((win) => win.presentation !== 'minimized')
+	);
+	let dockInteracting = $state(false);
 	let drawerCollapsed = $state(false);
 
 	// --- Session-first drawer history (D07; F4 pagination, F3 channel) -------
@@ -885,6 +899,23 @@
 			drawerSessionsLoadingMore = false;
 		}
 	}
+
+	/**
+	 * MCR S3: the drawer's Recent Chats follow the visible server
+	 * selection — every live `selectedServerId` change (server-select,
+	 * the hero scope strip, the tree, the post-enrollment hand-off)
+	 * automatically reloads the first history page under the NEW scope.
+	 * The last-loaded guard keeps the initial load single (no duplicate
+	 * first call) and the effect cannot loop: loading never writes the
+	 * selection.
+	 */
+	let drawerHistoryLoadedServerId: ServerId | null = null;
+	$effect(() => {
+		const scope = selectedServerId;
+		if (!live || scope === drawerHistoryLoadedServerId) return;
+		drawerHistoryLoadedServerId = scope;
+		void loadSessionHistory();
+	});
 
 	/** The single-flight `before_seq` older-page fetch (D08 F-acceptance 1). */
 	async function loadOlderEntries(): Promise<void> {
@@ -1173,6 +1204,64 @@
 		status = 'Chat column focused.';
 		const compose = dockEl?.querySelector('textarea');
 		if (compose instanceof HTMLTextAreaElement) compose.focus();
+	}
+
+	/**
+	 * MCR S4: the ONE New Chat action — shared verbatim by the drawer's
+	 * `+ New Chat` and the collapsed rail's quick action: abandon the
+	 * visible session (reset to hero) and focus the composer.
+	 */
+	function startNewChat(): void {
+		closeActiveSession();
+		focusChatDock();
+	}
+
+	// --- MCR S4: the collapsed tactical rail ----------------------------------
+	/** The active launcher set — the SAME registry entries the tree nav
+	 * renders (fixture kinds offline, the reviewed live kinds live). */
+	const railEntries = $derived(live ? liveEntries : fixtureEntries);
+	/** Monochrome technical glyphs (mirrors the tree nav's S3 set). */
+	const RAIL_GLYPH_BY_KIND: Readonly<Record<string, string>> = {
+		applications: '◈',
+		'server-profile': '⬡',
+		jobs: '⏱',
+		execution: '⌨',
+		docs: '≡',
+		'knowledge-models': '◎',
+		'model-settings': '⚙',
+		'capability-policy': '⛨',
+		'plugin-forms': '❖',
+		plugins: '⌘',
+		runbooks: '§',
+		overview: '⊞',
+		'fixture-notes': '▤',
+		'fixture-prefs': '⚙',
+		'fixture-broken': '⚠'
+	};
+
+	function railGlyphFor(kind: string): string {
+		return RAIL_GLYPH_BY_KIND[kind] ?? '▸';
+	}
+
+	/** Global-only entries launch unscoped; server entries pin the
+	 * current selection — exactly what `openPanel` resolves alone. */
+	function railEntryScopeLabel(entry: PanelRegistryEntry): string {
+		return entry.scope_types.has('server')
+			? serverLabel(selectedServerId)
+			: 'Global';
+	}
+
+	/** Brass tick while a matching window is open (any window for a
+	 * global-kind entry; a window pinned to the selected server for
+	 * server-scoped kinds). */
+	function railEntryActive(entry: PanelRegistryEntry): boolean {
+		const globalEntry = !entry.scope_types.has('server');
+		return snapshot.windows.some(
+			(win) =>
+				win.panel_kind === entry.panel_kind &&
+				(globalEntry ||
+					(win.scope.kind === 'server' && win.scope.server_id === selectedServerId))
+		);
 	}
 
 	const overviewApi: OverviewApi = {
@@ -1494,7 +1583,13 @@
 <div class="mai-desktop-shell">
 	<SideDrawer bind:collapsed={drawerCollapsed} data-testid="side-drawer" aria-label="Workspace navigation">
 		{#snippet header()}
-			<div class="mai-desktop-shell__drawer-brand">
+			<!-- MCR S4: while collapsed the brand collapses into sr-only —
+			     the h1 and subtitle stay in the accessibility tree while
+			     occupying zero visual box inside the 52px rail header. -->
+			<div
+				class="mai-desktop-shell__drawer-brand"
+				class:mai-sr-only={drawerCollapsed}
+			>
 				<span class="mai-desktop-shell__drawer-sigil" aria-hidden="true">⚙</span>
 				<h1 class="mai-desktop-shell__drawer-title">Machina</h1>
 				<span class="mai-desktop-shell__drawer-subtitle">M.A.I. — Machina Anima Intelligentia</span>
@@ -1509,8 +1604,7 @@
 			onnewchat={() => {
 				// A fresh chat abandons the visible session: its channel closes
 				// now, not when the next session opens (plan acceptance 2).
-				closeActiveSession();
-				focusChatDock();
+				startNewChat();
 			}}
 			onselectconversation={(rowKey) => {
 				// Session-first rows only (D09): open the visible session's
@@ -1574,6 +1668,55 @@
 				Connect live session / Sign in
 			</a>
 		{/if}
+		{#snippet rail()}
+			<!-- MCR S4: the tactical quick-action rail (collapsed only). -->
+			<button
+				type="button"
+				class="mai-rail-btn"
+				data-testid="rail-new-chat"
+				aria-label="New chat"
+				title="New Chat"
+				onclick={() => startNewChat()}
+			>
+				<span class="mai-rail-btn__glyph" aria-hidden="true">+</span>
+			</button>
+			<button
+				type="button"
+				class="mai-rail-btn"
+				data-testid="rail-history"
+				aria-label="Recent chats"
+				title="Recent Chats"
+				onclick={() => (drawerCollapsed = false)}
+			>
+				<span class="mai-rail-btn__glyph" aria-hidden="true">◈</span>
+			</button>
+			<div class="mai-rail-rule" aria-hidden="true"></div>
+			{#each railEntries as entry (entry.panel_kind)}
+				<button
+					type="button"
+					class="mai-rail-btn"
+					class:mai-rail-btn--active={railEntryActive(entry)}
+					data-testid={'rail-open-' + entry.panel_kind}
+					aria-label={'Open ' + entry.title + ' — ' + railEntryScopeLabel(entry)}
+					title={entry.title + ' (' + railEntryScopeLabel(entry) + ')'}
+					onclick={() => openPanel(entry.panel_kind)}
+				>
+					<span class="mai-rail-btn__glyph" aria-hidden="true">{railGlyphFor(entry.panel_kind)}</span>
+				</button>
+			{/each}
+			{#if live}
+				<button
+					type="button"
+					class="mai-rail-btn mai-rail-btn--end"
+					data-testid="rail-sign-out"
+					aria-label="Sign out"
+					title="Sign out"
+					onclick={() => void signOut()}
+				>
+					<span class="mai-rail-btn__glyph" aria-hidden="true">⏻</span>
+				</button>
+			{/if}
+		{/snippet}
 
 		{#snippet footer()}
 			<p class="mai-desktop-shell__status" role="status" data-testid="desktop-status">{status}</p>
@@ -1644,11 +1787,33 @@
 		class="mai-desktop-shell__dock"
 		class:mai-desktop-shell__dock--hero={activeSessionId === null}
 		class:mai-desktop-shell__dock--reduced-motion={shellMotionReduced}
+		class:mai-desktop-shell__dock--receded={hasVisibleWindows && !dockInteracting}
 		data-testid="bottom-chat-dock"
 		aria-label="Chat column"
 		bind:this={dockEl}
 	>
-		<div class="mai-desktop-shell__dock-body" bind:this={dockBodyEl}>
+		<!-- svelte-ignore a11y_no_static_element_interactions:
+		     the pointer/focus handlers drive a purely VISUAL depth effect
+		     (the MCR S2 auto-recede), not an interaction — keyboard users
+		     reach the same result through focusin/focusout, and the card
+		     keeps its ordinary content semantics (no widget role fits). -->
+		<div
+			class="mai-desktop-shell__dock-body"
+			bind:this={dockBodyEl}
+			onfocusin={() => (dockInteracting = true)}
+			onfocusout={(event) => {
+				const next = event.relatedTarget;
+				if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
+					dockInteracting = false;
+				}
+			}}
+			onpointerenter={() => (dockInteracting = true)}
+			onpointerleave={() => {
+				if (!(dockBodyEl?.contains(document.activeElement) ?? false)) {
+					dockInteracting = false;
+				}
+			}}
+		>
 			<!-- D09: the session-first virtualized surface is THE column; the
 			     legacy ChatPanel fallback is deleted (no toggle). Without a
 			     live session the panel renders its honest empty/create state;
@@ -1740,6 +1905,70 @@
 		font-family: var(--mai-font-mono);
 		font-size: 0.68rem;
 		color: var(--mai-color-text-muted);
+	}
+
+	/* MCR S4: the collapsed brand collapses into the accessibility tree
+	 * only — zero visual box inside the 52px rail header (must come
+	 * AFTER the brand rule so the pair wins the cascade). */
+	.mai-sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	/* MCR S4: the tactical rail's stamped-steel quick actions. */
+	.mai-rail-btn {
+		flex: 0 0 auto;
+		width: 2.25rem;
+		height: 2.25rem;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		font-family: var(--mai-font-mono);
+		font-size: 0.95rem;
+		color: var(--mai-color-text-muted);
+		background: var(--mai-color-surface-raised);
+		border: 1px solid var(--mai-color-border);
+		border-left: 2px solid transparent;
+		border-radius: var(--mai-radius-sm);
+		cursor: pointer;
+		transition:
+			color var(--mai-motion-fast) ease,
+			border-color var(--mai-motion-fast) ease,
+			background-color var(--mai-motion-fast) ease;
+	}
+
+	.mai-rail-btn:hover:not(:disabled) {
+		color: var(--mai-color-text);
+		border-color: var(--mai-color-brass);
+	}
+
+	.mai-rail-btn--active {
+		border-left: 2px solid var(--mai-color-brass);
+		color: var(--mai-color-brass);
+	}
+
+	.mai-rail-btn__glyph {
+		line-height: 1;
+	}
+
+	.mai-rail-btn--end {
+		margin-top: auto;
+	}
+
+	.mai-rail-rule {
+		flex: 0 0 auto;
+		width: 24px;
+		height: 0;
+		border-top: 1px solid var(--mai-color-border);
 	}
 
 	.mai-desktop-shell__status {
@@ -1863,9 +2092,31 @@
 		border: var(--mai-border-width) solid var(--mai-color-border);
 		border-radius: var(--mai-radius-2xl, var(--mai-radius-lg));
 		box-shadow: none;
+		/* MCR S2: the auto-recede flip eases on the base motion token —
+		   the global prefers-reduced-motion rule compiles it out. */
+		transition:
+			opacity var(--mai-motion-base) ease,
+			filter var(--mai-motion-base) ease;
 	}
 	.mai-desktop-shell__dock--hero .mai-desktop-shell__dock-body {
 		height: auto;
+	}
+	/* MCR S2 — three depth echelons: calm tactical grid canvas, the
+	   RECESSED active chat dataslate (sunken surface, quieted hairline
+	   — floating WindowFrames on --mai-color-surface #12161c separate
+	   cleanly above it), and crisp raised plates inside. The hero card
+	   keeps the calm near-canvas surface. */
+	.mai-desktop-shell__dock:not(.mai-desktop-shell__dock--hero) .mai-desktop-shell__dock-body {
+		background: var(--mai-color-surface-sunken);
+		border-color: color-mix(in srgb, var(--mai-color-border) 65%, transparent);
+	}
+	/* Auto-recede: while a VISIBLE window floats above the workspace
+	   and the operator is not interacting with the chat (no pointer
+	   over the card, no focus inside it), the dataslate steps back a
+	   full echelon. */
+	.mai-desktop-shell__dock--receded .mai-desktop-shell__dock-body {
+		opacity: 0.42;
+		filter: saturate(0.75);
 	}
 
 	.mai-desktop-shell__taskbar {
