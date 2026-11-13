@@ -28,6 +28,15 @@ downgrade/upgrade round trip. Fixtures carry only fixed opaque UUIDs and
 synthetic text — never secret values. The 05/07/08 chain fixtures stay
 untouched: this card adds its own auxiliary experiment databases
 (``mai_fxt_10_prior``, ``mai_fxt_10_down``).
+
+Notification-inbox extension (nbi-schema task): the unified-inbox pins ride
+on the same real-Postgres discipline — the widened origin vocabulary,
+severity/source/body bounds and the partial global dedup index are proven
+by real integrity violations and real index definitions; the severity
+backfill is proven row-for-row against the frozen reader
+(``mai.api.monitoring._alert_severity``) on a disposable database carried
+from the 0016 head; the 0017 downgrade proves the honest destructive
+reversal and the untouched 0007 constraints.
 """
 
 from __future__ import annotations
@@ -47,10 +56,15 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
+from mai.api.monitoring import _alert_severity
 from mai.contracts.observations import (
     DEDUP_KEY_MAX_CHARS,
     DETAIL_MAX_CHARS,
+    INGEST_RATE_WINDOW,
     KIND_MAX_CHARS,
+    MAX_INGEST_BODY_BYTES,
+    MAX_NOTIFICATION_BODY_CHARS,
+    MAX_NOTIFICATION_SOURCE_CHARS,
     SOURCE_MAX_CHARS,
     SUMMARY_MAX_CHARS,
     TITLE_MAX_CHARS,
@@ -75,8 +89,11 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 # assertions target the chain TIP; the tuple tracks the full chain.
 # Chain-tip reconciliation (card 10-observation-schema, exclusive
 # migration-chain owner): revision 0007 appends the bounded observation +
-# notification persistence; the tip constants are advanced here so this
-# file's head assertions stay true.
+# notification persistence; notification-inbox (nbi-schema) revision 0017
+# appends the unified inbox delta (nullable server scope, real
+# severity/source/body columns, global partial dedup index, ingest_keys).
+# The tip constants are advanced here so this file's head assertions stay
+# true.
 REVISION_IDS = (
     "0001",
     "0002",
@@ -94,12 +111,14 @@ REVISION_IDS = (
     "0014",
     "0015",
     "0016",
+    "0017",
 )
 
-# The exact public application schema at the 0015 head — the 0006 set plus the
-# three observation-domain tables (10-observation-schema); nothing else, in
-# particular no engine-shadowing run-state table and no ``dbos`` schema
-# before engine launch.
+# The exact public application schema at the chain tip — the 0006 set plus
+# the three observation-domain tables (10-observation-schema) and the
+# machine ingest principal (nbi-schema 0017); nothing else, in particular
+# no engine-shadowing run-state table and no ``dbos`` schema before engine
+# launch.
 EXPECTED_APP_TABLES = frozenset(
     {
         "admin_credential",
@@ -122,6 +141,7 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "ingest_keys",
         "sessions",
         "session_entries",
         "session_runs",
@@ -178,7 +198,7 @@ def _drop_app_tables(url: str) -> None:
 
 @pytest.fixture(scope="session")
 def migrated_url() -> str:
-    """Disposable fixture database migrated from zero through ``0007``."""
+    """Disposable fixture database migrated from zero to the chain tip."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -206,6 +226,7 @@ async def sessions(migrated_url: str):
     # fixture database): delete children before parents; the job_runs row
     # used by the alert FK test goes last.
     async with factory() as session:
+        await session.execute(text("DELETE FROM ingest_keys"))
         await session.execute(text("DELETE FROM notification_alerts"))
         await session.execute(text("DELETE FROM observation_findings"))
         await session.execute(text("DELETE FROM server_observations"))
@@ -350,7 +371,7 @@ async def _insert_alert(
     sessions,
     alert_id: str = ALERT_A,
     *,
-    server_id: str = SERVER_A,
+    server_id: str | None = SERVER_A,
     origin: str = "finding",
     run_id: str | None = None,
     finding_id: str | None = FINDING_A,
@@ -360,6 +381,9 @@ async def _insert_alert(
     delivered_at: datetime | None = None,
     acknowledged_at: datetime | None = None,
     retain_until: datetime = RETAIN_FUTURE,
+    severity: str | None = None,
+    source: str | None = None,
+    body: str | None = None,
 ) -> None:
     await _exec(
         sessions,
@@ -367,13 +391,14 @@ async def _insert_alert(
         INSERT INTO notification_alerts
             (alert_id, server_id, origin, run_id, finding_id, dedup_key,
              title, delivery_status, delivered_at, acknowledged_at,
-             retain_until)
+             retain_until, severity, source, body)
         VALUES
             (:aid, :sid, :origin, :rid, :fid, :dedup, :title,
-             :status, :delivered_at, :acknowledged_at, :retain_until)
+             :status, :delivered_at, :acknowledged_at, :retain_until,
+             COALESCE(:severity, 'info'), :source, :body)
         """,
         aid=uuid.UUID(alert_id),
-        sid=uuid.UUID(server_id),
+        sid=uuid.UUID(server_id) if server_id else None,
         origin=origin,
         rid=uuid.UUID(run_id) if run_id else None,
         fid=uuid.UUID(finding_id) if finding_id else None,
@@ -383,13 +408,77 @@ async def _insert_alert(
         delivered_at=delivered_at,
         acknowledged_at=acknowledged_at,
         retain_until=retain_until,
+        severity=severity,
+        source=source,
+        body=body,
     )
+
+
+async def _insert_ingest_key(
+    sessions,
+    key_id: str | None = None,
+    *,
+    key_hash: str | None = None,
+    label: str = "host-monitor",
+    server_id: str | None = None,
+    expires_at: datetime | None = None,
+    revoked_at: datetime | None = None,
+    last_used_at: datetime | None = None,
+    rate_window_start: datetime | None = None,
+    rate_window_count: int | None = None,
+) -> str:
+    """Insert one ingest key; returns its identity. Optional fields left
+    at ``None`` are left OUT of the insert so those columns exercise the
+    schema defaults (``created_at = now()``, ``rate_window_count = 0``)."""
+    key_id = key_id or str(uuid.uuid4())
+    params: dict[str, object] = {
+        "kid": uuid.UUID(key_id),
+        "hash": key_hash if key_hash is not None else "a" * 64,
+        "label": label,
+        "sid": uuid.UUID(server_id) if server_id else None,
+    }
+    columns = ["key_id", "key_hash", "label", "server_id"]
+    optional = (
+        ("expires_at", "expires", expires_at),
+        ("revoked_at", "revoked", revoked_at),
+        ("last_used_at", "used", last_used_at),
+        ("rate_window_start", "wstart", rate_window_start),
+        ("rate_window_count", "wcount", rate_window_count),
+    )
+    for column, placeholder, value in optional:
+        if value is not None:
+            columns.append(column)
+            params[placeholder] = value
+    placeholders = ", ".join(f":{name}" for name in params)
+    await _exec(
+        sessions,
+        f"INSERT INTO ingest_keys ({', '.join(columns)}) "
+        f"VALUES ({placeholders})",
+        **params,
+    )
+    return key_id
 
 
 def _migration_module():
     spec = importlib.util.spec_from_file_location(
         "migration_0007",
         os.path.join(BACKEND_ROOT, "migrations", "versions", "0007_observations.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _migration_0017_module():
+    spec = importlib.util.spec_from_file_location(
+        "migration_0017",
+        os.path.join(
+            BACKEND_ROOT,
+            "migrations",
+            "versions",
+            "0017_notification_inbox.py",
+        ),
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -910,6 +999,431 @@ class TestNotificationAlerts:
 
 
 # ---------------------------------------------------------------------------
+# Notification inbox (nbi-schema): widened origin, real severity column,
+# source/body bounds, nullable server scope, partial global dedup, inbox
+# indexes, ingest_keys constraints, 0007 constraints untouched
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationInboxSchema:
+    @pytest.mark.anyio
+    async def test_external_origin_with_null_server_is_storable(
+        self, sessions
+    ) -> None:
+        alert_id = str(uuid.uuid4())
+        await _insert_alert(
+            sessions,
+            alert_id=alert_id,
+            server_id=None,
+            origin="external",
+            finding_id=None,
+            run_id=None,
+            dedup_key="external:disk-/var-db-1",
+            title="disk almost full",
+            source="host-monitor",
+            body="/var usage 94% on db-1",
+            severity="warning",
+        )
+        row = await _fetchone(
+            sessions,
+            "SELECT server_id, origin, severity, source, body "
+            "FROM notification_alerts WHERE alert_id = :aid",
+            aid=uuid.UUID(alert_id),
+        )
+        assert row == (
+            None,
+            "external",
+            "warning",
+            "host-monitor",
+            "/var usage 94% on db-1",
+        )
+
+    @pytest.mark.anyio
+    async def test_origin_vocabulary_is_widened_with_external(
+        self, sessions
+    ) -> None:
+        constraint = await _constraint_def(
+            sessions, "ck_notification_alerts_origin"
+        )
+        assert set(_literals_of(constraint)) == {
+            o.value for o in AlertOrigin
+        }
+        assert "external" in _literals_of(constraint)
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                finding_id=None,
+                dedup_key="origin-invalid",
+                origin="email",
+            )
+
+    @pytest.mark.anyio
+    async def test_severity_defaults_and_rejects_unknown_values(
+        self, sessions
+    ) -> None:
+        await _insert_finding(sessions)
+        await _insert_alert(sessions)  # severity omitted -> DEFAULT 'info'
+        row = await _fetchone(
+            sessions,
+            "SELECT severity FROM notification_alerts WHERE alert_id = :aid",
+            aid=uuid.UUID(ALERT_A),
+        )
+        assert row == ("info",)
+        constraint = await _constraint_def(
+            sessions, "ck_notification_alerts_severity"
+        )
+        assert set(_literals_of(constraint)) == {
+            s.value for s in FindingSeverity
+        }
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                finding_id=None,
+                dedup_key="sev-urgent",
+                severity="urgent",
+            )
+        for severity in ("warning", "critical"):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                finding_id=None,
+                dedup_key=f"sev-{severity}",
+                severity=severity,
+            )
+
+    @pytest.mark.anyio
+    async def test_source_is_bounded_for_external_notices(
+        self, sessions
+    ) -> None:
+        await _insert_finding(sessions)
+        await _insert_alert(
+            sessions,
+            dedup_key="src-max",
+            source="x" * MAX_NOTIFICATION_SOURCE_CHARS,
+        )
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                dedup_key="src-over",
+                source="x" * (MAX_NOTIFICATION_SOURCE_CHARS + 1),
+            )
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                dedup_key="src-empty",
+                source="",
+            )
+
+    @pytest.mark.anyio
+    async def test_body_is_bounded_for_external_notices(
+        self, sessions
+    ) -> None:
+        await _insert_finding(sessions)
+        await _insert_alert(
+            sessions,
+            dedup_key="body-max",
+            body="x" * MAX_NOTIFICATION_BODY_CHARS,
+        )
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                dedup_key="body-over",
+                body="x" * (MAX_NOTIFICATION_BODY_CHARS + 1),
+            )
+        # NULL body is the finding/job_result shape (summary stays theirs).
+        await _insert_alert(
+            sessions,
+            alert_id=str(uuid.uuid4()),
+            dedup_key="body-null",
+            finding_id=None,
+        )
+        row = await _fetchone(
+            sessions,
+            "SELECT body, source FROM notification_alerts "
+            "WHERE dedup_key = 'body-null'",
+        )
+        assert row == (None, None)
+
+    @pytest.mark.anyio
+    async def test_global_dedup_arbitrated_by_partial_unique_index(
+        self, sessions
+    ) -> None:
+        # NULL-server rows never collide under the composite UNIQUE (NULL
+        # is distinct in SQL): the partial unique index is their arbiter.
+        key = "external:replay"
+        await _insert_alert(
+            sessions,
+            alert_id=str(uuid.uuid4()),
+            server_id=None,
+            origin="external",
+            finding_id=None,
+            run_id=None,
+            dedup_key=key,
+        )
+        with pytest.raises(IntegrityError):
+            await _insert_alert(
+                sessions,
+                alert_id=str(uuid.uuid4()),
+                server_id=None,
+                origin="external",
+                finding_id=None,
+                run_id=None,
+                dedup_key=key,
+            )
+        # The same key under a real server_id stays legal (distinct scope).
+        await _insert_finding(sessions)
+        await _insert_alert(sessions, dedup_key=key)
+        # And two real servers with the same key stay legal (0007 rule).
+        finding_b = str(uuid.uuid4())
+        await _insert_finding(sessions, finding_id=finding_b, server_id=SERVER_B)
+        await _insert_alert(
+            sessions,
+            alert_id=str(uuid.uuid4()),
+            server_id=SERVER_B,
+            finding_id=finding_b,
+            dedup_key=key,
+        )
+
+    @pytest.mark.anyio
+    async def test_inbox_indexes_exist_with_frozen_definitions(
+        self, sessions
+    ) -> None:
+        rows = await _fetchall(
+            sessions,
+            """
+            SELECT indexname, indexdef FROM pg_indexes
+            WHERE tablename = 'notification_alerts'
+              AND indexname IN ('uq_notification_alerts_dedup_global',
+                                'ix_notification_alerts_created_at',
+                                'ix_notification_alerts_unread')
+            """,
+        )
+        definitions = {name: definition for name, definition in rows}
+        assert set(definitions) == {
+            "uq_notification_alerts_dedup_global",
+            "ix_notification_alerts_created_at",
+            "ix_notification_alerts_unread",
+        }
+        assert "CREATE UNIQUE INDEX" in definitions[
+            "uq_notification_alerts_dedup_global"
+        ]
+        assert "server_id IS NULL" in definitions[
+            "uq_notification_alerts_dedup_global"
+        ]
+        assert "(created_at DESC, alert_id DESC)" in definitions[
+            "ix_notification_alerts_created_at"
+        ]
+        assert "(server_id, created_at)" in definitions[
+            "ix_notification_alerts_unread"
+        ]
+        assert "acknowledged_at IS NULL" in definitions[
+            "ix_notification_alerts_unread"
+        ]
+
+    def test_prior_0007_constraints_untouched(self, migrated_url: str) -> None:
+        """Criterion 4: the 0007 shape survives 0017 verbatim — the same
+        constraint names, the composite dedup UNIQUE, delivery/ack CHECKs,
+        retention bound and the ON DELETE SET NULL anchor FKs."""
+        with psycopg.connect(migrated_url) as conn:
+            constraints = {
+                r[0]: str(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT conname, pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE conrelid = 'notification_alerts'::regclass
+                    """
+                ).fetchall()
+            }
+            nullability = {
+                r[0]: str(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT column_name, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'notification_alerts'
+                    """
+                ).fetchall()
+            }
+        expected = (
+            "ck_notification_alerts_dedup_key",
+            "ck_notification_alerts_origin",  # name kept, vocabulary widened
+            "ck_notification_alerts_title",
+            "ck_notification_alerts_summary",
+            "ck_notification_alerts_context_ref",
+            "ck_notification_alerts_delivery_status",
+            "ck_notification_alerts_delivery_stamp",
+            "ck_notification_alerts_ack_after_created",
+            "uq_notification_alerts_dedup",
+            "fk_notification_alerts_run",
+            "fk_notification_alerts_finding",
+        )
+        missing = [name for name in expected if name not in constraints]
+        assert not missing, f"0007 constraints missing at head: {missing}"
+        assert "UNIQUE (server_id, dedup_key)" in constraints[
+            "uq_notification_alerts_dedup"
+        ]
+        assert set(
+            _literals_of(constraints["ck_notification_alerts_delivery_status"])
+        ) == {d.value for d in DeliveryStatus}
+        assert nullability["retain_until"] == "NO"
+        assert "ON DELETE SET NULL" in constraints["fk_notification_alerts_run"]
+        assert "ON DELETE SET NULL" in constraints[
+            "fk_notification_alerts_finding"
+        ]
+
+    def test_inbox_bounds_match_the_contract_constants(
+        self, migrated_url: str
+    ) -> None:
+        with psycopg.connect(migrated_url) as conn:
+            definitions = {
+                r[0]: str(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT conname, pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE contype = 'c'
+                      AND conrelid = 'notification_alerts'::regclass
+                    """
+                ).fetchall()
+            }
+        for name, bound in (
+            (
+                "ck_notification_alerts_source",
+                MAX_NOTIFICATION_SOURCE_CHARS,
+            ),
+            ("ck_notification_alerts_body", MAX_NOTIFICATION_BODY_CHARS),
+        ):
+            definition = definitions.get(name)
+            assert definition is not None, f"missing constraint {name}"
+            upper = re.search(r"char_length\(\w+\) <= (\d+)", definition)
+            lower = re.search(r"char_length\(\w+\) >= 1", definition)
+            assert (
+                upper and lower
+            ), f"{name} is not a 1..N char_length bound: {definition}"
+            assert int(upper.group(1)) == bound, (
+                f"{name} drifted from the contract constant"
+            )
+
+    def test_frozen_inbox_constants_and_migration_fragments(self) -> None:
+        """The frozen bounds stay at their contract values and the 0017
+        migration fragments stay in lockstep with them (0007 discipline)."""
+        assert MAX_NOTIFICATION_BODY_CHARS == 4096
+        assert MAX_NOTIFICATION_SOURCE_CHARS == 64
+        assert MAX_INGEST_BODY_BYTES == 16384
+        assert INGEST_RATE_WINDOW == 60
+        module = _migration_0017_module()
+        assert module._SEVERITIES_SQL == "('info', 'warning', 'critical')"
+        assert module._ALERT_ORIGINS_WIDE_SQL == (
+            "('finding', 'job_result', 'external')"
+        )
+        assert module._ALERT_ORIGINS_NARROW_SQL == "('finding', 'job_result')"
+        assert module._SOURCE_MAX == MAX_NOTIFICATION_SOURCE_CHARS
+        assert module._BODY_MAX == MAX_NOTIFICATION_BODY_CHARS
+        assert module._KEY_HASH_LENGTH == 64
+
+    @pytest.mark.anyio
+    async def test_ingest_key_roundtrips_with_schema_defaults(
+        self, sessions
+    ) -> None:
+        key_id = await _insert_ingest_key(sessions)
+        row = await _fetchone(
+            sessions,
+            """
+            SELECT key_id, key_hash, label, server_id,
+                   created_at IS NOT NULL, expires_at, revoked_at,
+                   last_used_at, rate_window_start, rate_window_count
+            FROM ingest_keys WHERE key_id = :kid
+            """,
+            kid=uuid.UUID(key_id),
+        )
+        assert row == (
+            uuid.UUID(key_id),
+            "a" * 64,
+            "host-monitor",
+            None,
+            True,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+
+    @pytest.mark.anyio
+    async def test_ingest_key_hash_is_unique_and_exactly_hex64(
+        self, sessions
+    ) -> None:
+        await _insert_ingest_key(sessions, key_hash="b" * 64)
+        with pytest.raises(IntegrityError):  # UNIQUE(key_hash)
+            await _insert_ingest_key(sessions, key_hash="b" * 64)
+        with pytest.raises(IntegrityError):  # not hex
+            await _insert_ingest_key(sessions, key_hash="z" * 64)
+        with pytest.raises(IntegrityError):  # short hex blank-padded by CHAR(64)
+            await _insert_ingest_key(sessions, key_hash="c" * 63)
+        with pytest.raises(IntegrityError):  # uppercase is not the frozen form
+            await _insert_ingest_key(sessions, key_hash="D" * 64)
+
+    def test_ingest_key_hash_column_is_char64(self, migrated_url: str) -> None:
+        with psycopg.connect(migrated_url) as conn:
+            row = conn.execute(
+                """
+                SELECT data_type, character_maximum_length
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'ingest_keys'
+                  AND column_name = 'key_hash'
+                """
+            ).fetchone()
+        assert row == ("character", 64)
+
+    @pytest.mark.anyio
+    async def test_ingest_key_label_is_bounded_and_non_blank(
+        self, sessions
+    ) -> None:
+        await _insert_ingest_key(sessions, label="x" * 64)
+        with pytest.raises(IntegrityError):
+            await _insert_ingest_key(sessions, label="x" * 65)
+        with pytest.raises(IntegrityError):
+            await _insert_ingest_key(sessions, label="")
+        with pytest.raises(IntegrityError):  # blank is not a label
+            await _insert_ingest_key(sessions, label="   ")
+
+    @pytest.mark.anyio
+    async def test_ingest_key_rate_window_count_is_non_negative(
+        self, sessions
+    ) -> None:
+        await _insert_ingest_key(
+            sessions, rate_window_start=NOW, rate_window_count=60
+        )
+        with pytest.raises(IntegrityError):
+            await _insert_ingest_key(sessions, rate_window_count=-1)
+
+    @pytest.mark.anyio
+    async def test_ingest_key_server_scope_has_no_foreign_key(
+        self, sessions
+    ) -> None:
+        # NO FK by design (server profiles are files): an unknown server
+        # identity must be storable; scope is enforced at the API boundary,
+        # fail-closed there.
+        await _insert_ingest_key(sessions, server_id=str(uuid.uuid4()))
+        row = await _fetchone(
+            sessions,
+            """
+            SELECT count(*) FROM pg_constraint
+            WHERE conrelid = 'ingest_keys'::regclass AND contype = 'f'
+            """,
+        )
+        assert row == (0,)
+
+
+# ---------------------------------------------------------------------------
 # AC1/AC2 — retention bounds + structural no-dump boundary
 # ---------------------------------------------------------------------------
 
@@ -1321,6 +1835,327 @@ def test_downgrade_upgrades_cleanly(
                 (uuid.UUID(OBS_A1),),
             ).fetchone()
         assert roundtrip == (1,)  # the reachable downgrade preserved the row
+    finally:
+        if previous is None:
+            os.environ.pop("MAI_DATABASE_URL", None)
+        else:
+            os.environ["MAI_DATABASE_URL"] = previous
+        with psycopg.connect(
+            _database_url(migrated_url, "postgres"), autocommit=True
+        ) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{down_db}" WITH (FORCE)')
+
+
+@pytest.fixture(scope="session")
+def backfill_database_url(migrated_url: str) -> str:
+    """Disposable database carried from the 0016 head (no severity column)
+    to the chain tip, pre-populated with the frozen reader's decision
+    cases: live anchor, summary tag, neither, and the boundary spellings.
+
+    Feature-gate scenario fragment (criterion 2): the severity backfill
+    must reproduce EXACTLY what ``mai.api.monitoring._alert_severity``
+    derives today — anchor join first, ``[severity=<v>]`` summary tag
+    second, ``info`` fallback third.
+    """
+    db = "mai_fxt_nbi_backfill"
+    db_url = _database_url(migrated_url, db)
+    with psycopg.connect(
+        _database_url(migrated_url, "postgres"), autocommit=True
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{db}"')
+    previous = os.environ.get("MAI_DATABASE_URL")
+    try:
+        os.environ["MAI_DATABASE_URL"] = db_url
+        command.upgrade(_alembic_config(), "0016")
+        finding_critical = str(uuid.uuid4())
+        finding_warning = str(uuid.uuid4())
+        with psycopg.connect(db_url) as conn:
+            conn.execute(
+                """
+                INSERT INTO observation_findings
+                    (finding_id, server_id, kind, dedup_key, severity,
+                     summary, retain_until)
+                VALUES (%s, %s, 'update.available', 'bk-critical',
+                        'critical', 'critical condition upstream', %s),
+                       (%s, %s, 'update.available', 'bk-warning',
+                        'warning', 'warning condition upstream', %s)
+                """,
+                (
+                    uuid.UUID(finding_critical),
+                    uuid.UUID(SERVER_A),
+                    RETAIN_FUTURE,
+                    uuid.UUID(finding_warning),
+                    uuid.UUID(SERVER_A),
+                    RETAIN_FUTURE,
+                ),
+            )
+            # The 0016-era writer shape: no severity/source/body columns.
+            # (dedup_key, finding anchor, summary)
+            cases = (
+                # (a) live anchor, untagged summary
+                ("bk-anchor-untagged", finding_critical,
+                 "critical condition upstream"),
+                # (a2) live anchor WINS over a stale contradicting tag
+                ("bk-anchor-over-tag", finding_warning,
+                 "stale tag lies [severity=info]"),
+                # (b) tag only (anchor severed/absent)
+                ("bk-tag-critical", None,
+                 "disk almost full [severity=critical]"),
+                # (b2) tag info
+                ("bk-tag-info", None, "backup finished [severity=info]"),
+                # (c) neither anchor nor tag -> fallback
+                ("bk-fallback", None, "job result notice without tag"),
+                # (d) tag NOT at the end -> no match -> fallback
+                ("bk-tag-mid", None, "[severity=critical] and then some"),
+                # (e) uppercase tag -> the reader regex is case-sensitive
+                ("bk-tag-upper", None, "screaming [severity=CRITICAL]"),
+                # (f) trailing newline after the tag (Python ``$`` tolerance)
+                ("bk-tag-newline", None,
+                 "newline after tag [severity=critical]\n"),
+                # (g) job_result notice, tagged
+                ("bk-job-tagged", None, "run finished [severity=warning]"),
+            )
+            for dedup, finding, summary in cases:
+                conn.execute(
+                    """
+                    INSERT INTO notification_alerts
+                        (alert_id, server_id, origin, run_id, finding_id,
+                         dedup_key, title, summary, delivery_status,
+                         retain_until)
+                    VALUES (%s, %s, %s, NULL, %s, %s, %s, %s, 'pending', %s)
+                    """,
+                    (
+                        uuid.uuid4(),
+                        uuid.UUID(SERVER_A),
+                        "job_result"
+                        if dedup == "bk-job-tagged"
+                        else "finding",
+                        uuid.UUID(finding) if finding else None,
+                        dedup,
+                        f"title {dedup}",
+                        summary,
+                        RETAIN_FUTURE,
+                    ),
+                )
+            conn.commit()
+        command.upgrade(_alembic_config(), "head")
+    finally:
+        if previous is None:
+            os.environ.pop("MAI_DATABASE_URL", None)
+        else:
+            os.environ["MAI_DATABASE_URL"] = previous
+    yield db_url
+    with psycopg.connect(
+        _database_url(migrated_url, "postgres"), autocommit=True
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+
+
+def test_severity_backfill_matches_frozen_reader_row_for_row(
+    backfill_database_url: str,
+) -> None:
+    """Criterion 2: every backfilled severity equals what the frozen
+    reader (``mai.api.monitoring._alert_severity``, monitoring.py:349-362)
+    derives TODAY from the same row — live anchor join first, the service
+    writer's exact ``[severity=<v>]`` tag second, ``info`` fallback third."""
+    with psycopg.connect(backfill_database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT a.dedup_key, a.severity, a.summary, f.severity
+            FROM notification_alerts a
+            LEFT JOIN observation_findings f
+              ON f.finding_id = a.finding_id
+            ORDER BY a.dedup_key
+            """
+        ).fetchall()
+    assert {r[0] for r in rows} >= {
+        "bk-anchor-untagged",
+        "bk-anchor-over-tag",
+        "bk-tag-critical",
+        "bk-tag-info",
+        "bk-fallback",
+        "bk-tag-mid",
+        "bk-tag-upper",
+        "bk-tag-newline",
+        "bk-job-tagged",
+    }
+    for dedup_key, stored, summary, anchor in rows:
+        expected = _alert_severity(anchor, summary)
+        assert stored == expected, (
+            f"{dedup_key}: backfilled {stored!r} != frozen reader "
+            f"{expected!r}"
+        )
+    # Explicit precedence spot checks (reader-derivable by inspection).
+    stored_by_dedup = {r[0]: r[1] for r in rows}
+    assert stored_by_dedup["bk-anchor-untagged"] == "critical"
+    assert stored_by_dedup["bk-anchor-over-tag"] == "warning"  # anchor wins
+    assert stored_by_dedup["bk-tag-critical"] == "critical"
+    assert stored_by_dedup["bk-tag-info"] == "info"
+    assert stored_by_dedup["bk-fallback"] == "info"
+    assert stored_by_dedup["bk-tag-mid"] == "info"  # tag must end the summary
+    assert stored_by_dedup["bk-tag-upper"] == "info"  # case-sensitive reader
+    assert stored_by_dedup["bk-tag-newline"] == "critical"
+    assert stored_by_dedup["bk-job-tagged"] == "warning"
+
+
+def test_downgrade_0016_round_trip_is_honest(migrated_url: str) -> None:
+    """Criterion 1 + 4: the 0017 downgrade reverses cleanly (destructive
+    for 0017-era data only), restores the exact 0007 shape, and the
+    re-upgrade re-derives severity through the SAME frozen backfill."""
+    down_db = "mai_fxt_nbi_down"
+    down_url = _database_url(migrated_url, down_db)
+    with psycopg.connect(
+        _database_url(migrated_url, "postgres"), autocommit=True
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{down_db}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{down_db}"')
+    previous = os.environ.get("MAI_DATABASE_URL")
+    try:
+        os.environ["MAI_DATABASE_URL"] = down_url
+        command.upgrade(_alembic_config(), "head")
+        finding_id = str(uuid.uuid4())
+        external_alert = str(uuid.uuid4())
+        scoped_alert = str(uuid.uuid4())
+        with psycopg.connect(down_url) as conn:
+            conn.execute(
+                """
+                INSERT INTO observation_findings
+                    (finding_id, server_id, kind, dedup_key, severity,
+                     summary, retain_until)
+                VALUES (%s, %s, 'update.available', 'down-finding',
+                        'warning', 'warning condition upstream', %s)
+                """,
+                (uuid.UUID(finding_id), uuid.UUID(SERVER_A), RETAIN_FUTURE),
+            )
+            conn.execute(
+                """
+                INSERT INTO notification_alerts
+                    (alert_id, server_id, origin, run_id, finding_id,
+                     dedup_key, title, delivery_status, retain_until)
+                VALUES (%s, %s, 'finding', NULL, %s, 'down-scoped',
+                        'scoped notice', 'pending', %s)
+                """,
+                (
+                    uuid.UUID(scoped_alert),
+                    uuid.UUID(SERVER_A),
+                    uuid.UUID(finding_id),
+                    RETAIN_FUTURE,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO notification_alerts
+                    (alert_id, server_id, origin, run_id, finding_id,
+                     dedup_key, title, source, body, severity,
+                     delivery_status, retain_until)
+                VALUES (%s, NULL, 'external', NULL, NULL, 'down-global',
+                        'global notice', 'host-monitor', 'hello',
+                        'critical', 'pending', %s)
+                """,
+                (uuid.UUID(external_alert), RETAIN_FUTURE),
+            )
+            conn.execute(
+                """
+                INSERT INTO ingest_keys (key_id, key_hash, label, server_id)
+                VALUES (%s, %s, 'down-key', NULL)
+                """,
+                (uuid.uuid4(), "f" * 64),
+            )
+            conn.commit()
+        command.downgrade(_alembic_config(), "0016")
+        with psycopg.connect(down_url) as conn:
+            version = conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+            columns = {
+                r[0]: str(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT column_name, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'notification_alerts'
+                    """
+                ).fetchall()
+            }
+            origin = conn.execute(
+                """
+                SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                WHERE conname = 'ck_notification_alerts_origin'
+                  AND conrelid = 'notification_alerts'::regclass
+                """
+            ).fetchone()
+            survivors = conn.execute(
+                "SELECT dedup_key FROM notification_alerts"
+            ).fetchall()
+            ingest_keys = conn.execute(
+                """
+                SELECT count(*) FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'ingest_keys'
+                """
+            ).fetchone()
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT indexname FROM pg_indexes
+                    WHERE tablename = 'notification_alerts'
+                    """
+                ).fetchall()
+            }
+        assert version == ("0016",)
+        assert "severity" not in columns
+        assert "source" not in columns
+        assert "body" not in columns
+        assert columns["server_id"] == "NO"  # NOT NULL restored
+        assert columns["retain_until"] == "NO"
+        assert origin is not None and set(_literals_of(str(origin[0]))) == {
+            "finding",
+            "job_result",
+        }
+        assert survivors == [("down-scoped",)]  # global/external rows deleted
+        assert ingest_keys == (0,)  # ingest_keys dropped
+        assert not {
+            "uq_notification_alerts_dedup_global",
+            "ix_notification_alerts_created_at",
+            "ix_notification_alerts_unread",
+        } & indexes
+        assert "uq_notification_alerts_dedup" in indexes  # 0007 uniqueness
+        command.upgrade(_alembic_config(), "head")
+        with psycopg.connect(down_url) as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone() == (REVISION_IDS[-1],)
+            row = conn.execute(
+                """
+                SELECT severity, source, body FROM notification_alerts
+                WHERE dedup_key = 'down-scoped'
+                """
+            ).fetchone()
+            widened = conn.execute(
+                """
+                SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                WHERE conname = 'ck_notification_alerts_origin'
+                  AND conrelid = 'notification_alerts'::regclass
+                """
+            ).fetchone()
+            keys_back = conn.execute(
+                """
+                SELECT count(*) FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'ingest_keys'
+                """
+            ).fetchone()
+        # The surviving scoped notice re-derives severity through the SAME
+        # frozen backfill (live anchor join): its finding survived the
+        # downgrade with severity 'warning'.
+        assert row == ("warning", None, None)
+        assert widened is not None and "external" in _literals_of(
+            str(widened[0])
+        )
+        assert keys_back == (1,)
     finally:
         if previous is None:
             os.environ.pop("MAI_DATABASE_URL", None)

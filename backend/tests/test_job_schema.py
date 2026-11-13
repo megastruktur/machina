@@ -103,6 +103,7 @@ REVISION_IDS = (
     "0014",
     "0015",
     "0016",
+    "0017",
 )
 
 # The exact public application schema at the tip — nothing else, in
@@ -135,6 +136,7 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "ingest_keys",
         "tags",
         "job_tags",
         "sessions",
