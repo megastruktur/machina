@@ -2091,6 +2091,7 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			};
 		});
 		expect(gaps.userToAssistant).toBeGreaterThanOrEqual(16 - 0.5);
+		expect(gaps.userToAssistant).toBeLessThanOrEqual(16 + 0.5);
 		expect(gaps.proseToGroup).toBeGreaterThanOrEqual(16 - 0.5);
 		expect(gaps.proseToGroup).toBeLessThanOrEqual(16 + 0.5);
 		expect(gaps.insideGroup).toBeGreaterThanOrEqual(4 - 0.5);
@@ -2185,6 +2186,7 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 			};
 		});
 		expect(desktop.inset).toBeGreaterThanOrEqual(24 - 2);
+		expect(desktop.inset).toBeLessThanOrEqual(24 + 2);
 		expect(desktop.docScroll).toBeLessThanOrEqual(desktop.docClient);
 		expect(desktop.viewScroll).toBeLessThanOrEqual(desktop.viewClient);
 
@@ -2208,6 +2210,7 @@ test.describe('delta reconciliation + reconnect (deterministic frames)', () => {
 		expect(pocket.inset).toBeGreaterThanOrEqual(12 - 2);
 		expect(pocket.inset).toBeLessThanOrEqual(12 + 2);
 		expect(pocket.docScroll).toBeLessThanOrEqual(pocket.docClient);
+		expect(pocket.viewScroll).toBeLessThanOrEqual(pocket.viewClient);
 	});
 });
 
