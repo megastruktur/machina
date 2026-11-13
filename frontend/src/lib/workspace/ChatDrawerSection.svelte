@@ -174,7 +174,7 @@
 
 <div class="mai-chat-drawer" data-testid="drawer-chat-section">
 	<Button
-		variant="primary"
+		variant="secondary"
 		size="sm"
 		tabindex={-1}
 		class="mai-chat-drawer__new-btn"
@@ -186,7 +186,7 @@
 
 	<AccordionGroup
 		title="Chat History"
-		icon="🕓"
+		icon="◈"
 		badge={historyBadge}
 		bind:open={historyExpanded}
 		ontoggle={(open) => {
@@ -245,7 +245,7 @@
 						<div class="mai-chat-drawer__item-row">
 							<div class="mai-chat-drawer__item-head">
 								<NavItem
-									icon="💬"
+									icon="▸"
 									label={formatConversationLabel(row)}
 									meta={row.state ?? row.status ?? ''}
 									active={activeRunId === rowKey(row)}

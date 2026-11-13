@@ -550,9 +550,10 @@
 					: String(servers[0].server_id);
 				if (!exists) persistence.setSelectedServerId(selectedServerId);
 			}
-			// The session history loads under the RESOLVED server scope (an
-			// earlier call here filtered against the fixture default server).
-			void loadSessionHistory();
+			// MCR S3: the session history now loads through the reactive
+			// effect below — every live `selectedServerId` change (select,
+			// hero scope strip, tree, enrollment) refreshes the drawer under
+			// the resolved scope; no duplicate initial call here.
 			// Refresh continuity (R2-3): restore the active session pointer.
 			try {
 				const raw = sessionStorage.getItem(SESSION_POINTER_KEY);
@@ -898,6 +899,23 @@
 			drawerSessionsLoadingMore = false;
 		}
 	}
+
+	/**
+	 * MCR S3: the drawer's Recent Chats follow the visible server
+	 * selection — every live `selectedServerId` change (server-select,
+	 * the hero scope strip, the tree, the post-enrollment hand-off)
+	 * automatically reloads the first history page under the NEW scope.
+	 * The last-loaded guard keeps the initial load single (no duplicate
+	 * first call) and the effect cannot loop: loading never writes the
+	 * selection.
+	 */
+	let drawerHistoryLoadedServerId: ServerId | null = null;
+	$effect(() => {
+		const scope = selectedServerId;
+		if (!live || scope === drawerHistoryLoadedServerId) return;
+		drawerHistoryLoadedServerId = scope;
+		void loadSessionHistory();
+	});
 
 	/** The single-flight `before_seq` older-page fetch (D08 F-acceptance 1). */
 	async function loadOlderEntries(): Promise<void> {

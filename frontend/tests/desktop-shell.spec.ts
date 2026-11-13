@@ -466,7 +466,8 @@ test('live nav: Global / Fleet lists Memory only there and opens it with the glo
 	// uir-u4: the Runbook Catalog entry lives under Global / Fleet only,
 	// never inside a server accordion, and opens with the global scope.
 	const runbooksItem = page.getByTestId('open-runbooks');
-	await expect(runbooksItem).toContainText('📖');
+	// MCR S3: the runbook glyph is the monochrome technical §.
+	await expect(runbooksItem).toContainText('§');
 	await expect(runbooksItem).toContainText('Open Runbook Catalog — Global');
 	await expect(page.getByTestId('open-runbooks-' + SERVER_ALPHA_ID)).toHaveCount(0);
 	await runbooksItem.click();
@@ -957,6 +958,162 @@ test('the chat dataslate recedes under open windows and returns on interaction (
 	await expect(frame(page, NOTES)).toHaveCount(0);
 	await expect(dock).not.toHaveClass(/mai-desktop-shell__dock--receded/);
 	await expect(dockBody).toHaveCSS('opacity', '1');
+});
+
+test('MCR S3: drawer accordion sections are flush and boxless; New Chat is calm secondary', async ({
+	page
+}) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto('/');
+	await expect(page.getByTestId('drawer-chat-section')).toBeVisible();
+
+	// Every OPEN accordion section in the drawer paints NO 4-sided box:
+	// top/right/left borders are 0 (only the quiet bottom hairline rule
+	// between sections survives).
+	const sections = await page.evaluate(() =>
+		Array.from(document.querySelectorAll('.mai-accordion--open')).map((el) => {
+			const cs = getComputedStyle(el);
+			return {
+				top: cs.borderTopWidth,
+				right: cs.borderRightWidth,
+				left: cs.borderLeftWidth,
+				radius: cs.borderRadius
+			};
+		})
+	);
+	expect(sections.length).toBeGreaterThan(0);
+	for (const box of sections) {
+		expect(box.top).toBe('0px');
+		expect(box.right).toBe('0px');
+		expect(box.left).toBe('0px');
+		expect(box.radius).toBe('0px');
+	}
+
+	// The crimson primary variant belongs exclusively to the composer's
+	// Send: + New Chat is the calm secondary stamp.
+	const newChat = page.getByTestId('drawer-new-chat');
+	await expect(newChat).toHaveClass(/mai-button--secondary/);
+	await expect(newChat).not.toHaveClass(/mai-button--primary/);
+});
+
+test('MCR S3: switching server-select live-refreshes the drawer history automatically', async ({
+	page
+}) => {
+	// Live-attach probe + the same one-profile mock surface as the
+	// live-nav proof, but with BOTH fixture servers enrolled so the
+	// selector can switch scopes.
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	const serverProfile = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: {
+			host: 'alpha.example',
+			port: 22,
+			user: 'mai',
+			host_key: 'k',
+			credential_ref: 'MAI_SSH_KEY'
+		},
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [
+					serverProfile(SERVER_ALPHA_ID, 'Server Alpha'),
+					serverProfile('b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60', 'Server Beta')
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/servers/*/memory/status', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				status: 'ok',
+				code: null,
+				provider: 'hindsight',
+				operation: 'status',
+				api_version: 'v1.2.3',
+				error_type: null
+			})
+		})
+	);
+	await page.route('**/api/v1/applications/catalog**', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ runbooks: [], categories: [], limit: 10, offset: 0, total: 0 })
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [
+					{
+						schema_version: 1,
+						name: 'glm53flash',
+						connection: 'litellm',
+						model: 'z-ai-coding/glm-5.3-flash'
+					}
+				]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				schema_version: 1,
+				connection: 'litellm',
+				profile: 'glm53flash'
+			})
+		})
+	);
+	const historyCalls: string[] = [];
+	await page.route('**/api/v1/agent-sessions**', (route) => {
+		historyCalls.push(new URL(route.request().url()).searchParams.get('server_id') ?? '');
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				items: [],
+				limit: 10,
+				offset: 0,
+				total: 0,
+				has_more: false
+			})
+		});
+	});
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+	// The initial history page lands under Alpha exactly once.
+	await expect
+		.poll(() => historyCalls, { timeout: 10_000 })
+		.toEqual([SERVER_ALPHA_ID]);
+
+	// Switching the selector — WITHOUT touching any accordion — reloads
+	// the drawer history under Beta immediately.
+	await page.getByTestId('server-select').selectOption({ label: 'Active: Server Beta' });
+	await expect
+		.poll(() => historyCalls, { timeout: 10_000 })
+		.toEqual([SERVER_ALPHA_ID, 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60']);
 });
 
 test('drawer Chat History is honestly empty offline (no fabricated rows)', async ({

@@ -64,7 +64,8 @@
 		font-weight: var(--mai-weight-medium);
 		color: var(--mai-color-text);
 		background: transparent;
-		border: var(--mai-border-width) solid transparent;
+		border: none;
+		border-left: 2px solid transparent;
 		border-radius: var(--mai-radius-sm);
 		text-align: left;
 		cursor: pointer;
@@ -76,19 +77,26 @@
 
 	.mai-nav-item:hover:not(:disabled) {
 		background: var(--mai-color-surface-raised);
-		border-color: var(--mai-color-border);
+		border-left-color: var(--mai-color-border);
 	}
 
 	.mai-nav-item--active {
 		background: var(--mai-color-surface-raised);
-		border-color: var(--mai-color-brass);
+		border-left-color: var(--mai-color-brass);
 		color: var(--mai-color-text);
 	}
 
+	/* MCR S3 single accent: the glyph stays subtle until the row is
+	   hovered or active — brass is the ONE accent, spent sparingly. */
 	.mai-nav-item__icon {
 		flex: 0 0 1rem;
 		text-align: center;
 		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-subtle);
+	}
+
+	.mai-nav-item:hover:not(:disabled) .mai-nav-item__icon,
+	.mai-nav-item--active .mai-nav-item__icon {
 		color: var(--mai-color-brass);
 	}
 
