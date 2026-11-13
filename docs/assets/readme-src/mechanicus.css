@@ -1,0 +1,114 @@
+/*
+ * Adeptus Mechanicus theme — Variant 1 "Forge World Mars" (campaign
+ * mechanicus-ui, mui_01-foundation). Encapsulated Theme Contract:
+ * this file owns the DEFAULT theme values, declared on
+ * `:root, [data-theme="mechanicus"]` so the palette applies both with and
+ * without the data-theme attribute. It must remain the ONLY stylesheet rule
+ * declaring `--mai-color-text` on `:root` (ui-tokens.spec.ts asserts exactly
+ * one such rule across document.styleSheets); the standard theme overrides
+ * via a separate `[data-theme="standard"]` rule in standard.css.
+ *
+ * Palette is FROZEN (campaign plan mui_01-foundation.md). Every text pair
+ * meets WCAG 2.1 AA (>= 4.5:1 normal text); the focus ring meets >= 3:1
+ * non-text on bg/surface; ratios are re-asserted in the browser by
+ * frontend/tests/ui-tokens.spec.ts.
+ */
+
+:root,
+[data-theme='mechanicus'] {
+	color-scheme: dark;
+
+	/* ---- Color: surfaces and text (Forge World Mars) ------------------- */
+	--mai-color-bg: #0b0d10;
+	--mai-color-surface-sunken: #0e1217;
+	--mai-color-surface: #12161c;
+	--mai-color-surface-raised: #181e27;
+	--mai-color-border: #2a3241;
+	--mai-color-border-strong: #d4a853;
+	--mai-color-text: #ece8de;
+	--mai-color-text-muted: #94a3b8;
+	--mai-color-text-subtle: #7c8b9e;
+
+	/* ---- Color: primary / interactive (crimson oath) -------------------- */
+	--mai-color-primary: #b91c1c;
+	--mai-color-primary-hover: #dc2626;
+	--mai-color-primary-active: #991b1b;
+	--mai-color-primary-contrast: #ffffff;
+
+	/* ---- Color: status (readable text / tint pairs + solid badges) ------ */
+	--mai-status-info-text: #7dd3fc;
+	--mai-status-info-bg: #0c2538;
+	--mai-status-info-border: #1e4e6e;
+	--mai-status-info-solid: #0369a1;
+	--mai-status-success-text: #6ee7b7;
+	--mai-status-success-bg: #09261e;
+	--mai-status-success-border: #155e46;
+	--mai-status-success-solid: #047857;
+	--mai-status-warning-text: #fcd34d;
+	--mai-status-warning-bg: #2b1d07;
+	--mai-status-warning-border: #784911;
+	--mai-status-warning-solid: #b45309;
+	--mai-status-danger-text: #fca5a5;
+	--mai-status-danger-bg: #2c0f12;
+	--mai-status-danger-border: #7f1d1d;
+	--mai-status-danger-solid: #b91c1c;
+	--mai-status-solid-contrast: #ffffff;
+	--mai-status-neutral-text: #cbd5e1;
+	--mai-status-neutral-bg: #1e2430;
+	--mai-status-neutral-border: #334155;
+
+	/* ---- Color: focus ---------------------------------------------------- */
+	--mai-focus-ring-color: #e5c158;
+
+	/* ---- Color: Mechanicus accents (brass / dark sanctum) --------------- */
+	--mai-color-brass: #d4a853;
+	--mai-color-brass-dim: #8a6a2f;
+	--mai-color-surface-header: #1a1114;
+
+	/* ---- Solid surfaces for windows/chat/drawer & line-grid canvas ------- */
+	--mai-surface-glass: #12161c;
+	--mai-surface-glass-raised: #181e27;
+	--mai-surface-glass-header: #1a1114;
+	--mai-border-specular: rgb(255 255 255 / 0.06);
+	--mai-canvas-bg:
+		linear-gradient(to right, rgb(42 50 65 / 0.15) 1px, transparent 1px),
+		linear-gradient(to bottom, rgb(42 50 65 / 0.15) 1px, transparent 1px);
+	--mai-canvas-size: 32px 32px;
+
+	/* ---- Type ------------------------------------------------------------ */
+	--mai-font-display: 'Cinzel', Georgia, serif;
+	--mai-font-sans: 'Rajdhani', system-ui, -apple-system, sans-serif;
+	--mai-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+	/* ---- Geometry (Stamped Steel & Chamfered Plates) --------------------- */
+	--mai-radius-sm: 1px;
+	--mai-radius-md: 2px;
+	--mai-radius-lg: 2px;
+	--mai-radius-xl: 2px;
+	--mai-radius-2xl: 2px;
+	--mai-radius-pill: 2px;
+	--mai-chip-accent-width: 3px;
+	--mai-button-clip: polygon(
+		0 0,
+		calc(100% - 6px) 0,
+		100% 6px,
+		100% 100%,
+		6px 100%,
+		0 calc(100% - 6px)
+	);
+
+	/* ---- Elevation -------------------------------------------------------- */
+	--mai-shadow-window:
+		inset 0 1px 0 rgb(255 255 255 / 0.07),
+		0 16px 40px -8px rgb(0 0 0 / 0.65),
+		0 4px 12px rgb(0 0 0 / 0.45);
+	--mai-shadow-window-focused:
+		inset 0 1px 0 rgb(212 168 83 / 0.22),
+		0 22px 52px -10px rgb(0 0 0 / 0.78),
+		0 0 0 1px rgb(185 28 28 / 0.35),
+		0 0 28px -6px rgb(185 28 28 / 0.28);
+	--mai-shadow-float:
+		inset 0 1px 0 rgb(255 255 255 / 0.09),
+		0 14px 36px -6px rgb(0 0 0 / 0.68),
+		0 4px 10px rgb(0 0 0 / 0.42);
+}

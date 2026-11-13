@@ -6,7 +6,7 @@
 
 **M.A.I. — Machina Anima Intelligentia**
 
-<img src="docs/assets/machina-hero-banner.svg" alt="Machina banner: Always-On Chat Dock, Server Service Map, Policy-Gated OpenSSH, DBOS Durable Runs" width="100%" />
+<img src="docs/assets/machina-hero-banner.png" alt="Machina banner: session-first chat column, categorized Server Service Map, policy-gated OpenSSH, DBOS durable runs" width="100%" />
 
 </div>
 
@@ -19,10 +19,10 @@ Every action follows an explicit loop:
 
 ## Key Capabilities
 
-- **Always-Visible Bottom Chat Dock:** The console's conversation surface is a dock pinned under the workspace — never a window to lose. Draft context is explicit: a pinned **Server Chip** (following the launcher selection) plus `@service` service chips from an autocomplete over the server's mapped services; both lock immutably the moment a conversation starts, and the **floating history selector** restores past conversations with their recorded scope (`chat.read_session`).
-- **Categorized Server Service Map:** Every adopted application renders as one map row with category chips (8 built-ins — `games`, `ai`, `agent`, `system`, `dev`, `infrastructure`, `media`, `observability` — plus operator-minted custom categories), client-side filter pills, per-server **custom instructions** injected into the agent's `@service` context, and a five-slot operational runbook (install, update, uninstall, backup, verify) recorded through `app.upsert_map_entry`. **Update** and **Remove** queue background runbook jobs — the agent executes the procedure under policy while the Chat window stays untouched.
+- **Session-First Chat Column:** The console's conversation surface is a centered, session-first chat column — the stage of the workspace, not a window to lose. With no active session it renders a compact **hero command plate** (scope strip + composer); submitting the first turn grows the same surface to a full-height transcript. Scope is explicit on a unified **scope strip**: a `NODE` server selector plus an `@service` picker over the server's mapped services, interactive while drafting and read-only once a session is bound (or **General Consult** for server-less questions). Past conversations live in the left drawer's **Chat History** and restore with their recorded scope; the durable transcript, tool-call stack and delegation cards stream over a per-session WebSocket channel (`session.read`).
+- **Categorized Server Service Map:** Every adopted application renders as one map row with category chips (8 built-ins — `games`, `ai`, `agent`, `system`, `dev`, `infrastructure`, `media`, `observability` — plus operator-minted custom categories), client-side filter pills, per-server **custom instructions** injected into the agent's `@service` context, and a five-slot operational runbook (install, update, uninstall, backup, verify) recorded through `app.upsert_map_entry`. **Update** and **Remove** queue background runbook jobs — the agent executes the procedure under policy while the chat column stays untouched.
 - **Global Runbook Catalog:** A `Global / Fleet` window over the server-agnostic runbook recipes (`/api/v1/applications/catalog`): paginated, searchable, category-filtered, with create/edit/delete. Every server's Applications window lists catalog runbooks that are not installed as **Available** cards with **Install** / **Refresh** (verify) actions and per-server custom-instruction drafts.
-- **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Plugin Forms, Overview Dashboard, and Memory & Local Models.
+- **Desktop-Style Windowed Workspace:** Multi-window SvelteKit interface with draggable, resizable panels for Server Profiles, Capability Policy, Jobs & Schedules, Terminal / Execution Receipts, Agent Chat & Delegation, Knowledge & Documents, Application Inventory, Runbook Catalog, Plugins, MCP & Plugin Forms, Model Settings, Overview Dashboard, and Memory & Local Models. A collapsible left side drawer carries the server tree, chat history and panel launcher; opened windows float over the line-grid canvas and stack above the chat column.
 - **Supervised SSH Execution & Policy Gates:** Key-only OpenSSH supervision with pinned host-key fingerprints, explicit capability grants (`none`, `narrow`, `broad`), one-use approval tokens for mutating operations, and secret-redacted command receipts.
 - **Durable Job Engine & Scheduling:** PostgreSQL-backed (`dbos`) workflows with lease fencing, crash recovery without blind re-execution of dangerous host steps, and cron/interval scheduling.
 - **Application Lifecycle Management:** Discover running services, adopt existing stacks, or install/update/remove curated digest-pinned recipes (`example-http.yaml`, `example-stateful.yaml`, `odysseus.yaml`) with automatic health-gate rollback.
@@ -35,11 +35,17 @@ Every action follows an explicit loop:
 
 ## The Machina Workspace
 
-### Command Deck — windows over the Always-Visible Bottom Chat Dock
+### Command Deck — the session-first chat column at center stage
 
-![Machina command deck: floating windows over the Always-Visible Bottom Chat Dock with pinned Server Chip and @service chip](docs/assets/screenshot-command-deck.png)
+![Machina command deck: left side drawer with server tree and chat history, centered session-first chat column with a live transcript and tool-call stack over the line-grid canvas](docs/assets/screenshot-command-deck.png)
 
-Operational surfaces live in draggable, resizable windows; the chat dock stays pinned underneath at all times (it is part of the served shell, never a registry window). The dock follows the launcher's server selection, tags conversations with immutable context chips, and survives collapse/expand without losing its transcript.
+The workspace opens on the chat column: a centered, session-first surface over the line-grid canvas, with the collapsible side drawer (server tree, **Chat History**, panel launcher) on the left. A live session shows its transcript as turn groups — assistant prose with a vertical, one-click **tool-call stack** and delegation cards on a telemetry rail — while the composer stays anchored at the bottom. Operational surfaces open as draggable, resizable windows that float above the column; the chat steps back a depth echelon while a window is focused and returns when you interact with it again.
+
+### Chat Hero — the command plate before a session starts
+
+![Machina chat hero: compact centered command plate with the NODE and @service scope strip and the composer](docs/assets/screenshot-chat-hero.png)
+
+With no active session the column hugs a compact **hero command plate**: the `COGITATOR DIRECTIVE // READY` sigil, the interactive scope strip (`NODE` server selector + `@service` picker), and the composer. Submitting the first turn grows the same card to the full-height transcript — focus and draft survive the transition.
 
 ### Server Service Map — every adopted application, categorized
 
@@ -67,7 +73,7 @@ Single-administrator sign-in under the cog-skull sigil: the setup bootstrap crea
 | **Containers** | Docker Engine + Docker Compose v2 (`docker compose version`) |
 | **Python Toolchain** | `uv` on `PATH` (manages Python ≥ 3.14 and locked dependencies in `backend/uv.lock`) |
 | **Firewall (Optional)** | `ufw` or `firewalld` (when active, the installer adds a single rule scoped to `--controller-address`) |
-| **Browser Access** | Desktop Chrome or Firefox via an operator-supplied TLS reverse proxy on LAN or Tailscale |
+| **Browser Access** | Desktop Chrome or Firefox via the bundled `mai-proxy` behind an operator TLS layer on LAN or Tailscale |
 
 ---
 
@@ -105,7 +111,7 @@ sudo bash scripts/install-host.sh \
 
 - `--controller-address` must be your admin workstation/controller IP or subnet (`/8` or narrower; blanket rules like `0.0.0.0/0` are refused).
 - `--grant-scope` chooses sudo privileges for the `mai` service account: `none` (no sudo), `narrow` (`systemctl start/stop/restart/status docker.service`), or `broad` (`NOPASSWD: ALL`).
-- `--stack-profiles` selects which Compose profiles to start: `core` (`postgres`, `mai-api`, `mai-web`), `worker` (`mai-worker` durable job runner), `search` (`searxng` + `valkey`), `memory` (`hindsight`).
+- `--stack-profiles` selects which Compose profiles to start: `core` (`postgres`, `mai-api`, `mai-web`, `mai-proxy`), `worker` (`mai-worker` durable job runner), `search` (`searxng` + `valkey`), `memory` (`hindsight`).
 
 ### 3. Apply the installation
 
@@ -131,13 +137,16 @@ cd backend && uv sync --frozen
 docker compose --env-file ../.env ps
 ```
 
-### 5. Attach your TLS reverse proxy
+### 5. Reach the browser (bundled proxy + operator TLS)
 
-By design, `compose.yaml` publishes **no host ports** (`mai-api:8000` and `mai-web:3000` listen only on the internal `mai` Docker network). Attach your reverse proxy (Caddy, Nginx, Traefik, or Tailscale Serve) to the `mai` network:
+`compose.yaml` ships a single bundled reverse proxy, **`mai-proxy`** (Caddy), the only component that publishes a host port — bound to loopback at `127.0.0.1:${MAI_PROXY_HTTP_PORT:-8390}`. It routes `/api/*` → `mai-api:8000` (path preserved) and everything else → `mai-web:3000`, so the browser talks to one same-origin endpoint (`deploy/proxy/Caddyfile`).
 
-- Forward `/api/v1/*` → `http://mai-api:8000`
-- Forward all other paths `/` → `http://mai-web:3000`
-- Configure `MAI_PUBLIC_ORIGINS` (e.g. `https://mai.lan.example`) and `MAI_TRUSTED_PROXIES` on `mai-api` (see [`docs/operations/quickstart.md`](docs/operations/quickstart.md) §6).
+Terminate TLS in front of it with your own layer (Tailscale Serve, or Caddy/Nginx/Traefik on the `mai` network), then make the API trust that origin and proxy — via a Compose override that adds to the `mai-api` service environment:
+
+- `MAI_PUBLIC_ORIGINS` — the exact browser origin allowed to mutate (e.g. `https://mai.lan.example`); no wildcards.
+- `MAI_TRUSTED_PROXIES` — the CIDR/name peers allowed to set forwarded headers (the pinned `mai` subnet for the bundled proxy); any other peer's forwarded headers are ignored.
+
+See [`docs/operations/quickstart.md`](docs/operations/quickstart.md) §6 for the origin/CSRF/forwarded-header rules.
 
 ### 6. Bootstrap the administrator password (one-shot)
 
@@ -270,14 +279,14 @@ sudo bash scripts/uninstall-host.sh \
 |---|---|
 | `backend/` | FastAPI + DBOS controller package (`mai`): API routes, auth, capability policy, SSH supervision, durable jobs, knowledge/retrieval, memory, monitoring, notifications, plugins |
 | `frontend/` | SvelteKit windowed desktop workspace (`mai-web`) and Playwright test suites (`frontend/tests/`) |
-| `compose.yaml` | Container topology: `postgres`, `mai-api`, `mai-web` + profile-gated `mai-worker`, `searxng` + `valkey`, `hindsight` |
+| `compose.yaml` | Container topology: `postgres`, `mai-api`, `mai-web`, `mai-proxy` + profile-gated `mai-worker`, `searxng` + `valkey`, `hindsight` |
 | `catalogue/` | Curated application & model recipes (`example-http.yaml`, `example-stateful.yaml`, `odysseus.yaml`) |
 | `scripts/` | Operator tooling: `install-host.sh`, `backup-restore.sh`, `uninstall-host.sh`, `runtime_check.py` |
-| `deploy/` | Service deployment notes (`deploy/hindsight/README.md`) and SearXNG configuration (`deploy/searxng/settings.yml`) |
+| `deploy/` | Service deployment notes (`deploy/hindsight/README.md`), SearXNG configuration (`deploy/searxng/settings.yml`), and the bundled proxy Caddyfile (`deploy/proxy/Caddyfile`) |
 | `docs/operations/` | Operator runbooks: [`quickstart.md`](docs/operations/quickstart.md), [`recovery.md`](docs/operations/recovery.md), [`uninstall.md`](docs/operations/uninstall.md), [`acceptance.md`](docs/operations/acceptance.md) |
 | `docs/plugins/` | Plugin, MCP & skill author guide: [`quickstart.md`](docs/plugins/quickstart.md) |
 | `docs/architecture/` | Architecture contracts (`docs/architecture/contracts.md` C01–C11) and subsystem ADRs |
-| `docs/assets/` | Mechanicus SVG artwork and README screenshots (produced by `frontend/tests/capture-readme-screenshots.spec.ts`) |
+| `docs/assets/` | Mechanicus artwork and README screenshots; the header and screenshots are reproducible from `docs/assets/readme-src/` (`capture-header.mjs`, `capture-readme.mjs`) |
 | `tests/` | Cross-cutting runtime (`tests/runtime/`) and documentation-consistency (`tests/docs/`) suites |
 
 ---
@@ -297,11 +306,24 @@ pnpm exec playwright test
 
 `tests/docs/test_docs_consistency.py` automatically verifies that every CLI subcommand/flag, script flag, Compose profile, recipe, repo path, relative link, and `/api/v1/` endpoint in `README.md`, `docs/operations/`, and `docs/plugins/` matches the live codebase.
 
+### Regenerating the README artwork
+
+The header and screenshots are produced from the app's own design tokens and the real product surfaces, not hand-drawn mockups:
+
+```bash
+# Header banner (HTML built on frontend/src/lib/ui/themes/mechanicus.css + fonts)
+node docs/assets/readme-src/capture-header.mjs
+
+# Screenshots (disposable Postgres + real backend + real shell; see the script header)
+MAI_README_PG=postgresql://mai:***@127.0.0.1:55432/postgres \
+  node docs/assets/readme-src/capture-readme.mjs
+```
+
 ---
 
 ## Scope & v1 Limitations
 
-- **No bundled TLS proxy or published ports:** `compose.yaml` binds internal networks only; expose the UI over LAN or Tailscale behind your own TLS proxy.
+- **Bundled loopback proxy, operator TLS in front:** `compose.yaml` ships `mai-proxy` (Caddy) bound to `127.0.0.1:8390` as the single same-origin entry point; terminate TLS with your own layer (Tailscale Serve or a reverse proxy) to expose the UI on LAN or Tailscale. No public-internet exposure is configured by default.
 - **Single administrator, Linux-only:** Designed for one administrator managing Linux hosts over OpenSSH (Windows/macOS targets and multi-tenant RBAC are out of scope for v1).
 - **In-app notifications:** Monitoring collectors and the notification inbox are active; external pager/messenger webhooks are not armed by default.
 

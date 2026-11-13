@@ -1,0 +1,245 @@
+<!doctype html>
+<!--
+  Machina README hero banner — rebuilt as HTML on the APP'S OWN STYLES.
+  Source of truth for docs/assets/machina-hero-banner.png.
+
+  Why HTML, not the old hand-placed SVG: the previous banner used fixed-width
+  rects sized for one font, but Cinzel/Rajdhani/JetBrains Mono are self-hosted
+  in the app and unavailable to a standalone SVG — fallback fonts changed every
+  width, so text overran its frames and ran off the canvas. Here every frame is
+  a CSS box that auto-sizes to its content, and the palette/type come straight
+  from frontend/src/lib/ui/themes/mechanicus.css + tokens.css, so the banner
+  cannot drift from the product's visual language.
+
+  Render: node docs/assets/readme-src/capture-header.mjs  (headless Chromium @2x)
+-->
+<html lang="en" data-theme="mechanicus">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Machina — M.A.I. hero banner</title>
+<link rel="stylesheet" href="./mechanicus.css" />
+<style>
+  /* Self-hosted app fonts (same woff2 the SvelteKit layout bundles). */
+  @font-face { font-family:'Cinzel'; font-weight:700; font-style:normal;
+    src:url('./fonts/cinzel-latin-700-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Rajdhani'; font-weight:500; font-style:normal;
+    src:url('./fonts/rajdhani-latin-500-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Rajdhani'; font-weight:600; font-style:normal;
+    src:url('./fonts/rajdhani-latin-600-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Rajdhani'; font-weight:700; font-style:normal;
+    src:url('./fonts/rajdhani-latin-700-normal.woff2') format('woff2'); }
+  @font-face { font-family:'JetBrains Mono'; font-weight:400; font-style:normal;
+    src:url('./fonts/jetbrains-mono-latin-400-normal.woff2') format('woff2'); }
+
+  /* Structural tokens mirrored from frontend/src/lib/ui/tokens.css. */
+  :root {
+    --mai-text-xs:0.75rem; --mai-text-sm:0.875rem; --mai-text-base:1rem;
+    --mai-space-1:4px; --mai-space-2:8px; --mai-space-3:12px;
+    --mai-space-4:16px; --mai-space-5:24px; --mai-space-6:32px;
+    --mai-radius-sm:1px; --mai-radius-md:2px; --mai-border-width:1px;
+    --mai-chip-accent-width:3px; --mai-weight-medium:500; --mai-weight-semibold:600;
+    --mai-leading-tight:1.25;
+  }
+  *,*::before,*::after { box-sizing:border-box; }
+  html,body { margin:0; padding:0; background:var(--mai-color-bg); }
+  body { font-family:var(--mai-font-sans); color:var(--mai-color-text);
+    -webkit-font-smoothing:antialiased; }
+
+  /* ---- The banner plate -------------------------------------------------- */
+  .hero {
+    width:1200px; height:380px; position:relative; overflow:hidden;
+    display:flex; align-items:center; gap:36px; padding:0 48px;
+    background:
+      radial-gradient(120% 140% at 12% 50%, rgb(185 28 28 / 0.16) 0%, rgb(185 28 28 / 0.05) 42%, transparent 68%),
+      linear-gradient(135deg, #0b0d11 0%, #12161c 52%, #0b0d11 100%);
+    border:1px solid var(--mai-color-brass-dim);
+  }
+  /* The app's line-grid canvas (same gradient as GridCanvas.svelte). */
+  .hero::before {
+    content:''; position:absolute; inset:0; pointer-events:none;
+    background-image:var(--mai-canvas-bg); background-size:var(--mai-canvas-size);
+  }
+  /* Inner sanctum frame + corner brackets (auto-sized, never drifts). */
+  .hero__frame { position:absolute; inset:12px; border:1px solid rgb(212 168 83 / 0.28);
+    pointer-events:none; }
+  .hero__frame i { position:absolute; width:22px; height:22px; border:0 solid var(--mai-color-brass); }
+  .hero__frame i.tl { top:-1px; left:-1px; border-top-width:2px; border-left-width:2px; }
+  .hero__frame i.tr { top:-1px; right:-1px; border-top-width:2px; border-right-width:2px; }
+  .hero__frame i.bl { bottom:-1px; left:-1px; border-bottom-width:2px; border-left-width:2px; }
+  .hero__frame i.br { bottom:-1px; right:-1px; border-bottom-width:2px; border-right-width:2px; }
+  /* Crimson oath bands top & bottom. */
+  .hero__band { position:absolute; left:48px; right:48px; height:3px;
+    background:linear-gradient(90deg, #dc2626 0%, #b91c1c 60%, transparent 100%); }
+  .hero__band.top { top:12px; } .hero__band.bottom { bottom:12px; transform:scaleX(-1); }
+
+  /* ---- Emblem medallion -------------------------------------------------- */
+  .hero__emblem { position:relative; flex:0 0 auto; width:212px; height:212px;
+    display:flex; align-items:center; justify-content:center; }
+  .hero__emblem::before { content:''; position:absolute; inset:-14px; border-radius:50%;
+    border:1px dashed rgb(156 122 56 / 0.55); }
+  .hero__emblem svg { width:200px; height:200px; display:block;
+    filter:drop-shadow(0 0 22px rgb(185 28 28 / 0.28)); }
+
+  /* ---- Typography column ------------------------------------------------- */
+  .hero__body { position:relative; flex:1 1 auto; min-width:0; display:flex;
+    flex-direction:column; gap:10px; }
+  .hero__rubric { align-self:flex-start; display:inline-flex; align-items:center; gap:8px;
+    padding:5px 12px; background:var(--mai-color-surface-header);
+    border:1px solid var(--mai-color-primary); border-radius:var(--mai-radius-sm);
+    font-family:var(--mai-font-mono); font-size:11px; font-weight:600;
+    letter-spacing:0.14em; text-transform:uppercase; color:var(--mai-status-danger-text); }
+  .hero__rubric::before { content:''; width:7px; height:7px; border-radius:50%;
+    background:var(--mai-color-primary-hover); box-shadow:0 0 8px rgb(220 38 38 / 0.9); }
+  .hero__title { font-family:var(--mai-font-display); font-weight:700; font-size:54px;
+    line-height:1.02; letter-spacing:0.14em; color:var(--mai-color-text);
+    text-shadow:0 0 26px rgb(212 168 83 / 0.18); }
+  .hero__subtitle { font-family:var(--mai-font-display); font-weight:700; font-size:19px;
+    letter-spacing:0.06em; color:var(--mai-color-brass); }
+  .hero__desc { font-family:var(--mai-font-sans); font-weight:500; font-size:15.5px;
+    letter-spacing:0.02em; color:var(--mai-color-text-muted); max-width:760px; }
+
+  /* ---- Capability chips (the app's Chip primitive geometry) -------------- */
+  .hero__chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:2px; }
+  .chip { display:inline-flex; align-items:center; gap:6px; min-height:24px;
+    padding:3px 10px; font-family:var(--mai-font-mono); font-size:11.5px;
+    font-weight:500; letter-spacing:0.03em; line-height:1.25; white-space:nowrap;
+    color:var(--mai-color-text); background:var(--mai-color-surface-raised);
+    border:1px solid var(--mai-color-border);
+    border-left-width:var(--mai-chip-accent-width); border-left-color:var(--mai-color-brass-dim);
+    border-radius:var(--mai-radius-sm); }
+  .chip .sig { font-size:12px; line-height:1; }
+  .chip--brass { border-color:var(--mai-color-border-strong); border-left-color:var(--mai-color-brass); }
+  .chip--brass .sig { color:var(--mai-color-brass); }
+  .chip--primary { border-color:var(--mai-color-primary); border-left-color:var(--mai-color-primary-hover);
+    background:var(--mai-status-danger-bg); }
+  .chip--primary .sig { color:var(--mai-status-danger-text); }
+  .chip--success { color:var(--mai-status-success-text); background:var(--mai-status-success-bg);
+    border-color:var(--mai-status-success-border); border-left-color:var(--mai-status-success-solid); }
+  .chip--info { color:var(--mai-status-info-text); background:var(--mai-status-info-bg);
+    border-color:var(--mai-status-info-border); border-left-color:var(--mai-status-info-solid); }
+
+  /* ---- Doctrine loop footer --------------------------------------------- */
+  .hero__loop { display:flex; align-items:center; gap:8px; margin-top:2px;
+    font-family:var(--mai-font-mono); font-size:10.5px; letter-spacing:0.1em;
+    color:var(--mai-color-brass); text-transform:uppercase; }
+  .hero__loop b { color:var(--mai-color-brass); font-weight:400; }
+  .hero__loop .sep { color:var(--mai-color-primary-hover); }
+</style>
+</head>
+<body>
+  <section class="hero" id="hero" role="img"
+    aria-label="Machina — M.A.I. (Machina Anima Intelligentia): self-hosted AI Linux administration console. Always-on chat column, categorized server service map, policy-gated OpenSSH, DBOS durable runs.">
+    <div class="hero__frame" aria-hidden="true"><i class="tl"></i><i class="tr"></i><i class="bl"></i><i class="br"></i></div>
+    <div class="hero__band top" aria-hidden="true"></div>
+    <div class="hero__band bottom" aria-hidden="true"></div>
+
+    <div class="hero__emblem" aria-hidden="true">
+      <!-- The app's own Opus Mechanicus cog-skull emblem (verbatim). -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+        <defs>
+          <radialGradient id="voidBg" cx="50%" cy="50%" r="55%">
+            <stop offset="0%" stop-color="#1a1114"/><stop offset="65%" stop-color="#12161c"/><stop offset="100%" stop-color="#0b0d11"/>
+          </radialGradient>
+          <linearGradient id="brassRim" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#e5c158"/><stop offset="45%" stop-color="#d4a853"/><stop offset="100%" stop-color="#9c7a38"/>
+          </linearGradient>
+          <linearGradient id="crimsonCore" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#dc2626"/><stop offset="100%" stop-color="#7f1d1d"/>
+          </linearGradient>
+          <linearGradient id="boneLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#ece8de"/><stop offset="70%" stop-color="#cbd5e1"/><stop offset="100%" stop-color="#94a3b8"/>
+          </linearGradient>
+          <linearGradient id="cyberRight" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#475569"/><stop offset="50%" stop-color="#1e2430"/><stop offset="100%" stop-color="#0f172a"/>
+          </linearGradient>
+          <radialGradient id="opticLens" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#fca5a5"/><stop offset="45%" stop-color="#dc2626"/><stop offset="100%" stop-color="#7f1d1d"/>
+          </radialGradient>
+          <clipPath id="leftHalf"><rect x="0" y="0" width="128" height="256"/></clipPath>
+          <clipPath id="rightHalf"><rect x="128" y="0" width="128" height="256"/></clipPath>
+        </defs>
+        <circle cx="128" cy="128" r="122" fill="url(#voidBg)" stroke="url(#brassRim)" stroke-width="3"/>
+        <circle cx="128" cy="128" r="114" fill="none" stroke="#9c7a38" stroke-width="1" stroke-dasharray="6 4"/>
+        <g transform="translate(128,128)">
+          <g fill="url(#brassRim)" stroke="#0b0d11" stroke-width="1.5">
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(0)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(30)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(60)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(90)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(120)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(150)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(180)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(210)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(240)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(270)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(300)"/>
+            <rect x="-11" y="-106" width="22" height="24" rx="2" transform="rotate(330)"/>
+          </g>
+          <circle r="88" fill="#0b0d11" stroke="url(#brassRim)" stroke-width="8"/>
+          <path d="M 0,-80 A 80,80 0 0,0 0,80 Z" fill="url(#crimsonCore)" opacity="0.55"/>
+          <path d="M 0,-80 A 80,80 0 0,1 0,80 Z" fill="#12161c"/>
+          <circle r="80" fill="none" stroke="#d4a853" stroke-width="1.5"/>
+          <g fill="#0b0d11" stroke="#e5c158" stroke-width="1.2">
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(15)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(45)"/>
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(75)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(105)"/>
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(135)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(165)"/>
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(195)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(225)"/>
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(255)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(285)"/>
+            <circle cx="0" cy="-88" r="2.6" transform="rotate(315)"/><circle cx="0" cy="-88" r="2.6" transform="rotate(345)"/>
+          </g>
+        </g>
+        <g clip-path="url(#leftHalf)">
+          <path d="M 128,58 C 88,58 66,82 66,116 C 66,136 74,148 84,155 L 86,184 L 128,184 L 128,58 Z" fill="url(#boneLeft)" stroke="#d4a853" stroke-width="2"/>
+          <path d="M 74,114 C 78,102 92,94 112,94" fill="none" stroke="#9c7a38" stroke-width="1.5"/>
+          <path d="M 80,142 C 92,146 104,148 118,148" fill="none" stroke="#9c7a38" stroke-width="1.5"/>
+          <circle cx="101" cy="122" r="15" fill="#0b0d11" stroke="#9c7a38" stroke-width="2"/>
+          <circle cx="101" cy="122" r="5" fill="#dc2626" opacity="0.8"/>
+          <path d="M 128,132 L 117,154 L 128,154 Z" fill="#0b0d11" stroke="#9c7a38" stroke-width="1.5"/>
+          <g stroke="#0b0d11" stroke-width="2">
+            <line x1="96" y1="166" x2="96" y2="184"/><line x1="107" y1="166" x2="107" y2="184"/><line x1="118" y1="166" x2="118" y2="184"/>
+            <line x1="86" y1="166" x2="128" y2="166" stroke="#9c7a38" stroke-width="1.5"/>
+          </g>
+        </g>
+        <g clip-path="url(#rightHalf)">
+          <path d="M 128,58 C 168,58 190,82 190,116 C 190,136 182,148 172,155 L 170,184 L 128,184 L 128,58 Z" fill="url(#cyberRight)" stroke="#d4a853" stroke-width="2"/>
+          <path d="M 128,76 L 156,76 L 174,94 L 188,94" fill="none" stroke="#d4a853" stroke-width="1.5"/>
+          <path d="M 128,92 L 148,92 L 162,106" fill="none" stroke="#dc2626" stroke-width="1.5"/>
+          <path d="M 176,144 L 194,154" fill="none" stroke="#d4a853" stroke-width="2"/>
+          <circle cx="155" cy="122" r="19" fill="#181e27" stroke="url(#brassRim)" stroke-width="3"/>
+          <circle cx="155" cy="122" r="13" fill="url(#opticLens)" stroke="#fca5a5" stroke-width="1"/>
+          <circle cx="155" cy="122" r="5" fill="#ffffff" opacity="0.9"/>
+          <line x1="134" y1="122" x2="142" y2="122" stroke="#d4a853" stroke-width="1.5"/>
+          <line x1="168" y1="122" x2="176" y2="122" stroke="#d4a853" stroke-width="1.5"/>
+          <line x1="155" y1="101" x2="155" y2="109" stroke="#d4a853" stroke-width="1.5"/>
+          <line x1="155" y1="135" x2="155" y2="143" stroke="#d4a853" stroke-width="1.5"/>
+          <path d="M 128,132 L 139,154 L 128,154 Z" fill="#0b0d11" stroke="#d4a853" stroke-width="1.5"/>
+          <rect x="128" y="162" width="42" height="22" fill="#0b0d11" stroke="#d4a853" stroke-width="1.5"/>
+          <g stroke="#d4a853" stroke-width="2">
+            <line x1="136" y1="164" x2="136" y2="182"/><line x1="145" y1="164" x2="145" y2="182"/>
+            <line x1="154" y1="164" x2="154" y2="182"/><line x1="163" y1="164" x2="163" y2="182"/>
+          </g>
+        </g>
+        <line x1="128" y1="48" x2="128" y2="192" stroke="url(#brassRim)" stroke-width="2.5"/>
+        <circle cx="128" cy="76" r="4" fill="#dc2626" stroke="#d4a853" stroke-width="1.5"/>
+      </svg>
+    </div>
+
+    <div class="hero__body">
+      <span class="hero__rubric">Noosphere Cogitator Sanctum // Omnissiah Deck</span>
+      <h1 class="hero__title">MACHINA</h1>
+      <div class="hero__subtitle">M.A.I. — Machina Anima Intelligentia</div>
+      <p class="hero__desc">Self-hosted AI Linux administration console — a windowed command deck, a session-first chat column, and a categorized server service map, all under policy-gated OpenSSH.</p>
+      <div class="hero__chips">
+        <span class="chip chip--primary"><span class="sig">⚙</span> ALWAYS-ON CHAT COLUMN</span>
+        <span class="chip chip--brass"><span class="sig">▤</span> SERVER SERVICE MAP</span>
+        <span class="chip chip--info"><span class="sig">⛨</span> POLICY-GATED OPENSSH</span>
+        <span class="chip chip--success"><span class="sig">✓</span> DBOS DURABLE RUNS</span>
+      </div>
+      <div class="hero__loop">
+        <b>Observe</b><span class="sep">→</span><b>Understand</b><span class="sep">→</span><b>Plan</b><span class="sep">→</span><b>Execute under policy</b><span class="sep">→</span><b>Verify</b><span class="sep">→</span><b>Document &amp; remember</b>
+      </div>
+    </div>
+  </section>
+</body>
+</html>
