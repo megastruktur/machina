@@ -1204,102 +1204,120 @@
 					{controlProblem.code}: {controlProblem.message}
 				</p>
 			{/if}
-		{#if isHero}
-			<!-- CCC S3: the unified scope strip — INTERACTIVE in hero. The
-			     server chip selects the shell's VISIBLE selection (the same
-			     state the HUD/tree use, written back through onserverchange);
-			     the service chip is the draft @service picker (SCOPE-3:
-			     committed at CREATE only, honest loading/empty/error/Load
-			     more preserved). -->
-			<div class="mai-scope-strip" data-testid="chat-scope-strip">
-				<span class="mai-scope-strip__slot" data-testid="chat-scope-server">
-					{#if serverOptionsList.length > 0}
-						<label class="mai-scope-strip__label" title="Server scope for the new session">
-							<span aria-hidden="true">⚙</span>
-							<select
-								class="mai-scope-strip__select"
-								data-testid="chat-scope-server-select"
-								value={selectedServerId ?? ''}
-								onchange={(event) => onserverchange(event.currentTarget.value)}
-							>
-								{#each serverOptionsList as option (option.id)}
-									<option value={option.id}>{option.label}</option>
-								{/each}
-							</select>
-						</label>
-					{:else}
-						<!-- No enrolled options: the honest static chip (never a
-						     fabricated interactive choice). -->
-						<span
-							class="mai-session-chat__scope"
-							title={selectedServerId === null ? 'No server selected' : selectedServerId}
+	{#if isHero}
+		<!-- MCR S1: the Mechanicus directive plate header — hero-only
+		     chrome (count 0 in active) capping the command plate. -->
+		<div class="mai-session-chat__hero-directive" data-testid="chat-hero-directive">
+			<span class="mai-session-chat__hero-sigil" aria-hidden="true">⚙</span>
+			<span class="mai-session-chat__hero-label">COGITATOR DIRECTIVE // READY</span>
+		</div>
+		<!-- CCC S3: the unified scope strip — INTERACTIVE in hero. The
+		     server chip selects the shell's VISIBLE selection (the same
+		     state the HUD/tree use, written back through onserverchange);
+		     the service chip is the draft @service picker (SCOPE-3:
+		     committed at CREATE only, honest loading/empty/error/Load
+		     more preserved). MCR S1: the strip is a single-row
+		     two-column grid of stamped field shells spanning the
+		     composer's full inner width. -->
+		<div class="mai-scope-strip" data-testid="chat-scope-strip">
+			<span class="mai-scope-strip__slot" data-testid="chat-scope-server">
+				{#if serverOptionsList.length > 0}
+					<label
+						class="mai-scope-strip__label mai-scope-strip__select-wrap"
+						title="Server scope for the new session"
+					>
+						<span class="mai-scope-strip__prefix" aria-hidden="true">NODE</span>
+						<select
+							class="mai-scope-strip__select"
+							data-testid="chat-scope-server-select"
+							value={selectedServerId ?? ''}
+							onchange={(event) => onserverchange(event.currentTarget.value)}
 						>
-							⚙ {selectedServerId === null
-								? 'no server'
-								: selectedServerId === GLOBAL_CONSULT_SERVER_ID
-									? 'General Consult'
-									: `Server: ${selectedServerId.slice(0, 8)}…`}
+							{#each serverOptionsList as option (option.id)}
+								<option value={option.id}>{option.label}</option>
+							{/each}
+						</select>
+					</label>
+				{:else}
+					<!-- No enrolled options: the honest static chip (never a
+					     fabricated interactive choice). -->
+					<span
+						class="mai-session-chat__scope"
+						title={selectedServerId === null ? 'No server selected' : selectedServerId}
+					>
+						⚙ {selectedServerId === null
+							? 'no server'
+							: selectedServerId === GLOBAL_CONSULT_SERVER_ID
+								? 'General Consult'
+								: `Server: ${selectedServerId.slice(0, 8)}…`}
+					</span>
+				{/if}
+			</span>
+			<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
+				<div
+					class="mai-session-chat__service-row"
+					class:mai-session-chat__service-row--sunken={servicesLoading ||
+						servicesError !== null || serviceOptions.length === 0}
+					data-testid="session-service-picker"
+				>
+					<span class="mai-session-chat__service-prefix" aria-hidden="true">@SVC</span>
+					{#if servicesLoading}
+						<span
+							class="mai-session-chat__service-state"
+							data-testid="session-services-loading"
+						>
+							Loading services…
 						</span>
-					{/if}
-				</span>
-				<span class="mai-scope-strip__slot mai-scope-strip__slot--service" data-testid="chat-scope-service">
-					<div class="mai-session-chat__service-row" data-testid="session-service-picker">
-						{#if servicesLoading}
-							<span
-								class="mai-session-chat__service-state"
-								data-testid="session-services-loading"
+					{:else if servicesError !== null}
+						<span
+							class="mai-session-chat__service-state"
+							role="alert"
+							data-testid="session-services-error"
+						>
+							Services unavailable: {servicesError}
+						</span>
+					{:else if serviceOptions.length === 0}
+						<span
+							class="mai-session-chat__service-state"
+							data-testid="session-services-empty"
+						>
+							No adopted services on this server.
+						</span>
+					{:else}
+						<label class="mai-session-chat__service-label" for="mai-session-service-select">
+							@service
+						</label>
+						<select
+							id="mai-session-service-select"
+							class="mai-session-chat__service-select"
+							data-testid="session-service-select"
+							bind:value={selectedServiceId}
+							disabled={submitting}
+						>
+							<option value="">— none —</option>
+							{#each serviceOptions as option (option.application_id)}
+								<option value={option.application_id}>
+									{option.name}{option.category ? ` · ${option.category}` : ''}
+								</option>
+							{/each}
+						</select>
+						{#if servicesHasMore}
+							<Button
+								variant="secondary"
+								size="sm"
+								tabindex={0}
+								loading={servicesLoading}
+								data-testid="session-services-load-more"
+								onclick={() => loadMoreServices()}
 							>
-								Loading services…
-							</span>
-						{:else if servicesError !== null}
-							<span
-								class="mai-session-chat__service-state"
-								role="alert"
-								data-testid="session-services-error"
-							>
-								Services unavailable: {servicesError}
-							</span>
-						{:else if serviceOptions.length === 0}
-							<span
-								class="mai-session-chat__service-state"
-								data-testid="session-services-empty"
-							>
-								No adopted services on this server.
-							</span>
-						{:else}
-							<label class="mai-session-chat__service-label">
-								@service
-								<select
-									class="mai-session-chat__service-select"
-									data-testid="session-service-select"
-									bind:value={selectedServiceId}
-									disabled={submitting}
-								>
-									<option value="">— none —</option>
-									{#each serviceOptions as option (option.application_id)}
-										<option value={option.application_id}>
-											{option.name}{option.category ? ` · ${option.category}` : ''}
-										</option>
-									{/each}
-								</select>
-							</label>
-							{#if servicesHasMore}
-								<Button
-									variant="secondary"
-									size="sm"
-									tabindex={0}
-									loading={servicesLoading}
-									data-testid="session-services-load-more"
-									onclick={() => loadMoreServices()}
-								>
-									Load more
-								</Button>
-							{/if}
+								Load more
+							</Button>
 						{/if}
-					</div>
-				</span>
-			</div>
-		{/if}
+					{/if}
+				</div>
+			</span>
+		</div>
+	{/if}
 			<div class="mai-session-chat__composer-row">
 				<textarea
 					class="mai-session-chat__input"
@@ -1413,15 +1431,41 @@
 	.mai-session-chat--hero {
 		height: auto;
 	}
-	/* Hero composer: a bounded, horizontally centered prompt block pinned
-	 * at the bottom — no border against nothing, a touch more breathing
-	 * room than the active footer. */
+	/* MCR S1: the hero composer is a FULL-WIDTH command plate — no 640px
+	 * inner clamp, no dead side gutters: it spans the dock card's whole
+	 * inner width with crisp 16px horizontal padding (10px ≤640px so
+	 * 360×640 stays spacious). The footer stays the ONLY hero chrome, so
+	 * the CHC H1 compact-card invariants hold unchanged. */
 	.mai-session-chat--hero .mai-session-chat__composer {
 		width: 100%;
-		max-width: 640px;
-		margin-inline: auto;
+		max-width: none;
+		box-sizing: border-box;
+		padding: 12px 16px;
+		gap: 10px;
 		border-top-color: transparent;
-		padding: 10px 12px;
+	}
+	@media (max-width: 640px) {
+		.mai-session-chat--hero .mai-session-chat__composer {
+			padding: 12px 10px;
+		}
+	}
+	/* MCR S1: the directive plate header above the scope strip. */
+	.mai-session-chat__hero-directive {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding-bottom: 6px;
+		border-bottom: 1px solid
+			color-mix(in srgb, var(--mai-color-border, #2a3241) 65%, transparent);
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.68rem;
+		font-weight: 600;
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		color: var(--mai-color-text-muted, #94a3b8);
+	}
+	.mai-session-chat__hero-sigil {
+		color: var(--mai-color-brass, #d4a853);
 	}
 
 	/* ---- CCC S3: the unified scope strip -----------------------------------
@@ -1485,6 +1529,135 @@
 			text-overflow: ellipsis;
 		}
 	}
+
+	/* ---- MCR S1: the hero two-column command plate -------------------------
+	 * Scoped ONLY to the hero strip: a single-row two-column grid
+	 * (NODE 2fr / @SVC 3fr) spanning the composer's full inner width —
+	 * both columns share one row even at 360×640. The ACTIVE header
+	 * strip above keeps its flex layout and one-row pocket behavior. */
+	.mai-session-chat--hero .mai-scope-strip {
+		display: grid;
+		grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+		gap: 8px;
+		width: 100%;
+		align-items: stretch;
+	}
+	.mai-session-chat--hero .mai-scope-strip__slot,
+	.mai-session-chat--hero .mai-scope-strip__slot--service {
+		min-width: 0;
+		width: 100%;
+		display: flex;
+		align-items: stretch;
+	}
+	/* Stamped Mechanicus field shells: the NODE select-wrap and the @SVC
+	 * service picker row. */
+	.mai-session-chat--hero .mai-scope-strip__select-wrap,
+	.mai-session-chat--hero .mai-session-chat__service-row {
+		width: 100%;
+		min-width: 0;
+		min-height: 2rem;
+		padding: 0;
+		padding-inline: 8px;
+		display: flex;
+		flex-wrap: nowrap;
+		align-items: center;
+		gap: 6px;
+		box-sizing: border-box;
+		background: var(--mai-color-surface-raised, #181e27);
+		border: 1px solid var(--mai-color-border, #2a3241);
+		border-radius: var(--mai-radius-sm, 2px);
+	}
+	/* Empty/loading/error: the right column is still a full-width calm
+	 * sunken plate, so the strip's right edge ALWAYS lands flush with the
+	 * Send button's row. */
+	.mai-session-chat--hero .mai-session-chat__service-row--sunken {
+		background: var(--mai-color-surface-sunken, #0e1217);
+	}
+	.mai-session-chat--hero .mai-scope-strip__prefix,
+	.mai-session-chat--hero .mai-session-chat__service-prefix {
+		flex: 0 0 auto;
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.66rem;
+		color: var(--mai-color-brass, #d4a853);
+	}
+	.mai-session-chat--hero .mai-session-chat__service-state {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.7rem;
+		color: var(--mai-color-text-muted, #94a3b8);
+	}
+	/* The borderless mono selects stretch inside their shells with a
+	 * brass inline-SVG chevron; the shell lights brass on focus. */
+	.mai-session-chat--hero .mai-scope-strip__select,
+	.mai-session-chat--hero .mai-session-chat__service-select {
+		flex: 1 1 auto;
+		width: 100%;
+		min-width: 0;
+		appearance: none;
+		background-color: transparent;
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23d4a853' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+		background-repeat: no-repeat;
+		background-position: right 6px center;
+		border: none;
+		border-radius: 0;
+		color: var(--mai-color-text, #ece8de);
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.76rem;
+		padding: 4px 20px 4px 2px;
+		cursor: pointer;
+	}
+	/* Open dropdown menus stay readable in dark mode. */
+	.mai-session-chat--hero .mai-scope-strip__select option,
+	.mai-session-chat--hero .mai-session-chat__service-select option {
+		background: var(--mai-color-surface-raised, #181e27);
+		color: var(--mai-color-text, #ece8de);
+	}
+	.mai-session-chat--hero .mai-scope-strip__select:focus-visible,
+	.mai-session-chat--hero .mai-session-chat__service-select:focus-visible {
+		outline: var(--mai-focus-ring-width, 2px) solid var(--mai-focus-ring-color, #e5c158);
+		outline-offset: -2px;
+	}
+	.mai-session-chat--hero .mai-scope-strip__select-wrap:focus-within,
+	.mai-session-chat--hero .mai-session-chat__service-row:focus-within {
+		border-color: var(--mai-color-brass, #d4a853);
+	}
+	/* The sr-only @service label keeps the select's accessible name; the
+	 * visible shell prefix is the decorative @SVC above. */
+	.mai-session-chat--hero .mai-session-chat__service-label {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		white-space: nowrap;
+		border: 0;
+	}
+	/* No enrolled options: the honest static server chip renders as the
+	 * same-width sunken plate so the left column still reads a field. */
+	.mai-session-chat--hero .mai-scope-strip__slot .mai-session-chat__scope {
+		flex: 1 1 auto;
+		width: 100%;
+		min-width: 0;
+		min-height: 2rem;
+		display: inline-flex;
+		align-items: center;
+		box-sizing: border-box;
+		padding: 2px 8px;
+		background: var(--mai-color-surface-sunken, #0e1217);
+		border: 1px solid var(--mai-color-border, #2a3241);
+		border-radius: var(--mai-radius-sm, 2px);
+		font-family: var(--mai-font-mono, monospace);
+		font-size: 0.76rem;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
 	.mai-session-chat__header {
 		display: flex;
 		flex-wrap: wrap;
@@ -1494,13 +1667,17 @@
 		font-size: 0.75rem;
 	}
 	/* SCOPE-3 chips: compact, wrap-safe at 360px (long names wrap inside
-	   the chip instead of pushing the header wide). */
+	   the chip instead of pushing the header wide). MCR S1: the broken
+	   var(--border)/999px pill is replaced by the real Mechanicus
+	   tokens — square raised chip on the mono stack. */
 	.mai-session-chat__scope {
 		max-width: 100%;
 		overflow-wrap: anywhere;
-		padding: 1px 6px;
-		border: 1px solid var(--border, currentColor);
-		border-radius: 999px;
+		border: 1px solid var(--mai-color-border, #2a3241);
+		border-radius: var(--mai-radius-sm, 2px);
+		background: var(--mai-color-surface-raised, #181e27);
+		font-family: var(--mai-font-mono, monospace);
+		padding: 2px 8px;
 		white-space: normal;
 	}
 	.mai-session-chat__service-row {
