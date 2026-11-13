@@ -16,9 +16,11 @@ Anchors: `docs/architecture/auth-and-origin.md` (exposure/bootstrap),
 - This covers the **single-host install**: the stack runs on the host you
   install, and that host is also the first managed server (the installer
   provisions the SSH lane it will be supervised through).
-- The stack **publishes no ports** (`compose.yaml` has no `ports:`).
-  Browser access requires an operator-supplied TLS reverse proxy —
-  §6 below is configuration guidance, not a shipped component.
+- The stack ships a single bundled reverse proxy, **`mai-proxy`** (Caddy),
+  the only component that publishes a host port — bound to loopback at
+  `127.0.0.1:${MAI_PROXY_HTTP_PORT:-8390}`. Browser access terminates TLS in
+  front of it with your own layer (Tailscale Serve or a reverse proxy);
+  §6 below is the configuration guidance.
 - The installer **never prints or sets a password**. The web admin
   credential is created exactly once by you (§7).
 
@@ -192,7 +194,7 @@ docker compose --env-file ../.env ps
   It reports `hash_mismatch` etc. — it never repairs (recovery is
   `recovery.md`'s discipline).
 - `docker compose ps` should show the core set (`postgres`, `mai-api`,
-  `mai-web`) `healthy`. `mai-api` health is liveness-only
+  `mai-web`, `mai-proxy`) `healthy`. `mai-api` health is liveness-only
   (`GET /api/v1/health`); `GET /api/v1/health/ready` reports dependency
   readiness and is the one to check after a database outage.
 
@@ -200,31 +202,39 @@ docker compose --env-file ../.env ps
 `{"error":{"code","message"}}` line on stderr), `2` usage/IO. Output is
 value-free — no profile text, no credential values, ever.
 
-## 6. Reach the browser (operator-supplied TLS proxy)
+## 6. Reach the browser (bundled proxy + operator TLS)
 
-Nothing is reachable from the host network by default. Attach your TLS-
-terminating reverse proxy to the `mai` Compose network and publish one
-origin:
+`compose.yaml` ships a single bundled reverse proxy, **`mai-proxy`** (Caddy),
+the only component that publishes a host port — bound to loopback at
+`127.0.0.1:${MAI_PROXY_HTTP_PORT:-8390}`. Its routing contract
+(`deploy/proxy/Caddyfile`) is:
 
-- route `/api/v1/*` to `mai-api:8000` and everything else to `mai-web:3000`
-  (the web client calls the API same-origin);
-- set `Host`, `X-Forwarded-Proto`, `X-Forwarded-For`; HTTP→HTTPS redirect;
-  HSTS; pass bodies unparsed (auth ADR §6.4).
+- `/api/*` → `mai-api:8000`, path **preserved** (FastAPI mounts `/api/v1`
+  itself — the prefix is never stripped);
+- everything else → `mai-web:3000` (the web client calls the API
+  same-origin, so browser `/api/v1` calls land on this proxy too);
+- Caddy sets `X-Forwarded-For` / `-Host` / `-Proto`; the API honors them
+  only because the proxy's source address is inside `MAI_TRUSTED_PROXIES`.
 
-Then make the API trust the proxy and your origin — via a Compose override
-that adds to the `mai-api` service environment:
+Terminate TLS in front of the loopback port with your own layer — Tailscale
+Serve (`svc:machina → 127.0.0.1:8390`) or a reverse proxy (Caddy, Nginx,
+Traefik) on the `mai` network — with HTTP→HTTPS redirect, HSTS, and bodies
+passed unparsed (auth ADR §6.4).
+
+Then make the API trust your origin and the proxy. Both variables are
+**required** in the Compose `.env` (the compose file fails closed without
+them); `.env.example` carries working defaults:
 
 | Variable | Meaning |
 |---|---|
-| `MAI_PUBLIC_ORIGINS` | Exact browser origins allowed to mutate, e.g. `https://mai.lan.example:8443`. No wildcards; invalid entries fail closed (every mutation then rejects) |
-| `MAI_TRUSTED_PROXIES` | CIDR/name peers allowed to set forwarded headers (unset ⇒ forwarded headers ignored everywhere) |
+| `MAI_PUBLIC_ORIGINS` | Exact browser origins allowed to mutate, e.g. `https://machina.tail6fa4ba.ts.net`. No wildcards; invalid entries fail closed (every mutation then rejects) |
+| `MAI_TRUSTED_PROXIES` | CIDR/name peers allowed to set forwarded headers — the pinned `mai` subnet `172.32.0.0/16` for the bundled proxy; any other peer's forwarded headers are ignored |
 
-Honest limits: this release ships no proxy service and no override file;
-the env-var behavior above is the reviewed, tested auth surface
-(`backend/tests/test_auth_http.py` — origin/CSRF/forwarded-header rules).
-Plain-HTTP serving is allowed only on loopback (development). Public-internet
-exposure is out of scope in v1; LAN and Tailscale are the intended access
-paths (auth ADR §7).
+Honest limits: the bundled proxy serves plain HTTP on loopback only; TLS is
+always your layer in front. The env-var behavior above is the reviewed,
+tested auth surface (`backend/tests/test_auth_http.py` — origin/CSRF/
+forwarded-header rules). Public-internet exposure is out of scope in v1; LAN
+and Tailscale are the intended access paths (auth ADR §7).
 
 ## 7. One-shot admin bootstrap and login
 
@@ -293,7 +303,9 @@ needed, or via `--stack-profiles` at install time). The core set always runs.
   `ufw`/`firewalld` honored when active; systemd `docker.service` is the
   `narrow` grant surface.
 - Not supported in v1: Windows/macOS targets, fleets, public-internet
-  exposure, messenger delivery, bundled TLS proxy, in-app plugin installer
-  (`docs/plugins/quickstart.md` documents the real mechanisms).
+  exposure, messenger delivery, in-app plugin installer
+  (`docs/plugins/quickstart.md` documents the real mechanisms). The bundled
+  `mai-proxy` serves plain HTTP on loopback; TLS termination is always an
+  operator layer in front (§6).
 - Monitoring collectors and the notification inbox exist; alert delivery is
   configured-not-armed in this release.
