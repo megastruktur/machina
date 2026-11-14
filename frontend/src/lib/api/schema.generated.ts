@@ -1992,6 +1992,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/unacknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unacknowledge one inbox notice (scope-checked, idempotent)
+         * @description Clear ``acknowledged_at`` on one notice; delete nothing.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any state is
+         *     touched. The value-free ``404`` mirrors the ack route exactly: a row
+         *     owned by another server and a missing row are indistinguishable (no
+         *     existence leak, C01 rule 7). Idempotent: unacknowledging an already
+         *     unacknowledged notice changes nothing and answers ``200``. Unack is
+         *     NOT a delete: the notice, its finding and its producing observation
+         *     survive; for finding notices re-opening the notice re-arms the
+         *     reminder logic (the notification service stops suppressing
+         *     re-delivery once ``acknowledged_at`` is cleared again).
+         */
+        post: operations["unacknowledge_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__unacknowledge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/notifications/ingest": {
         parameters: {
             query?: never;
@@ -2070,6 +2100,144 @@ export interface paths {
          *     oracle), and the audit row is never reactivated.
          */
         post: operations["revoke_ingest_key_api_v1_ingest_keys__key_id__revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded global inbox page (canonical filters, newest first)
+         * @description One bounded page of the unified inbox, newest first.
+         *
+         *     Safe method: session layer only; the captain's scope is the whole
+         *     fleet (explicit filters, never ambient server state). Deterministic
+         *     order ``created_at DESC, alert_id DESC``; ``COUNT(*)`` runs under the
+         *     EXACT same predicate as the slice, and ``has_more`` is the canonical
+         *     derivation — pagination is honest under every filter combination.
+         */
+        get: operations["list_notifications_api_v1_notifications_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications/unread-count": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Count unread notices under the exact canonical filters
+         * @description The badge/drawer count: ``COUNT(*)`` under the list's predicate,
+         *     pinned to UNACKNOWLEDGED notices.
+         *
+         *     The EXACT same filter surface as the list route, so a count can never
+         *     disagree with the page it belongs to — but the count is an UNREAD
+         *     count by definition: the route's own base clause is ``acknowledged_at
+         *     IS NULL``, added UNDER the canonical filters. ``unread`` composes on
+         *     top like on the list: omitted/``true`` is the same restriction;
+         *     ``unread=false`` is a contradiction (no notice is both read and
+         *     unread) and answers ``0`` — never a silently flipped semantics.
+         */
+        get: operations["count_unread_notifications_api_v1_notifications_unread_count_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications/{alert_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge one inbox notice (evidence-preserving, idempotent)
+         * @description Stamp ``acknowledged_at`` on one notice; delete nothing.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any state is
+         *     touched. The captain's surface is fleet-wide, so the value-free 404
+         *     is scope-blind by construction: an unknown id is the only failure.
+         *     Idempotency rides one truth column: ``acknowledged_at =
+         *     COALESCE(acknowledged_at, :now)`` — the first stamp wins, a replay
+         *     never re-stamps or shifts the timestamp, and the notice, its finding
+         *     and its producing observation all survive the ack.
+         */
+        post: operations["acknowledge_notification_api_v1_notifications__alert_id__ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications/{alert_id}/unack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unacknowledge one inbox notice (re-arms reminders, idempotent)
+         * @description Clear ``acknowledged_at`` on one notice; delete nothing.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order) before any state is
+         *     touched. Bidirectional ack on ONE truth column: ``acknowledged_at =
+         *     NULL`` is idempotent (a replay changes nothing and answers ``200``)
+         *     and re-arms finding reminder logic — the notification service stops
+         *     suppressing re-delivery once the notice is unacknowledged again.
+         *     Evidence is never deleted: the notice and its anchors survive.
+         */
+        post: operations["unacknowledge_notification_api_v1_notifications__alert_id__unack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications/mark-all-read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark every filtered unread notice read (ONE conditional UPDATE)
+         * @description Stamp ``acknowledged_at = now`` on every matching unread notice.
+         *
+         *     Mutation: session → origin → CSRF (ADR §5 order). The canonical
+         *     filters arrive as QUERY parameters (the same surface and semantics
+         *     as the list route — no second body dialect to keep in sync). ONE
+         *     UPDATE runs under the exact canonical predicate AND ``acknowledged_at
+         *     IS NULL``; ``updated`` is the database's own rowcount — the receipt
+         *     equals the rows actually stamped, never an optimistic guess. The
+         *     first-stamp-wins rule holds: already-read rows are not re-stamped.
+         */
+        post: operations["mark_all_read_api_v1_notifications_mark_all_read_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2392,6 +2560,13 @@ export interface components {
             record_doc: components["schemas"]["RecordDocView"];
         };
         /**
+         * AlertOrigin
+         * @description Frozen notification anchor (C10 rule 3: finding, job result, or an
+         *     external push via the machine ingest lane).
+         * @enum {string}
+         */
+        AlertOrigin: "finding" | "job_result" | "external";
+        /**
          * AlertPage
          * @description One bounded inbox page for one explicitly named server.
          */
@@ -2411,16 +2586,18 @@ export interface components {
          * AlertView
          * @description One inbox notice (0007 ``notification_alerts`` row).
          *
-         *     ``severity`` is derived per the frozen provenance rule (live anchor
-         *     join first, persisted summary tag second, ``info`` last — see module
-         *     docstring); ``acked`` mirrors ``acknowledged_at is not null`` so a
-         *     consumer never compares timestamps for state.
+         *     ``severity`` is the real 0017 column (the notification service is
+         *     its only writer); ``acked`` mirrors ``acknowledged_at is not null``
+         *     so a consumer never compares timestamps for state. Global notices
+         *     carry ``server_id: null`` (0017 dropped NOT NULL); ``source`` and
+         *     ``body`` are the 0017 external-notice columns — ``null`` for
+         *     finding/job_result notices, whose text is the ``summary``.
          */
         AlertView: {
             /** Alert Id */
             alert_id: string;
             /** Server Id */
-            server_id: string;
+            server_id: string | null;
             /** Origin */
             origin: string;
             /** Dedup Key */
@@ -2431,6 +2608,10 @@ export interface components {
             title: string;
             /** Summary */
             summary: string | null;
+            /** Source */
+            source: string | null;
+            /** Body */
+            body: string | null;
             /** Context Ref */
             context_ref: string | null;
             /** Delivery Status */
@@ -3698,6 +3879,14 @@ export interface components {
             backup_confirmed: boolean;
         };
         /**
+         * MarkAllReadResult
+         * @description The mark-all-read receipt: rows ACTUALLY stamped by the one UPDATE.
+         */
+        MarkAllReadResult: {
+            /** Updated */
+            updated: number;
+        };
+        /**
          * McpDiscoveryReportView
          * @description The value-free result of one bounded discovery run (09-mcp).
          */
@@ -4072,6 +4261,27 @@ export interface components {
             schema_revision: number;
             /** Sha256 */
             sha256: string;
+        };
+        /**
+         * NotificationPage
+         * @description One bounded global inbox page (AGENTS pagination invariant).
+         *
+         *     ``alerts`` carries the shared :class:`mai.api.monitoring.AlertView`
+         *     (additive fields only: nullable ``server_id`` for global notices,
+         *     nullable ``source``/``body``); the envelope is the canonical
+         *     ``limit``/``offset``/``total``/``has_more`` page.
+         */
+        NotificationPage: {
+            /** Alerts */
+            alerts: components["schemas"]["AlertView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+            /** Has More */
+            has_more: boolean;
         };
         /**
          * ObservationPage
@@ -6307,6 +6517,14 @@ export interface components {
              * @description Approval record id when the call parked on the approval seam
              */
             approval_id?: string | null;
+        };
+        /**
+         * UnreadCountView
+         * @description The unread badge/count receipt under the canonical filters.
+         */
+        UnreadCountView: {
+            /** Total */
+            total: number;
         };
         /**
          * UpdateSubmitBody
@@ -12021,6 +12239,74 @@ export interface operations {
             };
         };
     };
+    unacknowledge_notification_api_v1_monitoring_servers__server_id__notifications__alert_id__unacknowledge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No notice for this id in this server scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Monitoring service unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     ingest_notification_api_v1_notifications_ingest_post: {
         parameters: {
             query?: never;
@@ -12236,6 +12522,316 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_notifications_api_v1_notifications_get: {
+        parameters: {
+            query?: {
+                server_id?: string | null;
+                scope?: "global" | null;
+                include_global?: boolean;
+                unread?: boolean | null;
+                origin?: components["schemas"]["AlertOrigin"] | null;
+                source?: string | null;
+                q?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation (bounds, scope vocabulary, or server_id together with scope=global) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    count_unread_notifications_api_v1_notifications_unread_count_get: {
+        parameters: {
+            query?: {
+                server_id?: string | null;
+                scope?: "global" | null;
+                include_global?: boolean;
+                unread?: boolean | null;
+                origin?: components["schemas"]["AlertOrigin"] | null;
+                source?: string | null;
+                q?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnreadCountView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    acknowledge_notification_api_v1_notifications__alert_id__ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No notice for this id (value-free, scope-blind) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    unacknowledge_notification_api_v1_notifications__alert_id__unack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description No notice for this id (value-free, scope-blind) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    mark_all_read_api_v1_notifications_mark_all_read_post: {
+        parameters: {
+            query?: {
+                server_id?: string | null;
+                scope?: "global" | null;
+                include_global?: boolean;
+                unread?: boolean | null;
+                origin?: components["schemas"]["AlertOrigin"] | null;
+                source?: string | null;
+                q?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MarkAllReadResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Query parameters failed validation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

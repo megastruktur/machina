@@ -286,12 +286,24 @@ _FEATURE_SURFACE = frozenset(
         ("GET", "/api/v1/monitoring/notification-policy"),
         # (nbi-ingest-api: the machine ingest lane + ingest-key management
         # surface, auth ADR §13 — the one Bearer route plus the session-
-        # authenticated key lifecycle. The global read/SSE routes join the
-        # pin in later campaign tasks.)
+        # authenticated key lifecycle.)
         ("POST", "/api/v1/notifications/ingest"),
         ("GET", "/api/v1/ingest-keys"),
         ("POST", "/api/v1/ingest-keys"),
         ("POST", "/api/v1/ingest-keys/{key_id}/revoke"),
+        # (nbi-read-api: the captain's global read surface over the unified
+        # inbox (canonical /ack · /unack spellings) plus the per-server
+        # unacknowledge route. The SSE events route joins in nbi-live.)
+        ("GET", "/api/v1/notifications"),
+        ("GET", "/api/v1/notifications/unread-count"),
+        ("POST", "/api/v1/notifications/{alert_id}/ack"),
+        ("POST", "/api/v1/notifications/{alert_id}/unack"),
+        ("POST", "/api/v1/notifications/mark-all-read"),
+        (
+            "POST",
+            "/api/v1/monitoring/servers/{server_id}/notifications"
+            "/{alert_id}/unacknowledge",
+        ),
         # (11-knowledge-api: memory surface.)
         ("GET", "/api/v1/servers/{server_id}/memory/status"),
         ("POST", "/api/v1/servers/{server_id}/memory/recall"),
@@ -511,11 +523,22 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
         "/api/v1/monitoring/notification-policy",
         # (nbi-ingest-api: the machine ingest lane + ingest-key management
-        # surface, auth ADR §13 — three unique paths; the global read/SSE
-        # routes join the pin in later campaign tasks.)
+        # surface, auth ADR §13 — three unique paths.)
         "/api/v1/notifications/ingest",
         "/api/v1/ingest-keys",
         "/api/v1/ingest-keys/{key_id}/revoke",
+        # (nbi-read-api: the captain's global read surface over the unified
+        # inbox (canonical /ack · /unack spellings) plus the per-server
+        # unacknowledge route. The SSE events route joins in nbi-live.)
+        "/api/v1/notifications",
+        "/api/v1/notifications/unread-count",
+        "/api/v1/notifications/{alert_id}/ack",
+        "/api/v1/notifications/{alert_id}/unack",
+        "/api/v1/notifications/mark-all-read",
+        (
+            "/api/v1/monitoring/servers/{server_id}/notifications"
+            "/{alert_id}/unacknowledge"
+        ),
         # (11-knowledge-api: memory surface.)
         "/api/v1/servers/{server_id}/memory/status",
         "/api/v1/servers/{server_id}/memory/recall",

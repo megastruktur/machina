@@ -14,12 +14,16 @@ ASGI app (``create_app`` + lifespan + middleware + handlers), never mocks:
    observation/finding/notice views carry the bounded chat-usable
    references (``observation:<uuid>`` / ``finding:<uuid>`` /
    ``run:<uuid>``).
-2. **Ack does not delete source evidence; cross-server/unauthed access
-   denied** — the ack stamps ``acknowledged_at`` (idempotently) while the
-   notice, its finding and its producing observation all survive; a
-   cross-server ack/read is the same value-free 404 as a missing row and
-   leaves the row untouched; the ack state survives a full app
-   re-creation over the same database.
+2. **Ack/unack do not delete source evidence; cross-server/unauthed
+   access denied** — the ack stamps ``acknowledged_at`` (idempotently),
+   the per-server unack clears it again (idempotently, re-arming the
+   finding reminder logic) while the notice, its finding and its
+   producing observation all survive both; a cross-server ack/unack/read
+   is the same value-free 404 as a missing row and leaves the row
+   untouched; the ack state survives a full app re-creation over the
+   same database. Severity on notice views is the real 0017 column; the
+   views carry the additive nullable ``source``/``body`` external fields
+   and a nullable ``server_id`` (global notices).
 3. **Real app registration + OpenAPI contract** — the routes are reached
    through ``create_app``'s actual registration (api-wiring), the schema
    is regenerated mechanically from ``app.openapi()`` (evidence files),
@@ -57,6 +61,7 @@ from mai.notifications.service import (
     DEFAULT_COOLDOWN,
     evaluate_findings,
     finding_dedup_key,
+    ingest_external,
     notify_job_result,
 )
 
@@ -935,7 +940,8 @@ class TestNotificationInbox:
         by_finding = {view["finding_id"]: view for view in page["alerts"]}
         assert set(by_finding) == {str(FINDING_INFO), str(FINDING_UPDATE)}
         assert newest["origin"] == "finding"
-        # Severity comes from the LIVE anchor join (the finding's severity).
+        # Severity comes from the row's severity column (the service wrote
+        # it from the finding's severity at persist time).
         assert by_finding[str(FINDING_INFO)]["severity"] == "info"
         assert by_finding[str(FINDING_UPDATE)]["severity"] == "warning"
         for view in (newest, oldest):
@@ -945,7 +951,7 @@ class TestNotificationInbox:
             uuid.UUID(view["context_ref"].split(":", 1)[1])
             assert view["dedup_key"].startswith("finding:")
 
-    async def test_inbox_severity_falls_back_to_summary_tag_for_job_result(
+    async def test_inbox_job_result_severity_is_the_column(
         self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
     ) -> None:
         _seed_job_run(migrated_url, RUN_OK)
@@ -969,10 +975,39 @@ class TestNotificationInbox:
         assert page["total"] == 1
         view = page["alerts"][0]
         assert view["origin"] == "job_result"
-        assert view["finding_id"] is None  # no anchor: the tag is the source
-        assert view["severity"] == "warning"  # read from the frozen summary tag
+        assert view["finding_id"] is None  # no anchor; the row carries it all
+        assert view["severity"] == "warning"  # the service wrote the column
+        assert view["source"] is None and view["body"] is None
         assert view["context_ref"] == f"run:{RUN_OK}"
         assert view["run_id"] == str(RUN_OK)
+
+    async def test_inbox_view_carries_external_source_and_body(
+        self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
+    ) -> None:
+        """The additive 0017 external fields ride the SAME AlertView."""
+        async with _service_factory(migrated_url) as factory:
+            await ingest_external(
+                factory,
+                server_id=SERVER_A,
+                title="disk almost full",
+                body="/var usage 94% on db-1",
+                severity="warning",
+                source="host-monitor",
+            )
+        response = await call_app(
+            monitoring_app,
+            "GET",
+            f"{_monitoring_prefix(SERVER_A)}/notifications",
+            cookies=session_jar,
+        )
+        assert response.status == 200, response.body
+        [view] = response.json()["alerts"]
+        assert view["origin"] == "external"
+        assert view["server_id"] == SERVER_A
+        assert view["source"] == "host-monitor"
+        assert view["body"] == "/var usage 94% on db-1"
+        assert view["severity"] == "warning"  # straight from the column
+        assert view["summary"] is None  # external text lives in body
 
     async def test_unacknowledged_filter(
         self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
@@ -1291,6 +1326,146 @@ class TestAcknowledgment:
             if recreated.state.engine is not None:
                 await recreated.state.engine.dispose()
 
+    async def test_unack_clears_ack_is_idempotent_and_re_arms(
+        self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
+    ) -> None:
+        """ack → unack → ack round trip on the ONE truth column."""
+        alert_id = await self._seed_one_notice(migrated_url)
+        ack = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/ack",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert ack.status == 200, ack.body
+        stamped = _ack_at(migrated_url, alert_id)
+        assert stamped is not None
+        unack = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/unacknowledge",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert unack.status == 200, unack.body
+        cleared = unack.json()["alert"]
+        assert cleared["acked"] is False and cleared["acknowledged_at"] is None
+        assert _ack_at(migrated_url, alert_id) is None
+        # Idempotent replay: unacknowledging again changes nothing (200).
+        replay = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/unacknowledge",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert replay.status == 200, replay.body
+        assert replay.json()["alert"]["acked"] is False
+        # Re-ack re-opens the notice (re-armed reminder semantics); the
+        # cleared state never left evidence behind: row counts unchanged.
+        re_ack = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/ack",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert re_ack.status == 200, re_ack.body
+        assert re_ack.json()["alert"]["acked"] is True
+        assert _ack_at(migrated_url, alert_id) is not None
+        assert _count(migrated_url, "notification_alerts") == 1
+
+    async def test_cross_server_unack_is_denied_and_leaves_state(
+        self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
+    ) -> None:
+        _seed_finding(migrated_url, FINDING_B, server_id=SERVER_B)
+        async with _service_factory(migrated_url) as factory:
+            await evaluate_findings(
+                factory,
+                uuid.UUID(SERVER_B),
+                now=_utc(),
+                policy=_default_policy(),
+            )
+        with psycopg.connect(migrated_url) as conn:
+            alert_id = uuid.UUID(
+                str(
+                    conn.execute("SELECT alert_id FROM notification_alerts").fetchone()[
+                        0
+                    ]
+                )
+            )
+            conn.execute(
+                "UPDATE notification_alerts SET acknowledged_at = now()"
+                " WHERE alert_id = %s",
+                (str(alert_id),),
+            )
+            conn.commit()
+        stamped = _ack_at(migrated_url, alert_id)
+        assert stamped is not None
+        response = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/unacknowledge",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert response.status == 404, response.body
+        assert _error(response)["code"] == "not_found"
+        assert _ack_at(migrated_url, alert_id) == stamped  # untouched
+
+    async def test_unknown_notice_unack_is_404(
+        self, monitoring_app: FastAPI, session_jar: dict[str, str]
+    ) -> None:
+        response = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}"
+            f"/notifications/{uuid.uuid4()}/unacknowledge",
+            headers=_mutation_headers(),
+            cookies=session_jar,
+        )
+        assert response.status == 404
+        assert _error(response)["code"] == "not_found"
+
+    async def test_unack_without_csrf_is_403_and_never_clears(
+        self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
+    ) -> None:
+        alert_id = await self._seed_one_notice(migrated_url)
+        with psycopg.connect(migrated_url) as conn:
+            conn.execute(
+                "UPDATE notification_alerts SET acknowledged_at = now()"
+                " WHERE alert_id = %s",
+                (str(alert_id),),
+            )
+            conn.commit()
+        stamped = _ack_at(migrated_url, alert_id)
+        response = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/unacknowledge",
+            headers={"origin": ORIGIN},  # no X-CSRF-Token
+            cookies=session_jar,
+        )
+        assert response.status == 403, response.body
+        assert _error(response)["code"] == "csrf_rejected"
+        assert _ack_at(migrated_url, alert_id) == stamped
+
+    async def test_unack_with_evil_origin_is_403_and_never_clears(
+        self, monitoring_app: FastAPI, migrated_url: str, session_jar: dict[str, str]
+    ) -> None:
+        alert_id = await self._seed_one_notice(migrated_url)
+        response = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}/notifications/{alert_id}/unacknowledge",
+            headers={"origin": EVIL_ORIGIN, "x-csrf-token": session_jar[CSRF_COOKIE]},
+            cookies=session_jar,
+        )
+        assert response.status == 403, response.body
+        assert _error(response)["code"] == "origin_rejected"
+        assert _ack_at(migrated_url, alert_id) is None
+
 
 # ---------------------------------------------------------------------------
 # TestReEvaluation
@@ -1558,6 +1733,18 @@ class TestAuthBoundary:
             monitoring_app,
             "POST",
             f"{_monitoring_prefix(SERVER_A)}/notifications/{uuid.uuid4()}/ack",
+        )
+        assert response.status == 401, response.body
+        assert _error(response)["code"] == "unauthenticated"
+
+    async def test_unack_unauthenticated_is_401_and_never_clears(
+        self, monitoring_app: FastAPI
+    ) -> None:
+        response = await call_app(
+            monitoring_app,
+            "POST",
+            f"{_monitoring_prefix(SERVER_A)}"
+            f"/notifications/{uuid.uuid4()}/unacknowledge",
         )
         assert response.status == 401, response.body
         assert _error(response)["code"] == "unauthenticated"

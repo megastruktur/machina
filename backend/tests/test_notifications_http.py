@@ -24,6 +24,15 @@ lifespan + middleware + handlers), never mocks:
    page is bounded/paginated and never carries key material; mutations
    enforce session → origin → CSRF; revoke is effective on the next
    ingest and the receipt is idempotent.
+6. **Captain read surface (nbi-read-api)** — the canonical filter matrix
+   (all / scope=global / server_id ± include_global / unread / origin /
+   source / q over title, summary, body and source, case-insensitively
+   with escaped wildcards), honest pagination (deterministic order,
+   COUNT under the same predicate, bounded limits), bidirectional
+   idempotent ack → unack on the ONE ``acknowledged_at`` column with a
+   value-free scope-blind 404, and a mark-all-read receipt that equals
+   the rows actually stamped; every mutation keeps session → origin →
+   CSRF and evidence is never deleted.
 
 Secret hygiene: the fixture password is an inert constant for the
 disposable fixture DB; minted keys are throwaway tokens printed nowhere.
@@ -37,6 +46,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -58,6 +68,7 @@ LIVE_URL_VAR = "MAI_TEST_DATABASE_URL"
 #: Synthetic fixture credential (NOT a secret; disposable fixture DB only).
 FIXTURE_PASSWORD = "fixture-password-nbi-ingest-api-only"
 ORIGIN = "http://127.0.0.1:8443"  # loopback allowlist entry
+EVIL_ORIGIN = "https://attacker.example"
 
 #: Frozen fixed fixture identities (canonical lowercase UUID strings,
 #: distinct from every other card's constants).
@@ -70,6 +81,7 @@ SERVER_UNKNOWN = "d40e0000-0000-4000-8000-00000000d004"  # never seeded
 HOST_KEY = "SHA256:ZmXWe/xAeTz26CuAmJ1jHtg8ZPX0mMhVfrBPM+C/zS4"
 
 INGEST_PATH = "/api/v1/notifications/ingest"
+NOTIFICATIONS_PATH = "/api/v1/notifications"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +231,12 @@ def _seed_profile(data_root: str, server_id: str) -> None:
 def seeded_server_a(data_root: str) -> str:
     _seed_profile(data_root, SERVER_A)
     return SERVER_A
+
+
+@pytest.fixture
+def seeded_server_b(data_root: str) -> str:
+    _seed_profile(data_root, SERVER_B)
+    return SERVER_B
 
 
 # ---------------------------------------------------------------------------
@@ -1136,3 +1154,733 @@ class TestKeyManagement:
     ) -> None:
         _, view = await _mint_key(ingest_app, session_jar, label="fleet")
         assert view["server_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Captain read surface (nbi-read-api): seed helpers + filter matrix
+# ---------------------------------------------------------------------------
+
+
+async def _seed_inbox(
+    app: FastAPI,
+    jar: dict[str, str],
+) -> dict[str, list[str]]:
+    """Three external notices (SERVER_A, SERVER_B, global) via the REAL
+    ingest lane, each through its own scope-pinned key. Returns their
+    alert ids in creation order."""
+    a_token, _ = await _mint_key(app, jar, label="host-monitor", server_id=SERVER_A)
+    b_token, _ = await _mint_key(app, jar, label="backupd", server_id=SERVER_B)
+    g_token, _ = await _mint_key(app, jar, label="fleet-feed")
+    seeded: dict[str, list[str]] = {SERVER_A: [], SERVER_B: [], "global": []}
+    for token, scope, payload in (
+        (
+            a_token,
+            SERVER_A,
+            {
+                "title": "Disk almost full",
+                "body": "/var usage 94% on db-1",
+                "severity": "warning",
+                "source": "host-monitor",
+                "dedup_key": "disk-var",
+            },
+        ),
+        (
+            b_token,
+            SERVER_B,
+            {
+                "title": "Backup failed",
+                "body": "nightly backup did not run",
+                "severity": "critical",
+                "source": "backupd",
+                "dedup_key": "backup-nightly",
+            },
+        ),
+        (
+            g_token,
+            "global",
+            {
+                "title": "Fleet announcement",
+                "body": "maintenance window tonight",
+                "severity": "info",
+                "source": "fleet-feed",
+                "dedup_key": "announce-tonight",
+            },
+        ),
+    ):
+        response = await _ingest(app, payload, token=token)
+        assert response.status == 200, response.body
+        seeded[scope].append(str(response.json()["alert_id"]))
+    return seeded
+
+
+def _seed_finding_notice(
+    url: str, *, server_id: str, summary: str
+) -> str:
+    """Test-only state setup: one finding-anchored notice with a summary.
+
+    The REAL producer writes these through ``evaluate_findings``; this
+    file seeds the row directly (same discipline as the monitoring
+    suite's filter tests) to prove the ``q`` summary arm against a row
+    that carries ``summary`` instead of ``body``.
+    """
+    finding_id = str(uuid.uuid4())
+    alert_id = str(uuid.uuid4())
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "INSERT INTO observation_findings (finding_id, server_id, kind,"
+            " dedup_key, severity, summary, retain_until)"
+            " VALUES (%s, %s, 'seed.kind', %s, 'info', %s,"
+            " now() + interval '7 days')",
+            (finding_id, server_id, f"seed-{alert_id[:8]}", summary),
+        )
+        conn.execute(
+            "INSERT INTO notification_alerts (alert_id, server_id, origin,"
+            " finding_id, dedup_key, severity, title, summary, delivery_status,"
+            " delivered_at, retain_until)"
+            " VALUES (%s, %s, 'finding', %s, %s, 'info', 'Seeded finding"
+            " notice', %s, 'delivered', now(), now() + interval '30 days')",
+            (alert_id, server_id, finding_id, f"seed-alert-{alert_id[:8]}", summary),
+        )
+        conn.commit()
+    return alert_id
+
+
+async def _list_inbox(
+    app: FastAPI,
+    jar: dict[str, str],
+    query: str = "",
+) -> Any:
+    """GET /api/v1/notifications (one bounded page) as parsed JSON."""
+    path = NOTIFICATIONS_PATH + (f"?{query}" if query else "")
+    response = await call_app(app, "GET", path, cookies=jar)
+    assert response.status == 200, response.body
+    return response.json()
+
+
+async def _mutation(
+    app: FastAPI,
+    jar: dict[str, str],
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> HttpResponse:
+    """POST one read-surface mutation with default origin+CSRF headers."""
+    return await call_app(
+        app,
+        "POST",
+        path,
+        cookies=jar,
+        headers=headers if headers is not None else _mutation_headers(jar),
+    )
+
+
+def _ack_state(url: str) -> dict[str, str | None]:
+    """Every notice's ``acknowledged_at`` keyed by alert id (raw truth)."""
+    with psycopg.connect(url) as conn:
+        return {
+            str(row[0]): None if row[1] is None else str(row[1])
+            for row in conn.execute(
+                "SELECT alert_id, acknowledged_at FROM notification_alerts"
+            ).fetchall()
+        }
+
+
+@pytest.mark.anyio
+class TestReadFilters:
+    """The canonical filter matrix over the REAL ingested inbox."""
+
+    async def test_all_notices_page_shape_and_deterministic_order(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(ingest_app, session_jar)
+        assert page["total"] == 3
+        assert page["limit"] == 50 and page["offset"] == 0
+        assert page["has_more"] is False
+        assert len(page["alerts"]) == 3
+        by_id = {view["alert_id"]: view for view in page["alerts"]}
+        assert set(by_id) == {
+            seeded[SERVER_A][0],
+            seeded[SERVER_B][0],
+            seeded["global"][0],
+        }
+        global_view = by_id[seeded["global"][0]]
+        assert global_view["server_id"] is None  # global notice: NULL scope
+        assert global_view["origin"] == "external"
+        assert global_view["source"] == "fleet-feed"
+        assert global_view["body"] == "maintenance window tonight"
+        assert global_view["severity"] == "info"
+        assert global_view["delivery_status"] == "delivered"
+        assert global_view["acked"] is False
+        assert global_view["acknowledged_at"] is None
+        assert global_view["summary"] is None  # external text lives in body
+        assert by_id[seeded[SERVER_A][0]]["server_id"] == SERVER_A
+        assert by_id[seeded[SERVER_B][0]]["severity"] == "critical"
+        # Deterministic ordering: created_at DESC, alert_id DESC.
+        moments = [
+            (
+                datetime.fromisoformat(view["created_at"].replace("Z", "+00:00")),
+                view["alert_id"],
+            )
+            for view in page["alerts"]
+        ]
+        assert moments == sorted(moments, reverse=True)
+
+    async def test_scope_global_returns_only_null_server_rows(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(ingest_app, session_jar, "scope=global")
+        assert page["total"] == 1
+        [view] = page["alerts"]
+        assert view["server_id"] is None
+        assert view["source"] == "fleet-feed"
+
+    async def test_server_filter_includes_global_by_default(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(
+            ingest_app, session_jar, f"server_id={SERVER_A}"
+        )
+        assert page["total"] == 2  # SERVER_A + the global notice
+        assert {view["alert_id"] for view in page["alerts"]} == {
+            seeded[SERVER_A][0],
+            seeded["global"][0],
+        }
+
+    async def test_server_filter_include_global_false_is_strict(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(
+            ingest_app, session_jar, f"server_id={SERVER_A}&include_global=false"
+        )
+        assert page["total"] == 1
+        [view] = page["alerts"]
+        assert view["alert_id"] == seeded[SERVER_A][0]
+        assert view["server_id"] == SERVER_A
+
+    async def test_include_global_is_ignored_without_server_id(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(
+            ingest_app, session_jar, "include_global=false"
+        )
+        assert page["total"] == 3  # nothing to exclude: ALL notices
+
+    async def test_unread_filter_follows_acknowledged_at(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        unread = await _list_inbox(ingest_app, session_jar, "unread=true")
+        assert unread["total"] == 3
+        read = await _list_inbox(ingest_app, session_jar, "unread=false")
+        assert read["total"] == 0
+        acked = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{seeded[SERVER_A][0]}/ack",
+        )
+        assert acked.status == 200, acked.body
+        unread_after = await _list_inbox(ingest_app, session_jar, "unread=true")
+        assert unread_after["total"] == 2
+        read_after = await _list_inbox(ingest_app, session_jar, "unread=false")
+        assert read_after["total"] == 1
+        assert read_after["alerts"][0]["alert_id"] == seeded[SERVER_A][0]
+        assert read_after["alerts"][0]["acked"] is True
+
+    async def test_origin_filter_pins_the_vocabulary(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        external = await _list_inbox(ingest_app, session_jar, "origin=external")
+        assert external["total"] == 3
+        finding = await _list_inbox(ingest_app, session_jar, "origin=finding")
+        assert finding["total"] == 0
+        job = await _list_inbox(ingest_app, session_jar, "origin=job_result")
+        assert job["total"] == 0
+
+    async def test_source_filter_is_exact_match(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        page = await _list_inbox(ingest_app, session_jar, "source=backupd")
+        assert page["total"] == 1
+        assert page["alerts"][0]["source"] == "backupd"
+        # Exact match: case differs → no hit.
+        none = await _list_inbox(ingest_app, session_jar, "source=BACKUPD")
+        assert none["total"] == 0
+
+    async def test_q_matches_each_field_case_insensitively(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        seeded[SERVER_A].append(
+            _seed_finding_notice(
+                migrated_url,
+                server_id=SERVER_A,
+                summary="Quarterly compliance digest",
+            )
+        )
+
+        async def ids_for(q: str) -> set[str]:
+            page = await _list_inbox(
+                ingest_app, session_jar, f"q={q.replace(' ', '+')}"
+            )
+            return {view["alert_id"] for view in page["alerts"]}
+
+        # title (case-insensitive)
+        assert await ids_for("DISK ALMOST") == {seeded[SERVER_A][0]}
+        # body
+        assert await ids_for("94% on") == {seeded[SERVER_A][0]}
+        # summary (the finding notice carries summary, not body)
+        assert await ids_for("quarterly compliance") == {seeded[SERVER_A][1]}
+        # source
+        assert await ids_for("FLEET-FEED") == {seeded["global"][0]}
+        # wildcards stay LITERAL: underscore/percent are escaped, so the
+        # pattern "f_e" matches nothing (never "fleet-feed" as a wildcard).
+        assert await ids_for("f_e") == set()
+        # a bare % only matches rows that CONTAIN a literal % (one body).
+        assert await ids_for("%") == {seeded[SERVER_A][0]}
+        assert await ids_for("not-in-any-notice") == set()
+
+    async def test_server_id_and_scope_are_mutually_exclusive(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+    ) -> None:
+        response = await call_app(
+            ingest_app,
+            "GET",
+            f"{NOTIFICATIONS_PATH}?server_id={SERVER_A}&scope=global",
+            cookies=session_jar,
+        )
+        assert response.status == 422, response.body
+        assert _error(response)["code"] == "validation_failed"
+
+    async def test_scope_vocabulary_is_pinned(
+        self, ingest_app: FastAPI, session_jar: dict[str, str]
+    ) -> None:
+        response = await call_app(
+            ingest_app,
+            "GET",
+            f"{NOTIFICATIONS_PATH}?scope=fleet",
+            cookies=session_jar,
+        )
+        assert response.status == 422, response.body
+        assert _error(response)["code"] == "validation_failed"
+
+    async def test_pagination_bounds_and_load_more_slices(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        for query in ("limit=0", "limit=201", "offset=-1"):
+            response = await call_app(
+                ingest_app,
+                "GET",
+                f"{NOTIFICATIONS_PATH}?{query}",
+                cookies=session_jar,
+            )
+            assert response.status == 422, (query, response.body)
+            assert _error(response)["code"] == "validation_failed"
+        first = await _list_inbox(ingest_app, session_jar, "limit=2&offset=0")
+        assert first["total"] == 3
+        assert len(first["alerts"]) == 2
+        assert first["has_more"] is True
+        second = await _list_inbox(ingest_app, session_jar, "limit=2&offset=2")
+        assert second["total"] == 3
+        assert len(second["alerts"]) == 1
+        assert second["has_more"] is False
+        # Load-more slices: no duplicate and no gap under static data.
+        seen = [view["alert_id"] for view in first["alerts"] + second["alerts"]]
+        assert len(seen) == len(set(seen)) == 3
+        assert set(seen) == {
+            seeded[SERVER_A][0],
+            seeded[SERVER_B][0],
+            seeded["global"][0],
+        }
+
+    async def test_reads_require_a_session_and_reject_bearer(
+        self, ingest_app: FastAPI, session_jar: dict[str, str]
+    ) -> None:
+        for path in (
+            NOTIFICATIONS_PATH,
+            f"{NOTIFICATIONS_PATH}/unread-count",
+        ):
+            response = await call_app(ingest_app, "GET", path)
+            assert response.status == 401, (path, response.body)
+            assert _error(response)["code"] == "unauthenticated"
+        bearer = await call_app(
+            ingest_app,
+            "GET",
+            NOTIFICATIONS_PATH,
+            headers={"authorization": "Bearer not-a-session"},
+        )
+        assert bearer.status == 401, bearer.body
+
+
+@pytest.mark.anyio
+class TestUnreadCount:
+    """The count route answers under the EXACT list predicate."""
+
+    _FILTER_SETS = (
+        "",
+        "scope=global",
+        None,  # replaced with SERVER_A per test
+        "unread=false",
+        "origin=external",
+        "q=backup",
+    )
+
+    async def test_count_matches_the_unread_list_total_under_every_filter(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        for query in self._FILTER_SETS:
+            resolved = query if query is not None else f"server_id={SERVER_A}"
+            path = NOTIFICATIONS_PATH + "/unread-count" + (
+                f"?{resolved}" if resolved else ""
+            )
+            response = await call_app(
+                ingest_app, "GET", path, cookies=session_jar
+            )
+            assert response.status == 200, response.body
+            if "unread=false" in resolved:
+                # Contradiction: no notice is both read and unread.
+                expected = {"total": 0}
+            else:
+                # The count is UNREAD-pinned by definition: its honest
+                # list twin is the same filter with unread=true.
+                list_query = (
+                    resolved
+                    if "unread=" in resolved
+                    else (f"{resolved}&unread=true" if resolved else "unread=true")
+                )
+                page = await _list_inbox(ingest_app, session_jar, list_query)
+                expected = {"total": page["total"]}
+            assert response.json() == expected, resolved
+
+    async def test_count_drops_after_ack_and_unread_false_is_zero(
+        self,
+        ingest_app: FastAPI,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        acked = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{seeded[SERVER_B][0]}/ack",
+        )
+        assert acked.status == 200, acked.body
+        count = await call_app(
+            ingest_app,
+            "GET",
+            f"{NOTIFICATIONS_PATH}/unread-count",
+            cookies=session_jar,
+        )
+        assert count.json() == {"total": 2}
+        # An honest 0: no unread notice matches a read-only filter.
+        flipped = await call_app(
+            ingest_app,
+            "GET",
+            f"{NOTIFICATIONS_PATH}/unread-count?unread=false",
+            cookies=session_jar,
+        )
+        assert flipped.json() == {"total": 0}
+
+
+@pytest.mark.anyio
+class TestAcknowledgment:
+    """Bidirectional idempotent ack on the ONE truth column."""
+
+    async def test_ack_unack_round_trip_is_idempotent_and_preserves_rows(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        alert_id = seeded[SERVER_A][0]
+        first = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{alert_id}/ack",
+        )
+        assert first.status == 200, first.body
+        receipt = first.json()["alert"]
+        assert receipt["alert_id"] == alert_id
+        assert receipt["acked"] is True
+        assert receipt["acknowledged_at"] is not None
+        stamped = _ack_state(migrated_url)[alert_id]
+        assert stamped is not None
+        # Idempotent replay: 200, never re-stamped.
+        replay = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{alert_id}/ack",
+        )
+        assert replay.status == 200, replay.body
+        assert replay.json()["alert"]["acknowledged_at"] == receipt["acknowledged_at"]
+        assert _ack_state(migrated_url)[alert_id] == stamped
+        # Unacknowledge: cleared, honest view, idempotent replay.
+        unack = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{alert_id}/unack",
+        )
+        assert unack.status == 200, unack.body
+        cleared = unack.json()["alert"]
+        assert cleared["acked"] is False and cleared["acknowledged_at"] is None
+        assert _ack_state(migrated_url)[alert_id] is None
+        replay_clear = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{alert_id}/unack",
+        )
+        assert replay_clear.status == 200, replay_clear.body
+        assert replay_clear.json()["alert"]["acked"] is False
+        # Re-ack re-arms/re-opens; evidence never deleted: row count stable.
+        re_ack = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{alert_id}/ack",
+        )
+        assert re_ack.status == 200, re_ack.body
+        assert re_ack.json()["alert"]["acked"] is True
+        assert len(_ack_state(migrated_url)) == 3  # nothing deleted
+
+    async def test_unknown_alert_is_value_free_404(
+        self, ingest_app: FastAPI, session_jar: dict[str, str]
+    ) -> None:
+        for suffix in ("ack", "unack"):
+            response = await _mutation(
+                ingest_app,
+                session_jar,
+                f"{NOTIFICATIONS_PATH}/{uuid.uuid4()}/{suffix}",
+            )
+            assert response.status == 404, (suffix, response.body)
+            assert _error(response)["code"] == "not_found"
+
+    async def test_mutations_reject_missing_layers_without_effect(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        alert_id = seeded[SERVER_A][0]
+        path = f"{NOTIFICATIONS_PATH}/{alert_id}/ack"
+        no_session = await call_app(ingest_app, "POST", path)
+        assert no_session.status == 401, no_session.body
+        evil_origin = await call_app(
+            ingest_app,
+            "POST",
+            path,
+            cookies=session_jar,
+            headers={"origin": EVIL_ORIGIN, "x-csrf-token": session_jar[CSRF_COOKIE]},
+        )
+        assert evil_origin.status == 403, evil_origin.body
+        assert _error(evil_origin)["code"] == "origin_rejected"
+        missing_csrf = await call_app(
+            ingest_app,
+            "POST",
+            path,
+            cookies=session_jar,
+            headers={"origin": ORIGIN},  # no X-CSRF-Token
+        )
+        assert missing_csrf.status == 403, missing_csrf.body
+        assert _error(missing_csrf)["code"] == "csrf_rejected"
+        assert _ack_state(migrated_url)[alert_id] is None  # never stamped
+
+
+@pytest.mark.anyio
+class TestMarkAllRead:
+    """ONE conditional UPDATE; the receipt equals the stamped rows."""
+
+    async def test_receipt_equals_rows_stamped_under_server_filter(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        # A second SERVER_A notice: the filter must stamp exactly the
+        # matching unread rows and nothing else.
+        a2_token, _ = await _mint_key(
+            ingest_app, session_jar, label="host-monitor", server_id=SERVER_A
+        )
+        second = await _ingest(
+            ingest_app,
+            {"title": "Disk warning again", "dedup_key": "disk-var-2"},
+            token=a2_token,
+        )
+        assert second.status == 200, second.body
+        seeded[SERVER_A].append(str(second.json()["alert_id"]))
+        # Read one A notice first: the unread filter must skip it.
+        acked = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/{seeded[SERVER_A][0]}/ack",
+        )
+        assert acked.status == 200, acked.body
+        before = _ack_state(migrated_url)
+        assert before[seeded[SERVER_A][0]] is not None
+
+        response = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/mark-all-read"
+            f"?server_id={SERVER_A}&include_global=false&unread=true",
+        )
+        assert response.status == 200, response.body
+        assert response.json() == {"updated": 1}  # only A's unread notice
+        after = _ack_state(migrated_url)
+        assert after[seeded[SERVER_A][1]] is not None  # stamped
+        assert after[seeded[SERVER_A][0]] == before[seeded[SERVER_A][0]]
+        assert after[seeded[SERVER_B][0]] is None  # untouched
+        assert after[seeded["global"][0]] is None  # untouched
+        # Idempotent replay: nothing left unread → receipt 0.
+        replay = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/mark-all-read"
+            f"?server_id={SERVER_A}&include_global=false&unread=true",
+        )
+        assert replay.status == 200, replay.body
+        assert replay.json() == {"updated": 0}
+
+    async def test_no_filters_stamp_every_unread_notice(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        await _seed_inbox(ingest_app, session_jar)
+        response = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/mark-all-read",
+        )
+        assert response.status == 200, response.body
+        assert response.json() == {"updated": 3}
+        states = _ack_state(migrated_url)
+        assert all(at is not None for at in states.values())
+        replay = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/mark-all-read",
+        )
+        assert replay.json() == {"updated": 0}  # first stamp wins, always
+
+    async def test_scope_global_stamps_only_global_rows(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        response = await _mutation(
+            ingest_app,
+            session_jar,
+            f"{NOTIFICATIONS_PATH}/mark-all-read?scope=global",
+        )
+        assert response.status == 200, response.body
+        assert response.json() == {"updated": 1}
+        states = _ack_state(migrated_url)
+        assert states[seeded["global"][0]] is not None
+        assert states[seeded[SERVER_A][0]] is None
+        assert states[seeded[SERVER_B][0]] is None
+
+    async def test_mutations_reject_missing_layers_without_effect(
+        self,
+        ingest_app: FastAPI,
+        migrated_url: str,
+        session_jar: dict[str, str],
+        seeded_server_a: str,
+        seeded_server_b: str,
+    ) -> None:
+        seeded = await _seed_inbox(ingest_app, session_jar)
+        path = f"{NOTIFICATIONS_PATH}/mark-all-read"
+        no_session = await call_app(ingest_app, "POST", path)
+        assert no_session.status == 401, no_session.body
+        evil_origin = await call_app(
+            ingest_app,
+            "POST",
+            path,
+            cookies=session_jar,
+            headers={"origin": EVIL_ORIGIN, "x-csrf-token": session_jar[CSRF_COOKIE]},
+        )
+        assert evil_origin.status == 403, evil_origin.body
+        assert _error(evil_origin)["code"] == "origin_rejected"
+        missing_csrf = await call_app(
+            ingest_app,
+            "POST",
+            path,
+            cookies=session_jar,
+            headers={"origin": ORIGIN},
+        )
+        assert missing_csrf.status == 403, missing_csrf.body
+        assert _error(missing_csrf)["code"] == "csrf_rejected"
+        assert all(at is None for at in _ack_state(migrated_url).values())

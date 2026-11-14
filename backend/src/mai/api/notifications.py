@@ -1,8 +1,11 @@
-"""Machine ingest lane + ingest-key management HTTP surface (auth ADR §13).
+"""Machine ingest lane + ingest-key management + the captain's global
+read surface over the unified notification inbox (auth ADR §13;
+docs/architecture/notification-inbox.md).
 
-Ownership (notification-inbox campaign, task nbi-ingest-api; the frozen
-sources are ``docs/architecture/notification-inbox.md`` and auth
-ADR ``§13`` machine ingest principal):
+Ownership (notification-inbox campaign: tasks nbi-ingest-api +
+nbi-read-api; the frozen sources are
+``docs/architecture/notification-inbox.md`` and auth ADR ``§13``
+machine ingest principal):
 
 - ``POST /api/v1/notifications/ingest`` is the ONLY route that
   authenticates ``Authorization: Bearer <key>`` (RFC 6750 §2.1 header
@@ -27,6 +30,22 @@ ADR ``§13`` machine ingest principal):
   {key_id}/revoke``): mutations keep the session → origin → CSRF order
   (ADR §5); listings and mint receipts carry metadata only — plaintext is
   returned exactly once at mint and ``key_hash`` never leaves the store.
+- The captain's read surface (task nbi-read-api) is the fleet-wide,
+  session-authenticated view of the SAME durable inbox:
+  ``GET /api/v1/notifications`` (one bounded page under the canonical
+  filter set: ``server_id | scope=global`` mutually exclusive,
+  ``include_global``, ``unread``, ``origin``, ``source``, ``q`` ILIKE
+  over title/summary/body/source, ``limit``/``offset``),
+  ``GET /api/v1/notifications/unread-count`` (``{total}`` under the
+  exact same predicate), ``POST /api/v1/notifications/{alert_id}/ack``
+  and ``.../{alert_id}/unack`` (bidirectional, idempotent,
+  one truth column ``acknowledged_at``; evidence never deleted) and
+  ``POST /api/v1/notifications/mark-all-read`` (ONE conditional UPDATE
+  under the same filters; receipt ``{updated}`` = rows actually
+  stamped). Safe reads run the session layer only; every mutation keeps
+  session → origin → CSRF (ADR §5). The view model is
+  ``mai.api.monitoring.AlertView`` verbatim, so the unified inbox renders
+  ONE wire shape on every surface.
 
 Every error uses the shared C01 envelope renderer; the returned plaintext
 is never logged and never echoed by any error path.
@@ -36,17 +55,21 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Final
+from typing import Final, Literal
 
 from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.status import (
+    HTTP_200_OK,
     HTTP_201_CREATED,
     HTTP_401_UNAUTHORIZED,
     HTTP_403_FORBIDDEN,
+    HTTP_404_NOT_FOUND,
     HTTP_413_CONTENT_TOO_LARGE,
     HTTP_422_UNPROCESSABLE_CONTENT,
     HTTP_429_TOO_MANY_REQUESTS,
@@ -61,6 +84,7 @@ from mai.api.auth import (
     _require_session,
     render_error_envelope,
 )
+from mai.api.monitoring import AckResult, AlertView, _alert_view
 from mai.auth.ingest_keys import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -69,7 +93,12 @@ from mai.auth.ingest_keys import (
     IngestKeyErrorCode,
     IngestKeyStore,
 )
-from mai.contracts.observations import MAX_INGEST_BODY_BYTES
+from mai.contracts.observations import (
+    MAX_INGEST_BODY_BYTES,
+    MAX_NOTIFICATION_SOURCE_CHARS,
+    AlertOrigin,
+)
+from mai.contracts.tags import compute_has_more
 from mai.notifications.service import NotificationError, ingest_external
 from mai.profiles.files import ProfileFileError, ProfileFileStore
 
@@ -203,6 +232,40 @@ class IngestPayload(BaseModel):
     context_ref: str | None = None
 
 
+class NotificationPage(BaseModel):
+    """One bounded global inbox page (AGENTS pagination invariant).
+
+    ``alerts`` carries the shared :class:`mai.api.monitoring.AlertView`
+    (additive fields only: nullable ``server_id`` for global notices,
+    nullable ``source``/``body``); the envelope is the canonical
+    ``limit``/``offset``/``total``/``has_more`` page.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alerts: list[AlertView]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
+class UnreadCountView(BaseModel):
+    """The unread badge/count receipt under the canonical filters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    total: int
+
+
+class MarkAllReadResult(BaseModel):
+    """The mark-all-read receipt: rows ACTUALLY stamped by the one UPDATE."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    updated: int
+
+
 # ---------------------------------------------------------------------------
 # Accessors and small helpers
 # ---------------------------------------------------------------------------
@@ -326,6 +389,80 @@ def _profile_exists(request: Request, server_id: uuid.UUID) -> bool:
     except (ProfileFileError, OSError):
         return False
     return True
+
+
+def _ilike_pattern(q: str) -> str:
+    """Literal substring pattern for one ``q`` value (R2-F1 field set).
+
+    ``%``/``_``/``\\`` are escaped so the captain's search text never
+    becomes a wildcard; the SQL side pairs this with ``ESCAPE '\\'``.
+    """
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _canonical_filters(
+    *,
+    server_id: uuid.UUID | None,
+    scope: str | None,
+    include_global: bool,
+    unread: bool | None,
+    origin: AlertOrigin | None,
+    source: str | None,
+    q: str | None,
+) -> tuple[str, dict[str, object]]:
+    """The ONE canonical WHERE clause over the unified inbox (R4-F2).
+
+    Frozen semantics, shared VERBATIM by the list, unread-count and
+    mark-all-read routes so totals and effects can never disagree:
+
+    - no ``server_id`` and no ``scope`` → ALL notices (every server plus
+      global); ``include_global`` is ignored (nothing to exclude);
+    - ``server_id`` → that server plus global rows unless
+      ``include_global=False`` (then strictly that server);
+    - ``scope='global'`` → only ``server_id IS NULL`` rows;
+      ``server_id`` and ``scope`` are mutually exclusive → 422.
+    - ``unread`` composes like on the list (``True`` → unacknowledged
+      only, ``False`` → acknowledged only);
+    - ``q`` is ONE case-insensitive ILIKE field set over ``title``,
+      ``summary``, ``body`` and ``source`` (wildcards escaped).
+    """
+    if server_id is not None and scope is not None:
+        raise BoundaryError(
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "validation_failed",
+            "server_id and scope are mutually exclusive",
+        )
+    clauses: list[str] = []
+    params: dict[str, object] = {}
+    if scope is not None:  # the only Query-legal value is 'global'
+        clauses.append("server_id IS NULL")
+    elif server_id is not None:
+        params["f_server_id"] = server_id
+        if include_global:
+            clauses.append("(server_id = :f_server_id OR server_id IS NULL)")
+        else:
+            clauses.append("server_id = :f_server_id")
+    if unread is not None:
+        clauses.append(
+            "acknowledged_at IS NULL" if unread else "acknowledged_at IS NOT NULL"
+        )
+    if origin is not None:
+        clauses.append("origin = :f_origin")
+        params["f_origin"] = origin.value
+    if source is not None:
+        clauses.append("source = :f_source")
+        params["f_source"] = source
+    if q:
+        clauses.append(
+            "(title ILIKE :f_q ESCAPE '\\'"
+            " OR summary ILIKE :f_q ESCAPE '\\'"
+            " OR COALESCE(body, '') ILIKE :f_q ESCAPE '\\'"
+            " OR COALESCE(source, '') ILIKE :f_q ESCAPE '\\')"
+        )
+        params["f_q"] = _ilike_pattern(q)
+    where = " AND ".join(clauses) if clauses else "TRUE"
+    return where, params
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +750,407 @@ async def revoke_ingest_key(
     return RevokeIngestKeyResult(key_id=str(key_id), revoked=revoked)
 
 
+# ---------------------------------------------------------------------------
+# Captain read surface (unified inbox; docs/architecture/notification-inbox.md §3)
+# ---------------------------------------------------------------------------
+
+#: One full notice row by id (the ``_alert_view`` input shape); the
+#: global surface is fleet-wide, so unlike the monitoring loader there is
+#: deliberately NO server scope in this predicate — the captain reads
+#: every notice (C01 rule 2 exception recorded in contracts.md).
+_NOTICE_ROW_SQL = text(
+    "SELECT alert_id, server_id, origin, dedup_key, severity,"
+    " title, summary, source, body, context_ref, delivery_status,"
+    " created_at, delivered_at, acknowledged_at, finding_id, run_id"
+    " FROM notification_alerts WHERE alert_id = :alert_id"
+)
+
+async def _read_page(
+    request: Request,
+    filters: Mapping[str, object],
+    *,
+    limit: int,
+    offset: int,
+) -> NotificationPage:
+    """One bounded inbox page under the canonical predicate.
+
+    ``filters`` carries exactly the canonical filter surface (the route
+    hands its validated Query values over verbatim);
+    :func:`_canonical_filters` owns every semantics decision, so this
+    helper is pure plumbing over the one shared predicate.
+    """
+    factory = _session_factory(request)
+    where, params = _canonical_filters(
+        server_id=filters["server_id"],  # type: ignore[arg-type]
+        scope=filters["scope"],  # type: ignore[arg-type]
+        include_global=filters["include_global"],  # type: ignore[arg-type]
+        unread=filters["unread"],  # type: ignore[arg-type]
+        origin=filters["origin"],  # type: ignore[arg-type]
+        source=filters["source"],  # type: ignore[arg-type]
+        q=filters["q"],  # type: ignore[arg-type]
+    )
+    async with factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT alert_id, server_id, origin, dedup_key, severity,"
+                        " title, summary, source, body, context_ref, delivery_status,"
+                        " created_at, delivered_at, acknowledged_at, finding_id, run_id"
+                        " FROM notification_alerts"
+                        f" WHERE {where}"
+                        " ORDER BY created_at DESC, alert_id DESC"
+                        " LIMIT :limit OFFSET :offset"
+                    ),
+                    params | {"limit": limit, "offset": offset},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        total = (
+            await session.execute(
+                text(f"SELECT COUNT(*) FROM notification_alerts WHERE {where}"),
+                params,
+            )
+        ).scalar_one()
+    return NotificationPage(
+        alerts=[_alert_view(row) for row in rows],
+        limit=limit,
+        offset=offset,
+        total=int(total),
+        has_more=compute_has_more(offset, len(rows), int(total)),
+    )
+
+
+@router.get(
+    "/notifications",
+    status_code=HTTP_200_OK,
+    response_model=NotificationPage,
+    summary="One bounded global inbox page (canonical filters, newest first)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": (
+                "Query parameters failed validation (bounds, scope "
+                "vocabulary, or server_id together with scope=global)"
+            ),
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Notification storage unavailable",
+        },
+    },
+)
+async def list_notifications(
+    request: Request,
+    server_id: uuid.UUID | None = Query(default=None),
+    scope: Literal["global"] | None = Query(default=None),
+    include_global: bool = Query(default=True),
+    unread: bool | None = Query(default=None),
+    origin: AlertOrigin | None = Query(default=None),
+    source: str | None = Query(
+        default=None, max_length=MAX_NOTIFICATION_SOURCE_CHARS
+    ),
+    q: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> NotificationPage:
+    """One bounded page of the unified inbox, newest first.
+
+    Safe method: session layer only; the captain's scope is the whole
+    fleet (explicit filters, never ambient server state). Deterministic
+    order ``created_at DESC, alert_id DESC``; ``COUNT(*)`` runs under the
+    EXACT same predicate as the slice, and ``has_more`` is the canonical
+    derivation — pagination is honest under every filter combination.
+    """
+    await _require_session(request)  # layer 1
+    return await _read_page(
+        request,
+        {
+            "server_id": server_id,
+            "scope": scope,
+            "include_global": include_global,
+            "unread": unread,
+            "origin": origin,
+            "source": source,
+            "q": q,
+        },
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/notifications/unread-count",
+    status_code=HTTP_200_OK,
+    response_model=UnreadCountView,
+    summary="Count unread notices under the exact canonical filters",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Query parameters failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Notification storage unavailable",
+        },
+    },
+)
+async def count_unread_notifications(
+    request: Request,
+    server_id: uuid.UUID | None = Query(default=None),
+    scope: Literal["global"] | None = Query(default=None),
+    include_global: bool = Query(default=True),
+    unread: bool | None = Query(default=None),
+    origin: AlertOrigin | None = Query(default=None),
+    source: str | None = Query(
+        default=None, max_length=MAX_NOTIFICATION_SOURCE_CHARS
+    ),
+    q: str | None = Query(default=None),
+) -> UnreadCountView:
+    """The badge/drawer count: ``COUNT(*)`` under the list's predicate,
+    pinned to UNACKNOWLEDGED notices.
+
+    The EXACT same filter surface as the list route, so a count can never
+    disagree with the page it belongs to — but the count is an UNREAD
+    count by definition: the route's own base clause is ``acknowledged_at
+    IS NULL``, added UNDER the canonical filters. ``unread`` composes on
+    top like on the list: omitted/``true`` is the same restriction;
+    ``unread=false`` is a contradiction (no notice is both read and
+    unread) and answers ``0`` — never a silently flipped semantics.
+    """
+    await _require_session(request)  # layer 1
+    factory = _session_factory(request)
+    where, params = _canonical_filters(
+        server_id=server_id,
+        scope=scope,
+        include_global=include_global,
+        unread=unread,
+        origin=origin,
+        source=source,
+        q=q,
+    )
+    if where == "TRUE":
+        where = "acknowledged_at IS NULL"
+    else:
+        where = f"({where}) AND acknowledged_at IS NULL"
+    async with factory() as session:
+        total = (
+            await session.execute(
+                text(f"SELECT COUNT(*) FROM notification_alerts WHERE {where}"),
+                params,
+            )
+        ).scalar_one()
+    return UnreadCountView(total=int(total))
+
+
+@router.post(
+    "/notifications/{alert_id}/ack",
+    status_code=HTTP_200_OK,
+    response_model=AckResult,
+    summary="Acknowledge one inbox notice (evidence-preserving, idempotent)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowed or CSRF token rejected",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No notice for this id (value-free, scope-blind)",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Notification storage unavailable",
+        },
+    },
+)
+async def acknowledge_notification(
+    request: Request, alert_id: uuid.UUID
+) -> AckResult:
+    """Stamp ``acknowledged_at`` on one notice; delete nothing.
+
+    Mutation: session → origin → CSRF (ADR §5 order) before any state is
+    touched. The captain's surface is fleet-wide, so the value-free 404
+    is scope-blind by construction: an unknown id is the only failure.
+    Idempotency rides one truth column: ``acknowledged_at =
+    COALESCE(acknowledged_at, :now)`` — the first stamp wins, a replay
+    never re-stamps or shifts the timestamp, and the notice, its finding
+    and its producing observation all survive the ack.
+    """
+    _store, _token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    factory = _session_factory(request)
+    now = datetime.now(timezone.utc)
+    async with factory() as session:
+        stamped = await session.execute(
+            text(
+                "UPDATE notification_alerts"
+                " SET acknowledged_at = COALESCE(acknowledged_at, :now)"
+                " WHERE alert_id = :alert_id"
+            ),
+            {"now": now, "alert_id": alert_id},
+        )
+        if stamped.rowcount != 1:
+            raise BoundaryError(
+                HTTP_404_NOT_FOUND,
+                "not_found",
+                "no notice for this id",
+            )
+        row = (
+            await session.execute(_NOTICE_ROW_SQL, {"alert_id": alert_id})
+        ).mappings().one()
+        await session.commit()
+    return AckResult(alert=_alert_view(row))
+
+
+@router.post(
+    "/notifications/{alert_id}/unack",
+    status_code=HTTP_200_OK,
+    response_model=AckResult,
+    summary="Unacknowledge one inbox notice (re-arms reminders, idempotent)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowed or CSRF token rejected",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No notice for this id (value-free, scope-blind)",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Notification storage unavailable",
+        },
+    },
+)
+async def unacknowledge_notification(
+    request: Request, alert_id: uuid.UUID
+) -> AckResult:
+    """Clear ``acknowledged_at`` on one notice; delete nothing.
+
+    Mutation: session → origin → CSRF (ADR §5 order) before any state is
+    touched. Bidirectional ack on ONE truth column: ``acknowledged_at =
+    NULL`` is idempotent (a replay changes nothing and answers ``200``)
+    and re-arms finding reminder logic — the notification service stops
+    suppressing re-delivery once the notice is unacknowledged again.
+    Evidence is never deleted: the notice and its anchors survive.
+    """
+    _store, _token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    factory = _session_factory(request)
+    async with factory() as session:
+        cleared = await session.execute(
+            text(
+                "UPDATE notification_alerts SET acknowledged_at = NULL"
+                " WHERE alert_id = :alert_id"
+            ),
+            {"alert_id": alert_id},
+        )
+        if cleared.rowcount != 1:
+            raise BoundaryError(
+                HTTP_404_NOT_FOUND,
+                "not_found",
+                "no notice for this id",
+            )
+        row = (
+            await session.execute(_NOTICE_ROW_SQL, {"alert_id": alert_id})
+        ).mappings().one()
+        await session.commit()
+    return AckResult(alert=_alert_view(row))
+
+
+@router.post(
+    "/notifications/mark-all-read",
+    status_code=HTTP_200_OK,
+    response_model=MarkAllReadResult,
+    summary="Mark every filtered unread notice read (ONE conditional UPDATE)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowed or CSRF token rejected",
+        },
+        HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorEnvelope,
+            "description": "Query parameters failed validation",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Notification storage unavailable",
+        },
+    },
+)
+async def mark_all_read(
+    request: Request,
+    server_id: uuid.UUID | None = Query(default=None),
+    scope: Literal["global"] | None = Query(default=None),
+    include_global: bool = Query(default=True),
+    unread: bool | None = Query(default=None),
+    origin: AlertOrigin | None = Query(default=None),
+    source: str | None = Query(
+        default=None, max_length=MAX_NOTIFICATION_SOURCE_CHARS
+    ),
+    q: str | None = Query(default=None),
+) -> MarkAllReadResult:
+    """Stamp ``acknowledged_at = now`` on every matching unread notice.
+
+    Mutation: session → origin → CSRF (ADR §5 order). The canonical
+    filters arrive as QUERY parameters (the same surface and semantics
+    as the list route — no second body dialect to keep in sync). ONE
+    UPDATE runs under the exact canonical predicate AND ``acknowledged_at
+    IS NULL``; ``updated`` is the database's own rowcount — the receipt
+    equals the rows actually stamped, never an optimistic guess. The
+    first-stamp-wins rule holds: already-read rows are not re-stamped.
+    """
+    _store, _token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    factory = _session_factory(request)
+    where, params = _canonical_filters(
+        server_id=server_id,
+        scope=scope,
+        include_global=include_global,
+        unread=unread,
+        origin=origin,
+        source=source,
+        q=q,
+    )
+    now = datetime.now(timezone.utc)
+    async with factory() as session:
+        stamped = await session.execute(
+            text(
+                "UPDATE notification_alerts SET acknowledged_at = :now"
+                f" WHERE {where} AND acknowledged_at IS NULL"
+            ),
+            params | {"now": now},
+        )
+        updated = int(stamped.rowcount)
+        await session.commit()
+    return MarkAllReadResult(updated=updated)
+
+
 def register_notifications(app: FastAPI) -> None:
-    """Register the machine ingest lane + key management (api-wiring)."""
+    """Register the ingest lane, key management and the read surface."""
     app.include_router(router)
