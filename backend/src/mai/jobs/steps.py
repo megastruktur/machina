@@ -654,6 +654,7 @@ def _translate_outcome(
         "executor_ok": outcome.executor_ok,
         "payload_hash": outcome.payload_hash,
         "error_type": outcome.error_type,
+        "error_code": outcome.error_code,
         "output_truncated": None
         if outcome.output is None
         else outcome.output.truncated,

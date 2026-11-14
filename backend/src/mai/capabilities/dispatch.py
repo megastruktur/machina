@@ -56,7 +56,12 @@ The dispatch sequence (frozen order, fail-closed at every seam)
    crash can never be reported as clean: the receipt records
    ``effect="unknown"`` — the effect may or may not have happened
    (host rule 3 honesty, applied in-process) — with the exception
-   *type name* only (never its message, which may quote secrets).
+   *type name* only (never its message, which may quote secrets). A
+   structured refusal proven to occur BEFORE any effect/transport
+   (:class:`~mai.capabilities.errors.PreEffectError` raised by the
+   executor) is the one exception: it denies deterministically with
+   ``effect="not_attempted"`` and the stable ``error_code`` token —
+   an instant denial, never a reconciliation park.
 7. **Output boundary** — executor output is redacted (every resolved
    secret value replaced, defense-in-depth per C03 rule 6) *before* it
    is bounded to the configured byte budget with an explicit truncation
@@ -94,6 +99,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 
+from mai.capabilities.errors import PreEffectError
 from mai.credentials.env import EnvFileError, EnvResolver, SecretValue
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
 from mai.policy.approvals import ApprovalError, ApprovalStore
@@ -263,6 +269,10 @@ class DispatchOutcome:
     output: BoundedOutput | None
     error_type: str | None
     credential_references: tuple[str, ...]
+    #: Stable executor refusal token (``PreEffectError.code`` or the
+    #: executor's structured code) — value-free metadata, never the
+    #: exception message.
+    error_code: str | None = None
 
     def to_json(self) -> dict[str, object]:
         """Frozen-shape JSON document (stable key order; audit view)."""
@@ -545,6 +555,7 @@ class CapabilityDispatcher:
             executor_ok: bool | None = None,
             output: BoundedOutput | None = None,
             error_type: str | None = None,
+            error_code: str | None = None,
         ) -> DispatchOutcome:
             return DispatchOutcome(
                 op_id=op_id,
@@ -566,6 +577,7 @@ class CapabilityDispatcher:
                 executor_ok=executor_ok,
                 output=output,
                 error_type=error_type,
+                error_code=error_code,
                 credential_references=context.credential_references,
             )
 
@@ -737,6 +749,25 @@ class CapabilityDispatcher:
         )
         try:
             result = await self._executor(call)
+        except PreEffectError as exc:
+            # A structured refusal proven to occur BEFORE any host
+            # effect/transport: an instant, coded denial — never a
+            # reconciliation park. The mixed ServiceError also refuses
+            # mid-flight (its pre_effect=False sites): those stay honest
+            # ``unknown`` — the transport already went out. The receipt
+            # carries the stable code token only, never the detail.
+            pre_effect = getattr(exc, "pre_effect", True)
+            return outcome(
+                allowed=False,
+                reason=DispatchReason.EXECUTOR_FAILED,
+                effect=EFFECT_NOT_ATTEMPTED if pre_effect else EFFECT_UNKNOWN,
+                policy_revision=recheck.policy_revision,
+                effect_class=recheck.effect_class,
+                approval_spent=approval_spent,
+                consumed_approval=consumed,
+                error_type=type(exc).__name__,
+                error_code=str(exc.code),
+            )
         except Exception as exc:
             # The invocation started: the effect is unproven, never
             # "executed". Exception *type name* only — messages can quote
