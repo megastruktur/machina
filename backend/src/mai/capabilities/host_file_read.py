@@ -95,6 +95,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.errors import PreEffectError
 from mai.contracts.server import (
     ExecutionEnvironment,
     ServerProfile,
@@ -188,16 +189,17 @@ class FileReadErrorCode(StrEnum):
     DECODE_ERROR = "decode_error"
 
 
-class FileReadError(ValueError):
+class FileReadError(PreEffectError):
     """One structured, value-free pre-effect rejection.
 
     Raised only before any transport attempt; the dispatcher's seam
-    records it as ``executor_failed`` with ``effect="unknown"`` and
-    quotes the exception *type* name only.
+    records it as ``executor_failed`` with ``effect="not_attempted"`` —
+    an instant, coded denial (never a reconciliation park) that quotes
+    the exception *type* name and the stable code only.
     """
 
     def __init__(self, code: FileReadErrorCode, detail: str) -> None:
-        super().__init__(f"{code.value}: {detail}")
+        super().__init__(code.value, detail)
         self.code = code
         self.detail = detail
 

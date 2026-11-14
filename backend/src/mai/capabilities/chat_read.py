@@ -40,6 +40,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.errors import PreEffectError
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext
 
@@ -69,11 +70,11 @@ class ChatReadErrorCode(StrEnum):
     NOT_FOUND = "not_found"
 
 
-class ChatReadError(ValueError):
-    """One structured, value-free capability rejection."""
+class ChatReadError(PreEffectError):
+    """One structured, value-free pre-effect capability rejection."""
 
     def __init__(self, code: ChatReadErrorCode, detail: str) -> None:
-        super().__init__(f"{code.value}: {detail}")
+        super().__init__(code.value, detail)
         self.code = code
         self.detail = detail
 

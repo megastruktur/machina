@@ -44,6 +44,7 @@
 	import { onDestroy } from 'svelte';
 	import Button from '../ui/Button.svelte';
 	import CapabilityPicker from '../ui/CapabilityPicker.svelte';
+	import Chip from '../ui/Chip.svelte';
 	import Field from '../ui/Field.svelte';
 	import Select from '../ui/Select.svelte';
 	import { CircleCheck, Cog, FingerprintPattern, History, ScrollText, TriangleAlert } from 'lucide-svelte';
@@ -55,6 +56,8 @@
 
 	const uid = $props.id();
 	const MAX_PROMPT_BYTES = 16_384;
+	/** Canonical bound (contracts/server.py MAX_FILE_READ_ROOTS). */
+	const MAX_FILE_READ_ROOTS = 64;
 
 	// --- explicit inputs (fail closed when incomplete) -----------------------
 
@@ -92,6 +95,12 @@
 	let privilegeInput = $state<'none' | 'sudo' | 'root'>('sudo');
 	let capabilitiesList = $state<string[]>([]);
 	let promptTextInput = $state('');
+	/** Editable file-read allowlist (FRR T4): chips + add/remove with
+	 * client pre-validation. The empty list fails closed server-side. */
+	let rootsList = $state<string[]>([]);
+	let rootsDraft = $state('');
+	/** Refusal reason of the last attempted add (never silently dropped). */
+	let rootsError = $state('');
 
 	let saving = $state(false);
 	/** Stale-edit conflict banner: displayed, never auto-overwritten. */
@@ -114,6 +123,53 @@
 		if (!/^\d+$/.test(raw.trim())) return null;
 		const value = Number(raw.trim());
 		return value >= 1 && value <= 65535 ? value : null;
+	}
+
+	/** Defensive read of the stored roots (producers before FRR T3 omit the
+	 * field entirely); the wire type says `string[]`, old fixtures lie. */
+	function storedRootsOf(profile: ProfileResponse): string[] {
+		return Array.isArray(profile.file_read_roots) ? [...profile.file_read_roots] : [];
+	}
+
+	/** Client pre-validation mirroring the canonical rules loosely (the
+	 * producer stays authoritative): absolute, not '/', printable single
+	 * line, no duplicates, bounded count. Returns the refusal reason or ''. */
+	function rootsRefusal(root: string): string {
+		if (!root.startsWith('/')) return 'Read roots must be absolute paths (starting with "/").';
+		if (root === '/') return 'The filesystem root "/" itself is not a valid read root.';
+		if (!/^[ -~]+$/.test(root)) {
+			return 'A read root must be printable single-line text without control characters.';
+		}
+		if (rootsList.includes(root)) return `Read root ${root} is already in the list.`;
+		if (rootsList.length >= MAX_FILE_READ_ROOTS) {
+			return `At most ${MAX_FILE_READ_ROOTS} read roots are allowed.`;
+		}
+		return '';
+	}
+
+	function addRoot(): void {
+		const root = rootsDraft.trim();
+		if (!root) return;
+		const refusal = rootsRefusal(root);
+		if (refusal !== '') {
+			rootsError = refusal;
+			return;
+		}
+		rootsError = '';
+		rootsList = [...rootsList, root];
+		rootsDraft = '';
+	}
+
+	function removeRoot(root: string): void {
+		rootsError = '';
+		rootsList = rootsList.filter((item) => item !== root);
+	}
+
+	function onRootsKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			addRoot();
+		}
 	}
 
 	const parsedPort = $derived(parsePort(sshPortInput));
@@ -163,7 +219,8 @@
 			parsedPort !== p.ssh.port ||
 			sshUserInput.trim() !== p.ssh.user ||
 			privilegeInput !== p.privilege ||
-			parsedCapabilities.join(',') !== p.capabilities.join(',')
+			parsedCapabilities.join(',') !== p.capabilities.join(',') ||
+			rootsList.join(',') !== storedRootsOf(p).join(',')
 		);
 	});
 	const saveDisabled = $derived(
@@ -179,6 +236,9 @@
 		privilegeInput = profile.privilege;
 		capabilitiesList = [...profile.capabilities];
 		promptTextInput = defaultPromptFor(profile);
+		rootsList = storedRootsOf(profile);
+		rootsDraft = '';
+		rootsError = '';
 	}
 
 	function codeOf(error: unknown): string | null {
@@ -251,6 +311,7 @@
 		const nextHostKey = profile.ssh.host_key;
 		const nextCredentialRef = profile.ssh.credential_ref;
 		const nextCapabilities = [...parsedCapabilities];
+		const nextRoots = [...rootsList];
 		const nextPrompt = promptTextInput;
 
 		saving = true;
@@ -274,6 +335,9 @@
 				},
 				privilege: privilegeInput,
 				capabilities: nextCapabilities,
+				// The panel is the roots editor: the explicit array always
+				// rides along (omission-preserve protects OTHER clients).
+				file_read_roots: nextRoots,
 				expected_revision: profile.revision
 			});
 			if (disposed) return;
@@ -292,6 +356,7 @@
 				},
 				privilege: privilegeInput,
 				capabilities: nextCapabilities,
+				file_read_roots: nextRoots,
 				revision: result.revision,
 				sha256: result.sha256
 			};
@@ -428,6 +493,15 @@
 						</dd>
 					</div>
 					<div class="mai-server-profile__row">
+						<dt>File read roots</dt>
+						<dd data-testid="file-read-roots">
+							{#each storedRootsOf(view.profile) as root (root)}
+								<span class="mai-server-profile__root-view">{root}</span>
+							{/each}
+							{#if storedRootsOf(view.profile).length === 0}—{/if}
+						</dd>
+					</div>
+					<div class="mai-server-profile__row">
 						<dt>Canonical revision</dt>
 						<dd><span class="mai-server-profile__rev-stamp" data-testid="profile-revision">{view.profile.revision}</span></dd>
 					</div>
@@ -506,6 +580,64 @@
 						disabled={saving}
 						testId="edit-capabilities"
 					/>
+
+					<div class="mai-sp-roots" data-testid="edit-file-read-roots">
+						<div class="mai-sp-roots__header">
+							<label class="mai-sp-roots__label" for="mai-sp-root-{uid}">File read roots</label>
+							<span class="mai-sp-roots__count" data-testid="edit-file-read-roots-count">
+								{rootsList.length} / {MAX_FILE_READ_ROOTS}
+							</span>
+						</div>
+						<div class="mai-sp-roots__chips" data-testid="edit-file-read-roots-chips" aria-label="Allowed file read roots">
+							{#if rootsList.length === 0}
+								<span class="mai-sp-roots__empty" data-testid="edit-file-read-roots-empty">
+									No roots — all file reads are denied (fail closed)
+								</span>
+							{:else}
+								{#each rootsList as root (root)}
+									<Chip
+										variant="brass"
+										removeLabel="Remove read root {root}"
+										removeTestId="edit-file-read-roots-remove-{root}"
+										onremove={saving ? undefined : () => removeRoot(root)}
+										data-testid="edit-file-read-roots-chip"
+									>
+										{root}
+									</Chip>
+								{/each}
+							{/if}
+						</div>
+						<div class="mai-sp-roots__controls">
+							<input
+								type="text"
+								class="mai-sp-roots__input"
+								placeholder="Absolute path (e.g. /srv/data)"
+								bind:value={rootsDraft}
+								onkeydown={onRootsKeydown}
+								disabled={saving}
+								aria-label="Add file read root"
+								data-testid="edit-file-read-roots-input"
+							/>
+							<Button
+								size="sm"
+								variant="secondary"
+								onclick={addRoot}
+								disabled={saving || !rootsDraft.trim()}
+								data-testid="edit-file-read-roots-add"
+							>
+								Add
+							</Button>
+						</div>
+						{#if rootsError}
+							<p class="mai-sp-roots__error" role="alert" data-testid="edit-file-read-roots-error">{rootsError}</p>
+						{:else}
+							<p class="mai-sp-roots__hint">
+								Absolute directory paths the agent may read on this server; an empty
+								list denies every file read (fail closed). At most {MAX_FILE_READ_ROOTS}
+								entries.
+							</p>
+						{/if}
+					</div>
 
 					<div class="mai-server-profile__grid">
 						<Field
@@ -879,5 +1011,92 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--mai-space-2);
+	}
+
+	.mai-server-profile__root-view {
+		display: inline-block;
+		margin-right: var(--mai-space-2);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+	}
+
+	.mai-sp-roots {
+		display: flex;
+		flex-direction: column;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-sp-roots__header {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-sp-roots__label {
+		font-size: var(--mai-text-xs);
+		font-weight: var(--mai-weight-semibold);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-sp-roots__count {
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-subtle);
+	}
+
+	.mai-sp-roots__chips {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-1);
+		min-height: 2.25rem;
+		padding: var(--mai-space-2);
+		background: var(--mai-color-surface-sunken);
+		border: var(--mai-border-width) solid var(--mai-color-border);
+		border-radius: var(--mai-radius-md);
+	}
+
+	.mai-sp-roots__empty {
+		font-size: var(--mai-text-xs);
+		font-style: italic;
+		color: var(--mai-status-warning-text);
+	}
+
+	.mai-sp-roots__controls {
+		display: flex;
+		align-items: center;
+		gap: var(--mai-space-2);
+	}
+
+	.mai-sp-roots__input {
+		flex: 1 1 auto;
+		min-width: 0;
+		height: 2.125rem;
+		padding: 0 var(--mai-space-3);
+		color: var(--mai-color-text);
+		background: var(--mai-color-surface-sunken);
+		border: var(--mai-border-width) solid var(--mai-color-border-strong);
+		border-radius: var(--mai-radius-md);
+		font-family: var(--mai-font-mono);
+		font-size: var(--mai-text-xs);
+	}
+
+	.mai-sp-roots__input:focus-visible {
+		outline: var(--mai-focus-ring-width) solid var(--mai-focus-ring-color);
+		outline-offset: var(--mai-focus-ring-offset);
+		border-color: var(--mai-color-accent);
+	}
+
+	.mai-sp-roots__hint {
+		margin: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-color-text-subtle);
+	}
+
+	.mai-sp-roots__error {
+		margin: 0;
+		font-size: var(--mai-text-xs);
+		color: var(--mai-status-danger-text);
 	}
 </style>

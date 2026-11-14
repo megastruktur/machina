@@ -44,14 +44,18 @@ from mai.capabilities.dispatch import (
     CapabilityDispatcher,
     DispatchError,
     DispatchErrorCode,
+    DispatchOutcome,
     DispatchReason,
     ExecutorResult,
     canonical_payload_hash,
     canonical_payload_json,
     default_output_budget_bytes,
 )
+from mai.capabilities.errors import PreEffectError
+from mai.capabilities.service_http import ServiceError, ServiceErrorCode
 from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
+from mai.jobs.steps import StepState, _translate_outcome
 from mai.plugins.registry import CapabilityRegistry, parse_descriptor
 from mai.policy.approvals import ApprovalRequest, ApprovalStore
 from mai.policy.config import GrantConfigStore
@@ -759,6 +763,7 @@ async def test_executor_crash_reports_unknown_effect_with_type_only() -> None:
     )
     assert outcome.effect == "unknown"
     assert outcome.error_type == "RuntimeError"
+    assert outcome.error_code is None
     assert outcome.executor_ok is None and outcome.output is None
     _sweep(outcome.to_json(), SECRET_VALUE, "boom")
 
@@ -780,6 +785,128 @@ async def test_executor_contract_violation_is_unknown_not_executed() -> None:
     )
     assert outcome.effect == "unknown"
     assert outcome.reason == DispatchReason.EXECUTOR_CONTRACT_VIOLATION.value
+
+
+# ---------------------------------------------------------------------------
+# FRR T1: pre-effect refusals are deterministic denials, not parks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_pre_effect_refusal_is_deterministic_denial_not_park() -> None:
+    """A structured refusal proven to occur BEFORE any host effect is an
+    instant, coded denial — ``not_attempted`` with the stable
+    ``error_code`` token on the receipt — never a reconciliation park."""
+
+    class _PathDenied(PreEffectError):
+        pass
+
+    async def _refusing(call: CapabilityCall) -> ExecutorResult:
+        raise _PathDenied("path_denied", "outside every allowed root")
+
+    dispatcher = _dispatcher(
+        registry=_registry_with(_descriptor_document(READ_CAPABILITY, "read")),
+        approvals=_unused_approvals(),
+        executor=_refusing,
+    )
+    outcome = await dispatcher.dispatch(
+        context=_context(allowed=(READ_CAPABILITY,)),
+        capability_id=READ_CAPABILITY,
+        payload=GOOD_PAYLOAD,
+    )
+    assert outcome.allowed is False
+    assert outcome.reason == DispatchReason.EXECUTOR_FAILED
+    assert outcome.effect == "not_attempted"
+    assert outcome.error_type == "_PathDenied"
+    assert outcome.error_code == "path_denied"
+    assert outcome.executor_ok is None and outcome.output is None
+
+
+@pytest.mark.anyio
+async def test_service_error_pre_effect_flag_decides_the_seam() -> None:
+    """The MIXED ServiceError: a ``pre_effect=True`` validation refusal
+    is a deterministic denial; a mid-flight refusal (default
+    ``pre_effect=False``) stays honest ``unknown`` — the request already
+    went out, so nothing may claim it never did."""
+
+    async def _pre_effect(call: CapabilityCall) -> ExecutorResult:
+        raise ServiceError(
+            ServiceErrorCode.INVALID_PAYLOAD,
+            "wiring misuse before any HTTP attempt",
+            pre_effect=True,
+        )
+
+    pre = await _dispatcher(
+        registry=_registry_with(_descriptor_document(READ_CAPABILITY, "read")),
+        approvals=_unused_approvals(),
+        executor=_pre_effect,
+    ).dispatch(
+        context=_context(allowed=(READ_CAPABILITY,)),
+        capability_id=READ_CAPABILITY,
+        payload=GOOD_PAYLOAD,
+    )
+    assert pre.allowed is False
+    assert pre.reason == DispatchReason.EXECUTOR_FAILED
+    assert pre.effect == "not_attempted"
+    assert pre.error_type == "ServiceError"
+    assert pre.error_code == "invalid_payload"
+
+    async def _mid_flight(call: CapabilityCall) -> ExecutorResult:
+        raise ServiceError(
+            ServiceErrorCode.FORBIDDEN_REDIRECT,
+            "redirect left the approved origin",
+            at_url="http://elsewhere.example/hop",
+        )
+
+    mid = await _dispatcher(
+        registry=_registry_with(_descriptor_document(READ_CAPABILITY, "read")),
+        approvals=_unused_approvals(),
+        executor=_mid_flight,
+    ).dispatch(
+        context=_context(allowed=(READ_CAPABILITY,)),
+        capability_id=READ_CAPABILITY,
+        payload=GOOD_PAYLOAD,
+    )
+    assert mid.allowed is False
+    assert mid.reason == DispatchReason.EXECUTOR_FAILED
+    assert mid.effect == "unknown"
+    assert mid.error_type == "ServiceError"
+    assert mid.error_code == "forbidden_redirect"
+
+
+def test_denied_pre_effect_receipt_translates_to_failed_step() -> None:
+    """The job-step mapper finalizes a pre-effect denial as FAILED (the
+    deterministic-denial branch, never reconciliation) and the durable
+    receipt carries the stable ``error_code`` — never the detail."""
+    outcome = DispatchOutcome(
+        op_id=uuid.uuid4(),
+        ts=datetime.now(timezone.utc),
+        capability_id="host.file_read",
+        server_id=SERVER_A,
+        run_id=RUN_1,
+        principal=PRINCIPAL,
+        mode=PolicyMode.DELEGATED.value,
+        allowed=False,
+        reason=DispatchReason.EXECUTOR_FAILED.value,
+        policy_revision=7,
+        effect_class="read",
+        payload_hash="0" * 64,
+        effect="not_attempted",
+        approval_id=None,
+        approval_spent=False,
+        approval_code=None,
+        executor_ok=None,
+        output=None,
+        error_type="FileReadError",
+        error_code="path_denied",
+        credential_references=(),
+    )
+    state, reason, receipt = _translate_outcome(outcome)
+    assert state == StepState.FAILED.value
+    assert reason == DispatchReason.EXECUTOR_FAILED.value
+    assert receipt["effect"] == "not_attempted"
+    assert receipt["error_type"] == "FileReadError"
+    assert receipt["error_code"] == "path_denied"
 
 
 # ---------------------------------------------------------------------------

@@ -179,10 +179,19 @@ class ProfileCreate(BaseModel):
     ssh: SshIdentityBody
     privilege: PrivilegeMode
     capabilities: list[str]
+    #: Read allowlist roots (FRR T3); transport shape only — the semantic
+    #: rules (absolute, normalized, unique, bounded) stay authoritative in
+    #: ``parse_server_profile_text`` and surface as the 422 field codes.
+    file_read_roots: list[str] = Field(default_factory=list)
 
 
 class ProfileEdit(ProfileCreate):
-    """Edit payload: carries the caller's last observed revision (C01 rule 6)."""
+    """Edit payload: carries the caller's last observed revision (C01 rule 6).
+
+    ``file_read_roots`` omission-preserve: an edit body WITHOUT the field
+    keeps the stored roots (the anti-erasure guard in ``edit_profile``);
+    an explicit ``[]`` clears them.
+    """
 
     expected_revision: int = Field(ge=0)
 
@@ -215,6 +224,7 @@ class ProfileResponse(BaseModel):
     ssh: SshIdentityBody
     privilege: PrivilegeMode
     capabilities: list[str]
+    file_read_roots: list[str]
     revision: int
     sha256: str
     projection: ProjectionView
@@ -329,6 +339,10 @@ class OnboardingEnrollRequest(BaseModel):
     environment: ExecutionEnvironment = ExecutionEnvironment.LINUX_SSH
     privilege: PrivilegeMode
     capabilities: list[str]
+    #: Same transport-shape field as ``ProfileCreate`` (FRR T3); semantic
+    #: rules stay authoritative in ``parse_server_profile_text``. Absent
+    #: on enroll → no read roots (fail closed, unchanged).
+    file_read_roots: list[str] = Field(default_factory=list)
     ssh: OnboardingSshTarget
     host_key: str = Field(
         pattern=r"^SHA256:[A-Za-z0-9+/]{43}$",
@@ -377,6 +391,11 @@ def _canonical_document(
         "privilege": payload.privilege.value,
         "capabilities": list(payload.capabilities),
     }
+    if payload.file_read_roots:
+        # Canonical placement: directly after ``capabilities`` (FRR T3);
+        # an empty list OMITS the key so today's profiles keep their
+        # byte-identical canonical form.
+        document["file_read_roots"] = list(payload.file_read_roots)
     return yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
 
 
@@ -483,6 +502,7 @@ def _profile_view(
         ),
         privilege=profile.privilege,
         capabilities=list(profile.capabilities),
+        file_read_roots=list(profile.file_read_roots),
         revision=stored.revision,
         sha256=stored.sha256,
         projection=ProjectionView(
@@ -802,6 +822,12 @@ async def edit_profile(
         current_profile = parse_server_profile_text(current.text)
     except ProfileValidationError as exc:
         return _profile_error(request, exc)
+    if "file_read_roots" not in payload.model_fields_set:
+        # Omission-preserve (FRR T3 anti-erasure guard): an edit body
+        # without the field keeps the CURRENT roots; an explicit ``[]``
+        # clears them. Happens BEFORE the stale pre-check's write path —
+        # a rejected edit never touches the file at all.
+        payload.file_read_roots = list(current_profile.file_read_roots)
     resolved_revision = (
         payload.prompt_revision
         if payload.prompt_revision is not None
@@ -1187,6 +1213,7 @@ async def enroll_server(
         ),
         privilege=payload.privilege,
         capabilities=payload.capabilities,
+        file_read_roots=payload.file_read_roots,
     )
     resolved_revision = (
         payload.prompt_revision if payload.prompt_revision is not None else 1

@@ -103,9 +103,16 @@ DOCS_READ_CAPABILITY: Final = "docs.read"
 DOCS_UPSERT_CAPABILITY: Final = "docs.upsert"
 DOCS_DELETE_CAPABILITY: Final = "docs.delete"
 
+#: FRR T5: profile file-read-root extension. SECURITY: forced ASK prompting
+#: at the bridge seam (agents/tools.py dispatch_once) — interactive sessions
+#: run DELEGATED, where a plain mutate would self-execute.
+SERVER_PROFILE_UPDATE_CAPABILITY: Final = "server.profile.update"
+
 #: The internal-API capability set the chat agent exposes by default across
 #: both pinned-server conversations and General Consult (the UI/agent surface
-#: parity anchor).
+#: parity anchor). ``server.profile.update`` is included by captain decision:
+#: it is auto-granted to enrolled servers out of the box, and safe precisely
+#: because every call is forced through captain approval.
 INTERNAL_API_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     APP_DISCOVER_CAPABILITY,
     APP_LIST_ADOPTED_CAPABILITY,
@@ -121,6 +128,7 @@ INTERNAL_API_CAPABILITY_IDS: Final[tuple[str, ...]] = (
     DOCS_UPSERT_CAPABILITY,
     DOCS_DELETE_CAPABILITY,
     CHAT_READ_CAPABILITY,
+    SERVER_PROFILE_UPDATE_CAPABILITY,
 )
 
 # ---------------------------------------------------------------------------
@@ -1403,7 +1411,6 @@ class DocsUpsertPayload(BaseModel):
 
 class DocsDeletePayload(BaseModel):
     """Delete a canonical Markdown document or runbook from the Documents section."""
-
     model_config = {"extra": "forbid"}
 
     doc_id: str = Field(
@@ -1444,6 +1451,42 @@ class DocsDeletePayload(BaseModel):
         description=(
             "Optional expected revision; auto-resolved from the current "
             "stored document when omitted."
+        ),
+    )
+
+
+class ServerProfileUpdatePayload(BaseModel):
+    """Request ADDING file-read roots to the target server's canonical profile.
+
+    Add-only: the merged profile keeps every existing root; the request can
+    never remove or reorder. There is deliberately NO ``server_id`` field —
+    the target is the execution context's pinned server (same convention as
+    ``host.file_read``). ``reason`` is shown to the captain in the approval
+    preview and is otherwise without effect.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    roots: list[str] = Field(
+        min_length=1,
+        max_length=16,
+        description=(
+            "1..16 absolute normalized directory paths to ADD to the "
+            "profile's file_read_roots (add-only; existing roots are kept)"
+        ),
+    )
+    expected_revision: int = Field(
+        ge=1,
+        description=(
+            "The profile revision the caller last observed; a stale value "
+            "refuses with revision_conflict before any effect"
+        ),
+    )
+    reason: str = Field(
+        max_length=200,
+        description=(
+            "Why these read roots are needed; shown to the captain in the "
+            "approval preview"
         ),
     )
 
@@ -1521,7 +1564,7 @@ def build_internal_api_capabilities(
         classify_service,
         entry_digest,
     )
-    from mai.contracts.server import parse_server_profile_text
+    from mai.contracts.server import MAX_FILE_READ_ROOTS, parse_server_profile_text
     from mai.knowledge.documents import (
         DocumentNamespace,
         DocumentStore,
@@ -1531,6 +1574,16 @@ def build_internal_api_capabilities(
         VerificationStatus,
     )
     from mai.profiles.files import ProfileFileStore
+    from mai.profiles.projection import ProfileProjection
+
+    import posixpath
+
+    import yaml
+
+    #: The host file-read credential-material deny list (FRR T5): REUSED, not
+    #: copied — the profile root extension can never widen access to exactly
+    #: the paths host.file_read hard-denies.
+    from mai.capabilities.host_file_read import _DENY_PATH_PREFIXES
 
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
 
@@ -2872,6 +2925,160 @@ def build_internal_api_capabilities(
 
     operations.append(_docs_delete)
 
+    # -- server.profile.update (FRR T5) --------------------------------------
+    # Add-only read-root extension through the SAME canonical pipeline as the
+    # HTTP surface (journal + revision pre-check); prompt.md is never touched.
+    # Approval is FORCED at the bridge seam (dispatch_once pins ASK), so the
+    # executor here is deliberately plain mutate code: it only runs after a
+    # captain decision (resume path) or in an explicitly ASK-mode context.
+
+    @internal_api_tool(
+        capability_id=SERVER_PROFILE_UPDATE_CAPABILITY,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["server_profile"],
+        environments=["controller"],
+        payload_model=ServerProfileUpdatePayload,
+        description=(
+            "Request ADDING file-read roots to the target server's canonical "
+            "profile (add-only merge; prompt text untouched). EVERY call "
+            "requires explicit captain approval before it executes."
+        ),
+    )
+    async def _server_profile_update(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if session_factory is None or data_root is None:
+            raise InternalApiError(
+                "unavailable",
+                "canonical profile service is unavailable (composition incomplete)",
+            )
+        server_id = call.context.server_id
+        if server_id is None or server_id == uuid.UUID(int=0):
+            raise InternalApiError(
+                "invalid_request",
+                f"{SERVER_PROFILE_UPDATE_CAPABILITY} requires a pinned target "
+                "server (no server_id payload field exists)",
+            )
+        requested: list[str] = list(payload.get("roots") or [])
+        expected_revision = int(payload.get("expected_revision") or 0)
+
+        # (1) Read the canonical profile (pattern of app.discover).
+        try:
+            store = ProfileFileStore(Path(data_root))
+            stored = store.read(server_id)
+            profile = parse_server_profile_text(stored.text)
+        except InternalApiError:
+            raise
+        except Exception as exc:
+            raise InternalApiError(
+                "unavailable",
+                f"canonical profile read failed ({type(exc).__name__})",
+            ) from None
+
+        # (2) Stale caller: structured refusal BEFORE any effect.
+        if expected_revision != stored.revision:
+            raise InternalApiError(
+                "revision_conflict",
+                f"expected revision {expected_revision} does not match the "
+                f"stored profile revision {stored.revision}; re-read and retry",
+            )
+
+        # (3) Validate every requested root (canonical rules + the shared
+        # deny list). Value-free refusals: the root itself is never echoed.
+        seen: set[str] = set()
+        for root in requested:
+            if (
+                not isinstance(root, str)
+                or not root.startswith("/")
+                or root == "/"
+                or posixpath.normpath(root) != root
+                or not root.isprintable()
+                or "\x00" in root
+            ):
+                raise InternalApiError(
+                    "path_denied",
+                    "each root must be an absolute normalized directory path "
+                    '(never "/", printable single line)',
+                )
+            if root in seen:
+                raise InternalApiError(
+                    "path_denied", "duplicate read root within the request"
+                )
+            seen.add(root)
+            for prefix in _DENY_PATH_PREFIXES:
+                if root == prefix or root.startswith(prefix + "/"):
+                    raise InternalApiError(
+                        "path_denied",
+                        "read root matches the credential-material deny list",
+                    )
+
+        # (4) Add-only merge (preserve order, dedupe) with the canonical cap.
+        merged = list(profile.file_read_roots)
+        merged.extend(root for root in requested if root not in merged)
+        if len(merged) > MAX_FILE_READ_ROOTS:
+            raise InternalApiError(
+                "too_many_roots",
+                f"merging would exceed the {MAX_FILE_READ_ROOTS}-root cap",
+            )
+
+        # (5) Render the canonical document in the frozen field order (the
+        # api/servers.py _canonical_document shape: file_read_roots after
+        # capabilities, key omitted when empty) and write through the SAME
+        # journal/revision pipeline as the HTTP surface. prompt.md untouched.
+        document = yaml.safe_dump(
+            {
+                "schema_version": profile.schema_version,
+                "server_id": str(profile.server_id),
+                "name": profile.name,
+                "prompt_revision": profile.prompt_revision,
+                "environment": profile.environment.value,
+                "ssh": {
+                    "host": profile.ssh.host,
+                    "port": profile.ssh.port,
+                    "user": profile.ssh.user,
+                    "host_key": profile.ssh.host_key,
+                    "credential_ref": profile.ssh.credential_ref,
+                },
+                "privilege": profile.privilege.value,
+                "capabilities": list(profile.capabilities),
+                **(
+                    {"file_read_roots": merged}
+                    if merged
+                    else {}
+                ),
+            },
+            sort_keys=False,
+            default_flow_style=False,
+        )
+        projection = ProfileProjection(session_factory)
+        try:
+            result = await projection.apply_upsert(
+                store,
+                server_id,
+                document,
+                expected_revision=stored.revision,
+            )
+        except InternalApiError:
+            raise
+        except Exception as exc:
+            raise InternalApiError(
+                "unavailable",
+                f"canonical profile write failed ({type(exc).__name__})",
+            ) from None
+        if result.revision is None or result.sha256 is None:
+            raise InternalApiError(
+                "unavailable", "upsert outcome is missing its committed triple"
+            )
+        return {
+            "status": "ok",
+            "revision": result.revision,
+            "sha256": result.sha256,
+            "roots": merged,
+        }
+
+    operations.append(_server_profile_update)
+
     # -- registration ----------------------------------------------------------
 
     registry = CapabilityRegistry()
@@ -2922,6 +3129,8 @@ __all__ = [
     "InternalApiSpec",
     "MIN_FIELD_DESCRIPTION_CHARS",
     "MIN_TOOL_DESCRIPTION_CHARS",
+    "SERVER_PROFILE_UPDATE_CAPABILITY",
+    "ServerProfileUpdatePayload",
     "ServiceCategoryPayload",
     "ServiceInstructionsPayload",
     "assert_agent_ready_descriptor",

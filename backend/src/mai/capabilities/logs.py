@@ -91,6 +91,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from mai.capabilities.dispatch import REDACTED, CapabilityCall, ExecutorResult
+from mai.capabilities.errors import PreEffectError
 from mai.contracts.server import (
     ExecutionEnvironment,
     ServerProfile,
@@ -193,21 +194,30 @@ class LogsErrorCode(StrEnum):
     ARTIFACT_UNAVAILABLE = "artifact_unavailable"
 
 
-class LogsError(ValueError):
+class LogsError(PreEffectError):
     """One structured, value-free pre-effect rejection.
 
-    Raised only before any transport attempt (or for a failed evidence
-    write after the read — see the module docstring); the dispatcher's
-    seam records it as ``executor_failed`` with ``effect="unknown"``
-    (the receipt claims no proven effect and quotes the exception *type*
-    name only — never this detail, which is for the host's structured
-    logs and the operator).
+    Every rejection is pre-effect (default ``pre_effect=True``) EXCEPT
+    the load-bearing evidence-write failure AFTER the read succeeded
+    (``artifact_unavailable``): the target read already happened, so
+    that refusal stays honest ``unknown`` — never reclassified as
+    ``not_attempted``. Pre-effect rejections surface as instant, coded
+    denials at the dispatcher's seam; the receipt quotes the exception
+    *type* name and the stable code only — never this detail, which is
+    for the host's structured logs and the operator.
     """
 
-    def __init__(self, code: LogsErrorCode, detail: str) -> None:
-        super().__init__(f"{code.value}: {detail}")
+    def __init__(
+        self,
+        code: LogsErrorCode,
+        detail: str,
+        *,
+        pre_effect: bool = True,
+    ) -> None:
+        super().__init__(code.value, detail)
         self.code = code
         self.detail = detail
+        self.pre_effect = pre_effect
 
 
 class LogSource(StrEnum):
@@ -217,8 +227,13 @@ class LogSource(StrEnum):
     CONTAINER = "container"
 
 
-def _reject(code: LogsErrorCode, detail: str) -> LogsError:
-    return LogsError(code, detail)
+def _reject(
+    code: LogsErrorCode,
+    detail: str,
+    *,
+    pre_effect: bool = True,
+) -> LogsError:
+    return LogsError(code, detail, pre_effect=pre_effect)
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +571,7 @@ def write_evidence_artifact(
         raise _reject(
             LogsErrorCode.ARTIFACT_UNAVAILABLE,
             f"evidence artifact could not be written ({type(error).__name__})",
+            pre_effect=False,  # the target read already happened: unknown
         ) from None
     return ArtifactReference(
         path=str(log_path),
@@ -936,6 +952,7 @@ class HostLogsCapability:
             raise _reject(
                 LogsErrorCode.ARTIFACT_UNAVAILABLE,
                 f"evidence artifact could not be written ({type(error).__name__})",
+                pre_effect=False,  # the target read already happened
             ) from None
 
     def _excerpt(
