@@ -66,6 +66,7 @@ from typing import Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.errors import PreEffectError
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext, PolicyMode
 
@@ -182,7 +183,7 @@ class ServiceErrorCode(StrEnum):
     PROVIDER_ERROR = "provider_error"
 
 
-class ServiceError(ValueError):
+class ServiceError(PreEffectError):
     """One structured, value-free payload/refusal rejection.
 
     Raised only for malformed *inputs* (payload shape, host wiring) and
@@ -191,6 +192,12 @@ class ServiceError(ValueError):
     the ``at_url`` slot carries the refusing hop URL so a transcript
     stays auditable; it never carries credential material — URLs in this
     capability never contain userinfo by construction.
+
+    ``pre_effect`` marks the refusal as proven to occur BEFORE any HTTP
+    attempt (payload/wiring validation, no connection opened): only
+    those sites deny deterministically at the dispatcher's seam.
+    Mid-flight refusals keep the default ``False`` and stay honest
+    ``unknown`` — the request already went out.
     """
 
     def __init__(
@@ -199,17 +206,23 @@ class ServiceError(ValueError):
         detail: str,
         *,
         at_url: str | None = None,
+        pre_effect: bool = False,
     ) -> None:
-        super().__init__(f"{code.value}: {detail}")
+        super().__init__(code.value, detail)
         self.code = code
         self.detail = detail
         self.at_url = at_url
+        self.pre_effect = pre_effect
 
 
 def _reject(
-    code: ServiceErrorCode, detail: str, *, at_url: str | None = None
+    code: ServiceErrorCode,
+    detail: str,
+    *,
+    at_url: str | None = None,
+    pre_effect: bool = False,
 ) -> ServiceError:
-    return ServiceError(code, detail, at_url=at_url)
+    return ServiceError(code, detail, at_url=at_url, pre_effect=pre_effect)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +243,7 @@ def validate_base_url(base: str) -> str:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             "service base URL must be a non-empty string",
+            pre_effect=True,
         )
     try:
         parts = urlsplit(base.strip())
@@ -239,24 +253,28 @@ def validate_base_url(base: str) -> str:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"service base URL {base!r} is not parseable",
+            pre_effect=True,
         ) from None
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https") or not parts.hostname:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"service base URL {base!r} must be absolute http(s)",
+            pre_effect=True,
         )
     if parts.username is not None or parts.password is not None:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"service base URL {base!r} must not embed userinfo "
             "(credentials resolve by reference, C03 rule 6)",
+            pre_effect=True,
         )
     if parts.query or parts.fragment:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"service base URL {base!r} must not carry a query or "
             "fragment (the payload path owns path+query)",
+            pre_effect=True,
         )
     host = parts.hostname.lower()
     bracketed = f"[{host}]" if ":" in host else host
@@ -278,6 +296,7 @@ def validate_allowlist(services: Mapping[str, str]) -> dict[str, str]:
             ServiceErrorCode.INVALID_PAYLOAD,
             "services allowlist must be a non-empty mapping "
             "of name -> endpoint base URL",
+            pre_effect=True,
         )
     validated: dict[str, str] = {}
     for raw_name, raw_base in services.items():
@@ -293,11 +312,13 @@ def validate_allowlist(services: Mapping[str, str]) -> dict[str, str]:
                 f"service name {raw_name!r} must be a non-empty slug of "
                 f"at most {MAX_SERVICE_NAME_CHARS} characters without "
                 "whitespace or NUL bytes",
+                pre_effect=True,
             )
         if name in validated:
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 f"service name {name!r} is registered twice",
+                pre_effect=True,
             )
         validated[name] = validate_base_url(raw_base)
     return validated
@@ -319,6 +340,7 @@ def endpoint_for(services: Mapping[str, str], service: str, path: str) -> str:
             ServiceErrorCode.UNKNOWN_SERVICE,
             f"service {service!r} is not in the managed-services "
             "allowlist",
+            pre_effect=True,  # allowlist selection precedes any connection
         )
     return f"{base}{path}"
 
@@ -370,6 +392,7 @@ def validate_service_path(path: object) -> str:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             "path must be a non-empty string starting with '/'",
+            pre_effect=True,
         )
     if (
         len(path) > MAX_PATH_CHARS
@@ -387,6 +410,7 @@ def validate_service_path(path: object) -> str:
             f"path must start with '/', be at most {MAX_PATH_CHARS} "
             "characters, and contain no NUL/CR/LF/backslash/fragment/"
             "scheme separators",
+            pre_effect=True,
         )
     return path
 
@@ -405,11 +429,13 @@ def _canonical_body(body: object) -> str:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"body is not JSON-canonicalizable ({type(error).__name__})",
+            pre_effect=True,
         ) from None
     if len(text.encode("utf-8")) > MAX_BODY_BYTES:
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"body exceeds the {MAX_BODY_BYTES}-byte envelope budget",
+            pre_effect=True,
         )
     return text
 
@@ -432,6 +458,7 @@ def request_from_payload(
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             "payload must be a JSON object (mapping)",
+            pre_effect=True,
         )
     allowed = {
         "service",
@@ -447,6 +474,7 @@ def request_from_payload(
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"unknown payload fields: {', '.join(unknown)}",
+            pre_effect=True,
         )
 
     service = payload.get("service")
@@ -460,6 +488,7 @@ def request_from_payload(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"service must be a non-empty string of at most "
             f"{MAX_SERVICE_NAME_CHARS} characters without NUL bytes",
+            pre_effect=True,
         )
 
     method = payload.get("method")
@@ -467,6 +496,7 @@ def request_from_payload(
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"method must be one of {sorted(_ALLOWED_METHODS)}",
+            pre_effect=True,
         )
 
     path = validate_service_path(payload.get("path"))
@@ -477,6 +507,7 @@ def request_from_payload(
         raise _reject(
             ServiceErrorCode.INVALID_PAYLOAD,
             "body is only valid with method POST",
+            pre_effect=True,
         )
 
     credential_ref = payload.get("credential_ref")
@@ -490,6 +521,7 @@ def request_from_payload(
             ServiceErrorCode.INVALID_PAYLOAD,
             "credential_ref must be a non-empty credential reference "
             "name without whitespace or NUL bytes",
+            pre_effect=True,
         )
 
     max_bytes = payload.get("max_bytes", default_max_bytes)
@@ -502,6 +534,7 @@ def request_from_payload(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"max_bytes must be an integer between {MIN_MAX_BYTES} "
             f"and {MAX_MAX_BYTES}",
+            pre_effect=True,
         )
 
     timeout = payload.get("timeout_seconds", default_timeout_seconds)
@@ -514,6 +547,7 @@ def request_from_payload(
             ServiceErrorCode.INVALID_PAYLOAD,
             f"timeout_seconds must be a number between 0.1 and "
             f"{MAX_TIMEOUT_SECONDS}",
+            pre_effect=True,
         )
 
     return ServiceRequest(
@@ -603,18 +637,21 @@ class HttpServiceProvider:
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 f"timeout_seconds must be within (0, {MAX_TIMEOUT_SECONDS}]",
+                pre_effect=True,
             )
         if not MIN_MAX_BYTES <= max_bytes <= MAX_MAX_BYTES:
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 f"max_bytes must be an integer between {MIN_MAX_BYTES} "
                 f"and {MAX_MAX_BYTES}",
+                pre_effect=True,
             )
         if not 0 < max_redirects <= MAX_REDIRECTS:
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 f"max_redirects must be an integer between 1 and "
                 f"{MAX_REDIRECTS}",
+                pre_effect=True,
             )
         self._timeout_seconds = timeout_seconds
         self._max_bytes = max_bytes
@@ -646,6 +683,7 @@ class HttpServiceProvider:
                 ServiceErrorCode.INVALID_PAYLOAD,
                 f"max_bytes must be an integer between {MIN_MAX_BYTES} "
                 f"and the provider ceiling {self._max_bytes}",
+                pre_effect=True,  # input check before any connection opens
             )
         current = url
         client = httpx2.AsyncClient(
@@ -973,6 +1011,7 @@ class ServiceHttpCapability:
                 "(an async fetch(url=..., method=..., headers=..., "
                 "content=..., max_bytes=..., credential=..., "
                 "allowed_origin=...) -> RawServiceResponse)",
+                pre_effect=True,
             )
         self._services = validate_allowlist(services)
         self._provider = provider
@@ -992,12 +1031,14 @@ class ServiceHttpCapability:
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 "executor input must be a dispatcher CapabilityCall",
+                pre_effect=True,
             )
         context = call.context
         if not isinstance(context, ExecutionContext):
             raise _reject(
                 ServiceErrorCode.INVALID_PAYLOAD,
                 "call context must be an ExecutionContext",
+                pre_effect=True,
             )
         request = request_from_payload(
             call.payload,
@@ -1057,6 +1098,7 @@ class ServiceHttpCapability:
                 "declared in the context but unresolved in the call: "
                 "direct calls must carry resolved material for every "
                 "declared reference",
+                pre_effect=True,
             )
         headers = {"Accept": "application/json"}
         content = request.body.encode("utf-8") if request.body else None

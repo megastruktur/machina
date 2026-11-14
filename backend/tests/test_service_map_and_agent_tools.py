@@ -910,7 +910,9 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
     assert "limit" in docs_list_props and "offset" in docs_list_props
     upsert_catalog_props: Any = by_id["app.upsert_catalog_runbook"].input_schema["properties"]
     assert "install" in upsert_catalog_props["instructions"]["properties"]
-    assert len(INTERNAL_API_CAPABILITY_IDS) == 14
+    # FRR T5: server.profile.update joined the auto-grant vocabulary (forced
+    # captain approval at the bridge seam).
+    assert len(INTERNAL_API_CAPABILITY_IDS) == 15
 
 
 async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(

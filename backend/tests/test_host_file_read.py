@@ -33,6 +33,7 @@ from mai.capabilities.dispatch import (
     CapabilityCall,
     DispatchOutcome,
 )
+from mai.capabilities.errors import PreEffectError
 from mai.capabilities.host_file_read import (
     _HELPER_PROGRAM,
     CAPABILITY_ID,
@@ -404,6 +405,19 @@ class TestReadQueryFromPayload:
                 {"path": "/etc/passwd"}, file_read_roots=(ALLOWED_ROOT,)
             )
         assert excinfo.value.code is FileReadErrorCode.PATH_DENIED
+
+    def test_path_denial_is_a_pre_effect_error(self) -> None:
+        """FRR T1: every PATH_DENIED refusal is a ``PreEffectError`` —
+        the dispatcher's seam turns it into an instant, coded denial
+        (``not_attempted`` + ``error_code``), never a reconciliation
+        park; the stable token matches the StrEnum value."""
+        with pytest.raises(FileReadError) as excinfo:
+            read_query_from_payload(
+                {"path": "/etc/passwd"}, file_read_roots=(ALLOWED_ROOT,)
+            )
+        assert excinfo.value.code is FileReadErrorCode.PATH_DENIED
+        assert isinstance(excinfo.value, PreEffectError)
+        assert str(excinfo.value.code) == "path_denied"
 
     def test_sibling_prefix_escape_is_denied(self) -> None:
         # /srv/datax is NOT below /srv/data — a naive startswith check

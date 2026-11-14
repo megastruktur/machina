@@ -1387,8 +1387,11 @@ class TestAgainstLogsArch:
         outcome = await world.dispatch({"source": "file", "service": "/etc/shadow"})
         assert outcome.allowed is False
         assert outcome.reason == DispatchReason.EXECUTOR_FAILED
-        assert outcome.effect == "unknown"
+        # FRR T1: this refusal happens in payload validation BEFORE any
+        # transport — a deterministic coded denial now, not unknown.
+        assert outcome.effect == "not_attempted"
         assert outcome.error_type == "LogsError"
+        assert outcome.error_code == "invalid_request"
         assert world.artifact_files() == set()
         _rc, marker, _err = logs_arch.ssh(
             "test -e /tmp/mai-logs-shim-invoked && echo Y || echo N"

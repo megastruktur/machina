@@ -1165,3 +1165,267 @@ async def test_state_survives_a_fresh_app_instance(migrated_url: str, tmp_path: 
         assert got_alpha.json()["prompt_revision"] == 2
         assert got_beta.json()["revision"] == 1
     await second.state.engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# FRR T3: file_read_roots on the profile HTTP surface (omission-preserve)
+# ---------------------------------------------------------------------------
+
+
+def _roots_body(name: str, roots: list[str]) -> dict[str, Any]:
+    return {**_profile_body(name), "file_read_roots": roots}
+
+
+@pytest.mark.anyio
+async def test_create_with_roots_round_trips_through_file_and_get(
+    servers_app,
+) -> None:
+    jar = await login_session(servers_app)
+    created = await create_server(
+        servers_app, jar, _roots_body("roots-alpha", ["/srv/data", "/var/log/app"])
+    )
+    assert created.status == 201, created.body
+    server_id = uuid.UUID(created.json()["server_id"])
+
+    read = await get_server(servers_app, jar, server_id)
+    assert read.status == 200, read.body
+    payload = read.json()
+    assert payload["file_read_roots"] == ["/srv/data", "/var/log/app"]
+
+    # Durable truth: the canonical YAML carries the roots AFTER the
+    # capabilities block.
+    profile_file, _meta = _canonical_files(servers_app.state.profiles.root, server_id)
+    stored = profile_file.read_text()
+    assert yaml.safe_load(stored)["file_read_roots"] == ["/srv/data", "/var/log/app"]
+    assert stored.index("capabilities:") < stored.index("file_read_roots:")
+
+
+@pytest.mark.anyio
+async def test_edit_with_roots_bumps_revision_and_persists(servers_app) -> None:
+    jar = await login_session(servers_app)
+    created = await create_server(servers_app, jar, _profile_body("roots-edit"))
+    server_id = uuid.UUID(created.json()["server_id"])
+    edited = await edit_server(
+        servers_app,
+        jar,
+        server_id,
+        _roots_body("roots-edit", ["/srv/data"]),
+        expected_revision=1,
+    )
+    assert edited.status == 200, edited.body
+    assert edited.json()["revision"] == 2
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["file_read_roots"] == ["/srv/data"]
+    profile_file, _meta = _canonical_files(servers_app.state.profiles.root, server_id)
+    assert "- /srv/data" in profile_file.read_text()
+
+
+@pytest.mark.anyio
+async def test_edit_omission_preserves_roots_and_explicit_empty_clears(
+    servers_app,
+) -> None:
+    """The anti-erasure guard: an edit body WITHOUT ``file_read_roots``
+    keeps the stored roots; an explicit ``[]`` clears them and the
+    canonical YAML OMITS the key entirely (byte-form of an empty profile).
+    The edit body here genuinely lacks the key — the same shape the old
+    UI sent and silently erased roots with."""
+    jar = await login_session(servers_app)
+    created = await create_server(
+        servers_app,
+        jar,
+        _roots_body("roots-keep", ["/srv/data", "/opt/tools"]),
+    )
+    server_id = uuid.UUID(created.json()["server_id"])
+    assert "file_read_roots" not in _profile_body("roots-keep")
+
+    edited = await edit_server(
+        servers_app, jar, server_id, _profile_body("roots-keep"), expected_revision=1
+    )
+    assert edited.status == 200, edited.body
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["file_read_roots"] == ["/srv/data", "/opt/tools"]
+
+    cleared = await edit_server(
+        servers_app,
+        jar,
+        server_id,
+        _roots_body("roots-keep", []),
+        expected_revision=2,
+    )
+    assert cleared.status == 200, cleared.body
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["file_read_roots"] == []
+    profile_file, _meta = _canonical_files(servers_app.state.profiles.root, server_id)
+    assert "file_read_roots" not in profile_file.read_text()
+
+
+@pytest.mark.anyio
+async def test_create_without_roots_omits_the_canonical_key(servers_app) -> None:
+    """Empty-list create → the canonical YAML has NO file_read_roots key
+    (the canonical byte-form of today's profiles stays identical)."""
+    jar = await login_session(servers_app)
+    created = await create_server(servers_app, jar, _profile_body("roots-absent"))
+    assert created.status == 201, created.body
+    server_id = uuid.UUID(created.json()["server_id"])
+    profile_file, _meta = _canonical_files(servers_app.state.profiles.root, server_id)
+    assert "file_read_roots" not in profile_file.read_text()
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["file_read_roots"] == []
+
+
+@pytest.mark.anyio
+async def test_stale_edit_conflicts_and_leaves_roots_untouched(servers_app) -> None:
+    jar = await login_session(servers_app)
+    created = await create_server(
+        servers_app, jar, _roots_body("roots-stale", ["/srv/data"])
+    )
+    server_id = uuid.UUID(created.json()["server_id"])
+    stale = await edit_server(
+        servers_app,
+        jar,
+        server_id,
+        _roots_body("roots-stale", ["/elsewhere"]),
+        expected_revision=0,
+    )
+    assert stale.status == 409, stale.body
+    assert _error(stale)["code"] == "conflict"
+    # File truth unchanged; the view still shows revision 1 with the roots.
+    profile_file, _meta = _canonical_files(servers_app.state.profiles.root, server_id)
+    stored = profile_file.read_text()
+    assert "- /srv/data" in stored
+    assert "/elsewhere" not in stored
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["revision"] == 1
+    assert read.json()["file_read_roots"] == ["/srv/data"]
+
+
+@pytest.mark.anyio
+async def test_invalid_roots_get_canonical_422_field_code(servers_app) -> None:
+    """Transport shape is list-of-str; the SEMANTIC rules stay
+    authoritative in the producer and surface as the canonical 422 field
+    code — never duplicated in the transport layer."""
+    jar = await login_session(servers_app)
+    created = await create_server(servers_app, jar, _profile_body("roots-bad"))
+    server_id = uuid.UUID(created.json()["server_id"])
+    invalid_roots: list[list[str]] = [
+        ["relative/path"],  # not absolute
+        ["/"],  # the filesystem root itself
+        ["/srv/data", "/srv/data"],  # duplicate
+        ["/srv/../etc"],  # not normalized
+        [f"/srv/{index}" for index in range(65)],  # over MAX_FILE_READ_ROOTS
+    ]
+    for roots in invalid_roots:
+        rejected = await edit_server(
+            servers_app,
+            jar,
+            server_id,
+            _roots_body("roots-bad", roots),
+            expected_revision=1,
+        )
+        assert rejected.status == 422, (roots, rejected.body)
+        error = _error(rejected)
+        assert error["code"] == "validation_failed"
+        assert error["fields"] == {"file_read_roots": "invalid_field"}
+    # Every rejection left the stored profile untouched.
+    read = await get_server(servers_app, jar, server_id)
+    assert read.json()["file_read_roots"] == []
+    assert read.json()["revision"] == 1
+
+
+def _enroll_body(name: str, roots: list[str] | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "name": name,
+        "prompt_revision": 1,
+        "environment": "linux_ssh",
+        "privilege": "sudo",
+        "capabilities": ["site.deploy"],
+        "ssh": {"host": "enroll.example.internal", "port": 22, "user": "deploy"},
+        "host_key": HOST_KEY_A,
+        "host_key_confirmed": True,
+    }
+    if roots is not None:
+        body["file_read_roots"] = roots
+    return body
+
+
+@pytest.mark.anyio
+async def test_enroll_persists_submitted_roots_and_absent_stays_empty(
+    servers_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enroll renders through the SAME canonical document: submitted roots
+    persist, an absent field stores none. The verification/pin seams are
+    faked — this test owns the CANONICAL WRITE, not the SSH probe."""
+    from mai.contracts.server import PrivilegeMode
+    from mai.execution.onboarding import ConnectionTestResult
+    from mai.execution.ssh import TargetIdentity
+
+    def _verified(*args: object, **kwargs: object) -> ConnectionTestResult:
+        # Plain sync function: the handler runs the real probe via
+        # ``asyncio.to_thread`` and expects the result directly.
+        return ConnectionTestResult(
+            host_key=HOST_KEY_A,
+            key_type="ssh-ed25519",
+            privilege=PrivilegeMode.SUDO,
+            identity=TargetIdentity(
+                hostname="enroll.example.internal",
+                kernel_name="Linux",
+                kernel_release="6.0.0-fixture",
+                machine="x86_64",
+                os_id=None,
+                os_version_id=None,
+                os_pretty_name=None,
+                boot_id=None,
+            ),
+        )
+
+    monkeypatch.setattr("mai.api.servers.run_connection_test", _verified)
+    monkeypatch.setattr(
+        "mai.api.servers.resolve_default_identity_key",
+        lambda *args, **kwargs: Path("/tmp/mai-frr-t3-fixture-key"),
+    )
+    monkeypatch.setattr(
+        "mai.api.servers.pin_durable_host_key", lambda *args, **kwargs: None
+    )
+    # The fixture app builds no credential source (fail-closed 503 lane);
+    # the patched key resolution above never touches the resolver, so the
+    # guard itself is stubbed for this canonical-write test.
+    monkeypatch.setattr(
+        "mai.api.servers._credential_service", lambda request: object()
+    )
+
+    jar = await login_session(servers_app)
+
+    enrolled = await call_app(
+        servers_app,
+        "POST",
+        "/api/v1/servers/onboarding/enroll",
+        json_body=_enroll_body("roots-enroll", ["/srv/data"]),
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert enrolled.status == 201, enrolled.body
+    enrolled_id = uuid.UUID(enrolled.json()["server_id"])
+    read = await get_server(servers_app, jar, enrolled_id)
+    assert read.status == 200, read.body
+    assert read.json()["file_read_roots"] == ["/srv/data"]
+    profile_file, _meta = _canonical_files(
+        servers_app.state.profiles.root, enrolled_id
+    )
+    assert yaml.safe_load(profile_file.read_text())["file_read_roots"] == [
+        "/srv/data"
+    ]
+
+    plain = await call_app(
+        servers_app,
+        "POST",
+        "/api/v1/servers/onboarding/enroll",
+        json_body=_enroll_body("roots-enroll-plain"),
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert plain.status == 201, plain.body
+    plain_id = uuid.UUID(plain.json()["server_id"])
+    read = await get_server(servers_app, jar, plain_id)
+    assert read.json()["file_read_roots"] == []
+    plain_file, _meta = _canonical_files(servers_app.state.profiles.root, plain_id)
+    assert "file_read_roots" not in plain_file.read_text()

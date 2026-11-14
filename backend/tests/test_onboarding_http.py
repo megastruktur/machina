@@ -998,6 +998,7 @@ def test_onboarding_routes_precede_server_id_and_extend_openapi() -> None:
     enroll_fields = set(
         schema["components"]["schemas"]["OnboardingEnrollRequest"]["properties"]
     )
+    # FRR T3 added the optional file_read_roots field to the enroll payload.
     assert enroll_fields == {
         "name",
         "prompt_revision",
@@ -1005,6 +1006,7 @@ def test_onboarding_routes_precede_server_id_and_extend_openapi() -> None:
         "environment",
         "privilege",
         "capabilities",
+        "file_read_roots",
         "ssh",
         "host_key",
         "host_key_confirmed",

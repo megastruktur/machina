@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import Any
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.capabilities.errors import PreEffectError
 from mai.contracts.server import (
     ExecutionEnvironment,
     ServerProfile,
@@ -174,18 +175,19 @@ class HostShellErrorCode(StrEnum):
     HOST_KEY_UNENROLLED = "host_key_unenrolled"
 
 
-class HostShellError(ValueError):
+class HostShellError(PreEffectError):
     """One structured, value-free pre-effect rejection.
 
     Raised only before any transport attempt; the dispatcher's seam
-    records it as ``executor_failed`` with ``effect="unknown"`` (the
-    receipt claims no executed effect and quotes the exception *type*
-    name only — never this detail, which is for the host's structured
-    logs and the operator).
+    records it as ``executor_failed`` with ``effect="not_attempted"`` —
+    an instant, coded denial (never a reconciliation park). The receipt
+    claims no attempted effect and quotes the exception *type* name and
+    the stable code only — never this detail, which is for the host's
+    structured logs and the operator.
     """
 
     def __init__(self, code: HostShellErrorCode, detail: str) -> None:
-        super().__init__(f"{code.value}: {detail}")
+        super().__init__(code.value, detail)
         self.code = code
         self.detail = detail
 
