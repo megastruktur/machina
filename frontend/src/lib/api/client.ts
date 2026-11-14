@@ -615,6 +615,180 @@ function parseSseFrame(raw: string): SseFrame | null {
 	return { id, event, data: dataLines.join('\n') };
 }
 
+// --- Notification inbox surface (nbi; notification-inbox.md) ----------------
+// The unified inbox: global list/unread-count/ack/unack/mark-all-read, the
+// wakeup-only SSE stream and ingest-key management. Every alias below comes
+// verbatim from the generated schema (never a restated field shape). The
+// canonical filter query mirrors the frozen surface (PLAN HTTP table /
+// RESEARCH §R4-F2): `server_id` | `scope: 'global'` are MUTUALLY EXCLUSIVE
+// (the client fails closed before any byte when both are set — the server
+// would 422); `include_global` travels only beside an explicit `server_id`
+// (the route ignores it otherwise); `unread`/`origin`/`source`/`q` compose;
+// `limit`/`offset` ride the bounded-page vocabulary. The SSE stream carries
+// identity-only wakeups and has NO cursor: there is no `Last-Event-ID` here
+// — the caller refetches the durable store on every wakeup, on `resync`,
+// and when the bounded stream self-closes (`onStreamEnd`).
+
+/** One inbox notice row (0017 `notification_alerts`; `acked` mirrors the stamp). */
+export type AlertView = components['schemas']['AlertView'];
+/** Origin vocabulary of the unified inbox. */
+export type AlertOrigin = components['schemas']['AlertOrigin'];
+/** One bounded global inbox page (canonical filters, newest first). */
+export type NotificationPage = components['schemas']['NotificationPage'];
+/** The badge/drawer count: unread notices under the exact canonical filters. */
+export type UnreadCountView = components['schemas']['UnreadCountView'];
+/** Mark-all-read receipt: the database's own rowcount, never a guess. */
+export type MarkAllReadResult = components['schemas']['MarkAllReadResult'];
+/** One ingest key's metadata — NEVER `key_hash` or any plaintext material. */
+export type IngestKeyView = components['schemas']['IngestKeyView'];
+/** One bounded ingest-key metadata page (never key material). */
+export type IngestKeyPageView = components['schemas']['IngestKeyPageView'];
+/** Mint payload: label (1..64), optional server scope, optional expiry. */
+export type CreateIngestKeyBody = components['schemas']['CreateIngestKeyBody'];
+/**
+ * The mint receipt: `key` is the plaintext carried EXACTLY ONCE by this one
+ * response. It is an opaque one-time string for the caller to hand to the
+ * service being wired — this client never logs, stores or re-transmits it.
+ */
+export type IssuedIngestKeyView = components['schemas']['IssuedIngestKeyView'];
+/** Revoke receipt (`revoked: false` deliberately covers unknown/already-revoked). */
+export type RevokeIngestKeyResult = components['schemas']['RevokeIngestKeyResult'];
+
+/**
+ * Canonical inbox filter surface (R4-F2), shared verbatim by the list,
+ * unread-count and mark-all-read client methods. `server_id` and
+ * `scope: 'global'` are mutually exclusive; `include_global` is meaningful
+ * only beside `server_id` (default `true` server-side).
+ */
+export interface NotificationFilterQuery {
+	/** Explicit server scope; mutually exclusive with `scope`. */
+	server_id?: string | null;
+	/** Global-only scope (`NULL`-server notices); mutually exclusive with `server_id`. */
+	scope?: 'global' | null;
+	/** Only with `server_id`: include global notices (server default `true`). */
+	include_global?: boolean | null;
+	/** `true` unread only, `false` read only, omit for all. */
+	unread?: boolean | null;
+	/** Notice origin filter (`finding | job_result | external`). */
+	origin?: AlertOrigin | null;
+	/** Exact source filter (external sender identity). */
+	source?: string | null;
+	/** Server-side ILIKE over title/summary/body/source. */
+	q?: string | null;
+}
+
+/**
+ * Bounded global inbox page query: the canonical filter surface plus the
+ * page window (`limit`/`offset`; producer default 50, max 200). The shared
+ * `PageQuery` mirror is runs-specific (its `q`/date/tag fields are runs-list
+ * filters), so the page fields are restated here like every other
+ * collection query in this module.
+ */
+export interface NotificationListQuery extends NotificationFilterQuery {
+	/** Page size; producer default 50 and maximum 200 are the route bounds. */
+	limit?: number;
+	/** Page offset. */
+	offset?: number;
+}
+
+/**
+ * One identity-only SSE wakeup. The OpenAPI declaration for the stream body
+ * is `unknown` (SSE is not JSON), so this union is typed at this helper
+ * boundary exactly as the producer emits it (notification_channel.py):
+ * identity frames `{kind: "created" | "updated", alert_id, server_id}` or
+ * the identity-free `{kind: "resync"}` refetch signal. No content, no cursor.
+ */
+export type NotificationWakeup =
+	| { kind: 'created' | 'updated'; alert_id: string; server_id: string | null }
+	| { kind: 'resync' };
+
+/** Narrow one parsed SSE frame to the frozen wakeup union, else null. */
+export function readNotificationWakeup(frame: SseFrame): NotificationWakeup | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(frame.data);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== 'object' || parsed === null || !('kind' in parsed)) return null;
+	if (parsed.kind === 'resync') return { kind: 'resync' };
+	if (parsed.kind !== 'created' && parsed.kind !== 'updated') return null;
+	if (!('alert_id' in parsed) || typeof parsed.alert_id !== 'string') return null;
+	if (
+		!('server_id' in parsed) ||
+		(parsed.server_id !== null && typeof parsed.server_id !== 'string')
+	) {
+		return null;
+	}
+	return {
+		kind: parsed.kind,
+		alert_id: parsed.alert_id,
+		server_id: parsed.server_id as string | null
+	};
+}
+
+export interface SubscribeNotificationEventsOptions {
+	/** Abort to close the stream; the returned promise then resolves. */
+	signal?: AbortSignal;
+	/** One parsed identity/resync wakeup, in stream order. */
+	onWakeup: (wakeup: NotificationWakeup) => void;
+	/**
+	 * Refetch/resubscribe hook: the bounded stream self-closes (and any clean
+	 * server close ends the promise) — reconnect means refetch the durable
+	 * store and call this binding again. Not invoked after a caller abort.
+	 */
+	onStreamEnd?: () => void;
+	/** Fetch implementation; defaults to global fetch. */
+	fetch?: typeof fetch;
+}
+
+/**
+ * Subscribe to the wakeup-only inbox stream (`GET /api/v1/notifications/events`,
+ * session + origin before the first byte). Wakeup-only: NO `Last-Event-ID`
+ * cursor is ever sent — every frame ends in a caller refetch, so any
+ * reconnect timing is safe. Resolves when the server closes its bounded
+ * stream or `signal` aborts; rejects on HTTP/network failure with
+ * `ApiError`/`TypeError` respectively.
+ */
+export async function subscribeNotificationEvents(
+	url: string,
+	options: SubscribeNotificationEventsOptions
+): Promise<void> {
+	await subscribeEvents(url, {
+		fetch: options.fetch,
+		signal: options.signal,
+		onEvent: (frame) => {
+			const wakeup = readNotificationWakeup(frame);
+			if (wakeup) options.onWakeup(wakeup);
+		}
+	});
+	if (!options.signal?.aborted) options.onStreamEnd?.();
+}
+
+/** Renders the canonical inbox filters; mutual exclusion fails closed here. */
+function inboxFilterParams(query: NotificationFilterQuery): URLSearchParams {
+	if (query.server_id && query.scope) {
+		throw new MaiClientError(
+			'notification filters rejected: server_id and scope are mutually exclusive'
+		);
+	}
+	const params = new URLSearchParams();
+	if (query.server_id) params.set('server_id', query.server_id);
+	if (query.scope) params.set('scope', query.scope);
+	// include_global is meaningful ONLY beside an explicit server_id (the
+	// route ignores it otherwise); sending it standalone would be noise.
+	if (query.server_id && query.include_global !== undefined && query.include_global !== null) {
+		params.set('include_global', String(query.include_global));
+	}
+	if (query.unread !== undefined && query.unread !== null) {
+		params.set('unread', String(query.unread));
+	}
+	if (query.origin) params.set('origin', query.origin);
+	if (query.source) params.set('source', query.source);
+	if (query.q) params.set('q', query.q);
+	return params;
+}
+
 /** Renders optional bounded-page parameters as a JOIN suffix (`''` or `&…`). */
 function pageSuffix(page?: { limit?: number; offset?: number }): string {
 	const params = new URLSearchParams();
@@ -908,6 +1082,36 @@ export interface MaiApiClient {
 	listNotifications(serverId: string, query?: OverviewAlertsQuery): Promise<AlertPage>;
 	/** POST /api/v1/monitoring/servers/{id}/notifications/{alert_id}/ack. */
 	ackNotification(serverId: string, alertId: string): Promise<AckResult>;
+	/** POST /api/v1/monitoring/servers/{id}/notifications/{alert_id}/unacknowledge. */
+	unacknowledgeServerNotification(serverId: string, alertId: string): Promise<AckResult>;
+
+	// Notification inbox surface (nbi). The global surface is fleet-wide with
+	// EXPLICIT canonical filters (never an ambient scope); the per-server
+	// routes keep their explicit `server_id` argument (C01 rule 2). Session
+	// mutations ride the CSRF double submit; the ingest-key plaintext is an
+	// opaque one-time create receipt — never logged or persisted here.
+	/** GET /api/v1/notifications — bounded unified-inbox page under the canonical filters. */
+	listInboxNotifications(query?: NotificationListQuery): Promise<NotificationPage>;
+	/** GET /api/v1/notifications/unread-count — unread total under the same filters. */
+	getUnreadNotificationCount(query?: NotificationFilterQuery): Promise<UnreadCountView>;
+	/** POST /api/v1/notifications/{alert_id}/ack — idempotent, scope-blind 404. */
+	acknowledgeInboxNotification(alertId: string): Promise<AckResult>;
+	/** POST /api/v1/notifications/{alert_id}/unack — idempotent, re-arms reminders. */
+	unacknowledgeInboxNotification(alertId: string): Promise<AckResult>;
+	/** POST /api/v1/notifications/mark-all-read — ONE update under the same filters; rowcount receipt. */
+	markAllNotificationsRead(query?: NotificationFilterQuery): Promise<MarkAllReadResult>;
+	/**
+	 * GET /api/v1/notifications/events — wakeup-only SSE binding of this
+	 * client's base URL. Identity/resync frames reach `onWakeup`; the bounded
+	 * self-close fires `onStreamEnd` (refetch + resubscribe there). No cursor.
+	 */
+	subscribeNotificationEvents(options: SubscribeNotificationEventsOptions): Promise<void>;
+	/** GET /api/v1/ingest-keys — bounded metadata page (never key material). */
+	listIngestKeys(page?: PageQuery): Promise<IngestKeyPageView>;
+	/** POST /api/v1/ingest-keys — mints; plaintext arrives ONCE as `key`. */
+	createIngestKey(payload: CreateIngestKeyBody): Promise<IssuedIngestKeyView>;
+	/** POST /api/v1/ingest-keys/{key_id}/revoke — effective on the next ingest. */
+	revokeIngestKey(keyId: string): Promise<RevokeIngestKeyResult>;
 
 	/** GET /api/v1/servers/{id}/memory/status — availability probe. */
 	memoryStatus(serverId: string): Promise<MemoryStatusDocument>;
@@ -1493,6 +1697,75 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<AckResult>(
 				'POST',
 				`/api/v1/monitoring/servers/${encodeURIComponent(serverId)}/notifications/${encodeURIComponent(alertId)}/ack`
+			),
+		unacknowledgeServerNotification: (serverId, alertId) =>
+			requestJson<AckResult>(
+				'POST',
+				`/api/v1/monitoring/servers/${encodeURIComponent(serverId)}/notifications/${encodeURIComponent(alertId)}/unacknowledge`
+			),
+
+		// Notification inbox surface (nbi). Same transport as every other
+		// method: C01 envelope errors collapse through `ApiError`, the session
+		// cookie is the only credential, mutations carry the CSRF double
+		// submit, and the canonical filters are validated client-side before
+		// any byte (mutual exclusion fails closed in `inboxFilterParams`).
+		listInboxNotifications: async (query) => {
+			const params = inboxFilterParams(query ?? {});
+			if (query?.limit !== undefined) params.set('limit', String(query.limit));
+			if (query?.offset !== undefined) params.set('offset', String(query.offset));
+			const rendered = params.toString();
+			return requestJson<NotificationPage>(
+				'GET',
+				`/api/v1/notifications${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		getUnreadNotificationCount: async (query) => {
+			const rendered = inboxFilterParams(query ?? {}).toString();
+			return requestJson<UnreadCountView>(
+				'GET',
+				`/api/v1/notifications/unread-count${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		acknowledgeInboxNotification: (alertId) =>
+			requestJson<AckResult>(
+				'POST',
+				`/api/v1/notifications/${encodeURIComponent(alertId)}/ack`
+			),
+		unacknowledgeInboxNotification: (alertId) =>
+			requestJson<AckResult>(
+				'POST',
+				`/api/v1/notifications/${encodeURIComponent(alertId)}/unack`
+			),
+		markAllNotificationsRead: async (query) => {
+			const rendered = inboxFilterParams(query ?? {}).toString();
+			return requestJson<MarkAllReadResult>(
+				'POST',
+				`/api/v1/notifications/mark-all-read${rendered === '' ? '' : `?${rendered}`}`
+			);
+		},
+		subscribeNotificationEvents: (options) =>
+			subscribeNotificationEvents(`${baseUrl}/api/v1/notifications/events`, {
+				...options,
+				fetch: options.fetch ?? doFetch
+			}),
+		listIngestKeys: (page) => {
+			const params = new URLSearchParams();
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<IngestKeyPageView>(
+				'GET',
+				`/api/v1/ingest-keys${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		// The mint receipt's `key` plaintext flows through as an opaque value;
+		// this client never logs, stores or re-transmits it (C03 rule 6).
+		createIngestKey: (payload) =>
+			requestJson<IssuedIngestKeyView>('POST', '/api/v1/ingest-keys', payload),
+		revokeIngestKey: (keyId) =>
+			requestJson<RevokeIngestKeyResult>(
+				'POST',
+				`/api/v1/ingest-keys/${encodeURIComponent(keyId)}/revoke`
 			),
 
 		// Memory (P11).
