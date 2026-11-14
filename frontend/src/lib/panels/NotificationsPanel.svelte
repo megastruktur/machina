@@ -1,19 +1,30 @@
 <script module lang="ts">
 	/**
 	 * NotificationsPanel — the fleet-wide unified notification inbox
-	 * (campaign `notification-inbox`, `nbi-fe-panel`; contracts
-	 * docs/architecture/notification-inbox.md, AGENTS.md pagination invariant,
-	 * C08 rule 6, C11).
+	 * (campaign `notification-inbox`, `nbi-fe-panel` + `nbi-fe-filters`;
+	 * contracts docs/architecture/notification-inbox.md, AGENTS.md pagination
+	 * invariant, C08 rule 6, C11).
 	 *
 	 * Layer: reusable feature panel (windowed-workspace ADR-0001 §2 layer
 	 * table). It owns NO window mechanics and NO scope selection:
 	 *
 	 *  - GLOBAL window, fleet-wide reads: every read is the reviewed global
-	 *    route under the canonical filters (initially ALL notices — the
-	 *    filter toolbar is the sibling task's surface; a server filter is an
-	 *    explicit query param inside the panel, never a pinned scope, C01
-	 *    rule 2). The panel reads `panel.services.api` only; an absent or
-	 *    incomplete bag fails closed with a visible state (no locator).
+	 *    route under the ONE canonical filter query this panel owns (R4-F2):
+	 *    the server scope Select (All / Global / enrolled via `listProfiles`),
+	 *    the read-state Select, the origin chips and the debounced `q` — a
+	 *    server filter is an explicit query param inside the panel, never a
+	 *    pinned scope (C01 rule 2). List, unread-count and mark-all-read share
+	 *    the exact same query snapshot per dispatch; a response may only land
+	 *    while its epoch AND filter snapshot still match (the OverviewPanel
+	 *    race guard — a stale in-flight page never renders). The panel reads
+	 *    `panel.services.api` only; an absent or incomplete bag fails closed
+	 *    with a visible state (no locator).
+	 *  - Attention controls (R4-F2, C08 rule 6): debounced server-side search
+	 *    (`q`, trimmed, omitted when empty — commits reset pagination to
+	 *    offset 0), All/Unread/Read toggle (`unread`), origin chips
+	 *    (`origin`), and mark-all-read under the EXACT active filters —
+	 *    receipt-counted (`{updated}`), never optimistic, with a durable
+	 *    list + unread-count refetch afterwards.
 	 *  - Honest pagination (AGENTS.md invariant): bounded initial page
 	 *    (limit 50), `offset`/`total`/`hasMore`/`loadingMore` state, Load
 	 *    more appends rows deduplicated by `alert_id` inside a bounded
@@ -44,8 +55,18 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Button from '../ui/Button.svelte';
+	import Chip from '../ui/Chip.svelte';
+	import SearchFilterInput from '../ui/SearchFilterInput.svelte';
+	import Select from '../ui/Select.svelte';
 	import type { PanelContext, PanelServices } from '../workspace/registry.js';
-	import type { AlertView, NotificationsApi, ProfileResponse } from '../workspace/entries/14-web-notifications.js';
+	import type {
+		AlertOrigin,
+		AlertView,
+		MarkAllReadResult,
+		NotificationFilterQuery,
+		NotificationsApi,
+		ProfileResponse
+	} from '../workspace/entries/14-web-notifications.js';
 
 	let { panel }: { panel: PanelContext } = $props();
 
@@ -83,6 +104,8 @@
 	const PAGE_LIMIT = 50;
 	/** Debounce for the durable refresh triggered by wakeups. */
 	const REFRESH_DEBOUNCE_MS = 150;
+	/** Debounce for the committed server-side search term (`q`). */
+	const SEARCH_DEBOUNCE_MS = 250;
 	/** Fixed reconnect delay after a stream failure (bounded, visible). */
 	const BACKOFF_MS = 750;
 
@@ -122,6 +145,116 @@
 		return 'mai-notifications__dot--unknown';
 	}
 
+	// --- canonical inbox filters (R4-F2; ONE query for list/count/mark-all) --
+
+	/**
+	 * The filter toolbar state. `server_id` and `scope` are mutually
+	 * exclusive BY CONSTRUCTION (the branches below never both fire) and
+	 * `include_global` travels only beside an explicit `server_id` (R4-F2);
+	 * `unread`, `origin` and `q` are omitted — never null — when their
+	 * control sits at «All»/empty. The derived object's IDENTITY is the
+	 * race guard's filter snapshot: it changes only when a control changes.
+	 */
+	type ReadChoice = 'all' | 'unread' | 'read';
+	type OriginChoice = 'all' | AlertOrigin;
+
+	const READ_OPTIONS: ReadonlyArray<{ value: ReadChoice; label: string }> = [
+		{ value: 'all', label: 'All' },
+		{ value: 'unread', label: 'Unread' },
+		{ value: 'read', label: 'Read' }
+	];
+
+	const ORIGIN_OPTIONS: ReadonlyArray<{ value: OriginChoice; label: string }> = [
+		{ value: 'all', label: 'All' },
+		{ value: 'external', label: 'External' },
+		{ value: 'finding', label: 'Finding' },
+		{ value: 'job_result', label: 'Job result' }
+	];
+
+	/** 'all' | 'global' | enrolled server_id (the Select's option values). */
+	let scopeChoice = $state<string>('all');
+	let includeGlobal = $state(true);
+	let readChoice = $state<ReadChoice>('all');
+	let originChoice = $state<OriginChoice>('all');
+	/** Raw input text, bound to the SearchFilterInput primitive. */
+	let searchInput = $state('');
+	/** The committed (debounced, trimmed) `q` — the only value the wire sees. */
+	let searchQuery = $state('');
+
+	const filterQuery = $derived.by<NotificationFilterQuery>(() => {
+		const query: NotificationFilterQuery = {};
+		if (scopeChoice === 'global') {
+			query.scope = 'global';
+		} else if (scopeChoice !== 'all') {
+			query.server_id = scopeChoice;
+			query.include_global = includeGlobal;
+		}
+		if (readChoice === 'unread') query.unread = true;
+		else if (readChoice === 'read') query.unread = false;
+		if (originChoice !== 'all') query.origin = originChoice;
+		if (searchQuery !== '') query.q = searchQuery;
+		return query;
+	});
+
+	/**
+	 * Debounced search commit: every keystroke restarts the timer, only the
+	 * settled text becomes `q`. Whitespace never commits (trimmed), so a
+	 * no-op edit never triggers a server refetch. The effect teardown clears
+	 * the pending timer on unmount.
+	 */
+	$effect(() => {
+		const text = searchInput;
+		if (text === searchQuery) return;
+		const timer = setTimeout(() => {
+			const committed = text.trim();
+			if (committed !== searchQuery) {
+				searchQuery = committed;
+				applyFilters();
+			}
+		}, SEARCH_DEBOUNCE_MS);
+		return () => clearTimeout(timer);
+	});
+
+	/**
+	 * Any filter change: drop the previous mark-all receipt (it described a
+	 * previous query's effect) and refetch the durable page + count from
+	 * offset 0. `total`/`has_more` are taken from the fresh envelopes only.
+	 */
+	function applyFilters(): void {
+		markAllReceipt = null;
+		void refreshAll();
+	}
+
+	function setScope(value: string): void {
+		if (value === scopeChoice) return;
+		scopeChoice = value;
+		// The toggle is meaningless outside an explicit server scope; the
+		// default (true) is restored so a stale false never leaks into a
+		// later server selection.
+		if (value === 'all' || value === 'global') includeGlobal = true;
+		applyFilters();
+	}
+
+	function setReadState(value: string): void {
+		const next = READ_OPTIONS.find((option) => option.value === value)?.value ?? 'all';
+		if (next === readChoice) return;
+		readChoice = next;
+		applyFilters();
+	}
+
+	function setOrigin(value: string): void {
+		const next = ORIGIN_OPTIONS.find((option) => option.value === value)?.value ?? 'all';
+		if (next === originChoice) return;
+		originChoice = next;
+		applyFilters();
+	}
+
+	function setIncludeGlobal(checked: boolean): void {
+		if (checked === includeGlobal) return;
+		includeGlobal = checked;
+		applyFilters();
+	}
+
 	// --- the inbox page (bounded, deduplicated, honest) -----------------------
 
 	let alerts = $state<AlertView[]>([]);
@@ -135,19 +268,23 @@
 
 	async function loadList(): Promise<void> {
 		if (api === null) return;
+		// Snapshot of the filters riding THIS request: the response may only
+		// land while both the epoch and the filter snapshot still match (the
+		// OverviewPanel race guard) — a stale in-flight page never renders.
+		const filters = filterQuery;
 		const epoch = ++listEpoch;
 		listState = { status: 'loading' };
 		loadingMore = false;
 		try {
-			const page = await api.listInboxNotifications({ limit: PAGE_LIMIT, offset: 0 });
-			if (disposed || epoch !== listEpoch) return;
+			const page = await api.listInboxNotifications({ ...filters, limit: PAGE_LIMIT, offset: 0 });
+			if (disposed || epoch !== listEpoch || filters !== filterQuery) return;
 			alerts = page.alerts;
 			total = page.total;
 			// The producer's envelope flag is the only has-more truth.
 			hasMore = page.has_more;
 			listState = { status: 'ready' };
 		} catch (error) {
-			if (disposed || epoch !== listEpoch) return;
+			if (disposed || epoch !== listEpoch || filters !== filterQuery) return;
 			const code = codeOf(error) ?? 'unavailable';
 			alerts = [];
 			total = 0;
@@ -162,12 +299,19 @@
 
 	async function loadMore(): Promise<void> {
 		if (api === null || listState.status !== 'ready' || loadingMore || !hasMore) return;
+		// The active filters ride every page fetch; the epoch is NOT bumped —
+		// a filter change during the flight invalidates this page instead.
+		const filters = filterQuery;
 		const epoch = listEpoch;
 		loadingMore = true;
 		actionProblem = null;
 		try {
-			const page = await api.listInboxNotifications({ limit: PAGE_LIMIT, offset: alerts.length });
-			if (disposed || epoch !== listEpoch) return;
+			const page = await api.listInboxNotifications({
+				...filters,
+				limit: PAGE_LIMIT,
+				offset: alerts.length
+			});
+			if (disposed || epoch !== listEpoch || filters !== filterQuery) return;
 			// Deduplicate by alert_id: an overlapping page never duplicates rows.
 			const seen = new Set(alerts.map((row) => row.alert_id));
 			const appended = page.alerts.filter((row) => !seen.has(row.alert_id));
@@ -190,16 +334,20 @@
 
 	let unreadTotal = $state<number | null>(null);
 	let unreadUnavailable = $state(false);
+	/** Separate epoch: list and count refreshes never invalidate each other. */
+	let countEpoch = 0;
 
 	async function loadUnread(): Promise<void> {
 		if (api === null) return;
+		const filters = filterQuery;
+		const epoch = ++countEpoch;
 		try {
-			const view = await api.getUnreadNotificationCount({});
-			if (disposed) return;
+			const view = await api.getUnreadNotificationCount(filters);
+			if (disposed || epoch !== countEpoch || filters !== filterQuery) return;
 			unreadTotal = view.total;
 			unreadUnavailable = false;
 		} catch {
-			if (disposed) return;
+			if (disposed || epoch !== countEpoch || filters !== filterQuery) return;
 			// Honest: the count is hidden as unavailable, never fabricated stale.
 			unreadUnavailable = true;
 		}
@@ -227,6 +375,15 @@
 		for (const profile of profiles) names.set(profile.server_id, profile.name);
 		return names;
 	});
+
+	/** Enrolled servers for the scope Select — deterministic (name, id) order. */
+	const enrolledServers = $derived(
+		[...profiles].sort((a, b) => {
+			if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+			if (a.server_id !== b.server_id) return a.server_id < b.server_id ? -1 : 1;
+			return 0;
+		})
+	);
 
 	function displayName(serverId: string | null): string {
 		if (serverId === null) return 'Global';
@@ -293,6 +450,37 @@
 
 	function toggleBody(alertId: string): void {
 		expandedId = expandedId === alertId ? null : alertId;
+	}
+
+	// --- mark-all-read under the EXACT current filters (receipt-driven) ------
+
+	let markAllBusy = $state(false);
+	/** The route's own rowcount receipt; cleared by any filter change. */
+	let markAllReceipt = $state<MarkAllReadResult | null>(null);
+
+	async function markAllRead(): Promise<void> {
+		if (api === null || markAllBusy) return;
+		// The SAME canonical query snapshot the list/count reads use.
+		const filters = filterQuery;
+		markAllBusy = true;
+		actionProblem = null;
+		try {
+			const receipt = await api.markAllNotificationsRead(filters);
+			if (disposed) return;
+			// Never optimistic: the receipt renders, then the list + unread
+			// count refetch from the durable store (under the CURRENT filters).
+			markAllReceipt = receipt;
+			await Promise.allSettled([loadList(), loadUnread()]);
+		} catch (error) {
+			if (disposed) return;
+			const code = codeOf(error) ?? 'unavailable';
+			actionProblem = {
+				code,
+				message: friendlyText(code, messageOf(error) ?? 'The notices could not be marked read.')
+			};
+		} finally {
+			if (!disposed) markAllBusy = false;
+		}
 	}
 
 	// --- live wakeup signal (identity frames; refetch is the only reaction) --
@@ -374,8 +562,13 @@
 	$effect(() => {
 		if (!usable) return;
 		disposed = false;
-		void refreshAll();
-		void loadProfiles();
+		// The reads start untracked: loadList/loadUnread read the canonical
+		// filter query, and this effect must depend ONLY on `usable` — never
+		// re-run (teardown + refetch + resubscribe) from a filter change.
+		untrack(() => {
+			void refreshAll();
+			void loadProfiles();
+		});
 		// The loop reads no reactive state; started untracked so the effect
 		// depends only on `usable` and never re-runs from its own refreshes.
 		untrack(() => void liveLoop());
@@ -430,6 +623,92 @@
 				</Button>
 			</div>
 		</header>
+
+		<!-- Tab seam (nbi-fe-sources): the Inbox/Sources tab strip mounts here,
+			between the header and this toolbar; everything below stays
+			tab-content-agnostic. -->
+		<div class="mai-notifications__toolbar" role="group" aria-label="Inbox filters">
+			<SearchFilterInput
+				bind:value={searchInput}
+				label="Search notices"
+				placeholder="Search title, summary, body, source…"
+				resultCount={listState.status === 'ready' ? alerts.length : undefined}
+				totalCount={listState.status === 'ready' ? total : undefined}
+				testId="notifications-search"
+			/>
+			<Select
+				label="Server"
+				hideLabel
+				compact
+				value={scopeChoice}
+				onchange={(event) => setScope(event.currentTarget.value)}
+				data-testid="filter-scope"
+			>
+				<option value="all">All servers</option>
+				<option value="global">Global only</option>
+				{#each enrolledServers as profile (profile.server_id)}
+					<option value={profile.server_id}>{profile.name}</option>
+				{/each}
+			</Select>
+			{#if scopeChoice !== 'all' && scopeChoice !== 'global'}
+				<label class="mai-notifications__toggle">
+					<input
+						type="checkbox"
+						checked={includeGlobal}
+						onchange={(event) => setIncludeGlobal(event.currentTarget.checked)}
+						data-testid="filter-include-global"
+					/>
+					include global
+				</label>
+			{/if}
+			<Select
+				label="Read state"
+				hideLabel
+				compact
+				value={readChoice}
+				onchange={(event) => setReadState(event.currentTarget.value)}
+				data-testid="filter-read"
+			>
+				{#each READ_OPTIONS as option (option.value)}
+					<option value={option.value}>{option.label}</option>
+				{/each}
+			</Select>
+			<div class="mai-notifications__chips" role="group" aria-label="Origin filter">
+				{#each ORIGIN_OPTIONS as option (option.value)}
+					<Chip
+						variant={originChoice === option.value ? 'brass' : 'default'}
+						role="button"
+						tabindex={0}
+						aria-pressed={originChoice === option.value ? 'true' : 'false'}
+						onclick={() => setOrigin(option.value)}
+						onkeydown={(event) => {
+							if (event.key === 'Enter' || event.key === ' ') {
+								event.preventDefault();
+								setOrigin(option.value);
+							}
+						}}
+						data-testid={'filter-origin-' + option.value}
+					>
+						{option.label}
+					</Chip>
+				{/each}
+			</div>
+			<Button
+				variant="secondary"
+				size="sm"
+				loading={markAllBusy}
+				onclick={markAllRead}
+				data-testid="notifications-mark-all-read"
+			>
+				Mark all read
+			</Button>
+		</div>
+
+		{#if markAllReceipt !== null}
+			<p class="mai-notifications__receipt" role="status" data-testid="mark-all-receipt">
+				Marked {markAllReceipt.updated} read under the current filters.
+			</p>
+		{/if}
 
 		{#if actionProblem !== null}
 			<div
@@ -601,6 +880,44 @@
 		align-items: center;
 		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
+	}
+
+	/* Filter toolbar: search grows, the controls wrap on narrow windows. */
+	.mai-notifications__toolbar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--mai-space-2, 0.5rem);
+	}
+
+	.mai-notifications__toolbar :global(.mai-search-filter) {
+		flex: 1 1 12rem;
+		min-width: 10rem;
+	}
+
+	.mai-notifications__chips {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1, 0.25rem);
+		flex-wrap: wrap;
+	}
+
+	/* Origin chips are buttons for every input modality. */
+	.mai-notifications__chips :global(.mai-chip[role='button']) {
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.mai-notifications__toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--mai-space-1, 0.25rem);
+		color: var(--mai-color-text-muted);
+	}
+
+	.mai-notifications__receipt {
+		margin: 0;
+		color: var(--mai-status-success-text);
 	}
 
 	/* Bounded scroll container: the loaded page grows INSIDE this box. */

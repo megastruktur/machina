@@ -27,6 +27,22 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
  *    empty/error/offline/config states are truthful;
  * 5. wakeup frames (and a clean stream close) trigger recorded refetches of
  *    the durable list + unread count; no content is ever parsed from frames.
+ *
+ * nbi-fe-filters adds (R4-F2 canonical filters):
+ * 6. the server scope Select produces EXACTLY the canonical params — All
+ *    (no server_id/scope/include_global), Global (scope=global, never
+ *    server_id), enrolled server (server_id + include_global default true,
+ *    honest false via the toggle);
+ * 7. the read-state Select (unread true/false/omitted) and the origin chips
+ *    (external/finding/job_result/omitted) compose into ONE canonical query;
+ * 8. the debounced search commits ONCE server-side with the trimmed `q`,
+ *    resets pagination to offset 0, composes with the other filters, and the
+ *    shown/total counts stay honest;
+ * 9. mark-all-read rides the EXACT active filter query, renders the
+ *    receipt {updated} count, refetches the list + unread count durably and
+ *    surfaces envelope errors without optimistic flips;
+ * 10. switching filters mid-load is race-safe: a stale in-flight response
+ *     from an older filter epoch is discarded, the newer filter state wins.
  */
 
 const FIXTURE_URL = '/mai-notifications-fixture/';
@@ -74,9 +90,13 @@ interface NotificationsWindowApi {
 	failNextInbox(failure: Fail | null): void;
 	failNextUnread(failure: Fail | null): void;
 	failNextAck(failure: Fail | null): void;
+	failNextMarkAll(failure: Fail | null): void;
 	failNextProfiles(failure: Fail | null): void;
 	failNextStream(failure: Fail | null): void;
 	armEmptyInbox(): void;
+	/** Stall the NEXT inbox list response until releaseInboxHold resolves it. */
+	holdNextInbox(): void;
+	releaseInboxHold(): void;
 	deliverWakeup(frame: Record<string, unknown>): void;
 	endStream(): void;
 	registry: {
@@ -152,13 +172,14 @@ const APP_SOURCE = `
 
 	function noticeRow(index) {
 		var external = index % 5 === 0;
+		var jobResult = !external && index % 7 === 3;
 		var severity = index % 3 === 0 ? 'info' : index % 3 === 1 ? 'warning' : 'critical';
 		var acked = index === 2 || index === 5;
 		return Object.assign(
 			{
 				alert_id: alertIdOf(index),
 				server_id: ownerOf(index),
-				origin: external ? 'external' : 'finding',
+				origin: external ? 'external' : jobResult ? 'job_result' : 'finding',
 				dedup_key: 'notice-' + index,
 				severity: severity,
 				title: 'Notice ' + index + ' headline',
@@ -213,15 +234,35 @@ const APP_SOURCE = `
 
 	function applyFilters(query, rows) {
 		var filtered = rows;
-		if (query && query.server_id) {
-			filtered = filtered.filter(function (row) { return row.server_id === query.server_id; });
-		} else if (query && query.scope === 'global') {
+		if (!query) return filtered;
+		// R4-F2: server_id selects that server; global (NULL-server) rows ride
+		// along unless include_global is explicitly false (route default true).
+		// scope=global is the mutually exclusive alternative: NULL-server only.
+		if (query.server_id) {
+			var includeGlobal = query.include_global !== false;
+			filtered = filtered.filter(function (row) {
+				return row.server_id === query.server_id || (includeGlobal && row.server_id === null);
+			});
+		} else if (query.scope === 'global') {
 			filtered = filtered.filter(function (row) { return row.server_id === null; });
 		}
-		if (query && query.unread === true) {
+		if (query.unread === true) {
 			filtered = filtered.filter(function (row) { return !row.acked; });
-		} else if (query && query.unread === false) {
+		} else if (query.unread === false) {
 			filtered = filtered.filter(function (row) { return row.acked; });
+		}
+		if (query.origin) {
+			filtered = filtered.filter(function (row) { return row.origin === query.origin; });
+		}
+		if (typeof query.q === 'string' && query.q !== '') {
+			// Canonical ONE field set (R2-F1): ILIKE over title/summary/body/source.
+			var needle = query.q.toLowerCase();
+			filtered = filtered.filter(function (row) {
+				return ['title', 'summary', 'body', 'source'].some(function (field) {
+					var value = row[field];
+					return typeof value === 'string' && value.toLowerCase().indexOf(needle) !== -1;
+				});
+			});
 		}
 		return filtered;
 	}
@@ -234,8 +275,15 @@ const APP_SOURCE = `
 	 * is cleared at the call site (a helper that nulled its own parameter
 	 * would leave the arm set forever).
 	 */
-	var arms = { inbox: null, unread: null, ack: null, profiles: null, stream: null };
+	var arms = { inbox: null, unread: null, ack: null, markAll: null, profiles: null, stream: null };
 	var emptyInboxOnce = false;
+	/**
+	 * Inbox response gates: 'holdNextInbox' arms one gate, the next
+	 * listInboxNotifications call consumes and awaits it, and
+	 * 'releaseInboxHold' resolves it — the race-safety proof's slow lane.
+	 */
+	var inboxGates = [];
+	var heldInbox = [];
 
 	function record(op, payload, args) {
 		calls.push({ op: op, payload: payload, args: args || [] });
@@ -269,6 +317,11 @@ const APP_SOURCE = `
 		listInboxNotifications: async function (query) {
 			record('listInboxNotifications', query ? deep(query) : null);
 			throwArm('inbox');
+			if (inboxGates.length > 0) {
+				var gate = inboxGates.shift();
+				heldInbox.push(gate);
+				await gate.promise;
+			}
 			if (emptyInboxOnce) {
 				emptyInboxOnce = false;
 				return { alerts: [], limit: PAGE_LIMIT, offset: 0, total: 0, has_more: false };
@@ -310,7 +363,7 @@ const APP_SOURCE = `
 		},
 		markAllNotificationsRead: async function (query) {
 			record('markAllNotificationsRead', query ? deep(query) : null);
-			throwArm('ack');
+			throwArm('markAll');
 			var updated = 0;
 			for (var row of applyFilters(query, notices)) {
 				if (!row.acked) {
@@ -425,6 +478,9 @@ const APP_SOURCE = `
 		failNextAck: function (failure) {
 			arms.ack = failure;
 		},
+		failNextMarkAll: function (failure) {
+			arms.markAll = failure;
+		},
 		failNextProfiles: function (failure) {
 			arms.profiles = failure;
 		},
@@ -433,6 +489,14 @@ const APP_SOURCE = `
 		},
 		armEmptyInbox: function () {
 			emptyInboxOnce = true;
+		},
+		holdNextInbox: function () {
+			inboxGates.push(Promise.withResolvers());
+		},
+		releaseInboxHold: function () {
+			var gate = heldInbox.shift();
+			if (!gate) throw new Error('no inbox call is currently held');
+			gate.resolve();
 		},
 		// Identity-only delivery in spirit, deliberately HOSTILE in shape: the
 		// raw frame object reaches onWakeup so the proof shows the panel reads
@@ -1029,5 +1093,402 @@ test('wakeup frames and stream closes trigger refetches and their content is nev
 	for (const call of callsOf(final, 'getUnreadNotificationCount')) {
 		expect(call.payload).toEqual({});
 	}
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Server scope select — exactly the canonical params (R4-F2)
+// ---------------------------------------------------------------------------
+
+test('server scope select sends exactly the canonical params for All, Global and enrolled servers', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notifications-root')).toBeVisible();
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	// The scope Select offers All / Global / enrolled, deterministic order.
+	const scopeSelect = host.getByTestId('filter-scope');
+	expect(await scopeSelect.locator('option').allTextContents()).toEqual([
+		'All servers',
+		'Global only',
+		SERVER_A_NAME,
+		SERVER_B_NAME
+	]);
+
+	// ALL: neither server_id nor scope, no include_global — the bare page.
+	let { calls } = await apiState(page);
+	expect(callsOf(calls, 'listInboxNotifications')[0].payload).toEqual({ limit: 50, offset: 0 });
+	expect(callsOf(calls, 'getUnreadNotificationCount')[0].payload).toEqual({});
+
+	// GLOBAL: scope=global and NEVER server_id/include_global. All ten
+	// global notices (across the seeded 55) fit one page — has_more honest.
+	await scopeSelect.selectOption('global');
+	await expect(host.getByTestId('notice-row')).toHaveCount(10);
+	await expect(host.getByTestId('group-heading')).toHaveCount(1);
+	await expect(host.getByTestId('group-heading')).toHaveText('Global — 10 loaded');
+	await expect(host.getByTestId('notifications-page-count')).toHaveText(
+		'10 of 10 notices loaded.'
+	);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[1].payload).toEqual({
+		scope: 'global',
+		limit: 50,
+		offset: 0
+	});
+	expect(callsOf(calls, 'getUnreadNotificationCount')[1].payload).toEqual({ scope: 'global' });
+
+	// ENROLLED server: server_id + include_global default true (all ten
+	// global notices ride along: 40 alpha + 10 global = one full page).
+	await scopeSelect.selectOption(SERVER_A);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.getByTestId('group-heading')).toHaveCount(2);
+	await expect(host.getByTestId('group-heading').filter({ hasText: 'alpha-core —' })).toHaveText(
+		'alpha-core — 40 loaded'
+	);
+	await expect(host.getByTestId('group-heading').filter({ hasText: 'Global —' })).toHaveText(
+		'Global — 10 loaded'
+	);
+	await expect(
+		host.locator(`[data-testid="notice-group"][data-server="${SERVER_B}"]`)
+	).toHaveCount(0);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[2].payload).toEqual({
+		server_id: SERVER_A,
+		include_global: true,
+		limit: 50,
+		offset: 0
+	});
+	expect(callsOf(calls, 'getUnreadNotificationCount')[2].payload).toEqual({
+		server_id: SERVER_A,
+		include_global: true
+	});
+
+	// include_global=false: strictly that server — the Global group disappears.
+	await expect(host.getByTestId('filter-include-global')).toBeVisible();
+	await host.getByTestId('filter-include-global').uncheck();
+	await expect(host.getByTestId('notice-row')).toHaveCount(40);
+	await expect(host.getByTestId('group-heading')).toHaveCount(1);
+	await expect(host.getByTestId('group-heading')).toHaveText('alpha-core — 40 loaded');
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[3].payload).toEqual({
+		server_id: SERVER_A,
+		include_global: false,
+		limit: 50,
+		offset: 0
+	});
+
+	// Back to ALL: the bare canonical page again (bounded, more pages exist).
+	await scopeSelect.selectOption('all');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.getByTestId('notifications-load-more')).toHaveText('Load more (50 of 55)');
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[4].payload).toEqual({ limit: 50, offset: 0 });
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 7. Read-state select + origin chips — canonical params, composed
+// ---------------------------------------------------------------------------
+
+test('read-state select and origin chips send exactly the canonical params and compose', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	const readSelect = host.getByTestId('filter-read');
+	const chip = (value: string) => host.getByTestId(`filter-origin-${value}`);
+
+	// Unread: unread=true; every rendered row is unread.
+	await readSelect.selectOption('unread');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.locator('[data-testid="notice-row"][data-acked="true"]')).toHaveCount(0);
+	let { calls } = await apiState(page);
+	expect(callsOf(calls, 'listInboxNotifications')[1].payload).toEqual({
+		unread: true,
+		limit: 50,
+		offset: 0
+	});
+	expect(callsOf(calls, 'getUnreadNotificationCount')[1].payload).toEqual({ unread: true });
+
+	// Read: unread=false; exactly the two seeded read notices. The unread
+	// COUNT reads under the SAME filter surface (0 unread among read rows).
+	await readSelect.selectOption('read');
+	await expect(host.getByTestId('notice-row')).toHaveCount(2);
+	await expect(host.locator('[data-testid="notice-row"][data-acked="false"]')).toHaveCount(0);
+	await expect(host.getByTestId('unread-count')).toHaveText('Unread: 0');
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[2].payload).toEqual({
+		unread: false,
+		limit: 50,
+		offset: 0
+	});
+
+	// Back to All: the unread param leaves the wire entirely.
+	await readSelect.selectOption('all');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[3].payload).toEqual({ limit: 50, offset: 0 });
+
+	// Origin chips: external → finding → job_result → all. Filtered totals
+	// span the whole seed (11 external / 38 finding / 6 job_result) and each
+	// fits one honest page.
+	await chip('external').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(11);
+	await expect(host.getByTestId('notifications-page-count')).toHaveText(
+		'11 of 11 notices loaded.'
+	);
+	await expect(host.getByTestId('row-source')).toHaveText(
+		Array.from({ length: 11 }, () => 'host-monitor')
+	);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[4].payload).toEqual({
+		origin: 'external',
+		limit: 50,
+		offset: 0
+	});
+
+	await chip('finding').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(38);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[5].payload).toEqual({
+		origin: 'finding',
+		limit: 50,
+		offset: 0
+	});
+
+	await chip('job_result').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(6);
+	await expect(host.getByTestId('notifications-page-count')).toHaveText(
+		'6 of 6 notices loaded.'
+	);
+	await expect(host.getByTestId('row-source')).toHaveText(
+		Array.from({ length: 6 }, () => 'job_result')
+	);
+	await expect(chip('job_result')).toHaveAttribute('aria-pressed', 'true');
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[6].payload).toEqual({
+		origin: 'job_result',
+		limit: 50,
+		offset: 0
+	});
+
+	await chip('all').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.getByTestId('notifications-load-more')).toHaveText('Load more (50 of 55)');
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'listInboxNotifications')[7].payload).toEqual({ limit: 50, offset: 0 });
+
+	// Combined composition: Unread + Finding rides ONE canonical query
+	// (38 finding notices, the one acked finding excluded server-side).
+	await chip('finding').click();
+	await readSelect.selectOption('unread');
+	await expect(host.getByTestId('notice-row')).toHaveCount(37);
+	({ calls } = await apiState(page));
+	const combined = callsOf(calls, 'listInboxNotifications');
+	expect(combined[combined.length - 1].payload).toEqual({
+		unread: true,
+		origin: 'finding',
+		limit: 50,
+		offset: 0
+	});
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 8. Debounced server-side search: offset reset, composition, honest counts
+// ---------------------------------------------------------------------------
+
+test('debounced search commits once server-side, resets pagination and composes with filters', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	// Whitespace-only input NEVER commits: no server call at all.
+	const search = host.getByTestId('notifications-search');
+	const callsBeforeWhitespace = (await apiState(page)).calls.length;
+	await search.fill('   ');
+	await page.waitForTimeout(500);
+	expect((await apiState(page)).calls.length).toBe(callsBeforeWhitespace);
+
+	// Grow the loaded page first: the next committed search must reset it.
+	await host.getByTestId('notifications-load-more').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(55);
+
+	// Two rapid edits coalesce into exactly ONE server commit with the
+	// settled text; pagination resets to offset 0 (was 55 loaded rows).
+	await search.fill('hea');
+	await search.fill('headline');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.getByTestId('notifications-load-more')).toHaveText('Load more (50 of 55)');
+	let { calls } = await apiState(page);
+	let searchLists = callsOf(calls, 'listInboxNotifications').slice(2);
+	expect(searchLists).toHaveLength(1);
+	expect(searchLists[0].payload).toEqual({ q: 'headline', limit: 50, offset: 0 });
+	expect(callsOf(calls, 'getUnreadNotificationCount')[1].payload).toEqual({ q: 'headline' });
+
+	// Honest counts on the searched page: shown / total from the envelopes.
+	await expect(host.getByTestId('notifications-search-count')).toHaveText('50 / 55');
+
+	// Load more under the active search rides the same q at offset 50.
+	await host.getByTestId('notifications-load-more').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(55);
+	await expect(host.getByTestId('notifications-search-count')).toHaveText('55 / 55');
+	({ calls } = await apiState(page));
+	searchLists = callsOf(calls, 'listInboxNotifications').slice(2);
+	expect(searchLists).toHaveLength(2);
+	expect(searchLists[1].payload).toEqual({ q: 'headline', limit: 50, offset: 50 });
+
+	// Composition: the Read filter under the live search — ONE canonical
+	// query; only the two seeded read notices match both filters.
+	await host.getByTestId('filter-read').selectOption('read');
+	await expect(host.getByTestId('notice-row')).toHaveCount(2);
+	await expect(host.getByTestId('notifications-search-count')).toHaveText('2 / 2');
+	({ calls } = await apiState(page));
+	searchLists = callsOf(calls, 'listInboxNotifications').slice(2);
+	expect(searchLists).toHaveLength(3);
+	expect(searchLists[2].payload).toEqual({ unread: false, q: 'headline', limit: 50, offset: 0 });
+
+	// Clearing the search via the primitive drops `q` from the wire entirely
+	// (the debounced commit rides after its 250 ms window — poll for it).
+	await host.getByTestId('notifications-search-clear').click();
+	await expect
+		.poll(async () => callsOf((await apiState(page)).calls, 'listInboxNotifications').length)
+		.toBe(6); // 2 pre-search page loads + 4 search-flow commits
+	await expect(host.getByTestId('notice-row')).toHaveCount(2);
+	await expect(host.getByTestId('notifications-search-count')).toHaveText('2 / 2');
+	({ calls } = await apiState(page));
+	searchLists = callsOf(calls, 'listInboxNotifications').slice(2);
+	expect(searchLists).toHaveLength(4);
+	expect(searchLists[3].payload).toEqual({ unread: false, limit: 50, offset: 0 });
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 9. Mark-all-read: current filters ride, receipt renders, durable refetch
+// ---------------------------------------------------------------------------
+
+test('mark-all-read sends the active filters, renders the receipt and refetches durably', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	// Unread filter first: mark-all must ride EXACTLY {unread: true}.
+	await host.getByTestId('filter-read').selectOption('unread');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	let { calls } = await apiState(page);
+	const listsBefore = callsOf(calls, 'listInboxNotifications').length;
+	const countsBefore = callsOf(calls, 'getUnreadNotificationCount').length;
+
+	await host.getByTestId('notifications-mark-all-read').click();
+	await expect(host.getByTestId('mark-all-receipt')).toHaveText(
+		'Marked 53 read under the current filters.'
+	);
+	// Never optimistic: the durable refetch replaced the page — the SAME
+	// unread filter now yields an honest empty state and an honest count.
+	await expect(host.getByTestId('notifications-empty')).toBeVisible();
+	await expect(host.getByTestId('unread-count')).toHaveText('Unread: 0');
+	({ calls } = await apiState(page));
+	const marks = callsOf(calls, 'markAllNotificationsRead');
+	expect(marks).toHaveLength(1);
+	expect(marks[0].payload).toEqual({ unread: true });
+	expect(callsOf(calls, 'listInboxNotifications')).toHaveLength(listsBefore + 1);
+	expect(callsOf(calls, 'listInboxNotifications')[listsBefore].payload).toEqual({
+		unread: true,
+		limit: 50,
+		offset: 0
+	});
+	expect(callsOf(calls, 'getUnreadNotificationCount')).toHaveLength(countsBefore + 1);
+	expect(callsOf(calls, 'getUnreadNotificationCount')[countsBefore].payload).toEqual({
+		unread: true
+	});
+
+	// A filter change clears the stale receipt; a scoped mark-all rides the
+	// COMPOSED current query — the read state is still «Unread», so the
+	// canonical wire is scope+unread together (0 unread globals — everything
+	// is read already).
+	await host.getByTestId('filter-scope').selectOption('global');
+	await expect(host.getByTestId('mark-all-receipt')).toHaveCount(0);
+	await expect(host.getByTestId('notifications-empty')).toBeVisible();
+	await host.getByTestId('notifications-mark-all-read').click();
+	await expect(host.getByTestId('mark-all-receipt')).toHaveText(
+		'Marked 0 read under the current filters.'
+	);
+	({ calls } = await apiState(page));
+	const marksAll = callsOf(calls, 'markAllNotificationsRead');
+	expect(marksAll).toHaveLength(2);
+	expect(marksAll[1].payload).toEqual({ scope: 'global', unread: true });
+
+	// Envelope failure: the problem banner surfaces, the receipt stays the
+	// last honest one, and the empty state is untouched.
+	await apiCall(page, 'failNextMarkAll', [
+		{ status: 503, code: 'service_unavailable', message: 'mark-all refused by the store' }
+	]);
+	await host.getByTestId('notifications-mark-all-read').click();
+	await expect(host.getByTestId('notifications-problem')).toBeVisible();
+	await expect(host.getByTestId('notifications-problem')).toHaveAttribute(
+		'data-error-code',
+		'service_unavailable'
+	);
+	await expect(host.getByTestId('notifications-problem')).toContainText('mark-all refused');
+	await expect(host.getByTestId('mark-all-receipt')).toHaveText(
+		'Marked 0 read under the current filters.'
+	);
+	({ calls } = await apiState(page));
+	expect(callsOf(calls, 'markAllNotificationsRead')).toHaveLength(3);
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 10. Race-safe filter switching: the newer filter epoch wins
+// ---------------------------------------------------------------------------
+
+test('switching filters mid-load ignores the stale in-flight response', async ({ page }) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	// Hold the NEXT inbox response: the Global filter load stalls in flight
+	// and must NOT render over the still-visible All page.
+	await apiCall(page, 'holdNextInbox');
+	await host.getByTestId('filter-scope').selectOption('global');
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+
+	// Switch filters WHILE the Global load is still in flight: the server
+	// load is fast and becomes the live page (50 rows: 40 alpha + 10 global,
+	// two of them carrying the seeded read stamps).
+	await host.getByTestId('filter-scope').selectOption(SERVER_A);
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.getByTestId('unread-count')).toHaveText('Unread: 48');
+
+	let { calls } = await apiState(page);
+	const lists = callsOf(calls, 'listInboxNotifications');
+	expect(lists).toHaveLength(3);
+	expect(lists[1].payload).toEqual({ scope: 'global', limit: 50, offset: 0 });
+	expect(lists[2].payload).toEqual({
+		server_id: SERVER_A,
+		include_global: true,
+		limit: 50,
+		offset: 0
+	});
+
+	// Release the stale Global-only page: it must be DISCARDED (older epoch,
+	// older filter snapshot), never rendered over the newer server page.
+	await apiCall(page, 'releaseInboxHold');
+	await expect
+		.poll(async () => callsOf((await apiState(page)).calls, 'listInboxNotifications').length)
+		.toBe(3); // the stale completion raced in no fresh load
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	await expect(host.locator('[data-testid="notice-row"][data-acked="true"]')).toHaveCount(2);
+	await expect(host.getByTestId('group-heading')).toHaveCount(2);
+	await expect(host.getByTestId('group-heading').filter({ hasText: 'alpha-core —' })).toHaveText(
+		'alpha-core — 40 loaded'
+	);
+	await expect(host.getByTestId('group-heading').filter({ hasText: 'Global —' })).toHaveText(
+		'Global — 10 loaded'
+	);
+	await expect(host.getByTestId('unread-count')).toHaveText('Unread: 48');
 	expect(pageErrors).toEqual([]);
 });
