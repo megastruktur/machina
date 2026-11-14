@@ -4033,6 +4033,8 @@ export interface components {
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
             capabilities: string[];
+            /** File Read Roots */
+            file_read_roots?: string[];
             ssh: components["schemas"]["OnboardingSshTarget"];
             /**
              * Host Key
@@ -4427,10 +4429,16 @@ export interface components {
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
             capabilities: string[];
+            /** File Read Roots */
+            file_read_roots?: string[];
         };
         /**
          * ProfileEdit
          * @description Edit payload: carries the caller's last observed revision (C01 rule 6).
+         *
+         *     ``file_read_roots`` omission-preserve: an edit body WITHOUT the field
+         *     keeps the stored roots (the anti-erasure guard in ``edit_profile``);
+         *     an explicit ``[]`` clears them.
          */
         ProfileEdit: {
             /** Name */
@@ -4445,6 +4453,8 @@ export interface components {
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
             capabilities: string[];
+            /** File Read Roots */
+            file_read_roots?: string[];
             /** Expected Revision */
             expected_revision: number;
         };
@@ -4499,6 +4509,8 @@ export interface components {
             privilege: components["schemas"]["PrivilegeMode"];
             /** Capabilities */
             capabilities: string[];
+            /** File Read Roots */
+            file_read_roots: string[];
             /** Revision */
             revision: number;
             /** Sha256 */
