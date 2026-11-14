@@ -1992,6 +1992,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/notifications/ingest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Append one external notice (machine ingest principal, ADR §13)
+         * @description Persist one external notice through the Bearer machine lane.
+         *
+         *     Frozen ordering (auth ADR §13 rule 3; RESEARCH §R3-F2/§R3-F3):
+         *     G1 setup state → body budget → key validation (rate window) → payload
+         *     validation → scope enforcement → dedup insert. Success returns the
+         *     committed row identity; an idempotent replay answers ``200`` with
+         *     ``disposition: "deduped"``.
+         */
+        post: operations["ingest_notification_api_v1_notifications_ingest_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ingest-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One bounded ingest-key metadata page (never key material)
+         * @description List ingest keys: label/scope/timestamps only, deterministically.
+         *
+         *     Session-authenticated admin surface (layer 1 only; safe method). The
+         *     page envelope carries ``limit``/``offset``/``total``/``has_more``;
+         *     ``key_hash`` and plaintext never leave the store.
+         */
+        get: operations["list_ingest_keys_api_v1_ingest_keys_get"];
+        put?: never;
+        /**
+         * Mint one ingest key (plaintext returned exactly once)
+         * @description Mint one machine ingest key (auth ADR §13 key lifecycle).
+         *
+         *     session → origin → CSRF (ADR §5). A supplied ``server_id`` must name
+         *     an existing server profile; omitting it mints a GLOBAL key. The
+         *     plaintext is carried by exactly this one response — only the SHA-256
+         *     hash is stored, and no error path ever echoes key material.
+         */
+        post: operations["create_ingest_key_api_v1_ingest_keys_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ingest-keys/{key_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke one ingest key (effective on the next ingest)
+         * @description Revoke one key; the next ingest fails closed (value-free 401).
+         *
+         *     session → origin → CSRF (ADR §5). Idempotent: revoking an unknown or
+         *     already-revoked key changes nothing and reports ``revoked: false`` —
+         *     the receipt deliberately does not distinguish the two (no existence
+         *     oracle), and the audit row is never reactivated.
+         */
+        post: operations["revoke_ingest_key_api_v1_ingest_keys__key_id__revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/servers/{server_id}/terminal/info": {
         parameters: {
             query?: never;
@@ -2917,6 +3001,18 @@ export interface components {
             fingerprint: string;
         };
         /**
+         * CreateIngestKeyBody
+         * @description Mint payload: label (1..64), optional server scope, optional expiry.
+         */
+        CreateIngestKeyBody: {
+            /** Label */
+            label: string;
+            /** Server Id */
+            server_id?: string | null;
+            /** Expires At */
+            expires_at?: string | null;
+        };
+        /**
          * DecisionBody
          * @description The binding the admin confirms, field-for-field (C03 rule 4).
          *
@@ -3427,6 +3523,52 @@ export interface components {
             start_period_seconds: number;
         };
         /**
+         * IngestKeyPageView
+         * @description One bounded key list page (AGENTS pagination invariant).
+         */
+        IngestKeyPageView: {
+            /** Keys */
+            keys: components["schemas"]["IngestKeyView"][];
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Total */
+            total: number;
+            /** Has More */
+            has_more: boolean;
+        };
+        /**
+         * IngestKeyView
+         * @description One key's metadata — NEVER ``key_hash`` or any plaintext material.
+         */
+        IngestKeyView: {
+            /** Key Id */
+            key_id: string;
+            /** Label */
+            label: string;
+            /** Server Id */
+            server_id: string | null;
+            /** Created At */
+            created_at: string;
+            /** Last Used At */
+            last_used_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Revoked At */
+            revoked_at: string | null;
+        };
+        /**
+         * IngestResult
+         * @description The ingest receipt: the committed (or replayed) row identity.
+         */
+        IngestResult: {
+            /** Alert Id */
+            alert_id: string;
+            /** Disposition */
+            disposition: string;
+        };
+        /**
          * InstalledPluginView
          * @description One installed native plugin's rich catalog view (plugins window).
          *
@@ -3455,6 +3597,28 @@ export interface components {
             config_schema?: {
                 [key: string]: unknown;
             } | null;
+        };
+        /**
+         * IssuedIngestKeyView
+         * @description The mint receipt: plaintext carried EXACTLY ONCE, then never again.
+         */
+        IssuedIngestKeyView: {
+            /** Key */
+            key: string;
+            /** Key Id */
+            key_id: string;
+            /** Label */
+            label: string;
+            /** Server Id */
+            server_id: string | null;
+            /** Created At */
+            created_at: string;
+            /** Last Used At */
+            last_used_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Revoked At */
+            revoked_at: string | null;
         };
         /**
          * JobTagsPage
@@ -4676,6 +4840,16 @@ export interface components {
         RevokeBody: {
             /** Expected Revision */
             expected_revision: number;
+        };
+        /**
+         * RevokeIngestKeyResult
+         * @description Idempotent revoke receipt: ``revoked`` is False when nothing changed.
+         */
+        RevokeIngestKeyResult: {
+            /** Key Id */
+            key_id: string;
+            /** Revoked */
+            revoked: boolean;
         };
         /**
          * RunCreated
@@ -11843,6 +12017,225 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    ingest_notification_api_v1_notifications_ingest_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    title: string;
+                    body?: string | null;
+                    /** @enum {string|null} */
+                    severity?: "info" | "warning" | "critical" | null;
+                    server_id?: string | null;
+                    source?: string | null;
+                    dedup_key?: string | null;
+                    context_ref?: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestResult"];
+                };
+            };
+            /** @description Absent/malformed/unknown/revoked/expired credential or setup state (value-free, no existence oracle) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Body over MAX_INGEST_BODY_BYTES (decided before payload AND key validation; rate window still counts) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload bound violation or scope violation */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Per-key rate window exhausted (60/minute) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Ingest storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_ingest_keys_api_v1_ingest_keys_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestKeyPageView"];
+                };
+            };
+            /** @description No valid session (Bearer is not accepted here) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_ingest_key_api_v1_ingest_keys_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateIngestKeyBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedIngestKeyView"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Payload failed validation (label/scope/expiry) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    revoke_ingest_key_api_v1_ingest_keys__key_id__revoke_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevokeIngestKeyResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowed or CSRF token rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
