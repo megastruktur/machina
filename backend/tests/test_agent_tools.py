@@ -77,6 +77,10 @@ from mai.capabilities.dispatch import (
     ExecutorResult,
     canonical_payload_hash,
 )
+from mai.capabilities.host_file_read import (
+    FileReadError,
+    FileReadErrorCode,
+)
 from mai.capabilities.host_shell import descriptor as host_shell_descriptor
 from mai.capabilities.logs import descriptor as logs_descriptor
 from mai.credentials.env import EnvResolver
@@ -685,6 +689,8 @@ async def test_granted_read_executes_and_maps_outcome(
     assert result["effect_class"] == "read"
     assert result["payload_hash"] == canonical_payload_hash(payload)
     assert result["output"]["text"] == "token=***redacted*** tail"
+    # FRR T2: executed results carry no error block.
+    assert result["error"] is None
     assert len(recorder.calls) == 1
     assert recorder.calls[0].payload == payload
     assert recorder.calls[0].context.run_id == RUN_1
@@ -737,6 +743,45 @@ async def test_executor_crash_surfaces_unknown_effect_status(
     assert result["reason"] == "executor_failed"
     assert result["executor_ok"] is None
     assert result["output"] is None
+    # FRR T2: the unknown-effect crash window carries NO error code —
+    # only deterministic pre-effect denials do.
+    assert result["error"] is None
+
+
+@pytest.mark.anyio
+async def test_pre_effect_denial_carries_the_stable_error_code(
+    fxt_dir: Path, counter: Path
+) -> None:
+    """FRR T2: an executor raising a ``PreEffectError`` (the T1
+    ``FileReadError(PATH_DENIED)`` shape) lands a ``denied`` tool result
+    whose ``error`` block carries the stable refusal token — the model
+    sees WHY the call was denied — while the exception detail text never
+    surfaces."""
+    counter.write_text("0")
+
+    class _Denied:
+        async def __call__(self, call: CapabilityCall) -> ExecutorResult:
+            raise FileReadError(
+                FileReadErrorCode.PATH_DENIED,
+                "outside every allowed file_read_roots prefix",
+            )
+
+    registry = _real_registry()
+    bridge = _bridge(
+        registry,
+        _dispatcher(registry, _unused_approvals(), executor=_Denied()),
+        _context(allowed=(READ_CAPABILITY,)),
+    )
+    result = _result_of(
+        await _tool_of(bridge, READ_CAPABILITY).function(
+            **{"source": "journal", "service": "mai-api"}
+        )
+    )
+    assert result["status"] == ToolStatus.DENIED.value
+    assert result["effect"] == "not_attempted"
+    assert result["reason"] == "executor_failed"
+    assert result["error"] == {"code": "path_denied", "detail": None}
+    assert "outside every allowed" not in json.dumps(result)
 
 
 @pytest.mark.anyio

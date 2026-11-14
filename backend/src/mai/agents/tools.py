@@ -358,6 +358,11 @@ class ToolResult:
             status = ToolStatus.APPROVAL_REQUIRED
         else:
             status = ToolStatus.DENIED
+        # FRR T2: the model sees WHY a call was denied — the dispatcher's
+        # stable refusal token (T1), in the DENIED branch only. The
+        # outcome carries no safe detail text (T1 keeps receipts
+        # value-free), so ``error_detail`` stays None — never invented.
+        error_code = outcome.error_code if status is ToolStatus.DENIED else None
         return cls(
             schema_version=TOOL_RESULT_SCHEMA_VERSION,
             capability_id=outcome.capability_id,
@@ -381,7 +386,7 @@ class ToolResult:
             output_omitted_bytes=None
             if outcome.output is None
             else outcome.output.omitted_bytes,
-            error_code=None,
+            error_code=error_code,
             error_detail=None,
         )
 

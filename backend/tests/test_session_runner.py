@@ -374,6 +374,7 @@ from sqlalchemy.pool import NullPool
 
 import mai.agents.session_runner as session_runner
 from mai.capabilities.dispatch import CapabilityDispatcher, ExecutorResult
+from mai.capabilities.host_file_read import FileReadError, FileReadErrorCode
 from mai.agents.model_store import ModelConfigStore
 from mai.credentials.env import EnvResolver
 from mai.jobs import engine as jobs_engine
@@ -438,6 +439,14 @@ class FixtureExecutor:
         marker = call.payload.get("marker", "?")
         behavior = self._behavior(capability_id, str(marker))
         self._mark(f"begin:{capability_id}:{marker}")
+        if behavior == "path_denied":
+            # FRR T2 regression seam: the T1 pre-effect refusal shape —
+            # the executor raises BEFORE the effect marker (no transport,
+            # no effect), exactly like host.file_read outside its roots.
+            raise FileReadError(
+                FileReadErrorCode.PATH_DENIED,
+                "outside every allowed file_read_roots prefix",
+            )
         if behavior == "gate":
             gate = os.path.join(
                 self.gate_dir, f"gate-{capability_id}-{marker}"
@@ -1045,6 +1054,115 @@ def test_kill9_mid_tool_reconciles_without_reexecution(
     rows = _read_step_rows(agent_url, run_id)
     assert rows[0]["state"] == "succeeded"
     assert _run(_run_states(factory, run_id))[-1] == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# 2a-FRR. pre-effect denial: deterministic denial, NO reconciliation park
+# ---------------------------------------------------------------------------
+
+
+def test_pre_effect_denial_never_parks_reconciliation_frr_t2(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """FRR T2 regression (the 2026-11-14 incident): the executor raises a
+    ``PreEffectError`` (the T1 ``path_denied`` refusal shape) for one tool
+    call. The denial is deterministic — the tool result entry is ``denied``
+    with the stable ``error_code`` token — and the run continues to the
+    next model round WITHOUT ever entering ``reconciling``: no
+    ``reconciling`` transition, no ``agent.awaiting_reconciliation`` event,
+    no 300 s park. (The unknown-effect crash window beside it still parks —
+    ``test_kill9_mid_tool_reconciles_without_reexecution``.)"""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    (scenario / "behavior.json").write_text(
+        json.dumps({f"{READ_CAP}:m1": "path_denied"}), encoding="utf-8"
+    )
+    _script(
+        scenario,
+        [
+            _tool_call_entry(name="fixture_read", marker="m1", call_id="c1"),
+            {"text": "denied and done"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker: subprocess.Popen | None = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        # A reconciliation park would hold the run for the full
+        # reconcile deadline and blow this budget before settling.
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "denied run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The refusal was pre-effect (no effect marker) and the run CONTINUED:
+    # the model got round 2 with the denied tool return and closed the run.
+    lines = _journal_lines(scenario)
+    assert _journal_count(scenario, "begin:fixture.read:m1") == 1
+    assert _journal_count(scenario, "effect:fixture.read:m1") == 0
+    assert lines.count("model_call") == 2, lines
+    assert "saw_tool_return" in lines, lines
+
+    # The durable log carries the round-2 assistant close-out.
+    entries = _read_session_entries(agent_url, session_id)
+    assistant_texts = [
+        entry["payload"].get("text", "")
+        for entry in entries
+        if entry["kind"] == "assistant_message"
+    ]
+    assert "denied and done" in assistant_texts, assistant_texts
+
+    # The model-facing tool result entry: denied + the stable code; the
+    # exception detail text never reaches the durable entry.
+    entries = _read_session_entries(agent_url, session_id)
+    results = [e for e in entries if e["kind"] == "tool_result"]
+    assert len(results) == 1
+    payload = results[0]["payload"]
+    assert payload["call_id"] == "c1"
+    assert payload["status"] == "denied"
+    assert payload["execution_status"] == "failed"
+    assert payload["effect_certainty"] == "certain"
+    assert payload["error_code"] == "path_denied"
+    assert payload["error_detail"] is None
+    assert "outside every allowed" not in json.dumps(payload)
+
+    # NO reconciliation park for the denied step: no ``reconciling``
+    # transition and no awaiting_reconciliation event was ever recorded.
+    states = _run(_run_states(factory, run_id))
+    assert states[-1] == "succeeded"
+    assert "reconciling" not in states, states
+    events = _read_events(agent_url, run_id)
+    assert not [
+        event for event in events if event.type == "agent.awaiting_reconciliation"
+    ], [event.type for event in events]
+
+    # The durable step receipt is the honest denial (the runner lane
+    # stores its own value-free projection: reason + effect, no token —
+    # the stable ``error_code`` rides the session tool_result entry
+    # above; the jobs-facade lane's receipt carries it since T1).
+    rows = _read_step_rows(agent_url, run_id)
+    assert [row["state"] for row in rows] == ["failed"]
+    receipt = rows[0]["receipt"]
+    assert receipt["effect"] == "not_attempted"
+    assert receipt["reason"] == "executor_failed"
+    assert receipt["allowed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -2082,6 +2200,101 @@ def _run_replay_step(executor, payload_json, call_json, round_index, *, row_dict
         )
 
     return executor.run(_body())
+
+
+def test_repair_reconstructs_denied_result_from_not_attempted_receipt_frr_t2(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    tmp_path: pathlib.Path,
+) -> None:
+    """FRR T2: the replay/repair seam (SIGKILL between outcome commit and
+    session append) reconstructs a ``denied`` ToolResultEntry from a
+    committed ``not_attempted`` receipt — the T1 denial shape — and the
+    repair result carries an error_code (the receipt's ``reason`` token,
+    the repair surface's existing vocabulary) instead of staying empty."""
+    from mai.jobs.steps import StepIntent, StepState
+
+    executor = _in_process_executor(factory, tmp_path)
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id))
+    intent = parse_session_run_intent(
+        _canonical(
+            _intent_document(
+                run_id, session_id, client_request_id=str(uuid.uuid4())
+            )
+        )
+    )
+    _run(_ensure_run_row_helper(executor, intent))
+    call = {
+        "tool_call_id": "c1",
+        "tool_name": "fixture_read",
+        "capability_id": READ_CAP,
+        "args": {"marker": "m1"},
+        "seq": 100,
+    }
+    spec = StepIntent(seq=100, capability_id=READ_CAP, payload=dict(call["args"]))
+    _run(executor.steps.aensure_step_intent(run_id, spec))
+    _run(executor.steps.amark_running(run_id, 100, READ_CAP))
+    # The committed outcome receipt (T1 deterministic denial: the executor
+    # raised PreEffectError before any effect) — the SIGKILL happened right
+    # after this commit, before the session append.
+    _run(
+        executor.steps.apersist_outcome(
+            run_id,
+            100,
+            READ_CAP,
+            StepState.FAILED,
+            {
+                "v": 1,
+                "op_id": None,
+                "capability_id": READ_CAP,
+                "allowed": False,
+                "reason": "executor_failed",
+                "effect": "not_attempted",
+                "payload_hash": "a" * 64,
+                "policy_revision": 1,
+                "executor_ok": None,
+                "error_type": "FileReadError",
+                "error_code": "path_denied",
+            },
+            reason="executor_failed",
+            op_id=None,
+        )
+    )
+    row = _run(executor.steps.aread_step(run_id, 100))
+    assert row is not None and row["state"] == "failed"
+    assert not [
+        e
+        for e in _read_session_entries(agent_url, session_id)
+        if e["kind"] == "tool_result"
+    ]
+
+    call_json = json.dumps(call)
+    outcome = _run_replay_step(executor, intent.to_json(), call_json, 0, row_dict=row)
+    assert outcome["status"] == "denied" and outcome["state"] == "failed"
+    entries = _read_session_entries(agent_url, session_id)
+    results = [e for e in entries if e["kind"] == "tool_result"]
+    assert len(results) == 1
+    payload = results[0]["payload"]
+    assert payload["status"] == "denied"
+    assert payload["effect_certainty"] == "certain"
+    assert payload["error_code"]  # the receipt reason token, never empty
+    assert payload["error_detail"] is None
+
+    # Idempotent: a replayed repair adds no duplicate entry.
+    row_again = _run(executor.steps.aread_step(run_id, 100))
+    outcome_again = _run_replay_step(
+        executor, intent.to_json(), call_json, 0, row_dict=row_again
+    )
+    assert outcome_again["status"] == "denied"
+    results_again = [
+        e
+        for e in _read_session_entries(agent_url, session_id)
+        if e["kind"] == "tool_result"
+    ]
+    assert len(results_again) == 1
 
 
 # ---------------------------------------------------------------------------
