@@ -72,6 +72,7 @@ REVISION_IDS = (
     "0014",
     "0015",
     "0016",
+    "0017",
 )
 
 # The exact public application schema at the 0015 head — the 0005 set plus the
@@ -101,6 +102,7 @@ EXPECTED_APP_TABLES = frozenset(
         "server_observations",
         "observation_findings",
         "notification_alerts",
+        "ingest_keys",
         "sessions",
         "session_entries",
         "session_runs",

@@ -861,6 +861,19 @@
 		links.openJobs(serverScope);
 	}
 
+	/**
+	 * «View in Inbox →» hand-off: only wired when the host's links seam
+	 * carries the OPTIONAL `openNotifications` opener (fail closed otherwise —
+	 * the control does not render, never a fake navigation). The hand-off
+	 * names THIS window's pinned scope; the notifications panel turns it into
+	 * its own explicit server query param (C01 rule 2).
+	 */
+	function openInbox(): void {
+		if (links === null || serverScope === null) return;
+		if (typeof links.openNotifications !== 'function') return;
+		links.openNotifications(serverScope);
+	}
+
 	// --- mount cycle (the $effect teardown is the release path) ---------------
 
 	$effect(() => {
@@ -1111,9 +1124,16 @@
 			<section class="mai-overview__section" aria-label="Notification inbox" data-testid="overview-inbox">
 				<div class="mai-overview__section-head">
 					<h4>Notification inbox</h4>
-					<Button variant="secondary" onclick={loadInbox} data-testid="inbox-refresh">
-						Refresh
-					</Button>
+					<span class="mai-overview__head-actions">
+						<Button variant="secondary" onclick={loadInbox} data-testid="inbox-refresh">
+							Refresh
+						</Button>
+						{#if typeof links?.openNotifications === 'function'}
+							<Button variant="secondary" onclick={openInbox} data-testid="inbox-view-link">
+								View in Inbox →
+							</Button>
+						{/if}
+					</span>
 				</div>
 				{#if noticesState.status === 'loading'}
 					<div class="mai-overview__state" role="status" data-testid="inbox-loading">

@@ -87,6 +87,7 @@ from mai.api.knowledge_models import (
 )
 from mai.api.models import register_models
 from mai.api.monitoring import register_monitoring
+from mai.api.notifications import register_notifications
 from mai.api.password_challenges import (
     lane_approval_store,
     register_password_challenges,
@@ -616,6 +617,12 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # routing-policy view — all over the 0007 schema; no collection or
     # delivery effect ever runs in a route.
     register_monitoring(app)
+    # The machine ingest lane + ingest-key management surface (auth ADR
+    # §13): the ONLY Bearer-authenticated route (cookieless machine
+    # principal with the frozen body-budget ordering) plus the
+    # session→origin→CSRF key lifecycle — metadata only, plaintext shown
+    # exactly once at mint.
+    register_notifications(app)
     # The interactive terminal surface (u2-terminal): session+origin
     # authenticated WebSocket attaching one system-OpenSSH PTY (``ssh -tt``,
     # remote tmux/login shell) plus its session-authenticated info view. No

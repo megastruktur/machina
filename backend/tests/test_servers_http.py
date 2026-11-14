@@ -450,6 +450,11 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         # grant-configuration read/edit routes; intent unchanged.)
         ("GET", "/api/v1/grants"),
         ("PUT", "/api/v1/grants"),
+        # (notification-inbox campaign: machine ingest-key lifecycle —
+        # cookieless Bearer lane per auth-and-origin.md §13.)
+        ("GET", "/api/v1/ingest-keys"),
+        ("POST", "/api/v1/ingest-keys"),
+        ("POST", "/api/v1/ingest-keys/{key_id}/revoke"),
         # (04-password-api remediation: the pin expanded by the frozen
         # submit-only challenge route; intent unchanged.)
         ("POST", "/api/v1/password-challenges"),
@@ -546,7 +551,18 @@ def test_full_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications"),
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
         ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/unacknowledge"),
         ("GET", "/api/v1/monitoring/notification-policy"),
+        # (notification-inbox campaign: the unified fleet-wide inbox, its
+        # canonical filters, the wakeup-only SSE stream and the cookieless
+        # machine ingest lane.)
+        ("GET", "/api/v1/notifications"),
+        ("GET", "/api/v1/notifications/events"),
+        ("POST", "/api/v1/notifications/ingest"),
+        ("POST", "/api/v1/notifications/mark-all-read"),
+        ("GET", "/api/v1/notifications/unread-count"),
+        ("POST", "/api/v1/notifications/{alert_id}/ack"),
+        ("POST", "/api/v1/notifications/{alert_id}/unack"),
         # (11-knowledge-api: memory surface.)
         ("GET", "/api/v1/servers/{server_id}/memory/status"),
         ("POST", "/api/v1/servers/{server_id}/memory/recall"),

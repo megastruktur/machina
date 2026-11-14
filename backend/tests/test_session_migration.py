@@ -522,10 +522,11 @@ def test_destructive_cutover_is_installed_at_head_and_spares_generic(
         _restore_migration_env(saved)
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
-        # The chain head IS the current linear revision (0016 = additive
-        # SCOPE-1 service-scope column above the installed 0015 cutover).
+        # The chain head IS the current linear revision (0017 = the unified
+        # notification inbox above the installed 0016 SCOPE-1 service-scope
+        # column).
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert version is not None and version[0] == "0016", version
+        assert version is not None and version[0] == "0017", version
 
         for table in OBSOLETE_TABLES:
             assert not _table_exists(migrated_url, table), table

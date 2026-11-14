@@ -250,3 +250,48 @@ Route names (`/api/v1/auth/*`), cookie names, and parameter names above are **fr
 - `mai_UI_WORKSPACE.md` §1 (login uses shared primitives; login outside the privileged desktop).
 - `mai_QUESTIONS.md` Q3 (proposed approach frozen here within P00 authority).
 - Evidence: `plans/mai-v1/mai_evidence/00-web-auth/` — the campaign evidence root (gitignored; outside the disposable worktree per source C10; sibling `00-ui-contract/` and `monitoring/` records confirm the convention). Contains the writer's provenance/author-check receipts; coordinator artifact check reads it there.
+
+### 13. Addendum — machine ingest principal (notification-inbox campaign)
+
+Change control: this addendum amends the frozen ADR (`3e79449`) under §10 and
+contracts.md «Change control», following the D09/runtime-v2 addendum precedent.
+It was ratified by the coordinator (captain) before implementation; the
+ratification is recorded in the campaign STATE. G-ADR ratification record:
+presented to captain 2026-11-13T20:54:12Z; ratified 2026-11-13T20:56:00Z;
+captain verbatim answer: approved; decision: approved; ratified draft SHA-256
+`3fffc8f07f81b6b28b86f75ebbdbc92a3667f846e30b2d67edb5522f70ee73b7`.
+
+1. **New principal class, not a new admin identity.** A *machine ingest
+   principal* is a scoped API key that grants exactly ONE capability: appending
+   a notification to the unified inbox (`POST /api/v1/notifications/ingest`).
+   It is NOT an administrator identity, creates NO session, carries NO grants,
+   and has NO privileged effect (G2 untouched). §2's «no additional admin
+   identity» is preserved; §2's «no header-based principal» is amended ONLY for
+   this one route: the ingest route authenticates `Authorization: Bearer <key>`
+   (RFC 6750 §2.1 header form). Every other route continues to reject bearer
+   credentials; the cookie-session boundary is unchanged.
+2. **Key lifecycle.** Keys are minted by the authenticated admin
+   (session → origin → CSRF), 256-bit CSPRNG, only SHA-256 stored (the 0002
+   `token_hash` pattern). Plaintext is returned exactly once at creation.
+   Each key carries: label (1..64), scope (`server_id` UUID or NULL = global
+   only), optional `expires_at`, `revoked_at`, `last_used_at`, and a durable
+   per-key fixed rate window (60 requests/minute, DB-backed, restart-safe).
+   Revocation/expiry take effect on the next request. A key scoped to a server
+   may only append notices for that server; a global key may only append
+   server-less notices. Payload scope violations, unknown servers, and foreign
+   servers all answer the IDENTICAL 422 `invalid_scope` (no existence oracle).
+3. **Transport and boundary.** The ingest lane is cookieless: CSRF/origin
+   layers do not apply (no cookie to ride). G1 is preserved: in setup state the
+   ingest route answers 401 like every non-health route. Request bodies are
+   bounded BEFORE validation AND BEFORE key validation:
+   `MAX_INGEST_BODY_BYTES = 16384`; Content-Length pre-check plus bounded stream
+   read; over-budget → 413 `body_too_large` regardless of key validity (no
+   401-vs-413 key-validity oracle), no row written, rate window still counts
+   the request. Errors use the C01 envelope; auth failures are value-free (no
+   key material, no existence oracle).
+4. **Secret hygiene.** Key values are credential material (C03 rule 6
+   discipline): never logged, never in error envelopes/evidence, never
+   persisted by the UI; durable operator copies follow the 1Password workflow.
+5. **Non-goals of this addendum.** No OAuth flows, no token introspection
+   endpoint, no machine READ access to any surface, no additional admin
+   accounts, no change to session TTL/CSRF/origin rules.
