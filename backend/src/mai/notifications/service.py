@@ -1,10 +1,13 @@
 """Durable web notifications over the 0007 observation schema (card 10-notifications, C10 + C03).
 
 The notification service is the named consumer of the collector cards'
-findings (``observation_findings``) and of durable job outcomes: it
-evaluates conditions into ``notification_alerts`` inbox rows (C10 rule 3),
-one row per ``(server_id, dedup_key)`` — the UNIQUE backstop makes a
-repeated poll of the same condition collapse onto the same notice, and a
+findings (``observation_findings``), of durable job outcomes, and of the
+machine ingest lane (:func:`ingest_external`): it persists notices into
+the ``notification_alerts`` inbox (C10 rule 3) — one row per
+``(server_id, dedup_key)`` for server-scoped notices, per ``dedup_key``
+with a NULL server for global notices (partial unique index
+``uq_notification_alerts_dedup_global``) — so a repeated evaluation or
+publish of the same condition collapses onto the same notice, and a
 duplicate key is a real integrity violation, never a caller invariant.
 
 Evaluation pipeline, per condition:
@@ -54,18 +57,18 @@ Evaluation pipeline, per condition:
   messenger integration (C10 rule 5: ``NotificationChannel`` is the seam;
   adapters are future cards).
 
-**Severity provenance on stored rows** — ``notification_alerts`` has no
-severity column (frozen schema); a notice's severity lives at its anchor.
-While the anchor exists (``finding_id`` set, finding not yet GC-swept) the
-severity is read by join. But anchors are legally severed (ON DELETE SET
-NULL by the retention sweep / run GC), and job-result notices have no
-finding anchor at all — so every draft this module writes appends a frozen
-machine tag ``[severity=<v>]`` to the bounded summary. Writer and reader
-of that format both live in this module; :func:`_row_severity` prefers the
-live anchor join and falls back to the tag, so quiet-hours/routing
-decisions stay correct even for severed anchors. This is a documented
-self-consistency contract of the sole writer of these rows, pinned by the
-focused tests.
+**Severity provenance on stored rows** — ``notification_alerts.severity``
+(migration ``0017_notification_inbox``) is the single provenance: TEXT
+NOT NULL DEFAULT 'info', CHECK-pinned to the frozen vocabulary. Every
+writer in this module stores the draft severity on insert and refreshes it
+on every content update (escalation / de-escalation rescore), so the
+column always mirrors what the row last told the human; the reader
+(:func:`_row_severity`) reads only the column, so quiet-hours/routing
+decisions stay correct even for severed anchors. The pre-0017 summary-tag
+severity grammar is gone from writer and reader alike; migration 0017
+backfilled existing rows with the frozen reader precedence (live anchor
+join first, tag second, ``info`` fallback), so stored meaning survived the
+cutover.
 
 **LLM independence (brief acceptance 2)** — the module imports no agent,
 model or durable-engine symbol: deterministic collectors and notifications
@@ -82,7 +85,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -94,8 +96,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.contracts.observations import (
     CONTEXT_REF_MAX_CHARS,
+    DEDUP_KEY_MAX_CHARS,
     DeliveryStatus,
     FindingSeverity,
+    MAX_NOTIFICATION_BODY_CHARS,
+    MAX_NOTIFICATION_SOURCE_CHARS,
     SUMMARY_MAX_CHARS,
     TITLE_MAX_CHARS,
     validate_alert_shape,
@@ -130,6 +135,7 @@ __all__ = [
     "finding_alert_draft",
     "finding_dedup_key",
     "in_quiet_hours",
+    "ingest_external",
     "job_result_alert_draft",
     "notify_job_result",
 ]
@@ -174,10 +180,6 @@ _JOB_OUTCOME_SEVERITY: dict[str, str] = {
     "succeeded": FindingSeverity.INFO.value,
     "failed": FindingSeverity.WARNING.value,
 }
-
-#: Frozen machine tag appended to every draft summary (see module docstring
-#: "Severity provenance on stored rows"). Writer and reader both live here.
-_SEVERITY_TAG_RE = re.compile(r"\[severity=(info|warning|critical)\]$")
 
 JobOutcome = Literal["succeeded", "failed"]
 
@@ -418,12 +420,6 @@ def job_result_dedup_key(run_id: uuid.UUID) -> str:
     return f"job_result:{run_id}"
 
 
-def _severity_tagged(summary: str, severity: str) -> str:
-    """Summary + frozen machine tag, within the column bound (pure)."""
-    tag = f" [severity={severity}]"
-    return _truncate(summary, SUMMARY_MAX_CHARS - len(tag)) + tag
-
-
 @dataclass(frozen=True, slots=True)
 class AlertDraft:
     """One evaluated condition, ready to persist (bounded text only).
@@ -470,7 +466,7 @@ def finding_alert_draft(row: Mapping[str, object]) -> AlertDraft:
         dedup_key=finding_dedup_key(kind, str(condition_key)),
         severity=severity,
         title=_truncate(f"{kind}: {summary}", TITLE_MAX_CHARS),
-        summary=_severity_tagged(summary, severity),
+        summary=_truncate(summary, SUMMARY_MAX_CHARS),
         context_ref=_truncate(f"finding:{finding_id}", CONTEXT_REF_MAX_CHARS),
         finding_id=finding_id,
     )
@@ -498,10 +494,10 @@ def job_result_alert_draft(
         )
     short = str(run_id)[:8]
     title = _truncate(f"Run {short} {outcome}", TITLE_MAX_CHARS)
-    summary = _severity_tagged(
+    summary = _truncate(
         f"model_profile={model_profile} outcome={outcome}"
         + (f" error_ref={error_ref}" if error_ref else ""),
-        severity,
+        SUMMARY_MAX_CHARS,
     )
     return AlertDraft(
         origin="job_result",
@@ -680,13 +676,13 @@ class WebhookChannel:
 _INSERT_ALERT = sa.text(
     """
     INSERT INTO notification_alerts
-        (alert_id, server_id, origin, run_id, finding_id, dedup_key, title,
-         summary, context_ref, delivery_status, created_at, delivered_at,
+        (alert_id, server_id, origin, run_id, finding_id, dedup_key, severity,
+         title, summary, context_ref, delivery_status, created_at, delivered_at,
          acknowledged_at, retain_until)
     VALUES
         (:alert_id, :server_id, :origin, :run_id, :finding_id, :dedup_key,
-         :title, :summary, :context_ref, 'pending', :created_at, NULL,
-         NULL, :retain_until)
+         :severity, :title, :summary, :context_ref, 'pending', :created_at,
+         NULL, NULL, :retain_until)
     ON CONFLICT (server_id, dedup_key) DO NOTHING
     RETURNING alert_id
     """
@@ -694,8 +690,8 @@ _INSERT_ALERT = sa.text(
 
 _LOAD_ALERT_BY_KEY = sa.text(
     """
-    SELECT alert_id, origin, run_id, finding_id, dedup_key, title, summary,
-           context_ref, delivery_status, created_at, delivered_at,
+    SELECT alert_id, origin, run_id, finding_id, dedup_key, severity, title,
+           summary, context_ref, delivery_status, created_at, delivered_at,
            acknowledged_at
       FROM notification_alerts
      WHERE server_id = :server_id AND dedup_key = :dedup_key
@@ -706,7 +702,7 @@ _UPDATE_ALERT_CONTENT = sa.text(
     """
     UPDATE notification_alerts
        SET title = :title, summary = :summary, context_ref = :context_ref,
-           finding_id = :finding_id, run_id = :run_id
+           finding_id = :finding_id, run_id = :run_id, severity = :severity
      WHERE alert_id = :alert_id
     """
 )
@@ -722,16 +718,15 @@ _SET_DELIVERY = sa.text(
 _PENDING_ALERTS = sa.text(
     """
     SELECT alert_id, origin, run_id, finding_id, dedup_key, title, summary,
-           context_ref, delivery_status, created_at, anchor_severity
+           context_ref, delivery_status, created_at, severity
       FROM (
         SELECT a.alert_id, a.origin, a.run_id, a.finding_id, a.dedup_key,
                a.title, a.summary, a.context_ref, a.delivery_status,
-               a.created_at, f.severity AS anchor_severity,
+               a.created_at, a.severity,
                ROW_NUMBER() OVER (
                    ORDER BY a.created_at, a.alert_id
                ) AS rn
           FROM notification_alerts a
-          LEFT JOIN observation_findings f ON f.finding_id = a.finding_id
          WHERE a.server_id = :server_id AND a.delivery_status = 'pending'
        ) ranked
      WHERE rn <= :cap
@@ -756,6 +751,56 @@ _OPEN_FINDINGS = sa.text(
     """
 )
 
+#: External notices land DELIVERED (inbox-only: presence IS delivery, the
+#: stamp equivalence is CHECK-pinned). Server-scoped inserts keep the
+#: composite arbiter; global inserts arbitrate on the partial unique index
+#: (NULL-server rows are NULL-distinct under the composite constraint).
+_INSERT_EXTERNAL_SCOPED = sa.text(
+    """
+    INSERT INTO notification_alerts
+        (alert_id, server_id, origin, dedup_key, severity, title, body,
+         source, context_ref, delivery_status, delivered_at, created_at,
+         retain_until)
+    VALUES
+        (:alert_id, :server_id, 'external', :dedup_key, :severity, :title,
+         :body, :source, :context_ref, 'delivered', :delivered_at,
+         :created_at, :retain_until)
+    ON CONFLICT (server_id, dedup_key) DO NOTHING
+    RETURNING alert_id
+    """
+)
+
+_INSERT_EXTERNAL_GLOBAL = sa.text(
+    """
+    INSERT INTO notification_alerts
+        (alert_id, server_id, origin, dedup_key, severity, title, body,
+         source, context_ref, delivery_status, delivered_at, created_at,
+         retain_until)
+    VALUES
+        (:alert_id, NULL, 'external', :dedup_key, :severity, :title,
+         :body, :source, :context_ref, 'delivered', :delivered_at,
+         :created_at, :retain_until)
+    ON CONFLICT (dedup_key) WHERE server_id IS NULL DO NOTHING
+    RETURNING alert_id
+    """
+)
+
+_LOAD_EXTERNAL_ALERT_SCOPED = sa.text(
+    """
+    SELECT alert_id
+      FROM notification_alerts
+     WHERE server_id = :server_id AND dedup_key = :dedup_key
+    """
+)
+
+_LOAD_EXTERNAL_ALERT_GLOBAL = sa.text(
+    """
+    SELECT alert_id
+      FROM notification_alerts
+     WHERE server_id IS NULL AND dedup_key = :dedup_key
+    """
+)
+
 
 def _utc(value: datetime) -> datetime:
     """Normalize one aware timestamp to UTC (C01 rule 5)."""
@@ -767,33 +812,15 @@ def _utc(value: datetime) -> datetime:
 def _row_severity(row: Mapping[str, object]) -> str:
     """Severity of a stored notice row for DELIVERY routing (see module docstring).
 
-    Live anchor join first (the collector's freshest severity); the frozen
-    summary tag covers severed anchors and job-result notices; ``info`` only
-    if both are gone (not produced by this module's drafts — the tag is
-    always written).
+    The real ``notification_alerts.severity`` column is the ONLY
+    provenance: this module's writers store the draft severity on insert
+    and refresh it on every content update, so the column always mirrors
+    what the row last told the human. ``info`` is the defensive fallback
+    for rows written by anything else.
     """
-    anchor = row.get("anchor_severity")
-    if isinstance(anchor, str) and anchor in _SEVERITY_RANK:
-        return anchor
-    return _stored_severity(row)
-
-
-def _stored_severity(row: Mapping[str, object]) -> str:
-    """The severity AS LAST PERSISTED on the notice row (tag-based).
-
-    Escalation detection compares the condition's current severity against
-    this — the live anchor join is already the NEW severity by the time the
-    evaluator runs, so the durable tag is the only honest "what did we last
-    tell the human" reference.
-    """
-    summary = row.get("summary")
-    if isinstance(summary, str):
-        match = _SEVERITY_TAG_RE.search(summary)
-        if match is not None:
-            return match.group(1)
-    anchor = row.get("severity")
-    if isinstance(anchor, str) and anchor in _SEVERITY_RANK:
-        return anchor
+    severity = row.get("severity")
+    if isinstance(severity, str) and severity in _SEVERITY_RANK:
+        return severity
     return FindingSeverity.INFO.value
 
 
@@ -1051,6 +1078,7 @@ async def _persist_new(
                     "run_id": draft.run_id,
                     "finding_id": draft.finding_id,
                     "dedup_key": draft.dedup_key,
+                    "severity": draft.severity,
                     "title": draft.title,
                     "summary": draft.summary,
                     "context_ref": draft.context_ref,
@@ -1081,11 +1109,11 @@ async def _evaluate_one(
             "run_id": draft.run_id,
             "origin": draft.origin,
             "dedup_key": draft.dedup_key,
+            "severity": draft.severity,
             "title": draft.title,
             "summary": draft.summary,
             "context_ref": draft.context_ref,
             "created_at": now,
-            "anchor_severity": None,  # route by the freshly written tag
         }
         return await _deliver_row(
             sessions,
@@ -1124,7 +1152,7 @@ async def _evaluate_one(
             delivery="skipped",
         )
 
-    stored_severity = _stored_severity(existing)
+    stored_severity = _row_severity(existing)
 
     if stored_severity != draft.severity:
         escalated = _SEVERITY_RANK.get(draft.severity, 0) > _SEVERITY_RANK.get(
@@ -1139,6 +1167,7 @@ async def _evaluate_one(
                     "context_ref": draft.context_ref,
                     "finding_id": draft.finding_id,
                     "run_id": draft.run_id,
+                    "severity": draft.severity,
                     "alert_id": existing["alert_id"],
                 },
             )
@@ -1153,7 +1182,7 @@ async def _evaluate_one(
                 delivery="skipped",
             )
         row = dict(existing)
-        row["anchor_severity"] = None  # force the refreshed draft's tag
+        row["severity"] = draft.severity  # route by the refreshed column
         row["summary"] = draft.summary
         outcome = await _deliver_row(
             sessions,
@@ -1341,6 +1370,201 @@ async def notify_job_result(
         policy=policy,
         channels=registry,
         sink=sink,
+    )
+
+
+#: The frozen external-notice severity vocabulary (the ``severity`` column
+#: CHECK; mirrored from :class:`mai.contracts.observations.FindingSeverity`).
+_EXTERNAL_SEVERITIES = frozenset(_SEVERITY_RANK)
+
+#: Dedup-key namespace prefix of external notices (hash-derived when the
+#: caller supplies a logical key, unique per message otherwise).
+_EXTERNAL_DEDUP_PREFIX = "external:"
+
+
+def _external_dedup_key(source: str | None, dedup_key: str) -> str:
+    """Namespaced dedup key for one external message identity (pure).
+
+    ``external:<sha256(source|dedup_key)[:32]>`` — the caller's logical key
+    is namespaced so it can never collide with the finding/job-result key
+    spaces; an absent ``source`` hashes as the empty string. Bounded and
+    collision-free exactly like :func:`finding_dedup_key`.
+    """
+    digest = hashlib.sha256(f"{source or ''}|{dedup_key}".encode()).hexdigest()[:32]
+    return _EXTERNAL_DEDUP_PREFIX + digest
+
+
+def _require_bounded(
+    field: str,
+    value: object,
+    *,
+    maximum: int,
+    allow_none: bool = False,
+    require_blank_free: bool = False,
+) -> str | None:
+    """One bounded-text validation (value-free NotificationError on violation).
+
+    ``None`` passes only when :attr:`allow_none`; otherwise the value must
+    be a ``str`` of 1..``maximum`` chars (never empty), optionally without
+    blank-only content.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise NotificationError(
+            NotificationErrorCode.INVALID_DRAFT,
+            f"external notice {field} is required",
+        )
+    if not isinstance(value, str):
+        raise NotificationError(
+            NotificationErrorCode.INVALID_DRAFT,
+            f"external notice {field} must be a string",
+        )
+    if not 1 <= len(value) <= maximum or (
+        require_blank_free and not value.strip()
+    ):
+        raise NotificationError(
+            NotificationErrorCode.INVALID_DRAFT,
+            f"external notice {field} violates its frozen bound "
+            f"(1..{maximum} non-blank characters)",
+        )
+    return value
+
+
+async def ingest_external(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    server_id: str | None = None,
+    title: str,
+    body: str | None = None,
+    severity: str = "info",
+    source: str | None = None,
+    dedup_key: str | None = None,
+    context_ref: str | None = None,
+    now: datetime | None = None,
+) -> NoticeOutcome:
+    """Persist one external notice (the machine ingest lane's writer).
+
+    Bounded and LLM-free. Message semantics, not condition semantics:
+    external notices bypass cooldown, escalation and quiet hours entirely
+    and are inbox-only — delivered the moment the row exists (the
+    ``delivered`` stamp rides the insert; the CHECK-pinned equivalence
+    holds). Idempotent per scope: a supplied ``dedup_key`` is stored as
+    ``external:<sha256(source|dedup_key)[:32]>`` (``source`` hashes as
+    ``''`` when absent) so the same logical publish replays onto the
+    committed row (``deduped``, never a duplicate), while an omitted
+    ``dedup_key`` derives a unique per-message key. A global notice
+    (``server_id=None``) dedups on the partial unique index
+    ``uq_notification_alerts_dedup_global``; a server-scoped notice keeps
+    the composite ``(server_id, dedup_key)`` arbiter — a global row and a
+    server-scoped row of the same logical key never collide. Every bound
+    violation raises a value-free :class:`NotificationError` before any
+    write; the EventSink seam is untouched (live NOTIFY is a later card).
+    """
+    at = _utc(now) if now is not None else datetime.now(timezone.utc)
+    scope_id: uuid.UUID | None = None
+    if server_id is not None:
+        try:
+            scope_id = (
+                server_id
+                if isinstance(server_id, uuid.UUID)
+                else uuid.UUID(str(server_id))
+            )
+        except ValueError:
+            raise NotificationError(
+                NotificationErrorCode.INVALID_DRAFT,
+                "external notice server_id must be a UUID string or None",
+            ) from None
+    checked_title = _require_bounded(
+        "title", title, maximum=TITLE_MAX_CHARS, require_blank_free=True
+    )
+    checked_body = _require_bounded(
+        "body", body, maximum=MAX_NOTIFICATION_BODY_CHARS, allow_none=True
+    )
+    checked_source = _require_bounded(
+        "source",
+        source,
+        maximum=MAX_NOTIFICATION_SOURCE_CHARS,
+        allow_none=True,
+        require_blank_free=True,
+    )
+    checked_key = _require_bounded(
+        "dedup_key",
+        dedup_key,
+        maximum=DEDUP_KEY_MAX_CHARS,
+        allow_none=True,
+        require_blank_free=True,
+    )
+    if severity not in _EXTERNAL_SEVERITIES:
+        raise NotificationError(
+            NotificationErrorCode.INVALID_DRAFT,
+            f"external notice severity must be one of "
+            f"{sorted(_EXTERNAL_SEVERITIES)}",
+        )
+    assert checked_title is not None  # required field: never None here
+    notice_key = (
+        _external_dedup_key(source, checked_key)
+        if checked_key is not None
+        else _EXTERNAL_DEDUP_PREFIX + uuid.uuid4().hex
+    )
+    insert = (
+        _INSERT_EXTERNAL_SCOPED if scope_id is not None else _INSERT_EXTERNAL_GLOBAL
+    )
+    load = (
+        _LOAD_EXTERNAL_ALERT_SCOPED
+        if scope_id is not None
+        else _LOAD_EXTERNAL_ALERT_GLOBAL
+    )
+    params: dict[str, object] = {
+        "alert_id": uuid.uuid4(),
+        "server_id": scope_id,
+        "dedup_key": notice_key,
+        "severity": severity,
+        "title": checked_title,
+        "body": checked_body,
+        "source": checked_source,
+        "context_ref": (
+            _truncate(context_ref, CONTEXT_REF_MAX_CHARS)
+            if context_ref is not None
+            else None
+        ),
+        "delivered_at": at,
+        "created_at": at,
+        "retain_until": at + RETENTION_HORIZON,
+    }
+    async with sessions() as session:
+        inserted = (await session.execute(insert, params)).first()
+        await session.commit()
+    if inserted is not None:
+        return NoticeOutcome(
+            alert_id=inserted[0],
+            dedup_key=notice_key,
+            disposition="created",
+            delivery="delivered",
+        )
+    # Replay: the scope's arbiter already holds this logical key — return
+    # the committed row's identity, never a duplicate.
+    async with sessions() as session:
+        existing = (
+            (
+                await session.execute(
+                    load, {"server_id": scope_id, "dedup_key": notice_key}
+                )
+            )
+            .mappings()
+            .first()
+        )
+        await session.commit()
+    if existing is None:  # unreachable: the arbiter row raced away
+        raise NotificationError(
+            NotificationErrorCode.INVALID_DRAFT,
+            "existing external notice vanished between insert and load",
+        )
+    return NoticeOutcome(
+        alert_id=existing["alert_id"],  # type: ignore[arg-type]
+        dedup_key=notice_key,
+        disposition="deduped",
+        delivery="skipped",
     )
 
 
