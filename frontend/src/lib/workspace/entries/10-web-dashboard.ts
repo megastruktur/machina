@@ -119,6 +119,15 @@ export interface OverviewLinks {
 	openApplications(serverId: string): void;
 	/** Open the runs/schedules management panel for one server. */
 	openJobs(serverId: string): void;
+	/**
+	 * Optional: open (or focus) the ONE fleet-wide `notifications` window with
+	 * THIS server's inbox filter pre-selected — the cross-panel hand-off to
+	 * the `14-web-notifications` global entry (the filter is the panel's own
+	 * explicit query param; the window itself stays fleet-wide, C01 rule 2).
+	 * Omitted ⇒ the overview's «View in Inbox →» control fails closed and
+	 * does not render (never a fake navigation).
+	 */
+	openNotifications?(serverId: string): void;
 }
 
 /**

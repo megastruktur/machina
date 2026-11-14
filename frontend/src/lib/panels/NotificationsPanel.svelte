@@ -66,6 +66,7 @@
 		MarkAllReadResult,
 		NotificationFilterQuery,
 		NotificationsApi,
+		NotificationsFilterHandoff,
 		ProfileResponse
 	} from '../workspace/entries/14-web-notifications.js';
 
@@ -561,6 +562,48 @@
 			await sleep(BACKOFF_MS, controller.signal);
 		}
 	}
+
+	// --- the host's sequenced server-filter handoff (cross-panel seam) -------
+
+	/**
+	 * Narrow the optional handoff seam (the OverviewPanel «View in Inbox →»
+	 * journey). Absent or incomplete ⇒ null: the panel stays the plain
+	 * fleet-wide inbox and never guesses a scope (C01 rule 2).
+	 */
+	function readHandoffSeam(services: PanelServices): NotificationsFilterHandoff | null {
+		const candidate = services.handoff as Partial<NotificationsFilterHandoff> | null | undefined;
+		if (typeof candidate !== 'object' || candidate === null) return null;
+		if (typeof candidate.read !== 'function' || typeof candidate.consume !== 'function') {
+			return null;
+		}
+		return candidate as NotificationsFilterHandoff;
+	}
+
+	const handoffSeam = $derived(readHandoffSeam(panel.services));
+
+	/** Plain bookkeeping of the last handoff seq THIS instance applied. */
+	let appliedHandoffSeq = 0;
+
+	/**
+	 * Apply a pending handoff exactly once per seq, BEFORE the mount cycle's
+	 * first reads (created above them, so a fresh open mounts already
+	 * filtered): switch to the Inbox tab and pin the requested server scope
+	 * through the same `setScope` path the toolbar uses — ONE canonical query
+	 * change, refetch included. When the singleton window is already mounted,
+	 * the shell's sequenced state change re-runs this effect and the newer
+	 * request wins. The request is consumed exactly once, so a later plain
+	 * open of the window starts unfiltered.
+	 */
+	$effect(() => {
+		const seam = handoffSeam;
+		if (seam === null) return;
+		const request = seam.read();
+		if (request === null || request.seq === appliedHandoffSeq) return;
+		appliedHandoffSeq = request.seq;
+		activeTab = 'inbox';
+		setScope(request.serverId);
+		seam.consume(request.seq);
+	});
 
 	// --- mount cycle (the $effect teardown is the release path) ---------------
 

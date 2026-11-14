@@ -146,9 +146,32 @@ export interface NotificationsApi {
 	revokeIngestKey(keyId: string): Promise<RevokeIngestKeyResult>;
 }
 
+/**
+ * The host's ONE sequenced server-filter handoff — the pre-authorized
+ * cross-panel seam that lets the OverviewPanel's «View in Inbox →» control
+ * drive THIS fleet-wide window (the window itself stays global; the server
+ * filter is an explicit canonical query param, C01 rule 2 — the seam never
+ * pins a scope). `read()` returns the latest request `{serverId, seq}` or
+ * `null`; `seq` strictly increases per request so the panel can apply each
+ * handoff exactly once (including when the singleton window is already
+ * mounted). `consume(seq)` acknowledges one applied request so the host may
+ * clear it — a later plain open of the window starts unfiltered.
+ */
+export interface NotificationsFilterHandoff {
+	/** Latest handoff request, or `null` when none is pending. */
+	read(): { serverId: string; seq: number } | null;
+	/** Acknowledge one applied request (idempotent per seq). */
+	consume(seq: number): void;
+}
+
 /** Typed services bag the notifications panel requires from its opener. */
 export interface NotificationsServices {
 	readonly api: NotificationsApi;
+	/**
+	 * Optional handoff seam (the shell wires it; unwired hosts pass `null`
+	 * and the panel fails closed to the plain fleet-wide inbox).
+	 */
+	readonly handoff: NotificationsFilterHandoff | null;
 }
 
 /** The feature entry for composition into the app's one panel registry. */
@@ -172,11 +195,14 @@ export function notificationsEntry(): PanelEntryInput {
 
 /**
  * Typed services bag factory for openers (the composed desktop passes
- * `notificationsServices(client)` into its panel hosts; `nbi-fe-shell`
- * composes this from the one `MaiApiClient`). Freezing keeps the bag
- * read-only from the panel's side; the panel still fails closed when the
- * bag is missing or incomplete.
+ * `notificationsServices(slice, handoff)` into its panel hosts; `nbi-fe-shell`
+ * composes the slice from the one `MaiApiClient` and owns the ONE sequenced
+ * handoff seam). Freezing keeps the bag read-only from the panel's side; the
+ * panel still fails closed when the bag is missing or incomplete.
  */
-export function notificationsServices(api: NotificationsApi): NotificationsServices {
-	return Object.freeze({ api });
+export function notificationsServices(
+	api: NotificationsApi,
+	handoff: NotificationsFilterHandoff | null = null
+): NotificationsServices {
+	return Object.freeze({ api, handoff });
 }
