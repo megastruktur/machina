@@ -108,7 +108,8 @@ from mai.contracts.tool_results import (
     ExecutionStatus,
 )
 from mai.plugins.registry import CapabilityDescriptor, CapabilityRegistry
-from mai.policy.evaluate import ExecutionContext
+from mai.capabilities.internal_api import SERVER_PROFILE_UPDATE_CAPABILITY
+from mai.policy.evaluate import ExecutionContext, PolicyMode
 from mai.policy.exposure import ObjectiveExposure
 from mai.jobs.resource_locks import ResourceLockError, ResourceLockService
 
@@ -1264,8 +1265,19 @@ class CapabilityToolBridge:
         )
         if violation is not None:
             raise BridgeError(BridgeErrorCode.PAYLOAD_SCHEMA_MISMATCH, violation)
+        # FRR T5 security core: interactive sessions run DELEGATED, where a
+        # `mutate` capability would execute WITHOUT approval (policy
+        # evaluate(): requires_approval only in ASK). ``server.profile.update``
+        # must be captain-approved on EVERY call, so this seam pins the
+        # context mode to ASK for it alone — dataclasses.replace rebuilds the
+        # frozen context with identical grants/policy/scope (a mode can only
+        # ADD a prompt, never widen a grant). The resume path re-enters
+        # through this same method, so ASK holds on resume too.
+        dispatch_context = self._context
+        if capability_id == SERVER_PROFILE_UPDATE_CAPABILITY:
+            dispatch_context = replace(self._context, mode=PolicyMode.ASK)
         return await self._dispatcher.dispatch(
-            context=self._context,
+            context=dispatch_context,
             capability_id=capability_id,
             payload=payload,
             approval_id=approval_id,
