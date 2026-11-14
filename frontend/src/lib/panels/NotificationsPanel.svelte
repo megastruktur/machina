@@ -54,6 +54,7 @@
 
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import IngestKeysSection from '../components/IngestKeysSection.svelte';
 	import Button from '../ui/Button.svelte';
 	import Chip from '../ui/Chip.svelte';
 	import SearchFilterInput from '../ui/SearchFilterInput.svelte';
@@ -155,6 +156,10 @@
 	 * control sits at «All»/empty. The derived object's IDENTITY is the
 	 * race guard's filter snapshot: it changes only when a control changes.
 	 */
+	/** The tab seam (nbi-fe-sources): Inbox is the default so the inbox
+	 * loads exactly as before; Sources mounts the ingest-key section. */
+	let activeTab = $state<'inbox' | 'sources'>('inbox');
+
 	type ReadChoice = 'all' | 'unread' | 'read';
 	type OriginChoice = 'all' | AlertOrigin;
 
@@ -624,9 +629,37 @@
 			</div>
 		</header>
 
-		<!-- Tab seam (nbi-fe-sources): the Inbox/Sources tab strip mounts here,
-			between the header and this toolbar; everything below stays
-			tab-content-agnostic. -->
+		<!-- Tab seam (nbi-fe-sources): Inbox is the default tab, Sources mounts
+			the ingest-key section (api bag + loaded profiles). The inbox markup
+			below is the {:else} arm of this strip and stays tab-content-agnostic;
+			its state survives tab switches and re-renders without a refetch. -->
+		<div class="mai-notifications__tabs" role="tablist" aria-label="Notification surfaces">
+			<button
+				type="button"
+				role="tab"
+				aria-selected={activeTab === 'inbox'}
+				class="mai-notifications__tab"
+				class:mai-notifications__tab--active={activeTab === 'inbox'}
+				onclick={() => (activeTab = 'inbox')}
+				data-testid="tab-inbox"
+			>
+				Inbox
+			</button>
+			<button
+				type="button"
+				role="tab"
+				aria-selected={activeTab === 'sources'}
+				class="mai-notifications__tab"
+				class:mai-notifications__tab--active={activeTab === 'sources'}
+				onclick={() => (activeTab = 'sources')}
+				data-testid="tab-sources"
+			>
+				Sources
+			</button>
+		</div>
+		{#if activeTab === 'sources'}
+			<IngestKeysSection {api} profiles={profiles} />
+		{:else}
 		<div class="mai-notifications__toolbar" role="group" aria-label="Inbox filters">
 			<SearchFilterInput
 				bind:value={searchInput}
@@ -837,6 +870,7 @@
 				</p>
 			{/if}
 		{/if}
+		{/if}
 	{/if}
 </div>
 
@@ -880,6 +914,29 @@
 		align-items: center;
 		gap: var(--mai-space-2, 0.5rem);
 		flex-wrap: wrap;
+	}
+
+	/* Tab seam (nbi-fe-sources): Inbox / Sources strip under the header. */
+	.mai-notifications__tabs {
+		display: inline-flex;
+		gap: var(--mai-space-1, 0.25rem);
+		border-bottom: 1px solid var(--mai-color-border);
+	}
+
+	.mai-notifications__tab {
+		appearance: none;
+		background: none;
+		border: none;
+		border-bottom: 2px solid transparent;
+		cursor: pointer;
+		font: inherit;
+		color: var(--mai-color-text-muted);
+		padding: var(--mai-space-1, 0.25rem) var(--mai-space-2, 0.5rem);
+	}
+
+	.mai-notifications__tab--active {
+		color: var(--mai-color-text);
+		border-bottom-color: var(--mai-color-brass, var(--mai-color-text));
 	}
 
 	/* Filter toolbar: search grows, the controls wrap on narrow windows. */

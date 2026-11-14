@@ -43,6 +43,25 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
  *    surfaces envelope errors without optimistic flips;
  * 10. switching filters mid-load is race-safe: a stale in-flight response
  *     from an older filter epoch is discarded, the newer filter state wins.
+ *
+ * nbi-fe-sources adds (the Sources tab; notification-inbox.md §6/§7):
+ * 11. the tab seam defaults to Inbox (tests 1–10 stay unmodified) and
+ *     Sources mounts the bounded ingest-key list: Load more appends rows
+ *     deduplicated by `key_id`, honest loading/empty/error(+Retry) states,
+ *     and NO secret column ever (no `key_hash`, no plaintext, anywhere);
+ * 12. the mint flow shows the receipt plaintext EXACTLY ONCE in a modal —
+ *     copy via the clipboard writes the exact secret with visible feedback,
+ *     the «will not be shown again» warning renders, focus moves into the
+ *     dialog on open and back to the create control on close, the §7 curl
+ *     example carries the `$MAI_INGEST_KEY` placeholder (never the secret),
+ *     and closing clears the plaintext from DOM and web storage entirely;
+ * 13. the mint Scope select offers Global + enrolled servers (deterministic
+ *     order); a Global mint omits `server_id`, a scoped mint carries it and
+ *     the new row renders the enrolled display name;
+ * 14. revoke is receipt-driven: an inline confirm gates the call, the row
+ *     flips to the server's `revoked_at` only via the durable refetch after
+ *     the receipt, and create/revoke envelope failures surface honestly
+ *     without optimistic state changes.
  */
 
 const FIXTURE_URL = '/mai-notifications-fixture/';
@@ -73,6 +92,10 @@ const UNACK_STAMP = '2026-11-14T12:30:00Z';
 const PAGE_LIMIT = 50;
 /** Total seeded notices: first page 50, the rest reachable via Load more. */
 const TOTAL_NOTICES = 55;
+/** The revoke receipt's server stamp (the fixture's durable truth). */
+const REVOKE_STAMP = '2026-11-14T10:15:00.000Z';
+/** Seeded ingest keys: keys page 20, the rest reachable via Load more. */
+const TOTAL_KEYS = 26;
 
 /** Untruncated runtime-failure receipt: a page error is a harness defect. */
 const pageErrors: string[] = [];
@@ -93,10 +116,17 @@ interface NotificationsWindowApi {
 	failNextMarkAll(failure: Fail | null): void;
 	failNextProfiles(failure: Fail | null): void;
 	failNextStream(failure: Fail | null): void;
+	failNextListKeys(failure: Fail | null): void;
+	failNextCreateKey(failure: Fail | null): void;
+	failNextRevokeKey(failure: Fail | null): void;
 	armEmptyInbox(): void;
+	armEmptyKeys(): void;
 	/** Stall the NEXT inbox list response until releaseInboxHold resolves it. */
 	holdNextInbox(): void;
 	releaseInboxHold(): void;
+	/** Stall the NEXT ingest-key list response until releaseKeysHold resolves it. */
+	holdNextKeys(): void;
+	releaseKeysHold(): void;
 	deliverWakeup(frame: Record<string, unknown>): void;
 	endStream(): void;
 	registry: {
@@ -116,6 +146,8 @@ interface NotificationsWindowApi {
 declare global {
 	interface Window {
 		__maiNotificationsApi?: NotificationsWindowApi;
+		/** Clipboard writes recorded by the addInitScript stub (Playwright-safe). */
+		__maiClipboardWrites?: string[];
 		/** Set only if hostile fixture text ever executed — must stay undefined. */
 		__maiXssFired?: boolean;
 	}
@@ -150,8 +182,10 @@ const APP_SOURCE = `
 	const SERVER_B_NAME = '${SERVER_B_NAME}';
 	const ACK_STAMP = '${ACK_STAMP}';
 	const UNACK_STAMP = '${UNACK_STAMP}';
+	const REVOKE_STAMP = '${REVOKE_STAMP}';
 	const PAGE_LIMIT = ${PAGE_LIMIT};
 	const TOTAL_NOTICES = ${TOTAL_NOTICES};
+	const TOTAL_KEYS = ${TOTAL_KEYS};
 
 	// --- wire-view builders (the generated schema's exact field sets) --------
 
@@ -225,12 +259,49 @@ const APP_SOURCE = `
 		};
 	}
 
+	function ingestKeyIdOf(index) {
+		return 'ee000000-0000-4000-8000-' + String(index).padStart(12, '0');
+	}
+
+	function ingestKeyRow(index) {
+		// Newest first: index 0 is the newest key (route ORDER BY created_at DESC).
+		var scoped = index % 3 === 1 ? SERVER_A : index % 3 === 2 ? SERVER_B : null;
+		var revoked = index === 2;
+		var expired = index === 3;
+		return {
+			key_id: ingestKeyIdOf(index),
+			label: 'seed-key-' + index,
+			server_id: scoped,
+			created_at: new Date(Date.UTC(2026, 9, 10, 8, 0, 0) - index * 3600000).toISOString(),
+			last_used_at:
+				index % 2 === 0
+					? new Date(Date.UTC(2026, 9, 10, 8, 0, 0) - index * 1800000).toISOString()
+					: null,
+			expires_at: expired ? new Date(Date.UTC(2026, 9, 10, 7, 59, 59)).toISOString() : null,
+			revoked_at: revoked ? new Date(Date.UTC(2026, 9, 12, 7, 30, 0)).toISOString() : null
+		};
+	}
+
 	// --- the durable truth (fresh module evaluation per test) -----------------
 
 	var notices = [];
 	for (var index = 0; index < TOTAL_NOTICES; index += 1) notices.push(noticeRow(index));
 	// Deterministic (name, id) order, as the profiles route answers.
 	var profiles = [profileRow(SERVER_A, SERVER_A_NAME), profileRow(SERVER_B, SERVER_B_NAME)];
+	var ingestKeys = [];
+	for (var keyIndex = 0; keyIndex < TOTAL_KEYS; keyIndex += 1) ingestKeys.push(ingestKeyRow(keyIndex));
+
+	function ingestKeyById(keyId) {
+		for (var i = 0; i < ingestKeys.length; i += 1) {
+			if (ingestKeys[i].key_id === keyId) return ingestKeys[i];
+		}
+		return null;
+	}
+
+	// Mint-time truth: every minted key carries the same receipt stamp and
+	// unshifts (newest first), so its key_id stays deterministic per test.
+	var CREATE_STAMP = '2026-11-14T11:00:00.000Z';
+	var mintedKeys = 0;
 
 	function applyFilters(query, rows) {
 		var filtered = rows;
@@ -273,17 +344,33 @@ const APP_SOURCE = `
 	/**
 	 * One-shot failure arms, consumed by the next call to their op: the slot
 	 * is cleared at the call site (a helper that nulled its own parameter
-	 * would leave the arm set forever).
+	 * would leave the arm set forever). The ingest-key ops carry DEDICATED
+	 * arms (nbi-fe-sources) — an inbox/profile failure never fires on a key
+	 * call and vice versa.
 	 */
-	var arms = { inbox: null, unread: null, ack: null, markAll: null, profiles: null, stream: null };
+	var arms = {
+		inbox: null,
+		unread: null,
+		ack: null,
+		markAll: null,
+		profiles: null,
+		stream: null,
+		listKeys: null,
+		createKey: null,
+		revokeKey: null
+	};
 	var emptyInboxOnce = false;
+	var emptyKeysOnce = false;
 	/**
 	 * Inbox response gates: 'holdNextInbox' arms one gate, the next
 	 * listInboxNotifications call consumes and awaits it, and
 	 * 'releaseInboxHold' resolves it — the race-safety proof's slow lane.
+	 * The ingest-key list mirrors the same machinery ('holdNextKeys').
 	 */
 	var inboxGates = [];
 	var heldInbox = [];
+	var keysGates = [];
+	var heldKeys = [];
 
 	function record(op, payload, args) {
 		calls.push({ op: op, payload: payload, args: args || [] });
@@ -416,20 +503,68 @@ const APP_SOURCE = `
 			throwArm('profiles');
 			return { servers: deep(profiles) };
 		},
+		// The ingest-key surface (nbi-fe-sources): producer-mirroring page
+		// envelope, mint receipts carrying the plaintext EXACTLY ONCE, and an
+		// idempotent revoke receipt. listIngestKeys mirrors the inbox page
+		// builder: explicit limit/offset ride the query, total/has_more come
+		// from the pre-slice collection.
 		listIngestKeys: async function (page) {
 			record('listIngestKeys', page ? deep(page) : null);
-			throwArm('inbox');
-			return { keys: [], limit: 50, offset: 0, total: 0, has_more: false };
+			throwArm('listKeys');
+			if (keysGates.length > 0) {
+				var keysGate = keysGates.shift();
+				heldKeys.push(keysGate);
+				await keysGate.promise;
+			}
+			if (emptyKeysOnce) {
+				emptyKeysOnce = false;
+				return { keys: [], limit: 50, offset: 0, total: 0, has_more: false };
+			}
+			var keyOffset = page && page.offset !== undefined ? page.offset : 0;
+			var keyLimit = page && page.limit !== undefined ? page.limit : 50;
+			var keyRows = ingestKeys.slice(keyOffset, keyOffset + keyLimit);
+			return {
+				keys: deep(keyRows),
+				limit: keyLimit,
+				offset: keyOffset,
+				total: ingestKeys.length,
+				has_more: keyOffset + keyRows.length < ingestKeys.length
+			};
 		},
 		createIngestKey: async function (payload) {
 			record('createIngestKey', payload ? deep(payload) : null);
-			throwArm('ack');
-			throw new ApiError(501, 'not_implemented', 'key minting is the sources task surface');
+			throwArm('createKey');
+			// §6: label 1..64, omitting server_id mints a GLOBAL key, the
+			// plaintext rides the receipt EXACTLY ONCE, only metadata persists.
+			var label = payload && typeof payload.label === 'string' ? payload.label : '';
+			if (label.trim().length < 1 || label.trim().length > 64) {
+				throw new ApiError(422, 'validation_failed', 'label must be 1..64 characters');
+			}
+			mintedKeys += 1;
+			var minted = {
+				key_id: 'ee111111-0000-4000-8000-' + String(mintedKeys).padStart(12, '0'),
+				label: label.trim(),
+				server_id: payload && payload.server_id ? payload.server_id : null,
+				created_at: CREATE_STAMP,
+				last_used_at: null,
+				expires_at: payload && payload.expires_at ? payload.expires_at : null,
+				revoked_at: null
+			};
+			// Newest first — the route ORDER BY created_at DESC.
+			ingestKeys.unshift(minted);
+			var receipt = deep(minted);
+			// The one-time secret: deterministic per mint, never stored on the row.
+			receipt.key = 'mai-k-' + minted.key_id;
+			return receipt;
 		},
 		revokeIngestKey: async function (keyId) {
 			record('revokeIngestKey', null, [keyId]);
-			throwArm('ack');
-			return { revoked: false };
+			throwArm('revokeKey');
+			var keyRow = ingestKeyById(keyId);
+			// Idempotent receipt: revoked=false covers unknown/already-revoked.
+			if (!keyRow || keyRow.revoked_at !== null) return { key_id: keyId, revoked: false };
+			keyRow.revoked_at = REVOKE_STAMP;
+			return { key_id: keyId, revoked: true };
 		}
 	};
 
@@ -487,8 +622,20 @@ const APP_SOURCE = `
 		failNextStream: function (failure) {
 			arms.stream = failure;
 		},
+		failNextListKeys: function (failure) {
+			arms.listKeys = failure;
+		},
+		failNextCreateKey: function (failure) {
+			arms.createKey = failure;
+		},
+		failNextRevokeKey: function (failure) {
+			arms.revokeKey = failure;
+		},
 		armEmptyInbox: function () {
 			emptyInboxOnce = true;
+		},
+		armEmptyKeys: function () {
+			emptyKeysOnce = true;
 		},
 		holdNextInbox: function () {
 			inboxGates.push(Promise.withResolvers());
@@ -497,6 +644,14 @@ const APP_SOURCE = `
 			var gate = heldInbox.shift();
 			if (!gate) throw new Error('no inbox call is currently held');
 			gate.resolve();
+		},
+		holdNextKeys: function () {
+			keysGates.push(Promise.withResolvers());
+		},
+		releaseKeysHold: function () {
+			var keyGate = heldKeys.shift();
+			if (!keyGate) throw new Error('no ingest-key call is currently held');
+			keyGate.resolve();
 		},
 		// Identity-only delivery in spirit, deliberately HOSTILE in shape: the
 		// raw frame object reaches onWakeup so the proof shows the panel reads
@@ -699,6 +854,21 @@ test.beforeEach(async ({ page }) => {
 	page.on('console', (message) => {
 		if (message.type() === 'error') console.log(`[console.error] ${message.text()}`);
 	});
+	// Deterministic clipboard seam: headless writeText permission behavior is
+	// environment-dependent, so the stub records every write for assertion.
+	await page.addInitScript(() => {
+		const writes: string[] = [];
+		Object.defineProperty(navigator, 'clipboard', {
+			value: {
+				writeText: (text: string) => {
+					writes.push(text);
+					return Promise.resolve();
+				}
+			},
+			configurable: true
+		});
+		window.__maiClipboardWrites = writes;
+	});
 	await page.goto(FIXTURE_URL);
 });
 
@@ -750,6 +920,11 @@ function callsOf(calls: RecordedCall[], op: string): RecordedCall[] {
 /** The alert id fixture for the row at newest-first position `index`. */
 function alertIdOf(index: number): string {
 	return `aa000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+}
+
+/** The ingest-key fixture id for the seed at newest-first position `index`. */
+function keyIdOf(index: number): string {
+	return `ee000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
 }
 
 /** The global host's panel root, scoped for row/heading assertions. */
@@ -1490,5 +1665,308 @@ test('switching filters mid-load ignores the stale in-flight response', async ({
 		'Global — 10 loaded'
 	);
 	await expect(host.getByTestId('unread-count')).toHaveText('Unread: 48');
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 11. Sources tab: bounded key list, Load more dedup, honest states, NO secrets
+// ---------------------------------------------------------------------------
+
+test('sources tab: bounded key list loads pages honestly and never shows key material', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notifications-root')).toBeVisible();
+	// Inbox is the DEFAULT tab: the inbox toolbar is live before any switch.
+	await expect(host.getByTestId('notifications-search')).toBeVisible();
+	await expect(host.getByTestId('keys-root')).toHaveCount(0);
+
+	// Switching to Sources mounts the ingest-key section; the inbox toolbar
+	// unmounts (the surfaces are mutually exclusive tab content).
+	await host.getByTestId('tab-sources').click();
+	await expect(host.getByTestId('keys-root')).toBeVisible();
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+	await expect(host.getByTestId('notifications-search')).toHaveCount(0);
+
+	// Metadata columns only — no `key_hash`, no plaintext material, anywhere.
+	const bodyText = await page.evaluate(() => document.body.textContent ?? '');
+	expect(bodyText).not.toContain('key_hash');
+	expect(bodyText).not.toContain('mai-k-');
+
+	// Scope renders Global / enrolled display names in seeded variety; the
+	// revoked seed shows its status and the server's stamp, the active seed
+	// reads active with an honest em-dash.
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-scope')).toHaveText('Global');
+	await expect(host.getByTestId('key-row').nth(1).getByTestId('key-scope')).toHaveText(
+		SERVER_A_NAME
+	);
+	await expect(host.getByTestId('key-row').nth(2).getByTestId('key-scope')).toHaveText(
+		SERVER_B_NAME
+	);
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-status')).toHaveText('active');
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-revoked-at')).toHaveText('—');
+	await expect(host.getByTestId('key-row').nth(2).getByTestId('key-status')).toHaveText('revoked');
+	await expect(host.getByTestId('key-row').nth(2)).toHaveAttribute('data-revoked', 'true');
+
+	const { calls } = await apiState(page);
+	const keyLists = callsOf(calls, 'listIngestKeys');
+	expect(keyLists).toHaveLength(1);
+	expect(keyLists[0].payload).toEqual({ limit: 20, offset: 0 });
+
+	// Load more: exactly one more call at offset 20; rows append deduplicated.
+	await expect(host.getByTestId('keys-load-more')).toHaveText('Load more (20 of 26)');
+	await host.getByTestId('keys-load-more').click();
+	await expect(host.getByTestId('key-row')).toHaveCount(26);
+	await expect(host.getByTestId('key-row').nth(25).getByTestId('key-label')).toHaveText(
+		'seed-key-25'
+	);
+	const uniqueKeyIds = await page.evaluate(() => {
+		const ids = Array.from(
+			document.querySelectorAll('[data-testid="key-row"]'),
+			(row) => (row as HTMLElement).dataset.keyId
+		);
+		return { total: ids.length, unique: new Set(ids).size };
+	});
+	expect(uniqueKeyIds.total).toBe(26);
+	expect(uniqueKeyIds.unique).toBe(26);
+	await expect(host.getByTestId('keys-load-more')).toHaveCount(0);
+	await expect(host.getByTestId('keys-page-count')).toHaveText('26 of 26 ingest keys loaded.');
+	const { calls: afterLoadMore } = await apiState(page);
+	const keyListsAfter = callsOf(afterLoadMore, 'listIngestKeys');
+	expect(keyListsAfter[1].payload).toEqual({ limit: 20, offset: 20 });
+
+	// Error state: the envelope code renders with a Retry control; retry on a
+	// disarmed producer restores the bounded page.
+	await apiCall(page, 'failNextListKeys', [
+		{ status: 503, code: 'service_unavailable', message: 'keys store unavailable' }
+	]);
+	await host.getByTestId('keys-refresh').click();
+	await expect(host.getByTestId('keys-error')).toBeVisible();
+	await expect(host.getByTestId('keys-error')).toHaveAttribute(
+		'data-error-code',
+		'service_unavailable'
+	);
+	await expect(host.getByTestId('keys-error')).toContainText('keys store unavailable');
+	await host.getByTestId('keys-retry').click();
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+
+	// Empty state: the armed empty page renders the minting hint.
+	await apiCall(page, 'armEmptyKeys');
+	await host.getByTestId('keys-refresh').click();
+	await expect(host.getByTestId('keys-empty')).toBeVisible();
+
+	// Loading state: the held page keeps an honest loading note until release.
+	await apiCall(page, 'holdNextKeys');
+	await host.getByTestId('keys-refresh').click();
+	await expect(host.getByTestId('keys-loading')).toBeVisible();
+	await apiCall(page, 'releaseKeysHold');
+	await expect(host.getByTestId('keys-loading')).toHaveCount(0);
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 12. Sources tab: one-time secret modal — copy, warning, focus, zero traces
+// ---------------------------------------------------------------------------
+
+test('sources tab: minting shows the plaintext once, copies it, and close clears every trace', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notifications-root')).toBeVisible();
+	await host.getByTestId('tab-sources').click();
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+
+	// A blank label never reaches the wire: the create call is not recorded.
+	const callsBeforeBlank = (await apiState(page)).calls.length;
+	await host.getByTestId('keys-create').click();
+	expect((await apiState(page)).calls.length).toBe(callsBeforeBlank);
+	await expect(host.getByTestId('issued-key-modal')).toHaveCount(0);
+
+	// Mint a GLOBAL key with an optional expiry: the wire payload carries the
+	// trimmed label + ISO expiry and OMITS server_id (§6: omission = global).
+	await host.getByTestId('keys-new-label').fill('host-monitor-2');
+	await host.getByTestId('keys-new-expires').fill('2027-01-01T00:00');
+	await host.getByTestId('keys-create').click();
+	await expect(host.getByTestId('issued-key-modal')).toBeVisible();
+
+	const { calls } = await apiState(page);
+	const mints = callsOf(calls, 'createIngestKey');
+	expect(mints).toHaveLength(1);
+	const expectedExpiry = new Date('2027-01-01T00:00').toISOString();
+	expect(mints[0].payload).toEqual({ label: 'host-monitor-2', expires_at: expectedExpiry });
+
+	// The one-time modal: warning, the §7 publish example with the
+	// PLACEHOLDER (never the secret), and the plaintext exactly here.
+	const modal = host.getByTestId('issued-key-modal');
+	await expect(modal.getByTestId('issued-key-warning')).toContainText('will not be shown again');
+	const curlText = (await modal.getByTestId('issued-key-curl').textContent()) ?? '';
+	expect(curlText).toContain('$MAI_INGEST_KEY');
+	expect(curlText).toContain('notifications/ingest');
+	const plaintext = (await modal.getByTestId('issued-key-value').textContent()) ?? '';
+	expect(plaintext).toMatch(/^mai-k-/);
+	expect(curlText).not.toContain(plaintext);
+
+	// Focus moved INTO the dialog on open.
+	expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid'))).toBe(
+		'issued-key-modal'
+	);
+
+	// Copy: the exact secret reaches the clipboard; the feedback confirms.
+	await host.getByTestId('issued-key-copy').click();
+	expect(await page.evaluate(() => window.__maiClipboardWrites)).toEqual([plaintext]);
+	await expect(modal.getByTestId('issued-key-copied')).toHaveText('Copied to clipboard.');
+
+	// Close: the modal unmounts and the secret is absent from the DOM and
+	// from localStorage/sessionStorage (it was never persisted anywhere).
+	await host.getByTestId('issued-key-close').click();
+	await expect(host.getByTestId('issued-key-modal')).toHaveCount(0);
+	const absence = await page.evaluate(() => ({
+		html: document.documentElement.outerHTML,
+		local: JSON.stringify(localStorage),
+		session: JSON.stringify(sessionStorage),
+		focused: document.activeElement?.getAttribute('data-testid') ?? null
+	}));
+	expect(absence.html).not.toContain(plaintext);
+	expect(absence.local).not.toContain(plaintext);
+	expect(absence.session).not.toContain(plaintext);
+	// Focus management on close: back to the create control that triggered it.
+	expect(absence.focused).toBe('keys-create');
+
+	// The refreshed durable list carries the minted key: newest first,
+	// Global scope, the mint receipt's metadata.
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-label')).toHaveText(
+		'host-monitor-2'
+	);
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-scope')).toHaveText('Global');
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+	const { calls: finalCalls } = await apiState(page);
+	const finalKeyLists = callsOf(finalCalls, 'listIngestKeys');
+	expect(finalKeyLists[finalKeyLists.length - 1].payload).toEqual({ limit: 20, offset: 0 });
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 13. Sources tab: mint scope select — Global + enrolled servers, rendered scope
+// ---------------------------------------------------------------------------
+
+test('sources tab: scope select offers Global plus enrolled servers and a scoped key renders its server', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notifications-root')).toBeVisible();
+	await host.getByTestId('tab-sources').click();
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+
+	// The mint Scope select: Global first, then enrolled servers in the
+	// deterministic (name, id) order the profiles route answers.
+	const scopeSelect = host.getByTestId('keys-new-scope');
+	expect(await scopeSelect.locator('option').allTextContents()).toEqual([
+		'Global',
+		SERVER_A_NAME,
+		SERVER_B_NAME
+	]);
+
+	// A scoped mint carries the explicit server_id and NO expiry field.
+	await host.getByTestId('keys-new-label').fill('beta-publisher');
+	await scopeSelect.selectOption(SERVER_B);
+	await host.getByTestId('keys-create').click();
+	await expect(host.getByTestId('issued-key-modal')).toBeVisible();
+	let { calls } = await apiState(page);
+	const mints = callsOf(calls, 'createIngestKey');
+	expect(mints).toHaveLength(1);
+	expect(mints[0].payload).toEqual({ label: 'beta-publisher', server_id: SERVER_B });
+
+	// The refreshed row renders the enrolled DISPLAY name, not the raw id.
+	await host.getByTestId('issued-key-close').click();
+	await expect(host.getByTestId('issued-key-modal')).toHaveCount(0);
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-label')).toHaveText(
+		'beta-publisher'
+	);
+	await expect(host.getByTestId('key-row').nth(0).getByTestId('key-scope')).toHaveText(
+		SERVER_B_NAME
+	);
+
+	// Back to Inbox: the retained page re-renders WITHOUT a refetch — the
+	// inbox state survives the tab switch (the seam owns no extra loads).
+	await host.getByTestId('tab-inbox').click();
+	await expect(host.getByTestId('notice-row')).toHaveCount(50);
+	const { calls: finalCalls } = await apiState(page);
+	expect(callsOf(finalCalls, 'listInboxNotifications')).toHaveLength(1);
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// 14. Sources tab: revoke flips the row per receipt; failures surface envelopes
+// ---------------------------------------------------------------------------
+
+test('sources tab: revoke flips the row per receipt and failures surface envelopes', async ({
+	page
+}) => {
+	const host = panel(page);
+	await expect(host.getByTestId('notifications-root')).toBeVisible();
+	await host.getByTestId('tab-sources').click();
+	await expect(host.getByTestId('key-row')).toHaveCount(20);
+
+	// The already-revoked seed row exposes NO revoke control.
+	await expect(host.getByTestId('key-row').nth(2).getByTestId('key-revoke')).toHaveCount(0);
+
+	// Active seed row 0: the inline confirm gates the destructive call;
+	// canceling records nothing and leaves the row untouched.
+	const row = host.getByTestId('key-row').nth(0);
+	await expect(row.getByTestId('key-status')).toHaveText('active');
+	await row.getByTestId('key-revoke').click();
+	await expect(row.getByTestId('key-revoke-confirm')).toBeVisible();
+	await row.getByTestId('key-revoke-cancel').click();
+	await expect(row.getByTestId('key-revoke-confirm')).toHaveCount(0);
+	let { calls } = await apiState(page);
+	expect(callsOf(calls, 'revokeIngestKey')).toHaveLength(0);
+
+	// Confirm: the receipt gates the durable refetch, and the ROW flips to
+	// the server's own stamp — never optimistic.
+	await row.getByTestId('key-revoke').click();
+	await row.getByTestId('key-revoke-confirm').click();
+	await expect(row.getByTestId('key-status')).toHaveText('revoked');
+	await expect(row).toHaveAttribute('data-revoked', 'true');
+	await expect(row.getByTestId('key-revoked-at')).toHaveText(REVOKE_STAMP);
+	({ calls } = await apiState(page));
+	const revokes = callsOf(calls, 'revokeIngestKey');
+	expect(revokes).toHaveLength(1);
+	expect(revokes[0].args).toEqual([keyIdOf(0)]);
+	const keyLists = callsOf(calls, 'listIngestKeys');
+	expect(keyLists.length).toBeGreaterThanOrEqual(2);
+	expect(keyLists[keyLists.length - 1].payload).toEqual({ limit: 20, offset: 0 });
+
+	// Revoke failure: the envelope surfaces, the row NEVER flips.
+	await apiCall(page, 'failNextRevokeKey', [
+		{ status: 503, code: 'service_unavailable', message: 'revoke refused by the store' }
+	]);
+	const otherRow = host.getByTestId('key-row').nth(1);
+	await otherRow.getByTestId('key-revoke').click();
+	await otherRow.getByTestId('key-revoke-confirm').click();
+	await expect(host.getByTestId('keys-problem')).toBeVisible();
+	await expect(host.getByTestId('keys-problem')).toHaveAttribute(
+		'data-error-code',
+		'service_unavailable'
+	);
+	await expect(host.getByTestId('keys-problem')).toContainText('revoke refused');
+	await expect(otherRow.getByTestId('key-status')).toHaveText('active');
+	await expect(otherRow).toHaveAttribute('data-revoked', 'false');
+
+	// Create failure: the envelope surfaces by the form, no modal mounts and
+	// no plaintext ever reaches the DOM.
+	await apiCall(page, 'failNextCreateKey', [
+		{ status: 422, code: 'validation_failed', message: 'label conflicts with an existing key' }
+	]);
+	await host.getByTestId('keys-new-label').fill('dupe-label');
+	await host.getByTestId('keys-create').click();
+	await expect(host.getByTestId('keys-create-error')).toBeVisible();
+	await expect(host.getByTestId('keys-create-error')).toHaveAttribute(
+		'data-error-code',
+		'validation_failed'
+	);
+	await expect(host.getByTestId('keys-create-error')).toContainText('label conflicts');
+	await expect(host.getByTestId('issued-key-modal')).toHaveCount(0);
+	expect(await page.evaluate(() => document.body.textContent ?? '')).not.toContain('mai-k-');
 	expect(pageErrors).toEqual([]);
 });
