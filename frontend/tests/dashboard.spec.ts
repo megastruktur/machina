@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
 import { build, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
@@ -495,7 +495,8 @@ const APP_SOURCE = `
 
 	const links = {
 		openApplications: (serverId) => record('openApplications', null, [serverId]),
-		openJobs: (serverId) => record('openJobs', null, [serverId])
+		openJobs: (serverId) => record('openJobs', null, [serverId]),
+		openNotifications: (serverId) => record('openNotifications', null, [serverId])
 	};
 	const chat = {
 		attach: (payload) => record('attach', deep(payload), [])
@@ -1451,4 +1452,510 @@ test('negative control: global scope or missing services fail closed with no uns
 		}
 	}
 	expect(pageErrors).toEqual([]);
+});
+
+test('the inbox hand-off link records the pinned scope and the per-server card stays unchanged', async ({
+	page
+}) => {
+	const hostA = page.getByTestId('host-a');
+	const hostNoseam = page.getByTestId('host-noseam');
+	await serverWindowsMounted(page);
+	await expect(hostNoseam.getByTestId('overview-root')).toBeVisible();
+
+	// Unwired links seam: the OPTIONAL hand-off control never renders (never
+	// a fake navigation), while the rest of the card stays untouched.
+	await expect(hostNoseam.getByTestId('inbox-view-link')).toHaveCount(0);
+
+	// With the seam: the «View in Inbox →» control rides the notifications
+	// card head and hands over exactly the window's pinned scope.
+	await expect(hostA.getByTestId('inbox-view-link')).toBeVisible();
+	await expect(hostA.getByTestId('inbox-count')).toHaveText('2 of 2 unacknowledged (latest page).');
+	await hostA.getByTestId('inbox-view-link').click();
+	const { calls } = await apiState(page);
+	expect(callsOf(calls, 'openNotifications')).toEqual([
+		{ op: 'openNotifications', payload: null, args: [SERVER_A] }
+	]);
+
+	// The hand-off leaves the per-server card untouched: the bounded preview
+	// and its ack controls render exactly as before.
+	await expect(hostA.getByTestId('notice-row')).toHaveCount(2);
+	await expect(hostA.getByTestId('ack-button')).toHaveCount(2);
+	await expect(hostA.getByTestId('inbox-count')).toHaveText('2 of 2 unacknowledged (latest page).');
+	expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// Desktop shell integration (campaign `notification-inbox`, nbi-fe-shell):
+// the REAL composed DesktopShell (real registry composition, real rail, real
+// feature entries + the real notifications panel) on a virtual-module
+// harness. The production build compiles the shell once per worker
+// (`$app/navigation` aliased to an inert stub — the shell only navigates on
+// live-host auth failures, which the mocks avoid); the API surface is the
+// reviewed producers' wire shapes served by route handlers with recorded
+// requests (the desktop-shell spec's live-nav convention).
+// ---------------------------------------------------------------------------
+
+const SHELL_FIXTURE_URL = '/mai-shell-fixture/';
+const SHELL = `${FRONTEND_ROOT}src/lib/workspace/DesktopShell.svelte`;
+
+/** A window frame locator for one panel kind (frames carry the panel kind). */
+function frame(page: Page, kind: string) {
+	return page.locator(`.mai-window-frame[data-panel-kind="${kind}"]`);
+}
+
+const SHELL_APP_ID = 'virtual:mai-shell-app.svelte';
+const SHELL_ENTRY_ID = 'virtual:mai-shell-entry.js';
+const SHELL_NAV_ID = 'virtual:mai-shell-navigation.js';
+
+type ShellChunk = { fileName: string; code: string };
+
+/** Recorded per-test request/state boundary for the shell route mocks. */
+const shellState = {
+	/** The ONE mutable inbox truth the list/count/ack mocks read and stamp. */
+	alertRows: [] as Array<Record<string, unknown>>,
+	unreadTotal: 4,
+	unreadCountRequests: 0,
+	inboxQueries: [] as string[],
+	ackRequests: 0
+};
+
+/** Fresh alert rows in the reviewed generated AlertView field set. */
+function shellAlertRows(): Array<Record<string, unknown>> {
+	return [
+		{
+			alert_id: 'cc111111-1111-4555-8666-777788889999',
+			server_id: SERVER_A,
+			origin: 'external',
+			dedup_key: 'disk-/var',
+			severity: 'warning',
+			title: 'Disk almost full',
+			summary: '/var usage 94% on the pinned server',
+			source: 'host-monitor',
+			body: 'The /var filesystem crossed the 90% watermark.',
+			context_ref: null,
+			delivery_status: 'delivered',
+			created_at: '2026-11-14T09:31:00Z',
+			delivered_at: '2026-11-14T09:31:01Z',
+			acknowledged_at: null,
+			acked: false,
+			finding_id: null,
+			run_id: null
+		},
+		{
+			alert_id: 'cc222222-2222-4555-8666-777788889999',
+			server_id: SERVER_A,
+			origin: 'external',
+			dedup_key: 'cert-expiry',
+			severity: 'critical',
+			title: 'Certificate expires soon',
+			summary: 'edge cert expires in 3 days',
+			source: 'pki-monitor',
+			body: null,
+			context_ref: null,
+			delivery_status: 'delivered',
+			created_at: '2026-11-14T09:30:00Z',
+			delivered_at: '2026-11-14T09:30:01Z',
+			acknowledged_at: null,
+			acked: false,
+			finding_id: null,
+			run_id: null
+		}
+	];
+}
+
+/** One JSON route answer with the reviewed content type. */
+function shellJson(route: Route, body: unknown, status = 200): Promise<void> {
+	return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+}
+
+function shellProfile(id: string, name: string): Record<string, unknown> {
+	return {
+		schema_version: 1,
+		server_id: id,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: { host: `${name}.example`, port: 22, user: 'mai', host_key: 'k', credential_ref: 'MAI_SSH_KEY' },
+		privilege: 'sudo',
+		capabilities: [],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	};
+}
+
+/** The canonical list query the panel sends for a handed-off server (R4-F2). */
+function shellInboxListQuery(serverId: string): string {
+	return `server_id=${serverId}&include_global=true&limit=50&offset=0`;
+}
+
+/** Registers every API route the real shell (and its open panels) may hit. */
+async function routeShellApi(page: Page): Promise<void> {
+	await page.route('**/api/v1/servers', (route) =>
+		shellJson(route, {
+			servers: [shellProfile(SERVER_A, 'Server Alpha'), shellProfile(SERVER_B, 'Server Beta')]
+		})
+	);
+	await page.route('**/api/v1/agent-sessions**', (route) =>
+		shellJson(route, { items: [], total: 0, has_more: false, limit: 10, offset: 0 })
+	);
+	await page.route('**/api/v1/servers/*/applications**', (route) =>
+		shellJson(route, {
+			server_id: new URL(route.request().url()).pathname.split('/')[4],
+			applications: [],
+			categories: [],
+			limit: 50,
+			offset: 0,
+			total: 0
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) => shellJson(route, { profiles: [] }));
+	await page.route('**/api/v1/models/selection', (route) =>
+		shellJson(route, { schema_version: 1, connection: 'litellm', profile: null })
+	);
+	await page.route('**/api/v1/monitoring/servers/*/observations**', (route) =>
+		shellJson(route, {
+			server_id: new URL(route.request().url()).pathname.split('/')[5],
+			observations: [],
+			limit: 10,
+			offset: 0,
+			total: 0
+		})
+	);
+	await page.route('**/api/v1/monitoring/servers/*/findings**', (route) =>
+		shellJson(route, {
+			server_id: new URL(route.request().url()).pathname.split('/')[5],
+			findings: [],
+			limit: 10,
+			offset: 0,
+			total: 0
+		})
+	);
+	await page.route('**/api/v1/monitoring/servers/*/notifications**', (route) => {
+		const serverId = new URL(route.request().url()).pathname.split('/')[5];
+		const rows = serverId === SERVER_A ? shellState.alertRows : [];
+		return shellJson(route, {
+			server_id: serverId,
+			alerts: rows,
+			limit: 10,
+			offset: 0,
+			total: rows.length
+		});
+	});
+	await page.route('**/api/v1/jobs/runs**', (route) =>
+		shellJson(route, { runs: [], limit: 50, offset: 0, total: 0 })
+	);
+	await page.route('**/api/v1/notifications/unread-count', (route) => {
+		shellState.unreadCountRequests += 1;
+		return shellJson(route, { total: shellState.unreadTotal });
+	});
+	await page.route('**/api/v1/notifications/events', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'text/event-stream',
+			// One identity-only wakeup frame, then the bounded stream closes —
+			// the shell's badge loop refetches the durable count and resubscribes.
+			body: `data: ${JSON.stringify({
+				kind: 'created',
+				alert_id: 'cc111111-1111-4555-8666-777788889999',
+				server_id: SERVER_A
+			})}\n\n`
+		})
+	);
+	await page.route('**/api/v1/notifications?*', (route) => {
+		const query = new URL(route.request().url()).searchParams;
+		shellState.inboxQueries.push(query.toString());
+		const serverId = query.get('server_id');
+		const rows = shellState.alertRows.filter((row) =>
+			serverId === null ? true : row.server_id === serverId
+		);
+		return shellJson(route, {
+			alerts: rows,
+			limit: 50,
+			offset: 0,
+			total: rows.length,
+			has_more: false
+		});
+	});
+	await page.route('**/api/v1/notifications', (route) => {
+		shellState.inboxQueries.push('');
+		const rows = shellState.alertRows;
+		return shellJson(route, { alerts: rows, limit: 50, offset: 0, total: rows.length, has_more: false });
+	});
+	await page.route('**/api/v1/notifications/*/ack', (route) => {
+		const alertId = new URL(route.request().url()).pathname.split('/')[4];
+		const row = shellState.alertRows.find((candidate) => candidate.alert_id === alertId);
+		if (row === undefined) {
+			return shellJson(route, { code: 'not_found', message: 'no such notice', request_id: 'fixture' }, 404);
+		}
+		// The reviewed route: one idempotent stamp; the unread truth moves.
+		row.acked = true;
+		row.acknowledged_at = '2026-11-14T10:00:00Z';
+		shellState.unreadTotal = shellState.alertRows.filter(
+			(candidate) => candidate.acked !== true
+		).length;
+		shellState.ackRequests += 1;
+		return shellJson(route, { alert: row });
+	});
+	await page.route('**/api/v1/ingest-keys**', (route) =>
+		shellJson(route, { keys: [], limit: 10, offset: 0, total: 0, has_more: false })
+	);
+}
+
+test.describe('desktop shell notifications integration (real DesktopShell)', () => {
+	let shellJs = '';
+	let shellCss = '';
+	let shellChunks: ShellChunk[] = [];
+
+	test.beforeAll(async () => {
+		const sources: Record<string, string> = {
+			[SHELL_APP_ID]: `<script>\n\timport DesktopShell from '${SHELL}';\n</script>\n\n<DesktopShell />\n`,
+			[SHELL_ENTRY_ID]:
+				`import { mount } from 'svelte';\nimport App from '${SHELL_APP_ID}';\nimport '${TOKENS}';\nmount(App, { target: document.getElementById('app') });\n`,
+			// The shell imports `$app/navigation` (goto on live auth failures);
+			// the harness mocks avoid those paths, so an inert stub is honest.
+			[SHELL_NAV_ID]: 'export async function goto() {}\n'
+		};
+		const plugin: Plugin = {
+			name: 'mai-shell-harness',
+			resolveId(id) {
+				if (id === SHELL_APP_ID) return id;
+				if (id === SHELL_ENTRY_ID || id === SHELL_NAV_ID) return `\\0${id}`;
+				return undefined;
+			},
+			load(id) {
+				if (id === SHELL_APP_ID) return sources[SHELL_APP_ID];
+				if (id === `\\0${SHELL_ENTRY_ID}`) return sources[SHELL_ENTRY_ID];
+				if (id === `\\0${SHELL_NAV_ID}`) return sources[SHELL_NAV_ID];
+				return undefined;
+			}
+		};
+		const result = await build({
+			configFile: false,
+			root: FRONTEND_ROOT,
+			logLevel: 'error',
+			plugins: [svelte(), plugin],
+			resolve: {
+				alias: {
+					'$app/navigation': SHELL_NAV_ID,
+					// SvelteKit's `$lib` alias — the bare fixture build has no Kit
+					// pipeline, so the shell's `$lib/...` imports map by prefix.
+					'$lib': `${FRONTEND_ROOT}src/lib`
+				}
+			},
+			build: {
+				write: false,
+				emptyOutDir: true,
+				cssCodeSplit: false,
+				minify: false,
+				outDir: 'node_modules/.mai-shell-fixture',
+				rollupOptions: {
+					input: SHELL_ENTRY_ID,
+					output: {
+						entryFileNames: 'demo.js',
+						chunkFileNames: 'shell-[hash].js',
+						assetFileNames: 'demo[extname]'
+					}
+				}
+			}
+		});
+		const built = result as BuiltBundle | BuiltBundle[];
+		const outputs = Array.isArray(built) ? built : [built];
+		shellChunks = [];
+		shellJs = '';
+		shellCss = '';
+		for (const { output } of outputs) {
+			for (const item of output) {
+				if (item.type === 'chunk') {
+					if (item.isEntry) shellJs += item.code;
+					else shellChunks.push({ fileName: item.fileName, code: item.code });
+				} else if (item.fileName.endsWith('.css')) {
+					shellCss += String(item.source);
+				}
+			}
+		}
+		if (!shellJs || !shellCss || shellChunks.length === 0) {
+			throw new Error('shell harness bundle incomplete');
+		}
+	});
+
+	test.beforeEach(async ({ page }) => {
+		// Replace the panel-level fixture routing from the outer beforeEach:
+		// the shell harness serves the real DesktopShell plus its API mocks.
+		await page.unrouteAll({ behavior: 'ignoreErrors' });
+		pageErrors.length = 0;
+		shellState.alertRows = shellAlertRows();
+		shellState.unreadTotal = shellState.alertRows.filter((row) => row.acked !== true).length;
+		shellState.unreadCountRequests = 0;
+		shellState.inboxQueries = [];
+		shellState.ackRequests = 0;
+		const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MAI shell fixture</title>
+<link rel="stylesheet" href="${SHELL_FIXTURE_URL}demo.css">
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="${SHELL_FIXTURE_URL}demo.js"><\/script>
+</body>
+</html>`;
+		await page.route('**/*', (route) => {
+			const { pathname } = new URL(route.request().url());
+			if (!pathname.startsWith(SHELL_FIXTURE_URL)) return route.abort();
+			const rest = pathname.slice(SHELL_FIXTURE_URL.length);
+			if (rest === '' || rest.endsWith('/')) {
+				return route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
+			}
+			if (rest === 'demo.js') {
+				return route.fulfill({ contentType: 'text/javascript; charset=utf-8', body: shellJs });
+			}
+			if (rest === 'demo.css') {
+				return route.fulfill({ contentType: 'text/css; charset=utf-8', body: shellCss });
+			}
+			const chunk = shellChunks.find((candidate) => candidate.fileName === rest);
+			if (chunk) {
+				return route.fulfill({ contentType: 'text/javascript; charset=utf-8', body: chunk.code });
+			}
+			return route.abort();
+		});
+		await routeShellApi(page);
+		await page.context().addCookies([
+			{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+		]);
+		await page.goto(SHELL_FIXTURE_URL);
+		// Live attach: the readable csrf cookie composes the REAL live shell;
+		// the tree renders the REAL registry — notifications entry included.
+		await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+		await expect(page.getByTestId('open-notifications')).toContainText('Notifications');
+	});
+
+	test('shell: the notifications entry opens ONE global singleton window and the second click focuses it', async ({
+		page
+	}) => {
+		// The composed registry carries the notifications entry as a Global /
+		// Fleet launcher (the tree renders registry entries — registration
+		// proof through the real composition).
+		await expect(page.getByTestId('open-notifications')).toContainText('Open Notifications — Global');
+
+		// First click opens exactly ONE global window.
+		await page.getByTestId('open-notifications').click();
+		const notifications = frame(page, 'notifications');
+		await expect(notifications).toHaveCount(1);
+		await expect(notifications.locator('.mai-window-frame__title')).toHaveText('Notifications — Global');
+		await expect(page.getByTestId('desktop-status')).toHaveText('Opened Notifications — Global.');
+		await expect(notifications.getByTestId('notifications-root')).toBeVisible();
+		const windowId = await notifications.getAttribute('data-window-id');
+		expect(windowId).toBeTruthy();
+
+		// Second click focuses the EXISTING instance: same stable window id,
+		// still exactly one frame — the singleton open only raised it.
+		await page.getByTestId('open-notifications').click();
+		await expect(frame(page, 'notifications')).toHaveCount(1);
+		await expect(frame(page, 'notifications')).toHaveAttribute('data-window-id', windowId ?? '');
+		await expect(frame(page, 'notifications')).toHaveAttribute('data-focused', 'true');
+		expect(pageErrors).toEqual([]);
+	});
+
+	test('shell: the rail badge shows the unread total, refetches on wakeup frames and hides at zero', async ({
+		page
+	}) => {
+		// The initial fleet-wide count (server truth) — while NO notifications
+		// window exists: the badge is live even when the panel is closed.
+		await page.getByTestId('side-drawer-toggle').click();
+		await expect(page.getByTestId('side-drawer-rail')).toBeVisible();
+		const badge = page.getByTestId('rail-notifications-badge');
+		await expect(badge).toHaveText('2');
+		await expect(frame(page, 'notifications')).toHaveCount(0);
+
+		// The wakeup frame (identity-only SSE) schedules a durable refetch:
+		// the initial mount read plus at least one post-wakeup read.
+		await expect
+			.poll(() => shellState.unreadCountRequests, { timeout: 10_000 })
+			.toBeGreaterThanOrEqual(2);
+
+		// Zero is hidden honestly (never a fabricated count).
+		shellState.unreadTotal = 0;
+		await expect(badge).toHaveCount(0, { timeout: 10_000 });
+		expect(pageErrors).toEqual([]);
+	});
+
+	test('shell: «View in Inbox →» hands the pinned server into the ONE notifications window', async ({
+		page
+	}) => {
+		const notifications = frame(page, 'notifications');
+
+		// Alpha (the default selection) overview: the wired hand-off control.
+		await page.getByTestId('open-overview').click();
+		const alphaOverview = page
+			.locator('.mai-window-frame[data-panel-kind="overview"]')
+			.filter({ hasText: 'Server Alpha' });
+		await expect(alphaOverview.getByTestId('overview-root')).toBeVisible();
+		await expect(alphaOverview.getByTestId('inbox-view-link')).toBeVisible();
+
+		// First hand-off (fresh open): the fleet-wide window mounts ALREADY
+		// filtered to Alpha — the scope Select and the canonical query agree.
+		await alphaOverview.getByTestId('inbox-view-link').click();
+		await expect(notifications).toHaveCount(1);
+		await expect(notifications.getByTestId('notifications-root')).toBeVisible();
+		await expect(notifications.getByTestId('filter-scope')).toHaveValue(SERVER_A);
+		await expect
+			.poll(() => shellState.inboxQueries, { timeout: 5_000 })
+			.toContain(shellInboxListQuery(SERVER_A));
+		// The handed-off window is the focused surface: the source window's
+		// bubbling PT2 activation never paints it back on top.
+		await expect(notifications).toHaveAttribute('data-focused', 'true');
+
+		// Park the panel on Sources, then hand off Beta's overview scope: the
+		// already-mounted singleton applies the newer sequenced request (no
+		// duplicate window, back to Inbox, filter re-pinned).
+		await notifications.getByTestId('tab-sources').click();
+		await expect(notifications.getByTestId('tab-sources')).toHaveAttribute('aria-selected', 'true');
+		// The tree keeps ONE expanded accordion (the selected server): select
+		// Beta, then open ITS overview through the selected-server launcher.
+		await page.getByTestId('server-select').selectOption(SERVER_B);
+		await page.getByTestId('open-overview').click();
+		const betaOverview = page
+			.locator('.mai-window-frame[data-panel-kind="overview"]')
+			.filter({ hasText: 'Server Beta' });
+		await expect(betaOverview.getByTestId('overview-root')).toBeVisible();
+		await betaOverview.getByTestId('inbox-view-link').click();
+		await expect(frame(page, 'notifications')).toHaveCount(1);
+		await expect(notifications.getByTestId('tab-inbox')).toHaveAttribute('aria-selected', 'true');
+		await expect(notifications.getByTestId('filter-scope')).toHaveValue(SERVER_B);
+		await expect
+			.poll(() => shellState.inboxQueries, { timeout: 5_000 })
+			.toContain(shellInboxListQuery(SERVER_B));
+
+		// The per-server overview cards stay what they were: bounded previews
+		// of their own server (Alpha's rows, Beta's honest empty state).
+		await expect(alphaOverview.getByTestId('notice-row')).toHaveCount(2);
+		await expect(betaOverview.getByTestId('inbox-empty')).toBeVisible();
+		expect(pageErrors).toEqual([]);
+	});
+
+	test('shell: an ack inside the panel keeps the rail badge in sync after the stamp commits', async ({
+		page
+	}) => {
+		const notifications = frame(page, 'notifications');
+
+		// Open the inbox from the launcher (unfiltered fleet view: 2 rows).
+		await page.getByTestId('open-notifications').click();
+		await expect(notifications.getByTestId('notice-row')).toHaveCount(2);
+
+		// Ack the first notice: the receipt stamps the row, the panel refetches
+		// AND the shell's mutation sync refetches the fleet count for the badge.
+		await notifications.getByTestId('notice-row').first().getByTestId('row-toggle').click();
+		await expect(notifications.getByTestId('notice-row').first()).toHaveAttribute('data-acked', 'true');
+		await expect(notifications.getByTestId('unread-count')).toContainText('Unread: 1');
+
+		// The badge follows the mutation — server truth after the stamp, never
+		// optimistic (the wrapper refetch happens only after the receipt).
+		await page.getByTestId('side-drawer-toggle').click();
+		await expect(page.getByTestId('rail-notifications-badge')).toHaveText('1', { timeout: 10_000 });
+		expect(shellState.ackRequests).toBe(1);
+		expect(pageErrors).toEqual([]);
+	});
 });

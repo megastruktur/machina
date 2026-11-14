@@ -3,8 +3,13 @@ import { build, type Plugin } from 'vite';
 import {
 	ApiError,
 	createMaiApiClient,
+	MaiClientError,
 	readMaiEvent,
+	readNotificationWakeup,
 	subscribeEvents,
+	subscribeNotificationEvents,
+	type NotificationListQuery,
+	type NotificationWakeup,
 	type SseFrame
 } from '../src/lib/api/client';
 import type { components, paths } from '../src/lib/api/schema.generated';
@@ -23,6 +28,12 @@ declare const process: { env: Record<string, string | undefined> };
  *    mutations only, fail-closed without a token, C01 envelope → typed
  *    ApiError, non-envelope collapse, explicit per-call server target with
  *    zero client-level state, SSE replay-cursor parsing.
+ * 1b. Notification inbox surface (Node, injected fetch): canonical filter
+ *    shapes incl. server_id|scope=global mutual exclusion (fails closed),
+ *    unread-count/mark-all-read/ack/unack/per-server-unacknowledge, CSRF on
+ *    every mutation, ingest-key lifecycle (metadata page, one-time plaintext
+ *    mint receipt, revoke) and the wakeup-only SSE binding (identity/resync
+ *    frames, no Last-Event-ID, refetch hook on stream end).
  * 2. Browser semantics (real Chromium, preview origin, route-mocked API):
  *    HttpOnly `mai_session` never readable by JS, `mai_csrf` readable and
  *    attached, nothing in web storage, envelope errors and SSE frames flow
@@ -64,6 +75,31 @@ type _EnrollBodyIsGenerated = Assert<
 type ControllerKey = paths['/api/v1/servers/onboarding/controller-key']['get']['responses'][200]['content']['application/json'];
 type _ControllerKeyIsGenerated = Assert<
 	ControllerKey extends components['schemas']['ControllerKeyResponse'] ? true : false
+>;
+// Notification inbox surface: the canonical query interfaces are hand-mapped
+// mirrors of the generated route queries (assignability pinned both-ways
+// below via the routes), and every payload/response alias is generated.
+type InboxListQuery = NonNullable<paths['/api/v1/notifications']['get']['parameters']['query']>;
+type _InboxListQueryIsGenerated = Assert<InboxListQuery extends NotificationListQuery ? true : false>;
+type InboxListResponse = paths['/api/v1/notifications']['get']['responses'][200]['content']['application/json'];
+type _InboxListResponseIsGenerated = Assert<
+	InboxListResponse extends components['schemas']['NotificationPage'] ? true : false
+>;
+type UnreadCountResponse = paths['/api/v1/notifications/unread-count']['get']['responses'][200]['content']['application/json'];
+type _UnreadCountResponseIsGenerated = Assert<
+	UnreadCountResponse extends components['schemas']['UnreadCountView'] ? true : false
+>;
+type MarkAllReadResponse = paths['/api/v1/notifications/mark-all-read']['post']['responses'][200]['content']['application/json'];
+type _MarkAllReadResponseIsGenerated = Assert<
+	MarkAllReadResponse extends components['schemas']['MarkAllReadResult'] ? true : false
+>;
+type CreateIngestKeyBodyWire = paths['/api/v1/ingest-keys']['post']['requestBody']['content']['application/json'];
+type _CreateIngestKeyBodyIsGenerated = Assert<
+	CreateIngestKeyBodyWire extends components['schemas']['CreateIngestKeyBody'] ? true : false
+>;
+type IssuedKeyResponse = paths['/api/v1/ingest-keys']['post']['responses'][201]['content']['application/json'];
+type _IssuedKeyResponseIsGenerated = Assert<
+	IssuedKeyResponse extends components['schemas']['IssuedIngestKeyView'] ? true : false
 >;
 
 // ---------------------------------------------------------------------------
@@ -370,6 +406,420 @@ test.describe('typed boundary transport (injected fetch)', () => {
 				timeout_seconds: 10
 			})
 		).rejects.toMatchObject({ status: 409, code: 'conflict' });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Notification inbox surface (injected fetch) — canonical filters, CSRF,
+// envelope collapse, ingest-key lifecycle and the wakeup-only SSE binding.
+// ---------------------------------------------------------------------------
+
+test.describe('notification inbox surface (injected fetch)', () => {
+	const SERVER = '44b05a60-1e2b-4c3d-9a8b-7c6d5e4f3a21';
+	const ALERT = 'a1dd2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
+	const KEY_ID = '0d0a1b2c-3d4e-4f5a-6b7c-8d9e0f1a2b3c';
+
+	/** Synthetic notice fixture; the shape is the generated AlertView. */
+	const fixtureAlert = (acked: boolean): components['schemas']['AlertView'] => ({
+		alert_id: ALERT,
+		server_id: null,
+		origin: 'external',
+		dedup_key: 'external:fixture',
+		severity: 'warning',
+		title: 'disk almost full',
+		summary: null,
+		source: 'host-monitor',
+		body: '/var usage 94% on db-1',
+		context_ref: null,
+		delivery_status: 'delivered',
+		created_at: '2026-11-14T00:00:00Z',
+		delivered_at: '2026-11-14T00:00:01Z',
+		acknowledged_at: acked ? '2026-11-14T00:05:00Z' : null,
+		acked,
+		finding_id: null,
+		run_id: null
+	});
+
+	/** SSE response with the exact producer content type. */
+	function sseResponse(body: string): Response {
+		return new Response(body, {
+			status: 200,
+			headers: { 'content-type': 'text/event-stream' }
+		});
+	}
+
+	function inboxClient(doFetch: typeof globalThis.fetch) {
+		return createMaiApiClient({ fetch: doFetch, getCsrfToken: () => 'csrf-token-nbi' });
+	}
+
+	test('canonical list filters produce exactly the frozen query params', async () => {
+		const { fetch, calls } = stubFetch(() =>
+			jsonResponse(200, { alerts: [fixtureAlert(false)], limit: 10, offset: 20, total: 1, has_more: false })
+		);
+		const client = inboxClient(fetch);
+
+		const page = await client.listInboxNotifications({
+			server_id: SERVER,
+			include_global: false,
+			unread: true,
+			origin: 'external',
+			source: 'host-monitor',
+			q: 'disk',
+			limit: 10,
+			offset: 20
+		});
+		expect(page.total).toBe(1);
+
+		const url = new URL(calls[0].url);
+		expect(url.pathname).toBe('/api/v1/notifications');
+		expect(url.searchParams.get('server_id')).toBe(SERVER);
+		expect(url.searchParams.get('include_global')).toBe('false');
+		expect(url.searchParams.get('unread')).toBe('true');
+		expect(url.searchParams.get('origin')).toBe('external');
+		expect(url.searchParams.get('source')).toBe('host-monitor');
+		expect(url.searchParams.get('q')).toBe('disk');
+		expect(url.searchParams.get('limit')).toBe('10');
+		expect(url.searchParams.get('offset')).toBe('20');
+		expect(calls[0].method).toBe('GET');
+		expect(calls[0].credentials).toBe('include');
+		// Safe method: no CSRF header ever rides a read.
+		expect(calls[0].headers['x-csrf-token']).toBeUndefined();
+
+		// Global-only selection: scope=global, NEVER server_id beside it, and
+		// include_global is meaningless there so it never travels (frozen
+		// semantics: only meaningful beside an explicit server_id).
+		await client.listInboxNotifications({ scope: 'global', include_global: true, unread: false });
+		const globalUrl = new URL(calls[1].url);
+		expect(globalUrl.searchParams.get('scope')).toBe('global');
+		expect(globalUrl.searchParams.has('server_id')).toBe(false);
+		expect(globalUrl.searchParams.has('include_global')).toBe(false);
+		expect(globalUrl.searchParams.get('unread')).toBe('false');
+
+		// No filters: the bare collection route (ALL notices server-side).
+		await client.listInboxNotifications();
+		expect(new URL(calls[2].url).search).toBe('');
+	});
+
+	test('server_id and scope=global together fail closed before any byte', async () => {
+		let networkCalls = 0;
+		const { fetch } = stubFetch(() => {
+			networkCalls += 1;
+			return jsonResponse(200, { alerts: [], limit: 50, offset: 0, total: 0, has_more: false });
+		});
+		const client = inboxClient(fetch);
+
+		await expect(
+			client.listInboxNotifications({ server_id: SERVER, scope: 'global' })
+		).rejects.toThrow(MaiClientError);
+		await expect(
+			client.getUnreadNotificationCount({ server_id: SERVER, scope: 'global' })
+		).rejects.toThrow(/mutually exclusive/);
+		await expect(
+			client.markAllNotificationsRead({ server_id: SERVER, scope: 'global' })
+		).rejects.toThrow(/mutually exclusive/);
+		expect(networkCalls, 'an invalid filter pair may not leave the client').toBe(0);
+	});
+
+	test('unread-count and mark-all-read mirror the canonical filter surface', async () => {
+		const { fetch, calls } = stubFetch((request) => {
+			if (new URL(request.url).pathname === '/api/v1/notifications/unread-count') {
+				return jsonResponse(200, { total: 3 });
+			}
+			return jsonResponse(200, { updated: 3 });
+		});
+		const client = inboxClient(fetch);
+
+		const count = await client.getUnreadNotificationCount({
+			server_id: SERVER,
+			include_global: true
+		});
+		expect(count).toEqual({ total: 3 });
+		const countUrl = new URL(calls[0].url);
+		expect(countUrl.pathname).toBe('/api/v1/notifications/unread-count');
+		expect(countUrl.searchParams.get('server_id')).toBe(SERVER);
+		expect(countUrl.searchParams.get('include_global')).toBe('true');
+
+		const receipt = await client.markAllNotificationsRead({
+			server_id: SERVER,
+			unread: true,
+			q: 'disk'
+		});
+		expect(receipt).toEqual({ updated: 3 });
+		const markUrl = new URL(calls[1].url);
+		expect(markUrl.pathname).toBe('/api/v1/notifications/mark-all-read');
+		expect(markUrl.searchParams.get('server_id')).toBe(SERVER);
+		expect(markUrl.searchParams.get('unread')).toBe('true');
+		expect(markUrl.searchParams.get('q')).toBe('disk');
+		// Mutation: session cookie jar + CSRF double submit, no body dialect.
+		expect(calls[1].method).toBe('POST');
+		expect(calls[1].body).toBe('');
+		expect(calls[1].credentials).toBe('include');
+		expect(calls[1].headers['x-csrf-token']).toBe('csrf-token-nbi');
+	});
+
+	test('ack/unack and per-server unacknowledge carry CSRF; envelopes collapse to ApiError', async () => {
+		const { fetch, calls } = stubFetch((request) => {
+			const path = new URL(request.url).pathname;
+			if (path === `/api/v1/notifications/${ALERT}/ack`) {
+				return jsonResponse(200, { alert: fixtureAlert(true) });
+			}
+			if (path === `/api/v1/notifications/${ALERT}/unack`) {
+				return jsonResponse(200, { alert: fixtureAlert(false) });
+			}
+			if (path === `/api/v1/monitoring/servers/${SERVER}/notifications/${ALERT}/unacknowledge`) {
+				return jsonResponse(200, { alert: fixtureAlert(false) });
+			}
+			return jsonResponse(404, {
+				error: {
+					code: 'not_found',
+					message: 'no notice for this id',
+					request_id: 'req-nbi-404',
+					fields: {}
+				}
+			});
+		});
+		const client = inboxClient(fetch);
+
+		const acked = await client.acknowledgeInboxNotification(ALERT);
+		expect(acked.alert.acked).toBe(true);
+		expect(acked.alert.acknowledged_at).toBe('2026-11-14T00:05:00Z');
+		expect(calls[0].method).toBe('POST');
+		expect(new URL(calls[0].url).pathname).toBe(`/api/v1/notifications/${ALERT}/ack`);
+		expect(calls[0].headers['x-csrf-token']).toBe('csrf-token-nbi');
+		expect(calls[0].credentials).toBe('include');
+
+		await client.unacknowledgeInboxNotification(ALERT);
+		expect(new URL(calls[1].url).pathname).toBe(`/api/v1/notifications/${ALERT}/unack`);
+		expect(calls[1].headers['x-csrf-token']).toBe('csrf-token-nbi');
+
+		await client.unacknowledgeServerNotification(SERVER, ALERT);
+		expect(new URL(calls[2].url).pathname).toBe(
+			`/api/v1/monitoring/servers/${SERVER}/notifications/${ALERT}/unacknowledge`
+		);
+		expect(calls[2].headers['x-csrf-token']).toBe('csrf-token-nbi');
+
+		// Value-free 404 collapses to the typed ApiError envelope.
+		const missing = await client
+			.acknowledgeInboxNotification('00000000-0000-0000-0000-000000000000')
+			.catch((error: unknown) => error);
+		expect(missing).toBeInstanceOf(ApiError);
+		expect((missing as ApiError).status).toBe(404);
+		expect((missing as ApiError).code).toBe('not_found');
+		expect((missing as ApiError).requestId).toBe('req-nbi-404');
+	});
+
+	test('ingest-key surface: bounded page, mint with CSRF, revoke; plaintext only in the receipt', async () => {
+		const PLAINTEXT = 'mai_ingest_fixture_never_real_000000000000000000000000';
+		const { fetch, calls } = stubFetch((request) => {
+			const path = new URL(request.url).pathname;
+			if (request.method === 'GET' && path === '/api/v1/ingest-keys') {
+				return jsonResponse(200, {
+					keys: [
+						{
+							key_id: KEY_ID,
+							label: 'host-monitor',
+							server_id: SERVER,
+							created_at: '2026-11-14T00:00:00Z',
+							last_used_at: null,
+							expires_at: null,
+							revoked_at: null
+						}
+					],
+					limit: 10,
+					offset: 0,
+					total: 1,
+					has_more: false
+				});
+			}
+			if (request.method === 'POST' && path === '/api/v1/ingest-keys') {
+				return jsonResponse(201, {
+					key: PLAINTEXT,
+					key_id: KEY_ID,
+					label: 'host-monitor',
+					server_id: SERVER,
+					created_at: '2026-11-14T00:00:00Z',
+					last_used_at: null,
+					expires_at: null,
+					revoked_at: null
+				});
+			}
+			if (path === `/api/v1/ingest-keys/${KEY_ID}/revoke`) {
+				return jsonResponse(200, { key_id: KEY_ID, revoked: true });
+			}
+			return jsonResponse(404, {
+				error: { code: 'not_found', message: 'no such route', request_id: 'req-x', fields: {} }
+			});
+		});
+		const client = inboxClient(fetch);
+
+		const page = await client.listIngestKeys({ limit: 10, offset: 0 });
+		expect(page.keys).toHaveLength(1);
+		expect(page.keys[0].label).toBe('host-monitor');
+		expect(page.keys[0].server_id).toBe(SERVER);
+		expect(page.has_more).toBe(false);
+		// Metadata page: no key material field anywhere in the wire shape.
+		expect(JSON.stringify(page)).not.toContain('key_hash');
+		const listUrl = new URL(calls[0].url);
+		expect(listUrl.pathname).toBe('/api/v1/ingest-keys');
+		expect(listUrl.searchParams.get('limit')).toBe('10');
+		expect(listUrl.searchParams.get('offset')).toBe('0');
+		expect(calls[0].headers['x-csrf-token']).toBeUndefined();
+
+		const issued = await client.createIngestKey({ label: 'host-monitor', server_id: SERVER });
+		expect(issued.key).toBe(PLAINTEXT);
+		expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
+			label: 'host-monitor',
+			server_id: SERVER
+		});
+		expect(calls[1].method).toBe('POST');
+		expect(calls[1].headers['x-csrf-token']).toBe('csrf-token-nbi');
+
+		// Omitting server_id mints a GLOBAL key.
+		await client.createIngestKey({ label: 'global-notifier' });
+		expect(JSON.parse(calls[2].body ?? '{}')).toEqual({ label: 'global-notifier' });
+
+		const revoked = await client.revokeIngestKey(KEY_ID);
+		expect(revoked).toEqual({ key_id: KEY_ID, revoked: true });
+		expect(calls[3].method).toBe('POST');
+		expect(new URL(calls[3].url).pathname).toBe(`/api/v1/ingest-keys/${KEY_ID}/revoke`);
+		expect(calls[3].headers['x-csrf-token']).toBe('csrf-token-nbi');
+	});
+
+	test('ingest-key create errors collapse to the envelope without echoing the payload', async () => {
+		const { fetch } = stubFetch(() =>
+			jsonResponse(422, {
+				error: {
+					code: 'validation_failed',
+					message: 'key payload failed validation',
+					request_id: 'req-nbi-422',
+					fields: { label: 'too long' }
+				}
+			})
+		);
+		const client = inboxClient(fetch);
+		const error = await client
+			.createIngestKey({ label: 'x'.repeat(80) })
+			.catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(ApiError);
+		expect((error as ApiError).status).toBe(422);
+		expect((error as ApiError).code).toBe('validation_failed');
+		expect((error as ApiError).fields).toEqual({ label: 'too long' });
+		// Raw body text never surfaces to caller code.
+		expect((error as ApiError).message).not.toContain('x'.repeat(80));
+	});
+
+	test('wakeup frames narrow exactly; non-frames never reach the callback', async () => {
+		expect(
+			readNotificationWakeup({
+				id: null,
+				event: null,
+				data: '{"kind":"created","alert_id":"a-1","server_id":null}'
+			})
+		).toEqual({ kind: 'created', alert_id: 'a-1', server_id: null });
+		expect(
+			readNotificationWakeup({
+				id: null,
+				event: null,
+				data: '{"kind":"updated","alert_id":"a-2","server_id":"' + SERVER + '"}'
+			})
+		).toEqual({ kind: 'updated', alert_id: 'a-2', server_id: SERVER });
+		expect(readNotificationWakeup({ id: null, event: null, data: '{"kind":"resync"}' })).toEqual({
+			kind: 'resync'
+		});
+		// Unknown kinds, missing identity and non-JSON are not wakeups.
+		expect(readNotificationWakeup({ id: null, event: null, data: '{"kind":"deleted"}' })).toBeNull();
+		expect(readNotificationWakeup({ id: null, event: null, data: '{"kind":"created"}' })).toBeNull();
+		expect(
+			readNotificationWakeup({ id: null, event: null, data: '{"kind":"created","alert_id":"a-1"}' })
+		).toBeNull();
+		expect(readNotificationWakeup({ id: null, event: null, data: 'not-json' })).toBeNull();
+	});
+
+	test('subscribeNotificationEvents delivers identity/resync frames and never a cursor', async () => {
+		const stream = [
+			': ping\n\n',
+			'data: {"kind":"created","alert_id":"a-1","server_id":null}\n\n',
+			'data: {"kind":"updated","alert_id":"a-2","server_id":"' + SERVER + '"}\n\n',
+			'data: not-json\n\n',
+			'data: {"kind":"resync"}\n\n'
+		].join('');
+		const { fetch, calls } = stubFetch(() => sseResponse(stream));
+
+		const wakeups: NotificationWakeup[] = [];
+		let refetches = 0;
+		await subscribeNotificationEvents('http://mai.test/api/v1/notifications/events', {
+			fetch,
+			onWakeup: (wakeup) => wakeups.push(wakeup),
+			onStreamEnd: () => {
+				refetches += 1;
+			}
+		});
+
+		const request = calls[0];
+		expect(new URL(request.url).pathname).toBe('/api/v1/notifications/events');
+		expect(request.method).toBe('GET');
+		expect(request.credentials).toBe('include');
+		expect(request.headers['accept']).toBe('text/event-stream');
+		// Wakeup-only: NO Last-Event-ID cursor ever travels on this stream.
+		expect(request.headers['last-event-id']).toBeUndefined();
+
+		expect(wakeups).toEqual([
+			{ kind: 'created', alert_id: 'a-1', server_id: null },
+			{ kind: 'updated', alert_id: 'a-2', server_id: SERVER },
+			{ kind: 'resync' }
+		]);
+		// Bounded stream self-closed cleanly → refetch/resubscribe hook fired.
+		expect(refetches).toBe(1);
+	});
+
+	test('client-bound subscription rides the instance base URL', async () => {
+		const { fetch, calls } = stubFetch(() => sseResponse('data: {"kind":"resync"}\n\n'));
+		const client = createMaiApiClient({
+			fetch,
+			baseUrl: 'http://alpha.internal',
+			getCsrfToken: () => 'csrf-token-nbi'
+		});
+		const wakeups: NotificationWakeup[] = [];
+		let refetches = 0;
+		await client.subscribeNotificationEvents({
+			onWakeup: (wakeup) => wakeups.push(wakeup),
+			onStreamEnd: () => {
+				refetches += 1;
+			}
+		});
+		expect(calls[0].url).toBe('http://alpha.internal/api/v1/notifications/events');
+		expect(wakeups).toEqual([{ kind: 'resync' }]);
+		expect(refetches).toBe(1);
+	});
+
+	test('a caller abort suppresses the reconnect/refetch hook', async () => {
+		const { fetch } = stubFetch(() => sseResponse(': ping\n\n'));
+		const controller = new AbortController();
+		controller.abort();
+		let refetches = 0;
+		await subscribeNotificationEvents('http://mai.test/api/v1/notifications/events', {
+			fetch,
+			signal: controller.signal,
+			onWakeup: () => {
+				throw new Error('no wakeup may arrive after an abort');
+			},
+			onStreamEnd: () => {
+				refetches += 1;
+			}
+		});
+		expect(refetches, 'aborted subscription must not fake a reconnect').toBe(0);
+	});
+
+	test('stream denials surface the same typed ApiError', async () => {
+		const { fetch } = stubFetch(() => jsonResponse(401, ENVELOPE_CONFLICT));
+		await expect(
+			subscribeNotificationEvents('http://mai.test/api/v1/notifications/events', {
+				fetch,
+				onWakeup: () => {
+					throw new Error('no frame may arrive on a denial');
+				}
+			})
+		).rejects.toThrow('API 401 conflict');
 	});
 });
 

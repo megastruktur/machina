@@ -338,6 +338,12 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("PUT", "/api/v1/docs/{doc_id}"),
         ("GET", "/api/v1/grants"),
         ("PUT", "/api/v1/grants"),
+        # (notification-inbox campaign: machine ingest-key lifecycle — the
+        # cookieless Bearer lane of auth-and-origin.md §13; mint/revoke are
+        # admin session mutations, ingest itself authenticates the key.)
+        ("GET", "/api/v1/ingest-keys"),
+        ("POST", "/api/v1/ingest-keys"),
+        ("POST", "/api/v1/ingest-keys/{key_id}/revoke"),
         ("GET", "/api/v1/health"),
         ("GET", "/api/v1/health/ready"),
         ("GET", "/api/v1/jobs/runs"),
@@ -367,8 +373,19 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications"),
         ("GET", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}"),
         ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack"),
+        ("POST", "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/unacknowledge"),
         ("GET", "/api/v1/monitoring/servers/{server_id}/observations"),
         ("GET", "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}"),
+        # (notification-inbox campaign: the unified fleet-wide inbox, its
+        # canonical filters, the wakeup-only SSE stream and the cookieless
+        # machine ingest lane.)
+        ("GET", "/api/v1/notifications"),
+        ("GET", "/api/v1/notifications/events"),
+        ("POST", "/api/v1/notifications/ingest"),
+        ("POST", "/api/v1/notifications/mark-all-read"),
+        ("GET", "/api/v1/notifications/unread-count"),
+        ("POST", "/api/v1/notifications/{alert_id}/ack"),
+        ("POST", "/api/v1/notifications/{alert_id}/unack"),
         ("POST", "/api/v1/password-challenges"),
         ("GET", "/api/v1/plugins"),
         ("GET", "/api/v1/plugins/{plugin}/bindings"),
@@ -444,6 +461,11 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/docs/research",
         "/api/v1/docs/retrieve",
         "/api/v1/grants",
+        # (notification-inbox campaign: mint/revoke are session mutations;
+        # the ingest POST belongs to the cookieless machine lane — listed
+        # here because the pin classifies mutating HTTP methods, not lanes.)
+        "/api/v1/ingest-keys",
+        "/api/v1/ingest-keys/{key_id}/revoke",
         "/api/v1/jobs/runs",
         "/api/v1/jobs/runs/{run_id}/cancel",
         "/api/v1/jobs/runs/{run_id}/tags",
@@ -454,6 +476,11 @@ def test_auth_surface_registers_the_frozen_routes() -> None:
         "/api/v1/models/test",
         "/api/v1/monitoring/servers/{server_id}/findings/evaluate",
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/unacknowledge",
+        "/api/v1/notifications/{alert_id}/ack",
+        "/api/v1/notifications/{alert_id}/unack",
+        "/api/v1/notifications/ingest",
+        "/api/v1/notifications/mark-all-read",
         "/api/v1/password-challenges",
         "/api/v1/plugins/{plugin}/bindings/{server_id}",
         "/api/v1/plugins/{plugin}/config",
@@ -511,6 +538,9 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/docs/retrieve",
         "/api/v1/docs/{doc_id}",
         "/api/v1/grants",
+        # (notification-inbox campaign: machine ingest-key lifecycle paths.)
+        "/api/v1/ingest-keys",
+        "/api/v1/ingest-keys/{key_id}/revoke",
         "/api/v1/health",
         "/api/v1/health/ready",
         "/api/v1/jobs/runs",
@@ -532,8 +562,17 @@ def test_openapi_declares_the_frozen_auth_contract() -> None:
         "/api/v1/monitoring/servers/{server_id}/notifications",
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}",
         "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/ack",
+        "/api/v1/monitoring/servers/{server_id}/notifications/{alert_id}/unacknowledge",
         "/api/v1/monitoring/servers/{server_id}/observations",
         "/api/v1/monitoring/servers/{server_id}/observations/{observation_id}",
+        # (notification-inbox campaign: the unified inbox surface paths.)
+        "/api/v1/notifications",
+        "/api/v1/notifications/{alert_id}/ack",
+        "/api/v1/notifications/{alert_id}/unack",
+        "/api/v1/notifications/events",
+        "/api/v1/notifications/ingest",
+        "/api/v1/notifications/mark-all-read",
+        "/api/v1/notifications/unread-count",
         "/api/v1/password-challenges",
         "/api/v1/plugins",
         "/api/v1/plugins/{plugin}/bindings",

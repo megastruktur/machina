@@ -46,6 +46,11 @@ Normative rules:
    the authenticated session only — never a user-supplied admin flag, role header or
    query parameter (frozen by auth ADR `3e79449` §2: forged `X-Admin`-style headers are
    not authorization inputs).
+   Documented exception (notification-inbox addendum, 2026-11-13): the global
+   notifications surface (`/api/v1/notifications*`) takes explicit OPTIONAL server
+   filters (`server_id` | `scope=global`, mutually exclusive); the machine ingest lane
+   is scope-pinned by the key, never by ambient state. No hidden global server state
+   is introduced.
 3. Structured API error envelope (stable shape for all `/api/v1` errors):
 
    ```json
@@ -461,8 +466,10 @@ Normative rules (environment rules frozen by runtime-environment ADR `89b6532`):
    namespace `mai-fxt-<card>-<purpose>` and `/tmp/mai-fxt-<card>-*`; nothing outside
    the namespace is touched; Python via uv-managed venvs; SSH tested only against
    fixture containers; secrets never enter repo/transcripts/evidence.
-3. Notifications persist per server/run/finding with delivery status and a dedup
-   key; web inbox first, messenger adapters later (non-goal now).
+3. Notifications persist in ONE unified inbox (`notification_alerts`) with delivery
+   status and a dedup key; notices may be server-scoped (finding/job_result) or
+   global (external, server_id NULL); the web inbox is the product surface; inbound
+   machine ingest uses scoped keys (auth ADR §13); messenger adapters remain later.
 4. Metrics collection reports timestamp/method/quality; the product's own scheduled
    collector is not "managing cron" (engine schedules, §C05 rule 8).
 5. Future seams — `ExecutionEnvironmentAdapter`, `NotificationChannel`,
@@ -652,3 +659,42 @@ preserved.
    executes the pins (files, symbols, frozen values, legacy registration) and
    the scenario-registry ownership checks of
    [runtime-scenarios.md](runtime-scenarios.md) §"RV2".
+
+## Addendum — unified notification inbox (notification-inbox campaign, 2026-11-13)
+
+Narrow, explicitly ratified addendum (campaign `notification-inbox`, task
+`nbi-contracts`). C01–C11 above remain unchanged and binding except the two
+in-place amendments recorded below; nothing here alters grants, approval
+checks, session TTL/CSRF/origin rules or the frozen DBOS run lifecycle. The
+machine ingest principal is defined by
+[auth-and-origin.md](auth-and-origin.md) §13 (applied verbatim from the
+ratified draft) and the canonical route/contract reference is
+[notification-inbox.md](notification-inbox.md).
+
+**Change control (G-ADR ratification record):** presented to captain
+2026-11-13T20:54:12Z; ratified 2026-11-13T20:56:00Z; captain verbatim answer:
+approved; decision: approved; ratified draft SHA-256
+`3fffc8f07f81b6b28b86f75ebbdbc92a3667f846e30b2d67edb5522f70ee73b7`
+(`plans/notification-inbox/nbi_ADR_ADDENDUM_DRAFT.md` at presentation).
+Amendments applied in ONE motion:
+
+1. **C10 rule 3 (amended in place).** Notifications persist in ONE unified
+   inbox (`notification_alerts`) with delivery status and a dedup key; notices
+   may be server-scoped (finding/job_result) or global (external, server_id
+   NULL); the web inbox is the product surface; inbound machine ingest uses
+   scoped keys (auth ADR §13); messenger adapters remain later.
+2. **C01 rule 2 (documented exception added in place).** The global
+   notifications surface (`/api/v1/notifications*`) takes explicit OPTIONAL
+   server filters (`server_id` | `scope=global`, mutually exclusive); the
+   machine ingest lane is scope-pinned by the key, never by ambient state. No
+   hidden global server state is introduced.
+3. **AlertOrigin vocabulary widened.** `AlertOrigin`
+   (`backend/src/mai/contracts/observations.py`) widens from
+   `finding|job_result` to `finding|job_result|external`; the schema CHECK and
+   schema tests update in the same motion (migration 0017).
+4. **New frozen bounds** (`backend/src/mai/contracts/observations.py`):
+   `MAX_NOTIFICATION_BODY_CHARS=4096`, `MAX_NOTIFICATION_SOURCE_CHARS=64`,
+   `MAX_INGEST_BODY_BYTES=16384`, `INGEST_RATE_WINDOW=60/min` (durable per-key
+   fixed window; scope violations answer the identical 422 `invalid_scope`,
+   over-budget bodies answer 413 `body_too_large`, window exhaustion answers
+   429 — auth ADR §13 governs).

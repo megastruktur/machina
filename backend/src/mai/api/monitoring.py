@@ -46,15 +46,20 @@ scenario):
   ``GET /api/v1/monitoring/notification-policy`` reports exactly that
   constant. A durable policy store is a later card's decision, not a
   silent invention here.
-- **Severity provenance on notice views**: ``notification_alerts`` has
-  no severity column (frozen schema); the severity lives at the anchor
-  (live ``observation_findings.severity`` join) and, once the anchor is
-  legally severed (ON DELETE SET NULL) or absent (job-result notices),
-  in the frozen ``[severity=<v>]`` summary tag written by
-  ``mai.notifications.service`` (writer/reader format documented in that
-  module's docstring). This consumer-side reader mirrors the exact tag
-  grammar and falls back to ``info`` only when both are gone; the
-  focused tests pin reader/writer agreement through the REAL service.
+- **Severity on notice views is the real column**: since migration
+  ``0017_notification_inbox`` every ``notification_alerts`` row carries
+  ``severity`` and the notification service is its only writer; the
+  live reads below select ``a.severity`` directly (the anchor join is
+  gone). ``_alert_severity`` is RETAINED in this module as the frozen
+  pre-0017 backfill oracle — the exact reader migration 0017's backfill
+  reproduced — and ``tests/test_observation_schema.py`` imports it to
+  pin that backfill, so it stays defined even though no live route
+  calls it anymore.
+- **AlertView is additive over the unified inbox**: global notices
+  carry ``server_id IS NULL`` (no sentinel UUID), so ``AlertView
+  .server_id`` is nullable; the external sender identity and message
+  body arrive as the nullable ``source``/``body`` columns (0017), and
+  finding/job_result notices keep them ``null``.
 
 Every error renders the C01 envelope; an unmapped failure surfaces as
 the generic ``internal_error`` (fail-closed), never a guessed success.
@@ -132,10 +137,11 @@ _SEVERITY_ORDER: Final[dict[str, int]] = {
     FindingSeverity.INFO.value: 2,
 }
 
-#: Consumer-side reader of the frozen severity-provenance tag the
-#: notification service appends to every persisted notice summary (exact
-#: grammar from that module's documented writer/reader contract; the
-#: focused tests pin agreement through rows the REAL service wrote).
+#: Pre-0017 summary-tag grammar reader — RETAINED solely as part of the
+#: frozen backfill oracle below (:func:`_alert_severity`, imported by
+#: ``tests/test_observation_schema.py``); no live route reads tags
+#: anymore (the real ``notification_alerts.severity`` column replaced
+#: the writer/reader tag grammar in migration 0017).
 _SEVERITY_TAG: Final[re.Pattern[str]] = re.compile(
     r"\[severity=(info|warning|critical)\]$"
 )
@@ -227,21 +233,25 @@ class FindingPage(BaseModel):
 class AlertView(BaseModel):
     """One inbox notice (0007 ``notification_alerts`` row).
 
-    ``severity`` is derived per the frozen provenance rule (live anchor
-    join first, persisted summary tag second, ``info`` last — see module
-    docstring); ``acked`` mirrors ``acknowledged_at is not null`` so a
-    consumer never compares timestamps for state.
+    ``severity`` is the real 0017 column (the notification service is
+    its only writer); ``acked`` mirrors ``acknowledged_at is not null``
+    so a consumer never compares timestamps for state. Global notices
+    carry ``server_id: null`` (0017 dropped NOT NULL); ``source`` and
+    ``body`` are the 0017 external-notice columns — ``null`` for
+    finding/job_result notices, whose text is the ``summary``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     alert_id: str
-    server_id: str
+    server_id: str | None
     origin: str
     dedup_key: str
     severity: str
     title: str
     summary: str | None
+    source: str | None
+    body: str | None
     context_ref: str | None
     delivery_status: str
     created_at: str
@@ -347,11 +357,16 @@ def _context_ref(prefix: str, identity: uuid.UUID) -> str:
 
 
 def _alert_severity(anchor_severity: object, summary: object) -> str:
-    """Severity of one stored notice row (frozen provenance rule).
+    """Severity of one stored notice row (frozen pre-0017 oracle).
 
-    Live anchor join first (the collector's freshest severity); the frozen
-    persisted summary tag covers legally severed anchors and job-result
-    notices; ``info`` only if both are gone (the sole writer always tags).
+    RETAINED as the frozen pre-0017 backfill oracle: the exact reader
+    migration 0017's severity backfill reproduced row-for-row (live
+    anchor join first, the persisted ``[severity=<v>]`` summary tag
+    second, ``info`` fallback). ``tests/test_observation_schema.py``
+    imports this function to pin that backfill. Live routes no longer
+    call it — they read ``notification_alerts.severity`` directly — so
+    changing this function can only ever affect the pinned backfill
+    proof, never the served views.
     """
     if isinstance(anchor_severity, str) and anchor_severity in _SEVERITY_ORDER:
         return anchor_severity
@@ -873,12 +888,11 @@ async def list_notifications(
                 await session.execute(
                     text(
                         "SELECT a.alert_id, a.server_id, a.origin, a.dedup_key,"
-                        " a.title, a.summary, a.context_ref, a.delivery_status,"
+                        " a.title, a.summary, a.severity, a.source, a.body,"
+                        " a.context_ref, a.delivery_status,"
                         " a.created_at, a.delivered_at, a.acknowledged_at,"
-                        " a.finding_id, a.run_id, f.severity AS anchor_severity"
+                        " a.finding_id, a.run_id"
                         " FROM notification_alerts a"
-                        " LEFT JOIN observation_findings f"
-                        " ON f.finding_id = a.finding_id"
                         f" WHERE {where}"
                         " ORDER BY a.created_at DESC, a.alert_id DESC"
                         " LIMIT :limit OFFSET :offset"
@@ -897,28 +911,7 @@ async def list_notifications(
         ).scalar_one()
     return AlertPage(
         server_id=str(server_id),
-        alerts=[
-            AlertView(
-                alert_id=str(row["alert_id"]),
-                server_id=str(row["server_id"]),
-                origin=str(row["origin"]),
-                dedup_key=str(row["dedup_key"]),
-                severity=_alert_severity(row["anchor_severity"], row["summary"]),
-                title=str(row["title"]),
-                summary=row["summary"],
-                context_ref=row["context_ref"],
-                delivery_status=str(row["delivery_status"]),
-                created_at=_wire_ts(row["created_at"]),
-                delivered_at=_wire_ts_or_none(row["delivered_at"]),
-                acknowledged_at=_wire_ts_or_none(row["acknowledged_at"]),
-                acked=row["acknowledged_at"] is not None,
-                finding_id=None
-                if row["finding_id"] is None
-                else str(row["finding_id"]),
-                run_id=None if row["run_id"] is None else str(row["run_id"]),
-            )
-            for row in rows
-        ],
+        alerts=[_alert_view(row) for row in rows],
         limit=limit,
         offset=offset,
         total=int(total),
@@ -1039,17 +1032,97 @@ async def acknowledge_notification(
     return AckResult(alert=_alert_view(stamped))
 
 
+@router.post(
+    "/servers/{server_id}/notifications/{alert_id}/unacknowledge",
+    status_code=HTTP_200_OK,
+    response_model=AckResult,
+    summary="Unacknowledge one inbox notice (scope-checked, idempotent)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "Origin not allowed or CSRF token rejected",
+        },
+        HTTP_404_NOT_FOUND: {
+            "model": ErrorEnvelope,
+            "description": "No notice for this id in this server scope",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "Monitoring service unavailable",
+        },
+    },
+)
+async def unacknowledge_notification(
+    request: Request, server_id: uuid.UUID, alert_id: uuid.UUID
+) -> AckResult:
+    """Clear ``acknowledged_at`` on one notice; delete nothing.
+
+    Mutation: session → origin → CSRF (ADR §5 order) before any state is
+    touched. The value-free ``404`` mirrors the ack route exactly: a row
+    owned by another server and a missing row are indistinguishable (no
+    existence leak, C01 rule 7). Idempotent: unacknowledging an already
+    unacknowledged notice changes nothing and answers ``200``. Unack is
+    NOT a delete: the notice, its finding and its producing observation
+    survive; for finding notices re-opening the notice re-arms the
+    reminder logic (the notification service stops suppressing
+    re-delivery once ``acknowledged_at`` is cleared again).
+    """
+    _store, _token = await _require_session(request)  # layer 1
+    _require_allowed_origin(request)  # layer 2
+    _require_csrf(request)  # layer 3
+    factory = _sessions(request)
+    async with factory() as session:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT alert_id FROM notification_alerts"
+                        " WHERE alert_id = :alert_id AND server_id = :server_id"
+                    ),
+                    {"alert_id": alert_id, "server_id": server_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            raise BoundaryError(
+                HTTP_404_NOT_FOUND,
+                "not_found",
+                "no notice for this id in this server scope",
+            )
+        await session.execute(
+            text(
+                "UPDATE notification_alerts SET acknowledged_at = NULL"
+                " WHERE alert_id = :alert_id"
+            ),
+            {"alert_id": alert_id},
+        )
+        await session.commit()
+    cleared = await _alert_row(factory, server_id, alert_id)
+    if cleared is None:  # unreachable: the UNIQUE row raced away
+        raise BoundaryError(
+            HTTP_500_INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "unacknowledged notice vanished",
+        )
+    return AckResult(alert=_alert_view(cleared))
+
+
 # ---------------------------------------------------------------------------
 # Shared row loaders/views
 # ---------------------------------------------------------------------------
 
 _ALERT_ROW_SQL = text(
     "SELECT a.alert_id, a.server_id, a.origin, a.dedup_key,"
-    " a.title, a.summary, a.context_ref, a.delivery_status,"
-    " a.created_at, a.delivered_at, a.acknowledged_at,"
-    " a.finding_id, a.run_id, f.severity AS anchor_severity"
+    " a.title, a.summary, a.severity, a.source, a.body, a.context_ref,"
+    " a.delivery_status, a.created_at, a.delivered_at, a.acknowledged_at,"
+    " a.finding_id, a.run_id"
     " FROM notification_alerts a"
-    " LEFT JOIN observation_findings f ON f.finding_id = a.finding_id"
     " WHERE a.alert_id = :alert_id AND a.server_id = :server_id"
 )
 
@@ -1075,14 +1148,22 @@ async def _alert_row(
 
 
 def _alert_view(row: Mapping[str, object]) -> AlertView:
+    """One inbox notice view from a row carrying the 0017 columns.
+
+    The single row→view mapping for BOTH monitoring surfaces and the
+    global notification surface (``mai.api.notifications`` imports this
+    mapper), so the unified inbox can never render two shapes.
+    """
     return AlertView(
         alert_id=str(row["alert_id"]),
-        server_id=str(row["server_id"]),
+        server_id=None if row["server_id"] is None else str(row["server_id"]),
         origin=str(row["origin"]),
         dedup_key=str(row["dedup_key"]),
-        severity=_alert_severity(row["anchor_severity"], row["summary"]),
+        severity=str(row["severity"]),
         title=str(row["title"]),
         summary=row["summary"],
+        source=row["source"],
+        body=row["body"],
         context_ref=row["context_ref"],
         delivery_status=str(row["delivery_status"]),
         created_at=_wire_ts(row["created_at"]),

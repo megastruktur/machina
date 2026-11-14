@@ -27,6 +27,8 @@ or error strings — asserted, not assumed.
 from __future__ import annotations
 
 import ast
+import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -47,12 +49,14 @@ from mai.tags import RESERVED_UNCLASSIFIED_TAG_ID
 from mai.database import create_app_engine
 from mai.notifications.service import (
     DEFAULT_COOLDOWN,
+    MAX_NOTIFICATION_BODY_CHARS,
     MAX_WEBHOOK_BODY_BYTES,
     MAX_WEBHOOK_RESPONSE_BYTES,
     RETENTION_HORIZON,
     ChannelDeliveryError,
     DeliveryPayload,
     NotificationError,
+    NotificationErrorCode,
     NotificationEvent,
     QuietHours,
     RoutingPolicy,
@@ -63,6 +67,7 @@ from mai.notifications.service import (
     finding_alert_draft,
     finding_dedup_key,
     in_quiet_hours,
+    ingest_external,
     job_result_alert_draft,
     notify_job_result,
 )
@@ -234,8 +239,9 @@ async def _alerts(sessions) -> list:
     return await _fetchall(
         sessions,
         "SELECT alert_id, server_id, origin, run_id, finding_id, dedup_key, "
-        "title, summary, context_ref, delivery_status, created_at, "
-        "delivered_at, acknowledged_at, retain_until "
+        "severity, title, summary, body, source, context_ref, "
+        "delivery_status, created_at, delivered_at, acknowledged_at, "
+        "retain_until "
         "FROM notification_alerts ORDER BY created_at, dedup_key",
     )
 
@@ -385,7 +391,7 @@ class TestDraftsAndDedupKeys:
         assert draft.context_ref == f"finding:{FINDING_1}"
         assert draft.dedup_key == finding_dedup_key("update.available", "app-1")
         assert "update available" in draft.title
-        assert draft.summary.endswith("[severity=warning]")
+        assert draft.summary == "update available for fixture-app"
 
     def test_finding_draft_truncates_to_column_bounds(self):
         draft = finding_alert_draft(
@@ -399,7 +405,7 @@ class TestDraftsAndDedupKeys:
         )
         assert len(draft.title) <= 200
         assert len(draft.summary) <= 512
-        assert draft.summary.endswith("[severity=info]")
+        assert draft.summary.startswith("x") and draft.summary.endswith("…")
 
     def test_finding_draft_rejects_unknown_severity(self):
         with pytest.raises(NotificationError):
@@ -423,7 +429,6 @@ class TestDraftsAndDedupKeys:
         assert ok.run_id == RUN_OK and bad.run_id == RUN_BAD
         assert ok.context_ref == f"run:{RUN_OK}"
         assert "error_ref=err:1" in bad.summary and "error_ref" not in ok.summary
-        assert bad.summary.endswith("[severity=warning]")
 
     def test_job_result_draft_rejects_unknown_outcome(self):
         with pytest.raises(NotificationError):
@@ -603,7 +608,7 @@ def _payload(**kw: object) -> DeliveryPayload:
         "dedup_key": "finding:abc",
         "severity": "warning",
         "title": "update.available: update available",
-        "summary": "update available for fixture-app [severity=warning]",
+        "summary": "update available for fixture-app",
         "context_ref": f"finding:{FINDING_1}",
         "created_at": NOW,
         "event_type": "notification.delivered",
@@ -841,6 +846,7 @@ class TestPersistence:
         row = rows[0]
         assert row.server_id == uuid.UUID(SERVER_A)
         assert row.origin == "finding"
+        assert row.severity == "warning"  # the real column, no summary tag
         assert row.finding_id == FINDING_1
         assert row.run_id is None
         assert row.context_ref == f"finding:{FINDING_1}"
@@ -954,6 +960,9 @@ class TestPersistence:
         assert outcome.delivery == "delivered"
         assert len(channel.payloads) == 1
         assert channel.payloads[0].severity == "critical"
+        # The column mirrors what the escalation last told the human.
+        row = (await _alerts(sessions))[0]
+        assert row.severity == "critical"
 
     async def test_de_escalation_rescores_without_redelivery(self, sessions):
         await _insert_finding(sessions, FINDING_1, SERVER_A, severity="critical")
@@ -988,6 +997,8 @@ class TestPersistence:
         assert outcome.disposition == "rescored"
         assert outcome.delivery == "skipped"
         assert len(channel.payloads) == 1  # no second delivery
+        row = (await _alerts(sessions))[0]
+        assert row.severity == "info"  # rescored on the column
 
     async def test_unknown_channel_name_fails_closed(self, sessions):
         await _insert_finding(sessions, FINDING_1, SERVER_A, severity="warning")
@@ -1211,9 +1222,10 @@ class TestDeliveryLifecycle:
         row = (await _alerts(sessions))[0]
         assert row.delivery_status == "pending"
 
-    async def test_severed_anchor_routes_by_the_summary_tag(self, sessions):
+    async def test_severed_anchor_routes_by_the_stored_severity(self, sessions):
         # After the retention sweep severs the finding (ON DELETE SET NULL),
-        # a pending notice must still route by its recorded severity.
+        # a pending notice must still route by its recorded severity — the
+        # real column, no anchor join.
         await _insert_finding(sessions, FINDING_1, SERVER_A, severity="warning")
         quiet = QuietHours(
             start=time_from(21, 0), end=time_from(23, 0), tzinfo=timezone.utc
@@ -1244,7 +1256,7 @@ class TestDeliveryLifecycle:
         )
         assert sweep.delivered == 1
         assert len(channel.payloads) == 1
-        assert channel.payloads[0].severity == "warning"  # from the tag
+        assert channel.payloads[0].severity == "warning"  # from the column
 
     async def test_sink_failure_never_rolls_back_the_notice(self, sessions):
         await _insert_finding(sessions, FINDING_1, SERVER_A)
@@ -1303,6 +1315,7 @@ class TestJobResultNotices:
         assert rows[str(RUN_OK)].origin == "job_result"
         assert rows[str(RUN_OK)].finding_id is None
         assert rows[str(RUN_BAD)].context_ref == f"run:{RUN_BAD}"
+        assert rows[str(RUN_BAD)].severity == "warning"  # the real column
         assert "outcome=failed" in rows[str(RUN_BAD)].summary
         # Envelope carries the run anchor for job-result notices.
         created = [e for e in sink.envelopes if e["type"] == "notification.created"]
@@ -1376,3 +1389,227 @@ class TestJobResultNotices:
         assert outcome.delivery == "delivered"
         assert channel.payloads[0].severity == "warning"
         assert channel.payloads[0].origin == "job_result"
+
+
+# ---------------------------------------------------------------------------
+# External notices: the machine ingest lane's writer (unified inbox, 0017)
+# ---------------------------------------------------------------------------
+
+
+def _external_key(source: str | None, dedup_key: str) -> str:
+    """The frozen stored-key namespace the service derives (test oracle)."""
+    digest = hashlib.sha256(f"{source or ''}|{dedup_key}".encode()).hexdigest()[:32]
+    return f"external:{digest}"
+
+
+@pytest.mark.anyio
+class TestExternalNotices:
+    async def test_global_notice_persists_delivered_with_identity(self, sessions):
+        outcome = await ingest_external(
+            sessions,
+            title="disk almost full",
+            body="/var usage 94% on db-1",
+            severity="warning",
+            source="host-monitor",
+            dedup_key="disk-/var-db-1",
+            context_ref="https://monitoring.example/host/db-1",
+            now=NOW,
+        )
+        assert (outcome.disposition, outcome.delivery) == ("created", "delivered")
+        assert outcome.dedup_key == _external_key("host-monitor", "disk-/var-db-1")
+        rows = await _alerts(sessions)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.server_id is None  # global: NULL server, no sentinel UUID
+        assert row.origin == "external"
+        assert row.severity == "warning"  # the real column
+        assert row.title == "disk almost full"
+        assert row.body == "/var usage 94% on db-1"
+        assert row.source == "host-monitor"
+        assert row.summary is None  # body carries the external text
+        assert row.context_ref == "https://monitoring.example/host/db-1"
+        assert row.delivery_status == "delivered"  # inbox-only stamp on insert
+        assert row.delivered_at == NOW
+        assert row.acknowledged_at is None
+        assert row.retain_until == NOW + RETENTION_HORIZON
+
+    async def test_namespaced_key_hashes_source_and_key(self, sessions):
+        keyed = await ingest_external(
+            sessions, title="t", source="a", dedup_key="k", now=NOW
+        )
+        sourceless = await ingest_external(
+            sessions, title="t", dedup_key="k", now=NOW
+        )
+        assert keyed.dedup_key == _external_key("a", "k")
+        assert sourceless.dedup_key == _external_key(None, "k")  # '' source
+        assert keyed.dedup_key != sourceless.dedup_key
+
+    async def test_replay_is_idempotent_per_scope(self, sessions):
+        first = await ingest_external(
+            sessions, title="t1", source="s", dedup_key="k", now=NOW
+        )
+        second = await ingest_external(
+            sessions,
+            title="t2",
+            source="s",
+            dedup_key="k",
+            now=NOW + timedelta(minutes=5),
+        )
+        scoped_first = await ingest_external(
+            sessions,
+            server_id=SERVER_A,
+            title="t1",
+            source="s",
+            dedup_key="k",
+            now=NOW,
+        )
+        scoped_second = await ingest_external(
+            sessions,
+            server_id=SERVER_A,
+            title="t2",
+            source="s",
+            dedup_key="k",
+            now=NOW + timedelta(minutes=5),
+        )
+        assert (first.disposition, second.disposition) == ("created", "deduped")
+        assert (scoped_first.disposition, scoped_second.disposition) == (
+            "created",
+            "deduped",
+        )
+        assert second.alert_id == first.alert_id  # the committed row
+        assert scoped_second.alert_id == scoped_first.alert_id
+        assert second.delivery == "skipped"  # nothing re-delivered
+        rows = await _alerts(sessions)
+        assert len(rows) == 2  # one global + one server-scoped
+
+    async def test_global_and_server_rows_of_same_key_never_collide(self, sessions):
+        global_outcome = await ingest_external(
+            sessions, title="global", source="s", dedup_key="k", now=NOW
+        )
+        scoped_outcome = await ingest_external(
+            sessions,
+            server_id=SERVER_A,
+            title="scoped",
+            source="s",
+            dedup_key="k",
+            now=NOW,
+        )
+        assert (global_outcome.disposition, scoped_outcome.disposition) == (
+            "created",
+            "created",
+        )
+        assert global_outcome.dedup_key == scoped_outcome.dedup_key
+        rows = await _alerts(sessions)
+        assert len(rows) == 2  # composite arbiter + partial index both allow it
+        assert {r.server_id for r in rows} == {None, uuid.UUID(SERVER_A)}
+
+    async def test_omitted_dedup_key_is_unique_per_message(self, sessions):
+        first = await ingest_external(sessions, title="one", now=NOW)
+        second = await ingest_external(
+            sessions, title="two", now=NOW + timedelta(seconds=1)
+        )
+        assert (first.disposition, second.disposition) == ("created", "created")
+        assert first.dedup_key != second.dedup_key
+        assert all(
+            key.startswith("external:") and len(key) == len("external:") + 32
+            for key in (first.dedup_key, second.dedup_key)
+        )
+        assert len(await _alerts(sessions)) == 2
+
+    async def test_external_bypasses_quiet_hours_and_cooldown(self, sessions):
+        # The writer takes no policy/channels at all (message semantics, not
+        # condition semantics): a finding notice at the same instant defers
+        # inside the quiet window while the external push lands delivered.
+        await _insert_finding(sessions, FINDING_1, SERVER_A, severity="warning")
+        quiet = QuietHours(
+            start=time_from(21, 0), end=time_from(23, 0), tzinfo=timezone.utc
+        )
+        deferred = (
+            await evaluate_findings(
+                sessions,
+                uuid.UUID(SERVER_A),
+                now=NOW,  # 22:00 UTC → inside the window
+                policy=_quiet_policy(quiet=quiet),
+                channels={"webhook": CountingChannel("webhook")},
+            )
+        )[0]
+        assert deferred.delivery == "pending"
+        pushed = await ingest_external(
+            sessions,
+            title="push during quiet hours",
+            severity="warning",
+            source="s",
+            dedup_key="q1",
+            now=NOW,
+        )
+        assert pushed.delivery == "delivered"
+        rows = {r.origin: r for r in await _alerts(sessions)}
+        assert rows["external"].delivery_status == "delivered"
+        assert rows["external"].delivered_at == NOW
+        assert rows["finding"].delivery_status == "pending"  # unchanged
+
+    async def test_bounds_fail_closed_value_free_before_any_write(self, sessions):
+        good = dict(title="ok", source="s", dedup_key="k", body="fine")
+        bad_cases = [
+            dict(good, title="   "),  # blank title
+            dict(good, title="OVERBOUNDS-TITLE" * 20),  # > 200 chars
+            dict(good, body=""),  # empty body violates the CHECK bound
+            dict(good, body="OVERBOUNDS-BODY" * 400),  # > 4096 chars
+            dict(good, source="   "),  # blank source
+            dict(good, source="OVERBOUNDS-SRC" * 8),  # > 64 chars
+            dict(good, dedup_key="   "),  # blank dedup key
+            dict(good, dedup_key="OVERBOUNDS-KEY" * 20),  # > 256 chars
+            dict(good, severity="fatal"),  # outside the frozen vocabulary
+            dict(good, title=None),
+        ]
+        for case in bad_cases:
+            with pytest.raises(NotificationError) as err:
+                await ingest_external(sessions, **case, now=NOW)
+            assert err.value.code == NotificationErrorCode.INVALID_DRAFT
+            # Value-free: none of the rejected content leaks into the error.
+            for marker in ("OVERBOUNDS", "fatal"):
+                assert marker not in str(err.value)
+        assert await _alerts(sessions) == []  # fail-closed before any write
+
+    async def test_invalid_server_id_is_rejected_value_free(self, sessions):
+        with pytest.raises(NotificationError):
+            await ingest_external(
+                sessions, server_id="not-a-uuid", title="t", now=NOW
+            )
+        assert await _alerts(sessions) == []
+
+    async def test_oversized_context_ref_is_truncated_not_rejected(self, sessions):
+        await ingest_external(
+            sessions, title="t", context_ref="r" * 600, now=NOW
+        )
+        row = (await _alerts(sessions))[0]
+        assert row.context_ref == "r" * 511 + "…"
+        assert len(row.context_ref) == 512
+
+    async def test_concurrent_global_replay_yields_one_row(self, sessions):
+        # Two concurrent writers race the same global logical key: the
+        # partial unique index arbitrates — exactly one committed row, one
+        # created + one deduped outcome pointing at it, never a duplicate.
+        outcomes = await asyncio.gather(
+            ingest_external(
+                sessions,
+                title="first",
+                source="race-src",
+                dedup_key="race-key",
+                now=NOW,
+            ),
+            ingest_external(
+                sessions,
+                title="second",
+                source="race-src",
+                dedup_key="race-key",
+                now=NOW,
+            ),
+        )
+        assert sorted(o.disposition for o in outcomes) == ["created", "deduped"]
+        created, deduped = outcomes
+        assert created.alert_id == deduped.alert_id  # the one committed row
+        rows = await _alerts(sessions)
+        assert len(rows) == 1
+        assert rows[0].dedup_key == _external_key("race-src", "race-key")
+        assert rows[0].delivery_status == "delivered"

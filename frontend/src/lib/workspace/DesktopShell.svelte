@@ -41,6 +41,7 @@
 	import { jobsEntry } from './entries/05-web-jobs.js';
 	import { knowledgeModelsEntry } from './entries/11-web-memory-models.js';
 	import { modelSettingsEntry } from './entries/06-web-models.js';
+	import { notificationsEntry } from './entries/14-web-notifications.js';
 	import { overviewEntry } from './entries/10-web-dashboard.js';
 	import { pluginFormsEntry } from './entries/09-web-plugin-forms.js';
 	import { pluginsEntry } from './entries/12-web-plugins.js';
@@ -166,7 +167,11 @@
 			pluginFormsEntry(),
 			pluginsEntry(),
 			runbooksEntry(),
-			knowledgeModelsEntry()
+			knowledgeModelsEntry(),
+			// The unified notification inbox (campaign `notification-inbox`):
+			// ONE global singleton window, registered like every reviewed
+			// feature entry (registration ≠ permission, ADR §7.1).
+			notificationsEntry()
 		]);
 		if (!result.ok) {
 			// Constant input; failure here is a programming defect, not a
@@ -289,6 +294,12 @@
 		runbookCatalogServices
 	} from './entries/13-web-runbooks.js';
 	import { SERVER_PROFILE_PANEL_KIND, serverProfileServices } from './entries/02-web-server.js';
+	import {
+		NOTIFICATIONS_PANEL_ID,
+		notificationsServices,
+		type NotificationsApi,
+		type NotificationsFilterHandoff
+	} from './entries/14-web-notifications.js';
 	import type { PanelServices } from './registry.js';
 
 	const registry = createDesktopRegistry();
@@ -537,6 +548,10 @@
 			liveServers = servers;
 			live = true;
 			status = null;
+			// The rail badge starts from server truth and stays live through its
+			// own wakeup stream (badge updates even while the panel is closed).
+			void refreshUnreadCount();
+			startUnreadLiveLoop();
 			if (servers.length > 0) {
 				// Restore the stored choice ONLY when it still names an enrolled
 				// server; anything else (absent, deleted, stale, invalid) falls
@@ -597,6 +612,9 @@
 		live = false;
 		liveServers = [];
 		selectedServerId = FIXTURE_SERVERS[0].id;
+		// The badge is live-session truth: sign-out drops the stream and the
+		// count (the fixture desktop renders no badge rather than a stale one).
+		stopUnreadLiveLoop();
 		status = 'Signed out — fixture desktop.';
 		if (!isOfflineFixtureHost()) {
 			await goto('/login', { replaceState: true });
@@ -1234,6 +1252,7 @@
 		plugins: '⌘',
 		runbooks: '§',
 		overview: '⊞',
+		notifications: '☰',
 		'fixture-notes': '▤',
 		'fixture-prefs': '⚙',
 		'fixture-broken': '⚠'
@@ -1264,12 +1283,202 @@
 		);
 	}
 
+	// --- Unread badge + the notifications window seam (campaign nbi) ---------
+
+	/**
+	 * The rail badge's fleet-wide unread total (`GET /api/v1/notifications/
+	 * unread-count` with NO filters — ALL notices, R4-F2). Server truth only:
+	 * `null` (never loaded / refetch failed) hides the badge honestly — a
+	 * stale count is never fabricated (C08 rule 6).
+	 */
+	let railUnreadTotal = $state<number | null>(null);
+	/** Single-flight debounce shared by wakeup refetches and mutation syncs. */
+	let unreadRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	/** The badge's own wakeup stream controller (live while the session is). */
+	let unreadStreamAbort: AbortController | null = null;
+	/** Debounce + backoff budget (same values the panels' loops use). */
+	const UNREAD_REFRESH_DEBOUNCE_MS = 150;
+	const UNREAD_BACKOFF_MS = 750;
+
+	/** Abortable sleep for the bounded reconnect backoff. */
+	function unreadSleep(ms: number, signal: AbortSignal): Promise<void> {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		const timer = setTimeout(resolve, ms);
+		signal.addEventListener(
+			'abort',
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			{ once: true }
+		);
+		return promise;
+	}
+
+	function scheduleUnreadRefresh(): void {
+		if (unreadRefreshTimer !== null) return;
+		unreadRefreshTimer = setTimeout(() => {
+			unreadRefreshTimer = null;
+			void refreshUnreadCount();
+		}, UNREAD_REFRESH_DEBOUNCE_MS);
+	}
+
+	/** One fleet-wide unread-count read; failure hides the badge, never lies. */
+	async function refreshUnreadCount(): Promise<void> {
+		if (!live) return;
+		try {
+			const view = await api.getUnreadNotificationCount();
+			railUnreadTotal = view.total;
+		} catch {
+			railUnreadTotal = null;
+		}
+	}
+
+	/**
+	 * The badge's own wakeup loop: identity-only SSE frames (and the
+	 * bounded stream's clean close) are a refetch SIGNAL — the durable
+	 * unread-count read stays the only truth, so the badge stays live even
+	 * while the notifications window is closed. Failures back off and
+	 * resubscribe until the session ends (no fixed polling anywhere).
+	 */
+	async function unreadLiveLoop(controller: AbortController): Promise<void> {
+		while (live && !controller.signal.aborted) {
+			try {
+				await api.subscribeNotificationEvents({
+					signal: controller.signal,
+					onWakeup: () => {
+						if (controller.signal.aborted) return;
+						scheduleUnreadRefresh();
+					},
+					onStreamEnd: () => {
+						if (controller.signal.aborted) return;
+						scheduleUnreadRefresh();
+					}
+				});
+			} catch {
+				// Unreachable/failed stream: the backoff below retries while live.
+			}
+			if (!live || controller.signal.aborted) return;
+			await unreadSleep(UNREAD_BACKOFF_MS, controller.signal);
+		}
+	}
+
+	/** (Re)start the badge stream; one controller per live attach. */
+	function startUnreadLiveLoop(): void {
+		unreadStreamAbort?.abort();
+		const controller = new AbortController();
+		unreadStreamAbort = controller;
+		void unreadLiveLoop(controller);
+	}
+
+	/** Stop the badge stream and drop the count (the fixture desktop has none). */
+	function stopUnreadLiveLoop(): void {
+		unreadStreamAbort?.abort();
+		unreadStreamAbort = null;
+		unreadRefreshTimer !== null && clearTimeout(unreadRefreshTimer);
+		unreadRefreshTimer = null;
+		railUnreadTotal = null;
+	}
+
+	/**
+	 * The notifications panel's api slice: the ONE client mapped 1:1, with the
+	 * inbox MUTATIONS wrapped so a panel ack/unack/mark-all-read also refreshes
+	 * the rail badge after the mutation commits — the panel's own refetch
+	 * reads ITS filters; the badge needs its own fleet-wide read to stay in
+	 * sync (the frozen «ack in panel reflects in the badge» acceptance).
+	 */
+	const notificationsApi: NotificationsApi = {
+		listInboxNotifications: (query) => api.listInboxNotifications(query),
+		getUnreadNotificationCount: (query) => api.getUnreadNotificationCount(query),
+		acknowledgeInboxNotification: async (alertId) => {
+			const receipt = await api.acknowledgeInboxNotification(alertId);
+			scheduleUnreadRefresh();
+			return receipt;
+		},
+		unacknowledgeInboxNotification: async (alertId) => {
+			const receipt = await api.unacknowledgeInboxNotification(alertId);
+			scheduleUnreadRefresh();
+			return receipt;
+		},
+		markAllNotificationsRead: async (query) => {
+			const receipt = await api.markAllNotificationsRead(query);
+			scheduleUnreadRefresh();
+			return receipt;
+		},
+		subscribeNotificationEvents: (options) => api.subscribeNotificationEvents(options),
+		listProfiles: () => api.listProfiles(),
+		listIngestKeys: (page) => api.listIngestKeys(page),
+		createIngestKey: (payload) => api.createIngestKey(payload),
+		revokeIngestKey: (keyId) => api.revokeIngestKey(keyId)
+	};
+
+	/**
+	 * The ONE sequenced server-filter handoff (the pre-authorized cross-panel
+	 * seam): every «View in Inbox →» request opens/focuses the singleton
+	 * notifications window AND records `{serverId, seq}`; strictly increasing
+	 * `seq` lets the mounted panel apply each request exactly once — both for
+	 * a fresh open and when the window is already on screen. `consume` clears
+	 * the applied request so a later plain open starts unfiltered.
+	 */
+	let notificationsHandoff = $state<{ serverId: ServerId; seq: number } | null>(null);
+	let notificationsHandoffSeq = 0;
+
+	const notificationsHandoffSeam: NotificationsFilterHandoff = {
+		read: () => notificationsHandoff,
+		consume: (seq) => {
+			if (notificationsHandoff !== null && notificationsHandoff.seq === seq) {
+				notificationsHandoff = null;
+			}
+		}
+	};
+
+	/**
+	 * The «View in Inbox →» hand-off target (and the notifications seam the
+	 * overview's links bag carries): open (or focus) the ONE global window,
+	 * restore it first when it was minimized (raising the stack alone never
+	 * un-minimizes — the presentation controller owns that transition, PT4),
+	 * then record the sequenced filter request.
+	 *
+	 * Focus re-assertion: the handing-off click BUBBLES to the source
+	 * window's PT2 click activation, whose live `focused` prop re-reads after
+	 * this handler focused the inbox — mid-dispatch the source frame sees
+	 * itself unfocused and raises itself back on top (observed with the
+	 * overview source). Re-assert the inbox focus once the event dispatch
+	 * settles, so the ONE notifications window stays the focused surface the
+	 * open promised.
+	 */
+	function openNotificationsInbox(serverId: ServerId): void {
+		const existing = snapshot.windows.find((win) => win.panel_kind === NOTIFICATIONS_PANEL_ID);
+		openPanel(NOTIFICATIONS_PANEL_ID, { kind: 'global' });
+		if (existing !== undefined && existing.presentation === 'minimized') {
+			presentation.activate(existing.window_id);
+		}
+		notificationsHandoffSeq += 1;
+		notificationsHandoff = { serverId, seq: notificationsHandoffSeq };
+		const windowId = snapshot.windows.find(
+			(win) => win.panel_kind === NOTIFICATIONS_PANEL_ID
+		)?.window_id;
+		if (windowId === undefined) return;
+		queueMicrotask(() => {
+			if (snapshot.focused_id !== windowId && !snapshot.windows.some((win) => win.window_id === windowId && win.presentation === 'minimized')) {
+				presentation.focus(windowId);
+			}
+		});
+	}
+
 	const overviewApi: OverviewApi = {
 		listObservations: api.listObservations,
 		listFindings: api.listFindings,
 		evaluateFindings: api.evaluateFindings,
 		listNotifications: api.listNotifications,
-		ackNotification: api.ackNotification,
+		// The overview's per-server ack is a notification mutation too: the
+		// stamp changes the fleet unread total, so the badge refetches after
+		// the idempotent stamp commits (never before, never optimistically).
+		ackNotification: async (serverId, alertId) => {
+			const receipt = await api.ackNotification(serverId, alertId);
+			scheduleUnreadRefresh();
+			return receipt;
+		},
 		listAdoptedApplications: api.listAdoptedApplications,
 		listRuns: api.listRuns,
 		streamRunEvents: browserRunEventStream
@@ -1414,13 +1623,20 @@
 						{
 							openApplications: (serverId) =>
 								openServerPanel(APPLICATIONS_PANEL_KIND, serverId),
-							openJobs: (serverId) => openServerPanel(JOBS_PANEL_KIND, serverId)
+							openJobs: (serverId) => openServerPanel(JOBS_PANEL_KIND, serverId),
+							// «View in Inbox →»: the cross-panel hand-off into the ONE
+							// fleet-wide notifications window (sequenced server filter).
+							openNotifications: (serverId) => openNotificationsInbox(serverId)
 						},
 						{
 							attach: (payload: EvidenceAttachPayload) =>
 								openServerPanel(CHAT_PANEL_KIND, payload.server_id)
 						}
 					)
+				);
+			case NOTIFICATIONS_PANEL_ID:
+				return asBag(
+					notificationsServices(notificationsApi, notificationsHandoffSeam)
 				);
 			case KNOWLEDGE_MODELS_PANEL_KIND:
 				return asBag(
@@ -1702,6 +1918,13 @@
 					onclick={() => openPanel(entry.panel_kind)}
 				>
 					<span class="mai-rail-btn__glyph" aria-hidden="true">{railGlyphFor(entry.panel_kind)}</span>
+					{#if entry.panel_kind === NOTIFICATIONS_PANEL_ID && railUnreadTotal !== null && railUnreadTotal > 0}
+						<!-- The unread badge: fleet-wide server truth, hidden when 0 or
+						     unavailable (never a fabricated count, C08 rule 6). -->
+						<span class="mai-rail-btn__badge" data-testid="rail-notifications-badge">
+							{railUnreadTotal}
+						</span>
+					{/if}
 				</button>
 			{/each}
 			{#if live}
@@ -1958,6 +2181,34 @@
 
 	.mai-rail-btn__glyph {
 		line-height: 1;
+	}
+
+	/* The notifications rail badge (campaign nbi): a small brass counter
+	 * pinned to the glyph's top-right corner; hidden entirely when the
+	 * count is 0 or unavailable — the shell renders it only for >0. */
+	.mai-rail-btn {
+		position: relative;
+	}
+
+	.mai-rail-btn__badge {
+		position: absolute;
+		top: -4px;
+		right: -4px;
+		min-width: 0.95rem;
+		height: 0.95rem;
+		padding: 0 0.2rem;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-family: var(--mai-font-mono);
+		font-size: 0.62rem;
+		font-weight: var(--mai-weight-semibold);
+		line-height: 1;
+		color: var(--mai-color-primary-contrast, #12161c);
+		background: var(--mai-color-brass);
+		border: 1px solid var(--mai-color-surface-raised);
+		border-radius: 999px;
+		pointer-events: none;
 	}
 
 	.mai-rail-btn--end {

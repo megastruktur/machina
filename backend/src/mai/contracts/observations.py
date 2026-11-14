@@ -103,10 +103,12 @@ class FindingSeverity(StrEnum):
 
 
 class AlertOrigin(StrEnum):
-    """Frozen notification anchor (C10 rule 3: per finding or job result)."""
+    """Frozen notification anchor (C10 rule 3: finding, job result, or an
+    external push via the machine ingest lane)."""
 
     FINDING = "finding"
     JOB_RESULT = "job_result"
+    EXTERNAL = "external"
 
 
 class DeliveryStatus(StrEnum):
@@ -131,6 +133,15 @@ SUMMARY_MAX_CHARS = 512
 DETAIL_MAX_CHARS = 2048
 TITLE_MAX_CHARS = 200
 CONTEXT_REF_MAX_CHARS = 512
+
+# Notification-inbox bounds (migration ``0017_notification_inbox`` mirrors
+# the source/body ``char_length`` CHECKs on the unified inbox; the ingest
+# route enforces the byte budget BEFORE payload/key validation, and the
+# durable per-key fixed window counts requests per INGEST_RATE_WINDOW).
+MAX_NOTIFICATION_BODY_CHARS = 4096
+MAX_NOTIFICATION_SOURCE_CHARS = 64
+MAX_INGEST_BODY_BYTES = 16384
+INGEST_RATE_WINDOW = 60
 
 
 def validate_alert_shape(
