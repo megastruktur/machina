@@ -105,6 +105,7 @@ from mai.contracts.observations import (
     TITLE_MAX_CHARS,
     validate_alert_shape,
 )
+from mai.notification_channel import notify_notification_wakeup
 
 __all__ = [
     "DEFAULT_COOLDOWN",
@@ -1058,6 +1059,41 @@ async def _deliver_row(
     )
 
 
+async def _publish_wakeup(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    kind: str,
+    alert_id: uuid.UUID,
+    server_id: uuid.UUID | None,
+) -> None:
+    """Publish ONE identity-only live wakeup AFTER the durable commit.
+
+    Callers run this strictly after the row's own committed transaction
+    (durable FIRST, notify SECOND — nbi_PLAN shared contracts). The
+    engine rides the session factory's bind; a missing bind (a factory
+    without one) or a failed publish never touches the outcome — the
+    lost wakeup costs at most one coarse tick of delay, and the durable
+    inbox is the single truth. The payload carries identity only (never
+    title/body/summary/source/secret material).
+    """
+    engine = sessions.kw.get("bind")
+    if engine is None:
+        return
+    try:
+        await notify_notification_wakeup(
+            engine, kind=kind, alert_id=alert_id, server_id=server_id
+        )
+    except Exception as error:
+        import sys
+
+        print(
+            f"notification service: wakeup publish failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 async def _persist_new(
     sessions: async_sessionmaker[AsyncSession],
     server_id: uuid.UUID,
@@ -1088,6 +1124,16 @@ async def _persist_new(
             )
         ).first()
         await session.commit()
+    # Live wakeup AFTER the durable commit (nbi-live): the row above is
+    # already committed; a lost or failed notify costs one coarse tick,
+    # never correctness. Identity only — never draft content.
+    if inserted is not None:
+        await _publish_wakeup(
+            sessions,
+            kind="created",
+            alert_id=inserted[0],
+            server_id=server_id,
+        )
     return inserted[0] if inserted else None
 
 
@@ -1172,6 +1218,15 @@ async def _evaluate_one(
                 },
             )
             await session.commit()
+        # Live wakeup AFTER the durable commit (nbi-live): the in-place
+        # content update (escalation or de-escalation rescore) changed the
+        # committed row — subscribers refetch. Identity only.
+        await _publish_wakeup(
+            sessions,
+            kind="updated",
+            alert_id=existing["alert_id"],  # type: ignore[arg-type]
+            server_id=server_id,
+        )
         if not escalated:
             # De-escalation: content refresh only, never a delivery — only
             # escalations interrupt a human.
@@ -1459,7 +1514,9 @@ async def ingest_external(
     the composite ``(server_id, dedup_key)`` arbiter — a global row and a
     server-scoped row of the same logical key never collide. Every bound
     violation raises a value-free :class:`NotificationError` before any
-    write; the EventSink seam is untouched (live NOTIFY is a later card).
+    write; the EventSink seam is untouched (the live wakeup channel is
+    the separate identity-only NOTIFY lane — :func:`_publish_wakeup`
+    fires it after this row's commit).
     """
     at = _utc(now) if now is not None else datetime.now(timezone.utc)
     scope_id: uuid.UUID | None = None
@@ -1536,6 +1593,15 @@ async def ingest_external(
         inserted = (await session.execute(insert, params)).first()
         await session.commit()
     if inserted is not None:
+        # Live wakeup AFTER the durable commit (nbi-live): the external
+        # notice row is committed; subscribers refetch. Identity only —
+        # never the message body or source text.
+        await _publish_wakeup(
+            sessions,
+            kind="created",
+            alert_id=inserted[0],
+            server_id=scope_id,
+        )
         return NoticeOutcome(
             alert_id=inserted[0],
             dedup_key=notice_key,

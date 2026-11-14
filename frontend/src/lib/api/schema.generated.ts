@@ -2244,6 +2244,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/notifications/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to identity-only inbox wakeups (SSE, no cursor)
+         * @description Wakeup-only SSE over the unified inbox (notification-inbox.md §8).
+         *
+         *     Authorization completes BEFORE the response starts: an unauthenticated
+         *     call is an ordinary 401 envelope and a non-allowlisted Origin a 403 —
+         *     never stream bytes (jobs.py SSE discipline). Frames carry identity
+         *     ONLY — ``{"kind": "created"|"updated", "alert_id", "server_id"}`` or
+         *     the identity-free ``{"kind": "resync"}`` refetch signal — no title,
+         *     body, source or cursor ever crosses the wire. Delivery is
+         *     at-least-once with loss bounded by one coarse tick: the durable store
+         *     is the single truth and every wakeup/reconnect ends in a refetch.
+         */
+        get: operations["stream_notification_events_api_v1_notifications_events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/servers/{server_id}/terminal/info": {
         parameters: {
             query?: never;
@@ -12826,6 +12855,53 @@ export interface operations {
                 };
             };
             /** @description Notification storage unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    stream_notification_events_api_v1_notifications_events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No valid session (answered before any stream byte) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description An Origin header that is not allowlisted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The live wakeup channel is not running */
             503: {
                 headers: {
                     [name: string]: unknown;

@@ -296,6 +296,7 @@ _FEATURE_SURFACE = frozenset(
         # unacknowledge route. The SSE events route joins in nbi-live.)
         ("GET", "/api/v1/notifications"),
         ("GET", "/api/v1/notifications/unread-count"),
+        ("GET", "/api/v1/notifications/events"),
         ("POST", "/api/v1/notifications/{alert_id}/ack"),
         ("POST", "/api/v1/notifications/{alert_id}/unack"),
         ("POST", "/api/v1/notifications/mark-all-read"),
@@ -532,6 +533,7 @@ def test_openapi_contract_matches_implemented_routes() -> None:
         # unacknowledge route. The SSE events route joins in nbi-live.)
         "/api/v1/notifications",
         "/api/v1/notifications/unread-count",
+        "/api/v1/notifications/events",
         "/api/v1/notifications/{alert_id}/ack",
         "/api/v1/notifications/{alert_id}/unack",
         "/api/v1/notifications/mark-all-read",

@@ -46,6 +46,13 @@ machine ingest principal):
   session → origin → CSRF (ADR §5). The view model is
   ``mai.api.monitoring.AlertView`` verbatim, so the unified inbox renders
   ONE wire shape on every surface.
+- The live wakeup stream (task nbi-live) is ``GET /notifications/events``:
+  session + Origin checked BEFORE any stream byte (jobs.py SSE
+  discipline), identity-only frames (``created``/``updated`` + the
+  identity-free ``resync`` refetch signal), ping keepalive, bounded
+  lifetime, no cursor. ``ack``/``unack``/``mark-all-read`` and the
+  service's writers publish one identity-only NOTIFY AFTER the durable
+  commit; subscribers refetch the durable store on every wakeup.
 
 Every error uses the shared C01 envelope renderer; the returned plaintext
 is never logged and never echoed by any error path.
@@ -53,14 +60,16 @@ is never logged and never echoed by any error path.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from typing import Final, Literal
 
 from fastapi import APIRouter, FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -99,6 +108,12 @@ from mai.contracts.observations import (
     AlertOrigin,
 )
 from mai.contracts.tags import compute_has_more
+from mai.notification_channel import (
+    NotificationChannelHub,
+    NotificationSink,
+    attach_notification_channel,
+    notify_notification_wakeup,
+)
 from mai.notifications.service import NotificationError, ingest_external
 from mai.profiles.files import ProfileFileError, ProfileFileStore
 
@@ -113,6 +128,23 @@ _UNAUTHENTICATED_MESSAGE: Final[str] = "authentication required"
 #: 503 vocabulary of this surface (notification-inbox.md §5): the ingest
 #: lane cannot authenticate or persist without its storage.
 _UNAVAILABLE_MESSAGE: Final[str] = "ingest storage is unavailable"
+
+#: SSE keepalive cadence (jobs.py discipline): a silent stream would hit
+#: proxy idle timeouts; the ping comment is ignored by EventSource.
+SSE_PING_SECONDS: Final[float] = 15.0
+
+#: Bounded stream lifetime (jobs.py discipline): the server self-closes,
+#: the client reconnects (EventSource semantics) and REFETCHES the
+#: durable list/count — the wakeup channel carries no cursor and no
+#: replay, so reconnects are the recovery path by construction.
+SSE_MAX_STREAM_SECONDS: Final[float] = 600.0
+
+#: Per-row wakeup bound for mark-all-read: at most this many identity
+#: frames are published for one call (== MAX_PAGE_LIMIT, the page bound
+#: the UI consumes). Beyond the cap the remaining rows are learned by
+#: the next reconnect refetch — wakeups are an optimization, never a
+#: correctness dependency (notification-inbox.md §8).
+_MARK_ALL_WAKEUP_CAP: Final[int] = 200
 
 
 def _unauthenticated() -> BoundaryError:
@@ -137,6 +169,44 @@ def _unavailable() -> BoundaryError:
     return BoundaryError(
         HTTP_503_SERVICE_UNAVAILABLE, "service_unavailable", _UNAVAILABLE_MESSAGE
     )
+
+
+def _channel_unavailable() -> BoundaryError:
+    """The live wakeup channel is not running (no engine / at capacity)."""
+    return BoundaryError(
+        HTTP_503_SERVICE_UNAVAILABLE,
+        "service_unavailable",
+        "live notification channel is unavailable",
+    )
+
+
+async def _publish_wakeup(
+    request: Request,
+    *,
+    kind: str,
+    alert_id: uuid.UUID,
+    server_id: uuid.UUID | None,
+) -> None:
+    """Publish ONE identity-only wakeup AFTER this route's durable commit.
+
+    A lost or failed wakeup costs the subscribers one coarse tick (or one
+    reconnect) of delay — the durable row is the truth, never the notify.
+    Failures are observable on stderr and never fail the HTTP mutation.
+    """
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return
+    try:
+        await notify_notification_wakeup(
+            engine, kind=kind, alert_id=alert_id, server_id=server_id
+        )
+    except Exception as error:  # noqa: BLE001 - wakeups never fail a route
+        print(
+            f"notification route: wakeup publish failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1084,14 @@ async def acknowledge_notification(
             await session.execute(_NOTICE_ROW_SQL, {"alert_id": alert_id})
         ).mappings().one()
         await session.commit()
+    # Live wakeup AFTER the durable commit (nbi-live): subscribers
+    # refetch the list/count. Identity only.
+    await _publish_wakeup(
+        request,
+        kind="updated",
+        alert_id=row["alert_id"],  # type: ignore[arg-type]
+        server_id=row["server_id"],  # type: ignore[arg-type]
+    )
     return AckResult(alert=_alert_view(row))
 
 
@@ -1075,6 +1153,14 @@ async def unacknowledge_notification(
             await session.execute(_NOTICE_ROW_SQL, {"alert_id": alert_id})
         ).mappings().one()
         await session.commit()
+    # Live wakeup AFTER the durable commit (nbi-live): subscribers
+    # refetch the list/count. Identity only.
+    await _publish_wakeup(
+        request,
+        kind="updated",
+        alert_id=row["alert_id"],  # type: ignore[arg-type]
+        server_id=row["server_id"],  # type: ignore[arg-type]
+    )
     return AckResult(alert=_alert_view(row))
 
 
@@ -1143,14 +1229,130 @@ async def mark_all_read(
             text(
                 "UPDATE notification_alerts SET acknowledged_at = :now"
                 f" WHERE {where} AND acknowledged_at IS NULL"
+                " RETURNING alert_id, server_id"
             ),
             params | {"now": now},
         )
-        updated = int(stamped.rowcount)
+        stamped_rows = stamped.mappings().all()
+        updated = len(stamped_rows)
         await session.commit()
+    # Live wakeups AFTER the durable commit (nbi-live): one identity-only
+    # frame per stamped row, bounded by _MARK_ALL_WAKEUP_CAP (rows beyond
+    # the cap are learned by the next reconnect refetch — wakeups are an
+    # optimization, never a correctness dependency).
+    for stamped_row in stamped_rows[:_MARK_ALL_WAKEUP_CAP]:
+        await _publish_wakeup(
+            request,
+            kind="updated",
+            alert_id=stamped_row["alert_id"],  # type: ignore[arg-type]
+            server_id=stamped_row["server_id"],  # type: ignore[arg-type]
+        )
     return MarkAllReadResult(updated=updated)
+
+
+# ---------------------------------------------------------------------------
+# Live wakeup stream (nbi-live; notification-inbox.md §8)
+# ---------------------------------------------------------------------------
+
+
+def _notification_channel(request: Request) -> NotificationChannelHub:
+    """The running hub (fail closed with 503 when absent/stopped)."""
+    hub = getattr(request.app.state, "notification_channel", None)
+    if hub is None or not hub.running:
+        raise _channel_unavailable()
+    return hub
+
+
+async def _wakeup_stream(
+    hub: NotificationChannelHub, sink: NotificationSink
+) -> AsyncIterator[str]:
+    """The SSE body: identity-only wakeup frames, ping keepalive, self-close.
+
+    No cursor and no replay: the client refetches the durable list/count
+    on EVERY frame, on every reconnect, and when this bounded stream
+    self-closes. The sink is unsubscribed on ANY exit (dead clients are
+    never retained by the hub).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SSE_MAX_STREAM_SECONDS
+    last_frame = loop.time()
+    try:
+        while True:
+            now = loop.time()
+            remaining = deadline - now
+            if remaining <= 0:
+                return  # bounded lifetime: the client reconnects + refetches
+            try:
+                frame = await asyncio.wait_for(
+                    sink.outbox.get(), timeout=min(remaining, SSE_PING_SECONDS)
+                )
+            except TimeoutError:
+                now = loop.time()
+                if now - last_frame >= SSE_PING_SECONDS:
+                    yield ": ping\n\n"  # keepalive comment; consumers ignore it
+                    last_frame = now
+                continue
+            yield f"data: {frame.wire()}\n\n"
+            last_frame = loop.time()
+    finally:
+        hub.unsubscribe(sink)
+
+
+@router.get(
+    "/notifications/events",
+    summary="Subscribe to identity-only inbox wakeups (SSE, no cursor)",
+    responses={
+        HTTP_401_UNAUTHORIZED: {
+            "model": ErrorEnvelope,
+            "description": "No valid session (answered before any stream byte)",
+        },
+        HTTP_403_FORBIDDEN: {
+            "model": ErrorEnvelope,
+            "description": "An Origin header that is not allowlisted",
+        },
+        HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorEnvelope,
+            "description": "The live wakeup channel is not running",
+        },
+    },
+)
+async def stream_notification_events(request: Request) -> StreamingResponse:
+    """Wakeup-only SSE over the unified inbox (notification-inbox.md §8).
+
+    Authorization completes BEFORE the response starts: an unauthenticated
+    call is an ordinary 401 envelope and a non-allowlisted Origin a 403 —
+    never stream bytes (jobs.py SSE discipline). Frames carry identity
+    ONLY — ``{"kind": "created"|"updated", "alert_id", "server_id"}`` or
+    the identity-free ``{"kind": "resync"}`` refetch signal — no title,
+    body, source or cursor ever crosses the wire. Delivery is
+    at-least-once with loss bounded by one coarse tick: the durable store
+    is the single truth and every wakeup/reconnect ends in a refetch.
+    """
+    await _require_session(request)  # 401 before any stream byte
+    origin = request.headers.get("origin")
+    if origin and origin not in request.app.state.public_origins:
+        # C08 rule 7 "origin-checked": browsers omit Origin on same-origin
+        # GETs, so the legitimate consumer passes; cross-site attempts,
+        # which always carry Origin, are rejected here.
+        raise BoundaryError(
+            HTTP_403_FORBIDDEN, "origin_rejected", "request origin is not allowed"
+        )
+    hub = _notification_channel(request)
+    try:
+        sink = hub.subscribe()  # registered BEFORE any client refetch
+    except RuntimeError:
+        raise _channel_unavailable() from None
+    return StreamingResponse(
+        _wakeup_stream(hub, sink),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 def register_notifications(app: FastAPI) -> None:
     """Register the ingest lane, key management and the read surface."""
     app.include_router(router)
+    # Live wakeup channel (nbi-live): hub lifecycle rides the lifespan
+    # wrapper — started with the app engine, stopped at shutdown — without
+    # touching api/app.py.
+    attach_notification_channel(app)
