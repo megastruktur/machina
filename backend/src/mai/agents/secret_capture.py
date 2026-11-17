@@ -193,7 +193,7 @@ _ORDINARY_METADATA_WORDS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_PLAIN_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_-]*")
+_PLAIN_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[a-z]{3,16}")
 
 
 def _is_ordinary_metadata_word(value: str) -> bool:
@@ -204,13 +204,11 @@ def _is_ordinary_metadata_word(value: str) -> bool:
     excluded even if it is lowercase — so ``"default"`` stays plain but
     ``"Xk9fQ2mZpL8vR4tW"`` is treated as candidate secret material.
     """
-    if not 1 <= len(value) <= 24:
-        return False
-    if _PLAIN_WORD_RE.fullmatch(value) is None:
+    if not value:
         return False
     if (
         value not in _ORDINARY_METADATA_WORDS
-        and re.fullmatch(r"[a-z]{3,16}", value) is None
+        and _PLAIN_WORD_RE.fullmatch(value) is None
     ):
         return False
     return redact_text(value) == value
@@ -530,11 +528,7 @@ def sanitize_tool_call(
                 continue
             metadata_key = _normalized_key(key) in _NON_SENSITIVE_METADATA_KEYS
             for leaf in _iter_string_values(value):
-                if (
-                    metadata_key
-                    and isinstance(value, str)
-                    and _is_ordinary_metadata_word(leaf)
-                ):
+                if metadata_key and _is_ordinary_metadata_word(leaf):
                     continue
                 sensitive.append(leaf[:_MAX_SENSITIVE_VALUE_CHARS])
         return (

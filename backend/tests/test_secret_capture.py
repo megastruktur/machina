@@ -630,14 +630,18 @@ def test_unknown_operation_extracts_arbitrary_keys_not_metadata_words() -> None:
 def test_metadata_containers_and_high_entropy_values_are_extracted() -> None:
     """On an unknown secret operation, a container value under a
     metadata key and a high-entropy metadata value are candidate secret
-    material: their leaves are extracted and scrubbed from text."""
+    material: their leaves are extracted and scrubbed from text — while
+    an ordinary word leaf inside the same container stays plain."""
     response = _response(
-        TextPart("vault leaf sk-proj-container-leaf-99 and tag Xk9fQ2mZpL8vR4tW"),
+        TextPart(
+            "vault leaf default and sk-proj-container-leaf-9911 plus tag "
+            "Xk9fQ2mZpL8vR4tW"
+        ),
         ToolCallPart(
             tool_call_id="c1",
             tool_name="secret.delete",
             args={
-                "vault": ["sk-proj-container-leaf-99"],
+                "vault": ["default", "sk-proj-container-leaf-9911"],
                 "tag": "Xk9fQ2mZpL8vR4tW",
             },
         ),
@@ -645,10 +649,13 @@ def test_metadata_containers_and_high_entropy_values_are_extracted() -> None:
     sanitized = sanitize_model_response(response)
     assert sanitized.tool_calls[0].rejected is True
     assert sanitized.tool_calls[0].rejection_reason == "unknown_secret_operation"
-    assert sanitized.text == "vault leaf [REDACTED] and tag [REDACTED]"
-    assert "sk-proj-container-leaf-99" not in sanitized.text
+    assert sanitized.text == (
+        "vault leaf default and [REDACTED] plus tag [REDACTED]"
+    )
+    assert "default" in sanitized.text
+    assert "sk-proj-container-leaf-9911" not in sanitized.text
     assert "Xk9fQ2mZpL8vR4tW" not in sanitized.text
-    assert "sk-proj-container-leaf-99" not in json.dumps(
+    assert "sk-proj-container-leaf-9911" not in json.dumps(
         sanitized.tool_calls[0].safe_args
     )
     assert "Xk9fQ2mZpL8vR4tW" not in json.dumps(sanitized.tool_calls[0].safe_args)
