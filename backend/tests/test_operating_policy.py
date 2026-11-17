@@ -11,7 +11,7 @@ input/bound validation.
 from __future__ import annotations
 
 import dataclasses
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
@@ -56,7 +56,7 @@ def test_global_instructions_rule_content_intact() -> None:
 
 def test_versioned_bounds_declared() -> None:
     assert OPERATING_POLICY_VERSION == 1
-    assert 0 < MAX_OPERATING_POLICY_CHARS <= 8192
+    assert MAX_OPERATING_POLICY_CHARS == 8192
     assert MAX_ADMIN_INSTRUCTIONS_CHARS < MAX_OPERATING_POLICY_CHARS
 
 
@@ -210,7 +210,6 @@ def test_server_id_normalized_to_canonical_form() -> None:
 def test_server_id_none_is_explicit() -> None:
     snapshot = _build()
     assert snapshot.server_id is None
-    assert UUID(str(uuid4()))  # sanity: the module imports UUID typing fine
 
 
 def test_snapshot_fields_carry_version_and_state() -> None:
@@ -238,7 +237,11 @@ def test_admin_instructions_over_limit_rejected() -> None:
 
 
 def test_max_admin_instructions_still_fits_policy_ceiling() -> None:
-    snapshot = _build(admin_server_instructions="x" * MAX_ADMIN_INSTRUCTIONS_CHARS)
+    snapshot = _build(
+        is_child_run=True,
+        secret_route_latched=True,
+        admin_server_instructions="x" * MAX_ADMIN_INSTRUCTIONS_CHARS,
+    )
     assert len(snapshot.text) <= MAX_OPERATING_POLICY_CHARS
 
 
@@ -256,6 +259,27 @@ def test_invalid_capability_entries_rejected() -> None:
     with pytest.raises(OperatingPolicyError) as non_string:
         _build(exposed_capabilities=("app.discover", 7))
     assert non_string.value.code is OperatingPolicyErrorCode.INVALID_INPUT
+
+
+def test_bare_string_capabilities_rejected_by_builder() -> None:
+    """`str` satisfies Iterable[str]; a bare string must fail closed."""
+    with pytest.raises(OperatingPolicyError) as str_case:
+        _build(exposed_capabilities="secret.list")
+    assert str_case.value.code is OperatingPolicyErrorCode.INVALID_INPUT
+    with pytest.raises(OperatingPolicyError) as bytes_case:
+        _build(exposed_capabilities=b"secret.list")
+    assert bytes_case.value.code is OperatingPolicyErrorCode.INVALID_INPUT
+
+
+def test_bare_string_capabilities_rejected_by_latch_helper() -> None:
+    """The latch helper rejects bare str/bytes even when already latched."""
+    for prior in (False, True):
+        with pytest.raises(OperatingPolicyError) as str_case:
+            is_secret_route_latched("secret.list", prior_secret_route_latched=prior)
+        assert str_case.value.code is OperatingPolicyErrorCode.INVALID_INPUT
+        with pytest.raises(OperatingPolicyError) as bytes_case:
+            is_secret_route_latched(b"secret.list", prior_secret_route_latched=prior)
+        assert bytes_case.value.code is OperatingPolicyErrorCode.INVALID_INPUT
 
 
 def test_invalid_server_id_rejected() -> None:

@@ -262,6 +262,11 @@ def is_secret_route_latched(
     capability id starts with ``secret.`` or any bridge tool name starts
     with ``secret_``. One-way: later exposure removal never unlatches.
     """
+    if isinstance(exposed_capabilities, (str, bytes)):
+        raise OperatingPolicyError(
+            OperatingPolicyErrorCode.INVALID_INPUT,
+            "exposed_capabilities must be an iterable of names, not a single string",
+        )
     if prior_secret_route_latched:
         return True
     for capability in exposed_capabilities:
@@ -326,6 +331,11 @@ def build_operating_policy(config: OperatingPolicyInput, /) -> OperatingPolicySn
 
 def _normalize_capabilities(raw: Iterable[str]) -> tuple[str, ...]:
     """Validate and normalize declared capability names (order-stable)."""
+    if isinstance(raw, (str, bytes)):
+        raise OperatingPolicyError(
+            OperatingPolicyErrorCode.INVALID_INPUT,
+            "exposed_capabilities must be an iterable of names, not a single string",
+        )
     names: list[str] = []
     for capability in raw:
         if not isinstance(capability, str):
