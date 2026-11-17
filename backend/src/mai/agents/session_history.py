@@ -688,6 +688,12 @@ def extract_entries_from_run_messages(
     #: Call ids of the CURRENT pending assistant turn that were rejected
     #: pre-persistence (their denied results ride the same exchange).
     pending_rejected_ids: set[str] = set()
+    #: Every pre-persistence-rejected call id in THIS exchange: a later
+    #: ``ModelRequest`` may still carry a return/retry part for one (the
+    #: pinned adapter mirrors model errors back) — the authoritative
+    #: synthesized denied result is already persisted, so the duplicate
+    #: return is skipped.
+    exchange_rejected_ids: set[str] = set()
 
     def _draft(payload: Any, source_id: str) -> SessionEntryView:
         return SessionEntryView(
@@ -723,7 +729,9 @@ def extract_entries_from_run_messages(
                         call_id=item.call_id,
                         tool_name=item.tool_name,
                         capability_id=item.capability_id,
-                        args=dict(item.safe_args),
+                        args=_bounded_tool_call_args(
+                            item.safe_args, rejected=item.rejected
+                        ),
                     )
                 )
             for part in sanitized.thinking_parts:
@@ -732,13 +740,18 @@ def extract_entries_from_run_messages(
                 # Provider text is untrusted: strip the control
                 # characters the durable contract rejects BEFORE the
                 # bound, so capture can never crash on malformed
-                # reasoning content.
+                # reasoning content. When the response carried rejected
+                # secret material, the pattern layer runs again after
+                # every slice/bound so no oversized tail survives.
                 content = _PROVIDER_TEXT_CONTROL_RE.sub("", content)
+                content = content[:_ARTIFACT_REF_CONTENT_MAX_CHARS]
+                if sanitized.had_rejected_calls:
+                    content = redact_text(content)
                 artifacts.append(
                     ProviderReasoningArtifact(
                         provider=provider,
                         artifact_kind=kind,
-                        content=content[:_ARTIFACT_REF_CONTENT_MAX_CHARS],
+                        content=content,
                     )
                 )
             if not text and not tool_calls and not artifacts:
@@ -746,6 +759,14 @@ def extract_entries_from_run_messages(
             all_rejected = bool(tool_calls) and all(
                 call.rejected for call in sanitized.tool_calls
             )
+            if sanitized.had_rejected_calls:
+                exchange_rejected_ids.update(
+                    call.call_id for call in sanitized.tool_calls if call.rejected
+                )
+                # Belt over braces: after every slice/bound above, the
+                # pattern layer runs once more so no oversized-secret
+                # tail can survive in the persisted text.
+                text = redact_text(text)
             tool_group_state = (
                 "none"
                 if not tool_calls
@@ -794,6 +815,11 @@ def extract_entries_from_run_messages(
             for part in message.parts:
                 if isinstance(part, ToolReturnPart):
                     answered_ids.add(part.tool_call_id)
+                    if part.tool_call_id in exchange_rejected_ids:
+                        # The authoritative synthesized denied result is
+                        # already persisted for this call id; a duplicate
+                        # return/retry row must not join the exchange.
+                        continue
                     results.append(
                         (
                             f"{durable_prefix}:{index}:r{return_ordinal}",
@@ -803,6 +829,8 @@ def extract_entries_from_run_messages(
                     return_ordinal += 1
                 elif isinstance(part, RetryPromptPart):
                     answered_ids.add(part.tool_call_id)
+                    if part.tool_call_id in exchange_rejected_ids:
+                        continue
                     results.append(
                         (
                             f"{durable_prefix}:{index}:r{return_ordinal}",
@@ -858,19 +886,41 @@ def _user_entry_payload(part: UserPromptPart) -> UserMessageEntry:
     )
 
 
-def _normalized_args(args: str | dict[str, Any] | None) -> dict[str, Any]:
-    """Normalize one provider tool-call ``args`` to a bounded JSON object."""
-    if args is None:
-        return {}
-    if isinstance(args, Mapping):
-        return dict(args)
-    try:
-        parsed = json.loads(args)
-    except ValueError:
-        parsed = None
-    if isinstance(parsed, dict):
-        return parsed
-    return {"raw": redact_text(str(args))[:_ARGS_RAW_MAX_CHARS]}
+#: Rejected-call ``rejected_keys`` caps: at most 16 keys of at most 64
+#: chars each, so even hundreds of long hostile foreign keys stay far
+#: inside the ``ToolCallItem`` entry payload budget.
+_MAX_REJECTED_KEYS: Final[int] = 16
+_MAX_REJECTED_KEY_CHARS: Final[int] = 64
+
+
+def _bounded_tool_call_args(
+    safe_args: Mapping[str, Any], *, rejected: bool
+) -> dict[str, Any]:
+    """Bound one sanitized call's args to the ``ToolCallItem`` contract.
+
+    - Rejected calls: cap the ``rejected_keys`` list (count and key
+      length) so even hundreds of long foreign keys stay within the
+      entry payload budget.
+    - Allowed calls: the legacy unparseable-string ``raw`` projection
+      keeps its redaction + 128-char bound.
+    - Anything still over the ``ToolCallItem`` serialized-JSON ceiling
+      (``MAX_ENTRY_TEXT_CHARS``, the model's own validator) falls back
+      to the non-dispatchable ``{"_truncated_args": True}`` marker so
+      oversized hostile arguments can never crash capture.
+    """
+    args = dict(safe_args)
+    if rejected:
+        keys = args.get("rejected_keys")
+        if isinstance(keys, list):
+            args["rejected_keys"] = [
+                str(key)[:_MAX_REJECTED_KEY_CHARS]
+                for key in keys[:_MAX_REJECTED_KEYS]
+            ]
+    elif isinstance(args.get("raw"), str):
+        args["raw"] = redact_text(args["raw"])[:_ARGS_RAW_MAX_CHARS]
+    if len(json.dumps(args, ensure_ascii=False, default=str)) > MAX_ENTRY_TEXT_CHARS:
+        return {"_truncated_args": True}
+    return args
 
 
 def _bounded_user_text(content: Any) -> str:

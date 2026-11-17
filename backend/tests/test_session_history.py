@@ -1825,6 +1825,7 @@ async def test_rejected_secret_call_persists_pair_and_replays_denial(
         model_profile=MODEL_PROFILE,
         provider=PROVIDER,
     )
+    assert run[1].payload.tool_group_state == "complete"
     rejected_source_ids = [
         entry.durable_source_id
         for entry in run
@@ -1864,6 +1865,8 @@ async def test_rejected_secret_call_persists_pair_and_replays_denial(
     assert envelope["status"] == "denied"
     assert envelope["error_code"] == "sensitive_call_rejected"
     assert _CANARY not in json.dumps(envelope)
+    blob = ModelMessagesTypeAdapter.dump_json(list(history.messages)).decode()
+    assert _CANARY not in blob
 
 
 async def test_mixed_group_persists_rejection_and_completes_with_allowed(
@@ -2018,3 +2021,118 @@ async def test_allowed_generate_call_keeps_semantics_and_replay_idempotency(
     assert any(
         entry.durable_source_id == "run:1" for entry in history.excluded
     )
+
+
+async def test_duplicate_return_for_rejected_call_persists_one_result(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A later ``ModelRequest`` carrying a return part for an
+    already-rejected call_id must NOT add a second ``ToolResultEntry``:
+    the synthesized denial is the authoritative row."""
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="store the secret")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_call_id="call-secret",
+                    tool_name="secret_store",
+                    args={"title": "db", "value": _CANARY},
+                )
+            ],
+            usage=RequestUsage(),
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="secret_store",
+                    content="never persisted",
+                    tool_call_id="call-secret",
+                    outcome="denied",
+                )
+            ]
+        ),
+    ]
+    run = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x605),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    results = [
+        entry for entry in run if entry.payload.kind == EntryKind.TOOL_RESULT
+    ]
+    assert len(results) == 1
+    assert results[0].durable_source_id == "run:1:rejected:call-secret"
+    assert results[0].payload.error_code == "sensitive_call_rejected"
+    assert results[0].payload.output_preview is None
+
+    history = await abuild_session_model_history(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    returns = [
+        part
+        for message in history.messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(returns) == 1
+    assert returns[0].content.get("error_code") == "sensitive_call_rejected"
+    blob = ModelMessagesTypeAdapter.dump_json(list(history.messages)).decode()
+    assert "never persisted" not in blob
+
+
+def test_oversized_args_are_bounded_before_tool_call_items() -> None:
+    """A 20,000-char unparseable non-secret args string and a rejected
+    secret call with 200 long unsupported keys both persist within the
+    ``ToolCallItem`` budget — capture never crashes on hostile sizes."""
+    long_keys: dict[str, str] = {"title": "db"}
+    for index in range(200):
+        long_keys[f"foreign_key_{index:03d}_" + "k" * 70] = "v"
+    drafts = extract_entries_from_run_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_call_id="c1",
+                        tool_name="fixture_read",
+                        args="x" * 20_000,
+                    ),
+                    ToolCallPart(
+                        tool_call_id="c2",
+                        tool_name="secret_store",
+                        args=long_keys,
+                    ),
+                ],
+                usage=RequestUsage(),
+            )
+        ],
+        session_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    assistant = next(
+        draft.payload
+        for draft in drafts
+        if isinstance(draft.payload, AssistantMessageEntry)
+    )
+    legacy_raw = assistant.tool_calls[0].args
+    assert set(legacy_raw) == {"raw"}
+    assert len(legacy_raw["raw"]) <= 128
+    rejected = assistant.tool_calls[1]
+    assert rejected.args.get("_sensitive_call_redacted") is True
+    capped_keys = rejected.args["rejected_keys"]
+    assert len(capped_keys) <= 16
+    assert all(len(key) <= 64 for key in capped_keys)
+    assert len(json.dumps(assistant.model_dump(mode="json"))) <= MAX_ENTRY_TEXT_CHARS
