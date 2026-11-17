@@ -80,6 +80,7 @@ from pydantic_ai.usage import RequestUsage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.output_safety import project_text, redact_text
+from mai.agents.secret_capture import sanitize_model_response
 from mai.agents.tools import ToolResult, ToolStatus as BridgeToolStatus
 from mai.agents.tools import project_tool_result
 from mai.contracts.sessions import (
@@ -614,6 +615,34 @@ def _bounded_assistant_payload(
     return bounded
 
 
+def is_rejected_sensitive_tool_call(
+    call: ToolCallItem | Mapping[str, object],
+) -> bool:
+    """Whether one tool call carries the pre-persistence rejection marker.
+
+    A rejected sensitive call's persisted ``args`` are a value-free,
+    NON-dispatchable marker dict (``_sensitive_call_redacted: True`` —
+    the canonical key written by :mod:`mai.agents.secret_capture`; the
+    alias ``_redacted_sensitive_args`` is recognized for forward
+    compatibility). Host-side callers (``07-runner-safety``) use this to
+    short-circuit a replayed rejected call without touching the
+    dispatcher.
+    """
+    args: object
+    if isinstance(call, ToolCallItem):
+        args = call.args
+    elif isinstance(call, Mapping):
+        args = call
+    else:
+        return False
+    if not isinstance(args, Mapping):
+        return False
+    return (
+        args.get("_sensitive_call_redacted") is True
+        or args.get("_redacted_sensitive_args") is True
+    )
+
+
 def extract_entries_from_run_messages(
     new_messages: Sequence[ModelMessage],
     *,
@@ -630,7 +659,16 @@ def extract_entries_from_run_messages(
     ``ToolReturnPart``/``RetryPromptPart`` of the following ``ModelRequest``
     (single, parallel and retry shapes; ``BuiltinToolCallPart``/
     ``BuiltinToolReturnPart`` do not exist in the pinned 2.60.0 messages
-    API — verified — and therefore cannot occur here). ``ThinkingPart``
+    API — verified — and therefore cannot occur here). Every
+    ``ModelResponse`` passes through :mod:`mai.agents.secret_capture`'s
+    ``sanitize_model_response`` FIRST (D6/C6): rejected secret-namespace
+    calls persist only the value-free marker args, exact-value forms of
+    rejected raw secret material are scrubbed from the assistant text,
+    reasoning and sibling calls, and each rejected call gains an
+    immediate denied ``ToolResultEntry`` draft (deterministic
+    ``{prefix}:{index}:rejected:{call_id}`` source id) in the same
+    exchange — an ALL-rejected tool group is persisted ``complete`` and
+    replays its (call, denial) pair cleanly, never left dangling. ``ThinkingPart``
     content becomes bounded :class:`ProviderReasoningArtifact` references on
     the assistant entry; :func:`apersist_run_exchange` additionally persists
     the full artifact row. The assistant draft itself is bounded to the
@@ -647,6 +685,9 @@ def extract_entries_from_run_messages(
     """
     drafts: list[SessionEntryView] = []
     pending_assistant: SessionEntryView | None = None
+    #: Call ids of the CURRENT pending assistant turn that were rejected
+    #: pre-persistence (their denied results ride the same exchange).
+    pending_rejected_ids: set[str] = set()
 
     def _draft(payload: Any, source_id: str) -> SessionEntryView:
         return SessionEntryView(
@@ -663,42 +704,53 @@ def extract_entries_from_run_messages(
 
     for index, message in enumerate(new_messages):
         if isinstance(message, ModelResponse):
-            text = "".join(
-                part.content for part in message.parts if isinstance(part, TextPart)
-            )
+            # D6/C6 (ask_06): sanitize BEFORE any durable shape is built.
+            # Text, reasoning, tool-call args and sibling leaks are scrubbed
+            # here; rejected secret calls carry only the value-free marker
+            # dict, and their denied ToolResultEntry drafts persist in the
+            # same exchange so the group is never left dangling.
+            sanitized = sanitize_model_response(message)
+            text = sanitized.text
             # The contract's text field is a hard 20k chars: a longer model
             # answer would fail AssistantMessageEntry construction itself,
             # so the assembly is honestly marked-bounded first.
             text = _bound_with_marker(text, MAX_ENTRY_TEXT_CHARS)[0]
             tool_calls: list[ToolCallItem] = []
             artifacts: list[ProviderReasoningArtifact] = []
-            for part in message.parts:
-                if isinstance(part, ToolCallPart):
-                    tool_calls.append(
-                        ToolCallItem(
-                            call_id=part.tool_call_id,
-                            tool_name=part.tool_name,
-                            capability_id=part.tool_name,
-                            args=_normalized_args(part.args),
-                        )
+            for item in sanitized.tool_calls:
+                tool_calls.append(
+                    ToolCallItem(
+                        call_id=item.call_id,
+                        tool_name=item.tool_name,
+                        capability_id=item.capability_id,
+                        args=dict(item.safe_args),
                     )
-                elif isinstance(part, ThinkingPart):
-                    kind = "signature" if part.signature else "summary"
-                    content = part.signature or part.content
-                    # Provider text is untrusted: strip the control
-                    # characters the durable contract rejects BEFORE the
-                    # bound, so capture can never crash on malformed
-                    # reasoning content.
-                    content = _PROVIDER_TEXT_CONTROL_RE.sub("", content)
-                    artifacts.append(
-                        ProviderReasoningArtifact(
-                            provider=provider,
-                            artifact_kind=kind,
-                            content=content[:_ARTIFACT_REF_CONTENT_MAX_CHARS],
-                        )
+                )
+            for part in sanitized.thinking_parts:
+                kind = "signature" if part.signature else "summary"
+                content = part.signature or part.content
+                # Provider text is untrusted: strip the control
+                # characters the durable contract rejects BEFORE the
+                # bound, so capture can never crash on malformed
+                # reasoning content.
+                content = _PROVIDER_TEXT_CONTROL_RE.sub("", content)
+                artifacts.append(
+                    ProviderReasoningArtifact(
+                        provider=provider,
+                        artifact_kind=kind,
+                        content=content[:_ARTIFACT_REF_CONTENT_MAX_CHARS],
                     )
+                )
             if not text and not tool_calls and not artifacts:
                 continue  # a partless response carries nothing durable
+            all_rejected = bool(tool_calls) and all(
+                call.rejected for call in sanitized.tool_calls
+            )
+            tool_group_state = (
+                "none"
+                if not tool_calls
+                else ("complete" if all_rejected else "pending")
+            )
             payload = _bounded_assistant_payload(
                 AssistantMessageEntry(
                     kind=EntryKind.ASSISTANT_MESSAGE,
@@ -706,13 +758,32 @@ def extract_entries_from_run_messages(
                     tool_calls=tool_calls,
                     model_profile=model_profile,
                     provider_artifacts=artifacts,
-                    tool_group_state="pending" if tool_calls else "none",
+                    tool_group_state=tool_group_state,
                 )
             )
             assistant_draft = _draft(payload, f"{durable_prefix}:{index}")
             drafts.append(assistant_draft)
             if tool_calls:
-                pending_assistant = assistant_draft
+                if all_rejected:
+                    # Every call is already answered by its synthesized
+                    # denied result below: never a dangling group.
+                    pending_assistant = None
+                    pending_rejected_ids = set()
+                else:
+                    pending_assistant = assistant_draft
+                    pending_rejected_ids = {
+                        call.call_id
+                        for call in sanitized.tool_calls
+                        if call.rejected
+                    }
+            for result in sanitized.rejected_results:
+                drafts.append(
+                    _draft(
+                        result,
+                        f"{durable_prefix}:{index}:rejected:"
+                        f"{result.call_id[:MAX_IDENTITY_CHARS]}",
+                    )
+                )
             continue
         if isinstance(message, ModelRequest):
             results: list[tuple[str, ToolResultEntry]] = []
@@ -751,7 +822,8 @@ def extract_entries_from_run_messages(
                 payload = pending_assistant.payload
                 if isinstance(payload, AssistantMessageEntry):
                     expected = {call.call_id for call in payload.tool_calls}
-                    if expected and expected <= answered_ids:
+                    answered = answered_ids | pending_rejected_ids
+                    if expected and expected <= answered:
                         marked = payload.model_copy(
                             update={"tool_group_state": "complete"}
                         )
@@ -761,6 +833,7 @@ def extract_entries_from_run_messages(
                         position = _draft_position(drafts, pending_assistant)
                         drafts[position] = completed
                 pending_assistant = None
+                pending_rejected_ids = set()
             for source_id, user_payload in prompts:
                 drafts.append(_draft(user_payload, source_id))
             for source_id, result_payload in results:

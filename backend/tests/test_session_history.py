@@ -1667,3 +1667,354 @@ def test_compaction_retains_service_identity_for_later_turns() -> None:
     assert scoped == [
         f"[service scope: @nginx-proxy ({_SCOPE_SERVICE})]\nand now restart it"
     ]
+
+
+# ---------------------------------------------------------------------------
+# ask_06-history-safety: sensitive-call sanitization in capture + replay
+# ---------------------------------------------------------------------------
+
+_CANARY = "CANARY-RAW-SECRET-98765"
+
+
+def _secret_reject_response() -> ModelResponse:
+    """One assistant turn: rejected raw-value secret call, leaked canary
+    in text, thinking content, thinking signature and a sibling call."""
+    return _response(
+        ThinkingPart(
+            content=f"thinking about {_CANARY}",
+            signature=f"sig-{_CANARY}",
+        ),
+        TextPart(f"storing {_CANARY} now"),
+        ToolCallPart(
+            tool_call_id="call-secret",
+            tool_name="secret_store",
+            args={"title": "db", "value": _CANARY},
+        ),
+        ToolCallPart(
+            tool_call_id="call-sibling",
+            tool_name="tail_logs",
+            args={"source": f"logs-{_CANARY}"},
+        ),
+    )
+
+
+def test_is_rejected_sensitive_tool_call_detects_the_marker() -> None:
+    from mai.agents.session_history import is_rejected_sensitive_tool_call
+
+    marked = ToolCallItem(
+        call_id="c1",
+        tool_name="secret_store",
+        capability_id="secret_store",
+        args={"_sensitive_call_redacted": True, "rejected_keys": ["value"]},
+    )
+    assert is_rejected_sensitive_tool_call(marked) is True
+    assert (
+        is_rejected_sensitive_tool_call(
+            {"_sensitive_call_redacted": True, "rejected_keys": ["value"]}
+        )
+        is True
+    )
+    assert is_rejected_sensitive_tool_call({"_redacted_sensitive_args": True}) is True
+    assert is_rejected_sensitive_tool_call(
+        ToolCallItem(
+            call_id="c2",
+            tool_name="secret_store",
+            capability_id="secret_store",
+            args={"title": "db", "generate": True},
+        )
+    ) is False
+    assert is_rejected_sensitive_tool_call({"command": "echo"}) is False
+    assert is_rejected_sensitive_tool_call("not a mapping") is False
+
+
+async def test_rejected_secret_call_leaves_zero_canary_traces_in_store(
+    factory: async_sessionmaker[AsyncSession],
+    migrated_url: str,
+) -> None:
+    import base64
+    import urllib.parse
+
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="store the secret")]),
+        _secret_reject_response(),
+    ]
+    run = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x601),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    kinds = [entry.payload.kind for entry in run]
+    assert kinds == [
+        EntryKind.USER_MESSAGE,
+        EntryKind.ASSISTANT_MESSAGE,
+        EntryKind.TOOL_RESULT,
+    ]
+    assistant = run[1].payload
+    # Mixed group: the sibling allowed call still awaits execution, so
+    # the group starts pending — but the rejected call's denied result
+    # is persisted in the SAME exchange.
+    assert assistant.tool_group_state == "pending"
+    assert assistant.tool_calls[0].args.get("_sensitive_call_redacted") is True
+    assert assistant.tool_calls[1].args == {"source": "logs-[REDACTED]"}
+    result = run[2].payload
+    assert result.status == "denied"
+    assert result.error_code == "sensitive_call_rejected"
+
+    forms = {
+        _CANARY,
+        json.dumps(_CANARY),
+        urllib.parse.quote(_CANARY, safe=""),
+        base64.b64encode(_CANARY.encode()).decode(),
+        base64.urlsafe_b64encode(_CANARY.encode()).decode(),
+    }
+    with psycopg.connect(migrated_url) as conn:
+        entry_rows = conn.execute(
+            "SELECT payload FROM session_entries WHERE session_id = %s",
+            (sid,),
+        ).fetchall()
+        artifact_rows = conn.execute(
+            "SELECT content FROM session_provider_artifacts WHERE session_id = %s",
+            (sid,),
+        ).fetchall()
+    blob = json.dumps(
+        [row[0] for row in entry_rows], ensure_ascii=False, default=str
+    ) + json.dumps(
+        [row[0] for row in artifact_rows], ensure_ascii=False, default=str
+    )
+    for form in forms:
+        assert form not in blob, form
+    assert "[REDACTED]" in blob
+
+
+async def test_rejected_secret_call_persists_pair_and_replays_denial(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="store the secret")]),
+        _response(
+            ThinkingPart(
+                content=f"thinking about {_CANARY}",
+                signature=f"sig-{_CANARY}",
+            ),
+            TextPart(f"storing {_CANARY} now"),
+            ToolCallPart(
+                tool_call_id="call-secret",
+                tool_name="secret_store",
+                args={"title": "db", "value": _CANARY},
+            ),
+        ),
+    ]
+    run = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x602),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    rejected_source_ids = [
+        entry.durable_source_id
+        for entry in run
+        if entry.payload.kind == EntryKind.TOOL_RESULT
+    ]
+    assert rejected_source_ids == ["run:1:rejected:call-secret"]
+
+    history = await abuild_session_model_history(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    assert history.excluded == ()
+    shape = [
+        (type(message).__name__, [type(p).__name__ for p in message.parts])
+        for message in history.messages
+    ]
+    assert shape == [
+        ("ModelRequest", ["UserPromptPart"]),
+        ("ModelResponse", ["ThinkingPart", "TextPart", "ToolCallPart"]),
+        ("ModelRequest", ["ToolReturnPart"]),
+    ]
+    secret_call = next(
+        part
+        for part in history.messages[1].parts
+        if getattr(part, "part_kind", "") == "tool-call"
+    )
+    assert secret_call.tool_name == "secret_store"
+    assert secret_call.args.get("_sensitive_call_redacted") is True
+    assert secret_call.args.get("value") is None
+    denied_return = history.messages[2].parts[0]
+    assert denied_return.outcome == "denied"
+    envelope = denied_return.content
+    assert isinstance(envelope, dict)
+    assert envelope["status"] == "denied"
+    assert envelope["error_code"] == "sensitive_call_rejected"
+    assert _CANARY not in json.dumps(envelope)
+
+
+async def test_mixed_group_persists_rejection_and_completes_with_allowed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="mixed turn")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_call_id="call-secret",
+                    tool_name="secret_store",
+                    args={"title": "db", "value": _CANARY},
+                ),
+                ToolCallPart(
+                    tool_call_id="call-logs",
+                    tool_name="tail_logs",
+                    args={"source": "mai-api"},
+                ),
+            ],
+            usage=RequestUsage(),
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="tail_logs",
+                    content="3 log lines from mai-api",
+                    tool_call_id="call-logs",
+                    outcome="success",
+                )
+            ]
+        ),
+    ]
+    run = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x603),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    assistant = run[1].payload
+    # The rejected call's result is persisted immediately; the allowed
+    # return completes the group in the SAME exchange.
+    assert assistant.tool_group_state == "complete"
+    assert assistant.tool_calls[0].args.get("_sensitive_call_redacted") is True
+    assert assistant.tool_calls[1].args == {"source": "mai-api"}
+    rejected_results = [
+        entry.payload
+        for entry in run
+        if entry.payload.kind == EntryKind.TOOL_RESULT
+        and entry.payload.call_id == "call-secret"
+    ]
+    assert len(rejected_results) == 1
+    assert rejected_results[0].error_code == "sensitive_call_rejected"
+
+    history = await abuild_session_model_history(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    assert history.excluded == ()
+    call_ids = [
+        [
+            part.tool_call_id
+            for part in message.parts
+            if hasattr(part, "tool_call_id")
+        ]
+        for message in history.messages
+    ]
+    assert call_ids == [
+        [],
+        ["call-secret", "call-logs"],
+        ["call-secret", "call-logs"],
+    ]
+    blob = ModelMessagesTypeAdapter.dump_json(list(history.messages)).decode()
+    assert _CANARY not in blob
+
+
+async def test_allowed_generate_call_keeps_semantics_and_replay_idempotency(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    sid = session_row.session_id
+    allowed_args = {"title": "app-db", "generate": True, "length": 24}
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="fresh secret please")]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content="plan the generation", signature="sig-blob"),
+                ToolCallPart(
+                    tool_call_id="call-gen",
+                    tool_name="secret_store",
+                    args=allowed_args,
+                ),
+            ],
+            usage=RequestUsage(),
+        ),
+    ]
+    run = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x604),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    assistant = run[1].payload
+    # Allowed call: exact original args, no marker; the unanswered group
+    # is honestly pending. Existing capture semantics hold: one artifact
+    # per ThinkingPart, kind "signature" when a signature is present.
+    assert assistant.tool_calls[0].args == allowed_args
+    assert assistant.tool_group_state == "pending"
+    assert [a.artifact_kind for a in assistant.provider_artifacts] == [
+        "signature"
+    ]
+    assert assistant.provider_artifacts[0].content == "sig-blob"
+
+    # Idempotent replay of the same (still pending) exchange.
+    replayed = await apersist_run_exchange(
+        factory,
+        new_messages=messages,
+        session_id=sid,
+        server_id=SERVER_A,
+        run_id=uuid.UUID(int=0x604),
+        model_profile=MODEL_PROFILE,
+        provider=PROVIDER,
+    )
+    assert [entry.entry_id for entry in replayed] == [
+        entry.entry_id for entry in run
+    ]
+
+    history = await abuild_session_model_history(
+        factory,
+        session_id=sid,
+        server_id=SERVER_A,
+        provider=PROVIDER,
+        model_profile=MODEL_PROFILE,
+    )
+    # The dangling pending group is excluded honestly (never a fabricated
+    # result), and the pending assistant copy is excluded from replay.
+    assert any(
+        entry.durable_source_id == "run:1" for entry in history.excluded
+    )
