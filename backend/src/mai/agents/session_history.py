@@ -741,12 +741,15 @@ def extract_entries_from_run_messages(
                 # characters the durable contract rejects BEFORE the
                 # bound, so capture can never crash on malformed
                 # reasoning content. When the response carried rejected
-                # secret material, the pattern layer runs again after
-                # every slice/bound so no oversized tail survives.
+                # secret material, `redact_text` runs after control-
+                # character stripping and BEFORE the
+                # `_ARTIFACT_REF_CONTENT_MAX_CHARS` slice (redact before
+                # truncate: a cut can never split or hide a secret, and
+                # the redaction growth cannot exceed the bound).
                 content = _PROVIDER_TEXT_CONTROL_RE.sub("", content)
-                content = content[:_ARTIFACT_REF_CONTENT_MAX_CHARS]
                 if sanitized.had_rejected_calls:
                     content = redact_text(content)
+                content = content[:_ARTIFACT_REF_CONTENT_MAX_CHARS]
                 artifacts.append(
                     ProviderReasoningArtifact(
                         provider=provider,
