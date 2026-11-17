@@ -612,7 +612,7 @@ def test_unknown_operation_extracts_arbitrary_keys_not_metadata_words() -> None:
     """Without raw-value keys, arbitrary-key leaves are extracted while
     ordinary metadata words stay untouched."""
     response = _response(
-        TextPart("check the default vault scope"),
+        TextPart("check the default vault scope write-fixture-9c3"),
         ToolCallPart(
             tool_call_id="c1",
             tool_name="secret.delete",
@@ -622,5 +622,33 @@ def test_unknown_operation_extracts_arbitrary_keys_not_metadata_words() -> None:
     sanitized = sanitize_model_response(response)
     assert sanitized.tool_calls[0].rejected is True
     assert sanitized.tool_calls[0].rejection_reason == "unknown_secret_operation"
+    assert sanitized.text == "check the default vault scope [REDACTED]"
+    assert "[REDACTED]" in sanitized.text
     assert "write-fixture-9c3" not in sanitized.text
-    assert sanitized.text == "check the default vault scope"
+
+
+def test_metadata_containers_and_high_entropy_values_are_extracted() -> None:
+    """On an unknown secret operation, a container value under a
+    metadata key and a high-entropy metadata value are candidate secret
+    material: their leaves are extracted and scrubbed from text."""
+    response = _response(
+        TextPart("vault leaf sk-proj-container-leaf-99 and tag Xk9fQ2mZpL8vR4tW"),
+        ToolCallPart(
+            tool_call_id="c1",
+            tool_name="secret.delete",
+            args={
+                "vault": ["sk-proj-container-leaf-99"],
+                "tag": "Xk9fQ2mZpL8vR4tW",
+            },
+        ),
+    )
+    sanitized = sanitize_model_response(response)
+    assert sanitized.tool_calls[0].rejected is True
+    assert sanitized.tool_calls[0].rejection_reason == "unknown_secret_operation"
+    assert sanitized.text == "vault leaf [REDACTED] and tag [REDACTED]"
+    assert "sk-proj-container-leaf-99" not in sanitized.text
+    assert "Xk9fQ2mZpL8vR4tW" not in sanitized.text
+    assert "sk-proj-container-leaf-99" not in json.dumps(
+        sanitized.tool_calls[0].safe_args
+    )
+    assert "Xk9fQ2mZpL8vR4tW" not in json.dumps(sanitized.tool_calls[0].safe_args)

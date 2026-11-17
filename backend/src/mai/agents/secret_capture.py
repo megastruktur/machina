@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -172,6 +173,47 @@ def is_secret_namespace(tool_name: str | None) -> bool:
 
 def _normalized_key(key: str) -> str:
     return key.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+#: Well-known category/vault words that are NEVER literal secrets on an
+#: unknown secret operation.
+_ORDINARY_METADATA_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "default",
+        "login",
+        "password",
+        "api_credential",
+        "secure_note",
+        "ssh_key",
+        "database",
+        "server",
+        "custom",
+        "true",
+        "false",
+    }
+)
+
+_PLAIN_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_-]*")
+
+
+def _is_ordinary_metadata_word(value: str) -> bool:
+    """True ONLY for a short, plain, lowercase identifier word.
+
+    Mixed uppercase/digit/special shapes and high-entropy strings are
+    never "ordinary", and anything the trusted pattern layer flags is
+    excluded even if it is lowercase — so ``"default"`` stays plain but
+    ``"Xk9fQ2mZpL8vR4tW"`` is treated as candidate secret material.
+    """
+    if not 1 <= len(value) <= 24:
+        return False
+    if _PLAIN_WORD_RE.fullmatch(value) is None:
+        return False
+    if (
+        value not in _ORDINARY_METADATA_WORDS
+        and re.fullmatch(r"[a-z]{3,16}", value) is None
+    ):
+        return False
+    return redact_text(value) == value
 
 
 def _raw_value_keys(args: Mapping[str, Any]) -> tuple[str, ...]:
@@ -477,18 +519,23 @@ def sanitize_tool_call(
 
     if operation not in _KNOWN_SECRET_OPERATIONS:
         # Unknown operation: extract raw-value keys, arbitrary/unknown
-        # keys, and metadata values that themselves match the pattern
-        # layer — but ordinary metadata words ("default", "login") are
-        # NOT literal secrets and must not redact the whole response.
+        # keys, and any metadata leaf that is not an ORDINARY word — a
+        # metadata key carrying a container or a high-entropy/plain
+        # non-ordinary value (vault=["sk-…"], tag="Xk9fQ2mZpL8vR4tW")
+        # still yields its leaves for scrubbing, while "default"/"login"
+        # stay plain.
         reason = "unknown_secret_operation"
         for key, value in args.items():
             if not isinstance(key, str):
                 continue
-            if _normalized_key(key) in _NON_SENSITIVE_METADATA_KEYS:
-                if isinstance(value, str) and redact_text(value) != value:
-                    sensitive.append(value[:_MAX_SENSITIVE_VALUE_CHARS])
-                continue
+            metadata_key = _normalized_key(key) in _NON_SENSITIVE_METADATA_KEYS
             for leaf in _iter_string_values(value):
+                if (
+                    metadata_key
+                    and isinstance(value, str)
+                    and _is_ordinary_metadata_word(leaf)
+                ):
+                    continue
                 sensitive.append(leaf[:_MAX_SENSITIVE_VALUE_CHARS])
         return (
             _rejected_call(call_id, tool_name, capability_id, reason, ()),
