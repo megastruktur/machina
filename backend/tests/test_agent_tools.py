@@ -52,6 +52,8 @@ from pydantic_ai.models.function import FunctionModel
 
 from mai.agents.output_safety import REDACTED, project_text
 from mai.agents.tools import (
+    SECRET_RAW_VALUE_FIELDS,
+    SECRET_STORE_CAPABILITY_ID,
     BridgeError,
     BridgeErrorCode,
     CapabilityToolBridge,
@@ -86,6 +88,10 @@ from mai.capabilities.logs import descriptor as logs_descriptor
 from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
 from mai.plugins.registry import CapabilityRegistry, parse_descriptor
+from mai.plugins.builtin_onepassword import (
+    CAPABILITIES as ONEPASSWORD_CAPABILITIES,
+    SECRET_STORE_CAPABILITY,
+)
 from mai.policy.approvals import ApprovalRequest, ApprovalStore
 from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
 
@@ -1859,3 +1865,212 @@ async def test_bridge_canary_output_projects_without_leaks(
     assert projection["result_data"]["echo"] == DISPATCH_REDACTED
     assert projection["domain_outcome"] == DomainOutcome.SUCCESS.value
     assert projection["effect_certainty"] == EffectCertainty.CERTAIN.value
+
+
+# ---------------------------------------------------------------------------
+# ask_04-secret-surface: the agent-facing secret.* projection (D6/C6).
+# The REAL built-in 1Password descriptors are registered; the bridge
+# projects a generation/reference-only secret.store surface and enforces
+# it on BOTH invocation seams before any dispatch. The backend-only
+# provider is a synthetic fixture (mirrors the builtin executor's exact
+# success document, redacted by the dispatcher's redact-then-bound pass).
+# ---------------------------------------------------------------------------
+
+_SECRET_CAPS = ("secret.list", "secret.get", "secret.store")
+
+_CANARY = " plaintext-canary "
+
+_SYNTHETIC_GENERATED = "fxt-synthetic-generated-value-06Abc"
+
+
+def _secret_registry() -> CapabilityRegistry:
+    return _registry_with(*ONEPASSWORD_CAPABILITIES)
+
+
+def _secret_bridge(dispatcher) -> CapabilityToolBridge:
+    return _bridge(_secret_registry(), dispatcher, _context(allowed=_SECRET_CAPS))
+
+
+def _store_capture_executor(calls: list[CapabilityCall]):
+    async def _execute(call: CapabilityCall) -> ExecutorResult:
+        calls.append(call)
+        document = {
+            "status": "ok",
+            "vault": "fixture-vault",
+            "item_id": "itm_synthetic_01",
+            "title": call.payload.get("title"),
+            "field": "password",
+            "reference": "op://fixture-vault/itm_synthetic_01/password",
+            "generated": True,
+            "value": _SYNTHETIC_GENERATED,
+            "sha256": "3" * 64,
+        }
+        return ExecutorResult(
+            ok=True,
+            output=json.dumps(document, sort_keys=True),
+            redact_values=(_SYNTHETIC_GENERATED,),
+        )
+
+    return _execute
+
+
+@pytest.mark.anyio
+async def test_secret_surface_exposed_with_valid_unique_names(fxt_dir: Path) -> None:
+    bridge = _secret_bridge(_dispatcher(_secret_registry(), _unused_approvals()))
+    names = [tool.name for tool in bridge.tools]
+    assert names == ["secret_list", "secret_get", "secret_store"]
+    assert len(set(names)) == len(names)
+    for tool in bridge.tools:
+        schema = tool.tool_def.parameters_json_schema
+        assert isinstance(schema, dict) and schema.get("type") == "object"
+        assert tool.tool_def.description
+
+
+@pytest.mark.anyio
+async def test_secret_store_schema_is_generation_only(fxt_dir: Path) -> None:
+    bridge = _secret_bridge(_dispatcher(_secret_registry(), _unused_approvals()))
+    tool = _tool_of(bridge, SECRET_STORE_CAPABILITY_ID)
+    schema = tool.tool_def.parameters_json_schema
+    properties = schema["properties"]
+    for field in SECRET_RAW_VALUE_FIELDS | {"source_ref"}:
+        assert field not in properties, field
+    assert schema["required"] == ["title", "generate"]
+    assert properties["generate"]["const"] is True
+    assert properties["generate"]["type"] == "boolean"
+    assert len(properties["generate"]["description"]) >= 12
+    assert schema["additionalProperties"] is False
+    description = tool.tool_def.description or ""
+    assert "GENERATION/REFERENCE-ONLY" in description
+    assert "op CLI" in description
+    # The list/get surfaces state the exclusive secret-routing rule too.
+    for capability_id in ("secret.list", "secret.get"):
+        assert "op CLI" in (_tool_of(bridge, capability_id).tool_def.description or "")
+    # The trusted non-agent descriptor contract is untouched: the raw
+    # capability document still carries `value` and its original
+    # required list, and so does the descriptor behind the binding.
+    raw_properties = SECRET_STORE_CAPABILITY["input_schema"]["properties"]
+    assert "value" in raw_properties
+    assert SECRET_STORE_CAPABILITY["input_schema"]["required"] == ["title"]
+    descriptor = bridge.descriptor_for(SECRET_STORE_CAPABILITY_ID)
+    assert descriptor is not None
+    assert "value" in descriptor.input_schema["properties"]
+
+
+@pytest.mark.anyio
+async def test_secret_store_denies_raw_value_and_generate_false_pre_dispatch(
+    fxt_dir: Path, counter: Path
+) -> None:
+    calls: list[CapabilityCall] = []
+    recorder = _Recorder(counter)
+    bridge = _secret_bridge(
+        _dispatcher(_secret_registry(), _unused_approvals(), executor=recorder)
+    )
+    tool = _tool_of(bridge, SECRET_STORE_CAPABILITY_ID)
+    bad_payloads = (
+        {"title": "db", "value": _CANARY},
+        {"title": "db", "generate": False},
+        {"title": "db"},
+        {"title": "db", "generate": True, "value": _CANARY},
+    )
+    for payload in bad_payloads:
+        text = await tool.function(**payload)
+        result = _result_of(text)
+        assert result["status"] == ToolStatus.DENIED.value
+        assert result["reason"] == BridgeErrorCode.PAYLOAD_SCHEMA_MISMATCH.value
+        assert result["effect"] == "not_attempted"
+        assert result["error"]["code"] == "payload_schema_mismatch"
+        assert _CANARY not in text
+    assert recorder.calls == []
+    assert not counter.exists()
+    # The resume path raises the same contract before any dispatch, and
+    # the raised detail stays value-free.
+    with pytest.raises(BridgeError) as error:
+        await bridge.dispatch_once("secret.store", {"title": "db", "value": _CANARY})
+    assert error.value.code is BridgeErrorCode.PAYLOAD_SCHEMA_MISMATCH
+    assert _CANARY not in str(error.value)
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_secret_store_generation_dispatches_and_redacts(fxt_dir: Path) -> None:
+    calls: list[CapabilityCall] = []
+    bridge = _secret_bridge(
+        _dispatcher(
+            _secret_registry(), _unused_approvals(), executor=_store_capture_executor(calls)
+        )
+    )
+    # 1. Model-facing tool invocation.
+    tool = _tool_of(bridge, SECRET_STORE_CAPABILITY_ID)
+    text = await tool.function(title="app-db", generate=True, length=24)
+    result = _result_of(text)
+    assert result["status"] == ToolStatus.EXECUTED.value
+    assert result["effect"] == "executed"
+    output_text = result["output"]["text"]
+    document = json.loads(output_text)
+    assert document["status"] == "ok"
+    assert document["reference"] == "op://fixture-vault/itm_synthetic_01/password"
+    assert document["generated"] is True
+    assert DISPATCH_REDACTED in output_text
+    assert _SYNTHETIC_GENERATED not in text
+    assert calls[0].payload == {"title": "app-db", "generate": True, "length": 24}
+    # 2. The durable resume seam dispatches the same generation contract.
+    outcome = await bridge.dispatch_once(
+        "secret.store", {"title": "resume-item", "generate": True}
+    )
+    assert outcome.allowed and outcome.effect == "executed"
+    assert len(calls) == 2
+    # 3. A scripted agent run over the bridge reaches the same boundary.
+    calls.clear()
+    agent = _scripted_agent(
+        bridge,
+        [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="secret_store",
+                        args={"title": "agent-db", "generate": True, "length": 24},
+                    )
+                ]
+            ),
+            ModelResponse(parts=[TextPart("stored")]),
+        ],
+    )
+    with capture_run_messages() as messages:
+        run = await agent.run("store a fresh db secret")
+    assert run.output == "stored"
+    returns = [
+        part
+        for message in messages
+        for part in getattr(message, "parts", [])
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(returns) == 1
+    agent_document = _result_of(str(returns[0].content))
+    assert agent_document["status"] == ToolStatus.EXECUTED.value
+    assert DISPATCH_REDACTED in str(returns[0].content)
+    assert _SYNTHETIC_GENERATED not in str(returns[0].content)
+    assert calls[0].payload == {"title": "agent-db", "generate": True, "length": 24}
+
+
+@pytest.mark.anyio
+async def test_non_agent_dispatcher_keeps_raw_value_contract(fxt_dir: Path) -> None:
+    """The trusted non-agent dispatcher lane keeps the full descriptor
+    contract: raw `value` passes descriptor validation and reaches the
+    executor unchanged (compatibility, C6)."""
+    calls: list[CapabilityCall] = []
+    registry = _registry_with(SECRET_STORE_CAPABILITY)
+    dispatcher = _dispatcher(
+        registry, _unused_approvals(), executor=_store_capture_executor(calls)
+    )
+    outcome = await dispatcher.dispatch(
+        context=_context(allowed=("secret.store",)),
+        capability_id="secret.store",
+        payload={"title": "operator-item", "value": "operator-provided"},
+        approval_id=None,
+    )
+    assert outcome.allowed and outcome.effect == "executed"
+    assert len(calls) == 1
+    assert calls[0].payload == {
+        "title": "operator-item",
+        "value": "operator-provided",
+    }

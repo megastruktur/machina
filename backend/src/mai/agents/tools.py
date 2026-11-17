@@ -116,6 +116,8 @@ from mai.jobs.resource_locks import ResourceLockError, ResourceLockService
 __all__ = [
     "BridgeError",
     "BridgeErrorCode",
+    "SECRET_RAW_VALUE_FIELDS",
+    "SECRET_STORE_CAPABILITY_ID",
     "CapabilityToolBridge",
     "MAX_TOOL_NAME_CHARS",
     "TOOL_RESULT_PROJECTION_SCHEMA_VERSION",
@@ -253,6 +255,26 @@ _JSON_TYPES = ("object", "array", "string", "number", "integer", "boolean", "nul
 #: object (the dispatcher would reject it the same way; the bridge
 #: reports it before any state is read).
 _NON_CANONICAL = "non_canonical"
+
+#: Raw secret-value input fields NEVER exposed on an agent-facing secret
+#: tool surface (D6/C6 generation/reference-only contract). The trusted
+#: descriptor/executor keeps its full contract for non-agent callers;
+#: the bridge projects the agent-safe schema and enforces it pre-dispatch.
+SECRET_RAW_VALUE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "value",
+        "secret",
+        "password",
+        "token",
+        "private_key",
+        "passphrase",
+        "api_key",
+        "client_secret",
+    }
+)
+
+#: The capability id whose agent surface is generation/reference-only.
+SECRET_STORE_CAPABILITY_ID: Final[str] = "secret.store"
 
 
 class BridgeErrorCode(StrEnum):
@@ -908,6 +930,78 @@ def tool_name_for(capability_id: str) -> str:
     return _TOOL_NAME_UNSAFE.sub("_", capability_id)[:MAX_TOOL_NAME_CHARS]
 
 
+_SECRET_ROUTING_RULE: Final[str] = (
+    "EXCLUSIVE credential path: this tool is the only credential route — "
+    "never fall back to the op CLI, provider HTTP APIs, environment "
+    "variable dumps (`env`, `printenv`), or .env/credential-file searches."
+)
+
+
+def _agent_input_schema_for(
+    capability_id: str, descriptor: CapabilityDescriptor
+) -> dict[str, object]:
+    """The agent-facing input schema for one capability binding (D6/C6).
+
+    A deterministic deep projection of the descriptor's input schema;
+    the descriptor itself is NEVER mutated, so trusted non-agent
+    dispatcher callers keep the full contract (``secret.store`` keeps
+    its raw ``value`` input there).
+
+    For ``secret.store`` the projection removes every raw secret-value
+    input (``SECRET_RAW_VALUE_FIELDS``), makes ``generate`` a required
+    ``const: True`` argument, and states the generation/reference-only
+    contract plus the exclusive secret-routing rule in the schema
+    description. No invented copy-by-reference API is added. For the
+    other ``secret.*`` tools the shape is unchanged and the description
+    states the exclusive routing rule.
+    """
+    schema = json.loads(json.dumps(descriptor.input_schema))
+    if not isinstance(schema, dict):
+        return schema
+    if capability_id == SECRET_STORE_CAPABILITY_ID:
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for field in SECRET_RAW_VALUE_FIELDS:
+                properties.pop(field, None)
+            properties["generate"] = {
+                "type": "boolean",
+                "const": True,
+                "description": (
+                    "Agent-facing secret.store only GENERATES a fresh "
+                    "secret inside the vault (read-back verified) and "
+                    "returns the vault/item reference; raw plaintext "
+                    "values are never accepted from the model or any "
+                    "bridge caller."
+                ),
+            }
+        required = schema.get("required")
+        base = [
+            key
+            for key in (required if isinstance(required, list) else [])
+            if isinstance(key, str)
+            and key not in SECRET_RAW_VALUE_FIELDS
+            and key != "generate"
+        ]
+        if "title" not in base:
+            base.append("title")
+        base.append("generate")
+        schema["required"] = base
+        schema["description"] = (
+            "GENERATION/REFERENCE-ONLY agent surface: creates a fresh "
+            "generated secret in the vault and returns the vault/item "
+            "reference. Raw plaintext secret values are never accepted "
+            "(any raw secret field is rejected fail-closed before "
+            "dispatch); generate must be true. " + _SECRET_ROUTING_RULE
+        )
+    elif capability_id.startswith("secret."):
+        original = schema.get("description")
+        prefix = (
+            f"{original} " if isinstance(original, str) and original else ""
+        )
+        schema["description"] = prefix + _SECRET_ROUTING_RULE
+    return schema
+
+
 def _validated_target(
     raw: object, valid_targets: tuple[uuid.UUID, ...]
 ) -> uuid.UUID | None:
@@ -934,6 +1028,11 @@ class _Binding:
 
     capability_id: str
     descriptor: CapabilityDescriptor
+    #: The agent-facing projected input schema (D6/C6): what the tool
+    #: publishes and what BOTH invocation seams enforce pre-dispatch.
+    #: The raw ``descriptor.input_schema`` stays untouched for the
+    #: trusted non-agent contract.
+    agent_schema: dict[str, object]
     tool: Tool
 
 
@@ -1008,10 +1107,12 @@ class CapabilityToolBridge:
                     f"tool name {name!r}; rename one capability",
                 )
             names[name] = capability_id
+            agent_schema = _agent_input_schema_for(capability_id, descriptor)
             bindings[capability_id] = _Binding(
                 capability_id=capability_id,
                 descriptor=descriptor,
-                tool=self._build_tool(capability_id, descriptor, name),
+                agent_schema=agent_schema,
+                tool=self._build_tool(capability_id, descriptor, name, agent_schema),
             )
         self._bindings = bindings
 
@@ -1070,14 +1171,19 @@ class CapabilityToolBridge:
         return tuple(kept)
 
     def _build_tool(
-        self, capability_id: str, descriptor: CapabilityDescriptor, name: str
+        self,
+        capability_id: str,
+        descriptor: CapabilityDescriptor,
+        name: str,
+        agent_schema: dict[str, object],
     ) -> Tool:
         """One schema-declared tool bound to this bridge and capability.
 
-        The descriptor's ``input_schema`` is published verbatim as the
-        function-argument schema; PydanticAI's schema-declared tools
-        skip argument validation, which is exactly why the function
-        re-validates against the same schema before dispatching.
+        The binding's AGENT-FACING projected schema (D6/C6) is published
+        as the function-argument schema; PydanticAI's schema-declared
+        tools skip argument validation, which is exactly why both
+        invocation seams re-validate against the SAME projected schema
+        before dispatching.
 
         With a multi-target exposure (§6) the published schema GAINS the
         required ``server_id`` argument and the description names the
@@ -1099,9 +1205,8 @@ class CapabilityToolBridge:
             "and policy are rechecked immediately before the effect."
         )
         root_description = (
-            descriptor.input_schema.get("description")
-            if isinstance(descriptor.input_schema, Mapping)
-            and isinstance(descriptor.input_schema.get("description"), str)
+            agent_schema.get("description")
+            if isinstance(agent_schema.get("description"), str)
             else None
         )
         prefix = f"{root_description} " if root_description else ""
@@ -1111,7 +1216,7 @@ class CapabilityToolBridge:
             f"{', '.join(descriptor.execution_environments)}). {advisory} "
             "Arguments must match the declared input schema."
         )
-        schema = json.loads(json.dumps(descriptor.input_schema))
+        schema = json.loads(json.dumps(agent_schema))
         if targets:
             target_list = ", ".join(str(t) for t in targets)
             description += (
@@ -1195,7 +1300,7 @@ class CapabilityToolBridge:
                 dispatch_context = replace(self._context, server_id=parsed_target)
                 dispatch_payload = work
             violation = _validate_payload(
-                dispatch_payload, binding.descriptor.input_schema, path="$"
+                dispatch_payload, binding.agent_schema, path="$"
             )
             if violation is not None:
                 return ToolResult.rejected(
@@ -1261,7 +1366,7 @@ class CapabilityToolBridge:
                 "there is no tool and no resume path for it",
             )
         violation = _validate_payload(
-            payload, binding.descriptor.input_schema, path="$"
+            payload, binding.agent_schema, path="$"
         )
         if violation is not None:
             raise BridgeError(BridgeErrorCode.PAYLOAD_SCHEMA_MISMATCH, violation)
