@@ -107,11 +107,11 @@ _METADATA_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 _REJECTION_DETAILS: Final[dict[str, str]] = {
-    "raw_secret_value_argument": (
+    "raw_secret_value_forbidden": (
         "secret tool call carries a raw secret-value argument; only "
         "generation/reference-safe calls are persistable"
     ),
-    "unparseable_secret_tool_args": (
+    "malformed_secret_arguments": (
         "secret tool call arguments are not a parseable JSON object; the "
         "call cannot be proven generation/reference-safe"
     ),
@@ -123,13 +123,28 @@ _REJECTION_DETAILS: Final[dict[str, str]] = {
         "unknown secret-namespace operation; only secret.list, "
         "secret.get and secret.store are persistable"
     ),
-    "secret_shaped_metadata_field": (
+    "unsupported_secret_parameter": (
+        "secret.get and secret.list forbid unsupported parameters; only "
+        "reference lookup and listing arguments are permitted"
+    ),
+    "secret_material_in_arguments": (
         "secret tool call carries secret-shaped content in a metadata "
         "field; the value is rejected pre-persistence"
     ),
 }
 
 _STORE_REASON: Final[str] = "secret_store_requires_generate_true"
+
+#: Known operations with a foreign parameter: the operation is known;
+#: only its parameters are outside the generation/reference contract.
+_UNSUPPORTED_PARAM_REASON: Final[str] = "unsupported_secret_parameter"
+
+#: Well-known NON-secret metadata keys: on an unknown secret operation
+#: their values are ordinary words ("default", "login"), never extracted
+#: as literal secrets unless they themselves match the pattern layer.
+_NON_SENSITIVE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {"vault", "category", "tag", "limit", "offset", "generate", "length"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -239,21 +254,23 @@ def _value_forms(value: str) -> tuple[str, ...]:
     """
     if len(value) < 4:
         return ()
-    forms = {value[:_MAX_SENSITIVE_VALUE_CHARS]}
+    bounded = value[:_MAX_SENSITIVE_VALUE_CHARS]
+    forms = {bounded}
     try:
-        escaped = json.dumps(value, ensure_ascii=False)[1:-1]
-        if escaped != value:
+        escaped = json.dumps(bounded, ensure_ascii=False)[1:-1]
+        if escaped != bounded:
             forms.add(escaped[:_MAX_SENSITIVE_VALUE_CHARS])
-        quoted = urllib.parse.quote(value[:_MAX_SENSITIVE_VALUE_CHARS], safe="")
-        if quoted != value:
+        ascii_escaped = json.dumps(bounded, ensure_ascii=True)[1:-1]
+        if ascii_escaped != bounded and ascii_escaped != escaped:
+            forms.add(ascii_escaped[:_MAX_SENSITIVE_VALUE_CHARS])
+        quoted = urllib.parse.quote(bounded, safe="")
+        if quoted != bounded:
             forms.add(quoted)
-        encoded = base64.b64encode(
-            value[:_MAX_SENSITIVE_VALUE_CHARS].encode("utf-8")
-        ).decode("ascii")
+        encoded = base64.b64encode(bounded.encode("utf-8")).decode("ascii")
         forms.add(encoded)
-        urlsafe = base64.urlsafe_b64encode(
-            value[:_MAX_SENSITIVE_VALUE_CHARS].encode("utf-8")
-        ).decode("ascii")
+        urlsafe = base64.urlsafe_b64encode(bounded.encode("utf-8")).decode(
+            "ascii"
+        )
         if urlsafe != encoded:
             forms.add(urlsafe)
     except (TypeError, ValueError):  # pragma: no cover - str inputs only
@@ -324,7 +341,9 @@ def _parse_args(raw: str | dict[str, Any] | None) -> tuple[dict[str, Any], bool]
     if isinstance(raw, str) and raw.strip():
         try:
             parsed = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # json.loads raises RecursionError (not ValueError) on
+            # deeply nested hostile strings; degrade to unparseable.
             return {}, True
         if isinstance(parsed, Mapping):
             return dict(parsed), False
@@ -437,7 +456,7 @@ def sanitize_tool_call(
     sensitive: list[str] = []
 
     if unparseable:
-        reason = "unparseable_secret_tool_args"
+        reason = "malformed_secret_arguments"
         if isinstance(part.args, str):
             sensitive.append(part.args[:_MAX_SENSITIVE_VALUE_CHARS])
         return (
@@ -447,7 +466,7 @@ def sanitize_tool_call(
 
     raw_keys = _raw_value_keys(args)
     if raw_keys:
-        reason = "raw_secret_value_argument"
+        reason = "raw_secret_value_forbidden"
         sensitive.extend(_collect_raw_values(args))
         return (
             _rejected_call(
@@ -457,11 +476,20 @@ def sanitize_tool_call(
         )
 
     if operation not in _KNOWN_SECRET_OPERATIONS:
+        # Unknown operation: extract raw-value keys, arbitrary/unknown
+        # keys, and metadata values that themselves match the pattern
+        # layer — but ordinary metadata words ("default", "login") are
+        # NOT literal secrets and must not redact the whole response.
         reason = "unknown_secret_operation"
-        sensitive.extend(
-            value[:_MAX_SENSITIVE_VALUE_CHARS]
-            for value in _iter_string_values(args)
-        )
+        for key, value in args.items():
+            if not isinstance(key, str):
+                continue
+            if _normalized_key(key) in _NON_SENSITIVE_METADATA_KEYS:
+                if isinstance(value, str) and redact_text(value) != value:
+                    sensitive.append(value[:_MAX_SENSITIVE_VALUE_CHARS])
+                continue
+            for leaf in _iter_string_values(value):
+                sensitive.append(leaf[:_MAX_SENSITIVE_VALUE_CHARS])
         return (
             _rejected_call(call_id, tool_name, capability_id, reason, ()),
             tuple(sensitive),
@@ -491,7 +519,7 @@ def sanitize_tool_call(
                 tuple(sensitive),
             )
     elif unsupported:
-        reason = "unknown_secret_operation"
+        reason = _UNSUPPORTED_PARAM_REASON
         _secret_shaped_values(args, sensitive)
         return (
             _rejected_call(
@@ -540,7 +568,7 @@ def _metadata_violation(args: Mapping[str, Any], sensitive: list[str]) -> str | 
     before = len(sensitive)
     _secret_shaped_values(args, sensitive)
     if len(sensitive) > before:
-        return "secret_shaped_metadata_field"
+        return "secret_material_in_arguments"
     return None
 
 

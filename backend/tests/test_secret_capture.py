@@ -37,12 +37,18 @@ from mai.agents.tools import (
     _agent_input_schema_for,
     _validate_payload,
 )
-from mai.contracts.sessions import MAX_ENTRY_TEXT_CHARS
+from mai.contracts.sessions import (
+    MAX_ENTRY_TEXT_CHARS,
+    MAX_ERROR_DETAIL_CHARS,
+)
 from mai.plugins.builtin_onepassword import SECRET_STORE_CAPABILITY
 from mai.plugins.registry import parse_descriptor
 
 _CANARY = "hunter2-synthetic-secret-9f3a"
-_SPECIAL = "p@ss wörd&=+?/x"  # exercises the URL-encoding form layer
+# `"` and `\` make JSON escapes non-identity; `ö` separates
+# ensure_ascii=False from ensure_ascii=True; the `!!??` tail makes
+# standard base64 (`/`) differ from urlsafe (`_`).
+_SPECIAL = 'p@ss"wörd\\&=?+>/x!!??'
 
 
 def _response(*parts: object) -> ModelResponse:
@@ -108,7 +114,7 @@ def test_raw_value_keys_rejected_top_level_and_nested() -> None:
     ):
         call, values = sanitize_tool_call(_store_call(args=args))
         assert call.rejected is True, args
-        assert call.rejection_reason == "raw_secret_value_argument", args
+        assert call.rejection_reason == "raw_secret_value_forbidden", args
         assert call.rejection_result is not None
         assert values and _CANARY in values, args
 
@@ -121,7 +127,7 @@ def test_unparseable_or_non_object_args_rejected_on_secret_tools() -> None:
                 ToolCallPart(tool_call_id="c1", tool_name=name, args=args)
             )
             assert call.rejected is True, (name, args)
-            assert call.rejection_reason == "unparseable_secret_tool_args"
+            assert call.rejection_reason == "malformed_secret_arguments"
         # The malformed-JSON string itself is extracted for scrubbing.
         call, values = sanitize_tool_call(
             ToolCallPart(tool_call_id="c1", tool_name=name, args=malformed)
@@ -162,7 +168,8 @@ def test_unsupported_parameters_rejected_on_get() -> None:
         )
     )
     assert call.rejected is True
-    assert call.rejection_reason == "unknown_secret_operation"
+    assert call.rejection_reason == "unsupported_secret_parameter"
+    assert "unsupported parameters" in (call.rejection_result.error_detail or "")
 
 
 def test_secret_shaped_metadata_fields_rejected() -> None:
@@ -185,7 +192,7 @@ def test_secret_shaped_metadata_fields_rejected() -> None:
             ToolCallPart(tool_call_id="c1", tool_name=name, args=args)
         )
         assert call.rejected is True, args
-        assert call.rejection_reason == "secret_shaped_metadata_field"
+        assert call.rejection_reason == "secret_material_in_arguments"
         assert values, args
 
 
@@ -278,26 +285,35 @@ def test_rejected_value_scrubbed_from_text_thinking_and_sibling_args() -> None:
 
 
 def test_encoded_value_forms_scrubbed() -> None:
-    escaped = json.dumps(_SPECIAL, ensure_ascii=False)[1:-1]
-    quoted = urllib.parse.quote(_SPECIAL, safe="")
-    b64 = base64.b64encode(_SPECIAL.encode()).decode()
-    b64url = base64.urlsafe_b64encode(_SPECIAL.encode()).decode()
+    # The shared _SPECIAL canary genuinely differs across ALL forms; the
+    # pairwise distinctions are asserted up front.
+    special = _SPECIAL
+    escaped = json.dumps(special, ensure_ascii=False)[1:-1]
+    ascii_escaped = json.dumps(special, ensure_ascii=True)[1:-1]
+    quoted = urllib.parse.quote(special, safe="")
+    b64 = base64.b64encode(special.encode()).decode()
+    b64url = base64.urlsafe_b64encode(special.encode()).decode()
+    assert escaped != special
+    assert ascii_escaped != escaped and "\\u00f6" in ascii_escaped
+    assert quoted != special
+    assert b64 != b64url and "/" in b64
+    assert "_" in b64url
     response = _response(
         TextPart(
-            f"raw={_SPECIAL} json={escaped} url={quoted} "
-            f"b64={b64} b64url={b64url}"
+            f"raw={special} json={escaped} ascii={ascii_escaped} "
+            f"url={quoted} b64={b64} b64url={b64url}"
         ),
         ToolCallPart(
             tool_call_id="c1",
             tool_name="secret_store",
-            args={"title": "db", "value": _SPECIAL},
+            args={"title": "db", "value": special},
         ),
     )
     sanitized = sanitize_model_response(response)
-    assert _SPECIAL not in sanitized.text
-    for form in (escaped, quoted, b64, b64url):
+    assert special not in sanitized.text
+    for form in (escaped, ascii_escaped, quoted, b64, b64url):
         assert form not in sanitized.text, form
-    assert sanitized.text.count("[REDACTED]") >= 5
+    assert sanitized.text.count("[REDACTED]") >= 6
 
 
 def test_short_values_are_not_tracked() -> None:
@@ -376,22 +392,52 @@ def test_multiple_rejected_calls_produce_matching_results() -> None:
 
 
 def test_rejection_reason_vocabulary() -> None:
-    reasons = {
-        "raw_secret_value_argument": {"title": "db", "value": _CANARY},
-        "unparseable_secret_tool_args": "broken {",
-        "secret_store_requires_generate_true": {"title": "db"},
-        "unknown_secret_operation": {"item": "i"},
-    }
-    seen: set[str] = set()
-    for args in reasons.values():
-        call, _ = sanitize_tool_call(_store_call(args=args))
-        seen.add(call.rejection_reason or "")
-        assert call.rejection_reason in reasons
-    call, _ = sanitize_tool_call(
-        ToolCallPart(tool_call_id="c9", tool_name="secret_wipe", args={})
-    )
-    seen.add(call.rejection_reason or "")
-    assert seen == set(reasons)
+    """Each of the six reasons is produced by its own tool/args pairing."""
+    cases: list[tuple[str, str, object, str]] = [
+        # (expected_reason, tool_name, args, description)
+        (
+            "raw_secret_value_forbidden",
+            "secret_store",
+            {"title": "db", "value": _CANARY},
+            "raw value on a known operation",
+        ),
+        (
+            "malformed_secret_arguments",
+            "secret_get",
+            "broken {",
+            "malformed JSON string on a secret tool",
+        ),
+        (
+            "secret_store_requires_generate_true",
+            "secret_store",
+            {"title": "db", "generate": False},
+            "store without generate=true",
+        ),
+        (
+            "unknown_secret_operation",
+            "secret.rotate",
+            {"item": "i"},
+            "dotted unknown operation",
+        ),
+        (
+            "unsupported_secret_parameter",
+            "secret_list",
+            {"vault": "v", "source_ref": "op://v/i/p"},
+            "foreign parameter on a known operation",
+        ),
+        (
+            "secret_material_in_arguments",
+            "secret_store",
+            {"title": "db", "generate": True, "notes": "password: hunter2xyz"},
+            "secret-shaped metadata field",
+        ),
+    ]
+    for expected, tool_name, args, what in cases:
+        call, _ = sanitize_tool_call(
+            ToolCallPart(tool_call_id="c9", tool_name=tool_name, args=args)
+        )
+        assert call.rejected is True, what
+        assert call.rejection_reason == expected, (what, call.rejection_reason)
     assert SENSITIVE_CALL_REJECTED_CODE == "sensitive_call_rejected"
 
 
@@ -424,18 +470,26 @@ def test_raw_value_field_vocabulary_matches_the_bridge() -> None:
 def test_oversized_secret_value_stays_bounded() -> None:
     huge = "s" * 40_000
     response = _response(
-        TextPart(f"answer {huge}"),
+        TextPart(f"answer {huge} tail {_CANARY} end"),
         ToolCallPart(
             tool_call_id="c1",
             tool_name="secret_store",
             args={"title": "db", "value": huge},
         ),
+        ToolCallPart(
+            tool_call_id="c2",
+            tool_name="secret_store",
+            args={"title": "api", "value": _CANARY},
+        ),
     )
     sanitized = sanitize_model_response(response)
     assert len(sanitized.text) <= MAX_ENTRY_TEXT_CHARS
     assert huge not in sanitized.text
+    # The normal-length secret inside the oversized text is scrubbed
+    # BEFORE the bound applies (a cut never hides an unredacted secret).
+    assert _CANARY not in sanitized.text
     result = sanitized.rejected_results[0]
-    assert len(result.error_detail or "") <= 200
+    assert len(result.error_detail or "") <= MAX_ERROR_DETAIL_CHARS
 
 
 def test_oversized_malformed_args_rejected_with_bounded_detail() -> None:
@@ -444,10 +498,12 @@ def test_oversized_malformed_args_rejected_with_bounded_detail() -> None:
     )
     call, values = sanitize_tool_call(part)
     assert call.rejected is True
-    assert call.rejection_reason == "unparseable_secret_tool_args"
+    assert call.rejection_reason == "malformed_secret_arguments"
     assert len(call.safe_args) <= 4
     assert call.rejection_result is not None
-    assert len(call.rejection_result.error_detail or "") <= 200
+    assert (
+        len(call.rejection_result.error_detail or "") <= MAX_ERROR_DETAIL_CHARS
+    )
     assert len(values[0]) <= MAX_ENTRY_TEXT_CHARS
 
 
@@ -465,3 +521,106 @@ def test_sanitized_response_is_deterministic() -> None:
     second = sanitize_model_response(response)
     assert first == second
     assert isinstance(first, SanitizedModelResponse)
+
+
+# ---------------------------------------------------------------------------
+# 8. fix round 1 additions
+# ---------------------------------------------------------------------------
+
+
+def test_dotted_aliases_pass_through_like_underscore_names() -> None:
+    store_args = {"title": "app-db", "generate": True, "length": 32}
+    call, values = sanitize_tool_call(
+        ToolCallPart(tool_call_id="c1", tool_name="secret.store", args=store_args)
+    )
+    assert call.rejected is False
+    assert call.safe_args == store_args
+    assert values == ()
+    call, _ = sanitize_tool_call(
+        ToolCallPart(
+            tool_call_id="c2",
+            tool_name="secret.get",
+            args={"vault": "v", "item": "i"},
+        )
+    )
+    assert call.rejected is False
+    call, _ = sanitize_tool_call(
+        ToolCallPart(
+            tool_call_id="c3", tool_name="secret.list", args={"limit": 10}
+        )
+    )
+    assert call.rejected is False
+
+
+def test_thinking_signature_is_scrubbed() -> None:
+    sanitized = sanitize_model_response(
+        _response(
+            ThinkingPart(
+                content=f"plan without the secret: {_CANARY}",
+                signature=f"sig-{_CANARY}-blob",
+            ),
+            ToolCallPart(
+                tool_call_id="c1",
+                tool_name="secret_store",
+                args={"title": "db", "value": _CANARY},
+            ),
+        )
+    )
+    part = sanitized.thinking_parts[0]
+    assert _CANARY not in part.content
+    assert _CANARY not in (part.signature or "")
+    assert "[REDACTED]" in (part.signature or "")
+
+
+def test_deeply_nested_json_args_degrade_to_malformed() -> None:
+    """json.loads raises RecursionError (not ValueError) on deeply
+    nested hostile strings; the sanitizer degrades fail-closed."""
+    call, _ = sanitize_tool_call(
+        ToolCallPart(
+            tool_call_id="c1", tool_name="secret_store", args="[" * 2500
+        )
+    )
+    assert call.rejected is True
+    assert call.rejection_reason == "malformed_secret_arguments"
+    assert call.rejection_result is not None
+
+
+def test_unknown_operation_keeps_ordinary_metadata_words() -> None:
+    """`vault: "default"` is an ordinary word, never a literal secret;
+    the raw-value key IS extracted and scrubbed everywhere. The
+    raw-value class takes priority over the unknown-operation class."""
+    response = _response(
+        TextPart("the vault default stays plain, the token goes"),
+        ToolCallPart(
+            tool_call_id="c1",
+            tool_name="secret.delete",
+            args={"vault": "default", "token": "my-secret-tok"},
+        ),
+    )
+    sanitized = sanitize_model_response(response)
+    assert sanitized.tool_calls[0].rejected is True
+    assert sanitized.tool_calls[0].rejection_reason == "raw_secret_value_forbidden"
+    assert sanitized.tool_calls[0].safe_args["rejected_keys"] == ["token"]
+    # The token value appears only in ARGS, so the text is unchanged —
+    # and the ordinary metadata word stays plain everywhere.
+    assert sanitized.text == "the vault default stays plain, the token goes"
+    assert "my-secret-tok" not in json.dumps(sanitized.tool_calls[0].safe_args)
+    assert "my-secret-tok" not in sanitized.rejected_results[0].model_dump_json()
+
+
+def test_unknown_operation_extracts_arbitrary_keys_not_metadata_words() -> None:
+    """Without raw-value keys, arbitrary-key leaves are extracted while
+    ordinary metadata words stay untouched."""
+    response = _response(
+        TextPart("check the default vault scope"),
+        ToolCallPart(
+            tool_call_id="c1",
+            tool_name="secret.delete",
+            args={"vault": "default", "scope": "write-fixture-9c3"},
+        ),
+    )
+    sanitized = sanitize_model_response(response)
+    assert sanitized.tool_calls[0].rejected is True
+    assert sanitized.tool_calls[0].rejection_reason == "unknown_secret_operation"
+    assert "write-fixture-9c3" not in sanitized.text
+    assert sanitized.text == "check the default vault scope"
