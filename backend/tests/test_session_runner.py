@@ -506,17 +506,25 @@ def _script_model():
             # E2-fix1 probe seam: a sentinel-NAMED dynamic subclass (the
             # class NAME is the leak vector under audit F-A).
             raise type(exc_name, (RuntimeError,), {})(message)
-        if "tool_call" in inner:
-            call = inner["tool_call"]
-            return ModelResponse(
-                parts=[
+        if "tool_call" in inner or "tool_calls" in inner:
+            parts = []
+            if inner.get("text"):
+                # Optional leaked/side text beside the call(s).
+                parts.append(TextPart(content=str(inner["text"])))
+            calls = (
+                [inner["tool_call"]]
+                if "tool_call" in inner
+                else list(inner.get("tool_calls", []))
+            )
+            for call in calls:
+                parts.append(
                     ToolCallPart(
                         tool_name=call["name"],
                         args=call.get("args", {"marker": "m1"}),
                         tool_call_id=call.get("id", "c1"),
                     )
-                ]
-            )
+                )
+            return ModelResponse(parts=parts)
         return ModelResponse(parts=[TextPart(content=inner.get("text", "done"))])
 
     def _model_fn(messages, info):
@@ -604,11 +612,17 @@ def _build():
     registry = CapabilityRegistry()
     registry.register(_descriptor("fixture.read", "read"))
     registry.register(_descriptor("fixture.priv", "privileged"))
-    # ask_03-runtime-policy: registered so a scenario granting it in
-    # context.allowed_capabilities exposes the secret.* tool surface;
-    # exposure follows context ∩ registry, so scenarios that never allow
-    # it are unaffected.
-    registry.register(_descriptor("secret.get", "read"))
+    # ask_07-runner-safety: the REAL built-in secret descriptors, so a
+    # scenario granting secret.* exposes the true agent-projected surface
+    # (generation/reference-only secret.store) and valid generation calls
+    # dispatch through the actual schema gate; exposure follows
+    # context ∩ registry, so scenarios that never allow them are unaffected.
+    from mai.plugins.builtin_onepassword import (
+        CAPABILITIES as ONEPASSWORD_CAPABILITIES,
+    )
+
+    for document in ONEPASSWORD_CAPABILITIES:
+        registry.register(parse_descriptor(document))
     dispatcher = CapabilityDispatcher(
         registry=registry,
         approvals=ApprovalStore(sessions),
@@ -3711,3 +3725,283 @@ def test_secret_exposure_latches_route_for_the_whole_run(
     assert "saw_tool_return" in lines, lines
     # The latch persisted exactly once for the run.
     assert len(_read_latch_events(agent_url, run_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# ask_07-runner-safety: rejected secret calls never reach the dispatch
+# fence, the executor, or any durable checkpoint. The REAL built-in
+# secret descriptors are registered in the worker (generation/reference-
+# only agent surface); the backend-only provider is the synthetic
+# FixtureExecutor.
+# ---------------------------------------------------------------------------
+
+_RAW_CANARY = "RAW-SECRET-CANARY-777"
+_CRASH_CANARY = "CRASH-CANARY-888"
+
+#: The generation/reference-only surface under test (slice 04's
+#: projected schema lives on THIS capability).
+SECRET_STORE_CAP = "secret.store"
+
+_ZERO_LEAK_TABLES = (
+    "session_entries",
+    "session_provider_artifacts",
+    "job_steps",
+    "job_events",
+    "dbos.operation_outputs",
+    "dbos.workflow_status",
+)
+
+
+def _whole_table_blobs(url: str) -> dict[str, str]:
+    """Every row of every durable table as JSON text (zero-leak scan)."""
+    blobs: dict[str, str] = {}
+    with psycopg.connect(url) as conn:
+        for table in _ZERO_LEAK_TABLES:
+            rows = conn.execute(f"SELECT to_jsonb(t) FROM {table} AS t").fetchall()
+            blobs[table] = json.dumps(
+                [row[0] for row in rows], ensure_ascii=False, default=str
+            )
+    return blobs
+
+
+def _assert_secret_absent(blobs: dict[str, str], secret: str) -> None:
+    import base64
+    import urllib.parse
+
+    forms = {
+        secret,
+        json.dumps(secret),
+        urllib.parse.quote(secret, safe=""),
+        base64.b64encode(secret.encode()).decode(),
+        base64.urlsafe_b64encode(secret.encode()).decode(),
+    }
+    for table, blob in blobs.items():
+        for form in forms:
+            assert form not in blob, (table, form)
+
+
+def test_rejected_secret_store_never_dispatches_generation_succeeds(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """Round 0: raw-value secret_store call (leaked canary in the side
+    text) is rejected PRE-dispatch — no executor effect, no job_steps
+    row — and the group completes. Round 1: the permitted generation
+    call dispatches through the REAL schema gate. Round 2 finishes. The
+    canary is absent from every durable table including the DBOS
+    checkpoints."""
+    composition()
+    _write_policy_files(
+        scenario, grants=[{READ_CAP: True, SECRET_STORE_CAP: True}]
+    )
+    _script(
+        scenario,
+        [
+            {
+                "tool_call": {
+                    "name": "secret_store",
+                    "args": {"title": "db", "value": _RAW_CANARY},
+                    "id": "c1",
+                },
+                "text": f"storing {_RAW_CANARY} for you",
+            },
+            {
+                "tool_call": {
+                    "name": "secret_store",
+                    "args": {"title": "db", "generate": True, "length": 24},
+                    "id": "c2",
+                }
+            },
+            {"text": "generated via reference; stored"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-saf")
+        _run(insert_run(run_id, requested_grants=(READ_CAP, SECRET_STORE_CAP)))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id,
+                    session_id,
+                    allowed=(READ_CAP, SECRET_STORE_CAP),
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "safety run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    lines = _journal_lines(scenario)
+    # Three model rounds: rejected turn, generation turn, final text.
+    assert lines.count("model_call") == 3, lines
+    # The rejected call NEVER reached the executor: exactly ONE
+    # secret.store begin marker exists — the generation call's.
+    assert lines.count("begin:secret.store:?") == 1, lines
+    assert lines.count("effect:secret.store:?") == 1, lines
+    assert "policy_latched:True" in lines
+    assert lines.count("policy_latched:True") == 3
+    # No job_steps row for the rejected call (its denial is capture-level).
+    with psycopg.connect(agent_url) as conn:
+        step_rows = conn.execute(
+            "SELECT seq, capability_id, state FROM job_steps WHERE run_id = %s "
+            "ORDER BY seq",
+            (uuid.UUID(run_id),),
+        ).fetchall()
+    assert [(row[0], row[1]) for row in step_rows] == [(116, "secret.store")]
+    assert step_rows[0][2] == "succeeded"
+    # The durable log: denied c1 result, executed c2 result, both groups
+    # complete.
+    entries = _read_session_entries(agent_url, session_id)
+    results = [
+        entry["payload"]
+        for entry in entries
+        if entry["kind"] == "tool_result"
+    ]
+    assert [payload["call_id"] for payload in results] == ["c1", "c2"]
+    assert results[0]["status"] == "denied"
+    assert results[0]["error_code"] == "sensitive_call_rejected"
+    assert results[1]["status"] == "executed"
+    assistant_payloads = [
+        entry["payload"]
+        for entry in entries
+        if entry["kind"] == "assistant_message"
+        and entry["payload"].get("tool_calls")
+    ]
+    assert all(
+        payload.get("tool_group_state") == "complete"
+        for payload in assistant_payloads
+    )
+    blobs = _whole_table_blobs(agent_url)
+    _assert_secret_absent(blobs, _RAW_CANARY)
+
+
+def test_crash_replay_keeps_rejected_secret_undispatched(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """Crash window on a MIXED group: the rejected secret call is never
+    dispatched before or after the worker restart, the allowed call
+    reconciles honestly, the group completes, and the canary is absent
+    from every durable table and checkpoint."""
+    composition()
+    _write_policy_files(
+        scenario, grants=[{READ_CAP: True, SECRET_STORE_CAP: True}]
+    )
+    (scenario / "behavior.json").write_text(
+        json.dumps({READ_CAP: "gate"}), encoding="utf-8"
+    )
+    _script(
+        scenario,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "secret_store",
+                        "args": {"title": "db", "value": _CRASH_CANARY},
+                        "id": "c1",
+                    },
+                    {
+                        "name": "fixture_read",
+                        "args": {"marker": "m1"},
+                        "id": "c2",
+                    },
+                ]
+            },
+            {"text": "recovered and done"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker1: subprocess.Popen | None = None
+    worker2: subprocess.Popen | None = None
+    try:
+        worker1 = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1s")
+        _run(insert_run(run_id, requested_grants=(READ_CAP, SECRET_STORE_CAP)))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id,
+                    session_id,
+                    allowed=(READ_CAP, SECRET_STORE_CAP),
+                    reconcile_wait_seconds=120.0,
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _wait_until(
+            lambda: _journal_count(scenario, "begin:fixture.read:m1") == 1,
+            RUN_TIMEOUT,
+            "gated begin marker",
+        )
+        # The rejected secret call produced NO executor activity.
+        assert _journal_count(scenario, "begin:secret.store") == 0
+        _kill9(worker1)
+        worker1 = None
+        assert _journal_count(scenario, "effect:fixture.read:m1") == 0
+
+        worker2 = _spawn_worker(agent_url, scenario / "handlers", scenario, "w2s")
+        _wait_until(
+            lambda: any(
+                entry["kind"] == "tool_result"
+                and entry["payload"].get("status") == "unknown_effect"
+                for entry in _read_session_entries(agent_url, session_id)
+            ),
+            RUN_TIMEOUT,
+            "the honest unknown_effect session entry",
+        )
+        with psycopg.connect(agent_url, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE job_steps SET state = 'succeeded' "
+                "WHERE run_id = %s AND seq = 101",
+                (uuid.UUID(run_id),),
+            )
+        _send_wake(run_id, agent_url, {"kind": "resolve"})
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "crash run")
+    finally:
+        for worker in (worker1, worker2):
+            if worker is not None:
+                _stop(worker)
+        client.close()
+
+    lines = _journal_lines(scenario)
+    assert lines.count("begin:fixture.read:m1") == 1
+    assert lines.count("effect:fixture.read:m1") == 0  # never re-executed
+    assert "begin:secret.store" not in lines
+    assert "effect:secret.store" not in lines
+    entries = _read_session_entries(agent_url, session_id)
+    assistant_payloads = [
+        entry["payload"]
+        for entry in entries
+        if entry["kind"] == "assistant_message"
+        and entry["payload"].get("tool_calls")
+    ]
+    assert assistant_payloads
+    assert assistant_payloads[0]["tool_group_state"] == "complete"
+    rejected_results = [
+        entry["payload"]
+        for entry in entries
+        if entry["kind"] == "tool_result"
+        and entry["payload"].get("call_id") == "c1"
+    ]
+    assert len(rejected_results) == 1
+    assert rejected_results[0]["error_code"] == "sensitive_call_rejected"
+    blobs = _whole_table_blobs(agent_url)
+    _assert_secret_absent(blobs, _CRASH_CANARY)

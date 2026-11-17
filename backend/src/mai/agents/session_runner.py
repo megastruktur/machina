@@ -75,7 +75,8 @@ from mai.agents.operating_policy import (
     build_operating_policy,
     is_secret_route_latched,
 )
-from mai.agents.output_safety import project_text
+from mai.agents.output_safety import project_text, redact_text
+from mai.agents.secret_capture import SENSITIVE_CALL_REJECTED_CODE
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
     SESSION_DELEGATE_TOOL_NAME,
@@ -89,6 +90,7 @@ from mai.agents.session_history import (
     abuild_session_model_history,
     apersist_run_exchange,
     assert_tool_result_honesty,
+    is_rejected_sensitive_tool_call,
 )
 from mai.agents.tools import BridgeError, CapabilityToolBridge, ToolResult
 from mai.contracts.sessions import (
@@ -1061,7 +1063,12 @@ def _load_admin_server_instructions(
         / PROMPT_FILENAME
     )
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
     except OSError:
         return None
     try:
@@ -1188,19 +1195,30 @@ async def _round_model(
 
     def _deferring(tool: PydanticTool) -> PydanticTool:
         # The reviewed deferral wrapper (run.py pattern): the tool SURFACE
-        # stays the bridge's; execution moves to the durable seam.
+        # stays the bridge's; execution moves to the durable seam. The
+        # PUBLISHED schema stays strict (it is what the model sees), but
+        # the local args validator is permissive — any JSON object
+        # validates — so a malformed or raw-value call reaches `_defer`
+        # (CallDeferred) on the SAME round instead of a pydantic-side
+        # validation retry inside `agent.run`: the capture, the secret
+        # sanitizer and the dispatcher own the authoritative verdict
+        # (D6/C6), never a silent model-side retry.
         definition = tool.tool_def
         from pydantic_ai.exceptions import CallDeferred
 
         def _defer(**_payload: Any) -> Any:
             raise CallDeferred
 
-        return PydanticTool.from_schema(
+        deferred_tool = PydanticTool.from_schema(
             _defer,
             name=definition.name,
             description=definition.description or "",
             json_schema=json.loads(json.dumps(definition.parameters_json_schema)),
         )
+        from pydantic_core import SchemaValidator
+
+        deferred_tool.function_schema.validator = SchemaValidator({"type": "any"})
+        return deferred_tool
 
     agent: Agent[None, Any] = Agent(
         model=resolved_model,
@@ -1250,14 +1268,31 @@ async def _round_model(
         durable_prefix=f"{_child_source_prefix(intent)}round:{round_index}",
     )
     calls: list[dict[str, object]] = []
+    rejected_calls: list[dict[str, object]] = []
     assistant_entry_id: str | None = None
+    sanitized_text: str | None = None
     for entry in persisted:
         payload = entry.payload
         if isinstance(payload, AssistantMessageEntry) and payload.tool_calls:
             assistant_entry_id = str(entry.entry_id)
+            # D6/C6 (ask_07): the checkpoint carries the SANITIZED
+            # persisted text and NEVER the raw model output, and the
+            # dispatch list never includes a rejected sensitive call —
+            # its denied result is already persisted by the capture.
+            sanitized_text = payload.text
             for call_index, call in enumerate(
                 payload.tool_calls[:MAX_TOOL_CALLS_PER_ROUND]
             ):
+                if is_rejected_sensitive_tool_call(call):
+                    rejected_calls.append(
+                        {
+                            "call_id": call.call_id,
+                            "tool_name": call.tool_name,
+                            "entry_id": str(entry.entry_id),
+                            "error_code": SENSITIVE_CALL_REJECTED_CODE,
+                        }
+                    )
+                    continue
                 calls.append(
                     {
                         "tool_call_id": call.call_id,
@@ -1272,11 +1307,22 @@ async def _round_model(
                         + call_index,
                     }
                 )
-    output_text = result.output if isinstance(result.output, str) else ""
+    if sanitized_text is not None:
+        output_text = sanitized_text
+    elif isinstance(result.output, str):
+        output_text = redact_text(result.output)
+    else:
+        output_text = ""
+    # A round with ONLY rejected calls still returns "tool_calls" (with
+    # an empty dispatch list): the run loop records the denials, keeps
+    # the already-complete group, and advances to the next round so the
+    # model sees the denial and can report the blocker.
+    has_tool_work = bool(calls) or bool(rejected_calls)
     return {
-        "status": "tool_calls" if calls else "final",
+        "status": "tool_calls" if has_tool_work else "final",
         "assistant_entry_id": assistant_entry_id,
         "calls": calls,
+        "rejected_calls": rejected_calls,
         "output_text": output_text,
         "round": round_index,
     }
@@ -1447,6 +1493,12 @@ def _session_tool_execute(payload_json: str, call_json: str, round_index: int) -
     call = json.loads(call_json)
     seq = int(call["seq"])
     capability_id = str(call["capability_id"])
+    if is_rejected_sensitive_tool_call(call.get("args")):
+        # Defense in depth (D6/C6): a rejected sensitive call must NEVER
+        # reach the step fence or the dispatcher. The capture layer
+        # already excluded it from the dispatch list; this refuses any
+        # host misuse loudly instead of dispatching marker args.
+        raise SessionStageError(SENSITIVE_CALL_REJECTED_CODE)
     spec = StepIntent(seq=seq, capability_id=capability_id, payload=dict(call["args"]))
 
     row = executor.run(executor.steps.aensure_step_intent(intent.run_id, spec))
@@ -3081,6 +3133,21 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                 break
             calls = list(round_record["calls"])
             entry_id = str(round_record["assistant_entry_id"])
+            # ask_07 (D6/C6): rejected sensitive calls are recorded as
+            # denials WITHOUT any dispatch — their denied results are
+            # already persisted by the capture, and the all-rejected
+            # group rides its entry already "complete". On DBOS replay
+            # the records re-derive deterministically from the
+            # checkpointed round record.
+            for rejected in round_record.get("rejected_calls", []):
+                tool_records.append(
+                    {
+                        "call_id": rejected.get("call_id"),
+                        "state": StepState.FAILED.value,
+                        "status": "denied",
+                        "error_code": SENSITIVE_CALL_REJECTED_CODE,
+                    }
+                )
             for call in calls:
                 call_json = json.dumps(call)
                 # Safe boundary BEFORE each new tool effect: a drained stop
