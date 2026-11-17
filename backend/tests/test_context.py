@@ -30,6 +30,7 @@ checked value-free (no prompt prose or evidence text in error details).
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -39,6 +40,8 @@ from pathlib import Path
 
 import pytest
 
+from mai.agents import context as context_module
+from mai.agents import operating_policy
 from mai.agents.context import (
     CHARS_PER_TOKEN,
     CONTEXT_SCHEMA_VERSION,
@@ -60,6 +63,7 @@ from mai.agents.context import (
 from mai.agents.model_store import ModelConfigStore
 from mai.applications.service_map import ServiceInstructions, ServiceMapEntry
 from mai.contracts.server import SCHEMA_VERSION
+from mai.contracts.sessions import SERVICE_MAP_SECTION_HEADER
 from mai.profiles.files import FileStoreErrorCode, ProfileFileError, ProfileFileStore
 
 SERVER_A = uuid.UUID("7e6c1a34-9a2b-4c3d-8e5f-1029384756af")
@@ -1118,3 +1122,56 @@ def test_service_map_section_tolerates_entries_without_the_field() -> None:
     assert format_service_map_section([stripped]).count(
         "Server custom instructions"
     ) == 0
+
+
+# ---------------------------------------------------------------------------
+# Shared core-rule source (ask_02-context): context re-exports the
+# operating-policy GLOBAL_INSTRUCTIONS; no duplicate literal remains and
+# assembly still carries it exactly once as system authority only.
+# ---------------------------------------------------------------------------
+
+
+def test_global_instructions_is_the_operating_policy_object() -> None:
+    """Exact object identity: one authoritative source, no second copy."""
+    assert context_module.GLOBAL_INSTRUCTIONS is operating_policy.GLOBAL_INSTRUCTIONS
+
+
+def test_context_module_has_no_global_instructions_assignment() -> None:
+    """AST guard: no independently editable literal remains in context.py."""
+    source = Path(context_module.__file__).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assert target.id != "GLOBAL_INSTRUCTIONS"
+
+
+def test_system_prompt_carries_global_instructions_exactly_once(
+    binding, materials
+) -> None:
+    """The assembled system prompt opens with the shared constant, once."""
+    assembled = _assemble(binding, materials)
+    assert assembled.system_prompt.startswith(GLOBAL_INSTRUCTIONS)
+    assert assembled.system_prompt.count(GLOBAL_INSTRUCTIONS) == 1
+
+
+def test_service_map_content_stays_out_of_system_authority(
+    binding, materials
+) -> None:
+    """Service Map text travels only in the user message's untrusted
+    Service Map section, never in the system-prompt authority layers."""
+    section = format_service_map_section([_map_entry()])
+    assembled = _assemble(binding, materials, task=f"{TASK}{section}")
+    assert SERVICE_MAP_SECTION_HEADER in assembled.user_message
+    assert "### jellyfin" in assembled.user_message
+    assert SERVICE_MAP_SECTION_HEADER not in assembled.system_prompt
+    assert "jellyfin" not in assembled.system_prompt
+    # The system prompt keeps its exact authority composition (global
+    # instructions + role + verbatim administrator prompt).
+    assert assembled.system_prompt.startswith(GLOBAL_INSTRUCTIONS)
+    assert PROMPT_A in assembled.system_prompt
