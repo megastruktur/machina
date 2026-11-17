@@ -48,21 +48,31 @@ from psycopg.rows import dict_row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.model_store import ModelConfigStore
+from mai.agents import session_runner as sr
 from mai.agents.session_runner import (
     HANDLER_NAME as SESSION_HANDLER_NAME,
+    SECRET_ROUTE_LATCHED_EVENT_TYPE,
+    SessionRunExecutor,
+    SessionRunIntent,
     SessionStageError,
     asubmit_session_control,
     parse_session_run_intent,
 )
+from mai.agents.session_runner import SessionSourceKind
 from mai.contracts.jobs import parse_job_event
 from mai.contracts.server import SCHEMA_VERSION as SERVER_SCHEMA_VERSION
 from mai.agents.models import SCHEMA_VERSION as MODEL_SCHEMA_VERSION
+from mai.credentials.env import EnvResolver
 from mai.database import create_app_engine
 from mai.jobs import engine, steps
 from mai.jobs.engine import EngineClient
+from mai.jobs.resource_locks import ResourceLockService
+from mai.plugins.registry import CapabilityRegistry
 from mai.policy.approvals import ApprovalStore
-from mai.policy.evaluate import ExecutionContext, PolicyMode
+from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
 from mai.session_store import acreate_session
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 
 # Reuse the PROVEN harness pieces (BRIEF_D04 mandate): the persistent test
 # loop, the kill -9 / stop protocol, the wait helper and the journal
@@ -512,6 +522,34 @@ def _script_model():
     def _model_fn(messages, info):
         _mark("model_call")
         _mark(f"history_len:{len(messages)}")
+        # ask_03-runtime-policy seam: capture the CURRENT request's
+        # instructions (the composed operating policy) and prove the
+        # history carries exactly ONE instructions-bearing request and
+        # zero system-prompt parts (per-request injection, no duplicates).
+        req_instructions = (
+            str(getattr(messages[-1], "instructions", "") or "")
+            if messages
+            else ""
+        )
+        _mark(f"has_instructions:{bool(req_instructions)}")
+        _mark(f"policy_latched:{'Secret routing status: ACTIVE' in req_instructions}")
+        _mark(f"policy_role_root:{'Run role: ROOT run' in req_instructions}")
+        _mark(f"policy_role_child:{'DELEGATED CHILD run' in req_instructions}")
+        _mark(f"policy_rules_global:{'Binding rules:' in req_instructions}")
+        _mark(
+            f"policy_service_knowledge:{'app.resolve_service' in req_instructions}"
+        )
+        _mark(
+            f"policy_secret_routing:{'secret-only credential routing' in req_instructions}"
+        )
+        _mark(
+            "instructions_messages:"
+            f"{sum(1 for m in messages if str(getattr(m, 'instructions', '') or ''))}"
+        )
+        _mark(
+            "system_parts:"
+            f"{sum(1 for m in messages for p in getattr(m, 'parts', []) if getattr(p, 'part_kind', '') == 'system-prompt')}"
+        )
         kinds = []
         for message in messages:
             for part in getattr(message, "parts", []):
@@ -566,6 +604,11 @@ def _build():
     registry = CapabilityRegistry()
     registry.register(_descriptor("fixture.read", "read"))
     registry.register(_descriptor("fixture.priv", "privileged"))
+    # ask_03-runtime-policy: registered so a scenario granting it in
+    # context.allowed_capabilities exposes the secret.* tool surface;
+    # exposure follows context ∩ registry, so scenarios that never allow
+    # it are unaffected.
+    registry.register(_descriptor("secret.get", "read"))
     dispatcher = CapabilityDispatcher(
         registry=registry,
         approvals=ApprovalStore(sessions),
@@ -3285,3 +3328,386 @@ def test_bridge_outcome_oversized_output_bounded_with_marker_s2() -> None:
     assert denied_entry.error_detail is not None
     assert len(denied_entry.error_detail) == MAX_ERROR_DETAIL_CHARS
     assert long_detail not in denied_entry.error_detail
+
+
+# ---------------------------------------------------------------------------
+# ask_03-runtime-policy: the operating policy on EVERY production model
+# round (root + child), and the durable one-way secret-route latch.
+# In-process seams drive the REAL _round_model/_resolve_run_secret_route_
+# latch code against the real fixture DB; worker scenarios prove the
+# same contract through the real DBOS worker path.
+# ---------------------------------------------------------------------------
+
+SECRET_CAP = "secret.get"
+
+_INPROC_PINS = {"connection": "gateway", "profile": "fast"}
+
+
+def _inproc_descriptor(capability_id: str, effect_class: str):
+    from mai.plugins.registry import parse_descriptor
+
+    return parse_descriptor(
+        {
+            "identifier": capability_id,
+            "version": "1.0.0",
+            "config_schema": None,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["marker"],
+                "properties": {"marker": {"type": "string", "minLength": 1}},
+            },
+            "output_schema": {
+                "type": "object",
+                "required": ["status", "exit_code", "stdout", "stderr"],
+                "properties": {
+                    "status": {"type": "string"},
+                    "exit_code": {"type": ["integer", "null"]},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
+                },
+            },
+            "execution_environments": ["linux_ssh"],
+            "effect_class": effect_class,
+            "resource_scope": [] if effect_class == "read" else ["target.exec"],
+            "required_grants": [],
+        },
+        source=f"<{capability_id} descriptor>",
+    )
+
+
+def _inproc_executor(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    scenario: pathlib.Path,
+    roots: dict[str, pathlib.Path],
+    *,
+    allowed: tuple[str, ...],
+    captured: list[list[object]],
+) -> SessionRunExecutor:
+    """A REAL SessionRunExecutor over the fixture DB + scenario roots,
+    with a FunctionModel that captures every model request it sees."""
+    from mai.capabilities.dispatch import CapabilityDispatcher
+    from mai.plugins.registry import CapabilityRegistry as Registry
+    from mai.policy.evaluate import Policy as EvalPolicy
+
+    registry = Registry()
+    for capability_id in allowed:
+        registry.register(_inproc_descriptor(capability_id, "read"))
+    grants = {
+        capability_id: frozenset({uuid.UUID(SERVER_ID)})
+        for capability_id in allowed
+    }
+
+    def _capture_model_fn(messages, info):
+        captured.append(list(messages))
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    env_path = str(scenario / "fixture.env")
+    return SessionRunExecutor(
+        sessions=factory,
+        dispatcher=CapabilityDispatcher(
+            registry=registry,
+            approvals=ApprovalStore(factory),
+            grants=lambda: grants,
+            policy=lambda: EvalPolicy(
+                revision=1, denied_capabilities=frozenset()
+            ),
+            adopted=lambda server_id: True,
+            credentials=lambda: EnvResolver(env_path),
+            executor=lambda call: None,
+        ),
+        registry=registry,
+        model_store=ModelConfigStore(roots["model_root"]),
+        data_root=roots["data_root"],
+        locks=ResourceLockService(agent_url),
+        resolver=EnvResolver(env_path),
+        model_builder=lambda **kwargs: FunctionModel(_capture_model_fn),
+    )
+
+
+def _inproc_intent(
+    run_id: str,
+    session_id: str,
+    *,
+    allowed: tuple[str, ...],
+    parent_run_id: str | None = None,
+) -> SessionRunIntent:
+    from mai.policy.evaluate import ExecutionContext as ExecContext
+
+    context = ExecContext(
+        principal="hash:fixture-principal",
+        server_id=uuid.UUID(SERVER_ID),
+        run_id=uuid.UUID(run_id),
+        parent_scope=None,
+        profile_revision="profile-1",
+        prompt_revision="prompt-1",
+        credential_references=(),
+        allowed_capabilities=allowed,
+        mode=PolicyMode("delegated"),
+    )
+    return SessionRunIntent(
+        payload_version=1,
+        session_id=session_id,
+        run_id=run_id,
+        server_id=SERVER_ID,
+        client_request_id=str(uuid.uuid4()),
+        context=context,
+        prompt="Run the fixture task and report the marker outcome.",
+        parent_run_id=parent_run_id,
+        source=SessionSourceKind.API,
+        connection="gateway",
+        profile="fast",
+        max_rounds=4,
+        approval_wait_seconds=30.0,
+        reconcile_wait_seconds=5.0,
+        wait_poll_seconds=0.5,
+        document_ref=None,
+        runbook_ref=None,
+    )
+
+
+def _read_latch_events(url: str, run_id: str) -> list[dict]:
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT seq, type, data FROM job_events "
+            "WHERE run_id = %s AND type = %s ORDER BY seq",
+            (uuid.UUID(run_id), SECRET_ROUTE_LATCHED_EVENT_TYPE),
+        ).fetchall()
+    for row in rows:
+        if isinstance(row["data"], str):
+            row["data"] = json.loads(row["data"])
+    return rows
+
+
+def test_round_model_injects_policy_once_on_root_and_child(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """Round seam (D1): every production model round — root AND delegated
+    child — carries exactly ONE composed operating-policy instruction on
+    the current request; history never duplicates it and no system-prompt
+    part appears."""
+    roots = composition()
+    captured: list[list[object]] = []
+    executor = _inproc_executor(
+        agent_url, factory, scenario, roots, allowed=(READ_CAP,), captured=captured
+    )
+    session_id = _run(_make_session(factory))
+    root_run = str(uuid.uuid4())
+    _run(insert_run(root_run))
+    root_intent = _inproc_intent(root_run, session_id, allowed=(READ_CAP,))
+    _run(sr._ensure_run_row(executor, root_intent))
+    _run(sr._append_user_turn(executor, root_intent))
+
+    record = _run(sr._round_model(executor, root_intent, _INPROC_PINS, 0))
+    assert record["status"] == "final"
+    assert len(captured) == 1
+    messages = captured[-1]
+    instructions = str(getattr(messages[-1], "instructions", "") or "")
+    assert instructions.startswith("Run role: ROOT run.")
+    assert (
+        "You are MAI, a supervised server-administration agent." in instructions
+    )
+    assert "Binding rules:" in instructions
+    assert "app.resolve_service" in instructions
+    assert "secret-only credential routing" in instructions
+    assert "Run role: ROOT run" in instructions
+    assert "DELEGATED CHILD" not in instructions
+    # The bounded administrator server prompt rides as a subordinate input.
+    assert "fixture prompt" in instructions
+    # Exactly ONE instructions-bearing request; zero system-prompt parts.
+    assert sum(1 for m in messages if str(getattr(m, "instructions", "") or "")) == 1
+    assert not [
+        part
+        for m in messages
+        for part in getattr(m, "parts", [])
+        if getattr(part, "part_kind", "") == "system-prompt"
+    ]
+
+    # The delegated child surface composes the CHILD role of the same policy.
+    child_run = str(uuid.uuid4())
+    _run(insert_run(child_run))
+    child_intent = _inproc_intent(
+        child_run, session_id, allowed=(READ_CAP,), parent_run_id=root_run
+    )
+    _run(sr._ensure_run_row(executor, child_intent))
+    _run(sr._append_user_turn(executor, child_intent))
+    _run(sr._round_model(executor, child_intent, _INPROC_PINS, 0))
+    child_instructions = str(getattr(captured[-1][-1], "instructions", "") or "")
+    assert "Run role: DELEGATED CHILD run" in child_instructions
+    assert "Run role: ROOT run" not in child_instructions
+    assert "Binding rules:" in child_instructions
+    assert "app.resolve_service" in child_instructions
+
+
+def test_secret_route_latch_is_durable_and_idempotent_per_run(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """D6/C6 seam: first secret.* exposure latches the run durably (one
+    ``agent.secret_route_latched`` event); later rounds keep the latch
+    even with NO current secret exposure; a fresh unexposed run never
+    latches; a missing facade row degrades to the round-local computation
+    without failing."""
+    roots = composition()
+    captured: list[list[object]] = []
+    allowed = (READ_CAP, SECRET_CAP)
+    executor = _inproc_executor(
+        agent_url, factory, scenario, roots, allowed=allowed, captured=captured
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    _run(insert_run(run_id, requested_grants=allowed))
+    intent = _inproc_intent(run_id, session_id, allowed=allowed)
+    _run(sr._ensure_run_row(executor, intent))
+    _run(sr._append_user_turn(executor, intent))
+
+    _run(sr._round_model(executor, intent, _INPROC_PINS, 0))
+    instructions = str(getattr(captured[-1][-1], "instructions", "") or "")
+    assert "Secret routing status: ACTIVE" in instructions
+    events = _read_latch_events(agent_url, run_id)
+    assert len(events) == 1
+    assert events[0]["data"] == {"policy_version": 1}
+
+    # Exposure later disappears (revocation / recovery / replay): the
+    # durable row still binds the run — and no duplicate event lands.
+    assert _run(sr._resolve_run_secret_route_latch(executor, intent, ())) is True
+    assert len(_read_latch_events(agent_url, run_id)) == 1
+
+    # A fresh run with NO secret exposure never latches and never writes.
+    fresh_run = str(uuid.uuid4())
+    _run(insert_run(fresh_run))
+    fresh_intent = _inproc_intent(fresh_run, session_id, allowed=(READ_CAP,))
+    assert (
+        _run(sr._resolve_run_secret_route_latch(executor, fresh_intent, (READ_CAP,)))
+        is False
+    )
+    assert _read_latch_events(agent_url, fresh_run) == []
+
+    # Missing facade row (mid-run facade-drop seam): degrade honestly to
+    # the round-local latch instead of failing the round; nothing persists.
+    ghost_intent = _inproc_intent(str(uuid.uuid4()), session_id, allowed=allowed)
+    assert (
+        _run(sr._resolve_run_secret_route_latch(executor, ghost_intent, allowed))
+        is True
+    )
+    assert _read_latch_events(agent_url, ghost_intent.run_id) == []
+
+
+def test_every_worker_round_receives_one_policy_block(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """Worker seam: rounds 0 and 1 (after a real tool call) BOTH receive
+    exactly one operating-policy instruction block through the REAL
+    worker path."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [
+            _tool_call_entry(name="fixture_read", marker="m1", call_id="c1"),
+            {"text": "all done"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-pol")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "policy run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    lines = _journal_lines(scenario)
+    assert lines.count("model_call") == 2, lines
+    for mark in (
+        "has_instructions:True",
+        "instructions_messages:1",
+        "system_parts:0",
+        "policy_rules_global:True",
+        "policy_service_knowledge:True",
+        "policy_secret_routing:True",
+        "policy_role_root:True",
+        "policy_role_child:False",
+        "policy_latched:False",
+    ):
+        assert lines.count(mark) == 2, (mark, lines)
+
+
+def test_secret_exposure_latches_route_for_the_whole_run(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    """Worker seam (D6/C6): a granted secret.get surface latches the run
+    in round 0; round 1 (after the real tool call) still receives the
+    latched policy, and exactly ONE durable latch event exists."""
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True, SECRET_CAP: True}])
+    _script(
+        scenario,
+        [
+            _tool_call_entry(name="secret_get", marker="m1", call_id="c1"),
+            {"text": "secret handled via references only"},
+        ],
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w-latch")
+        _run(insert_run(run_id, requested_grants=(READ_CAP, SECRET_CAP)))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id,
+                    session_id,
+                    allowed=(READ_CAP, SECRET_CAP),
+                    client_request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "latch run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    lines = _journal_lines(scenario)
+    assert lines.count("model_call") == 2, lines
+    assert lines.count("has_instructions:True") == 2, lines
+    assert lines.count("policy_latched:True") == 2, lines
+    assert lines.count("policy_secret_routing:True") == 2, lines
+    assert "saw_tool_call:c1" in lines, lines
+    assert "saw_tool_return" in lines, lines
+    # The latch persisted exactly once for the run.
+    assert len(_read_latch_events(agent_url, run_id)) == 1

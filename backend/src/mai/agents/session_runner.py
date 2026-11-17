@@ -43,11 +43,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -61,6 +64,17 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mai.agents.budgets import BudgetError
+from mai.agents.context import PROMPT_FILENAME
+# The ONE versioned core operating-policy source (D1/C2); the session
+# runner composes it for every production model round (D1) and drives the
+# durable one-way secret-only latch (D6/C6) from real capability exposure.
+from mai.agents.operating_policy import (
+    MAX_ADMIN_INSTRUCTIONS_CHARS,
+    OPERATING_POLICY_VERSION,
+    OperatingPolicyInput,
+    build_operating_policy,
+    is_secret_route_latched,
+)
 from mai.agents.output_safety import project_text
 from mai.agents.session_compaction import acompact_session_head
 from mai.agents.session_delegate import (
@@ -113,6 +127,7 @@ from mai.jobs.steps import (
     StepIntent,
     StepState,
     StepsError,
+    StepsErrorCode,
 )
 from mai.policy.evaluate import ExecutionContext, execution_context_from_json
 
@@ -124,6 +139,7 @@ __all__ = [
     "HANDLER_NAME",
     "MAX_MAX_ROUNDS",
     "RUN_PAYLOAD_VERSION_SESSION",
+    "SECRET_ROUTE_LATCHED_EVENT_TYPE",
     "SessionRunError",
     "SessionRunExecutor",
     "SessionRunFailed",
@@ -161,6 +177,12 @@ MAX_TOOL_CALLS_PER_ROUND: Final[int] = 16
 
 #: Tool calls per RUN budget (facade parity: the bounded tool budget).
 MAX_TOOL_CALLS_PER_RUN: Final[int] = 64
+
+#: The D6/C6 one-way secret-only routing latch rides the run's durable
+#: ``job_events`` stream under this producer-owned type: once any
+#: ``secret.*`` capability was exposed on ANY round, the latch binds the
+#: run for its whole lifetime (revocation, recovery and replay included).
+SECRET_ROUTE_LATCHED_EVENT_TYPE: Final[str] = "agent.secret_route_latched"
 
 #: Steering note bound (the D01 control-note bound).
 _STEER_NOTE_MAX: Final[int] = 500
@@ -1017,6 +1039,105 @@ async def _drain_controls(
     return notes, stop
 
 
+def _load_admin_server_instructions(
+    executor: SessionRunExecutor, intent: SessionRunIntent
+) -> str | None:
+    """The bounded optional administrator server prompt (D1 input).
+
+    The canonical ``servers/<server_id>/prompt.md`` namespace is admin
+    authority in the assembly surface; here it is an OPTIONAL bounded
+    customization input below the core rules. Missing, empty, symlinked,
+    non-regular, unreadable or undecodable files degrade to omission; an
+    oversized file truncates at ``MAX_ADMIN_INSTRUCTIONS_CHARS``. This
+    seam can NEVER crash or fail a model round.
+    """
+    data_root = executor._data_root  # noqa: SLF001 - composed seam
+    if data_root is None:
+        return None
+    path = (
+        Path(data_root)
+        / "servers"
+        / str(uuid.UUID(intent.server_id))
+        / PROMPT_FILENAME
+    )
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks: list[bytes] = []
+        remaining = MAX_ADMIN_INSTRUCTIONS_CHARS + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    stripped = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    if not stripped:
+        return None
+    return stripped[:MAX_ADMIN_INSTRUCTIONS_CHARS]
+
+
+async def _read_run_secret_route_latch(
+    executor: SessionRunExecutor, run_id: str
+) -> bool:
+    """Read the run's durable one-way secret-routing latch (D6/C6).
+
+    One bounded existence probe on the run's ``job_events`` stream: any
+    ``agent.secret_route_latched`` event binds the run, whatever the
+    current round exposes.
+    """
+    async with executor.sessions() as session:
+        found = (
+            await session.execute(
+                sql_text(
+                    "SELECT 1 FROM job_events "
+                    "WHERE run_id = :r AND type = :t LIMIT 1"
+                ),
+                {"r": uuid.UUID(run_id), "t": SECRET_ROUTE_LATCHED_EVENT_TYPE},
+            )
+        ).scalar()
+    return found is not None
+
+
+async def _resolve_run_secret_route_latch(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    current_capabilities: Iterable[str],
+) -> bool:
+    """Resolve the run's one-way secret-only routing latch (D6/C6).
+
+    Latched when this run was already latched durably, or when the
+    current round exposes any ``secret.*`` capability. The FIRST latched
+    round records the event idempotently (the durable row then outlives
+    any later exposure change). A missing facade row (the mid-run
+    facade-drop test seam) degrades to the round-local computation
+    instead of failing the round.
+    """
+    prior_latched = await _read_run_secret_route_latch(executor, intent.run_id)
+    latched = is_secret_route_latched(
+        current_capabilities, prior_secret_route_latched=prior_latched
+    )
+    if latched and not prior_latched:
+        try:
+            await executor.steps.aemit_run_event(
+                intent.run_id,
+                SECRET_ROUTE_LATCHED_EVENT_TYPE,
+                {"policy_version": OPERATING_POLICY_VERSION},
+            )
+        except StepsError as error:
+            if error.code is not StepsErrorCode.RUN_NOT_FOUND:
+                raise
+    return latched
+
+
 async def _round_model(
     executor: SessionRunExecutor,
     intent: SessionRunIntent,
@@ -1045,6 +1166,25 @@ async def _round_model(
     )
     bridge = executor.bridge_of(intent.context)
     resolved_model = executor.build_model_for(pins)
+    # D1: the versioned operating policy rides EVERY production model
+    # round (root, child, replay/recovery, post-compaction) as per-request
+    # instructions; the D6/C6 one-way latch state comes from the durable
+    # run stream plus this round's real exposure.
+    capabilities = tuple(bridge.enabled_capabilities)
+    secret_route_latched = await _resolve_run_secret_route_latch(
+        executor, intent, capabilities
+    )
+    policy = build_operating_policy(
+        OperatingPolicyInput(
+            is_child_run=bool(intent.parent_run_id),
+            server_id=uuid.UUID(intent.server_id),
+            exposed_capabilities=capabilities,
+            secret_route_latched=secret_route_latched,
+            admin_server_instructions=_load_admin_server_instructions(
+                executor, intent
+            ),
+        )
+    )
 
     def _deferring(tool: PydanticTool) -> PydanticTool:
         # The reviewed deferral wrapper (run.py pattern): the tool SURFACE
@@ -1064,6 +1204,7 @@ async def _round_model(
 
     agent: Agent[None, Any] = Agent(
         model=resolved_model,
+        instructions=policy.text,
         tools=(
             # Depth-1 delegation (D05): the delegate tool exists ONLY on a
             # root surface; a child surface never offers it.
