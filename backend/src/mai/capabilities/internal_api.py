@@ -51,6 +51,7 @@ from typing import (
     Final,
     Literal,
     Mapping,
+    NoReturn,
     Protocol,
     Sequence,
     Union,
@@ -1558,7 +1559,9 @@ def build_internal_api_capabilities(
     ``app.get_service_knowledge``, ``app.get_learning_status``,
     ``app.learn_service``) joins the same contract: the descriptors and
     executors are ALWAYS registered, but absent knowledge dependencies
-    answer ``{"status": "unavailable", ...}`` at call time. The read store
+    answer the structured ``InternalApiError("unavailable")`` refusal at
+    call time (the sibling discipline; the jobs lane resolves it to
+    FAILED, never ``status_unresolved``). The read store
     derives from ``session_factory`` when ``knowledge_read`` is omitted;
     the learn admission is available only when BOTH the operation store
     and the ``learn_engine_enqueue`` seam are composed (fail-closed, never
@@ -3376,15 +3379,16 @@ def build_internal_api_capabilities(
             str(envelope.get("message", "service knowledge capability refused")),
         )
 
-    def _unavailable_document(message: str) -> Mapping[str, Any]:
-        """Returned (NOT raised): the uniform executor merges the
-        operation document over its ok wrapper, so the envelope answers
-        ``{"status": "unavailable", ...}`` verbatim."""
-        return {
-            "status": "unavailable",
-            "code": "unavailable",
-            "message": message,
-        }
+    def _unavailable(message: str) -> NoReturn:
+        """Raise the SAME structured unavailable refusal every sibling
+        writer in this module uses (``InternalApiError("unavailable")``
+        → ``{"status": "refused", "code": "unavailable", ...}``,
+        ``ExecutorResult.ok=False``). The jobs step lane resolves that
+        to ``StepState.FAILED`` — a RETURNED ``{"status": "unavailable"}``
+        document would land ``ok=True`` + a non-``CommandStatus`` status
+        string and resolve to ``status_unresolved``, violating outcome
+        translation contract 2 of this module."""
+        raise InternalApiError("unavailable", message)
 
     @internal_api_tool(
         capability_id=RESOLVE_SERVICE_CAPABILITY_ID,
@@ -3403,9 +3407,7 @@ def build_internal_api_capabilities(
         call: CapabilityCall, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         if resolve_capability is None:
-            return _unavailable_document(
-                "service knowledge read service is unavailable"
-            )
+            _unavailable("service knowledge read service is unavailable")
         return _knowledge_envelope(await resolve_capability(call))
 
     @internal_api_tool(
@@ -3425,9 +3427,7 @@ def build_internal_api_capabilities(
         call: CapabilityCall, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         if knowledge_capability is None:
-            return _unavailable_document(
-                "service knowledge read service is unavailable"
-            )
+            _unavailable("service knowledge read service is unavailable")
         return _knowledge_envelope(await knowledge_capability(call))
 
     @internal_api_tool(
@@ -3447,9 +3447,7 @@ def build_internal_api_capabilities(
         call: CapabilityCall, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         if learning_status_capability is None:
-            return _unavailable_document(
-                "service knowledge read service is unavailable"
-            )
+            _unavailable("service knowledge read service is unavailable")
         return _knowledge_envelope(await learning_status_capability(call))
 
     @internal_api_tool(
@@ -3469,9 +3467,7 @@ def build_internal_api_capabilities(
         call: CapabilityCall, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         if learn_capability is None:
-            return _unavailable_document(
-                "learning admission service is unavailable"
-            )
+            _unavailable("learning admission service is unavailable")
         return _knowledge_envelope(await learn_capability(call))
 
     operations.extend(
