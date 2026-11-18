@@ -258,7 +258,10 @@ class LearningOperationStore:
         id replay (identical digest replays the stored receipt; a queued
         row retries the enqueue; a divergent digest is a typed
         ``payload_conflict`` and the stored row is untouched) -> duplicate
-        coalescing BEFORE the budget -> atomic per-run budget ->
+        coalescing BEFORE the budget (a coalesced duplicate of a QUEUED
+        unacknowledged operation reconciles that same deterministic
+        workflow and reports ``coalesced=True, replayed=False``) ->
+        atomic per-run budget ->
         INSERT the ``queued`` receipt and COMMIT -> await the engine
         enqueue seam -> promote to ``accepted`` ONLY on acknowledgment.
         Actor, grants and timestamps never come from the payload: the
@@ -270,8 +273,11 @@ class LearningOperationStore:
         workflow_id = _workflow_id(operation_id)
         coalesce_key = _coalesce_key(trusted.server_id, application_id, request)
 
-        replay_row: Mapping[str, object] | None = None
         settled: AdmitOperationResult | None = None
+        retry_operation_id: uuid.UUID | None = None
+        retry_workflow_id: str | None = None
+        retry_queued = False
+        coalesced_queued = False
         budget = 0
 
         async with self._sessions() as session:
@@ -313,7 +319,9 @@ class LearningOperationStore:
                     if str(existing["status"]) == "queued":
                         # Admitted but never acknowledged: reconciliation
                         # through the SAME deterministic workflow id.
-                        replay_row = existing
+                        retry_queued = True
+                        retry_operation_id = uuid.UUID(str(existing["operation_id"]))
+                        retry_workflow_id = str(existing["workflow_id"])
                     else:
                         settled = AdmitOperationResult(
                             receipt=_row_to_receipt(existing),
@@ -347,13 +355,25 @@ class LearningOperationStore:
                         )
                     ).mappings().first()
                     if coalesced is not None:
-                        settled = AdmitOperationResult(
-                            receipt=_row_to_receipt(coalesced),
-                            replayed=False,
-                            coalesced=True,
-                            budget_used=budget,
-                            budget_limit=MAX_PRESERVATION_OPERATIONS_PER_RUN,
-                        )
+                        if str(coalesced["status"]) == "queued":
+                            # A duplicate observation of an UNACKNOWLEDGED
+                            # operation reconciles the SAME deterministic
+                            # workflow and is reported honestly as
+                            # coalesced (never as a replay).
+                            retry_queued = True
+                            coalesced_queued = True
+                            retry_operation_id = uuid.UUID(
+                                str(coalesced["operation_id"])
+                            )
+                            retry_workflow_id = str(coalesced["workflow_id"])
+                        else:
+                            settled = AdmitOperationResult(
+                                receipt=_row_to_receipt(coalesced),
+                                replayed=False,
+                                coalesced=True,
+                                budget_used=budget,
+                                budget_limit=MAX_PRESERVATION_OPERATIONS_PER_RUN,
+                            )
                     else:
                         # Coalescing happened BEFORE the budget: a
                         # duplicate never wastes a budget slot.
@@ -403,13 +423,19 @@ class LearningOperationStore:
 
         # C5: the durable request row is COMMITTED ('queued') before the
         # enqueue; the accepted claim happens only after acknowledgment.
+        # A queued replay/coalesce retry targets the FIRST row's
+        # deterministic workflow, never a fresh identity.
+        target_workflow = retry_workflow_id if retry_queued else workflow_id
+        promoted_operation_id = (
+            retry_operation_id if retry_queued else operation_id
+        )
         try:
-            await engine_enqueue(workflow_id)
+            await engine_enqueue(target_workflow)
         except Exception as exc:
             raise OperationAdmissionError(
                 "enqueue_failed",
                 f"the engine did not acknowledge the enqueue of workflow "
-                f"{workflow_id}; the row stays queued for recovery",
+                f"{target_workflow}; the row stays queued for recovery",
             ) from exc
 
         async with self._sessions() as session:
@@ -422,7 +448,7 @@ class LearningOperationStore:
                             f"operation_id = :o AND status = 'queued' "
                             f"RETURNING {_RECEIPT_COLUMNS}"
                         ),
-                        {"o": operation_id},
+                        {"o": promoted_operation_id},
                     )
                 ).mappings().first()
                 if updated is None:
@@ -435,13 +461,13 @@ class LearningOperationStore:
                                 "service_learning_operation WHERE "
                                 "operation_id = :o"
                             ),
-                            {"o": operation_id},
+                            {"o": promoted_operation_id},
                         )
                     ).mappings().one()
         result = AdmitOperationResult(
             receipt=_row_to_receipt(updated),
-            replayed=replay_row is not None,
-            coalesced=False,
+            replayed=retry_queued and not coalesced_queued,
+            coalesced=coalesced_queued,
             budget_used=budget,
             budget_limit=MAX_PRESERVATION_OPERATIONS_PER_RUN,
         )

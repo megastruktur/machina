@@ -448,6 +448,22 @@ def test_coalesce_before_budget_divergent_is_new_op(
     assert divergent.budget_used == 2
     assert _op_count(migrated_url) == 2
 
+    # A later observation identical to the DIVERGENT second payload
+    # coalesces onto THAT row (the digest filter in the coalescing
+    # lookup must match the newest identical payload, not the oldest
+    # row under the coalesce key).
+    onto_divergent = _admit(
+        factory,
+        trusted=_trusted(SERVER_A, tool_call_id="call-4", run_id=run_id),
+        request=_request([_delta("deploy.port", "8080 without tls")]),
+        engine=_RecordingEngine(),
+    )
+    assert onto_divergent.coalesced is True
+    assert onto_divergent.replayed is False
+    assert onto_divergent.receipt.operation_id == divergent.receipt.operation_id
+    assert onto_divergent.budget_used == 2  # no duplicate slot burned
+    assert _op_count(migrated_url) == 2
+
 
 # ---------------------------------------------------------------------------
 # 5. atomic 16-op per-run budget under concurrent admissions
@@ -533,6 +549,41 @@ def test_no_accepted_before_enqueue_ack_and_recovery(
 
     after = _run(store.list_pending_recovery())
     assert after.total == 0
+
+    # A duplicate observation under a DIFFERENT tool call id of the
+    # unacknowledged row reconciles the SAME queued workflow: it retries
+    # the enqueue, promotes the first row, and reports honestly as
+    # coalesced (replayed=False) — never as a fresh operation.
+    flaky_run = uuid.uuid4()
+    flaky_request = _request([_delta("flaky.k1", "statement flaky")])
+    flaky_queued_operation = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{flaky_run}:call-flaky-a"
+    )
+    with pytest.raises(OperationAdmissionError) as flaky_err:
+        _admit(
+            factory,
+            trusted=_trusted(SERVER_A, tool_call_id="call-flaky-a", run_id=flaky_run),
+            request=flaky_request,
+            engine=_RecordingEngine(fail=True),
+        )
+    assert flaky_err.value.code == "enqueue_failed"
+
+    duplicate_engine = _RecordingEngine()
+    recovered_coalesce = _admit(
+        factory,
+        trusted=_trusted(SERVER_A, tool_call_id="call-flaky-b", run_id=flaky_run),
+        request=_request([_delta("flaky.k1", "statement flaky")]),
+        engine=duplicate_engine,
+    )
+    assert recovered_coalesce.coalesced is True
+    assert recovered_coalesce.replayed is False
+    assert recovered_coalesce.receipt.operation_id == flaky_queued_operation
+    assert recovered_coalesce.receipt.status is OperationStatus.ACCEPTED
+    assert duplicate_engine.calls == [
+        f"service.learn:{flaky_queued_operation}"
+    ]  # the QUEUED row's deterministic workflow, not a fresh one
+    assert _op_count(migrated_url, "status = 'accepted'") == 2  # + first recovery
+    assert _op_count(migrated_url) == 2  # one row per run, never a second op
 
 
 # ---------------------------------------------------------------------------
