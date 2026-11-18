@@ -61,11 +61,16 @@ from mai.applications.knowledge_contracts import (
     OperationStatus,
     ScopeMismatchError,
 )
+from mai.api.auth import ErrorEnvelope
+from mai.applications.knowledge_contracts import OperationReceipt
+from mai.applications.knowledge_contracts import OperationPage
 from mai.applications.knowledge_read import (
+    FactRevisionPage,
+    KnowledgeRead,
     KnowledgeReadStore,
     ServiceKnowledgeNotFoundError,
 )
-from mai.applications.knowledge_write import KnowledgeWriteStore
+from mai.applications.knowledge_write import KnowledgeWriteStore, RetractionResult
 from mai.applications.learning_operations import (
     LearningOperationStore,
     OperationAdmissionError,
@@ -206,6 +211,33 @@ async def _ensure_scope(
 
 
 # ---------------------------------------------------------------------------
+# C01 error response documentation (the boundary handlers render these)
+# ---------------------------------------------------------------------------
+
+_UNAUTHENTICATED = {
+    "model": ErrorEnvelope,
+    "description": "No valid session",
+}
+_FORBIDDEN = {
+    "model": ErrorEnvelope,
+    "description": "Origin not allowlisted or CSRF token mismatch",
+}
+_NOT_FOUND = {"model": ErrorEnvelope, "description": "Unknown scope or identity"}
+_CONFLICT = {"model": ErrorEnvelope, "description": "Stale CAS or refused transition"}
+_UNAVAILABLE = {
+    "model": ErrorEnvelope,
+    "description": "A composed dependency is absent or the enqueue failed",
+}
+_READ_ERRORS = {401: _UNAUTHENTICATED, 404: _NOT_FOUND, 503: _UNAVAILABLE}
+_MUTATION_ERRORS = {
+    401: _UNAUTHENTICATED,
+    403: _FORBIDDEN,
+    404: _NOT_FOUND,
+    409: _CONFLICT,
+    503: _UNAVAILABLE,
+}
+
+# ---------------------------------------------------------------------------
 # payload models
 # ---------------------------------------------------------------------------
 
@@ -233,7 +265,11 @@ class RetractBody(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.get("")
+@router.get(
+    "",
+    response_model=KnowledgeRead,
+    responses={**_READ_ERRORS, 409: _CONFLICT},
+)
 async def read_knowledge(
     request: Request,
     server_id: uuid.UUID,
@@ -267,7 +303,11 @@ async def read_knowledge(
     return JSONResponse(content=read.model_dump(mode="json"))
 
 
-@router.get("/history")
+@router.get(
+    "/history",
+    response_model=FactRevisionPage,
+    responses=_READ_ERRORS,
+)
 async def read_fact_history(
     request: Request,
     server_id: uuid.UUID,
@@ -293,7 +333,11 @@ async def read_fact_history(
     return JSONResponse(content=page.model_dump(mode="json"))
 
 
-@router.get("/operations")
+@router.get(
+    "/operations",
+    response_model=OperationPage,
+    responses=_READ_ERRORS,
+)
 async def read_operations(
     request: Request,
     server_id: uuid.UUID,
@@ -319,7 +363,11 @@ async def read_operations(
     return JSONResponse(content=page.model_dump(mode="json"))
 
 
-@router.post("/facts/{fact_id}/retract")
+@router.post(
+    "/facts/{fact_id}/retract",
+    response_model=RetractionResult,
+    responses=_MUTATION_ERRORS,
+)
 async def retract_fact(
     request: Request,
     server_id: uuid.UUID,
@@ -374,7 +422,11 @@ async def retract_fact(
     return _conflict(request, code, message)
 
 
-@router.post("/operations/{operation_id}/retry")
+@router.post(
+    "/operations/{operation_id}/retry",
+    response_model=OperationReceipt,
+    responses=_MUTATION_ERRORS,
+)
 async def retry_operation(
     request: Request,
     server_id: uuid.UUID,
