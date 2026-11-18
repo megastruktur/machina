@@ -298,6 +298,23 @@ def test_proposed_delta_source_refs_and_bounds() -> None:
             source_kind=FactSourceKind.TOOL_RESULT,
             source_refs=["a"],
         )
+    # Each provenance reference shares the persisted 256-char ceiling.
+    exact_ref = ProposedFactDelta(
+        category="deployment",
+        key="health-path",
+        statement="s",
+        source_kind=FactSourceKind.TOOL_RESULT,
+        source_refs=["r" * 256],
+    )
+    assert len(exact_ref.source_refs[0]) == 256
+    with pytest.raises(ValidationError):
+        ProposedFactDelta(
+            category="deployment",
+            key="health-path",
+            statement="s",
+            source_kind=FactSourceKind.TOOL_RESULT,
+            source_refs=["r" * 257],
+        )
 
 
 def test_trusted_source_context_is_separate_from_payload() -> None:

@@ -43,6 +43,7 @@ __all__ = [
     "MAX_PAGE_LIMIT",
     "MAX_SERIALIZED_ENVELOPE_BYTES",
     "MAX_SOURCE_REFS_PER_FACT",
+    "MAX_SOURCE_REF_CHARS",
     "LearnRequest",
     "OperationPage",
     "OperationReceipt",
@@ -84,6 +85,10 @@ MAX_FACTS_PER_LEARN_REQUEST: Final[int] = 8
 
 #: Bounded provenance references per proposed fact.
 MAX_SOURCE_REFS_PER_FACT: Final[int] = 4
+
+#: Per-reference character ceiling (persisted provenance references and
+#: proposed source_refs entries share the same bound).
+MAX_SOURCE_REF_CHARS: Final[int] = 256
 
 #: The CapabilityDispatcher serialized-envelope cap: payloads must stay
 #: STRICTLY BELOW this byte count (equal is already overflow).
@@ -283,7 +288,7 @@ class FactSource(BaseModel):
     )
     source_ref: str = Field(
         min_length=1,
-        max_length=256,
+        max_length=MAX_SOURCE_REF_CHARS,
         description="Bounded persisted reference to the proving source artifact",
     )
     verified_at: datetime = Field(
@@ -517,6 +522,11 @@ class ProposedFactDelta(BaseModel):
         for ref in value:
             if not ref.strip():
                 raise ValueError("source_refs entries must be non-empty")
+            if len(ref) > MAX_SOURCE_REF_CHARS:
+                raise ValueError(
+                    f"source_refs entries must be at most "
+                    f"{MAX_SOURCE_REF_CHARS} characters"
+                )
         return value
 
 
