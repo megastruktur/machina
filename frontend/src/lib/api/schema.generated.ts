@@ -1514,6 +1514,115 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{server_id}/applications/{application_id}/knowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Knowledge
+         * @description The bounded current knowledge read (D2/D3): identity/revision
+         *     scalars, operator map state, catalog runbook and the ACTIVE
+         *     learned-fact page (``limit``/``offset`` paginated).
+         */
+        get: operations["read_knowledge_api_v1_servers__server_id__applications__application_id__knowledge_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/knowledge/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Fact History
+         * @description The paginated append-only fact revision history, newest change
+         *     first, optional ``fact_id`` filter.
+         */
+        get: operations["read_fact_history_api_v1_servers__server_id__applications__application_id__knowledge_history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/knowledge/operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Operations
+         * @description The paginated durable preservation-operation receipts of THIS
+         *     application, newest acceptance first, optional ``status`` filter.
+         */
+        get: operations["read_operations_api_v1_servers__server_id__applications__application_id__knowledge_operations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/knowledge/facts/{fact_id}/retract": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retract Fact
+         * @description Operator retraction by exact compare-and-set under the C4 lease
+         *     set (mutation order: session → allowed-origin → CSRF).
+         */
+        post: operations["retract_fact_api_v1_servers__server_id__applications__application_id__knowledge_facts__fact_id__retract_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{server_id}/applications/{application_id}/knowledge/operations/{operation_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Operation
+         * @description Explicit authorized retry of one unacknowledged (``queued``)
+         *     preservation operation through its SAME deterministic workflow id.
+         *     An unknown-effect outcome is refused (409); cancelled, superseded
+         *     and otherwise non-queued rows are refused (409); an unknown or
+         *     cross-scope identity answers 404.
+         */
+        post: operations["retry_operation_api_v1_servers__server_id__applications__application_id__knowledge_operations__operation_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plugins": {
         parameters: {
             query?: never;
@@ -4527,6 +4636,15 @@ export interface components {
             probe_environment: components["schemas"]["OnboardingIdentityView"];
         };
         /**
+         * OperationStatus
+         * @description Durable operation status progression (D5): accepted -> queued ->
+         *     applying -> applied | failed | partial | unknown. ``partial`` and
+         *     ``unknown`` are distinct states and are NEVER collapsed into each
+         *     other or into ``failed``.
+         * @enum {string}
+         */
+        OperationStatus: "accepted" | "queued" | "applying" | "applied" | "failed" | "partial" | "unknown";
+        /**
          * PasswordBody
          * @description Login/bootstrap payload; bounds mirror the store's input guard.
          */
@@ -5040,6 +5158,27 @@ export interface components {
             payload: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * RetractBody
+         * @description Operator retraction compare-and-set values (exact, stale-proof).
+         */
+        RetractBody: {
+            /**
+             * Expected Revision
+             * @description The fact revision the operator observed before retracting
+             */
+            expected_revision: number;
+            /**
+             * Expected Generation
+             * @description The knowledge generation the operator observed before retracting
+             */
+            expected_generation: number;
+            /**
+             * Reason
+             * @description Bounded value-free operator reason (not persisted)
+             */
+            reason?: string | null;
         };
         /**
          * RetrievalBody
@@ -10994,6 +11133,183 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    read_knowledge_api_v1_servers__server_id__applications__application_id__knowledge_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_fact_history_api_v1_servers__server_id__applications__application_id__knowledge_history_get: {
+        parameters: {
+            query?: {
+                fact_id?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_operations_api_v1_servers__server_id__applications__application_id__knowledge_operations_get: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["OperationStatus"] | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retract_fact_api_v1_servers__server_id__applications__application_id__knowledge_facts__fact_id__retract_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+                fact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetractBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_operation_api_v1_servers__server_id__applications__application_id__knowledge_operations__operation_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                application_id: string;
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
