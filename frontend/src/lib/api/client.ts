@@ -66,6 +66,108 @@ import type {
 	RetrievalResult
 } from '../workspace/entries/07-web-docs.js';
 import type { ApplicationsPageQuery } from '../workspace/entries/08-web-apps.js';
+
+// ask_29 (D7/C3): the scoped service-knowledge surface. Every type here
+// derives EXCLUSIVELY from ./schema.generated.ts (paths + components) —
+// the routes hand back plain JSONResponse documents, so the success
+// content type is the schema's own alias. No wire models are hand-written;
+// the bounded-page vocabulary is the shared PageQuery.
+type KnowledgeOperationName =
+	| 'read_knowledge_api_v1_servers__server_id__applications__application_id__knowledge_get'
+	| 'read_fact_history_api_v1_servers__server_id__applications__application_id__knowledge_history_get'
+	| 'read_operations_api_v1_servers__server_id__applications__application_id__knowledge_operations_get'
+	| 'retract_fact_api_v1_servers__server_id__applications__application_id__knowledge_facts__fact_id__retract_post'
+	| 'retry_operation_api_v1_servers__server_id__applications__application_id__knowledge_operations__operation_id__retry_post';
+
+/** Retraction CAS body — schema-derived (components.RetractBody). */
+type KnowledgeRetractBody = components['schemas']['RetractBody'];
+/** Operation status vocabulary — schema-derived (components.OperationStatus). */
+type KnowledgeOperationStatus = NonNullable<components['schemas']['OperationStatus']>;
+
+/**
+ * Narrow document views over the knowledge routes' bodies. The routes
+ * hand back plain JSONResponse documents, so the OpenAPI 200 content is
+ * `unknown` by construction — the same discipline as `HealthOk` above:
+ * these mirrors document the OBSERVED bodies, and everything
+ * constraint-bearing (the CAS body, the status vocabulary) stays
+ * schema-derived via `components`. The full document is the backend's;
+ * these carry the fields the D7 surface reads today.
+ */
+export interface KnowledgeFactRecord {
+	fact_id: string;
+	category: string;
+	key: string;
+	statement: string;
+	status: string;
+}
+export interface KnowledgeFactPageView {
+	items: KnowledgeFactRecord[];
+	limit: number;
+	offset: number;
+	total: number;
+	has_more: boolean;
+}
+export interface KnowledgeReadView {
+	status: 'ok';
+	server_id: string;
+	application_id: string;
+	generation: number;
+	service_revision: number;
+	knowledge_revision: number;
+	found_in_map: boolean;
+	auto_adopt_suppressed: boolean;
+	facts: KnowledgeFactPageView;
+}
+export interface FactHistoryDocument {
+	status: 'ok';
+	items: Array<{
+		revision_id: string;
+		fact_id: string;
+		revision: number;
+		statement: string;
+		status: string;
+		changed_at: string;
+	}>;
+	limit: number;
+	offset: number;
+	total: number;
+	has_more: boolean;
+}
+export interface KnowledgeOperationsDocument {
+	status: 'ok';
+	items: Array<{
+		operation_id: string;
+		status: string;
+		workflow_id: string;
+		accepted_at: string;
+	}>;
+	limit: number;
+	offset: number;
+	total: number;
+	has_more: boolean;
+}
+export interface RetractionResultView {
+	status: 'ok';
+	server_id: string;
+	application_id: string;
+	fact_id: string;
+	new_revision: number;
+}
+export interface RetryReceiptView {
+	status: 'ok';
+	accepted: boolean;
+	operation_id: string;
+	workflow_id: string;
+	receipt_status: string;
+	replayed: boolean;
+	coalesced: boolean;
+	poll_reference: string;
+}
+type KnowledgeReadResponse = KnowledgeReadView;
+type FactHistoryResponse = FactHistoryDocument;
+type KnowledgeOperationsResponse = KnowledgeOperationsDocument;
+type RetractionResponse = RetractionResultView;
+type RetryResponse = RetryReceiptView;
 import type {
 	CatalogPageQuery,
 	RunbookCatalogPage,
@@ -798,6 +900,15 @@ function pageSuffix(page?: { limit?: number; offset?: number }): string {
 	return query === '' ? '' : `&${query}`;
 }
 
+/** Scoped service-knowledge route prefix (ask_26/D7): the path
+ * identities are the ONLY target — never an ambient scope. */
+function knowledgeBase(serverId: string, applicationId: string): string {
+	return (
+		`/api/v1/servers/${encodeURIComponent(serverId)}` +
+		`/applications/${encodeURIComponent(applicationId)}/knowledge`
+	);
+}
+
 /** Renders the task-collection query (bounded page + the P3 history switch). */
 function taskQuerySuffix(query?: TaskCollectionQuery): string {
 	const params = new URLSearchParams();
@@ -1084,6 +1195,45 @@ export interface MaiApiClient {
 	ackNotification(serverId: string, alertId: string): Promise<AckResult>;
 	/** POST /api/v1/monitoring/servers/{id}/notifications/{alert_id}/unacknowledge. */
 	unacknowledgeServerNotification(serverId: string, alertId: string): Promise<AckResult>;
+	// Scoped service-knowledge surface (ask_29, D7/C3): reads are
+	// paginated collection methods; the operator writes are the exact
+	// CAS retraction and the explicit authorized retry. Types derive
+	// exclusively from ./schema.generated.ts.
+	/** GET …/knowledge — bounded current knowledge read (paginated). */
+	readKnowledge(
+		serverId: string,
+		applicationId: string,
+		page?: PageQuery
+	): Promise<KnowledgeReadResponse>;
+	/** GET …/knowledge/history — paginated fact revision history. */
+	readFactHistory(
+		serverId: string,
+		applicationId: string,
+		factId?: string,
+		page?: PageQuery
+	): Promise<FactHistoryResponse>;
+	/** GET …/knowledge/operations — paginated preservation receipts. */
+	readKnowledgeOperations(
+		serverId: string,
+		applicationId: string,
+		status?: KnowledgeOperationStatus,
+		page?: PageQuery
+	): Promise<KnowledgeOperationsResponse>;
+	/** POST …/knowledge/facts/{fact_id}/retract — operator CAS retraction
+	 * (session + allowed-origin + CSRF; stale CAS answers 409). */
+	retractKnowledgeFact(
+		serverId: string,
+		applicationId: string,
+		factId: string,
+		payload: KnowledgeRetractBody
+	): Promise<RetractionResponse>;
+	/** POST …/knowledge/operations/{operation_id}/retry — explicit
+	 * authorized retry of an unacknowledged preservation operation. */
+	retryKnowledgeOperation(
+		serverId: string,
+		applicationId: string,
+		operationId: string
+	): Promise<RetryResponse>;
 
 	// Notification inbox surface (nbi). The global surface is fleet-wide with
 	// EXPLICIT canonical filters (never an ambient scope); the per-server
@@ -1697,6 +1847,53 @@ export function createMaiApiClient(options: MaiApiClientOptions = {}): MaiApiCli
 			requestJson<AckResult>(
 				'POST',
 				`/api/v1/monitoring/servers/${encodeURIComponent(serverId)}/notifications/${encodeURIComponent(alertId)}/ack`
+			),
+		// Scoped service-knowledge surface (ask_29, D7/C3). Strict same-
+		// server scope: the path identities are the ONLY target; the
+		// collection reads are paginated; the writes use the session
+		// CSRF transport (required token) — no secrets flow here.
+		readKnowledge: (serverId, applicationId, page) => {
+			const params = new URLSearchParams();
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<KnowledgeReadResponse>(
+				'GET',
+				`${knowledgeBase(serverId, applicationId)}${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		readFactHistory: (serverId, applicationId, factId, page) => {
+			const params = new URLSearchParams();
+			if (factId !== undefined) params.set('fact_id', factId);
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<FactHistoryResponse>(
+				'GET',
+				`${knowledgeBase(serverId, applicationId)}/history${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		readKnowledgeOperations: (serverId, applicationId, status, page) => {
+			const params = new URLSearchParams();
+			if (status !== undefined) params.set('status', status);
+			if (page?.limit !== undefined) params.set('limit', String(page.limit));
+			if (page?.offset !== undefined) params.set('offset', String(page.offset));
+			const qs = params.toString();
+			return requestJson<KnowledgeOperationsResponse>(
+				'GET',
+				`${knowledgeBase(serverId, applicationId)}/operations${qs === '' ? '' : `?${qs}`}`
+			);
+		},
+		retractKnowledgeFact: (serverId, applicationId, factId, payload) =>
+			requestJson<RetractionResponse>(
+				'POST',
+				`${knowledgeBase(serverId, applicationId)}/facts/${encodeURIComponent(factId)}/retract`,
+				payload
+			),
+		retryKnowledgeOperation: (serverId, applicationId, operationId) =>
+			requestJson<RetryResponse>(
+				'POST',
+				`${knowledgeBase(serverId, applicationId)}/operations/${encodeURIComponent(operationId)}/retry`
 			),
 		unacknowledgeServerNotification: (serverId, alertId) =>
 			requestJson<AckResult>(

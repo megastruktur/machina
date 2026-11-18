@@ -1218,3 +1218,93 @@ test.describe('real MAI backend (MAI_E2E_API_URL)', () => {
 		});
 	});
 });
+
+test.describe('service-knowledge client surface (injected fetch)', () => {
+	const SERVER_A = '5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60';
+	const APP_MAIN = '0aaaaaaa-0000-4000-8000-000000000001';
+	const FACT_ID = '11111111-2222-4333-8444-555555555555';
+	const OPERATION_ID = '66666666-7777-4888-9999-aaaaaaaaaaaa';
+	const KB = `/api/v1/servers/${SERVER_A}/applications/${APP_MAIN}/knowledge`;
+
+	test('collection reads serialize the scoped route, paging, fact filter and status; GETs carry no CSRF header', async () => {
+		const { fetch, calls } = stubFetch(() =>
+			jsonResponse(200, { status: 'ok', found: false, items: [], total: 0 })
+		);
+		const client = createMaiApiClient({ fetch, getCsrfToken: () => 'csrf-token-1' });
+
+		await client.readKnowledge(SERVER_A, APP_MAIN, { limit: 5, offset: 10 });
+		await client.readFactHistory(SERVER_A, APP_MAIN, FACT_ID, { limit: 3 });
+		await client.readFactHistory(SERVER_A, APP_MAIN);
+		await client.readKnowledgeOperations(SERVER_A, APP_MAIN, 'queued', { limit: 2, offset: 4 });
+
+		expect(calls).toHaveLength(4);
+		expect(calls[0].method).toBe('GET');
+		expect(calls[0].url).toBe(`${STUB_ORIGIN}${KB}?limit=5&offset=10`);
+		expect(calls[1].url).toBe(`${KB}/history?fact_id=${FACT_ID}&limit=3`);
+		expect(calls[2].url).toBe(`${KB}/history`);
+		expect(calls[3].url).toBe(
+			`${KB}/operations?status=queued&limit=2&offset=4`
+		);
+		for (const call of calls) {
+			expect(call.credentials).toBe('include');
+			// Safe methods: the session cookie is the only credential layer.
+			expect(call.headers['x-csrf-token']).toBeUndefined();
+		}
+	});
+
+	test('retract posts the exact CAS body with the session CSRF transport', async () => {
+		const { fetch, calls } = stubFetch(() =>
+			jsonResponse(200, { status: 'applied', fact_id: FACT_ID, new_revision: 2 })
+		);
+		const client = createMaiApiClient({ fetch, getCsrfToken: () => 'csrf-token-1' });
+
+		const result = await client.retractKnowledgeFact(SERVER_A, APP_MAIN, FACT_ID, {
+			expected_revision: 1,
+			expected_generation: 1,
+			reason: 'operator verified the statement is wrong'
+		});
+
+		expect(result.status).toBe('applied');
+		const call = calls[0];
+		expect(call.method).toBe('POST');
+		expect(call.url).toBe(`${STUB_ORIGIN}${KB}/facts/${FACT_ID}/retract`);
+		expect(call.headers['x-csrf-token']).toBe('csrf-token-1');
+		expect(call.headers['content-type']).toBe('application/json');
+		expect(JSON.parse(call.body ?? '')).toEqual({
+			expected_revision: 1,
+			expected_generation: 1,
+			reason: 'operator verified the statement is wrong'
+		});
+	});
+
+	test('retry posts with CSRF and surfaces the C01 conflict envelope as ApiError', async () => {
+		const { fetch, calls } = stubFetch(() =>
+			jsonResponse(
+				409,
+				{
+					error: {
+						code: 'operation_not_runnable',
+						message: 'only unacknowledged queued operations are retryable here',
+						request_id: 'req-1',
+						fields: {}
+					}
+				}
+			)
+		);
+		const client = createMaiApiClient({ fetch, getCsrfToken: () => 'csrf-token-1' });
+
+		const error = (await client
+			.retryKnowledgeOperation(SERVER_A, APP_MAIN, OPERATION_ID)
+			.catch((thrown: unknown) => thrown)) as ApiError;
+
+		expect(error).toBeInstanceOf(ApiError);
+		expect(error.code).toBe('operation_not_runnable');
+		expect(error.requestId).toBe('req-1');
+		const call = calls[0];
+		expect(call.method).toBe('POST');
+		expect(call.url).toBe(
+			`${STUB_ORIGIN}${KB}/operations/${OPERATION_ID}/retry`
+		);
+		expect(call.headers['x-csrf-token']).toBe('csrf-token-1');
+	});
+});
