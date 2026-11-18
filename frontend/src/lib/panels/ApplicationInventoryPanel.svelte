@@ -70,6 +70,7 @@
 		AdoptionCreated,
 		ComposeDetailView,
 		DiscoveryView,
+		KnowledgeApi,
 		ObservedApplicationView,
 		RecordDocView,
 		ServiceCategoryView,
@@ -77,6 +78,7 @@
 		StandaloneDetailView,
 		SystemdUnitDetailView
 	} from '../workspace/entries/08-web-apps.js';
+	import ServiceKnowledge from '../components/ServiceKnowledge.svelte';
 	import type {
 		RunbookExecutionView,
 		RunbookView
@@ -118,9 +120,35 @@
 		return candidate as ApplicationsDocs;
 	}
 
+	/**
+	 * Narrow the OPTIONAL learned-notes seam (D7): all five knowledge
+	 * methods must be functions or the whole group is treated as absent —
+	 * ServiceKnowledge then renders its honest unavailable state instead
+	 * of a fake read. The narrowing mirrors readDocs/readLifecycle; the
+	 * group itself is owned by `08-web-apps` and never restated here.
+	 */
+	function readKnowledge(services: PanelServices): KnowledgeApi | null {
+		const candidate = services.knowledge as Partial<KnowledgeApi> | null | undefined;
+		if (typeof candidate !== 'object' || candidate === null) return null;
+		for (
+			const name of [
+				'readKnowledge',
+				'readFactHistory',
+				'readKnowledgeOperations',
+				'retractKnowledgeFact',
+				'retryKnowledgeOperation'
+			] as const
+		) {
+			if (typeof candidate[name] !== 'function') return null;
+		}
+		return candidate as KnowledgeApi;
+	}
+
 	const api = $derived(readApi(panel.services));
 	const lifecycle = $derived(readLifecycle(panel.services));
 	const docs = $derived(readDocs(panel.services));
+	/** Learned operational notes seam: null ⇒ honest unavailable state. */
+	const knowledge = $derived(readKnowledge(panel.services));
 
 	/**
 	 * The optional background-execution seam: `executeRunbook` on the api
@@ -1479,6 +1507,21 @@
 										</dl>
 									{/if}
 								</details>
+								{#if usable && serverScope !== null && row.application_id === pinnedApplicationId}
+									<!-- D7 learned operational notes for the SELECTED (pinned)
+										service only — one bounded instance per panel, fed the
+										explicit scope props; switching the pin re-keys the
+										component so stale in-flight reads never paint. The
+										knowledge group may be absent (legacy bag): the child
+										then renders its honest unavailable notice. -->
+									<div class="mai-apps__knowledge" data-testid="service-knowledge">
+										<ServiceKnowledge
+											serverId={serverScope}
+											applicationId={row.application_id}
+											{knowledge}
+										/>
+									</div>
+								{/if}
 								{#if editTarget?.application_id === row.application_id}
 									<div class="mai-apps__editor" data-testid="service-edit-form">
 										<Select
@@ -2514,6 +2557,14 @@
 		border: 1px solid var(--mai-color-border, transparent);
 		border-radius: var(--mai-radius-sm, 4px);
 		padding: var(--space-2, 0.5rem);
+	}
+
+	/* Learned operational notes (D7): the child component owns its own
+	   styling; the wrapper only separates it from the operator runbook. */
+	.mai-apps__knowledge {
+		border-top: 1px dotted var(--mai-color-border, currentColor);
+		margin-top: var(--space-2, 0.5rem);
+		padding-top: var(--space-2, 0.5rem);
 	}
 
 	.mai-apps__runbook summary {

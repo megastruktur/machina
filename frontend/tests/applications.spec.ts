@@ -93,6 +93,8 @@ interface AppsWindowApi {
 	armRecordDoc(doc: unknown | null): void;
 	setRevision(applicationId: string, revision: number): void;
 	toggleHostA(): void;
+	switchPinnedApplication(applicationId: string): void;
+	pinnedApplicationId(): string;
 	registry: {
 		kinds: string[];
 		scopeChecks: {
@@ -617,6 +619,16 @@ const APP_SOURCE = `
 	// mock injected into a SECOND bag; the LEGACY bag omits the group and
 	// stays byte-for-byte the old adoption-only surface.
 	const knowledgeCalls = [];
+	// ask_32: one deterministic learned fact + revision + pending operation
+	// per scope, so the notes area repaints observably distinct rows when
+	// the pinned service switches (and the stale rows are provably gone).
+	const knowledgeFact = (applicationId) => ({
+		fact_id: 'fact-learned-' + applicationId.slice(0, 8),
+		revision: 1,
+		statement: 'Learned note for ' + applicationId.slice(0, 8) + ': memory limit raised after OOM.',
+		status: 'active',
+		source: { source_kind: 'user_statement', source_ref: 'session-7/turn-2' }
+	});
 	const knowledgeApi = {
 		readKnowledge(serverId, applicationId, page) {
 			knowledgeCalls.push({ op: 'readKnowledge', serverId, applicationId, page });
@@ -626,25 +638,37 @@ const APP_SOURCE = `
 				application_id: applicationId,
 				generation: 1,
 				facts: {
-					items: [],
+					items: [knowledgeFact(applicationId)],
 					limit: page?.limit ?? 0,
 					offset: page?.offset ?? 0,
-					total: 0,
+					total: 1,
 					has_more: false
 				}
 			});
 		},
 		readFactHistory(serverId, applicationId, factId, page) {
 			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, factId, page });
-			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
+			const fact = knowledgeFact(applicationId);
+			return Promise.resolve({ items: [{ ...fact, revision_id: 'rev-' + applicationId.slice(0, 8) }], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 1, has_more: false });
 		},
 		readKnowledgeOperations(serverId, applicationId, status, page) {
 			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, status, page });
-			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
+			return Promise.resolve({
+				items: [{
+					operation_id: 'op-preserve-' + applicationId.slice(0, 8),
+					status: 'queued',
+					workflow_id: 'service.learn:op-preserve-' + applicationId.slice(0, 8),
+					accepted_at: '2026-11-18T00:00:00Z'
+				}],
+				limit: page?.limit ?? 0,
+				offset: page?.offset ?? 0,
+				total: 1,
+				has_more: false
+			});
 		},
 		retractKnowledgeFact(serverId, applicationId, factId, payload) {
 			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, factId, payload });
-			return Promise.resolve({ server_id: serverId, application_id: applicationId, fact_id: factId, new_revision: 2 });
+			return Promise.resolve({ status: 'applied', server_id: serverId, application_id: applicationId, fact_id: factId, new_revision: 2 });
 		},
 		retryKnowledgeOperation(serverId, applicationId, operationId) {
 			knowledgeCalls.push({ op: 'retryKnowledgeOperation', serverId, applicationId, operationId });
@@ -688,6 +712,9 @@ const APP_SOURCE = `
 
 	// --- hosts ----------------------------------------------------------------
 	let showA = $state(true);
+	// ask_32: the PINNED (selected) application of the pinned host; the
+	// window API flips it to prove the notes area follows the selection.
+	let pinnedApplicationId = $state('${APP_ADOPTED}');
 
 	function descriptor(windowId, scope, z, kind) {
 		return {
@@ -770,6 +797,10 @@ const APP_SOURCE = `
 		toggleHostA() {
 			showA = !showA;
 		},
+		switchPinnedApplication(applicationId) {
+			pinnedApplicationId = applicationId;
+		},
+		pinnedApplicationId: () => pinnedApplicationId,
 		registry: {
 			kinds: Array.from(registry.knownPanelKinds()).sort(),
 			scopeChecks: {
@@ -830,8 +861,8 @@ const APP_SOURCE = `
 		<PanelHost
 			onpanelerror={onPanelError}
 			{registry}
-			descriptor={descriptor('${WINDOW_PINNED}', { kind: 'server', server_id: SERVER_A, object: { kind: 'application', id: '${APP_ADOPTED}' } }, 3)}
-			{services}
+			descriptor={descriptor('${WINDOW_PINNED}', { kind: 'server', server_id: SERVER_A, object: { kind: 'application', id: pinnedApplicationId } }, 3)}
+			services={servicesWithKnowledge}
 		/>
 	</ComponentHost>
 </section>
@@ -868,7 +899,7 @@ const APP_SOURCE = `
 		<PanelHost
 			onpanelerror={onPanelError}
 			{registry}
-			descriptor={descriptor('${WINDOW_NOSEAM}', { kind: 'server', server_id: SERVER_A }, 7)}
+			descriptor={descriptor('${WINDOW_NOSEAM}', { kind: 'server', server_id: SERVER_A, object: { kind: 'application', id: '${APP_ADOPTED}' } }, 7)}
 			services={servicesNoSeams}
 		/>
 	</ComponentHost>
@@ -2233,6 +2264,14 @@ test('the optional knowledge capability group fails closed for legacy bags and p
 	// Exercise ALL FIVE methods through the injected group (OCR 7e43fa93):
 	// every call records its distinctive argument (factId/status/payload/
 	// operationId) and the page query propagates on the collection reads.
+	// The pinned host's notes area fired its own mount reads; wait for that
+	// mount to settle, then reset the recording so the EXACT five
+	// test-issued calls are asserted below.
+	await page.getByTestId('host-pinned').getByTestId('inventory-list').waitFor();
+	await page.evaluate(() => {
+		const api = window.__maiAppsApi;
+		if (api) api.knowledgeCalls.length = 0;
+	});
 	await page.evaluate(([server, application]) => {
 		const api = window.__maiAppsApi;
 		if (!api) throw new Error('harness window API missing');
@@ -2271,4 +2310,112 @@ test('the optional knowledge capability group fails closed for legacy bags and p
 	});
 	expect(calls[4].op).toBe('retryKnowledgeOperation');
 	expect(calls[4].operationId).toBe('op-77');
+});
+
+// ---------------------------------------------------------------------------
+// ask_32: learned operational notes integrated into the inventory panel's
+// SELECTED (pinned) service details (D7; C3/C7)
+// ---------------------------------------------------------------------------
+
+test('the pinned service shows learned notes beside unchanged operator instructions', async ({
+	page
+}) => {
+	const pinned = page.getByTestId('host-pinned');
+	await pinned.getByTestId('inventory-list').waitFor();
+
+	// The notes area mounts for the SELECTED service only and paints the
+	// bounded first page: one learned fact, its revision history and the
+	// pending preservation operation with its stable identity.
+	const factRow = pinned.getByTestId('knowledge-fact-row');
+	await expect(factRow).toHaveCount(1);
+	await expect(factRow).toContainText(`Learned note for ${APP_ADOPTED.slice(0, 8)}`);
+	await expect(factRow).toHaveAttribute(
+		'data-fact-id',
+		`fact-learned-${APP_ADOPTED.slice(0, 8)}`
+	);
+	await expect(pinned.getByTestId('knowledge-history-row')).toHaveCount(1);
+	const operationRow = pinned.getByTestId('knowledge-operation-row');
+	await expect(operationRow).toHaveCount(1);
+	await expect(operationRow).toContainText('queued');
+	await expect(operationRow).toHaveAttribute(
+		'data-operation-id',
+		`op-preserve-${APP_ADOPTED.slice(0, 8)}`
+	);
+
+	// Retraction through the panel notes records the EXACT CAS against the
+	// observed fact revision and generation, with the bounded reason.
+	await pinned.getByTestId('knowledge-reason').fill('stale after reconfig');
+	await pinned.getByTestId('knowledge-fact-retract').click();
+	const calls = await page.evaluate(() => window.__maiAppsApi?.knowledgeCalls ?? []);
+	const retract = calls.find((call) => call.op === 'retractKnowledgeFact');
+	expect(retract).toBeDefined();
+	expect(retract!.serverId).toBe(SERVER_A);
+	expect(retract!.applicationId).toBe(APP_ADOPTED);
+	expect(retract!.factId).toBe(`fact-learned-${APP_ADOPTED.slice(0, 8)}`);
+	expect(retract!.payload).toEqual({
+		expected_revision: 1,
+		expected_generation: 1,
+		reason: 'stale after reconfig'
+	});
+
+	// The operator's own instructions remain untouched beside the notes:
+	// the runbook text and the custom_instructions editor keep their exact
+	// values while the learned notes are visible above them.
+	await pinned.getByTestId('service-edit-start').click();
+	await expect(pinned.getByTestId('service-edit-custom-instructions')).toHaveValue('');
+	await expect(pinned.getByTestId('service-instructions')).toContainText(
+		'No runbook instructions recorded for this service.'
+	);
+	await expect(factRow).toContainText('Learned note for');
+});
+
+test('switching the selected service re-keys the notes and never leaks reads across the server scope', async ({
+	page
+}) => {
+	const pinned = page.getByTestId('host-pinned');
+	await pinned.getByTestId('inventory-list').waitFor();
+	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveAttribute(
+		'data-fact-id',
+		`fact-learned-${APP_ADOPTED.slice(0, 8)}`
+	);
+
+	// Select the OTHER server's adopted service: it is outside this
+	// panel's pinned server scope, so the notes area disappears (stale
+	// rows are gone with the unmounted component) and NO knowledge read
+	// may carry the foreign application id.
+	await apiCall(page, 'switchPinnedApplication', [APP_BETA]);
+	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveCount(0);
+	await expect(pinned.getByTestId('service-knowledge')).toHaveCount(0);
+
+	// Selecting back re-keys the notes to the pinned row again with a
+	// fresh bounded read (two readKnowledge rounds for the same scope).
+	await apiCall(page, 'switchPinnedApplication', [APP_ADOPTED]);
+	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveAttribute(
+		'data-fact-id',
+		`fact-learned-${APP_ADOPTED.slice(0, 8)}`
+	);
+
+	const calls = await page.evaluate(() => window.__maiAppsApi?.knowledgeCalls ?? []);
+	expect(calls.filter((call) => call.applicationId === APP_BETA)).toHaveLength(0);
+	const readsForPinned = calls.filter(
+		(call) => call.applicationId === APP_ADOPTED && call.op === 'readKnowledge'
+	);
+	expect(readsForPinned.length).toBeGreaterThanOrEqual(2);
+});
+
+test('without the knowledge group the pinned service renders the honest unavailable notice', async ({
+	page
+}) => {
+	const noseam = page.getByTestId('host-noseam');
+	await noseam.getByTestId('inventory-list').waitFor();
+
+	// The legacy bag omits the group entirely: the panel passes null and
+	// the notes component renders its explicit unavailable state — no
+	// fake rows, no reads recorded.
+	await expect(noseam.getByTestId('service-knowledge')).toBeVisible();
+	await expect(noseam.getByTestId('knowledge-unavailable')).toContainText('unavailable');
+	await expect(noseam.getByTestId('knowledge-fact-row')).toHaveCount(0);
+
+	// The operator instructions render unchanged beside the notice.
+	await expect(noseam.getByTestId('service-instructions')).toBeVisible();
 });
