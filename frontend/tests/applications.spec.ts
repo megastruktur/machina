@@ -62,6 +62,20 @@ type Fail = { status: number; code: string; message: string };
 
 interface AppsWindowApi {
 	calls: Array<{ op: string; payload?: unknown; args?: unknown[] }>;
+	knowledgeLegacy: { readKnowledge?: unknown } | undefined;
+	knowledgeFull: unknown;
+	knowledgeGroup: unknown;
+	knowledgeCalls: Array<{
+		op: string;
+		serverId: string;
+		applicationId: string;
+		page?: { limit?: number; offset?: number } | undefined;
+	}>;
+	knowledgeRead(
+		serverId: string,
+		applicationId: string,
+		page?: { limit?: number; offset?: number } | undefined
+	): Promise<unknown>;
 	failNextList(failure: Fail | null): void;
 	failNextDiscover(failure: Fail | null): void;
 	failNextAdopt(failure: Fail | null): void;
@@ -595,6 +609,55 @@ const APP_SOURCE = `
 	);
 	const servicesNoSeams = applicationsServices(apiNoExecute, null, null);
 
+	// ask_30: the OPTIONAL knowledge capability group (D7) — a recording
+	// mock injected into a SECOND bag; the LEGACY bag omits the group and
+	// stays byte-for-byte the old adoption-only surface.
+	const knowledgeCalls = [];
+	const knowledgeApi = {
+		readKnowledge(serverId, applicationId, page) {
+			knowledgeCalls.push({ op: 'readKnowledge', serverId, applicationId, page });
+			return Promise.resolve({
+				status: 'ok',
+				server_id: serverId,
+				application_id: applicationId,
+				generation: 1,
+				facts: {
+					items: [],
+					limit: page?.limit ?? 0,
+					offset: page?.offset ?? 0,
+					total: 0,
+					has_more: false
+				}
+			});
+		},
+		readFactHistory(serverId, applicationId, factId, page) {
+			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, page });
+			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
+		},
+		readKnowledgeOperations(serverId, applicationId, status, page) {
+			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, page });
+			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
+		},
+		retractKnowledgeFact(serverId, applicationId, factId, payload) {
+			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, payload });
+			return Promise.resolve({ server_id: serverId, application_id: applicationId, fact_id: factId, new_revision: 2 });
+		},
+		retryKnowledgeOperation(serverId, applicationId, operationId) {
+			knowledgeCalls.push({ op: 'retryKnowledgeOperation', serverId, applicationId, operationId });
+			return Promise.resolve({ status: 'accepted', operation_id: operationId });
+		}
+	};
+	const servicesWithKnowledge = applicationsServices(
+		api,
+		{
+			openInstall: openLifecycle('openInstall'),
+			openUpdate: openLifecycle('openUpdate'),
+			openRemove: openLifecycle('openRemove')
+		},
+		{ openDocument: openDocument },
+		knowledgeApi
+	);
+
 	// --- registry: the REAL feature entry + one benign sibling ----------------
 	const sibling = createRawSnippet(() => {
 		return {
@@ -646,6 +709,13 @@ const APP_SOURCE = `
 
 	const windowApi = {
 		calls,
+		knowledgeLegacy: servicesNoSeams.knowledge,
+		knowledgeFull: servicesWithKnowledge.knowledge,
+		knowledgeGroup: knowledgeApi,
+		knowledgeCalls,
+		knowledgeRead(serverId, applicationId, page) {
+			return servicesWithKnowledge.knowledge.readKnowledge(serverId, applicationId, page);
+		},
 		failNextList(failure) {
 			arms.list = failure;
 		},
@@ -2126,4 +2196,44 @@ test('map-details editing re-adopts with the observed revision and a stale revis
 		'data-category',
 		'games'
 	);
+});
+
+test('the optional knowledge capability group fails closed for legacy bags and propagates the page query', async ({ page }) => {
+	await page.goto('/');
+
+	const state = await page.evaluate(([server, application]) => {
+		const api = window.__maiAppsApi;
+		if (!api) throw new Error('harness window API missing');
+		// Legacy adoption-only bag: the OPTIONAL group is absent — the
+		// honest fail-closed inspection result.
+		const legacyAbsent = api.knowledgeLegacy === undefined;
+		// The full bag CARRIES the injected group (identity, not a copy and
+		// not a module singleton: the factory wraps whatever is injected).
+		const fullIsInjected = api.knowledgeFull === api.knowledgeGroup;
+		// Invoking through the absent group stays impossible: optional
+		// chaining answers undefined (the panel's honest fail-closed read).
+		const invokedThroughLegacy = api.knowledgeLegacy?.readKnowledge ?? 'unavailable';
+
+		return Promise.all([
+			Promise.resolve({
+				legacyAbsent,
+				fullIsInjected,
+				invokedThroughLegacy,
+				groupType: typeof api.knowledgeFull
+			}),
+			api.knowledgeRead(server, application, { limit: 7, offset: 2 }).then(() => api.knowledgeCalls)
+		]).then(([inspection, calls]) => ({ ...inspection, calls }));
+	}, [SERVER_A, APP_ADOPTED]);
+
+	expect(state.legacyAbsent).toBe(true);
+	expect(state.fullIsInjected).toBe(true);
+	expect(state.invokedThroughLegacy).toBe('unavailable');
+	expect(state.groupType).toBe('object');
+
+	// Page query propagated VERBATIM on the collection read.
+	expect(state.calls).toHaveLength(1);
+	expect(state.calls[0].op).toBe('readKnowledge');
+	expect(state.calls[0].serverId).toBe(SERVER_A);
+	expect(state.calls[0].applicationId).toBe(APP_ADOPTED);
+	expect(state.calls[0].page).toEqual({ limit: 7, offset: 2 });
 });

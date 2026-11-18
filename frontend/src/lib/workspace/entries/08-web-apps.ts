@@ -34,6 +34,7 @@
 
 import type { components } from '../../api/schema.generated.js';
 import type { RunbookExecutionView } from './13-web-runbooks.js';
+import type { PageQuery } from './05-web-jobs.js';
 import type { PanelEntryInput } from '../registry.js';
 
 /** Stable panel slug (ADR §7.1); validated against the registry on open. */
@@ -67,6 +68,22 @@ export type StandaloneDetailView = components['schemas']['StandaloneDetailView']
 export type SystemdUnitDetailView = components['schemas']['SystemdUnitDetailView'];
 /** Generated wire shape: one observed container (no env/mounts/command lines). */
 export type ContainerView = components['schemas']['ContainerView'];
+/** Generated wire shape: the bounded current knowledge read (D7). */
+export type KnowledgeRead = components['schemas']['KnowledgeRead'];
+/** Generated wire shape: one bounded fact revision history page (C3). */
+export type FactRevisionPage = components['schemas']['FactRevisionPage'];
+/** Generated wire shape: one bounded preservation-operation receipt page (D5). */
+export type OperationPage = components['schemas']['OperationPage'];
+/** Generated wire shape: one operator retraction result (CAS-refused stays failed). */
+export type RetractionResult = components['schemas']['RetractionResult'];
+/** Generated wire shape: one durable preservation-operation receipt. */
+export type OperationReceipt = components['schemas']['OperationReceipt'];
+/** Generated wire shape: the operator retraction CAS body. */
+export type RetractBody = components['schemas']['RetractBody'];
+/** Generated wire shape: the preservation-operation status vocabulary. */
+export type KnowledgeOperationStatus = NonNullable<
+	components['schemas']['OperationStatus']
+>;
 /** Generated wire shape: the identity-record documentation outcome of one adoption. */
 export type RecordDocView = components['schemas']['RecordDocView'];
 /** Generated wire shape: one revision-checked, non-destructive revoke request. */
@@ -194,6 +211,90 @@ export interface ApplicationsApi {
 			custom_instructions?: string | null;
 		}
 	): Promise<RunbookExecutionView>;
+	/**
+	 * READ the scoped knowledge surfaces through the SAME seam (D7):
+	 * current page, revision history and preservation receipts — each a
+	 * bounded, paginated collection read. Optional: the panel hides the
+	 * knowledge surfaces honestly when the group is absent.
+	 */
+	readKnowledge?(
+		serverId: string,
+		applicationId: string,
+		page?: PageQuery
+	): Promise<KnowledgeRead>;
+	readFactHistory?(
+		serverId: string,
+		applicationId: string,
+		factId?: string,
+		page?: PageQuery
+	): Promise<FactRevisionPage>;
+	readKnowledgeOperations?(
+		serverId: string,
+		applicationId: string,
+		status?: KnowledgeOperationStatus,
+		page?: PageQuery
+	): Promise<OperationPage>;
+	/**
+	 * Operator retraction by exact compare-and-set (session + allowed-
+	 * origin + CSRF server-side). Optional: absent group fails closed.
+	 */
+	retractKnowledgeFact?(
+		serverId: string,
+		applicationId: string,
+		factId: string,
+		payload: RetractBody
+	): Promise<RetractionResult>;
+	/**
+	 * Explicit authorized retry of one unacknowledged preservation
+	 * operation. Optional: absent group fails closed.
+	 */
+	retryKnowledgeOperation?(
+		serverId: string,
+		applicationId: string,
+		operationId: string
+	): Promise<OperationReceipt>;
+}
+
+/**
+ * The OPTIONAL knowledge capability group (D7): typed method surface
+ * over the ask_26 scoped routes, consumed through the SAME seam as the
+ * adoption reads. Panel code MUST treat the whole group as optional —
+ * an absent group fails closed honestly (no fake reads/writes).
+ */
+export interface KnowledgeApi {
+	/** GET …/knowledge — the bounded current knowledge read (paginated). */
+	readKnowledge(
+		serverId: string,
+		applicationId: string,
+		page?: PageQuery
+	): Promise<KnowledgeRead>;
+	/** GET …/knowledge/history — paginated fact revision history. */
+	readFactHistory(
+		serverId: string,
+		applicationId: string,
+		factId?: string,
+		page?: PageQuery
+	): Promise<FactRevisionPage>;
+	/** GET …/knowledge/operations — paginated preservation receipts. */
+	readKnowledgeOperations(
+		serverId: string,
+		applicationId: string,
+		status?: KnowledgeOperationStatus,
+		page?: PageQuery
+	): Promise<OperationPage>;
+	/** POST …/knowledge/facts/{fact_id}/retract — operator CAS retraction. */
+	retractKnowledgeFact(
+		serverId: string,
+		applicationId: string,
+		factId: string,
+		payload: RetractBody
+	): Promise<RetractionResult>;
+	/** POST …/knowledge/operations/{operation_id}/retry — authorized retry. */
+	retryKnowledgeOperation(
+		serverId: string,
+		applicationId: string,
+		operationId: string
+	): Promise<OperationReceipt>;
 }
 
 /** Typed services bag the applications panel requires from its opener. */
@@ -210,6 +311,14 @@ export interface ApplicationsServices {
 	 * the recorded doc reference stays displayed text, not a fake link.
 	 */
 	readonly docs: ApplicationsDocs | null;
+	/**
+	 * The OPTIONAL knowledge capability group (D7): bounded knowledge
+	 * reads, operator CAS retraction and authorized preservation retry.
+	 * Absent (or `null`) fails closed honestly — the panel hides the
+	 * knowledge surfaces and never fakes a read or an operator write.
+	 * LEGACY adoption-only bags omit it and stay exactly as they were.
+	 */
+	readonly knowledge?: KnowledgeApi | null;
 }
 
 /** The feature entry for composition into the app's one panel registry. */
@@ -244,7 +353,8 @@ export function applicationsEntry(): PanelEntryInput {
 export function applicationsServices(
 	api: ApplicationsApi,
 	lifecycle: ApplicationsLifecycle | null = null,
-	docs: ApplicationsDocs | null = null
+	docs: ApplicationsDocs | null = null,
+	knowledge: KnowledgeApi | null = null
 ): ApplicationsServices {
-	return Object.freeze({ api, lifecycle, docs });
+	return Object.freeze({ api, lifecycle, docs, knowledge });
 }
