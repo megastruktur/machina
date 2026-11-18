@@ -94,7 +94,9 @@ interface AppsWindowApi {
 	setRevision(applicationId: string, revision: number): void;
 	toggleHostA(): void;
 	switchPinnedApplication(applicationId: string): void;
-	pinnedApplicationId(): string;
+	armKnowledgeDefer(): void;
+	releaseKnowledgeAll(): void;
+	adoptSecondOnServerA(applicationId: string): Promise<unknown>;
 	registry: {
 		kinds: string[];
 		scopeChecks: {
@@ -185,7 +187,10 @@ const APP_SOURCE = `
 			external_working_dir: '/srv/metrics',
 			external_config_files: ['/srv/metrics/compose.yaml'],
 			external_environment_files: ['/srv/metrics/.env'],
-			revision: 2
+			revision: 2,
+			// ask_32 fix1: the operator's OWN words on the record — the
+			// learned notes must never overwrite this exact text.
+			custom_instructions: 'This host scrapes via the tailnet address only.'
 		});
 		adopted[SERVER_B] = {};
 		adopted[SERVER_B][APP_BETA] = makeRecord(APP_BETA, SERVER_B, 'beta-agent', {
@@ -619,9 +624,14 @@ const APP_SOURCE = `
 	// mock injected into a SECOND bag; the LEGACY bag omits the group and
 	// stays byte-for-byte the old adoption-only surface.
 	const knowledgeCalls = [];
-	// ask_32: one deterministic learned fact + revision + pending operation
-	// per scope, so the notes area repaints observably distinct rows when
-	// the pinned service switches (and the stale rows are provably gone).
+	// ask_32 fix1: one deterministic learned fact + revision + pending
+	// operation per scope, so the notes area repaints observably distinct
+	// rows when the pinned service switches (and the stale rows are
+	// provably gone). The OPTIONAL defer gate parks every subsequent read
+	// until releaseKnowledgeAll, letting a test interleave a stale answer
+	// ahead of the fresh one on the SAME live component instance.
+	const knowledgeGates = [];
+	let knowledgeDeferArmed = false;
 	const knowledgeFact = (applicationId) => ({
 		fact_id: 'fact-learned-' + applicationId.slice(0, 8),
 		revision: 1,
@@ -629,42 +639,55 @@ const APP_SOURCE = `
 		status: 'active',
 		source: { source_kind: 'user_statement', source_ref: 'session-7/turn-2' }
 	});
+	const knowledgeReadDoc = (serverId, applicationId, page) => ({
+		status: 'ok',
+		server_id: serverId,
+		application_id: applicationId,
+		generation: 1,
+		facts: {
+			items: [knowledgeFact(applicationId)],
+			limit: page?.limit ?? 0,
+			offset: page?.offset ?? 0,
+			total: 1,
+			has_more: false
+		}
+	});
+	const knowledgeHistoryDoc = (applicationId, page) => {
+		const fact = knowledgeFact(applicationId);
+		return { items: [{ ...fact, revision_id: 'rev-' + applicationId.slice(0, 8) }], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 1, has_more: false };
+	};
+	const knowledgeOperationsDoc = (applicationId, page) => ({
+		items: [{
+			operation_id: 'op-preserve-' + applicationId.slice(0, 8),
+			status: 'queued',
+			workflow_id: 'service.learn:op-preserve-' + applicationId.slice(0, 8),
+			accepted_at: '2026-11-18T00:00:00Z'
+		}],
+		limit: page?.limit ?? 0,
+		offset: page?.offset ?? 0,
+		total: 1,
+		has_more: false
+	});
+	const parkedOr = (value) => {
+		if (!knowledgeDeferArmed) return Promise.resolve(value);
+		const gate = Promise.withResolvers();
+		// Park the RESOLVER with its value bound: releasing the gate later
+		// answers THIS call's own scope (stale gates answer stale scopes).
+		knowledgeGates.push(() => gate.resolve(value));
+		return gate.promise;
+	};
 	const knowledgeApi = {
 		readKnowledge(serverId, applicationId, page) {
 			knowledgeCalls.push({ op: 'readKnowledge', serverId, applicationId, page });
-			return Promise.resolve({
-				status: 'ok',
-				server_id: serverId,
-				application_id: applicationId,
-				generation: 1,
-				facts: {
-					items: [knowledgeFact(applicationId)],
-					limit: page?.limit ?? 0,
-					offset: page?.offset ?? 0,
-					total: 1,
-					has_more: false
-				}
-			});
+			return parkedOr(knowledgeReadDoc(serverId, applicationId, page));
 		},
 		readFactHistory(serverId, applicationId, factId, page) {
 			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, factId, page });
-			const fact = knowledgeFact(applicationId);
-			return Promise.resolve({ items: [{ ...fact, revision_id: 'rev-' + applicationId.slice(0, 8) }], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 1, has_more: false });
+			return parkedOr(knowledgeHistoryDoc(applicationId, page));
 		},
 		readKnowledgeOperations(serverId, applicationId, status, page) {
 			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, status, page });
-			return Promise.resolve({
-				items: [{
-					operation_id: 'op-preserve-' + applicationId.slice(0, 8),
-					status: 'queued',
-					workflow_id: 'service.learn:op-preserve-' + applicationId.slice(0, 8),
-					accepted_at: '2026-11-18T00:00:00Z'
-				}],
-				limit: page?.limit ?? 0,
-				offset: page?.offset ?? 0,
-				total: 1,
-				has_more: false
-			});
+			return parkedOr(knowledgeOperationsDoc(applicationId, page));
 		},
 		retractKnowledgeFact(serverId, applicationId, factId, payload) {
 			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, factId, payload });
@@ -800,7 +823,25 @@ const APP_SOURCE = `
 		switchPinnedApplication(applicationId) {
 			pinnedApplicationId = applicationId;
 		},
-		pinnedApplicationId: () => pinnedApplicationId,
+		armKnowledgeDefer() {
+			knowledgeDeferArmed = true;
+		},
+		releaseKnowledgeAll() {
+			while (knowledgeGates.length > 0) knowledgeGates.shift()();
+			knowledgeDeferArmed = false;
+		},
+		adoptSecondOnServerA(applicationId) {
+			// ask_32 fix1: the selection switch stays ON the pinned server —
+			// a second adopted record on SERVER_A keeps the notes switch in
+			// scope so the live epoch guard is what is exercised.
+			return api.adopt(SERVER_A, {
+				application_id: applicationId,
+				name: 'logs-stack',
+				origin: 'compose',
+				expected_revision: 0,
+				installed: true
+			});
+		},
 		registry: {
 			kinds: Array.from(registry.knownPanelKinds()).sort(),
 			scopeChecks: {
@@ -1048,6 +1089,23 @@ test.beforeEach(async ({ page }) => {
 // ---------------------------------------------------------------------------
 
 /** Call one fixture-api method inside the page; args must be serializable. */
+/**
+ * ask_32 fix1: clear the recording ONLY after the pinned notes mount has
+ * settled (its learned-fact row is painted) — otherwise the mount's own
+ * three reads could land mid-test and pollute the exact call-log asserts.
+ */
+async function resetKnowledgeCalls(page: Page): Promise<void> {
+	await page
+		.getByTestId('host-pinned')
+		.getByTestId('knowledge-fact-row')
+		.first()
+		.waitFor({ state: 'visible' });
+	await page.evaluate(() => {
+		const api = window.__maiAppsApi;
+		if (api) api.knowledgeCalls.length = 0;
+	});
+}
+
 async function apiCall(page: Page, method: string, args: unknown[] = []): Promise<void> {
 	const pair: [string, unknown[]] = [method, args];
 	await page.evaluate(([name, callArgs]) => {
@@ -1714,6 +1772,7 @@ const METRICS_MAPPED = {
 	stale: false,
 	category: 'observability',
 	description: 'Metrics and alerting stack.',
+	custom_instructions: 'This host scrapes via the tailnet address only.',
 	instructions: {
 		install: 'docker compose up -d',
 		update: 'docker compose pull && docker compose up -d',
@@ -2168,7 +2227,9 @@ test('map-details editing re-adopts with the observed revision and a stale revis
 	await expect(hostA.getByTestId('service-edit-description')).toHaveValue(
 		'Metrics and alerting stack.'
 	);
-	await expect(hostA.getByTestId('service-edit-custom-instructions')).toHaveValue('');
+	await expect(hostA.getByTestId('service-edit-custom-instructions')).toHaveValue(
+		'This host scrapes via the tailnet address only.'
+	);
 	await expect(hostA.getByTestId('service-edit-instructions-install')).toHaveValue(
 		'docker compose up -d'
 	);
@@ -2264,14 +2325,10 @@ test('the optional knowledge capability group fails closed for legacy bags and p
 	// Exercise ALL FIVE methods through the injected group (OCR 7e43fa93):
 	// every call records its distinctive argument (factId/status/payload/
 	// operationId) and the page query propagates on the collection reads.
-	// The pinned host's notes area fired its own mount reads; wait for that
-	// mount to settle, then reset the recording so the EXACT five
-	// test-issued calls are asserted below.
-	await page.getByTestId('host-pinned').getByTestId('inventory-list').waitFor();
-	await page.evaluate(() => {
-		const api = window.__maiAppsApi;
-		if (api) api.knowledgeCalls.length = 0;
-	});
+	// The pinned host's notes area fired its own mount reads; reset the
+	// recording only once that mount has settled (fact row painted) so the
+	// EXACT five test-issued calls are asserted below.
+	await resetKnowledgeCalls(page);
 	await page.evaluate(([server, application]) => {
 		const api = window.__maiAppsApi;
 		if (!api) throw new Error('harness window API missing');
@@ -2358,18 +2415,21 @@ test('the pinned service shows learned notes beside unchanged operator instructi
 		reason: 'stale after reconfig'
 	});
 
-	// The operator's own instructions remain untouched beside the notes:
-	// the runbook text and the custom_instructions editor keep their exact
-	// values while the learned notes are visible above them.
+	// The operator's OWN words remain untouched beside the notes: the
+	// custom_instructions editor keeps the seeded record text exactly while
+	// the learned notes are visible above it, and the (unmapped) runbook
+	// region stays honestly empty.
 	await pinned.getByTestId('service-edit-start').click();
-	await expect(pinned.getByTestId('service-edit-custom-instructions')).toHaveValue('');
+	await expect(pinned.getByTestId('service-edit-custom-instructions')).toHaveValue(
+		'This host scrapes via the tailnet address only.'
+	);
 	await expect(pinned.getByTestId('service-instructions')).toContainText(
 		'No runbook instructions recorded for this service.'
 	);
 	await expect(factRow).toContainText('Learned note for');
 });
 
-test('switching the selected service re-keys the notes and never leaks reads across the server scope', async ({
+test('switching the selected service keeps the scope and the live epoch guard discards the stale read', async ({
 	page
 }) => {
 	const pinned = page.getByTestId('host-pinned');
@@ -2379,28 +2439,47 @@ test('switching the selected service re-keys the notes and never leaks reads acr
 		`fact-learned-${APP_ADOPTED.slice(0, 8)}`
 	);
 
-	// Select the OTHER server's adopted service: it is outside this
-	// panel's pinned server scope, so the notes area disappears (stale
-	// rows are gone with the unmounted component) and NO knowledge read
-	// may carry the foreign application id.
-	await apiCall(page, 'switchPinnedApplication', [APP_BETA]);
-	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveCount(0);
-	await expect(pinned.getByTestId('service-knowledge')).toHaveCount(0);
+	// Adopt a SECOND service on the SAME pinned server and refresh the
+	// inventory: the selection switch below stays IN SCOPE (both pins are
+	// SERVER_A identities), so the notes component stays mounted and its
+	// live scope-epoch guard is what actually gets exercised.
+	const SECOND_APP = '2c222222-2222-4222-8333-444455556666';
+	await apiCall(page, 'adoptSecondOnServerA', [SECOND_APP]);
+	await pinned.getByTestId('inventory-refresh').click();
+	await expect(
+		pinned.getByTestId('inventory-row').filter({ hasText: 'logs-stack' })
+	).toHaveCount(1);
 
-	// Selecting back re-keys the notes to the pinned row again with a
-	// fresh bounded read (two readKnowledge rounds for the same scope).
-	await apiCall(page, 'switchPinnedApplication', [APP_ADOPTED]);
+	// Arm the deferred knowledge gate: every subsequent read parks.
+	await apiCall(page, 'armKnowledgeDefer', []);
+
+	// A manual notes Reload parks THREE reads for the OLD scope; the pin
+	// switch then parks THREE more for the NEW scope — SAME component
+	// instance, epoch already moved on for the new scope.
+	await pinned.getByTestId('knowledge-reload').click();
+	await apiCall(page, 'switchPinnedApplication', [SECOND_APP]);
+
+	// Release FIFO: the STALE old-scope answers arrive FIRST. The epoch
+	// guard must discard them (they never paint); only the new scope's
+	// rows may render.
+	await apiCall(page, 'releaseKnowledgeAll', []);
 	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveAttribute(
 		'data-fact-id',
-		`fact-learned-${APP_ADOPTED.slice(0, 8)}`
+		`fact-learned-${SECOND_APP.slice(0, 8)}`
 	);
+	const ids = await pinned
+		.getByTestId('knowledge-fact-row')
+		.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-fact-id')));
+	for (const id of ids) expect(id).toBe(`fact-learned-${SECOND_APP.slice(0, 8)}`);
+	await expect(pinned.getByTestId('knowledge-status')).toContainText('Ready');
 
+	// Every recorded read stayed on the pinned server's two identities —
+	// nothing leaked to the other server's application.
 	const calls = await page.evaluate(() => window.__maiAppsApi?.knowledgeCalls ?? []);
 	expect(calls.filter((call) => call.applicationId === APP_BETA)).toHaveLength(0);
-	const readsForPinned = calls.filter(
-		(call) => call.applicationId === APP_ADOPTED && call.op === 'readKnowledge'
-	);
-	expect(readsForPinned.length).toBeGreaterThanOrEqual(2);
+	for (const call of calls) {
+		expect([APP_ADOPTED, SECOND_APP]).toContain(call.applicationId);
+	}
 });
 
 test('without the knowledge group the pinned service renders the honest unavailable notice', async ({
