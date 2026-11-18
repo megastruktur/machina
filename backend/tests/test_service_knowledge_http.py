@@ -25,7 +25,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -122,6 +121,8 @@ def app_client(
             "session_entries",
             "session_runs",
             "sessions",
+            "admin_sessions",
+            "admin_credential",
             "job_resource_locks",
         ):
             if conn.execute(
@@ -139,15 +140,17 @@ def app_client(
     # (ask_27): the routes below are served through the PRODUCTION
     # registration — the tests mount nothing. The ENTERED TestClient is
     # yielded so the lifespan (and its LISTEN connections) opens exactly
-    # once per test and closes on fixture teardown.
+    # once per module and closes on module teardown.
     with TestClient(app) as client:
         yield client
 
 
 @pytest.fixture(autouse=True)
-def _clean_tables(migrated_url: str) -> Iterator[None]:
-    """Per-test SQL isolation (inside the module-scoped client's
-    lifetime; the app holds no table state)."""
+def _clean_tables(app_client: TestClient, migrated_url: str) -> Iterator[None]:
+    """Per-test isolation: a clean cookie jar (no stale session/CSRF
+    across tests) and truncated SQL state — including the ADMIN AUTH
+    tables the login flow writes."""
+    app_client.cookies.clear()
     import psycopg
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
@@ -159,6 +162,8 @@ def _clean_tables(migrated_url: str) -> Iterator[None]:
             "session_entries",
             "session_runs",
             "sessions",
+            "admin_sessions",
+            "admin_credential",
             "job_resource_locks",
         ):
             if conn.execute(
@@ -320,7 +325,7 @@ class _DeferredEngine:
 
 
 def _admit_queued(
-    app: FastAPI,
+    client: TestClient,
     *,
     application_id: uuid.UUID = APP_MAIN_ID,
 ) -> tuple[uuid.UUID, uuid.UUID]:
@@ -331,7 +336,7 @@ def _admit_queued(
         TrustedSourceContext,
     )
 
-    operations: LearningOperationStore = app.app.state.learning_operations
+    operations: LearningOperationStore = client.app.state.learning_operations
     run_id = uuid.uuid4()
     tool_call_id = str(uuid.uuid4())
     trusted = TrustedSourceContext(
@@ -374,7 +379,7 @@ def _admit_queued(
     # on — a checkout on the _LOOP worker deadlocks db_engine.dispose().
     # The deferred seam never acknowledges: the row stays queued.
     try:
-        app.portal.call(_admit)
+        client.portal.call(_admit)
     except OperationAdmissionError as error:
         assert error.code == "enqueue_failed", error.code
     return operation_id, run_id
@@ -583,7 +588,7 @@ async def test_operations_page_and_status_filter(
 
 
 async def test_retract_auth_boundary(
-    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -622,7 +627,7 @@ async def test_retract_auth_boundary(
 
 
 async def test_retract_applies_and_stale_revision_conflicts(
-    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -727,7 +732,7 @@ async def test_retry_lifecycle_and_refusals(
 
 
 async def test_retry_refuses_cancelled_unknown_and_cross_scope(
-    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str
 ) -> None:
     cancelled_id, _run_a = _admit_queued(app_client)
     unknown_effect_id, _run_b = _admit_queued(app_client)
