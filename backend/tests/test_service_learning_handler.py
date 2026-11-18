@@ -18,8 +18,11 @@ import asyncio
 import json
 import os
 import pathlib
-import time
+import signal
+import subprocess
+import sys
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -1168,15 +1171,6 @@ def test_startup_recovery_sweep_is_bounded_and_idempotent(
     assert {row[0] for row in workflows} == {str(op) for op in run_ids}
     assert all(row[1] == 1 for row in workflows)
 
-    # Idempotent reattach: the promoted rows are now accepted (in-flight,
-    # owned by their executor) — the re-sweep visits but NEVER touches
-    # them and never re-enqueues (promoted stays 0).
-    visited_again, promoted_again = _recover_pending_learning(
-        runtime.operations, runtime.learn_engine_enqueue, page_limit=3
-    )
-    assert visited_again == 6
-    assert promoted_again == 0
-
     # Execution itself is the handler's proof (covered deterministically
     # by test_recovery_reenqueues_queued_operation): wait for the
     # engine to drain and assert no receipt was LOST or DUPLICATED.
@@ -1195,19 +1189,18 @@ def test_startup_recovery_sweep_is_bounded_and_idempotent(
                 "WHERE workflow_uuid = ANY(%s) ORDER BY workflow_uuid",
                 ([str(op) for op in run_ids],),
             ).fetchall()
-        errors: list[str] = []
-        for workflow_uuid, status, _error in flows:
-            if status != "SUCCESS":
-                try:
-                    runtime.learn_engine_client._client.retrieve_workflow(
-                        workflow_uuid
-                    ).get_result()
-                except BaseException as exc:  # noqa: BLE001 - diagnostic
-                    errors.append(f"{workflow_uuid}: {type(exc).__name__}: {exc}")
         raise AssertionError(
-            f"applied={applied} statuses={statuses} dbos={flows} "
-            f"exceptions={errors}"
+            f"applied={applied} statuses={statuses} dbos={flows}"
         )
+
+    # Idempotent reattach AFTER the drain: the pending set is empty —
+    # the re-sweep visits nothing and never re-enqueues (no duplicate
+    # work from repeated startups).
+    visited_again, promoted_again = _recover_pending_learning(
+        runtime.operations, runtime.learn_engine_enqueue, page_limit=3
+    )
+    assert (visited_again, promoted_again) == (0, 0)
+
     assert applied == 6
     # All six recovered receipts propose the IDENTICAL delta: the write
     # seam dedupes them — exactly ONE durable fact revision, never six.
@@ -1235,17 +1228,6 @@ def _statuses(url: str, operation_ids: list[uuid.UUID]) -> dict[str, str]:
     return {str(r[0]): str(r[1]) for r in rows}
 
 
-def _last_operation_id(url: str, run_id: uuid.UUID) -> uuid.UUID:
-    with psycopg.connect(url) as conn:
-        row = conn.execute(
-            "SELECT operation_id FROM service_learning_operation WHERE "
-            "source_run_id = %s",
-            (str(run_id),),
-        ).fetchone()
-    assert row is not None
-    return uuid.UUID(str(row[0]))
-
-
 def _applied_count(url: str, operation_ids: list[uuid.UUID]) -> int:
     with psycopg.connect(url) as conn:
         row = conn.execute(
@@ -1263,12 +1245,6 @@ def test_worker_process_recovers_pending_receipt_end_to_end(
     registers service.learn BEFORE the engine launches, runs the bounded
     startup sweep, executes the pending receipt exactly once, exits
     cleanly on SIGTERM."""
-    import os
-    import signal
-    import subprocess
-    import sys
-    import time as _time
-
     run_id = uuid.uuid4()
     ref = _seed_foreground_run(worker_url, factory, run_id)
     outcome = _admit(
@@ -1277,6 +1253,11 @@ def test_worker_process_recovers_pending_receipt_end_to_end(
     operation_id = outcome.operation_id
     assert _row(worker_url, operation_id)["status"] == "queued"
 
+    # ISOLATION: the in-process fixture engine is shut down for the
+    # duration so ONLY the subprocess worker can claim the recovered
+    # workflow; it relaunches in the finally block.
+    engine.shutdown()
+
     env = dict(os.environ)
     env["MAI_DATABASE_URL"] = worker_url
     env["MAI_DATA_ROOT"] = str(tmp_path / "data")
@@ -1284,30 +1265,34 @@ def test_worker_process_recovers_pending_receipt_end_to_end(
     env.pop("MAI_TEST_DATABASE_URL", None)
     env.pop("MAI_WORKER_HANDLERS", None)
 
+    stderr_path = tmp_path / "worker_stderr.log"
     proc = subprocess.Popen(
         [sys.executable, "-m", "mai.jobs.worker"],
         cwd=str(BACKEND_ROOT),
         env=env,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_path.open("w"),
     )
     try:
-        deadline = _time.monotonic() + 300
+        deadline = time.monotonic() + 300
         settled = 0
-        while _time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             durable = _row(worker_url, operation_id)
             if durable["status"] in ("applied", "failed"):
                 settled = 1
                 break
             if proc.poll() is not None:
                 break  # worker died: let the assertions below fail loudly
-            _time.sleep(0.5)
+            time.sleep(0.5)
         assert settled == 1, "the worker never settled the pending receipt"
+        # The startup sweep RAN (bounded, count-only summary in stderr):
+        assert "mai worker: learning recovery visited=1 promoted=1" in (
+            stderr_path.read_text()
+        )
         # Honest cross-process boundary (slice 36 carries the full
-        # payload): the worker's startup sweep re-enqueued the queued
-        # receipt with the deterministic workflow id, and the handler
-        # FAILED it closed — the admitted request/context is not
-        # resolvable in a fresh process. NO duplicate work, NO facts.
+        # payload): the handler FAILED the receipt closed — the admitted
+        # request/context is not resolvable in a fresh process. NO
+        # duplicate work, NO facts.
         assert durable["status"] == "failed", durable
         assert durable["error_code"] == "authority_revoked", durable
         assert _fact_count(worker_url, str(_FACT["statement"])) == 0
@@ -1320,4 +1305,6 @@ def test_worker_process_recovers_pending_receipt_end_to_end(
         except subprocess.TimeoutExpired:
             proc.kill()
             rc = proc.wait(timeout=30)
+    # Relaunch the module fixture engine for any remaining tests.
+    engine.launch_worker(worker_url)
     assert rc == 0  # clean SIGTERM shutdown after the sweep + execution

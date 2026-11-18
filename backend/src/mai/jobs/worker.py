@@ -182,7 +182,8 @@ def _recover_pending_learning(
     never reach the logs."""
     from mai.applications.learning_operations import LearningOperationStore
 
-    assert isinstance(operations, LearningOperationStore)
+    if not isinstance(operations, LearningOperationStore):
+        raise ValueError("operations must be a LearningOperationStore")
 
     async def _sweep() -> tuple[int, int]:
         visited = 0
@@ -204,7 +205,12 @@ def _recover_pending_learning(
             after_operation_id = page.next_after_operation_id
         return visited, promoted
 
-    return asyncio.run(_sweep())
+    # The startup sweep runs on the SAME persistent async-handler loop
+    # the DBOS async handlers execute on — never on a transient
+    # ``asyncio.run`` loop over the shared async sessionmaker pool
+    # (pooled connections are loop-bound).
+    loop = engine._async_handler_loop()
+    return asyncio.run_coroutine_threadsafe(_sweep(), loop).result()
 
 
 def _request_stop(signum: int, _frame: object) -> None:
