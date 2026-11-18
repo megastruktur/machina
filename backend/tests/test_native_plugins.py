@@ -1361,10 +1361,13 @@ class TestBuiltinOnepassword:
         return registry, runtime, dispatcher
 
     def _context(
-        self, *, credential_references: tuple[str, ...] = ("OP_SERVICE_ACCOUNT_TOKEN",)
+        self,
+        *,
+        principal: str = "fxt-principal",
+        credential_references: tuple[str, ...] = ("OP_SERVICE_ACCOUNT_TOKEN",),
     ) -> ExecutionContext:
         return ExecutionContext(
-            principal="fxt-principal",
+            principal=principal,
             server_id=SERVER_ID,
             run_id=RUN_ID,
             parent_scope=None,
@@ -1591,6 +1594,249 @@ class TestBuiltinOnepassword:
         assert bad.executor_ok is False
         assert bad.output is not None
         assert "invalid_credential_ref" in bad.output.text
+
+    # -- ask_08-secret-export: protected agent-created exports (D6/C6) --
+
+    def _write_operator_refs(self, data_root: Path) -> tuple[str, str, str]:
+        """Seed SSH / model / plugin operator credential refs under the
+        data root (the operator surfaces an agent export must never
+        overwrite)."""
+        server_dir = data_root / "servers" / str(uuid.uuid4())
+        server_dir.mkdir(parents=True)
+        (server_dir / "profile.yaml").write_text(
+            'schema_version: 1\n'
+            f'server_id: "{uuid.uuid4()}"\n'
+            "privilege: none\n"
+            "ssh:\n"
+            '  credential_ref: "MAI_SSH_KEY_PROD"\n',
+            encoding="utf-8",
+        )
+        connections = data_root / "models" / "connections"
+        connections.mkdir(parents=True)
+        (connections / "primary.json").write_text(
+            json.dumps({"name": "primary", "credential_ref": "MODEL_DB_PASS"}),
+            encoding="utf-8",
+        )
+        plugins_dir = data_root / "plugins"
+        plugins_dir.mkdir(parents=True)
+        (plugins_dir / "onepassword.yaml").write_text(
+            "schema_version: 1\n"
+            "plugin: onepassword\n"
+            "enabled: true\n"
+            "credential_refs:\n"
+            "  - PLUGIN_TOKEN\n",
+            encoding="utf-8",
+        )
+        return "MAI_SSH_KEY_PROD", "MODEL_DB_PASS", "PLUGIN_TOKEN"
+
+    def test_export_bootstrap_refs_refused_without_side_effects(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from mai.credentials.env import parse_env_text
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        bin_dir = _op_fixtures._install_fake_op(tmp_path)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        scenarios = (
+            (
+                "secret.get",
+                {"vault": OP_VAULT, "item": "test-item", "field": "api-key"},
+            ),
+            (
+                "secret.store",
+                {"vault": OP_VAULT, "title": "operator-item",
+                 "value": _op_fixtures.SENTINEL},
+            ),
+        )
+        for capability, base in scenarios:
+            for ref in ("OP_SERVICE_ACCOUNT_TOKEN", "MAI_DATABASE_URL", "PATH"):
+                outcome: DispatchOutcome = _run(
+                    dispatcher.dispatch(
+                        context=self._context(),
+                        capability_id=capability,
+                        payload={**base, "export_credential_ref": ref},
+                    )
+                )
+                assert outcome.executor_ok is False
+                assert outcome.output is not None
+                assert "credential_ref_protected" in outcome.output.text
+                assert _op_fixtures.SENTINEL not in outcome.output.text
+        # Zero side effects: no op invocation, no credentials.env write.
+        assert _op_fixtures._invocations(bin_dir) == []
+        assert not (data_root / "credentials.env").exists()
+        parse_env_text  # noqa: B018 - asserted via read-back in sibling tests
+
+    def test_export_operator_refs_refused(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        ssh_ref, model_ref, plugin_ref = self._write_operator_refs(data_root)
+        bin_dir = _op_fixtures._install_fake_op(tmp_path)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        for ref in (ssh_ref, model_ref, plugin_ref):
+            outcome: DispatchOutcome = _run(
+                dispatcher.dispatch(
+                    context=self._context(),
+                    capability_id="secret.get",
+                    payload={
+                        "vault": OP_VAULT,
+                        "item": "test-item",
+                        "field": "api-key",
+                        "export_credential_ref": ref,
+                    },
+                )
+            )
+            assert outcome.executor_ok is False
+            assert outcome.output is not None
+            assert "credential_ref_protected" in outcome.output.text
+            assert _op_fixtures.SENTINEL not in outcome.output.text
+        assert _op_fixtures._invocations(bin_dir) == []
+        assert not (data_root / "credentials.env").exists()
+
+    def test_agent_export_namespace_rules(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from mai.credentials.env import parse_env_text
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        bin_dir = _op_fixtures._install_fake_op(tmp_path)
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        server8 = SERVER_ID.hex[:8].upper()
+        run8 = RUN_ID.hex[:8].upper()
+        good_ref = f"MAI_AGENT_{server8}_{run8}_DB_PASS"
+
+        # Agent caller, valid server/run-owned ref: succeeds and reads back.
+        good: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal="agent"),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": good_ref,
+                },
+            )
+        )
+        assert good.executor_ok is True
+        assert good.output is not None
+        assert json.loads(good.output.text)["exported_credential_ref"] == good_ref
+        credentials_path = data_root / "credentials.env"
+        assert credentials_path.is_file()
+        assert (credentials_path.stat().st_mode & 0o777) == 0o600
+        assert parse_env_text(credentials_path.read_text(encoding="utf-8")) == {
+            good_ref: _op_fixtures.SENTINEL
+        }
+        assert EnvResolver(credentials_path).resolve(good_ref).value == (
+            _op_fixtures.SENTINEL
+        )
+
+        # Unscoped operator ref, another server's and another run's
+        # namespace: refused BEFORE any op call or env write.
+        refusals = (
+            ("OPERATOR_DB_PASS", "credential_ref_scope_mismatch"),
+            (
+                f"MAI_AGENT_{uuid.uuid4().hex[:8].upper()}_{run8}_DB_PASS",
+                "credential_ref_scope_mismatch",
+            ),
+            (
+                f"MAI_AGENT_{server8}_{uuid.uuid4().hex[:8].upper()}_DB_PASS",
+                "credential_ref_scope_mismatch",
+            ),
+            (good_ref, "credential_ref_collision"),
+        )
+        for ref, code in refusals:
+            outcome: DispatchOutcome = _run(
+                dispatcher.dispatch(
+                    context=self._context(principal="agent"),
+                    capability_id="secret.get",
+                    payload={
+                        "vault": OP_VAULT,
+                        "item": "test-item",
+                        "field": "api-key",
+                        "export_credential_ref": ref,
+                    },
+                )
+            )
+            assert outcome.executor_ok is False, ref
+            assert outcome.output is not None
+            assert code in outcome.output.text, (ref, outcome.output.text)
+            assert _op_fixtures.SENTINEL not in outcome.output.text
+        assert parse_env_text(credentials_path.read_text(encoding="utf-8")) == {
+            good_ref: _op_fixtures.SENTINEL
+        }
+
+        # Store-side refusals happen BEFORE `op item create`.
+        store_bad: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal="agent"),
+                capability_id="secret.store",
+                payload={
+                    "vault": OP_VAULT,
+                    "title": "agent-item",
+                    "generate": True,
+                    "export_credential_ref": "OPERATOR_DB_PASS",
+                },
+            )
+        )
+        assert store_bad.executor_ok is False
+        assert store_bad.output is not None
+        assert "credential_ref_scope_mismatch" in store_bad.output.text
+        assert not any(
+            record["argv"][:2] == ["item", "create"]
+            for record in _op_fixtures._invocations(bin_dir)
+        )
+
+    def test_agent_store_generation_export_persists_and_redacts(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from mai.credentials.env import parse_env_text
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
+        bin_dir = _op_fixtures._install_fake_op(tmp_path, items=[])
+        _registry, _runtime, dispatcher = self._compose(
+            tmp_path, monkeypatch, bin_dir=bin_dir
+        )
+        good_ref = (
+            f"MAI_AGENT_{SERVER_ID.hex[:8].upper()}_"
+            f"{RUN_ID.hex[:8].upper()}_DB_PASS"
+        )
+        outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal="agent"),
+                capability_id="secret.store",
+                payload={
+                    "vault": OP_VAULT,
+                    "title": "agent-db",
+                    "generate": True,
+                    "export_credential_ref": good_ref,
+                },
+            )
+        )
+        assert outcome.executor_ok is True
+        assert outcome.output is not None
+        document = json.loads(outcome.output.text)
+        assert document["status"] == "ok"
+        assert document["exported_credential_ref"] == good_ref
+        assert document["generated"] is True
+        credentials_path = data_root / "credentials.env"
+        stored = parse_env_text(credentials_path.read_text(encoding="utf-8"))
+        assert stored[good_ref]
+        assert stored[good_ref] != REDACTED
+        # The generated value itself never reaches the durable outcome.
+        assert REDACTED in outcome.output.text
+        assert stored[good_ref] not in outcome.output.text
+        _sweep(outcome.to_json(), stored[good_ref])
 
     def test_vault_allowlist_default_and_disabled_config(
         self, tmp_path: Path, monkeypatch: Any
