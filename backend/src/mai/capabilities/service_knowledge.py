@@ -393,7 +393,13 @@ def resolve_service_descriptor() -> CapabilityDescriptor:
                                 "name",
                                 "origin",
                                 "category",
-                                "revision",
+                                "installed",
+                                "map_revision",
+                                "generation",
+                                "service_revision",
+                                "knowledge_revision",
+                                "manual_identity",
+                                "auto_adopt_suppressed",
                             ],
                             "properties": {
                                 "application_id": {
@@ -406,8 +412,25 @@ def resolve_service_descriptor() -> CapabilityDescriptor:
                                 },
                                 "name": {"type": "string"},
                                 "origin": {"type": "string"},
+                                "compose_project": {
+                                    "type": ["string", "null"],
+                                },
+                                "working_dir": {
+                                    "type": ["string", "null"],
+                                },
+                                "unit_name": {
+                                    "type": ["string", "null"],
+                                },
                                 "category": {"type": "string"},
-                                "revision": {"type": "integer"},
+                                "installed": {"type": "boolean"},
+                                "map_revision": {"type": "integer"},
+                                "generation": {"type": "integer"},
+                                "service_revision": {"type": "integer"},
+                                "knowledge_revision": {"type": "integer"},
+                                "manual_identity": {"type": "boolean"},
+                                "auto_adopt_suppressed": {
+                                    "type": "boolean"
+                                },
                             },
                         },
                     },
@@ -474,7 +497,12 @@ def get_service_knowledge_descriptor() -> CapabilityDescriptor:
                     "application_id",
                     "found_in_map",
                     "generation",
+                    "service_revision",
+                    "knowledge_revision",
+                    "manual_identity",
+                    "auto_adopt_suppressed",
                     "conflict_count",
+                    "conflicts",
                     "facts",
                 ],
                 "properties": {
@@ -483,7 +511,21 @@ def get_service_knowledge_descriptor() -> CapabilityDescriptor:
                     "application_id": {"type": "string", "format": "uuid"},
                     "found_in_map": {"type": "boolean"},
                     "generation": {"type": "integer", "minimum": 1},
+                    "service_revision": {"type": "integer", "minimum": 0},
+                    "knowledge_revision": {"type": "integer", "minimum": 0},
+                    "manual_identity": {"type": "boolean"},
+                    "auto_adopt_suppressed": {"type": "boolean"},
+                    "name": {"type": ["string", "null"]},
+                    "origin": {"type": ["string", "null"]},
+                    "category": {"type": ["string", "null"]},
+                    "description": {"type": ["string", "null"]},
+                    "custom_instructions": {"type": ["string", "null"]},
+                    "instructions": {"type": ["object", "null"]},
+                    "installed": {"type": ["boolean", "null"]},
+                    "map_revision": {"type": ["integer", "null"]},
+                    "catalog_runbook": {"type": ["object", "null"]},
                     "conflict_count": {"type": "integer", "minimum": 0},
+                    "conflicts": {"type": "array"},
                     "facts": {"type": "object"},
                 },
             },
@@ -544,12 +586,28 @@ def get_learning_status_descriptor() -> CapabilityDescriptor:
             "output_schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["status", "found"],
+                "required": [
+                    "status",
+                    "found",
+                    "operation_id",
+                    "receipt_status",
+                    "payload_digest",
+                    "sub_effects",
+                    "accepted_at",
+                    "workflow_id",
+                ],
                 "properties": {
                     "status": {"type": "string", "enum": ["ok"]},
                     "found": {"type": "boolean"},
                     "operation_id": {"type": "string", "format": "uuid"},
                     "receipt_status": {"type": "string"},
+                    "payload_digest": {"type": "string"},
+                    "sub_effects": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "accepted_at": {"type": "string"},
+                    "workflow_id": {"type": "string"},
                 },
             },
             "execution_environments": ["controller"],
@@ -594,8 +652,8 @@ class ResolveServiceCapability:
         selector: Any = None
         selector_parts = {
             "compose_project": payload.compose_project,
-            "working_dir": payload.working_dir,
-            "unit_name": payload.unit_name,
+            "compose_directory": payload.working_dir,
+            "systemd_unit": payload.unit_name,
         }
         if any(value is not None for value in selector_parts.values()):
             from types import SimpleNamespace
@@ -749,9 +807,12 @@ class GetLearningStatusCapability:
         if receipt is None:
             envelope: dict[str, Any] = {"status": "ok", "found": False}
             return _ok_envelope(GET_LEARNING_STATUS_CAPABILITY_ID, envelope)
+        receipt_data = receipt.model_dump(mode="json")
+        receipt_status = receipt_data.pop("status")
         envelope = {
             "status": "ok",
             "found": True,
-            **receipt.model_dump(mode="json"),
+            "receipt_status": receipt_status,
+            **receipt_data,
         }
         return _ok_envelope(GET_LEARNING_STATUS_CAPABILITY_ID, envelope)

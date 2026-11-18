@@ -608,6 +608,14 @@ def test_learning_status_found_filters_and_honest_empty(
     )
     assert latest["found"] is True
     assert latest["operation_id"] == str(op_new)
+    # The receipt's own status travels as receipt_status; the envelope
+    # status stays "ok" (fix 2: no key collision).
+    assert latest["status"] == "ok"
+    assert latest["receipt_status"] == OperationStatus.APPLIED.value
+    assert latest["payload_digest"]
+    assert isinstance(latest["sub_effects"], dict)
+    assert latest["accepted_at"]
+    assert latest["workflow_id"]
 
     # Exact operation filter.
     by_op = json.loads(
@@ -653,7 +661,8 @@ def test_envelope_overflow_refused(
     factory: async_sessionmaker,
     map_store: ServiceMapStore,
 ) -> None:
-    _seed_map_entries(map_store)
+    # No map entry for APP_MAIN_ID: the knowledge read resolves through
+    # the SQL identity row seeded below (not_found guard satisfied).
     _run(
         _seed_identity(
             factory, server_id=SERVER_A, application_id=APP_MAIN_ID
@@ -709,5 +718,183 @@ def test_envelope_overflow_refused(
     envelope = json.loads(result.output)
     assert envelope["code"] == "envelope_overflow"
     assert len(result.output.encode("utf-8")) < 65536
-    # The stored facts are untouched (read-only capability).
-    assert map_store.get_entry(SERVER_A, APP_MAIN_ID) is None or True
+    # Read-only honesty: the store holds ONLY the seeded facts (2 x
+    # MAX_PAGE_LIMIT) and no writer touched the map in this test.
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM service_learned_fact WHERE "
+            "application_id = %s",
+            (str(APP_MAIN_ID),),
+        ).fetchone()[0]
+    assert fact_count == 2 * MAX_PAGE_LIMIT
+    assert map_store.list_entries(SERVER_A) == ()  # read-only: map untouched
+
+
+def test_resolve_selector_vocabulary_and_disambiguation(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker,
+    map_store: ServiceMapStore,
+) -> None:
+    """Fix 5a/5b: the selector vocabulary is compose_directory /
+    systemd_unit (the store's canonical selector attributes), and a
+    compose selector disambiguates by working directory."""
+    unit_entry = map_store.upsert_entry(
+        SERVER_A,
+        name="nginx",
+        category="proxy",
+        origin="systemd_unit",
+        unit_name="nginx.service",
+    )
+    compose_a = map_store.upsert_entry(
+        SERVER_A,
+        name="web-a",
+        category="web",
+        origin="compose",
+        compose_project="web",
+        working_dir="/srv/web-a",
+    )
+    compose_b = map_store.upsert_entry(
+        SERVER_A,
+        name="web-b",
+        category="web",
+        origin="compose",
+        compose_project="web",
+        working_dir="/srv/web-b",
+    )
+    descriptor = resolve_service_descriptor()
+    capability = _resolve_capability(factory, map_store)
+
+    def resolve(payload: dict[str, object]):
+        return json.loads(
+            _run(capability.__call__(_call(descriptor, payload))).output
+        )
+
+    # unit_name-only exact selector resolution on the systemd entry.
+    unit_resolution = resolve({"unit_name": "nginx.service"})
+    assert unit_resolution["exact_match"] is True
+    assert unit_resolution["match_kind"] == "exact_selector"
+    assert unit_resolution["total"] == 1
+    assert (
+        unit_resolution["candidates"][0]["application_id"]
+        == unit_entry.application_id
+    )
+
+    # compose_project + working_dir disambiguates across two entries
+    # sharing the same compose project.
+    compose_resolution = resolve(
+        {"compose_project": "web", "working_dir": "/srv/web-a"}
+    )
+    assert compose_resolution["exact_match"] is True
+    assert compose_resolution["match_kind"] == "exact_selector"
+    assert compose_resolution["total"] == 1
+    assert (
+        compose_resolution["candidates"][0]["application_id"]
+        == compose_a.application_id
+    )
+    assert (
+        compose_resolution["candidates"][0]["application_id"]
+        != compose_b.application_id
+    )
+
+    # A NON-matching working_dir against single compose entries is NOT
+    # an exact selector hit (the store falls back to the empty
+    # candidate page, total 0).
+    non_matching = resolve(
+        {"compose_project": "web", "working_dir": "/srv/web-zzz"}
+    )
+    assert non_matching["exact_match"] is False
+    assert non_matching["total"] == 0
+
+
+def test_learning_status_envelope_matches_descriptor_keys(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker,
+    map_store: ServiceMapStore,
+) -> None:
+    """Fix 5c: every emitted key of every successful envelope is declared
+    in its descriptor's output_schema properties and includes all
+    required keys."""
+    from mai.capabilities.dispatch import CapabilityCall
+    from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+    _seed_map_entries(map_store)
+    created_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    _run(
+        _seed_identity(factory, server_id=SERVER_A, application_id=APP_MAIN_ID)
+    )
+    _run(
+        _seed_fact(
+            factory,
+            fact_id=uuid.uuid4(),
+            server_id=SERVER_A,
+            application_id=APP_MAIN_ID,
+            generation=2,
+            created_at=created_at,
+        )
+    )
+    op_accepted = uuid.uuid4()
+    _run(_seed_operation(factory, operation_id=op_accepted,
+                         workflow_id="wf-acc",
+                         status=OperationStatus.ACCEPTED, accepted_at=created_at))
+
+    descriptors = _descriptors()
+
+    def invoke(descriptor, payload):
+        call = CapabilityCall(
+            descriptor=descriptor,
+            payload=dict(payload),
+            context=ExecutionContext(
+                principal="principal",
+                server_id=SERVER_A,
+                run_id=uuid.uuid4(),
+                parent_scope=None,
+                profile_revision="1",
+                prompt_revision="1",
+                credential_references=(),
+                allowed_capabilities=(),
+                mode=PolicyMode.DELEGATED,
+            ),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        executors = {
+            RESOLVE_SERVICE_CAPABILITY_ID: _resolve_capability(factory, map_store),
+            GET_SERVICE_KNOWLEDGE_CAPABILITY_ID: _knowledge_capability(factory, map_store),
+            GET_LEARNING_STATUS_CAPABILITY_ID: _status_capability(factory, map_store),
+        }
+        return _run(executors[descriptor.identifier](call))
+
+    resolve_env = json.loads(invoke(
+        descriptors[RESOLVE_SERVICE_CAPABILITY_ID], {"name_query": "traefik"}
+    ).output)
+    knowledge_env = json.loads(invoke(
+        descriptors[GET_SERVICE_KNOWLEDGE_CAPABILITY_ID],
+        {"application_id": str(APP_MAIN_ID)},
+    ).output)
+    status_env = json.loads(invoke(
+        descriptors[GET_LEARNING_STATUS_CAPABILITY_ID],
+        {"application_id": str(APP_MAIN_ID)},
+    ).output)
+
+    assert status_env["status"] == "ok"
+    assert status_env["found"] is True
+    assert status_env["receipt_status"] == OperationStatus.ACCEPTED.value
+    assert status_env["operation_id"]
+    assert status_env["payload_digest"]
+    assert isinstance(status_env["sub_effects"], dict)
+    assert status_env["accepted_at"]
+    assert status_env["workflow_id"]
+
+    for envelope, descriptor_id in (
+        (resolve_env, RESOLVE_SERVICE_CAPABILITY_ID),
+        (knowledge_env, GET_SERVICE_KNOWLEDGE_CAPABILITY_ID),
+        (status_env, GET_LEARNING_STATUS_CAPABILITY_ID),
+    ):
+        schema = descriptors[descriptor_id].output_schema
+        declared = set(schema["properties"])
+        required = set(schema["required"])
+        emitted = set(envelope)
+        assert emitted <= declared, (
+            f"{descriptor_id}: undeclared keys {emitted - declared}"
+        )
+        assert required <= emitted, (
+            f"{descriptor_id}: missing required keys {required - emitted}"
+        )
