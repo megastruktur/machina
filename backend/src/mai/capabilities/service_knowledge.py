@@ -586,16 +586,7 @@ def get_learning_status_descriptor() -> CapabilityDescriptor:
             "output_schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": [
-                    "status",
-                    "found",
-                    "operation_id",
-                    "receipt_status",
-                    "payload_digest",
-                    "sub_effects",
-                    "accepted_at",
-                    "workflow_id",
-                ],
+                "required": ["status", "found"],
                 "properties": {
                     "status": {"type": "string", "enum": ["ok"]},
                     "found": {"type": "boolean"},

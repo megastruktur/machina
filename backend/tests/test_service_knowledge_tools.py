@@ -873,6 +873,13 @@ def test_learning_status_envelope_matches_descriptor_keys(
         descriptors[GET_LEARNING_STATUS_CAPABILITY_ID],
         {"application_id": str(APP_MAIN_ID)},
     ).output)
+    # found=False (unknown application): the honest-empty envelope emits
+    # ONLY status + found — the receipt fields stay optional.
+    empty_env = json.loads(invoke(
+        descriptors[GET_LEARNING_STATUS_CAPABILITY_ID],
+        {"application_id": str(uuid.uuid4())},
+    ).output)
+    assert empty_env["found"] is False
 
     assert status_env["status"] == "ok"
     assert status_env["found"] is True
@@ -883,10 +890,20 @@ def test_learning_status_envelope_matches_descriptor_keys(
     assert status_env["accepted_at"]
     assert status_env["workflow_id"]
 
+    schema = descriptors[GET_LEARNING_STATUS_CAPABILITY_ID].output_schema
+    declared = set(schema["properties"])
+    required = set(schema["required"])
+    # found=True: the full receipt envelope — exactly the declared keys,
+    # including every required one.
+    assert set(status_env) == declared
+    assert required <= set(status_env)
+    # found=False: the honest-empty envelope still satisfies
+    # required <= emitted <= declared.
+    assert required <= set(empty_env) <= declared
+
     for envelope, descriptor_id in (
         (resolve_env, RESOLVE_SERVICE_CAPABILITY_ID),
         (knowledge_env, GET_SERVICE_KNOWLEDGE_CAPABILITY_ID),
-        (status_env, GET_LEARNING_STATUS_CAPABILITY_ID),
     ):
         schema = descriptors[descriptor_id].output_schema
         declared = set(schema["properties"])
