@@ -1740,3 +1740,293 @@ class TestRunbookSessionExecution:
         assert after["unknown_sessions"] == 0
         assert after["unknown_runs"] == 0
         assert after["unknown_facades"] == 0
+
+
+# ---------------------------------------------------------------------------
+# ask_18-http-writer-retrofit: suppression-before-removal, readopt
+# generation bumps and C4 lease contention on the HTTP writer routes.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_queued_learning_op(
+    apps_app: FastAPI, server_id: uuid.UUID, application_id: uuid.UUID
+) -> uuid.UUID:
+    """Leave one durable queued preservation op for the identity (a
+    failing engine fake never acknowledges, so the row stays queued)."""
+    from datetime import datetime, timezone
+
+    from mai.applications.knowledge_contracts import (
+        LearnRequest,
+        ProposedFactDelta,
+        TrustedSourceContext,
+    )
+    from mai.applications.learning_operations import (
+        LearningOperationStore,
+        OperationAdmissionError,
+    )
+
+    class _NoAckEngine:
+        async def __call__(self, workflow_id: str) -> None:
+            raise RuntimeError("simulated engine outage: no acknowledgment")
+
+    learning = LearningOperationStore(apps_app.state.session_factory)
+    run_id = uuid.uuid4()
+    trusted = TrustedSourceContext(
+        server_id=server_id,
+        run_id=run_id,
+        session_id=None,
+        tool_call_id="call-http-unadopt",
+        actor="agent:mai",
+        grants=["knowledge.learn"],
+        context_at=datetime.now(tz=timezone.utc),
+    )
+    request = LearnRequest(
+        facts=[
+            ProposedFactDelta(
+                category="runtime",
+                key="k",
+                statement="queued before http unadopt",
+                source_kind="tool_result",
+                source_refs=["00000000-0000-4000-8000-000000000001"],
+            )
+        ],
+        expected_generation=1,
+    )
+
+    async def go() -> None:
+        with pytest.raises(OperationAdmissionError) as err:
+            await learning.admit(
+                request=request,
+                trusted=trusted,
+                application_id=application_id,
+                engine_enqueue=_NoAckEngine(),
+            )
+        assert err.value.code == "enqueue_failed"
+
+    await go()
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-http-unadopt"
+    )
+
+
+def _knowledge_row(url: str, server_id: uuid.UUID, application_id: uuid.UUID):
+    with psycopg.connect(url) as conn:
+        return conn.execute(
+            "SELECT auto_adopt_suppressed, generation FROM "
+            "service_knowledge_identity WHERE server_id = %s AND "
+            "application_id = %s",
+            (str(server_id), str(application_id)),
+        ).fetchone()
+
+
+def _learning_op_row(url: str, operation_id: uuid.UUID):
+    with psycopg.connect(url) as conn:
+        return conn.execute(
+            "SELECT status, error_code FROM service_learning_operation "
+            "WHERE operation_id = %s",
+            (str(operation_id),),
+        ).fetchone()
+
+
+class TestMetadataGuardLifecycle:
+    """ask_18: DELETE tombstones BEFORE removal; stale revisions refuse
+    without a tombstone; re-adoption bumps the generation; a held
+    application lease makes every writer return 409."""
+
+    async def test_delete_suppresses_readopt_bumps(
+        self,
+        apps_app: FastAPI,
+        bootstrapped_url: str,
+        jar: dict[str, str],
+        server_a: uuid.UUID,
+    ) -> None:
+        application_id = uuid.uuid4()
+        created = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(application_id, name="guard-compose"),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+
+        queued = await _seed_queued_learning_op(
+            apps_app, server_a, application_id
+        )
+
+        # Stale revision: 409 WITHOUT a tombstone.
+        stale = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{application_id}",
+            json_body={"expected_revision": 99},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert stale.status == 409, stale.body
+        assert _knowledge_row(bootstrapped_url, server_a, application_id) is None
+
+        # Matching revision: 204 with suppression BEFORE removal, and the
+        # stale pending preservation cancelled as generation_superseded.
+        revoked = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{application_id}",
+            json_body={"expected_revision": 1},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert revoked.status == 204, revoked.body
+        row = _knowledge_row(bootstrapped_url, server_a, application_id)
+        assert row is not None
+        assert row[0] is True and row[1] == 1
+        op_row = _learning_op_row(bootstrapped_url, queued)
+        assert op_row is not None
+        assert op_row[0] == "failed" and op_row[1] == "generation_superseded"
+
+        # Explicit re-adoption clears the tombstone and bumps 1 -> 2.
+        re_adopted = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(application_id, name="guard-compose"),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert re_adopted.status == 201, re_adopted.body
+        row = _knowledge_row(bootstrapped_url, server_a, application_id)
+        assert row is not None
+        assert row[0] is False and row[1] == 2
+
+    async def test_manual_delete_tombstones_and_manual_readopt_bumps(
+        self,
+        apps_app: FastAPI,
+        bootstrapped_url: str,
+        jar: dict[str, str],
+        server_a: uuid.UUID,
+    ) -> None:
+        application_id = uuid.uuid4()
+        manual = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(
+                application_id, name="guard-manual", origin="manual"
+            ),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert manual.status == 201, manual.body
+
+        # No canonical record: the manual entry is tombstoned and deleted.
+        revoked = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{application_id}",
+            json_body={"expected_revision": 1},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert revoked.status == 204, revoked.body
+        row = _knowledge_row(bootstrapped_url, server_a, application_id)
+        assert row is not None
+        assert row[0] is True and row[1] == 1
+        store = apps_app.state.service_map
+        assert store.get_entry(server_a, application_id) is None
+
+        re_manual = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(
+                application_id, name="guard-manual", origin="manual"
+            ),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert re_manual.status == 201, re_manual.body
+        row = _knowledge_row(bootstrapped_url, server_a, application_id)
+        assert row is not None
+        assert row[0] is False and row[1] == 2
+
+    async def test_writers_refuse_under_lease_contention(
+        self,
+        apps_app: FastAPI,
+        bootstrapped_url: str,
+        jar: dict[str, str],
+        server_a: uuid.UUID,
+    ) -> None:
+        from mai.jobs.resource_locks import ResourceLockService
+
+        application_id = uuid.uuid4()
+        created = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(application_id, name="contention"),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert created.status == 201, created.body
+
+        holder = ResourceLockService(
+            bootstrapped_url, boot_id=str(uuid.uuid4())
+        )
+        holder.ensure_schema()
+        lease = holder.acquire(
+            str(server_a), f"application:{application_id}", owner_ref="recipe"
+        )
+
+        adopt_conflict = await call_app(
+            apps_app,
+            "POST",
+            _apps_root(server_a),
+            json_body=_adopt_body(
+                application_id, name="contention", expected_revision=1
+            ),
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert adopt_conflict.status == 409, adopt_conflict.body
+        assert adopt_conflict.json()["error"]["code"] == "conflict"
+
+        delete_conflict = await call_app(
+            apps_app,
+            "DELETE",
+            f"{_apps_root(server_a)}/{application_id}",
+            json_body={"expected_revision": 1},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert delete_conflict.status == 409, delete_conflict.body
+        assert delete_conflict.json()["error"]["code"] == "conflict"
+
+        execute_conflict = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(server_a)}/{application_id}/execute",
+            json_body={"action": "verify", "custom_instructions": "notes"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert execute_conflict.status == 409, execute_conflict.body
+        assert execute_conflict.json()["error"]["code"] == "conflict"
+
+        # The guarded refusals wrote NOTHING: revision stays 1.
+        entry = apps_app.state.service_map.get_entry(server_a, application_id)
+        assert entry is not None and entry.revision == 1
+
+        holder.release(lease)
+        notes_ok = await call_app(
+            apps_app,
+            "POST",
+            f"{_apps_root(server_a)}/{application_id}/execute",
+            json_body={"action": "verify", "custom_instructions": "notes"},
+            headers=_mutation_headers(jar),
+            cookies=jar,
+        )
+        assert notes_ok.status == 201, notes_ok.body  # queued run receipt
+        entry = apps_app.state.service_map.get_entry(server_a, application_id)
+        assert entry is not None and entry.revision == 2
+        assert entry.custom_instructions == "notes"

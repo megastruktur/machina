@@ -74,7 +74,7 @@ import asyncio
 import contextlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Final, Literal
@@ -119,6 +119,10 @@ from mai.agents.session_runner import (
 from mai.api.capability_defaults import resolve_default_capabilities
 from mai.auth.sessions import hash_token
 from mai.jobs.engine import RunIdInUseError
+from mai.jobs.resource_locks import (
+    ResourceLockError,
+    ResourceLockService,
+)
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
 
 from dbos import error as dbos_error
@@ -130,6 +134,12 @@ from mai.applications.adopt import (
     ApplicationAdoption,
     ApplicationManifestStore,
     AdoptedApplication,
+)
+from mai.applications.learning_operations import LearningOperationStore
+from mai.applications.metadata_mutations import (
+    MetadataMutationCoordinator,
+    MetadataMutationError,
+    MetadataMutationErrorCode,
 )
 from mai.applications.discover import (
     ApplicationOrigin,
@@ -731,6 +741,127 @@ def _map_store(request: Request) -> ServiceMapStore:
             "service map is unavailable",
         )
     return store
+
+
+def _learning_store(request: Request) -> LearningOperationStore:
+    """The cached identity/preservation seam (slice 14); fail closed."""
+    learning = getattr(request.app.state, "learning_operations", None)
+    if learning is None:
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "applications service is unavailable",
+        )
+    return learning
+
+
+def _metadata_coordinator(request: Request) -> MetadataMutationCoordinator:
+    """The per-app service-metadata coordinator (slice 16), resolved once
+    per app instance and cached on the app state (ask_18).
+
+    The lease service is resolved from the composed app state when
+    present, otherwise AUTO-DERIVED from the session factory's async
+    engine URL (sync driver form) and cached — the HTTP writers must
+    never run an unguarded mutation, and they must never bypass the C4
+    lease order (sorted ``application:<aid>`` leases first, then the
+    server ``service-metadata`` lease, then the short file/SQL
+    section)."""
+    coordinator = getattr(request.app.state, "metadata_coordinator", None)
+    if coordinator is not None:
+        return coordinator
+    map_store = getattr(request.app.state, "service_map", None)
+    session_factory = getattr(request.app.state, "session_factory", None)
+    locks = getattr(request.app.state, "resource_locks", None) or getattr(
+        request.app.state, "locks", None
+    )
+    if locks is None:
+        url = getattr(request.app.state, "database_url", None)
+        if url is None and session_factory is not None:
+            bind = getattr(session_factory, "kw", {}).get("bind")
+            bind_url = getattr(bind, "url", None)
+            if bind is not None and bind_url is not None:
+                url = (
+                    bind_url.render_as_string(hide_password=False)
+                    .replace("postgresql+asyncpg://", "postgresql://")
+                    .replace("postgres+asyncpg://", "postgresql://")
+                )
+        if url is not None:
+            cached_locks = getattr(request.app.state, "_ask_resource_locks", None)
+            if cached_locks is None:
+                cached_locks = ResourceLockService(str(url))
+                request.app.state._ask_resource_locks = cached_locks
+            locks = cached_locks
+    if map_store is None or session_factory is None or locks is None:
+        # Fail closed: the writers never run unguarded (AC1).
+        raise BoundaryError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "unavailable",
+            "applications service is unavailable",
+        )
+    learning_store = getattr(request.app.state, "learning_operations", None)
+    if learning_store is None:
+        learning_store = LearningOperationStore(session_factory)
+        request.app.state.learning_operations = learning_store
+    coordinator = MetadataMutationCoordinator(
+        locks=locks,
+        map_store=map_store,
+        learning=learning_store,
+        adoption=getattr(request.app.state, "app_adoption", None),
+        sessions=session_factory,
+    )
+    request.app.state.metadata_coordinator = coordinator
+    return coordinator
+
+
+def _release_leases(
+    coordinator: MetadataMutationCoordinator,
+    held: Sequence[Any],
+) -> None:
+    """Release coordinator-acquired leases in reverse order through the
+    coordinator's own lock service (a lease that lapsed mid-operation
+    was already fenced by the touch)."""
+    lock_service = getattr(coordinator, "_locks", None)
+    for lease in reversed(tuple(held)):
+        if lock_service is None:
+            return
+        try:
+            lock_service.release(lease)
+        except ResourceLockError:
+            pass
+
+
+def _metadata_error(request: Request, error: MetadataMutationError) -> Response:
+    """Map one coordinator guard refusal onto the C01 envelope (AC 1)."""
+    if error.code is MetadataMutationErrorCode.INVALID_REQUEST:
+        return _validation_error(request, "body", error.detail)
+    return render_error_envelope(request, HTTP_409_CONFLICT, "conflict", error.detail)
+
+
+async def _identity_suppressed(
+    request: Request,
+    server_id: uuid.UUID,
+    application_id: uuid.UUID,
+) -> bool:
+    """True when the identity row exists and carries the auto-adopt
+    tombstone (absent row: NOT suppressed — creation paths are the
+    adoption seam's business)."""
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        return False
+    from sqlalchemy import text as _sql_text
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                _sql_text(
+                    "SELECT auto_adopt_suppressed FROM "
+                    "service_knowledge_identity WHERE server_id = :s "
+                    "AND application_id = :a"
+                ),
+                {"s": str(server_id), "a": str(application_id)},
+            )
+        ).first()
+    return row is not None and bool(row[0])
 
 
 def _application_id(value: str) -> uuid.UUID | None:
@@ -1403,36 +1534,53 @@ async def adopt_application(
         )
     except AdoptionError as error:
         return _adoption_error(request, error)
+    # ask_18 common guard: the canonical adoption + sidecar write run
+    # under the C4 lease set for this application (D4/C4). An explicit
+    # HTTP re-adoption of a tombstoned identity also READOPTS: clears the
+    # suppression and bumps the generation.
+    coordinator = _metadata_coordinator(request)
+    learning_store = _learning_store(request)
     try:
-        result = await adoption.adopt(store, composed)
-    except AdoptionError as error:
-        return _adoption_error(request, error)
-    # The Service Map sidecar: category/description/instructions persist
-    # for the adopted service (the map is the metadata catalogue over the
-    # C09 truth; a store rejection here surfaces, never a silent skip).
-    (
-        eff_category,
-        eff_description,
-        eff_instructions,
-        eff_custom,
-        eff_installed,
-    ) = _resolve_inherited_service_map_fields(
-        map_store, server_id, application_id, payload
-    )
-    entry = map_store.upsert_entry(
-        server_id,
-        name=payload.name,
-        category=eff_category,
-        origin=ApplicationOrigin(payload.origin).value,
-        application_id=application_id,
-        compose_project=payload.compose_project,
-        working_dir=payload.working_dir,
-        unit_name=payload.unit_name,
-        description=eff_description,
-        instructions=eff_instructions,
-        custom_instructions=eff_custom,
-        installed=eff_installed,
-    )
+        held_leases = coordinator.lease_set(server_id, [application_id])
+    except MetadataMutationError as error:
+        return _metadata_error(request, error)
+    try:
+        try:
+            result = await adoption.adopt(store, composed)
+        except AdoptionError as error:
+            return _adoption_error(request, error)
+        # The Service Map sidecar: category/description/instructions persist
+        # for the adopted service (the map is the metadata catalogue over the
+        # C09 truth; a store rejection here surfaces, never a silent skip).
+        (
+            eff_category,
+            eff_description,
+            eff_instructions,
+            eff_custom,
+            eff_installed,
+        ) = _resolve_inherited_service_map_fields(
+            map_store, server_id, application_id, payload
+        )
+        entry = map_store.upsert_entry(
+            server_id,
+            name=payload.name,
+            category=eff_category,
+            origin=ApplicationOrigin(payload.origin).value,
+            application_id=application_id,
+            compose_project=payload.compose_project,
+            working_dir=payload.working_dir,
+            unit_name=payload.unit_name,
+            description=eff_description,
+            instructions=eff_instructions,
+            custom_instructions=eff_custom,
+            installed=eff_installed,
+        )
+        if await _identity_suppressed(request, server_id, application_id):
+            await learning_store.readopt_service_identity(
+                server_id, application_id, manual_identity=False
+            )
+    finally:
+        _release_leases(coordinator, held_leases)
     record = await adoption.read(server_id, application_id)
     assert record is not None  # the pipeline just reconciled it
     return AdoptionCreated(
@@ -1463,30 +1611,47 @@ async def _adopt_manual_entry(
     write is an upsert; a documentation refusal/absence is reported
     honestly (``pending``) — the committed map entry is never rolled
     back for it.
+
+    ask_18: the map write runs under the C4 lease set for this
+    application, and an explicit HTTP re-adoption of a tombstoned
+    identity READOPTS (clears the suppression, bumps the generation).
     """
-    (
-        eff_category,
-        eff_description,
-        eff_instructions,
-        eff_custom,
-        eff_installed,
-    ) = _resolve_inherited_service_map_fields(
-        map_store, server_id, application_id, payload
-    )
-    entry = map_store.upsert_entry(
-        server_id,
-        name=payload.name,
-        category=eff_category,
-        origin="manual",
-        application_id=application_id,
-        compose_project=payload.compose_project,
-        working_dir=payload.working_dir,
-        unit_name=payload.unit_name,
-        description=eff_description,
-        instructions=eff_instructions,
-        custom_instructions=eff_custom,
-        installed=eff_installed,
-    )
+    coordinator = _metadata_coordinator(request)
+    learning_store = _learning_store(request)
+    try:
+        held_leases = coordinator.lease_set(server_id, [application_id])
+    except MetadataMutationError as error:
+        return _metadata_error(request, error)
+    try:
+        (
+            eff_category,
+            eff_description,
+            eff_instructions,
+            eff_custom,
+            eff_installed,
+        ) = _resolve_inherited_service_map_fields(
+            map_store, server_id, application_id, payload
+        )
+        entry = map_store.upsert_entry(
+            server_id,
+            name=payload.name,
+            category=eff_category,
+            origin="manual",
+            application_id=application_id,
+            compose_project=payload.compose_project,
+            working_dir=payload.working_dir,
+            unit_name=payload.unit_name,
+            description=eff_description,
+            instructions=eff_instructions,
+            custom_instructions=eff_custom,
+            installed=eff_installed,
+        )
+        if await _identity_suppressed(request, server_id, application_id):
+            await learning_store.readopt_service_identity(
+                server_id, application_id, manual_identity=True
+            )
+    finally:
+        _release_leases(coordinator, held_leases)
     return AdoptionCreated(
         intent_id=str(uuid.uuid5(application_id, "service-map:manual-adoption")),
         application_id=entry.application_id,
@@ -1757,17 +1922,81 @@ async def revoke_application(
     _require_csrf(request)  # layer 3
     store = _store(request)
     adoption = _adoption(request)
+    map_store = _map_store(request)
+    # ask_18 common guard: the removal runs under the C4 lease set, and
+    # the auto-adopt tombstone is persisted BEFORE the canonical revoke
+    # (suppression-before-removal, D4) — a stale revision refuses
+    # WITHOUT setting a premature tombstone. A canonically adopted
+    # entry's Service Map sidecar is deliberately RETAINED (non-
+    # destructive, C09 rule 6); a MANUAL entry is tombstoned and
+    # deleted by this route.
+    coordinator = _metadata_coordinator(request)
+    learning_store = _learning_store(request)
     _canonical_profile(request, server_id)
     try:
-        await adoption.revoke(
-            store,
-            server_id,
-            application_id,
-            expected_revision=payload.expected_revision,
-        )
-    except AdoptionError as error:
-        return _adoption_error(request, error)
-    return Response(status_code=HTTP_204_NO_CONTENT)
+        held_leases = coordinator.lease_set(server_id, [application_id])
+    except MetadataMutationError as error:
+        return _metadata_error(request, error)
+    try:
+        record = await adoption.read(server_id, application_id)
+        if record is not None:
+            if record.revision != payload.expected_revision:
+                # Stale caller: revoke raises STALE_REVISION (409) and no
+                # tombstone has been set.
+                try:
+                    await adoption.revoke(
+                        store,
+                        server_id,
+                        application_id,
+                        expected_revision=payload.expected_revision,
+                    )
+                except AdoptionError as error:
+                    return _adoption_error(request, error)
+                return Response(status_code=HTTP_204_NO_CONTENT)
+            await learning_store.suppress_for_unadopt(server_id, application_id)
+            try:
+                await adoption.revoke(
+                    store,
+                    server_id,
+                    application_id,
+                    expected_revision=payload.expected_revision,
+                )
+            except AdoptionError as error:
+                return _adoption_error(request, error)
+            return Response(status_code=HTTP_204_NO_CONTENT)
+        manual_entry = map_store.get_entry(server_id, application_id)
+        if manual_entry is not None and manual_entry.origin == "manual":
+            if manual_entry.revision != payload.expected_revision:
+                return render_error_envelope(
+                    request,
+                    HTTP_409_CONFLICT,
+                    "conflict",
+                    (
+                        f"stale revision: expected {payload.expected_revision}, "
+                        f"current is {manual_entry.revision}"
+                    ),
+                )
+            await learning_store.suppress_for_unadopt(server_id, application_id)
+            map_store.delete_entry(
+                server_id,
+                application_id,
+                expected_revision=manual_entry.revision,
+            )
+            return Response(status_code=HTTP_204_NO_CONTENT)
+        # Neither a canonical record nor a manual entry: the canonical
+        # revoke raises NOT_FOUND (404) — never a fabricated success.
+        try:
+            await adoption.revoke(
+                store,
+                server_id,
+                application_id,
+                expected_revision=payload.expected_revision,
+            )
+        except AdoptionError as error:
+            return _adoption_error(request, error)
+        return Response(status_code=HTTP_204_NO_CONTENT)
+    finally:
+        _release_leases(coordinator, held_leases)
 
 
 @router.post(
@@ -2311,39 +2540,46 @@ async def execute_runbook(
             "no service map entry or catalog runbook is stored under this id",
         )
 
-    try:
-        if payload.custom_instructions is not None:
+    # ask_18 common guard: the operator-notes writes run under the C4
+    # lease set (a tombstoned service is never implicitly re-adopted by
+    # a runbook execution — staging a catalog-only target keeps
+    # ``installed=False`` + ``origin="manual"`` under its own lease).
+    if payload.custom_instructions is not None:
+        coordinator = _metadata_coordinator(request)
+        try:
             if entry is not None:
-                # Persist the per-server notes (revision-bumped upsert).
-                entry = map_store.upsert_entry(
+                # Persist the per-server notes through the CAS guard.
+                await coordinator.update_entry_metadata(
                     server_id,
-                    name=entry.name,
-                    category=entry.category,
-                    origin=entry.origin,
-                    application_id=uuid.UUID(entry.application_id),
-                    compose_project=entry.compose_project,
-                    working_dir=entry.working_dir,
-                    unit_name=entry.unit_name,
-                    description=entry.description,
-                    instructions=entry.instructions,
+                    uuid.UUID(entry.application_id),
+                    expected_revision=entry.revision,
                     custom_instructions=payload.custom_instructions,
                 )
+                entry = map_store.get_entry(server_id, application_id)
             else:
-                # Stage the catalog runbook on this server: an explicit
-                # installed=False entry carrying the operator's notes.
-                entry = map_store.upsert_entry(
-                    server_id,
-                    name=runbook.name,
-                    category=runbook.category,
-                    origin="manual",
-                    application_id=uuid.UUID(runbook.runbook_id),
-                    description=runbook.description,
-                    instructions=runbook.instructions,
-                    custom_instructions=payload.custom_instructions,
-                    installed=False,
+                held_leases = coordinator.lease_set(
+                    server_id, [uuid.UUID(runbook.runbook_id)]
                 )
-    except ServiceMapError as error:
-        return _validation_error(request, "custom_instructions", error.detail)
+                try:
+                    # Stage the catalog runbook on this server: an explicit
+                    # installed=False entry carrying the operator's notes.
+                    entry = map_store.upsert_entry(
+                        server_id,
+                        name=runbook.name,
+                        category=runbook.category,
+                        origin="manual",
+                        application_id=uuid.UUID(runbook.runbook_id),
+                        description=runbook.description,
+                        instructions=runbook.instructions,
+                        custom_instructions=payload.custom_instructions,
+                        installed=False,
+                    )
+                finally:
+                    _release_leases(coordinator, held_leases)
+        except MetadataMutationError as error:
+            return _metadata_error(request, error)
+        except ServiceMapError as error:
+            return _validation_error(request, "custom_instructions", error.detail)
 
     effective = entry
     if effective is None:
