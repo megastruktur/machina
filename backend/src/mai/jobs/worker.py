@@ -30,21 +30,181 @@ Signals: ``SIGTERM``/``SIGINT`` stop the engine cleanly (exit 0);
 from __future__ import annotations
 
 import argparse
+import asyncio
+import dataclasses
 import importlib
 import os
 import signal
 import sys
 import threading
+import uuid
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Final
 
 from mai.database import resolve_database_url
 from mai.jobs import engine
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Awaitable
+
+    from mai.applications.learning_operations import LearningOperationStore
     from mai.research.pages import WebPageCapability
 
 _STOP = threading.Event()
+
+#: Bounded startup recovery: at most this many keyset-cursor pages per
+#: startup sweep (each page ``_LEARNING_RECOVERY_PAGE_LIMIT`` receipts) —
+#: a startup sweep is a reconciliation enumeration, never an unbounded loop.
+_LEARNING_RECOVERY_MAX_PAGES: Final[int] = 8
+_LEARNING_RECOVERY_PAGE_LIMIT: Final[int] = 25
+
+
+@dataclasses.dataclass(frozen=True)
+class ServiceLearningRuntime:
+    """The ask_25 worker-side knowledge/learning dependency family —
+    created ONCE per worker process and shared by the ``service.learn``
+    handler and the internal-API capability lane (API/worker parity;
+    no module-level mutable singletons)."""
+
+    operations: Any  # LearningOperationStore
+    knowledge_read: Any  # KnowledgeReadStore
+    coordinator: Any  # MetadataMutationCoordinator
+    learn_engine_client: Any  # EngineClient (bare queue client)
+    learn_engine_enqueue: Any  # Callable[[str], Awaitable[None]]
+
+
+def compose_service_learning_runtime(
+    *,
+    database_url: str,
+    sessions: Any,
+    service_map_store: Any,
+    adoption_service: Any,
+    manifest_store: Any,
+    docs_indexer: Any,
+) -> ServiceLearningRuntime | None:
+    """Compose the ask_22 ``service.learn`` handler plus the SAME
+    knowledge/coordinator/operation dependency family as the API lane,
+    and REGISTER the handler.
+
+    Called BEFORE the durable engine launches (``main`` runs this inside
+    ``_configure_default_agent_runtime``, ahead of
+    ``engine.launch_worker``): the handler is registered in the engine's
+    run-handler table first, so a workflow claimed at launch-recovery
+    time already resolves it. Honest degradation: without a Service Map
+    store the runtime is ``None`` and nothing registers.
+    """
+    from mai.applications.knowledge_read import KnowledgeReadStore
+    from mai.applications.knowledge_write import KnowledgeWriteStore
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+    from mai.jobs.engine import EngineClient
+    from mai.jobs.resource_locks import ResourceLockService
+    from mai.jobs.service_learning import (
+        ServiceLearningHandler,
+        build_engine_enqueue,
+        register_service_learning_handler,
+    )
+
+    if service_map_store is None:
+        # Honest degradation: the handler and the knowledge read both
+        # require the confined Service Map store.
+        return None
+
+    learning_operations = LearningOperationStore(sessions)
+    knowledge_read = KnowledgeReadStore(sessions, service_map_store)
+    coordinator = MetadataMutationCoordinator(
+        locks=ResourceLockService(database_url),
+        map_store=service_map_store,
+        learning=learning_operations,
+        adoption=adoption_service,
+        sessions=sessions,
+    )
+    learn_engine_client = EngineClient(database_url)
+
+    def _payload_resolver(operation_id: uuid.UUID) -> Any:
+        """Embed the admitted (request, trusted) context from THIS
+        process's admission registry into the durable enqueue payload,
+        so the handler consumes them from the PAYLOAD (cross-process
+        the registry is empty — the payload is the only carrier until
+        slice 36's full-payload binding). A registry miss answers the
+        minimal document; the handler then fails the operation closed
+        (never a blind apply)."""
+        registry = getattr(learning_operations, "_contexts", None)
+        stored = (
+            registry.get(operation_id) if isinstance(registry, dict) else None
+        )
+        if stored is None:
+            return None
+        request, trusted = stored
+        from mai.jobs.service_learning import ServiceLearningPayload
+
+        return ServiceLearningPayload(
+            operation_id=operation_id,
+            server_id=trusted.server_id,
+            request=request,
+            trusted=trusted,
+        )
+
+    learn_engine_enqueue = build_engine_enqueue(
+        learn_engine_client, payload_resolver=_payload_resolver
+    )
+    handler = ServiceLearningHandler(
+        operations=learning_operations,
+        coordinator=coordinator,
+        knowledge_write=KnowledgeWriteStore(sessions),
+        map_store=service_map_store,
+        sessions=sessions,
+        manifest_store=manifest_store,
+        docs_indexer=docs_indexer,
+    )
+    register_service_learning_handler(handler)
+    return ServiceLearningRuntime(
+        operations=learning_operations,
+        knowledge_read=knowledge_read,
+        coordinator=coordinator,
+        learn_engine_client=learn_engine_client,
+        learn_engine_enqueue=learn_engine_enqueue,
+    )
+
+
+def _recover_pending_learning(
+    operations: LearningOperationStore,
+    enqueue: Callable[[str], Awaitable[None]],
+    *,
+    page_limit: int = _LEARNING_RECOVERY_PAGE_LIMIT,
+) -> tuple[int, int]:
+    """One bounded startup receipt-recovery sweep.
+
+    Keyset-cursor pages (deterministic workflow ids; idempotent
+    replay/reattach through the store's own discipline) until the
+    pending set drains or the page cap hits — never an unbounded loop.
+    Returns ``(visited, promoted)``: value-free counts only; receipts
+    never reach the logs."""
+    from mai.applications.learning_operations import LearningOperationStore
+
+    assert isinstance(operations, LearningOperationStore)
+
+    async def _sweep() -> tuple[int, int]:
+        visited = 0
+        promoted = 0
+        after_accepted_at = None
+        after_operation_id = None
+        for _page in range(_LEARNING_RECOVERY_MAX_PAGES):
+            page = await operations.recover_pending_batch(
+                limit=page_limit,
+                after_accepted_at=after_accepted_at,
+                after_operation_id=after_operation_id,
+                engine_enqueue=enqueue,
+            )
+            visited += len(page.receipts)
+            promoted += page.promoted
+            if not page.has_more:
+                break
+            after_accepted_at = page.next_after_accepted_at
+            after_operation_id = page.next_after_operation_id
+        return visited, promoted
+
+    return asyncio.run(_sweep())
 
 
 def _request_stop(signum: int, _frame: object) -> None:
@@ -101,11 +261,18 @@ def _build_web_read_capability(
     return WebPageCapability(provider)
 
 
-def _configure_default_agent_runtime(database_url: str) -> None:
-    """Wire the session-first runtime handlers when ``MAI_DATA_ROOT`` is set."""
+def _configure_default_agent_runtime(
+    database_url: str,
+) -> ServiceLearningRuntime | None:
+    """Wire the session-first runtime handlers when ``MAI_DATA_ROOT`` is set.
+
+    Returns the ask_25 service-learning runtime (handler registered, shared
+    dependency family) or ``None`` when the data root / Service Map store is
+    unavailable — the caller runs the bounded startup recovery sweep with it
+    AFTER the durable engine launches."""
     data_root_raw = os.environ.get("MAI_DATA_ROOT", "").strip()
     if not data_root_raw:
-        return
+        return None
     from pathlib import Path
     import uuid
 
@@ -339,6 +506,29 @@ def _configure_default_agent_runtime(database_url: str) -> None:
     # listing, Service Map CRUD) becomes a worker-registered executor
     # automatically through the ONE shared builder. Fails closed with 503
     # when any service is absent.
+    # ask_25: the service.learn handler + the SAME knowledge/coordinator/
+    # operation dependency family as the API lane — composed ONCE here and
+    # registered BEFORE the durable engine launches (main() invokes this
+    # function ahead of ``engine.launch_worker``).
+    service_learning_runtime: ServiceLearningRuntime | None = None
+    if service_map_store is not None:
+        try:
+            service_learning_runtime = compose_service_learning_runtime(
+                database_url=database_url,
+                sessions=sessions,
+                service_map_store=service_map_store,
+                adoption_service=app_adoption_service,
+                manifest_store=app_manifest_store,
+                docs_indexer=doc_indexer,
+            )
+        except Exception as exc:  # noqa: BLE001 - value-free startup warning
+            print(
+                "mai worker: service learning composition failed: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     internal_api = build_internal_api_capabilities(
         applications=app_manifest_store,
         adoption=app_adoption_service,
@@ -348,6 +538,26 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         data_root=data_root,
         env_resolver=lambda: _resolve_env(),
         doc_indexer=doc_indexer,
+        metadata_coordinator=(
+            service_learning_runtime.coordinator
+            if service_learning_runtime is not None
+            else None
+        ),
+        knowledge_read=(
+            service_learning_runtime.knowledge_read
+            if service_learning_runtime is not None
+            else None
+        ),
+        learning_operations=(
+            service_learning_runtime.operations
+            if service_learning_runtime is not None
+            else None
+        ),
+        learn_engine_enqueue=(
+            service_learning_runtime.learn_engine_enqueue
+            if service_learning_runtime is not None
+            else None
+        ),
     )
     for desc in internal_api.descriptors:
         registry.register(desc)
@@ -728,6 +938,7 @@ def _configure_default_agent_runtime(database_url: str) -> None:
         # the session runner in this process.
         if exc.reason != "already_configured":
             raise
+    return service_learning_runtime
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -759,8 +970,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rc != 0:
         return rc
 
+    runtime: ServiceLearningRuntime | None = None
     try:
-        _configure_default_agent_runtime(database_url)
+        runtime = _configure_default_agent_runtime(database_url)
     except Exception as exc:  # noqa: BLE001 - log non-fatal runtime init warning
         print(
             f"mai worker: agent runtime init warning: {type(exc).__name__}",
@@ -781,9 +993,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
+    # ask_25: bounded startup receipt-recovery sweep — AFTER the launch,
+    # through the SAME learn enqueue seam (deterministic workflow ids;
+    # idempotent replay/reattach; the existing engine remains the sole
+    # owner and claims the re-enqueued runs). Count-only summary line:
+    # receipts never reach the logs.
+    if runtime is not None:
+        try:
+            visited, promoted = _recover_pending_learning(
+                runtime.operations, runtime.learn_engine_enqueue
+            )
+            if visited or promoted:
+                print(
+                    f"mai worker: learning recovery visited={visited} "
+                    f"promoted={promoted}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - non-fatal; next startup
+            print(
+                "mai worker: learning recovery failed: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     print("mai worker: ready", file=sys.stderr, flush=True)
     _STOP.wait()
     engine.shutdown()
+    if runtime is not None:
+        runtime.learn_engine_client.close()
     print("mai worker: stopped", file=sys.stderr, flush=True)
     return 0
 

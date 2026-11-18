@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import pathlib
+import time
 import threading
 import uuid
 from collections.abc import Iterator
@@ -97,10 +98,13 @@ def _drop_schemas(url: str) -> None:
         conn.execute("DROP SCHEMA IF EXISTS dbos CASCADE")
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def worker_url() -> Iterator[str]:
-    """Migrate the disposable DB, launch the REAL DBOS worker, and
-    restore pre-bootstrap state afterwards."""
+    """Migrate the disposable DB and launch the REAL DBOS worker ONCE for
+    this module. Module-scope teardown (engine shutdown + schema drop)
+    runs BEFORE the next module's module-scoped fixtures start, so this
+    composes with the other engine-launching suites in one pytest
+    process."""
     url = os.environ.get(LIVE_URL_VAR)
     if not url:
         pytest.skip(
@@ -117,7 +121,7 @@ def worker_url() -> Iterator[str]:
             os.environ.pop("MAI_DATABASE_URL", None)
         else:
             os.environ["MAI_DATABASE_URL"] = previous
-    engine.launch_worker(url)  # engine-owned dbos schema + queue claim
+    engine.launch_worker(url)  # engine-owned dbos schema + queue claims
     try:
         yield url
     finally:
@@ -159,6 +163,15 @@ def _clean_tables(worker_url: str) -> Iterator[None]:
         conn.execute(
             "TRUNCATE TABLE " + ", ".join(targets) + " CASCADE"
         )
+        # DBOS system rows are NOT app tables: stale PENDING workflows
+        # from a previous test would be launch-recovered by the next
+        # live engine (their domain rows are already truncated —
+        # recovered runs would answer unknown_operation and deadlock
+        # fresh admissions). Purge them per test.
+        if conn.execute(
+            "SELECT to_regclass('dbos.workflow_status')"
+        ).fetchone()[0]:
+            conn.execute("DELETE FROM dbos.workflow_status")
     yield
 
 
@@ -1042,3 +1055,269 @@ def test_docs_resume_reads_persisted_fact_ids(
     assert seen_app == APP_MAIN_ID
     assert {str(fid) for fid in seen_ids} == set(committed_ids)
     assert {str(fid) for fid in seen_ids} == _fact_ids(worker_url)
+
+
+# ---------------------------------------------------------------------------
+# ask_25: worker composition — registration before launch, API parity,
+# bounded idempotent startup recovery
+# ---------------------------------------------------------------------------
+
+
+def test_worker_composition_registers_handler_and_shares_instances(
+    tmp_path: pathlib.Path, worker_url: str, factory: async_sessionmaker
+) -> None:
+    from mai.jobs import engine as jobs_engine
+    from mai.jobs.worker import compose_service_learning_runtime
+
+    map_store = ServiceMapStore(tmp_path / "service_map")
+    adoption = ApplicationAdoption(factory)
+    manifest = ApplicationManifestStore(tmp_path / "manifests")
+
+    runtime = compose_service_learning_runtime(
+        database_url=worker_url,
+        sessions=factory,
+        service_map_store=map_store,
+        adoption_service=adoption,
+        manifest_store=manifest,
+        docs_indexer=None,
+    )
+    assert runtime is not None
+    # The dependency family is ONE instance set (identity, not copies).
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+
+    assert isinstance(runtime.operations, LearningOperationStore)
+    assert isinstance(runtime.coordinator, MetadataMutationCoordinator)
+    assert runtime.coordinator._learning is runtime.operations
+    assert runtime.coordinator._map_store is map_store
+    assert runtime.coordinator._adoption is adoption
+    assert runtime.coordinator._sessions is factory
+    assert runtime.knowledge_read._sessions is factory
+    assert runtime.knowledge_read._map_store is map_store
+
+    # The ask_22 handler is registered in the engine's run-handler table
+    # by composition alone — NO durable engine launch happened here.
+    assert "service.learn" in jobs_engine._RUN_HANDLERS
+
+    # Honest degradation: without a Service Map store the runtime is
+    # None and nothing composes.
+    assert (
+        compose_service_learning_runtime(
+            database_url=worker_url,
+            sessions=factory,
+            service_map_store=None,
+            adoption_service=adoption,
+            manifest_store=manifest,
+            docs_indexer=None,
+        )
+        is None
+    )
+
+
+def test_startup_recovery_sweep_is_bounded_and_idempotent(
+    tmp_path: pathlib.Path, worker_url: str, factory: async_sessionmaker
+) -> None:
+    from mai.jobs.worker import _recover_pending_learning, compose_service_learning_runtime
+
+    runtime = compose_service_learning_runtime(
+        database_url=worker_url,
+        sessions=factory,
+        service_map_store=ServiceMapStore(tmp_path / "service_map"),
+        adoption_service=ApplicationAdoption(factory),
+        manifest_store=ApplicationManifestStore(tmp_path / "manifests"),
+        docs_indexer=None,
+    )
+    assert runtime is not None
+
+    # The identity row EXISTS before the six concurrent applies: the
+    # write seam's SELECT ... FOR UPDATE then SERIALIZES them (a missing
+    # row gives the lock nothing to hold and two transactions lose the
+    # initial INSERT race — knowledge_write.py identity creation).
+    with psycopg.connect(worker_url, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO service_knowledge_identity "
+            "(server_id, application_id, generation) VALUES (%s, %s, 1) "
+            "ON CONFLICT DO NOTHING",
+            (str(SERVER_A), str(APP_MAIN_ID)),
+        )
+
+    # 6 admitted-but-never-acknowledged receipts; page limit 3 → the
+    # bounded sweep MUST page (3 + 3 ≤ the 8-page cap).
+    run_ids: list[uuid.UUID] = []
+    for _index in range(6):
+        run_id = uuid.uuid4()
+        ref = _seed_foreground_run(worker_url, factory, run_id)
+        outcome = _admit(
+            runtime.operations, _DeferredEngine(), run_id=run_id, ref=ref
+        )
+        run_ids.append(outcome.operation_id)
+    assert _pending_count(worker_url, run_ids) == 6
+
+    visited, promoted = _recover_pending_learning(
+        runtime.operations, runtime.learn_engine_enqueue, page_limit=3
+    )
+    assert visited == 6
+    assert promoted == 6
+
+    # Deterministic workflow ids, durably enqueued EXACTLY once each.
+    with psycopg.connect(worker_url) as conn:
+        workflows = conn.execute(
+            "SELECT workflow_uuid, count(*) FROM dbos.workflow_status "
+            "WHERE workflow_uuid = ANY(%s) GROUP BY workflow_uuid",
+            ([str(op) for op in run_ids],),
+        ).fetchall()
+    assert {row[0] for row in workflows} == {str(op) for op in run_ids}
+    assert all(row[1] == 1 for row in workflows)
+
+    # Idempotent reattach: the promoted rows are now accepted (in-flight,
+    # owned by their executor) — the re-sweep visits but NEVER touches
+    # them and never re-enqueues (promoted stays 0).
+    visited_again, promoted_again = _recover_pending_learning(
+        runtime.operations, runtime.learn_engine_enqueue, page_limit=3
+    )
+    assert visited_again == 6
+    assert promoted_again == 0
+
+    # Execution itself is the handler's proof (covered deterministically
+    # by test_recovery_reenqueues_queued_operation): wait for the
+    # engine to drain and assert no receipt was LOST or DUPLICATED.
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        applied = _applied_count(worker_url, run_ids)
+        if applied == 6:
+            break
+        time.sleep(1.0)
+    statuses = _statuses(worker_url, run_ids)
+    if applied < 6 or any(s != "applied" for s in statuses.values()):
+        with psycopg.connect(worker_url) as conn:
+            flows = conn.execute(
+                "SELECT workflow_uuid, status, "
+                "COALESCE(LEFT(error, 300), '') FROM dbos.workflow_status "
+                "WHERE workflow_uuid = ANY(%s) ORDER BY workflow_uuid",
+                ([str(op) for op in run_ids],),
+            ).fetchall()
+        errors: list[str] = []
+        for workflow_uuid, status, _error in flows:
+            if status != "SUCCESS":
+                try:
+                    runtime.learn_engine_client._client.retrieve_workflow(
+                        workflow_uuid
+                    ).get_result()
+                except BaseException as exc:  # noqa: BLE001 - diagnostic
+                    errors.append(f"{workflow_uuid}: {type(exc).__name__}: {exc}")
+        raise AssertionError(
+            f"applied={applied} statuses={statuses} dbos={flows} "
+            f"exceptions={errors}"
+        )
+    assert applied == 6
+    # All six recovered receipts propose the IDENTICAL delta: the write
+    # seam dedupes them — exactly ONE durable fact revision, never six.
+    assert _revision_history_count(worker_url) == 1
+    assert _fact_count(worker_url, str(_FACT["statement"])) == 1
+
+
+def _pending_count(url: str, operation_ids: list[uuid.UUID]) -> int:
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM service_learning_operation WHERE "
+            "status = 'queued' AND operation_id = ANY(%s)",
+            ([str(op) for op in operation_ids],),
+        ).fetchone()
+    return int(row[0])
+
+
+def _statuses(url: str, operation_ids: list[uuid.UUID]) -> dict[str, str]:
+    with psycopg.connect(url) as conn:
+        rows = conn.execute(
+            "SELECT operation_id, status FROM service_learning_operation "
+            "WHERE operation_id = ANY(%s)",
+            ([str(op) for op in operation_ids],),
+        ).fetchall()
+    return {str(r[0]): str(r[1]) for r in rows}
+
+
+def _last_operation_id(url: str, run_id: uuid.UUID) -> uuid.UUID:
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT operation_id FROM service_learning_operation WHERE "
+            "source_run_id = %s",
+            (str(run_id),),
+        ).fetchone()
+    assert row is not None
+    return uuid.UUID(str(row[0]))
+
+
+def _applied_count(url: str, operation_ids: list[uuid.UUID]) -> int:
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM service_learning_operation WHERE "
+            "status = 'applied' AND operation_id = ANY(%s)",
+            ([str(op) for op in operation_ids],),
+        ).fetchone()
+    return int(row[0])
+
+
+def test_worker_process_recovers_pending_receipt_end_to_end(
+    tmp_path: pathlib.Path, worker_url: str, factory: async_sessionmaker
+) -> None:
+    """The REAL production worker process (python -m mai.jobs.worker):
+    registers service.learn BEFORE the engine launches, runs the bounded
+    startup sweep, executes the pending receipt exactly once, exits
+    cleanly on SIGTERM."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time as _time
+
+    run_id = uuid.uuid4()
+    ref = _seed_foreground_run(worker_url, factory, run_id)
+    outcome = _admit(
+        LearningOperationStore(factory), _DeferredEngine(), run_id=run_id, ref=ref
+    )
+    operation_id = outcome.operation_id
+    assert _row(worker_url, operation_id)["status"] == "queued"
+
+    env = dict(os.environ)
+    env["MAI_DATABASE_URL"] = worker_url
+    env["MAI_DATA_ROOT"] = str(tmp_path / "data")
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    env.pop("MAI_TEST_DATABASE_URL", None)
+    env.pop("MAI_WORKER_HANDLERS", None)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mai.jobs.worker"],
+        cwd=str(BACKEND_ROOT),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = _time.monotonic() + 300
+        settled = 0
+        while _time.monotonic() < deadline:
+            durable = _row(worker_url, operation_id)
+            if durable["status"] in ("applied", "failed"):
+                settled = 1
+                break
+            if proc.poll() is not None:
+                break  # worker died: let the assertions below fail loudly
+            _time.sleep(0.5)
+        assert settled == 1, "the worker never settled the pending receipt"
+        # Honest cross-process boundary (slice 36 carries the full
+        # payload): the worker's startup sweep re-enqueued the queued
+        # receipt with the deterministic workflow id, and the handler
+        # FAILED it closed — the admitted request/context is not
+        # resolvable in a fresh process. NO duplicate work, NO facts.
+        assert durable["status"] == "failed", durable
+        assert durable["error_code"] == "authority_revoked", durable
+        assert _fact_count(worker_url, str(_FACT["statement"])) == 0
+        assert _revision_history_count(worker_url) == 0
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+        try:
+            rc = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait(timeout=30)
+    assert rc == 0  # clean SIGTERM shutdown after the sweep + execution
