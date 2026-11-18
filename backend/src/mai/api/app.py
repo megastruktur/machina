@@ -96,6 +96,7 @@ from mai.api.plugins import register_plugins
 from mai.jobs.lifecycle import RunLifecycle
 from mai.jobs.recovery import RecoveryService
 from mai.jobs.schedules import ScheduleManager
+from mai.api.service_knowledge import register_service_knowledge
 from mai.api.servers import register_servers, resolve_profiles_root
 from mai.api.schedules import register_schedules
 from mai.api.terminal import register_terminal
@@ -652,6 +653,11 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     # submits through the EXISTING jobs facade — no Docker/SSH effect ever
     # runs in a route; the data-removal decision is an explicit field.
     register_applications(app)
+    # The scoped service-knowledge surface (D7/ask_26): the SAME C3
+    # knowledge reads the agent lane uses, plus the operator retract
+    # (C4 lease + CAS) and the authorized preservation-operation retry
+    # (D5) over the shared dependency family composed at lifespan time.
+    register_service_knowledge(app)
     # Internal API → Agent Tool surface (C09/C06): every declared internal
     # API operation (service adoption/unadoption, discovery, inventory
     # listing, Service Map CRUD) becomes a chat-agent tool automatically

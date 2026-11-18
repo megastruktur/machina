@@ -17,7 +17,7 @@ import json
 import os
 import pathlib
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -102,10 +102,15 @@ def migrated_url() -> Iterator[str]:
     _drop_all(url)
 
 
-@pytest.fixture
-async def app_fixture(
-    migrated_url: str, tmp_path: pathlib.Path
-) -> AsyncIterator[FastAPI]:
+@pytest.fixture(scope="module")
+def app_client(
+    migrated_url: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[TestClient]:
+    """ONE app + ONE entered TestClient for the whole module: the
+    lifespan (and its LISTEN connections) opens exactly once and closes
+    at module teardown — per-test churn leaked hub connections until GC
+    (observed 12 leaked LISTEN connections after ~12 tests)."""
+    data_root = tmp_path_factory.mktemp("data-root")
     import psycopg
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
@@ -127,14 +132,42 @@ async def app_fixture(
         env={
             "MAI_DATABASE_URL": migrated_url,
             "MAI_PUBLIC_ORIGINS": ORIGIN,
-            "MAI_DATA_ROOT": str(tmp_path / "data-root"),
+            "MAI_DATA_ROOT": str(data_root),
         }
     )
     # create_app registers register_service_knowledge(app) itself
     # (ask_27): the routes below are served through the PRODUCTION
-    # registration — the tests mount nothing.
+    # registration — the tests mount nothing. The ENTERED TestClient is
+    # yielded so the lifespan (and its LISTEN connections) opens exactly
+    # once per test and closes on fixture teardown.
     with TestClient(app) as client:
-        yield client.app  # type: ignore[misc]
+        yield client
+
+
+@pytest.fixture(autouse=True)
+def _clean_tables(migrated_url: str) -> Iterator[None]:
+    """Per-test SQL isolation (inside the module-scoped client's
+    lifetime; the app holds no table state)."""
+    import psycopg
+
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        for table in (
+            "service_learned_fact_revision",
+            "service_learned_fact",
+            "service_learning_operation",
+            "service_knowledge_identity",
+            "session_entries",
+            "session_runs",
+            "sessions",
+            "job_resource_locks",
+        ):
+            if conn.execute(
+                "SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",)
+            ).fetchone()[0]:
+                conn.execute(f"TRUNCATE TABLE {table} CASCADE")
+    yield
+
+
 
 
 def _login(client: TestClient) -> dict[str, str]:
@@ -298,7 +331,7 @@ def _admit_queued(
         TrustedSourceContext,
     )
 
-    operations: LearningOperationStore = app.state.learning_operations
+    operations: LearningOperationStore = app.app.state.learning_operations
     run_id = uuid.uuid4()
     tool_call_id = str(uuid.uuid4())
     trusted = TrustedSourceContext(
@@ -336,10 +369,13 @@ def _admit_queued(
             engine_enqueue=_DeferredEngine(),
         )
 
+    # The admission runs on the TestClient PORTAL loop so the pooled
+    # connection belongs to the SAME loop the module teardown disposes
+    # on — a checkout on the _LOOP worker deadlocks db_engine.dispose().
+    # The deferred seam never acknowledges: the row stays queued.
     try:
-        _run(_admit())
+        app.portal.call(_admit)
     except OperationAdmissionError as error:
-        # The deferred seam never acknowledges: the row stays queued.
         assert error.code == "enqueue_failed", error.code
     return operation_id, run_id
 
@@ -350,7 +386,7 @@ def _admit_queued(
 
 
 async def test_read_page_scalars_and_strict_scope(
-    app_fixture: FastAPI, migrated_url: str
+    app_client: TestClient, migrated_url: str
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -358,52 +394,51 @@ async def test_read_page_scalars_and_strict_scope(
     finally:
         _run(engine.dispose())
 
-    with TestClient(app_fixture) as client:
-        # Reads require an authenticated session (C3): unauthenticated → 401.
-        unauthenticated = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge"
-        )
-        assert unauthenticated.status_code == 401
-        assert unauthenticated.json()["error"]["code"] == "unauthenticated"
+    # Reads require an authenticated session (C3): unauthenticated → 401.
+    unauthenticated = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge"
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["error"]["code"] == "unauthenticated"
 
-        jar = _login(client)
-        response = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
-            params={"limit": 5, "offset": 0},
-            cookies=jar,
-        )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["server_id"] == str(SERVER_A)
-        assert body["application_id"] == str(APP_MAIN_ID)
-        assert body["generation"] == 1
-        assert body["facts"]["limit"] == 5
-        assert body["facts"]["offset"] == 0
-        assert body["facts"]["total"] == 1
-        assert body["facts"]["items"][0]["statement"] == str(_FACT["statement"])
-        assert len(json.dumps(body).encode()) < 65536
+    jar = _login(app_client)
+    response = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
+        params={"limit": 5, "offset": 0},
+        cookies=jar,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["server_id"] == str(SERVER_A)
+    assert body["application_id"] == str(APP_MAIN_ID)
+    assert body["generation"] == 1
+    assert body["facts"]["limit"] == 5
+    assert body["facts"]["offset"] == 0
+    assert body["facts"]["total"] == 1
+    assert body["facts"]["items"][0]["statement"] == str(_FACT["statement"])
+    assert len(json.dumps(body).encode()) < 65536
 
-        # Strict same-server scope: unknown application and cross-server
-        # path identities both answer 404 not_found (no existence leak).
-        unknown = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{uuid.uuid4()}/knowledge",
-            cookies=jar,
-        )
-        assert unknown.status_code == 404
-        assert unknown.json()["error"]["code"] == "not_found"
+    # Strict same-server scope: unknown application and cross-server
+    # path identities both answer 404 not_found (no existence leak).
+    unknown = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{uuid.uuid4()}/knowledge",
+        cookies=jar,
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "not_found"
 
-        cross = client.get(
-            f"/api/v1/servers/{SERVER_B}/applications/{APP_MAIN_ID}/knowledge",
-            cookies=jar,
-        )
-        assert cross.status_code == 404
-        assert cross.json()["error"]["code"] == "not_found"
+    cross = app_client.get(
+        f"/api/v1/servers/{SERVER_B}/applications/{APP_MAIN_ID}/knowledge",
+        cookies=jar,
+    )
+    assert cross.status_code == 404
+    assert cross.json()["error"]["code"] == "not_found"
 
     _run(engine.dispose())
 
 
 async def test_read_page_pagination_window(
-    app_fixture: FastAPI, migrated_url: str
+    app_client: TestClient, migrated_url: str
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -418,28 +453,27 @@ async def test_read_page_pagination_window(
     finally:
         _run(engine.dispose())
 
-    with TestClient(app_fixture) as client:
-        jar = _login(client)
-        page = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
-            params={"limit": 1, "offset": 1},
-            cookies=jar,
-        )
-        assert page.status_code == 200
-        body = page.json()
-        assert body["facts"]["total"] == 3
-        assert body["facts"]["limit"] == 1
-        assert body["facts"]["offset"] == 1
-        assert len(body["facts"]["items"]) == 1
+    jar = _login(app_client)
+    page = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
+        params={"limit": 1, "offset": 1},
+        cookies=jar,
+    )
+    assert page.status_code == 200
+    body = page.json()
+    assert body["facts"]["total"] == 3
+    assert body["facts"]["limit"] == 1
+    assert body["facts"]["offset"] == 1
+    assert len(body["facts"]["items"]) == 1
 
-        beyond = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
-            params={"limit": 5, "offset": 9},
-            cookies=jar,
-        )
-        assert beyond.status_code == 200
-        assert beyond.json()["facts"]["total"] == 3
-        assert beyond.json()["facts"]["items"] == []
+    beyond = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge",
+        params={"limit": 5, "offset": 9},
+        cookies=jar,
+    )
+    assert beyond.status_code == 200
+    assert beyond.json()["facts"]["total"] == 3
+    assert beyond.json()["facts"]["items"] == []
 
     _run(engine.dispose())
 
@@ -450,7 +484,7 @@ async def test_read_page_pagination_window(
 
 
 async def test_history_page_and_fact_filter(
-    app_fixture: FastAPI, migrated_url: str
+    app_client: TestClient, migrated_url: str
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -461,34 +495,33 @@ async def test_history_page_and_fact_filter(
     finally:
         _run(engine.dispose())
 
-    with TestClient(app_fixture) as client:
-        jar = _login(client)
-        page = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
-            cookies=jar,
-        )
-        assert page.status_code == 200
-        body = page.json()
-        assert body["total"] == 2
-        assert len(body["items"]) == 2
+    jar = _login(app_client)
+    page = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
+        cookies=jar,
+    )
+    assert page.status_code == 200
+    body = page.json()
+    assert body["total"] == 2
+    assert len(body["items"]) == 2
 
-        filtered = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
-            params={"fact_id": str(fact_one)},
-            cookies=jar,
-        )
-        assert filtered.status_code == 200
-        filtered_body = filtered.json()
-        assert filtered_body["total"] == 1
-        assert filtered_body["items"][0]["fact_id"] == str(fact_one)
-        assert filtered_body["items"][0]["fact_id"] != str(fact_two)
+    filtered = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
+        params={"fact_id": str(fact_one)},
+        cookies=jar,
+    )
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total"] == 1
+    assert filtered_body["items"][0]["fact_id"] == str(fact_one)
+    assert filtered_body["items"][0]["fact_id"] != str(fact_two)
 
-        # Strict scope on the collection read as well.
-        cross = client.get(
-            f"/api/v1/servers/{SERVER_B}/applications/{APP_MAIN_ID}/knowledge/history",
-            cookies=jar,
-        )
-        assert cross.status_code == 404
+    # Strict scope on the collection read as well.
+    cross = app_client.get(
+        f"/api/v1/servers/{SERVER_B}/applications/{APP_MAIN_ID}/knowledge/history",
+        cookies=jar,
+    )
+    assert cross.status_code == 404
 
     _run(engine.dispose())
 
@@ -499,50 +532,49 @@ async def test_history_page_and_fact_filter(
 
 
 async def test_operations_page_and_status_filter(
-    app_fixture: FastAPI, migrated_url: str
+    app_client: TestClient, migrated_url: str
 ) -> None:
-    operation_id, _run_id = _admit_queued(app_fixture)
+    operation_id, _run_id = _admit_queued(app_client)
 
-    with TestClient(app_fixture) as client:
-        unauthenticated = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations"
-        )
-        assert unauthenticated.status_code == 401
+    unauthenticated = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations"
+    )
+    assert unauthenticated.status_code == 401
 
-        jar = _login(client)
-        page = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
-            cookies=jar,
-        )
-        assert page.status_code == 200
-        body = page.json()
-        assert body["total"] == 1
-        assert body["items"][0]["operation_id"] == str(operation_id)
-        assert body["items"][0]["status"] == "queued"
+    jar = _login(app_client)
+    page = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
+        cookies=jar,
+    )
+    assert page.status_code == 200
+    body = page.json()
+    assert body["total"] == 1
+    assert body["items"][0]["operation_id"] == str(operation_id)
+    assert body["items"][0]["status"] == "queued"
 
-        queued = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
-            params={"status": "queued"},
-            cookies=jar,
-        )
-        assert queued.json()["total"] == 1
+    queued = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
+        params={"status": "queued"},
+        cookies=jar,
+    )
+    assert queued.json()["total"] == 1
 
-        applied = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
-            params={"status": "applied"},
-            cookies=jar,
-        )
-        assert applied.json()["total"] == 0
+    applied = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/operations",
+        params={"status": "applied"},
+        cookies=jar,
+    )
+    assert applied.json()["total"] == 0
 
-        # Strict scope: the (server, application) predicates ARE the
-        # scope — an unknown application owns no receipts (honest empty
-        # page), and receipts never leak across applications.
-        other = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{uuid.uuid4()}/knowledge/operations",
-            cookies=jar,
-        )
-        assert other.status_code == 200
-        assert other.json()["total"] == 0
+    # Strict scope: the (server, application) predicates ARE the
+    # scope — an unknown application owns no receipts (honest empty
+    # page), and receipts never leak across applications.
+    other = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{uuid.uuid4()}/knowledge/operations",
+        cookies=jar,
+    )
+    assert other.status_code == 200
+    assert other.json()["total"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +583,7 @@ async def test_operations_page_and_status_filter(
 
 
 async def test_retract_auth_boundary(
-    app_fixture: FastAPI, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -565,33 +597,32 @@ async def test_retract_auth_boundary(
     )
     body = {"expected_revision": 1, "expected_generation": 1}
 
-    with TestClient(app_fixture) as client:
-        no_session = client.post(base, json=body)
-        assert no_session.status_code == 401
-        assert no_session.json()["error"]["code"] == "unauthenticated"
+    no_session = app_client.post(base, json=body)
+    assert no_session.status_code == 401
+    assert no_session.json()["error"]["code"] == "unauthenticated"
 
-        jar = _login(client)
-        # Origin allowlisted but CSRF token missing → layer 3 rejects.
-        no_csrf = client.post(
-            base, json=body, headers={"origin": ORIGIN}, cookies=jar
-        )
-        assert no_csrf.status_code == 403
-        assert no_csrf.json()["error"]["code"] == "csrf_rejected"
+    jar = _login(app_client)
+    # Origin allowlisted but CSRF token missing → layer 3 rejects.
+    no_csrf = app_client.post(
+        base, json=body, headers={"origin": ORIGIN}, cookies=jar
+    )
+    assert no_csrf.status_code == 403
+    assert no_csrf.json()["error"]["code"] == "csrf_rejected"
 
-        bad_origin = client.post(
-            base,
-            json=body,
-            headers={"origin": "http://evil.example"},
-            cookies=jar,
-        )
-        assert bad_origin.status_code == 403
-        assert bad_origin.json()["error"]["code"] == "origin_rejected"
+    bad_origin = app_client.post(
+        base,
+        json=body,
+        headers={"origin": "http://evil.example"},
+        cookies=jar,
+    )
+    assert bad_origin.status_code == 403
+    assert bad_origin.json()["error"]["code"] == "origin_rejected"
 
     _run(engine.dispose())
 
 
 async def test_retract_applies_and_stale_revision_conflicts(
-    app_fixture: FastAPI, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
 ) -> None:
     engine, factory = create_app_engine(migrated_url)
     try:
@@ -604,56 +635,55 @@ async def test_retract_applies_and_stale_revision_conflicts(
         f"/knowledge/facts/{fact_id}/retract"
     )
 
-    with TestClient(app_fixture) as client:
-        jar = _login(client)
-        headers = _mutation_headers(jar)
+    jar = _login(app_client)
+    headers = _mutation_headers(jar)
 
-        stale = client.post(
-            base,
-            json={"expected_revision": 9, "expected_generation": 1},
-            headers=headers,
-            cookies=jar,
-        )
-        assert stale.status_code == 409, stale.text
-        assert stale.json()["error"]["code"] == "revision_conflict"
+    stale = app_client.post(
+        base,
+        json={"expected_revision": 9, "expected_generation": 1},
+        headers=headers,
+        cookies=jar,
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["code"] == "revision_conflict"
 
-        ok = client.post(
-            base,
-            json={
-                "expected_revision": 1,
-                "expected_generation": 1,
-                "reason": "operator verified the statement is wrong",
-            },
-            headers=headers,
-            cookies=jar,
-        )
-        assert ok.status_code == 200, ok.text
-        result = ok.json()
-        assert result["status"] == "applied"
-        assert result["new_revision"] == 2
-        assert uuid.UUID(result["fact_id"]) == fact_id
+    ok = app_client.post(
+        base,
+        json={
+            "expected_revision": 1,
+            "expected_generation": 1,
+            "reason": "operator verified the statement is wrong",
+        },
+        headers=headers,
+        cookies=jar,
+    )
+    assert ok.status_code == 200, ok.text
+    result = ok.json()
+    assert result["status"] == "applied"
+    assert result["new_revision"] == 2
+    assert uuid.UUID(result["fact_id"]) == fact_id
 
-        # The durable truth: the fact is RETRACTED (never deleted) and
-        # one retracted history row was appended.
-        history = client.get(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
-            params={"fact_id": str(fact_id)},
-            cookies=jar,
-        )
-        rows = history.json()["items"]
-        assert rows[0]["status"] == "retracted"
-        assert rows[0]["revision"] == 2
+    # The durable truth: the fact is RETRACTED (never deleted) and
+    # one retracted history row was appended.
+    history = app_client.get(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}/knowledge/history",
+        params={"fact_id": str(fact_id)},
+        cookies=jar,
+    )
+    rows = history.json()["items"]
+    assert rows[0]["status"] == "retracted"
+    assert rows[0]["revision"] == 2
 
-        # A re-retract with the CURRENT revision is a fresh CAS the seam
-        # honors (status stays retracted, revision bumps again).
-        again = client.post(
-            base,
-            json={"expected_revision": 2, "expected_generation": 1},
-            headers=headers,
-            cookies=jar,
-        )
-        assert again.status_code == 200, again.text
-        assert again.json()["new_revision"] == 3
+    # A re-retract with the CURRENT revision is a fresh CAS the seam
+    # honors (status stays retracted, revision bumps again).
+    again = app_client.post(
+        base,
+        json={"expected_revision": 2, "expected_generation": 1},
+        headers=headers,
+        cookies=jar,
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["new_revision"] == 3
 
     _run(engine.dispose())
 
@@ -664,44 +694,43 @@ async def test_retract_applies_and_stale_revision_conflicts(
 
 
 async def test_retry_lifecycle_and_refusals(
-    app_fixture: FastAPI, migrated_url: str
+    app_client: TestClient, migrated_url: str
 ) -> None:
-    operation_id, _run_id = _admit_queued(app_fixture)
+    operation_id, _run_id = _admit_queued(app_client)
     base = (
         f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
         f"/knowledge/operations/{operation_id}/retry"
     )
 
-    with TestClient(app_fixture) as client:
-        jar = _login(client)
-        headers = _mutation_headers(jar)
+    jar = _login(app_client)
+    headers = _mutation_headers(jar)
 
-        # Unauthenticated retry is refused at the boundary.
-        no_session = client.post(base)
-        assert no_session.status_code == 401
+    # Unauthenticated retry is refused at the boundary.
+    no_session = app_client.post(base)
+    assert no_session.status_code == 401
 
-        retry = client.post(base, headers=headers, cookies=jar)
-        assert retry.status_code == 200, retry.text
-        receipt = retry.json()
-        assert receipt["status"] == "accepted"
-        assert receipt["operation_id"] == str(operation_id)
+    retry = app_client.post(base, headers=headers, cookies=jar)
+    assert retry.status_code == 200, retry.text
+    receipt = retry.json()
+    assert receipt["status"] == "accepted"
+    assert receipt["operation_id"] == str(operation_id)
 
-        # The REAL queue client recorded the deterministic workflow.
-        assert app_fixture.state.learn_engine_client.run_state(
-            str(operation_id)
-        ) is not None
+    # The REAL queue client recorded the deterministic workflow.
+    assert app_client.app.state.learn_engine_client.run_state(
+        str(operation_id)
+    ) is not None
 
-        # A second retry hits an ACCEPTED (in-flight) row: refused.
-        again = client.post(base, headers=headers, cookies=jar)
-        assert again.status_code == 409
-        assert again.json()["error"]["code"] == "operation_not_runnable"
+    # A second retry hits an ACCEPTED (in-flight) row: refused.
+    again = app_client.post(base, headers=headers, cookies=jar)
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "operation_not_runnable"
 
 
 async def test_retry_refuses_cancelled_unknown_and_cross_scope(
-    app_fixture: FastAPI, migrated_url: str, tmp_path: pathlib.Path
+    app_client: TestClient, migrated_url: str, tmp_path: pathlib.Path
 ) -> None:
-    cancelled_id, _run_a = _admit_queued(app_fixture)
-    unknown_effect_id, _run_b = _admit_queued(app_fixture)
+    cancelled_id, _run_a = _admit_queued(app_client)
+    unknown_effect_id, _run_b = _admit_queued(app_client)
     unknown_op = uuid.uuid4()
 
     with psycopg.connect(migrated_url, autocommit=True) as conn:
@@ -719,49 +748,48 @@ async def test_retry_refuses_cancelled_unknown_and_cross_scope(
             (str(unknown_effect_id),),
         )
 
-    with TestClient(app_fixture) as client:
-        jar = _login(client)
-        headers = _mutation_headers(jar)
+    jar = _login(app_client)
+    headers = _mutation_headers(jar)
 
-        cancelled = client.post(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
-            f"/knowledge/operations/{cancelled_id}/retry",
-            headers=headers,
-            cookies=jar,
-        )
-        assert cancelled.status_code == 409
-        assert cancelled.json()["error"]["code"] == "source_cancelled"
+    cancelled = app_client.post(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
+        f"/knowledge/operations/{cancelled_id}/retry",
+        headers=headers,
+        cookies=jar,
+    )
+    assert cancelled.status_code == 409
+    assert cancelled.json()["error"]["code"] == "source_cancelled"
 
-        unknown_effect = client.post(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
-            f"/knowledge/operations/{unknown_effect_id}/retry",
-            headers=headers,
-            cookies=jar,
-        )
-        assert unknown_effect.status_code == 409
-        assert unknown_effect.json()["error"]["code"] == "unknown_effect"
+    unknown_effect = app_client.post(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
+        f"/knowledge/operations/{unknown_effect_id}/retry",
+        headers=headers,
+        cookies=jar,
+    )
+    assert unknown_effect.status_code == 409
+    assert unknown_effect.json()["error"]["code"] == "unknown_effect"
 
-        unknown = client.post(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
-            f"/knowledge/operations/{unknown_op}/retry",
-            headers=headers,
-            cookies=jar,
-        )
-        assert unknown.status_code == 404
-        assert unknown.json()["error"]["code"] == "not_found"
+    unknown = app_client.post(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
+        f"/knowledge/operations/{unknown_op}/retry",
+        headers=headers,
+        cookies=jar,
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "not_found"
 
-        # Cross-scope retry: the operation exists but under a DIFFERENT
-        # application than the path → 404, never a substituted retry.
-        other_app = uuid.uuid4()
-        outcome = _admit_queued(app_fixture, application_id=other_app)
-        cross = client.post(
-            f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
-            f"/knowledge/operations/{outcome[0]}/retry",
-            headers=headers,
-            cookies=jar,
-        )
-        assert cross.status_code == 404
-        assert cross.json()["error"]["code"] == "not_found"
+    # Cross-scope retry: the operation exists but under a DIFFERENT
+    # application than the path → 404, never a substituted retry.
+    other_app = uuid.uuid4()
+    outcome = _admit_queued(app_client, application_id=other_app)
+    cross = app_client.post(
+        f"/api/v1/servers/{SERVER_A}/applications/{APP_MAIN_ID}"
+        f"/knowledge/operations/{outcome[0]}/retry",
+        headers=headers,
+        cookies=jar,
+    )
+    assert cross.status_code == 404
+    assert cross.json()["error"]["code"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -783,82 +811,79 @@ _KNOWLEDGE_OPENAPI_PATHS = {
 
 
 async def test_router_registered_exactly_once_with_openapi_schema(
-    app_fixture: FastAPI,
+    app_client: TestClient,
 ) -> None:
     """The production create_app registers the knowledge router EXACTLY
     once (five route entries, five OpenAPI paths with the expected
     methods); the collections document their pagination parameters and
     the retract request body documents its CAS fields."""
-    with TestClient(app_fixture):
-        app = app_fixture
-        # app.openapi() materializes the FULL effective route set (this
-        # FastAPI wraps mounted routers in lazy _IncludedRouter objects
-        # whose internal route lists are not a stable surface).
-        schema = app.openapi()
-        knowledge_paths = {
-            path: sorted(methods.keys())
-            for path, methods in schema["paths"].items()
-            if path.startswith(_KNOWLEDGE_PREFIX)
-        }
-        # Exactly once: five paths, five operations, byte-shape equal to
-        # the frozen contract — no extra knowledge-ish route exists.
-        assert knowledge_paths == {
-            path: sorted(methods)
-            for path, methods in _KNOWLEDGE_OPENAPI_PATHS.items()
-        }
-        assert (
-            sum(len(methods) for methods in knowledge_paths.values()) == 5
-        )
+    # app.openapi() materializes the FULL effective route set (this
+    # FastAPI wraps mounted routers in lazy _IncludedRouter objects whose
+    # internal route lists are not a stable surface).
+    schema = app_client.app.openapi()
+    knowledge_paths = {
+        path: sorted(methods.keys())
+        for path, methods in schema["paths"].items()
+        if path.startswith(_KNOWLEDGE_PREFIX)
+    }
+    # Exactly once: five paths, five operations, byte-shape equal to
+    # the frozen contract — no extra knowledge-ish route exists.
+    assert knowledge_paths == {
+        path: sorted(methods)
+        for path, methods in _KNOWLEDGE_OPENAPI_PATHS.items()
+    }
+    assert (
+        sum(len(methods) for methods in knowledge_paths.values()) == 5
+    )
 
-        # Pagination parameters documented on the collection reads.
-        list_params = schema["paths"][_KNOWLEDGE_PREFIX]["get"]["parameters"]
-        param_names = {param["name"] for param in list_params}
-        assert {"server_id", "application_id", "limit", "offset"} <= param_names
-        history_params = schema["paths"][_KNOWLEDGE_PREFIX + "/history"]["get"][
-            "parameters"
-        ]
-        assert {"fact_id"} <= {param["name"] for param in history_params}
-        operations_params = schema["paths"][_KNOWLEDGE_PREFIX + "/operations"][
-            "get"
-        ]["parameters"]
-        assert {"status"} <= {param["name"] for param in operations_params}
+    # Pagination parameters documented on the collection reads.
+    list_params = schema["paths"][_KNOWLEDGE_PREFIX]["get"]["parameters"]
+    param_names = {param["name"] for param in list_params}
+    assert {"server_id", "application_id", "limit", "offset"} <= param_names
+    history_params = schema["paths"][_KNOWLEDGE_PREFIX + "/history"]["get"][
+        "parameters"
+    ]
+    assert {"fact_id"} <= {param["name"] for param in history_params}
+    operations_params = schema["paths"][_KNOWLEDGE_PREFIX + "/operations"][
+        "get"
+    ]["parameters"]
+    assert {"status"} <= {param["name"] for param in operations_params}
 
-        # The retract request body documents its CAS fields.
-        retract_body = schema["paths"][
-            _KNOWLEDGE_PREFIX + "/facts/{fact_id}/retract"
-        ]["post"]["requestBody"]["content"]["application/json"]["schema"]
-        ref = retract_body.get("$ref", "")
-        assert ref, retract_body
-        body_schema = schema["components"]["schemas"][ref.split("/")[-1]]
-        assert {"expected_revision", "expected_generation", "reason"} <= set(
-            body_schema["properties"]
-        )
+    # The retract request body documents its CAS fields.
+    retract_body = schema["paths"][
+        _KNOWLEDGE_PREFIX + "/facts/{fact_id}/retract"
+    ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    ref = retract_body.get("$ref", "")
+    assert ref, retract_body
+    body_schema = schema["components"]["schemas"][ref.split("/")[-1]]
+    assert {"expected_revision", "expected_generation", "reason"} <= set(
+        body_schema["properties"]
+    )
 
 
 async def test_health_and_existing_routes_unaffected(
-    app_fixture: FastAPI,
+    app_client: TestClient,
 ) -> None:
     """Liveness is untouched, and the pre-existing surface is still
     documented and served alongside the new router."""
-    with TestClient(app_fixture) as client:
-        assert client.get("/api/v1/health").status_code == 200
-        schema = app_fixture.openapi()
-        assert "/api/v1/auth/login" in schema["paths"]
-        assert "/api/v1/agent-sessions" in schema["paths"]
-        assert "/api/v1/servers/{server_id}/applications" in schema["paths"]
+    assert app_client.get("/api/v1/health").status_code == 200
+    schema = app_client.app.openapi()
+    assert "/api/v1/auth/login" in schema["paths"]
+    assert "/api/v1/agent-sessions" in schema["paths"]
+    assert "/api/v1/servers/{server_id}/applications" in schema["paths"]
 
-        jar = _login(client)
-        created = client.post(
-            "/api/v1/agent-sessions",
-            json={
-                "server_id": str(SERVER_A),
-                "source": "interactive",
-                "client_request_id": str(uuid.uuid4()),
-            },
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert created.status_code == 201, created.text
+    jar = _login(app_client)
+    created = app_client.post(
+        "/api/v1/agent-sessions",
+        json={
+            "server_id": str(SERVER_A),
+            "source": "interactive",
+            "client_request_id": str(uuid.uuid4()),
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert created.status_code == 201, created.text
 
 
 async def test_unmigrated_database_fails_explicitly(
@@ -870,17 +895,18 @@ async def test_unmigrated_database_fails_explicitly(
     missing-table failure as a 500 — never a silent success."""
     import psycopg
 
-    unmigrated = (
-        "postgresql://mai_ask_fxt:mai_ask_fxt_synth@127.0.0.1:35815/"
-        "mai_knowledge_unmigrated_db"
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(migrated_url)
+    scratch_db = "mai_knowledge_unmigrated_db"
+    unmigrated = urlunsplit(
+        (parts.scheme, parts.netloc, "/" + scratch_db, "", "")
     )
-    admin = psycopg.connect(
-        "postgresql://mai_ask_fxt:mai_ask_fxt_synth@127.0.0.1:35815/postgres",
-        autocommit=True,
-    )
-    admin.execute("DROP DATABASE IF EXISTS mai_knowledge_unmigrated_db")
+    admin_url = urlunsplit((parts.scheme, parts.netloc, "/postgres", "", ""))
+    admin = psycopg.connect(admin_url, autocommit=True)
+    admin.execute(f"DROP DATABASE IF EXISTS {scratch_db} WITH (FORCE)")
     admin.execute(
-        "CREATE DATABASE mai_knowledge_unmigrated_db OWNER mai_ask_fxt"
+        f"CREATE DATABASE {scratch_db} OWNER {parts.username}"
     )
     admin.close()
 
@@ -913,9 +939,6 @@ async def test_unmigrated_database_fails_explicitly(
                 bootstrap.text[:200],
             )
     finally:
-        admin = psycopg.connect(
-            "postgresql://mai_ask_fxt:mai_ask_fxt_synth@127.0.0.1:35815/postgres",
-            autocommit=True,
-        )
-        admin.execute("DROP DATABASE IF EXISTS mai_knowledge_unmigrated_db")
+        admin = psycopg.connect(admin_url, autocommit=True)
+        admin.execute(f"DROP DATABASE IF EXISTS {scratch_db} WITH (FORCE)")
         admin.close()
