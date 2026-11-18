@@ -82,6 +82,7 @@ if TYPE_CHECKING:  # composition-time types only; no runtime import cycles
         ApplicationDocService,
         ApplicationManifestStore,
     )
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
     from mai.applications.service_map import ServiceMapStore
     from mai.knowledge.index import ScopeIndexer
 
@@ -1538,6 +1539,7 @@ def build_internal_api_capabilities(
     env_resolver: Callable[[], Any] | None = None,
     doc_indexer: "ScopeIndexer | None" = None,
     locks: "ResourceLockService | None" = None,
+    metadata_coordinator: "MetadataMutationCoordinator | None" = None,
 ) -> InternalApiComposition:
     """Build every ``app.*`` descriptor + executor over the composed state.
 
@@ -1588,34 +1590,76 @@ def build_internal_api_capabilities(
         MetadataMutationCoordinator,
         MetadataMutationError,
     )
-    from mai.jobs.resource_locks import ResourceLockError
+    from mai.applications.adopt import ApplicationAdoption
+    from mai.jobs.resource_locks import ResourceLockError, ResourceLockService
+    from sqlalchemy import text as _sql_text
 
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
 
     # -- ask_17 agent-writer retrofit: the common mutation guard -------------
 
-    #: The shared service-metadata coordinator (slice 16). Wired ONLY when
-    #: the lease service AND the identity session factory are present; the
-    #: absent-dependency default keeps the legacy (unguarded) mutation path
-    #: byte-identical for every existing caller.
-    coordinator = None
-    learning_store = None
-    if locks is not None and service_map is not None and session_factory is not None:
+    #: The shared service-metadata coordinator (slice 16). The lease
+    #: service is AUTO-DERIVED from the session factory's async engine URL
+    #: when omitted (same fixture/production DSN, sync driver form); an
+    #: explicitly injected coordinator always wins. The writer executors
+    #: FAIL CLOSED (``unavailable``) when the coordinator or the identity
+    #: seam is absent — never an unguarded mutation path.
+    coordinator: MetadataMutationCoordinator | None = None
+    learning_store: LearningOperationStore | None = None
+    effective_locks: ResourceLockService | None = locks
+    if session_factory is not None and service_map is not None:
         learning_store = LearningOperationStore(session_factory)  # type: ignore[arg-type]
-        coordinator = MetadataMutationCoordinator(
-            locks=locks,
-            map_store=service_map,
-            learning=learning_store,  # type: ignore[arg-type]
-            adoption=adoption,
-            sessions=session_factory,  # type: ignore[arg-type]
-        )
+        if effective_locks is None:
+            bind = getattr(session_factory, "kw", {}).get("bind")
+            bind_url = getattr(bind, "url", None)
+            if bind is not None and bind_url is not None:
+                dsn = (
+                    bind_url.render_as_string(hide_password=False)
+                    .replace("postgresql+asyncpg://", "postgresql://")
+                    .replace("postgres+asyncpg://", "postgresql://")
+                )
+                effective_locks = ResourceLockService(dsn)
+        if effective_locks is not None:
+            coordinator = metadata_coordinator or MetadataMutationCoordinator(
+                locks=effective_locks,
+                map_store=service_map,
+                learning=learning_store,
+                adoption=(
+                    adoption if isinstance(adoption, ApplicationAdoption) else None
+                ),
+                sessions=session_factory,  # type: ignore[arg-type]
+            )
+
+    async def _identity_suppressed(
+        session_factory: Callable[[], Any],
+        server_id: uuid.UUID,
+        application_id: uuid.UUID,
+    ) -> bool:
+        """True when the identity row exists and carries the auto-adopt
+        tombstone (absent row: NOT suppressed — creation paths are the
+        adoption seam's business)."""
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    _sql_text(
+                        "SELECT auto_adopt_suppressed FROM "
+                        "service_knowledge_identity WHERE server_id = :s "
+                        "AND application_id = :a"
+                    ),
+                    {"s": str(server_id), "a": str(application_id)},
+                )
+            ).first()
+        return row is not None and bool(row[0])
 
     def _release_leases(held: Sequence[Any]) -> None:
         """Release coordinator-acquired leases in reverse order (a lease
-        that lapsed mid-operation was already fenced by the touch)."""
+        that lapsed mid-operation was already fenced by the touch).
+        Releases through the SAME locks instance the coordinator used
+        (the auto-derived service when ``locks`` was omitted)."""
         for lease in reversed(tuple(held)):
+            assert effective_locks is not None
             try:
-                locks.release(lease)
+                effective_locks.release(lease)
             except ResourceLockError:
                 pass
 
@@ -1865,6 +1909,11 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
+        if coordinator is None or learning_store is None:
+            # Fail-closed: no unguarded mutation path exists (AC1).
+            raise InternalApiError(
+                "unavailable", "service metadata coordinator is unavailable"
+            )
         server_id = _resolve_server_id(call, payload, APP_ADOPT_CAPABILITY)
         name = str(payload["name"]).strip()
         raw_call_payload = call.payload if isinstance(call.payload, Mapping) else {}
@@ -2010,15 +2059,26 @@ def build_internal_api_capabilities(
 
         # ask_17 common guard: the whole read-modify-write effect section
         # (category upserts, map write, canonical adoption, stale-entry
-        # cleanup) runs under the C4 lease set for this application. Reads
-        # above stay lock-free (atomic, read-only). Without the lease
-        # service the legacy path runs unchanged.
-        held_leases: Sequence[Any] = ()
-        if coordinator is not None:
-            try:
-                held_leases = coordinator.lease_set(server_id, [application_id])
-            except MetadataMutationError as error:
-                raise _lease_guard_error(error) from None
+        # cleanup) runs under the C4 lease set for this application — and
+        # for a superseded manual entry's OWN identity too, so its stale
+        # cleanup is fenced as well. Reads above stay lock-free (atomic,
+        # read-only). Without the lease service the executors already
+        # failed closed above.
+        lease_app_ids = sorted(
+            {
+                application_id,
+                *(
+                    [uuid.UUID(existing_entry.application_id)]
+                    if existing_entry is not None
+                    else []
+                ),
+            },
+            key=str,
+        )
+        try:
+            held_leases = coordinator.lease_set(server_id, lease_app_ids)
+        except MetadataMutationError as error:
+            raise _lease_guard_error(error) from None
         try:
             if payload.get("upsert_categories"):
                 for category in payload["upsert_categories"]:
@@ -2051,6 +2111,12 @@ def build_internal_api_capabilities(
                     and existing_entry.origin == "manual"
                 ):
                     service_map.delete_entry(server_id, existing_entry.application_id)
+                # An explicit adopt RE-ADOPTS a tombstoned identity: clears
+                # the suppression and bumps the generation (D4 readopt).
+                if await _identity_suppressed(session_factory, server_id, application_id):
+                    await learning_store.readopt_service_identity(
+                        server_id, application_id, manual_identity=True
+                    )
                 doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
                 if data_root is not None:
                     try:
@@ -2152,6 +2218,12 @@ def build_internal_api_capabilities(
                 custom_instructions=payload.get("custom_instructions"),
                 installed=payload.get("installed"),
             )
+            # An explicit adopt RE-ADOPTS a tombstoned identity: clears the
+            # suppression and bumps the generation (D4 readopt).
+            if await _identity_suppressed(session_factory, server_id, result.application_id):
+                await learning_store.readopt_service_identity(
+                    server_id, result.application_id, manual_identity=False
+                )
             if (
                 existing_entry is not None
                 and existing_entry.application_id != str(result.application_id)
@@ -2217,6 +2289,11 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "applications service is unavailable"
             )
+        if coordinator is None or learning_store is None:
+            # Fail-closed: no unguarded mutation path exists (AC1).
+            raise InternalApiError(
+                "unavailable", "service metadata coordinator is unavailable"
+            )
         server_id = _resolve_server_id(call, payload, APP_UNADOPT_CAPABILITY)
         application_id = uuid.UUID(str(payload["application_id"]))
         expected_revision = payload.get("expected_revision")
@@ -2232,17 +2309,12 @@ def build_internal_api_capabilities(
         # cancelled BEFORE the canonical revoke and the map deletion
         # (suppression-before-removal, D4). Without the lease service the
         # legacy path runs unchanged.
-        held_leases: Sequence[Any] = ()
-        if coordinator is not None:
-            try:
-                held_leases = coordinator.lease_set(server_id, [application_id])
-            except MetadataMutationError as error:
-                raise _lease_guard_error(error) from None
         try:
-            if learning_store is not None:
-                await learning_store.suppress_for_unadopt(
-                    server_id, application_id
-                )
+            held_leases = coordinator.lease_set(server_id, [application_id])
+        except MetadataMutationError as error:
+            raise _lease_guard_error(error) from None
+        try:
+            await learning_store.suppress_for_unadopt(server_id, application_id)
             try:
                 result = await adoption.revoke(
                     store=applications,  # type: ignore[arg-type]
@@ -2291,22 +2363,47 @@ def build_internal_api_capabilities(
             raise InternalApiError(
                 "unavailable", "service map service is unavailable"
             )
+        if coordinator is None or learning_store is None:
+            # Fail-closed: no unguarded mutation path exists (AC1).
+            raise InternalApiError(
+                "unavailable", "service metadata coordinator is unavailable"
+            )
         server_id = _resolve_server_id(call, payload, APP_DELETE_MAP_ENTRY_CAPABILITY)
         application_id = uuid.UUID(str(payload["application_id"]))
         # ask_17 common guard: the deletion runs under the C4 lease set.
-        held_leases: Sequence[Any] = ()
-        if coordinator is not None:
-            try:
-                held_leases = coordinator.lease_set(server_id, [application_id])
-            except MetadataMutationError as error:
-                raise _lease_guard_error(error) from None
         try:
-            removed = service_map.delete_entry(server_id, application_id)
-            if not removed:
+            held_leases = coordinator.lease_set(server_id, [application_id])
+        except MetadataMutationError as error:
+            raise _lease_guard_error(error) from None
+        try:
+            # A missing entry is refused BEFORE any tombstone is written:
+            # suppression never fabricates identity for a phantom service.
+            existing = service_map.get_entry(server_id, application_id)
+            if existing is None:
                 raise InternalApiError(
                     "not_found",
                     f"no service map entry stored for {application_id}",
                 )
+            # A canonically adopted entry is never deleted behind the
+            # adoption seam's back: app.unadopt owns that path.
+            adoption_record = None
+            if adoption is not None and isinstance(adoption, ApplicationAdoption):
+                try:
+                    adoption_record = await adoption.read(
+                        server_id, application_id
+                    )
+                except Exception:
+                    adoption_record = None
+            if existing.origin != "manual" or adoption_record is not None:
+                raise InternalApiError(
+                    "conflict",
+                    f"service {application_id} is canonically adopted; "
+                    "use app.unadopt instead",
+                )
+            # Tombstone BEFORE removal (D4): the deleted manual service can
+            # never be silently re-adopted by background work.
+            await learning_store.suppress_for_unadopt(server_id, application_id)
+            service_map.delete_entry(server_id, application_id)
             return {
                 "application_id": str(application_id),
                 "server_id": str(server_id),

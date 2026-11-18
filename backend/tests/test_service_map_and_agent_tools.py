@@ -920,18 +920,24 @@ def test_internal_api_tool_enforces_endpoint_and_field_descriptions() -> None:
 
 
 async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
-    tmp_path: Path,
+    tmp_path: Path, migrated_url: str
 ) -> None:
-    """Unit test (no database required) verifying:
+    """Unit test verifying:
     - @internal_api_tool catalog capabilities: app.upsert_catalog_runbook,
       app.list_catalog, app.delete_catalog_runbook
     - app.adopt inheriting category, description, and 5-slot instructions from
       the global catalog while persisting server-specific custom_instructions
       and installed status.
+
+    The writers are fail-closed on the metadata coordinator, so the unit
+    composition wires a REAL session factory (the fixture DB) — the lease
+    service is auto-derived from its engine URL.
     """
     from unittest.mock import MagicMock
     from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.jobs.resource_locks import LOCK_TABLE
 
+    engine, session_factory = create_app_engine(migrated_url)
     map_store = _store(tmp_path)
     composition = build_internal_api_capabilities(
         applications=MagicMock(),
@@ -939,6 +945,7 @@ async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
         docs=MagicMock(),
         service_map=map_store,
         data_root=tmp_path,
+        session_factory=session_factory,
     )
     desc_by_id = {d.identifier: d for d in composition.descriptors}
 
@@ -1103,6 +1110,7 @@ async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
         docs=MagicMock(),
         service_map=map_store,
         data_root=tmp_path,
+        session_factory=session_factory,
     )
     compose_adopt_exec = comp_compose.executors["app.adopt"]
     res_comp1 = await compose_adopt_exec(
@@ -1160,6 +1168,11 @@ async def test_catalog_tools_and_adopt_manual_inherits_catalog_unit(
     )
     assert res_del.ok is True, res_del.output
     assert json.loads(res_del.output)["removed"] is True
+
+    # Lease + engine cleanup for the coordinator wired above.
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        conn.execute(f"DELETE FROM {LOCK_TABLE}")
+    await engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -2082,6 +2095,15 @@ async def test_internal_api_writer_guard_tombstones_before_removal(
     assert coordinator_locks.inspect(str(server_a), app_key) is None
     assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
 
+    # A canonically adopted entry is refused by app.delete_map_entry
+    # (use app.unadopt instead); nothing is deleted or tombstoned.
+    del_refused = await composition.executors["app.delete_map_entry"](
+        _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
+    )
+    assert del_refused.ok is False
+    assert json.loads(del_refused.output)["code"] == "conflict"
+    assert live_app.state.service_map.get_entry(server_a, aid) is not None
+
     # Contention: another boot holding the metadata lease refuses the
     # unadopt BEFORE any effect (no fence bypass, no tombstone written).
     holder = recipe_locks.acquire(str(server_a), "service-metadata", owner_ref="other")
@@ -2123,6 +2145,34 @@ async def test_internal_api_writer_guard_tombstones_before_removal(
     assert tombstone is not None
     assert tombstone[0] is True and tombstone[1] == 1
     assert coordinator_locks.inspect(str(server_a), app_key) is None
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+    # An explicit re-adopt RE-ADOPTS the tombstoned identity: suppression
+    # cleared, generation bumped 1 -> 2, entry and projection rebuilt.
+    re_adopted = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"guard-{tag}",
+                "origin": "compose",
+                "compose_project": f"grd-{tag}",
+                "working_dir": f"/srv/grd-{tag}",
+            },
+            ctx,
+        )
+    )
+    assert re_adopted.ok is True, re_adopted.output
+    assert json.loads(re_adopted.output)["revision"] == 1  # fresh projection
+    assert live_app.state.service_map.get_entry(server_a, aid) is not None
+    with psycopg.connect(bootstrapped_url) as conn:
+        readopt_row = conn.execute(
+            "SELECT auto_adopt_suppressed, generation FROM "
+            "service_knowledge_identity WHERE server_id = %s AND "
+            "application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert readopt_row is not None
+    assert readopt_row[0] is False and readopt_row[1] == 2
     assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
 
 
@@ -2186,6 +2236,17 @@ async def test_internal_api_delete_map_entry_guard_releases_leases(
     assert coordinator_locks.inspect(str(server_a), f"application:{aid}") is None
     assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
 
+    # The manual delete TOMBSTONED the identity before removal (D4).
+    with psycopg.connect(bootstrapped_url) as conn:
+        tombstone = conn.execute(
+            "SELECT auto_adopt_suppressed, generation FROM "
+            "service_knowledge_identity WHERE server_id = %s AND "
+            "application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert tombstone is not None
+    assert tombstone[0] is True and tombstone[1] == 1
+
     # The second delete keeps the not_found contract and still releases.
     missing = await delete_exec(
         _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
@@ -2193,3 +2254,81 @@ async def test_internal_api_delete_map_entry_guard_releases_leases(
     assert missing.ok is False
     assert json.loads(missing.output)["code"] == "not_found"
     assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+    # An explicit re-adopt of the same manual service clears the tombstone
+    # and bumps the generation 1 -> 2; the entry is rebuilt at revision 1.
+    re_manual = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"manual-{tag}",
+                "origin": "manual",
+                "custom_instructions": "manual notes",
+            },
+            ctx,
+        )
+    )
+    assert re_manual.ok is True, re_manual.output
+    assert json.loads(re_manual.output)["revision"] == 1
+    with psycopg.connect(bootstrapped_url) as conn:
+        readopt_row = conn.execute(
+            "SELECT auto_adopt_suppressed, generation FROM "
+            "service_knowledge_identity WHERE server_id = %s AND "
+            "application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert readopt_row is not None
+    assert readopt_row[0] is False and readopt_row[1] == 2
+
+
+async def test_internal_api_writers_fail_closed_when_coordinator_dependencies_absent(
+    tmp_path: Path,
+) -> None:
+    """AC1 fail-closed discipline: with NO session factory and NO lease
+    service the coordinator cannot exist, and the three writer executors
+    refuse with ``unavailable`` — there is NO unguarded mutation path."""
+    from unittest.mock import MagicMock
+
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    map_store = ServiceMapStore(tmp_path / "service_map")
+    composition = build_internal_api_capabilities(
+        applications=MagicMock(),
+        adoption=MagicMock(),
+        docs=MagicMock(),
+        service_map=map_store,
+        session_factory=None,
+        locks=None,
+    )
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+    ctx = _context(
+        ("app.adopt", "app.unadopt", "app.delete_map_entry"), server_id=SERVER_A
+    )
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    for capability, payload in (
+        ("app.adopt", {"name": "whatever"}),
+        ("app.unadopt", {"application_id": str(uuid.uuid4())}),
+        ("app.delete_map_entry", {"application_id": str(uuid.uuid4())}),
+    ):
+        refused = await composition.executors[capability](
+            _call(capability, payload, ctx)
+        )
+        assert refused.ok is False, refused.output
+        assert json.loads(refused.output)["code"] == "unavailable"
+        assert (
+            json.loads(refused.output)["message"]
+            == "service metadata coordinator is unavailable"
+        )
+    # Not a single byte was written to the map.
+    assert map_store.list_entries(SERVER_A) == ()
