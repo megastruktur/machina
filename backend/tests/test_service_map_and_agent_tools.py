@@ -2916,3 +2916,195 @@ async def test_worker_style_positional_upsert_capability_discovers_coordinator_a
         assert bound_locks.inspect(str(SERVER_A), "service-metadata") is None
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# ask_23: service_knowledge capability composition (internal-API lane)
+# ---------------------------------------------------------------------------
+
+_KNOWLEDGE_CAPABILITY_IDS = (
+    "app.resolve_service",
+    "app.get_service_knowledge",
+    "app.get_learning_status",
+    "app.learn_service",
+)
+
+
+async def test_knowledge_capabilities_compose_identically_and_never_autogrant() -> None:
+    """HTTP-style and worker-style compositions expose IDENTICAL
+    descriptor id sets (both call the ONE shared builder); the four
+    service-knowledge capabilities are registered + executor-backed in
+    both; every composed descriptor passes the fail-closed gate; the
+    ids stay OUT of the frozen grant vocabulary; and double
+    registration of the same capability line is refused."""
+    from mai.capabilities.internal_api import (
+        INTERNAL_API_CAPABILITY_IDS,
+        assert_agent_ready_descriptor,
+        build_internal_api_capabilities,
+    )
+    from mai.capabilities.service_knowledge import (
+        get_learning_status_descriptor,
+        get_service_knowledge_descriptor,
+        learn_service_descriptor,
+        resolve_service_descriptor,
+    )
+    from mai.plugins.registry import CapabilityError
+
+    http_comp = build_internal_api_capabilities(
+        applications=None, adoption=None, docs=None, service_map=None
+    )
+    worker_comp = build_internal_api_capabilities(
+        applications=None, adoption=None, docs=None, service_map=None
+    )
+    http_ids = {d.identifier for d in http_comp.descriptors}
+    worker_ids = {d.identifier for d in worker_comp.descriptors}
+    assert http_ids == worker_ids
+
+    for cap_id in _KNOWLEDGE_CAPABILITY_IDS:
+        assert cap_id in http_ids
+        assert cap_id in http_comp.executors
+        assert cap_id in worker_comp.executors
+        # Registered, NEVER auto-granted.
+        assert cap_id not in INTERNAL_API_CAPABILITY_IDS
+    for desc in http_comp.descriptors:
+        assert_agent_ready_descriptor(desc)
+    # The rich service_knowledge descriptors pass the SAME gate.
+    for desc in (
+        resolve_service_descriptor(),
+        get_service_knowledge_descriptor(),
+        get_learning_status_descriptor(),
+        learn_service_descriptor(),
+    ):
+        assert_agent_ready_descriptor(desc)
+
+    # Worker-side registration discipline (worker.py): every composed
+    # descriptor registers fail-closed; the SAME capability line cannot
+    # register twice (the internal-API projection and the native
+    # service_knowledge descriptor share identifier+version).
+    registry = CapabilityRegistry()
+    for desc in worker_comp.descriptors:
+        registry.register(desc)
+    with pytest.raises(CapabilityError):
+        registry.register(learn_service_descriptor())
+
+
+async def test_absent_knowledge_dependencies_answer_unavailable() -> None:
+    """With no knowledge_read/session_factory/learning store/enqueue
+    seam, all four executors answer {"status": "unavailable", ...} —
+    no store touch, no fake success."""
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    comp = build_internal_api_capabilities(
+        applications=None, adoption=None, docs=None, service_map=None
+    )
+    by_id = {d.identifier: d for d in comp.descriptors}
+    valid_payloads = {
+        "app.resolve_service": {},
+        "app.get_service_knowledge": {"application_id": str(uuid.uuid4())},
+        "app.get_learning_status": {"application_id": str(uuid.uuid4())},
+        "app.learn_service": {
+            "application_id": str(uuid.uuid4()),
+            "facts": [
+                {
+                    "category": "deployment",
+                    "key": "health-path",
+                    "statement": "health lives at /healthz",
+                    "source_kind": "tool_result",
+                    "source_refs": [
+                        "00000000-0000-4000-8000-000000000001"
+                    ],
+                }
+            ],
+            "expected_generation": 1,
+        },
+    }
+    for cap_id in _KNOWLEDGE_CAPABILITY_IDS:
+        call = CapabilityCall(
+            descriptor=by_id[cap_id],
+            payload=dict(valid_payloads[cap_id]),
+            context=_context((cap_id,)),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        result = await comp.executors[cap_id](call)
+        envelope = json.loads(result.output)
+        assert envelope["status"] == "unavailable", envelope
+        assert envelope["code"] == "unavailable"
+
+
+async def test_composed_knowledge_reads_execute_over_session_factory(
+    tmp_path: Path, migrated_url: str
+) -> None:
+    """The derived-from-session_factory read store executes real
+    bounded reads through the internal-API lane (empty DB: learning
+    status answers found=false), while the learn admission stays
+    honestly unavailable without an engine enqueue seam."""
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        comp = build_internal_api_capabilities(
+            applications=None,
+            adoption=None,
+            docs=None,
+            service_map=_store(tmp_path),
+            session_factory=session_factory,
+        )
+        by_id = {d.identifier: d for d in comp.descriptors}
+
+        status_call = CapabilityCall(
+            descriptor=by_id["app.get_learning_status"],
+            payload={"application_id": str(uuid.uuid4())},
+            context=_context(("app.get_learning_status",)),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        status_env = json.loads(
+            (
+                await comp.executors["app.get_learning_status"](status_call)
+            ).output
+        )
+        assert status_env["status"] == "ok"
+        assert status_env["found"] is False
+
+        resolve_call = CapabilityCall(
+            descriptor=by_id["app.resolve_service"],
+            payload={"name_query": "nothing-matches"},
+            context=_context(("app.resolve_service",)),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        resolve_env = json.loads(
+            (await comp.executors["app.resolve_service"](resolve_call)).output
+        )
+        assert resolve_env["status"] == "ok"
+        assert resolve_env["total"] == 0
+
+        learn_call = CapabilityCall(
+            descriptor=by_id["app.learn_service"],
+            payload={
+                "application_id": str(uuid.uuid4()),
+                "facts": [
+                    {
+                        "category": "deployment",
+                        "key": "health-path",
+                        "statement": "health lives at /healthz",
+                        "source_kind": "tool_result",
+                        "source_refs": [
+                            "00000000-0000-4000-8000-000000000001"
+                        ],
+                    }
+                ],
+                "expected_generation": 1,
+            },
+            context=_context(("app.learn_service",)),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        learn_env = json.loads(
+            (await comp.executors["app.learn_service"](learn_call)).output
+        )
+        assert learn_env["status"] == "unavailable"
+        assert learn_env["code"] == "unavailable"
+    finally:
+        await engine.dispose()

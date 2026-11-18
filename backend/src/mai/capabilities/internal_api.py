@@ -77,11 +77,15 @@ from mai.plugins.registry import (
 )
 
 if TYPE_CHECKING:  # composition-time types only; no runtime import cycles
+    from collections.abc import Awaitable
+
     from mai.api.applications import (
         ApplicationAdoption,
         ApplicationDocService,
         ApplicationManifestStore,
     )
+    from mai.applications.knowledge_read import KnowledgeReadStore
+    from mai.applications.learning_operations import LearningOperationStore
     from mai.applications.metadata_mutations import MetadataMutationCoordinator
     from mai.applications.service_map import ServiceMapStore
     from mai.knowledge.index import ScopeIndexer
@@ -1540,12 +1544,27 @@ def build_internal_api_capabilities(
     doc_indexer: "ScopeIndexer | None" = None,
     locks: "ResourceLockService | None" = None,
     metadata_coordinator: "MetadataMutationCoordinator | None" = None,
+    knowledge_read: "KnowledgeReadStore | None" = None,
+    learning_operations: "LearningOperationStore | None" = None,
+    learn_engine_enqueue: "Callable[[str], Awaitable[None]] | None" = None,
 ) -> InternalApiComposition:
     """Build every ``app.*`` descriptor + executor over the composed state.
 
     ``None`` services (fail-closed app composition) produce executors whose
     every call answers ``{"status": "unavailable", ...}`` — the composition
     contract of the HTTP routes, mirrored for the agent lane.
+
+    The ask_23 service-knowledge surface (``app.resolve_service``,
+    ``app.get_service_knowledge``, ``app.get_learning_status``,
+    ``app.learn_service``) joins the same contract: the descriptors and
+    executors are ALWAYS registered, but absent knowledge dependencies
+    answer ``{"status": "unavailable", ...}`` at call time. The read store
+    derives from ``session_factory`` when ``knowledge_read`` is omitted;
+    the learn admission is available only when BOTH the operation store
+    and the ``learn_engine_enqueue`` seam are composed (fail-closed, never
+    a fake enqueue). The four capabilities are NEVER auto-granted:
+    ``INTERNAL_API_CAPABILITY_IDS`` and the default grant vocabulary are
+    unchanged — policy grants them explicitly.
     """
     import asyncio
     from dataclasses import asdict
@@ -1586,6 +1605,25 @@ def build_internal_api_capabilities(
     from mai.capabilities.host_file_read import _DENY_PATH_PREFIXES
 
     from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.knowledge_read import KnowledgeReadStore
+    from mai.capabilities.service_knowledge import (
+        LEARN_SERVICE_CAPABILITY_ID,
+        RESOLVE_SERVICE_CAPABILITY_ID,
+        GET_SERVICE_KNOWLEDGE_CAPABILITY_ID,
+        GET_LEARNING_STATUS_CAPABILITY_ID,
+        GetLearningStatusCapability,
+        GetLearningStatusPayload,
+        GetServiceKnowledgeCapability,
+        GetServiceKnowledgePayload,
+        LearnServiceCapability,
+        LearnServicePayload,
+        ResolveServiceCapability,
+        ResolveServicePayload,
+        get_learning_status_descriptor,
+        get_service_knowledge_descriptor,
+        learn_service_descriptor,
+        resolve_service_descriptor,
+    )
     from mai.applications.metadata_mutations import (
         MetadataMutationCoordinator,
         MetadataMutationError,
@@ -3274,6 +3312,177 @@ def build_internal_api_capabilities(
 
     operations.append(_server_profile_update)
 
+    # -- ask_23: the service-knowledge agent surface --------------------------
+    #
+    # The C3 scope-confirmed reads (slice 20) and the durable learn
+    # admission seam (slice 21) join the internal-API lane through ONE
+    # shared builder: descriptors and executors are ALWAYS registered,
+    # absent knowledge dependencies answer {"status": "unavailable", ...}
+    # at call time, and the learn admission composes only when BOTH the
+    # operation store and the engine enqueue seam are present (fail-closed,
+    # never a fake enqueue). The executors DELEGATE to the service_knowledge
+    # capability classes so the agent lane and the internal-API lane share
+    # one envelope discipline (scope confirmation, structured refusals,
+    # envelope bounds) — never a reimplementation.
+
+    knowledge_read_service = (
+        knowledge_read
+        if knowledge_read is not None
+        else (
+            KnowledgeReadStore(session_factory, service_map)  # type: ignore[arg-type]
+            if session_factory is not None and service_map is not None
+            else None
+        )
+    )
+    learn_operation_store = (
+        learning_operations if learning_operations is not None else learning_store
+    )
+    resolve_capability = (
+        ResolveServiceCapability(knowledge_read_service)
+        if knowledge_read_service is not None
+        else None
+    )
+    knowledge_capability = (
+        GetServiceKnowledgeCapability(knowledge_read_service)
+        if knowledge_read_service is not None
+        else None
+    )
+    learning_status_capability = (
+        GetLearningStatusCapability(knowledge_read_service)
+        if knowledge_read_service is not None
+        else None
+    )
+    learn_capability = (
+        LearnServiceCapability(
+            learn_operation_store, engine_enqueue=learn_engine_enqueue
+        )
+        if learn_operation_store is not None and learn_engine_enqueue is not None
+        else None
+    )
+
+    def _knowledge_envelope(result: Any) -> Mapping[str, Any]:
+        """Bridge a service_knowledge ExecutorResult onto the internal-API
+        executor contract: the ok envelope loses its redundant outer
+        ``status`` (the uniform executor re-wraps it), and a refusal
+        re-raises as the structured InternalApiError — build_executor
+        reproduces the same refused shape (status/code/message/
+        capability_id) the capability emitted."""
+        envelope = json.loads(result.output)
+        if result.ok:
+            envelope.pop("status", None)
+            return envelope
+        raise InternalApiError(
+            str(envelope.get("code", "internal_error")),
+            str(envelope.get("message", "service knowledge capability refused")),
+        )
+
+    def _unavailable_document(message: str) -> Mapping[str, Any]:
+        """Returned (NOT raised): the uniform executor merges the
+        operation document over its ok wrapper, so the envelope answers
+        ``{"status": "unavailable", ...}`` verbatim."""
+        return {
+            "status": "unavailable",
+            "code": "unavailable",
+            "message": message,
+        }
+
+    @internal_api_tool(
+        capability_id=RESOLVE_SERVICE_CAPABILITY_ID,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["service_map", "knowledge"],
+        environments=["controller"],
+        payload_model=ResolveServicePayload,
+        description=(
+            "Resolve one service on the pinned server by exact application "
+            "id, canonical compose/unit selector, or bounded name query; "
+            "returns the matched candidate page without writing."
+        ),
+    )
+    async def _resolve_service(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if resolve_capability is None:
+            return _unavailable_document(
+                "service knowledge read service is unavailable"
+            )
+        return _knowledge_envelope(await resolve_capability(call))
+
+    @internal_api_tool(
+        capability_id=GET_SERVICE_KNOWLEDGE_CAPABILITY_ID,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["knowledge"],
+        environments=["controller"],
+        payload_model=GetServiceKnowledgePayload,
+        description=(
+            "Read the bounded per-service knowledge page for one same-server "
+            "application: operator map state, catalog runbook, active learned "
+            "facts and the conflict summary — read-only, never writes."
+        ),
+    )
+    async def _get_service_knowledge(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if knowledge_capability is None:
+            return _unavailable_document(
+                "service knowledge read service is unavailable"
+            )
+        return _knowledge_envelope(await knowledge_capability(call))
+
+    @internal_api_tool(
+        capability_id=GET_LEARNING_STATUS_CAPABILITY_ID,
+        version="1.0.0",
+        effect_class="read",
+        resource_scope=["knowledge"],
+        environments=["controller"],
+        payload_model=GetLearningStatusPayload,
+        description=(
+            "Read the latest durable learning operation receipt for one "
+            "same-server application; answers found=false honestly when no "
+            "admitted preservation operation exists."
+        ),
+    )
+    async def _get_learning_status(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if learning_status_capability is None:
+            return _unavailable_document(
+                "service knowledge read service is unavailable"
+            )
+        return _knowledge_envelope(await learning_status_capability(call))
+
+    @internal_api_tool(
+        capability_id=LEARN_SERVICE_CAPABILITY_ID,
+        version="1.0.0",
+        effect_class="mutate",
+        resource_scope=["service_knowledge"],
+        environments=["controller"],
+        payload_model=LearnServicePayload,
+        description=(
+            "Propose bounded learned facts for one same-server service for "
+            "durable preservation: the admission is persisted with the "
+            "trusted run identity and enqueued for background application."
+        ),
+    )
+    async def _learn_service(
+        call: CapabilityCall, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if learn_capability is None:
+            return _unavailable_document(
+                "learning admission service is unavailable"
+            )
+        return _knowledge_envelope(await learn_capability(call))
+
+    operations.extend(
+        (
+            _resolve_service,
+            _get_service_knowledge,
+            _get_learning_status,
+            _learn_service,
+        )
+    )
+
     # -- registration ----------------------------------------------------------
 
     registry = CapabilityRegistry()
@@ -3286,6 +3495,17 @@ def build_internal_api_capabilities(
     # internal-API descriptors included in INTERNAL_API_CAPABILITY_IDS.
     for sibling_desc in (upsert_map_descriptor(), chat_read_descriptor()):
         assert_agent_ready_descriptor(sibling_desc)
+    # ask_23: the service-knowledge descriptors pass the SAME gate (their
+    # rich shapes live in capabilities/service_knowledge.py; the registry
+    # carries the internal-API projections above). Registered, never
+    # auto-granted.
+    for knowledge_desc in (
+        resolve_service_descriptor(),
+        get_service_knowledge_descriptor(),
+        get_learning_status_descriptor(),
+        learn_service_descriptor(),
+    ):
+        assert_agent_ready_descriptor(knowledge_desc)
     return InternalApiComposition(
         descriptors=tuple(registry.list_capabilities()),
         executors=executors,
