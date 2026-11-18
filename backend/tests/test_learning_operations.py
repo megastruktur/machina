@@ -42,8 +42,11 @@ from mai.applications.learning_operations import (
     LearningOperationStore,
     MAX_PRESERVATION_OPERATIONS_PER_RUN,
     OperationAdmissionError,
+    ServiceAutoAdoptSuppressedError,
+    UnknownOutcomeRetryForbiddenError,
 )
 from mai.database import create_app_engine
+from mai.jobs.engine import RunIdInUseError
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALEMBIC_INI = os.path.join(BACKEND_ROOT, "alembic.ini")
@@ -148,6 +151,7 @@ def _trusted(
     tool_call_id: str,
     run_id: uuid.UUID | None = None,
     actor: str = "agent:mai",
+    grants: list[str] | None = None,
 ) -> TrustedSourceContext:
     return TrustedSourceContext(
         server_id=server_id,
@@ -155,7 +159,7 @@ def _trusted(
         session_id=None,
         tool_call_id=tool_call_id,
         actor=actor,
-        grants=["knowledge.learn"],
+        grants=grants if grants is not None else ["knowledge.learn"],
         context_at=datetime.now(tz=timezone.utc),
     )
 
@@ -824,3 +828,495 @@ def test_envelope_bound_on_representative_and_maximal_pages(
     assert maximal.total == 51  # the admitted row plus 50 bulk rows
     assert len(maximal.items) == 50
     assert len(maximal.model_dump_json()) < 64 * 1024
+
+
+# ---------------------------------------------------------------------------
+# slice 14 helpers
+# ---------------------------------------------------------------------------
+
+
+def _admit_on(
+    store: LearningOperationStore,
+    *,
+    trusted: TrustedSourceContext,
+    request: LearnRequest,
+    engine: _RecordingEngine,
+    application_id: uuid.UUID | None = APP_MAIN_ID,
+) -> AdmitOperationResult:
+    """Admit through a SHARED store instance (the admission -> execution
+    context registry is in-process by design)."""
+    return _run(
+        store.admit(
+            request=request,
+            trusted=trusted,
+            application_id=application_id,
+            engine_enqueue=engine,
+        )
+    )
+
+
+def _queued_op(
+    factory: async_sessionmaker,
+    store: LearningOperationStore,
+    run_id: uuid.UUID,
+    index: int,
+) -> None:
+    """Leave one durable queued (unacknowledged) row via a failing engine."""
+    with pytest.raises(OperationAdmissionError) as err:
+        _admit_on(
+            store,
+            trusted=_trusted(SERVER_A, tool_call_id=f"call-q{index}", run_id=run_id),
+            request=_request([_delta(f"rec.k{index}", f"statement rec {index}")]),
+            engine=_RecordingEngine(fail=True),
+        )
+    assert err.value.code == "enqueue_failed"
+
+
+# ---------------------------------------------------------------------------
+# 12. tombstone before removal + readopt generation bump
+# ---------------------------------------------------------------------------
+
+
+def test_suppress_cancels_pending_blocks_admit_and_readopt_fences_old_generation(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    run_id = uuid.uuid4()
+    store = LearningOperationStore(factory)
+    grants = ["app.learn_service_facts"]
+
+    accepted = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-live", run_id=run_id, grants=grants),
+        request=_request([_delta("gen.live", "statement live")]),
+        engine=_RecordingEngine(),
+    )
+    _queued_op(factory, store, run_id, 9)
+
+    state = _run(store.suppress_for_unadopt(SERVER_A, APP_MAIN_ID))
+    assert state.auto_adopt_suppressed is True
+    assert state.generation == 1  # tombstone row created (identity was absent)
+    assert state.suppressed_generation == 1
+    for operation_id in (accepted.receipt.operation_id,):
+        row = _row(migrated_url, operation_id)
+        assert row["status"] == "failed"
+        assert row["error_code"] == "generation_superseded"
+    queued_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-q9"
+    )
+    assert _row(migrated_url, queued_id)["error_code"] == "generation_superseded"
+
+    with pytest.raises(ServiceAutoAdoptSuppressedError):
+        _admit_on(
+            store,
+            trusted=_trusted(SERVER_A, tool_call_id="call-blocked", run_id=run_id, grants=grants),
+            request=_request([_delta("gen.blocked", "statement blocked")]),
+            engine=_RecordingEngine(),
+        )
+
+    readopted = _run(
+        store.readopt_service_identity(SERVER_A, APP_MAIN_ID, manual_identity=True)
+    )
+    assert readopted.generation == 2  # explicit readopt starts a NEW generation
+    assert readopted.auto_adopt_suppressed is False
+    assert readopted.manual_identity is True
+    assert readopted.knowledge_revision == 0
+    assert readopted.service_revision == 1
+
+    # New admit at generation 2 applies; the old-generation operation is
+    # fenced at begin_apply.
+    fresh = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-fresh", run_id=run_id, grants=grants),
+        request=_request([_delta("gen.fresh", "statement fresh")], expected_generation=2),
+        engine=_RecordingEngine(),
+    )
+    assert fresh.receipt.status is OperationStatus.ACCEPTED
+
+    authorized = _run(
+        store.begin_apply(
+            SERVER_A,
+            fresh.receipt.operation_id,
+            current_grants={"app.learn_service_facts"},
+        )
+    )
+    assert authorized.generation == 2
+    assert authorized.effective_grants == ["app.learn_service_facts"]
+    assert authorized.request is not None
+    assert authorized.trusted is not None
+    assert authorized.trusted.tool_call_id == "call-fresh"
+    assert _row(migrated_url, fresh.receipt.operation_id)["status"] == "applying"
+
+    stale = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-stale", run_id=run_id, grants=grants),
+        request=_request([_delta("gen.stale", "statement stale")], expected_generation=1),
+        engine=_RecordingEngine(),
+    )
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(store.begin_apply(SERVER_A, stale.receipt.operation_id, current_grants=set(grants)))
+    assert err.value.code == "generation_superseded"
+    stale_row = _row(migrated_url, stale.receipt.operation_id)
+    assert stale_row["status"] == "failed"
+    assert stale_row["error_code"] == "generation_superseded"
+
+
+# ---------------------------------------------------------------------------
+# 13. current-authority intersection at execution time
+# ---------------------------------------------------------------------------
+
+
+def test_begin_apply_authority_intersection(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    grants = ["app.learn_service_facts", "app.adopt"]
+    admitted = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-auth", run_id=run_id, grants=grants),
+        request=_request([_delta("auth.k1", "statement auth")]),
+        engine=_RecordingEngine(),
+    )
+
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(
+            store.begin_apply(
+                SERVER_A, admitted.receipt.operation_id, current_grants={"app.adopt"}
+            )
+        )
+    assert err.value.code == "authority_revoked"
+    row = _row(migrated_url, admitted.receipt.operation_id)
+    assert row["status"] == "failed"
+    assert row["error_code"] == "authority_revoked"
+
+    # The failed row is terminal and cannot begin again.
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(
+            store.begin_apply(
+                SERVER_A,
+                admitted.receipt.operation_id,
+                current_grants={"app.learn_service_facts", "app.adopt"},
+            )
+        )
+    assert err.value.code == "operation_not_runnable"
+
+    # Scope guard on the execution fence: a foreign server is refused.
+    other = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-scope", run_id=run_id, grants=grants),
+        request=_request([_delta("auth.k2", "statement scope")]),
+        engine=_RecordingEngine(),
+    )
+    with pytest.raises(ScopeMismatchError):
+        _run(
+            store.begin_apply(
+                SERVER_B, other.receipt.operation_id, current_grants=set(grants)
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# 14. retry of an unknown outcome is forbidden everywhere
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_outcome_never_retried(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    admitted = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-unknown", run_id=run_id),
+        request=_request([_delta("unk.k1", "statement unk")]),
+        engine=_RecordingEngine(),
+    )
+    progressed = _run(
+        store.record_progress(
+            admitted.receipt.operation_id,
+            sub_effects={"facts": SubEffectStatus.APPLIED, "metadata": SubEffectStatus.UNKNOWN},
+        )
+    )
+    assert progressed.status is OperationStatus.UNKNOWN
+
+    engine = _RecordingEngine()
+    with pytest.raises(UnknownOutcomeRetryForbiddenError):
+        _run(store.retry_operation(admitted.receipt.operation_id, engine_enqueue=engine))
+    with pytest.raises(UnknownOutcomeRetryForbiddenError):
+        _run(
+            store.begin_apply(
+                SERVER_A, admitted.receipt.operation_id, current_grants={"anything"}
+            )
+        )
+    assert engine.calls == []  # never re-enqueued
+
+    # The sweep never visits unknown rows (terminal -> outside the pending set).
+    sweep = _run(store.recover_pending_batch(engine_enqueue=engine))
+    assert sweep.total == 0
+    assert sweep.skipped_unknown == 0
+    assert engine.calls == []
+    assert _row(migrated_url, admitted.receipt.operation_id)["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 15. stable keyset cursor under concurrent status mutations
+# ---------------------------------------------------------------------------
+
+
+def test_keyset_cursor_stable_under_mutations(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    for index in range(7):
+        _queued_op(factory, store, run_id, index)
+
+    expected = _ordered_ids(
+        migrated_url, "status = 'queued'", "accepted_at ASC, operation_id ASC"
+    )
+    assert len(expected) == 7
+
+    page_one = _run(store.list_pending_recovery(limit=3))
+    assert [r.operation_id for r in page_one.items] == expected[:3]
+
+    # The three page-1 rows complete while the reader holds the cursor.
+    for receipt in page_one.items:
+        progressed = _run(
+            store.record_progress(
+                receipt.operation_id,
+                sub_effects={"facts": SubEffectStatus.APPLIED, "metadata": SubEffectStatus.FAILED},
+            )
+        )
+        assert progressed.status is OperationStatus.PARTIAL
+
+    last = page_one.items[-1]
+    page_two = _run(
+        store.list_pending_recovery(
+            limit=3,
+            after_accepted_at=last.accepted_at,
+            after_operation_id=last.operation_id,
+        )
+    )
+    assert [r.operation_id for r in page_two.items] == expected[3:6]
+    assert page_two.total == 4  # count under the SAME keyset predicate
+
+    page_three = _run(
+        store.list_pending_recovery(
+            limit=3,
+            after_accepted_at=page_two.items[-1].accepted_at,
+            after_operation_id=page_two.items[-1].operation_id,
+        )
+    )
+    assert [r.operation_id for r in page_three.items] == expected[6:]
+    assert page_three.has_more is False
+
+    visited = [r.operation_id for r in (*page_two.items, *page_three.items)]
+    assert visited == expected[3:]  # zero skipped, zero duplicated
+
+    with pytest.raises(ValueError):
+        _run(store.list_pending_recovery(after_accepted_at=last.accepted_at))
+    with pytest.raises(ValueError):
+        _run(
+            store.list_pending_recovery(
+                after_accepted_at=last.accepted_at,
+                after_operation_id=last.operation_id,
+                offset=3,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# 16. partial outcomes durable
+# ---------------------------------------------------------------------------
+
+
+def test_partial_outcomes_durable(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    admitted = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-partial", run_id=run_id),
+        request=_request([_delta("part.k1", "statement part")]),
+        engine=_RecordingEngine(),
+    )
+    fact_id = uuid.uuid4()
+    progressed = _run(
+        store.record_progress(
+            admitted.receipt.operation_id,
+            sub_effects={"facts": SubEffectStatus.APPLIED, "metadata": SubEffectStatus.FAILED},
+            applied_fact_ids=[fact_id],
+            conflict_keys=["deploy.port"],
+            error_code="metadata_write_refused",
+            error_detail="the metadata writer refused the effect",
+        )
+    )
+    assert progressed.status is OperationStatus.PARTIAL
+    row = _row(migrated_url, admitted.receipt.operation_id)
+    assert row["sub_effects"] == {"facts": "applied", "metadata": "failed"}
+    assert row["applied_fact_ids"] == [str(fact_id)]
+    assert row["conflict_keys"] == ["deploy.port"]
+    assert row["error_code"] == "metadata_write_refused"
+    fetched = _run(store.get_operation(admitted.receipt.operation_id))
+    assert fetched is not None and fetched.status is OperationStatus.PARTIAL
+
+
+# ---------------------------------------------------------------------------
+# 17. post-cancel reconciliation preserves the actually-applied portion
+# ---------------------------------------------------------------------------
+
+
+def test_post_cancel_reconciliation_preserves_applied_portion(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    raced = _admit_on(
+        store,
+        trusted=_trusted(
+            SERVER_A, tool_call_id="call-race", run_id=run_id, grants=["app.learn_service_facts"]
+        ),
+        request=_request([_delta("race.k1", "statement race")]),
+        engine=_RecordingEngine(),
+    )
+    _run(
+        store.begin_apply(
+            SERVER_A,
+            raced.receipt.operation_id,
+            current_grants={"app.learn_service_facts"},
+        )
+    )
+    assert _run(store.cancel_pending_for_run(run_id)) == 1
+
+    # The in-flight executor records its real outcome after the cancel race.
+    fact_id = uuid.uuid4()
+    reconciled = _run(
+        store.record_progress(
+            raced.receipt.operation_id,
+            sub_effects={"facts": SubEffectStatus.APPLIED, "docs": SubEffectStatus.UNKNOWN},
+            applied_fact_ids=[fact_id],
+        )
+    )
+    assert reconciled.status is OperationStatus.UNKNOWN
+    row = _row(migrated_url, raced.receipt.operation_id)
+    assert row["error_code"] == "source_cancelled"  # preserved, never overwritten
+    assert row["applied_fact_ids"] == [str(fact_id)]
+    assert row["sub_effects"] == {"facts": "applied", "docs": "unknown"}
+
+    # Without an applied/unknown portion the regression refusal stands.
+    other = _admit_on(
+        store,
+        trusted=_trusted(
+            SERVER_A, tool_call_id="call-race2", run_id=run_id, grants=["app.learn_service_facts"]
+        ),
+        request=_request([_delta("race.k2", "statement race two")]),
+        engine=_RecordingEngine(),
+    )
+    _run(
+        store.begin_apply(
+            SERVER_A,
+            other.receipt.operation_id,
+            current_grants={"app.learn_service_facts"},
+        )
+    )
+    assert _run(store.cancel_pending_for_run(run_id)) == 1
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(
+            store.record_progress(
+                other.receipt.operation_id,
+                sub_effects={"facts": SubEffectStatus.PENDING},
+            )
+        )
+    assert err.value.code == "status_regression"
+
+
+# ---------------------------------------------------------------------------
+# 18. startup recovery sweep: promotion, RunIdInUse ack, stale-generation
+# ---------------------------------------------------------------------------
+
+
+def test_recover_pending_batch_promotes_and_reattaches(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    _queued_op(factory, store, run_id, 1)
+    _queued_op(factory, store, run_id, 2)
+
+    healthy = _RecordingEngine()
+    sweep = _run(store.recover_pending_batch(limit=10, engine_enqueue=healthy))
+    assert sweep.promoted == 2
+    assert sweep.superseded == 0
+    assert sweep.enqueue_failed == 0
+    assert all(r.status is OperationStatus.ACCEPTED for r in sweep.receipts)
+    assert len(healthy.calls) == 2
+    assert len(sweep.model_dump_json()) < 64 * 1024
+
+    # A duplicate-workflow-id rejection means the enqueue ALREADY landed
+    # before the crash: treat it as the acknowledgment and promote.
+    _queued_op(factory, store, run_id, 3)
+
+    async def _raise_run_in_use(workflow_id: str) -> None:
+        raise RunIdInUseError(workflow_id)
+
+    promoted = _run(
+        store.recover_pending_batch(limit=10, engine_enqueue=_raise_run_in_use)
+    )
+    assert promoted.promoted == 1
+    assert promoted.enqueue_failed == 0
+    assert promoted.receipts[-1].status is OperationStatus.ACCEPTED
+
+    # Accepted rows are in-flight: untouched, engine never called for them.
+    live = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-live-rec", run_id=run_id),
+        request=_request([_delta("rec.live", "statement live rec")]),
+        engine=_RecordingEngine(),
+    )
+    quiet = _RecordingEngine()
+    sweep_two = _run(store.recover_pending_batch(limit=10, engine_enqueue=quiet))
+    # The three promoted rows plus the fresh admission are all accepted:
+    # in-flight work their executors own — a sweep leaves them untouched.
+    assert sweep_two.in_flight == 4
+    assert sweep_two.promoted == 0
+    assert quiet.calls == []
+    assert _row(migrated_url, live.receipt.operation_id)["status"] == "accepted"
+
+
+def test_recover_pending_batch_supersedes_stale_generation(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    stale_live = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-old", run_id=run_id),
+        request=_request([_delta("gen.old", "statement old")]),
+        engine=_RecordingEngine(),
+    )
+    _queued_op(factory, store, run_id, 5)
+    first = _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))
+    assert first.generation == 1  # explicit readopt on an absent identity starts at 1
+    readopted = _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))
+    assert readopted.generation == 2  # the old operations now carry a stale generation
+
+    engine = _RecordingEngine()
+    sweep = _run(store.recover_pending_batch(limit=10, engine_enqueue=engine))
+    assert sweep.superseded == 2
+    assert sweep.promoted == 0
+    assert engine.calls == []  # the queued stale row is NEVER enqueued
+    for operation_id in (
+        stale_live.receipt.operation_id,
+        uuid.uuid5(uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-q5"),
+    ):
+        row = _row(migrated_url, operation_id)
+        assert row["status"] == "failed"
+        assert row["error_code"] == "generation_superseded"
+
+    # Server-scoped sweep: a different server owns no pending rows here.
+    scoped = _run(
+        store.recover_pending_batch(SERVER_B, limit=10, engine_enqueue=engine)
+    )
+    assert scoped.total == 0
+    assert scoped.receipts == []
