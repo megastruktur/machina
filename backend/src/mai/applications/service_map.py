@@ -48,7 +48,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:  # composition-time only; metadata_mutations imports this module
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
 
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
@@ -636,6 +639,25 @@ def _registry_lock(lock_path: Path, ensure: Callable[[], None]) -> _ProcessFileL
         return existing
 
 
+class _NoopLockService:
+    """Lock stub for coordinator wiring WITHOUT a lease service.
+
+    ``acquire_all`` grants nothing and ``release`` is a no-op: the
+    metadata coordinator then runs without the C4 Postgres lease set —
+    the slice-15 in-process/file store lock still serializes the leaf
+    write. Production wiring binds a real ``ResourceLockService`` (or
+    injects a fully-wired coordinator), which enforces the tombstone
+    guard and the lease order."""
+
+    def acquire_all(self, requests: Any) -> tuple[Any, ...]:
+        del requests
+        return ()
+
+    def release(self, lease: Any) -> None:
+        del lease
+        return None
+
+
 def _entry_of(document: Mapping[str, object], *, server_id: str) -> ServiceMapEntry:
     """Strictly type one persisted entry document (malformed = surfaced)."""
     try:
@@ -719,6 +741,22 @@ class ServiceMapStore:
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self._root = Path(root).resolve(strict=False)
+        #: Optionally bound service-metadata coordinator (slice 16/19):
+        #: when bound, composed capabilities route their mutations
+        #: through it (C4 lease order + tombstone guard) instead of the
+        #: bare store seam. ``None`` keeps the pure-filesystem behavior.
+        self._metadata_coordinator: Any = None
+
+    @property
+    def metadata_coordinator(self) -> Any:
+        """The bound coordinator, or ``None`` when unbound."""
+        return self._metadata_coordinator
+
+    def bind_coordinator(self, coordinator: Any) -> None:
+        """Bind a shared ``MetadataMutationCoordinator`` to this store so
+        composed capabilities inherit the C4 lease order and the tombstone
+        guard from the same instance."""
+        self._metadata_coordinator = coordinator
 
     @property
     def root(self) -> Path:
@@ -1444,19 +1482,106 @@ class ServiceMapUpsertCapability:
     :class:`ServiceMapError` rejections the dispatcher maps honestly.
     """
 
-    def __init__(self, store: ServiceMapStore) -> None:
+    def __init__(
+        self,
+        store: ServiceMapStore,
+        *,
+        coordinator: Any = None,
+        locks: Any = None,
+        session_factory: Any = None,
+        adoption: Any = None,
+        check_suppression: bool = True,
+        explicit_operator_write: bool = False,
+        application_lease: Any = None,
+    ) -> None:
         if not isinstance(store, ServiceMapStore):
             raise ServiceMapError(
                 ServiceMapErrorCode.INVALID_REQUEST,
                 "store must be a ServiceMapStore",
             )
         self._store = store
+        self._check_suppression = check_suppression
+        self._explicit_operator_write = explicit_operator_write
+        self._application_lease = application_lease
+        # Lazy import: mai.applications.metadata_mutations imports THIS
+        # module, so the coordinator class is only resolved at wiring time.
+        from mai.applications.metadata_mutations import (
+            MetadataMutationCoordinator,
+        )
+
+        resolved: MetadataMutationCoordinator | Any
+        if coordinator is not None:
+            if not isinstance(coordinator, MetadataMutationCoordinator):
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    "coordinator must be a MetadataMutationCoordinator",
+                )
+            resolved = coordinator
+        elif (
+            store.metadata_coordinator is not None
+            and locks is None
+            and session_factory is None
+        ):
+            # The store's own bound coordinator (slice 16/19 wiring).
+            resolved = store.metadata_coordinator
+        elif session_factory is not None or locks is not None:
+            from mai.applications.learning_operations import (
+                LearningOperationStore,
+            )
+            from mai.jobs.resource_locks import ResourceLockService
+
+            effective_locks = locks
+            if effective_locks is None and session_factory is not None:
+                bind = getattr(session_factory, "kw", {}).get("bind")
+                bind_url = getattr(bind, "url", None)
+                if bind is not None and bind_url is not None:
+                    dsn = (
+                        bind_url.render_as_string(hide_password=False)
+                        .replace("postgresql+asyncpg://", "postgresql://")
+                        .replace("postgres+asyncpg://", "postgresql://")
+                    )
+                    effective_locks = ResourceLockService(dsn)
+            resolved = MetadataMutationCoordinator(
+                locks=(
+                    effective_locks
+                    if effective_locks is not None
+                    else _NoopLockService()
+                ),
+                map_store=store,
+                learning=(
+                    LearningOperationStore(session_factory)
+                    if session_factory is not None
+                    else None
+                ),
+                adoption=adoption,
+                sessions=session_factory,
+            )
+        else:
+            # Pure-filesystem unit wiring: the store's own slice-15 lock
+            # still serializes the leaf write; the C4 Postgres lease set
+            # and the tombstone guard require a wired session factory.
+            resolved = MetadataMutationCoordinator(
+                locks=_NoopLockService(),
+                map_store=store,
+                learning=None,
+                adoption=adoption,
+                sessions=None,
+            )
+        self._coordinator: MetadataMutationCoordinator | Any = resolved
 
     def __repr__(self) -> str:
         return f"<ServiceMapUpsertCapability root={self._store.root!s}>"
 
     async def __call__(self, call: CapabilityCall) -> ExecutorResult:
-        """Execute one gated upsert (see module docstring for the shape)."""
+        """Execute one gated upsert THROUGH the metadata coordinator.
+
+        The store's internal lock is acquired ONLY inside
+        ``store.upsert_entry`` at the leaf of
+        ``coordinator.upsert_map_entry`` — never here, and never held
+        across an ``await``. ``MetadataMutationError`` (lease set,
+        tombstone guard) maps to a structured refused
+        ``ExecutorResult``; ``ServiceMapError`` (invalid payload fields,
+        categories, instructions) keeps raising exactly as before."""
         if not isinstance(call, CapabilityCall):
             raise ServiceMapError(
                 ServiceMapErrorCode.INVALID_REQUEST,
@@ -1496,21 +1621,53 @@ class ServiceMapUpsertCapability:
             raise ServiceMapError(
                 ServiceMapErrorCode.INVALID_REQUEST, "name is required"
             )
-        application_id = payload.get("application_id")
-        entry = self._store.upsert_entry(
-            context.server_id,
-            name=payload["name"],
-            category=payload.get("category", "system"),
-            origin=payload.get("origin", "manual"),
-            application_id=None if application_id is None else application_id,
-            compose_project=payload.get("compose_project"),
-            working_dir=payload.get("working_dir"),
-            unit_name=payload.get("unit_name"),
-            description=payload.get("description", ""),
-            instructions=payload.get("instructions"),
-            custom_instructions=payload.get("custom_instructions"),
-            installed=payload.get("installed"),
-        )
+        # Identity validation BEFORE any lease is touched: invalid
+        # server/name/application ids are the caller's field errors.
+        sid = _canonical_uuid(context.server_id, "server_id")
+        server_uuid = uuid.UUID(sid)
+        validated_name = _validated_name(payload["name"])
+        if payload.get("application_id") is not None:
+            target_uuid = uuid.UUID(
+                _canonical_uuid(payload["application_id"], "application_id")
+            )
+        else:
+            target_uuid = uuid.uuid5(
+                server_uuid, f"service-map:{validated_name.strip().lower()}"
+            )
+        from mai.applications.metadata_mutations import MetadataMutationError
+
+        try:
+            entry: ServiceMapEntry = await self._coordinator.upsert_map_entry(
+                server_uuid,
+                target_uuid,
+                name=payload["name"],
+                category=payload.get("category", "system"),
+                origin=payload.get("origin", "manual"),
+                compose_project=payload.get("compose_project"),
+                working_dir=payload.get("working_dir"),
+                unit_name=payload.get("unit_name"),
+                description=payload.get("description", ""),
+                instructions=payload.get("instructions"),
+                custom_instructions=payload.get("custom_instructions"),
+                installed=payload.get("installed"),
+                check_suppression=self._check_suppression,
+                explicit_operator_write=self._explicit_operator_write,
+                application_lease=self._application_lease,
+            )
+        except MetadataMutationError as exc:
+            return ExecutorResult(
+                ok=False,
+                error_code=exc.code.value,
+                output=json.dumps(
+                    {
+                        "status": "refused",
+                        "code": exc.code.value,
+                        "message": exc.detail,
+                        "capability_id": CAPABILITY_ID,
+                    },
+                    sort_keys=True,
+                ),
+            )
         previous_revision = entry.revision - 1
         summary = {
             "status": "ok",

@@ -25,6 +25,7 @@ pure and need no database. No live provider, no real SSH, no browser.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import multiprocessing
@@ -2486,3 +2487,288 @@ async def test_internal_api_injected_metadata_coordinator_is_honored(
     # coordinator's own lock service.
     assert coordinator_locks.inspect(str(server_a), f"application:{aid}") is None
     assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+
+# ---------------------------------------------------------------------------
+# ask_19-map-capability-retrofit: app.upsert_map_entry delegates through
+# the metadata coordinator (C4 lease order + tombstone guard) WITHOUT
+# recursively acquiring the store's internal file lock.
+# ---------------------------------------------------------------------------
+
+
+def _derived_locks(session_factory: Any):
+    from mai.jobs.resource_locks import ResourceLockService as _RLS
+
+    bind = getattr(session_factory, "kw", {}).get("bind")
+    dsn = (
+        getattr(bind, "url")
+        .render_as_string(hide_password=False)
+        .replace("postgresql+asyncpg://", "postgresql://")
+        .replace("postgres+asyncpg://", "postgresql://")
+    )
+    locks = _RLS(dsn)
+    locks.ensure_schema()
+    return locks
+
+
+async def test_upsert_map_capability_delegates_to_coordinator_without_recursive_store_lock(
+    tmp_path: Path, migrated_url: str
+) -> None:
+    import asyncio
+
+    store = _store(tmp_path)
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        my_locks = _derived_locks(session_factory)
+        capability = ServiceMapUpsertCapability(
+            store, session_factory=session_factory, locks=my_locks
+        )
+        coordinator = capability._coordinator
+        original = coordinator.upsert_map_entry
+        lock_key = str(
+            (store.root / "servers" / f"{SERVER_A}.lock").resolve(strict=False)
+        )
+        calls: list[tuple[str, str]] = []
+        depths_at_entry: list[int | None] = []
+
+        async def spy(server_id: uuid.UUID, application_id: uuid.UUID, **kwargs: Any):
+            # Delegation entry point: the store's internal file lock must
+            # NOT be held here (it is acquired only inside upsert_entry).
+            from mai.applications.service_map import _FILE_LOCKS
+
+            lock = _FILE_LOCKS.get(lock_key)
+            depths_at_entry.append(None if lock is None else lock._depth)
+            calls.append((str(server_id), str(application_id)))
+            return await original(server_id, application_id, **kwargs)
+
+        coordinator.upsert_map_entry = spy  # type: ignore[method-assign]
+
+        call = CapabilityCall(
+            descriptor=upsert_map_descriptor(),
+            payload={"name": "delegated"},
+            context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        result = await asyncio.wait_for(capability(call), 30)
+        assert result.ok is True, result.output
+        aid = uuid.uuid5(SERVER_A, "service-map:delegated")
+        assert calls == [(str(SERVER_A), str(aid))]  # delegation proven
+        assert depths_at_entry == [None]  # store lock NOT held at entry
+
+        entry = store.get_entry(SERVER_A, aid)
+        assert entry is not None and entry.revision == 1
+        # Both C4 leases were acquired and RELEASED through the wired
+        # lock service.
+        assert my_locks.inspect(str(SERVER_A), f"application:{aid}") is None
+        assert my_locks.inspect(str(SERVER_A), "service-metadata") is None
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_map_capability_respects_deletion_tombstone_and_readopt(
+    tmp_path: Path, migrated_url: str
+) -> None:
+    from mai.applications.learning_operations import LearningOperationStore
+
+    store = _store(tmp_path)
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        my_locks = _derived_locks(session_factory)
+        capability = ServiceMapUpsertCapability(
+            store, session_factory=session_factory, locks=my_locks
+        )
+        learning = LearningOperationStore(session_factory)
+        aid = uuid.uuid4()
+
+        async def upsert(**overrides: Any) -> Any:
+            from mai.capabilities.dispatch import CapabilityCall
+
+            call = CapabilityCall(
+                descriptor=upsert_map_descriptor(),
+                payload={
+                    "name": "tombstoned",
+                    "application_id": str(aid),
+                    **overrides,
+                },
+                context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+                credentials={},
+                op_id=uuid.uuid4(),
+            )
+            return await capability(call)
+
+        created = await asyncio.wait_for(
+            upsert(custom_instructions="first notes"), 30
+        )
+        assert created.ok is True, created.output
+
+        # Unadopt/delete equivalent: tombstone + full map removal.
+        await learning.suppress_for_unadopt(SERVER_A, aid)
+        store.delete_entry(SERVER_A, aid)
+
+        refused = await asyncio.wait_for(upsert(), 30)
+        assert refused.ok is False
+        assert "auto_adopt_suppressed" in refused.output
+        # The deleted service was NOT recreated by the refused call.
+        assert store.get_entry(SERVER_A, aid) is None
+
+        # An operator-initiated write passes through the tombstone...
+        operator = ServiceMapUpsertCapability(
+            store,
+            session_factory=session_factory,
+            locks=my_locks,
+            explicit_operator_write=True,
+        )
+        operator_call = CapabilityCall(
+            descriptor=upsert_map_descriptor(),
+            payload={
+                "name": "tombstoned",
+                "application_id": str(aid),
+                "custom_instructions": "operator notes",
+            },
+            context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        operator_result = await asyncio.wait_for(operator(operator_call), 30)
+        assert operator_result.ok is True, operator_result.output
+        assert store.get_entry(SERVER_A, aid) is not None
+
+        # ...and the explicit readopt clears the tombstone for background
+        # writers again.
+        await learning.readopt_service_identity(SERVER_A, aid, manual_identity=True)
+
+        background = ServiceMapUpsertCapability(
+            store, session_factory=session_factory, locks=my_locks
+        )
+        background_call = CapabilityCall(
+            descriptor=upsert_map_descriptor(),
+            payload={"name": "tombstoned", "application_id": str(aid)},
+            context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        background_result = await asyncio.wait_for(background(background_call), 30)
+        assert background_result.ok is True, background_result.output
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_map_capability_refuses_under_lease_contention_and_concurrent_http_ops(
+    live_app: FastAPI,
+    bootstrapped_url: str,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+) -> None:
+    import asyncio
+
+    from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+    from mai.jobs.resource_locks import ResourceLockService
+
+    store = live_app.state.service_map
+    my_locks = ResourceLockService(bootstrapped_url)
+    my_locks.ensure_schema()
+    capability = ServiceMapUpsertCapability(
+        store=store, session_factory=live_app.state.session_factory
+    )
+
+    async def upsert_call(aid: uuid.UUID, name: str):
+        call = CapabilityCall(
+            descriptor=upsert_map_descriptor(),
+            payload={"name": name, "application_id": str(aid), "origin": "manual"},
+            context=_context((UPSERT_CAPABILITY,), server_id=server_a),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        return await capability(call)
+
+    # Contention: a foreign boot holding service-metadata refuses the
+    # capability WITHOUT modifying the store; the lease is released in
+    # finally so nothing leaks into the session-scoped fixture DB.
+    holder = ResourceLockService(bootstrapped_url, boot_id=str(uuid.uuid4()))
+    holder.ensure_schema()
+    lease = holder.acquire(str(server_a), "service-metadata", owner_ref="test")
+    try:
+        refused = await upsert_call(uuid.uuid4(), "contended")
+        assert refused.ok is False
+        assert refused.error_code == "lease_conflict"
+        envelope = json.loads(refused.output)
+        assert envelope["code"] == "lease_conflict"
+        assert store.list_entries(server_a) == ()
+    finally:
+        holder.release(lease)
+
+    # Concurrent HTTP writer: adopt a compose service, then run the
+    # capability upserts (distinct services) alongside the HTTP DELETE of
+    # the adopted entry — everything serializes through the metadata
+    # lease with clean release.
+    compose_id = uuid.uuid4()
+    tag = uuid.uuid4().hex[:8]
+    created = await call_app(
+        live_app,
+        "POST",
+        _apps_root(server_a),
+        json_body={
+            "application_id": str(compose_id),
+            "name": f"cap-compose-{tag}",
+            "origin": "compose",
+            "expected_revision": 0,
+            "compose_project": f"cap-{tag}",
+            "working_dir": f"/srv/cap-{tag}",
+        },
+        headers=_mutation_headers(jar),
+        cookies=jar,
+    )
+    assert created.status == 201, created.body
+
+    x_id, y_id = uuid.uuid4(), uuid.uuid4()
+
+    # The lease discipline is FAIL-FAST (never waits): concurrent
+    # contenders refuse with lease_conflict. Bounded retries settle every
+    # operation while keeping the concurrency genuine.
+    async def upsert_with_retry(aid: uuid.UUID, name: str):
+        for _ in range(20):
+            result = await upsert_call(aid, name)
+            if result.ok:
+                return result
+            await asyncio.sleep(0.05)
+        return result
+
+    async def delete_with_retry():
+        for _ in range(20):
+            response = await call_app(
+                live_app,
+                "DELETE",
+                f"{_apps_root(server_a)}/{compose_id}",
+                json_body={"expected_revision": 1},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            if response.status in (200, 201, 204):
+                return response
+            await asyncio.sleep(0.05)
+        return response
+
+    results = await asyncio.gather(
+        upsert_with_retry(x_id, f"cap-x-{tag}"),
+        upsert_with_retry(y_id, f"cap-y-{tag}"),
+        delete_with_retry(),
+    )
+    for result in results:
+        if isinstance(result, ExecutorResult):
+            assert result.ok is True, result.output
+        else:  # HttpResponse
+            assert result.status in (200, 201, 204), result.body
+
+    entries = {e.application_id: e for e in store.list_entries(server_a)}
+    assert entries[str(x_id)].revision == 1  # serialized, no lost update
+    assert entries[str(y_id)].revision == 1
+    assert entries[str(compose_id)].revision == 1  # sidecar retained
+    record = await live_app.state.app_adoption.read(server_a, compose_id)
+    assert record is None  # the concurrent HTTP revoke applied
+    assert my_locks.inspect(str(server_a), "service-metadata") is None
+    for application_id in (x_id, y_id, compose_id):
+        assert (
+            my_locks.inspect(str(server_a), f"application:{application_id}")
+            is None
+        )
