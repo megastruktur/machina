@@ -2193,9 +2193,14 @@ async def test_delegation_narrows_the_admitted_surface(
 # ---------------------------------------------------------------------------
 
 
-async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
-    app_fixture: FastAPI,
+def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
+    migrated_url: str, tmp_path: Path
 ) -> None:
+    """A SYNC test on a FRESH app instance: the composition coroutines run
+    on TestClient's OWN portal loop (never pytest-asyncio's), so the
+    pooled engine connections it binds are disposed on the SAME loop at
+    lifespan exit — the previous async variant deadlocked the two
+    threads' loops at dispose."""
     import json
 
     from mai.applications.knowledge_read import KnowledgeReadStore
@@ -2206,12 +2211,12 @@ async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
     from mai.jobs.engine import EngineClient
     from mai.policy.evaluate import ExecutionContext, PolicyMode
 
-    app = app_fixture
+    app = _build_app(migrated_url, tmp_path / "data-root-comp")
     # AC 1: the API process NEVER launches the durable engine — no
     # launch-recovery scheduler, no stolen pending workflows.
     assert jobs_engine._LAUNCHED is None
 
-    with TestClient(app):  # the lifespan RUNS the composition here
+    with TestClient(app) as client:  # the lifespan RUNS the composition here
         # Entering TestClient re-ran the lifespan and rebuilt
         # app.state: acquire the composition family INSIDE the block so
         # the calls AND the assertions exercise the SAME instances
@@ -2263,25 +2268,24 @@ async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
             )
 
         learn_env = json.loads(
-            (
-                await comp.executors["app.learn_service"](
-                    _call(
-                        "app.learn_service",
-                        {
-                            "application_id": str(application_id),
-                            "facts": [
-                                {
-                                    "category": "deployment",
-                                    "key": "health-path",
-                                    "statement": "health lives at /healthz",
-                                    "source_kind": "tool_result",
-                                    "source_refs": [str(uuid.uuid4())],
-                                }
-                            ],
-                            "expected_generation": 1,
-                        },
-                    )
-                )
+            client.portal.call(
+                comp.executors["app.learn_service"],
+                _call(
+                    "app.learn_service",
+                    {
+                        "application_id": str(application_id),
+                        "facts": [
+                            {
+                                "category": "deployment",
+                                "key": "health-path",
+                                "statement": "health lives at /healthz",
+                                "source_kind": "tool_result",
+                                "source_refs": [str(uuid.uuid4())],
+                            }
+                        ],
+                        "expected_generation": 1,
+                    },
+                ),
             ).output
         )
         assert learn_env["status"] == "ok", learn_env
@@ -2299,13 +2303,12 @@ async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
         # The SAME admission is readable through the lane's SHARED read
         # store — one instance family across the API surface.
         status_env = json.loads(
-            (
-                await comp.executors["app.get_learning_status"](
-                    _call(
-                        "app.get_learning_status",
-                        {"application_id": str(application_id)},
-                    )
-                )
+            client.portal.call(
+                comp.executors["app.get_learning_status"],
+                _call(
+                    "app.get_learning_status",
+                    {"application_id": str(application_id)},
+                ),
             ).output
         )
         assert status_env["found"] is True, status_env
