@@ -2194,7 +2194,7 @@ async def test_delegation_narrows_the_admitted_surface(
 
 
 async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
-    app_fixture: FastAPI, tmp_path: Path
+    app_fixture: FastAPI,
 ) -> None:
     import json
 
@@ -2211,45 +2211,57 @@ async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
     # launch-recovery scheduler, no stolen pending workflows.
     assert jobs_engine._LAUNCHED is None
 
-    # The composition root created the shared dependency family.
-    assert isinstance(app.state.knowledge_read, KnowledgeReadStore)
-    assert isinstance(app.state.learning_operations, LearningOperationStore)
-    assert isinstance(app.state.metadata_coordinator, MetadataMutationCoordinator)
-    assert isinstance(app.state.learn_engine_client, EngineClient)
-    assert callable(app.state.learn_engine_enqueue)
-    # The coordinator SHARES the composition's own instances (identity,
-    # not copies): one map store, one operation store, one adoption seam.
-    assert (
-        app.state.metadata_coordinator._learning
-        is app.state.learning_operations
-    )
-    assert app.state.metadata_coordinator._map_store is app.state.service_map
-    assert app.state.metadata_coordinator._adoption is app.state.app_adoption
+    with TestClient(app):  # the lifespan RUNS the composition here
+        # Entering TestClient re-ran the lifespan and rebuilt
+        # app.state: acquire the composition family INSIDE the block so
+        # the calls AND the assertions exercise the SAME instances
+        # (never a stale pre-lifespan view).
+        comp = app.state.internal_api
+        by_id = {d.identifier: d for d in comp.descriptors}
 
-    comp = app.state.internal_api
-    by_id = {d.identifier: d for d in comp.descriptors}
-    application_id = uuid.uuid4()
-
-    def _call(cap_id: str, payload: dict[str, object]) -> CapabilityCall:
-        return CapabilityCall(
-            descriptor=by_id[cap_id],
-            payload=dict(payload),
-            context=ExecutionContext(
-                principal="principal",
-                server_id=SERVER_A,
-                run_id=uuid.uuid4(),
-                parent_scope=None,
-                profile_revision="1",
-                prompt_revision="1",
-                credential_references=(),
-                allowed_capabilities=(cap_id,),
-                mode=PolicyMode.DELEGATED,
-            ),
-            credentials={},
-            op_id=uuid.uuid4(),
+        # The composition root created the shared dependency family.
+        assert isinstance(app.state.knowledge_read, KnowledgeReadStore)
+        assert isinstance(app.state.learning_operations, LearningOperationStore)
+        assert isinstance(
+            app.state.metadata_coordinator, MetadataMutationCoordinator
+        )
+        assert isinstance(app.state.learn_engine_client, EngineClient)
+        assert callable(app.state.learn_engine_enqueue)
+        # The coordinator SHARES the composition's own instances
+        # (identity, not copies): one map store, one operation store,
+        # one adoption seam.
+        assert (
+            app.state.metadata_coordinator._learning
+            is app.state.learning_operations
+        )
+        assert (
+            app.state.metadata_coordinator._map_store is app.state.service_map
+        )
+        assert (
+            app.state.metadata_coordinator._adoption is app.state.app_adoption
         )
 
-    with TestClient(app):  # lifespan runs the composition
+        application_id = uuid.uuid4()
+
+        def _call(cap_id: str, payload: dict[str, object]) -> CapabilityCall:
+            return CapabilityCall(
+                descriptor=by_id[cap_id],
+                payload=dict(payload),
+                context=ExecutionContext(
+                    principal="principal",
+                    server_id=SERVER_A,
+                    run_id=uuid.uuid4(),
+                    parent_scope=None,
+                    profile_revision="1",
+                    prompt_revision="1",
+                    credential_references=(),
+                    allowed_capabilities=(cap_id,),
+                    mode=PolicyMode.DELEGATED,
+                ),
+                credentials={},
+                op_id=uuid.uuid4(),
+            )
+
         learn_env = json.loads(
             (
                 await comp.executors["app.learn_service"](
@@ -2300,6 +2312,6 @@ async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
         assert status_env["operation_id"] == operation_id
         assert status_env["receipt_status"] == "accepted"
 
-    # The learn client's system-database pool is released at shutdown.
-    assert app.state.learn_engine_client is not None
-    app.state.learn_engine_client.close()  # idempotent second close
+    # Lifespan shutdown already closed the learn client that ACTUALLY
+    # enqueued (no leaked system-DB pool); a second close is idempotent.
+    app.state.learn_engine_client.close()
