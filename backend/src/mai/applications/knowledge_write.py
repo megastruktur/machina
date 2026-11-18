@@ -54,6 +54,7 @@ from mai.applications.knowledge_contracts import (
     TrustedSourceContext,
     derive_operation_status,
     enforce_envelope_bound,
+    validate_same_server_scope,
 )
 
 __all__ = [
@@ -227,13 +228,22 @@ class KnowledgeWriteStore:
         persisted session log. Returns ``None`` when every reference
         resolves to a persisted, same-scope, successful entry of the
         required kind; otherwise a stable refusal code."""
-        wanted: dict[str, str] = {}
+        wanted: dict[str, set[str]] = {}
         for source_kind, refs in provenance.items():
             required_kind = _PROVENANCE_ENTRY_KIND[source_kind]
             for ref in refs:
-                wanted[ref] = required_kind
+                try:
+                    canonical = str(uuid.UUID(ref.strip()))
+                except ValueError:
+                    return _CODE_INVALID_PROVENANCE
+                wanted.setdefault(canonical, set()).add(required_kind)
         if not wanted:
             return _CODE_INVALID_PROVENANCE
+        # One persisted entry has exactly ONE kind: a reference claimed
+        # under two different source kinds can never satisfy both.
+        for required_kinds in wanted.values():
+            if len(required_kinds) > 1:
+                return _CODE_INVALID_PROVENANCE
         rows = (
             await session.execute(
                 sa.text(
@@ -246,10 +256,11 @@ class KnowledgeWriteStore:
             )
         ).mappings().all()
         found = {str(row["entry_id"]): row for row in rows}
-        for ref, required_kind in wanted.items():
+        for ref, required_kinds in wanted.items():
             row = found.get(ref)
             if row is None:
                 return _CODE_INVALID_PROVENANCE
+            required_kind = next(iter(required_kinds))
             if str(row["kind"]) != required_kind:
                 return _CODE_INVALID_PROVENANCE
             if uuid.UUID(str(row["server_id"])) != trusted.server_id:
@@ -306,16 +317,13 @@ class KnowledgeWriteStore:
         """Apply one bounded learn request through the single mutation
         seam. Provenance is validated before any write; the generation
         CAS must match exactly (an absent identity is created at
-        generation 1); unrelated keys merge, identical same-key
-        proposals are idempotent, divergent same-key proposals (within
-        the request or against a stored ACTIVE fact) are refused as
-        conflicts; capacity is explicit. Operator notes and the catalog
-        runbook are never touched."""
-        if trusted.server_id != server_id:
-            raise ValueError(
-                "the trusted context server does not match the authorized "
-                "scope"
-            )
+        generation 1 — stale work never applies and never fabricates an
+        identity row); unrelated (category, key) identities merge,
+        identical same-key proposals are idempotent, divergent same-key
+        proposals (within the request or against a stored ACTIVE fact)
+        are refused as conflicts; capacity is explicit. Operator notes
+        and the catalog runbook are never touched."""
+        validate_same_server_scope(server_id, trusted.server_id)
         if request.expected_generation != expected_generation:
             raise ValueError(
                 "request.expected_generation does not match the "
@@ -400,15 +408,21 @@ class KnowledgeWriteStore:
                     enforce_envelope_bound(result)
                     return result
 
-                # 3. Same-key analysis within the request.
-                grouped: dict[str, list[ProposedFactDelta]] = {}
+                # 3. Same-(category, key) analysis within the request:
+                #    the active-key identity is (category, key) — the
+                #    same key under a different category is a DISTINCT
+                #    fact (matching uq_service_learned_fact_active_key).
+                grouped: dict[tuple[str, str], list[ProposedFactDelta]] = {}
                 for delta in request.facts:
-                    grouped.setdefault(delta.key, []).append(delta)
+                    grouped.setdefault(
+                        (delta.category, delta.key), []
+                    ).append(delta)
                 conflict_keys: list[str] = []
+                conflicted_cat_keys: set[tuple[str, str]] = set()
                 plan: list[ProposedFactDelta] = []
-                request_deduped_keys: set[str] = set()
-                for key in sorted(grouped):
-                    deltas = grouped[key]
+                request_deduped_keys: set[tuple[str, str]] = set()
+                for cat_key in sorted(grouped):
+                    deltas = grouped[cat_key]
                     first = deltas[0]
                     identical = all(
                         _normalized_statement(other.statement)
@@ -419,17 +433,17 @@ class KnowledgeWriteStore:
                         for other in deltas[1:]
                     )
                     if not identical:
-                        conflict_keys.append(key)
+                        conflicted_cat_keys.add(cat_key)
                         continue
                     if len(deltas) > 1:
-                        request_deduped_keys.add(key)
+                        request_deduped_keys.add(cat_key)
                     plan.append(first)
 
-                # 4. Per-key CAS against stored ACTIVE facts.
+                # 4. Per-(category, key) CAS against stored ACTIVE facts.
                 active_rows = (
                     await session.execute(
                         sa.text(
-                            "SELECT fact_id, key, statement FROM "
+                            "SELECT fact_id, category, key, statement FROM "
                             "service_learned_fact WHERE server_id = :s AND "
                             "application_id = :a AND generation = :g AND "
                             "status = 'active' FOR UPDATE"
@@ -437,15 +451,21 @@ class KnowledgeWriteStore:
                         {"s": server_id, "a": application_id, "g": generation},
                     )
                 ).mappings().all()
-                active_by_key = {str(row["key"]): row for row in active_rows}
+                active_by_cat_key = {
+                    (str(row["category"]), str(row["key"])): row
+                    for row in active_rows
+                }
 
                 applied: list[uuid.UUID] = []
                 idempotent: list[uuid.UUID] = []
                 new_rows: list[dict[str, object]] = []
-                for delta in sorted(plan, key=lambda item: item.key):
-                    if delta.key in conflict_keys:  # pragma: no cover
+                for delta in sorted(
+                    plan, key=lambda item: (item.category, item.key)
+                ):
+                    cat_key = (delta.category, delta.key)
+                    if cat_key in conflicted_cat_keys:  # pragma: no cover
                         continue
-                    stored = active_by_key.get(delta.key)
+                    stored = active_by_cat_key.get(cat_key)
                     if stored is not None:
                         if _normalized_statement(
                             str(stored["statement"])
@@ -457,7 +477,7 @@ class KnowledgeWriteStore:
                         # Divergent same-key value against a stored ACTIVE
                         # fact: a CONFLICT — corrections go through the
                         # per-fact CAS, never last-writer-wins.
-                        conflict_keys.append(delta.key)
+                        conflicted_cat_keys.add(cat_key)
                         continue
                     new_id = uuid.uuid4()
                     new_rows.append(
@@ -480,12 +500,14 @@ class KnowledgeWriteStore:
 
                 # 5. Capacity is explicit (never silently dropped).
                 if new_rows:
-                    active_count = len(active_by_key)
+                    active_count = len(active_by_cat_key)
                     if (
                         active_count + len(new_rows)
                         > MAX_ACTIVE_FACTS_PER_SERVICE
                     ):
-                        kwargs = base | self._refusal_kwargs(
+                        kwargs = base | {
+                            "generation": generation
+                        } | self._refusal_kwargs(
                             _CODE_CAPACITY_EXCEEDED,
                             f"applying this request would exceed "
                             f"{MAX_ACTIVE_FACTS_PER_SERVICE} active facts; "
@@ -522,10 +544,14 @@ class KnowledgeWriteStore:
                         ),
                         row | {"rid": uuid.uuid4()},
                     )
-                    if row["key"] in request_deduped_keys:
+                    if (row["c"], row["k"]) in request_deduped_keys:
                         idempotent.append(uuid.UUID(str(row["fact_id"])))
 
-                # 7. Honest derived status (partial stays distinct).
+                # 7. Honest derived status (partial stays distinct);
+                #    conflict_keys report the semantic key (deduped).
+                conflict_keys = sorted(
+                    {key for _cat, key in conflicted_cat_keys}
+                )
                 sub_effects: dict[str, SubEffectStatus] = {}
                 if applied or idempotent:
                     sub_effects[_FACTS_EFFECT] = SubEffectStatus.APPLIED
@@ -535,7 +561,7 @@ class KnowledgeWriteStore:
                     "generation": generation,
                     "applied_fact_ids": applied,
                     "idempotent_fact_ids": idempotent,
-                    "conflict_keys": sorted(set(conflict_keys)),
+                    "conflict_keys": conflict_keys,
                     "revisions_written": len(new_rows),
                     "status": derive_operation_status(sub_effects)
                     if sub_effects
@@ -567,6 +593,7 @@ class KnowledgeWriteStore:
         the old row becomes ``superseded``, a NEW row with
         ``revision = N+1`` and ``supersedes_fact_id`` is inserted, and
         the append-only history gains one row. Never last-writer-wins."""
+        validate_same_server_scope(server_id, trusted.server_id)
         base: dict[str, object] = {
             "server_id": server_id,
             "application_id": application_id,

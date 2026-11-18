@@ -34,6 +34,7 @@ from mai.applications.knowledge_contracts import (
     MAX_ACTIVE_FACTS_PER_SERVICE,
     OperationStatus,
     ProposedFactDelta,
+    ScopeMismatchError,
     TrustedSourceContext,
 )
 from mai.applications.knowledge_write import (
@@ -173,7 +174,7 @@ def _seed_session_log(
 
 
 def _successful_tool_entry(
-    entry_id: uuid.UUID, payload_tail: dict[str, object] | None = None
+    payload_tail: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
     payload: dict[str, object] = {
         "status": "executed",
@@ -238,14 +239,15 @@ def _apply(
 def _fact_rows(migrated_url: str, application_id: uuid.UUID) -> list[dict]:
     with psycopg.connect(migrated_url) as conn:
         rows = conn.execute(
-            "SELECT fact_id, key, statement, revision, status, "
+            "SELECT fact_id, category, key, statement, revision, status, "
             "source_kind, source_ref, supersedes_fact_id FROM "
             "service_learned_fact WHERE application_id = %s "
-            "ORDER BY key, revision",
+            "ORDER BY category, key, revision",
             (str(application_id),),
         ).fetchall()
     names = (
         "fact_id",
+        "category",
         "key",
         "statement",
         "revision",
@@ -323,7 +325,7 @@ def test_cross_server_provenance_denied_without_writes(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_B,
-        entry_ids={foreign_entry: _successful_tool_entry(foreign_entry)},
+        entry_ids={foreign_entry: _successful_tool_entry()},
     )
     with pytest.raises(ProvenanceRefusalError):
         _apply(
@@ -391,7 +393,7 @@ def test_generation_cas_stale_refused_correct_succeeds(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     stale = _apply(
         factory,
@@ -419,7 +421,8 @@ def test_generation_cas_stale_refused_correct_succeeds(
     assert good.status is OperationStatus.APPLIED
     assert good.generation == 1
     assert len(good.applied_fact_ids) == 1
-    # A second write at the SAME generation is a stale CAS now.
+    # A second write at the SAME generation succeeds because apply_facts
+    # does not bump generation.
     second = _apply(
         factory,
         facts=[_delta("port.mapping", "8080 published", [entry_id])],
@@ -428,6 +431,20 @@ def test_generation_cas_stale_refused_correct_succeeds(
     assert second.status is OperationStatus.APPLIED
     rows = _fact_rows(migrated_url, APP_MAIN_ID)
     assert [row["key"] for row in rows] == ["port.mapping", "upstream.image"]
+    # The identity stays at generation 1: a stale generation-2 CAS is
+    # refused against it.
+    stale_again = _apply(
+        factory,
+        facts=[_delta("cert.source", "letsencrypt", [entry_id])],
+        expected_generation=2,
+    )
+    assert stale_again.status is OperationStatus.FAILED
+    assert stale_again.error_code == "revision_conflict"
+    assert stale_again.generation == 1
+    assert [row["key"] for row in _fact_rows(migrated_url, APP_MAIN_ID)] == [
+        "port.mapping",
+        "upstream.image",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +459,7 @@ def test_per_fact_cas_stale_refused_correct_supersedes(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     applied = _apply(
         factory,
@@ -509,8 +526,8 @@ def test_unrelated_keys_merge_in_one_request(
         migrated_url,
         server_id=SERVER_A,
         entry_ids={
-            first: _successful_tool_entry(first),
-            second: _successful_tool_entry(second),
+            first: _successful_tool_entry(),
+            second: _successful_tool_entry(),
         },
     )
     result = _apply(
@@ -538,7 +555,7 @@ def test_identical_same_key_is_idempotent(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     result = _apply(
         factory,
@@ -568,8 +585,8 @@ def test_divergent_same_key_is_refused_conflict(
         migrated_url,
         server_id=SERVER_A,
         entry_ids={
-            first: _successful_tool_entry(first),
-            second: _successful_tool_entry(second),
+            first: _successful_tool_entry(),
+            second: _successful_tool_entry(),
         },
     )
     result = _apply(
@@ -609,7 +626,7 @@ def test_divergent_against_stored_active_fact_is_conflict(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     _apply(
         factory,
@@ -648,7 +665,7 @@ def test_capacity_limit_refuses_explicitly(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     generation = 1
     with psycopg.connect(migrated_url, autocommit=True) as conn:
@@ -721,7 +738,7 @@ def test_retraction_cas_marks_retracted_without_delete(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     applied = _apply(
         factory,
@@ -795,10 +812,11 @@ def test_operator_notes_and_runbook_byte_for_byte_untouched(
     _seed_session_log(
         migrated_url,
         server_id=SERVER_A,
-        entry_ids={entry_id: _successful_tool_entry(entry_id)},
+        entry_ids={entry_id: _successful_tool_entry()},
     )
     entry = map_store.upsert_entry(
         SERVER_A,
+        application_id=APP_MAIN_ID,
         name="app-main",
         category="app",
         origin="compose",
@@ -865,9 +883,7 @@ def test_no_transcript_payload_retained(
         migrated_url,
         server_id=SERVER_A,
         entry_ids={
-            entry_id: _successful_tool_entry(
-                entry_id, {"output": secret_tail}
-            )
+            entry_id: _successful_tool_entry({"output": secret_tail})
         },
     )
     result = _apply(
@@ -919,8 +935,8 @@ def test_bounded_source_ref_multi_ref_deterministic(
         migrated_url,
         server_id=SERVER_A,
         entry_ids={
-            first: _successful_tool_entry(first),
-            second: _successful_tool_entry(second),
+            first: _successful_tool_entry(),
+            second: _successful_tool_entry(),
         },
     )
     result = _apply(
@@ -931,3 +947,139 @@ def test_bounded_source_ref_multi_ref_deterministic(
     rows = _fact_rows(migrated_url, APP_MAIN_ID)
     expected_joined = ",".join(sorted([str(first), str(second)]))
     assert rows[0]["source_ref"] == expected_joined
+
+
+# ---------------------------------------------------------------------------
+# fix round 1: provenance hardening, category scoping, scope guards
+# ---------------------------------------------------------------------------
+
+
+def test_same_entry_claimed_under_two_kinds_is_refused(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    entry_id = uuid.uuid4()
+    _seed_session_log(
+        migrated_url,
+        server_id=SERVER_A,
+        entry_ids={entry_id: _successful_tool_entry()},
+    )
+    result = _apply(
+        factory,
+        facts=[
+            _delta("upstream.image", "traefik v3.1", [entry_id]),
+            _delta(
+                "operator.note",
+                "traefik confirmed verbally",
+                [entry_id],
+                source_kind=FactSourceKind.USER_STATEMENT,
+            ),
+        ],
+    )
+    # One persisted entry has exactly ONE kind: a reference claimed as
+    # both a tool result and a user statement can never satisfy both.
+    assert result.status is OperationStatus.FAILED
+    assert result.error_code == "invalid_provenance"
+    assert _fact_rows(migrated_url, APP_MAIN_ID) == []
+    assert _history_count(migrated_url, APP_MAIN_ID) == 0
+
+
+def test_non_uuid_ref_refused_cleanly_and_uppercase_accepted(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    entry_id = uuid.uuid4()
+    _seed_session_log(
+        migrated_url,
+        server_id=SERVER_A,
+        entry_ids={entry_id: _successful_tool_entry()},
+    )
+    garbage = _apply(
+        factory,
+        facts=[_delta("upstream.image", "traefik v3.1", ["not-a-uuid"])],
+    )
+    # The refusal is the structured invalid_provenance code — never an
+    # unhandled driver cast error.
+    assert garbage.status is OperationStatus.FAILED
+    assert garbage.error_code == "invalid_provenance"
+    assert _fact_rows(migrated_url, APP_MAIN_ID) == []
+
+    upper = _apply(
+        factory,
+        facts=[
+            _delta(
+                "upstream.image", "traefik v3.1", [str(entry_id).upper()]
+            )
+        ],
+    )
+    assert upper.status is OperationStatus.APPLIED
+    assert len(upper.applied_fact_ids) == 1
+
+
+def test_same_key_under_different_categories_merge(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    entry_id = uuid.uuid4()
+    _seed_session_log(
+        migrated_url,
+        server_id=SERVER_A,
+        entry_ids={entry_id: _successful_tool_entry()},
+    )
+    runtime = ProposedFactDelta(
+        category="runtime",
+        key="port",
+        statement="8080 published",
+        source_kind=FactSourceKind.TOOL_RESULT,
+        source_refs=[str(entry_id)],
+    )
+    network = ProposedFactDelta(
+        category="network",
+        key="port",
+        statement="published behind traefik",
+        source_kind=FactSourceKind.TOOL_RESULT,
+        source_refs=[str(entry_id)],
+    )
+    result = _apply(factory, facts=[runtime, network])
+    # The active-key identity is (category, key): the same key under a
+    # different category is a DISTINCT fact, not a conflict.
+    assert result.status is OperationStatus.APPLIED
+    assert result.conflict_keys == []
+    assert len(result.applied_fact_ids) == 2
+    rows = _fact_rows(migrated_url, APP_MAIN_ID)
+    assert sorted(row["key"] for row in rows) == ["port", "port"]
+    assert sorted(row["category"] for row in rows) == ["network", "runtime"]
+    assert _history_count(migrated_url, APP_MAIN_ID) == 2
+
+
+def test_correct_fact_foreign_trusted_scope_refused(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    entry_id = uuid.uuid4()
+    _seed_session_log(
+        migrated_url,
+        server_id=SERVER_A,
+        entry_ids={entry_id: _successful_tool_entry()},
+    )
+    applied = _apply(
+        factory,
+        facts=[_delta("upstream.image", "traefik v3.1", [entry_id])],
+    )
+    fact_id = applied.applied_fact_ids[0]
+    store = KnowledgeWriteStore(factory)
+    with pytest.raises(ScopeMismatchError):
+        _run(
+            store.correct_fact(
+                server_id=SERVER_A,
+                application_id=APP_MAIN_ID,
+                cas=FactCas(
+                    fact_id=fact_id,
+                    expected_revision=1,
+                    new_statement="traefik v3.2",
+                ),
+                trusted=_trusted(SERVER_B),
+                expected_generation=1,
+            )
+        )
+    rows = _fact_rows(migrated_url, APP_MAIN_ID)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "active"
+    assert rows[0]["statement"] == "traefik v3.1"
+    assert _history_count(migrated_url, APP_MAIN_ID) == 1
