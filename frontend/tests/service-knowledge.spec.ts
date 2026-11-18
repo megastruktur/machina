@@ -3,6 +3,7 @@ import { build, type Plugin } from 'vite';
 import { svelte as sveltePlugin } from '@sveltejs/vite-plugin-svelte';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -58,7 +59,7 @@ const VIEWPORT = { width: 360, height: 640 };
 // ask_38: REAL-API scenarios (fixture FastAPI over the disposable Postgres)
 // ---------------------------------------------------------------------------
 
-const TESTS_DIR = new URL('./', import.meta.url).pathname;
+const TESTS_DIR = fileURLToPath(new URL('.', import.meta.url));
 const BACKEND_ROOT = path.resolve(TESTS_DIR, '../../backend');
 const LIVE_URL_VAR = 'MAI_TEST_DATABASE_URL';
 const API_PORT = 4837;
@@ -73,6 +74,30 @@ const EVIDENCE_DIR =
 				'projects/dev/machina/plans/agent-service-knowledge/ask_evidence/38-ui-integration/evidence'
 			)
 		: path.join(os.tmpdir(), 'mai-svk-38-evidence'));
+/** Merge one upstream Set-Cookie header batch into the jar. The jar is
+ * keyed by cookie NAME: a rotated mai_csrf/mai_session overwrites the
+ * older value instead of appending a duplicate attribute cookie. */
+interface CookieJar {
+	cookie: string;
+	csrf: string;
+}
+
+function updateCookieJar(jar: CookieJar, setCookieHeaders: string[]): void {
+	const jarMap = new Map<string, string>();
+	for (const pair of jar.cookie ? jar.cookie.split('; ') : []) {
+		const eq = pair.indexOf('=');
+		if (eq > 0) jarMap.set(pair.slice(0, eq), pair.slice(eq + 1));
+	}
+	for (const header of setCookieHeaders) {
+		const first = header.split(';')[0];
+		const eq = first.indexOf('=');
+		if (eq <= 0) continue;
+		jarMap.set(first.slice(0, eq), first.slice(eq + 1));
+	}
+	jar.cookie = [...jarMap].map(([name, value]) => `${name}=${value}`).join('; ');
+	jar.csrf = jarMap.get('mai_csrf') ?? jar.csrf;
+}
+
 interface ApiJournalEntry {
 	method: string;
 	path: string;
@@ -132,17 +157,6 @@ function harnessEntry(): string {
 	// jar). Every request is journaled (method/path/status/duration).
 	window.__maiApiJournal = [];
 	async function realApi(method, path, body) {
-		try {
-			return await realApiInner(method, path, body);
-		} catch (error) {
-			console.error(
-				'[real-api-debug] ' + method + ' ' + path + ' → ' +
-					String(error) + ' code=' + String(error && error.code)
-			);
-			throw error;
-		}
-	}
-	async function realApiInner(method, path, body) {
 		const started = Date.now();
 		const response = await fetch(path, {
 			method,
@@ -163,16 +177,25 @@ function harnessEntry(): string {
 			} catch {
 				error.code = '';
 			}
-			console.error('[real-api] ' + method + ' ' + response.status + ' ' + path);
 			throw error;
 		}
-		const document_json = await response.json();
-		console.error(
-			'[real-api] ' + method + ' ' + response.status + ' ' + path +
-				' keys=' + JSON.stringify(Object.keys(document_json ?? {}))
-		);
-		return document_json;
+		return response.json();
 	}
+	const knowledgeGroup = realMode
+		? {
+				readKnowledge: (...callArgs) =>
+					window.__maiClient.readKnowledge(...callArgs),
+				readFactHistory: (...callArgs) =>
+					window.__maiClient.readFactHistory(...callArgs),
+				readKnowledgeOperations: (...callArgs) =>
+					window.__maiClient.readKnowledgeOperations(...callArgs),
+				retractKnowledgeFact: (...callArgs) =>
+					window.__maiClient.retractKnowledgeFact(...callArgs),
+				retryKnowledgeOperation: (...callArgs) =>
+					window.__maiClient.retryKnowledgeOperation(...callArgs)
+			}
+		: null;
+
 	if (realMode) {
 		// The PRODUCTION client (ask_29) against the LIVE backend: same
 		// cookie-backed CSRF + error contract as the product.
@@ -368,27 +391,19 @@ function harnessEntry(): string {
 	// — two live components would answer every testid query twice).
 	window.__maiCalls = [];
 	window.__maiPending = [];
+	function resolveKnowledge(realMode, state, mockKnowledge) {
+		// Real mode: the production client group. Otherwise the scripted
+		// mock (or an explicit null for the honest unavailable state).
+		if (realMode) return knowledgeGroup;
+		return state.noknowledge ? null : mockKnowledge;
+	}
+
 	mount(Holder, {
 		target: document.getElementById('app'),
 		props: {
 			serverId,
 			applicationId,
-			knowledge: realMode
-				? {
-						readKnowledge: (...callArgs) =>
-							window.__maiClient.readKnowledge(...callArgs),
-						readFactHistory: (...callArgs) =>
-							window.__maiClient.readFactHistory(...callArgs),
-						readKnowledgeOperations: (...callArgs) =>
-							window.__maiClient.readKnowledgeOperations(...callArgs),
-						retractKnowledgeFact: (...callArgs) =>
-							window.__maiClient.retractKnowledgeFact(...callArgs),
-						retryKnowledgeOperation: (...callArgs) =>
-							window.__maiClient.retryKnowledgeOperation(...callArgs)
-					}
-				: state.noknowledge
-					? null
-					: knowledge,
+			knowledge: resolveKnowledge(realMode, state, knowledge),
 			pageLimit: realMode ? 10 : 2,
 			reasonMaxLength: 400,
 			register: (api) => {
@@ -526,23 +541,13 @@ async function openFixture(
 						: route.request().postData()
 				}
 			);
-			const setCookies = upstream.headers.getSetCookie();
-			if (setCookies.length > 0) {
-				const parts = proxy.jar.cookie ? [proxy.jar.cookie] : [];
-				for (const cookie of setCookies) parts.push(cookie.split(';')[0]);
-				proxy.jar.cookie = parts.join('; ');
-				proxy.jar.csrf =
-					proxy.jar.cookie.match(/mai_csrf=([^;]+)/)?.[1] ?? proxy.jar.csrf;
-			}
+			updateCookieJar(proxy.jar, upstream.headers.getSetCookie());
 			apiJournal.push({
 				method,
 				path: requestUrl.pathname + requestUrl.search,
 				status: upstream.status,
 				ms: Date.now() - started
 			});
-			console.error(
-				`[api-proxy] ${method} ${upstream.status} ${requestUrl.pathname}${requestUrl.search}`
-			);
 			return route.fulfill({
 				status: upstream.status,
 				contentType: 'application/json',
@@ -796,29 +801,33 @@ function _backendPython(code: string, env: Record<string, string> = {}): string 
 	return result.stdout;
 }
 
-function _waitForApiReady(deadlineMs: number): void {
+async function _waitForApiReady(deadlineMs: number): Promise<void> {
 	const deadline = Date.now() + deadlineMs;
 	let lastError: unknown = 'never probed';
 	while (Date.now() < deadline) {
-		const probe = spawnSync(
-			'curl',
-			['-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '3', `${API_BASE}/api/v1/health`],
-			{ encoding: 'utf-8', timeout: 10_000 }
-		);
-		if (probe.stdout.trim() === '200') return;
-		lastError = probe.stdout.trim() || probe.stderr;
-		void sleepSync(500);
+		try {
+			const response = await fetch(`${API_BASE}/api/v1/health`);
+			if (response.status === 200) return;
+			lastError = `health ${response.status}`;
+		} catch (error) {
+			lastError = error;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 500));
 	}
 	throw new Error(`BLOCKED: the fixture API never became ready: ${String(lastError)}`);
 }
 
-function sleepSync(ms: number): void {
-	spawnSync('sleep', [String(ms / 1000)]);
-}
 
 test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
+	// The scenarios share the seeded fixture backend (and its proxy jar):
+	// serialize them and reset the request journal per test.
+	test.describe.configure({ mode: 'serial' });
 	let server: ChildProcess | undefined;
 	let dataRoot = '';
+
+	test.beforeEach(() => {
+		apiJournal.length = 0;
+	});
 
 	test.beforeAll(async () => {
 		const url = process.env[LIVE_URL_VAR];
@@ -871,15 +880,26 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 					MAI_DATA_ROOT: dataRoot,
 					MAI_PUBLIC_ORIGINS: 'http://127.0.0.1:4173'
 				},
-				stdio: ['ignore', 'pipe', 'pipe']
+				// 'ignore': the uvicorn pipe buffers would block a long run.
+				stdio: 'ignore'
 			}
 		) as ChildProcess;
-		_waitForApiReady(120_000);
+		await _waitForApiReady(120_000);
 	});
 
 	test.afterAll(async () => {
 		if (server && server.exitCode === null) {
 			server.kill('SIGTERM');
+			const exited = new Promise<void>((resolve) => {
+				server!.once('exit', () => resolve());
+			});
+			const fallback = new Promise<void>((resolve) => {
+				setTimeout(() => {
+					if (server && server.exitCode === null) server.kill('SIGKILL');
+					resolve();
+				}, 5_000);
+			});
+			await Promise.race([exited, fallback]);
 		}
 		const url = process.env[LIVE_URL_VAR];
 		if (url) {
@@ -888,6 +908,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 				{ MAI_DATABASE_URL: url }
 			);
 		}
+		fs.rmSync(dataRoot, { recursive: true, force: true });
 	});
 
 	function _seedSql(statements: string[]): void {
@@ -912,58 +933,15 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 		const statements = [
 			`INSERT INTO service_knowledge_identity (server_id, application_id, generation, manual_identity, auto_adopt_suppressed) VALUES ('${SERVER_A}', '${appId}', ${generation}, false, false) ON CONFLICT (server_id, application_id) DO NOTHING`,
 			...facts.flatMap((fact) => [
-				`INSERT INTO service_learned_fact (fact_id, server_id, application_id, generation, category, key, statement, revision, status, source_kind, source_ref, source_run_id, verified_at) VALUES ('${fact.id}', '${SERVER_A}', '${appId}', ${generation}, 'operations', '${fact.key}', '${fact.statement.replace(/'/g, "''")}', ${fact.revision}, 'active', 'tool_result', 'runtime-suite-ref-1', '${RUN_SEED_ID}', now())`,
+				`INSERT INTO service_learned_fact (fact_id, server_id, application_id, generation, category, key, statement, revision, status, source_kind, source_ref, source_run_id, verified_at) VALUES ('${fact.id}', '${SERVER_A}', '${appId}', ${generation}, 'operations', '${fact.key}', '${fact.statement.replace(/'/g, "''")}', ${fact.revision}, 'active', 'tool_result', 'runtime-suite-ref-1', '${crypto.randomUUID()}', now())`,
 				`INSERT INTO service_learned_fact_revision (revision_id, fact_id, server_id, application_id, revision, statement, status, source_kind, source_ref, changed_at) VALUES ('${crypto.randomUUID()}', '${fact.id}', '${SERVER_A}', '${appId}', ${fact.revision}, '${fact.statement.replace(/'/g, "''")}', 'active', 'tool_result', 'runtime-suite-ref-1', now())`
 			])
 		];
 		_seedSql(statements);
 	}
 
-	const RUN_SEED_ID = crypto.randomUUID();
-
-	function _seedProvenanceRun(appId: string): string {
-		// One real foreground session run + a committed tool-result entry:
-		// the provenance a learn admission must reference (validated).
-		const runId = crypto.randomUUID();
-		const entryId = crypto.randomUUID();
-		const sessionId = crypto.randomUUID();
-		_seedSql([
-			`INSERT INTO sessions (session_id, server_id, source, created_at) VALUES ('${sessionId}', '${SERVER_A}', 'interactive', now()) ON CONFLICT DO NOTHING`,
-			`INSERT INTO session_runs (run_id, session_id, server_id, state, model_profile, client_request_id) VALUES ('${runId}', '${sessionId}', '${SERVER_A}', 'running', 'behavior-profile', '${crypto.randomUUID()}')`,
-			`INSERT INTO session_entries (entry_id, session_id, run_id, seq, kind, payload, durable_source_id) VALUES ('${entryId}', '${sessionId}', '${runId}', 1, 'tool_result', '{"status": "executed", "output": "fixture evidence"}'::jsonb, '${crypto.randomUUID()}')`
-		]);
-		void appId;
-		return entryId;
-	}
-
-	function _seedProvenanceSession(serverId: string): { runId: string; entryId: string } {
-		const runId = crypto.randomUUID();
-		const entryId = crypto.randomUUID();
-		const serverEnv = { MAI_SEED_SERVER: serverId, MAI_DATABASE_URL: process.env[LIVE_URL_VAR]! };
-		const stdout = _backendPython(
-			[
-				"import asyncio, os, uuid",
-				"from mai.database import create_app_engine",
-				"from mai.session_store import acreate_session",
-				"from mai.contracts.sessions import SessionSourceKind",
-				"async def main():",
-				"    engine, factory = create_app_engine(os.environ['MAI_DATABASE_URL'])",
-				"    session = await acreate_session(factory, server_id=uuid.UUID(os.environ['MAI_SEED_SERVER']), source=SessionSourceKind.INTERACTIVE)",
-				"    await engine.dispose()",
-				"    print(session.session_id)",
-				"asyncio.run(main())"
-			].join("\n"),
-			serverEnv
-		).trim();
-		const sessionId = stdout.trim().split('\n').slice(-1)[0];
-		_seedSql([
-			`INSERT INTO session_runs (run_id, session_id, server_id, state, model_profile, client_request_id) VALUES ('${runId}', '${sessionId}', '${serverId}', 'running', 'behavior-profile', '${crypto.randomUUID()}')`,
-			`INSERT INTO session_entries (entry_id, session_id, run_id, seq, kind, payload, durable_source_id) VALUES ('${entryId}', '${sessionId}', '${runId}', 1, 'tool_result', '{"status": "executed", "output": "fixture evidence"}'::jsonb, '${crypto.randomUUID()}')`
-		]);
-		return { runId, entryId };
-	}
-
-	async function _openRealApiFixture(page: Page, jar: { cookie: string; csrf: string }, appId: string): Promise<void> {
+	
+	async function _openRealApiFixture(page: Page, jar: CookieJar, appId: string): Promise<void> {
 		await openFixture(
 			page,
 			`?mode=real&api=${encodeURIComponent(API_BASE)}&app=${appId}&csrf=${encodeURIComponent(jar.csrf)}`,
@@ -975,7 +953,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 		return path.join(EVIDENCE_DIR, name);
 	}
 
-	async function realLoginSetup(jar: { cookie: string; csrf: string }): Promise<void> {
+	async function realLoginSetup(jar: CookieJar): Promise<void> {
 		for (const routePath of ['/api/v1/auth/bootstrap', '/api/v1/auth/login']) {
 			const response = await fetch(`${API_BASE}${routePath}`, {
 				method: 'POST',
@@ -986,11 +964,17 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 				},
 				body: JSON.stringify({ password: REAL_PASSWORD })
 			});
-			const setCookies = response.headers.getSetCookie();
-			const parts = jar.cookie ? [jar.cookie] : [];
-			for (const cookie of setCookies) parts.push(cookie.split(';')[0]);
-			jar.cookie = parts.join('; ');
-			jar.csrf = jar.cookie.match(/mai_csrf=([^;]+)/)?.[1] ?? jar.csrf;
+			// bootstrap answers 201 (created) or 409 (already bootstrapped);
+			// login must answer 204.
+			const ok = routePath.endsWith('bootstrap')
+				? [201, 409].includes(response.status)
+				: response.status === 204;
+			if (!ok) {
+				throw new Error(
+					`auth ${routePath} failed: ${response.status}`
+				);
+			}
+			updateCookieJar(jar, response.headers.getSetCookie());
 		}
 	}
 
@@ -1001,7 +985,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	test('real api: learned note lifecycle reads facts, history and operations from the backend', async ({
 		page
 	}) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		const factA = crypto.randomUUID();
 		const factB = crypto.randomUUID();
@@ -1014,18 +998,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 		]);
 		await realLoginSetup(jar);
 
-
 		await _openRealApiFixture(page, jar, appId);
-		const diag = await page.evaluate(() => ({
-			mode: new URLSearchParams(location.search).get('mode'),
-			hasRealApi: typeof window.__maiRealApi,
-			journal: window.__maiApiJournal ?? [],
-			status: document.querySelector('[data-testid="knowledge-status"]')?.textContent ?? '',
-			notes: Array.from(
-				document.querySelectorAll('[data-testid^="knowledge-"] .knowledge-error, .knowledge-error')
-			).map((el) => el.textContent ?? '')
-		}));
-		console.log('[diag]', JSON.stringify(diag));
 		await expect(page.getByTestId('knowledge-fact-row')).toHaveCount(2);
 		await expect(page.getByTestId('knowledge-fact-row').first()).toContainText(
 			'/healthz'
@@ -1050,7 +1023,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	test('real api: retract applies the revision CAS and a stale revision answers 409', async ({
 		page
 	}) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		const factA = crypto.randomUUID();
 		const factB = crypto.randomUUID();
@@ -1097,7 +1070,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	});
 
 	test('real api: retry posts for a queued preservation operation', async ({ page }) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		const runId = crypto.randomUUID();
 		_seedServiceKnowledge(appId, 2, [
@@ -1136,7 +1109,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	test('real api: scope switch reads the other application notes from the backend', async ({
 		page
 	}) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		const appId2 = crypto.randomUUID();
 		_seedServiceKnowledge(appId, 2, [
@@ -1165,7 +1138,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	test('real api: pagination loads more with exactly two bounded requests', async ({
 		page
 	}) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		_seedServiceKnowledge(
 			appId,
@@ -1198,7 +1171,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 	test('real api: learned notes survive a fresh session and keyboard retract at 360x640', async ({
 		page
 	}) => {
-		const jar = { cookie: '', csrf: '' };
+		const jar: CookieJar = { cookie: '', csrf: '' };
 		const appId = crypto.randomUUID();
 		const factId = crypto.randomUUID();
 		_seedServiceKnowledge(appId, 2, [
