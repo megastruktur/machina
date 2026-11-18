@@ -244,6 +244,7 @@ async def read_knowledge(
     """The bounded current knowledge read (D2/D3): identity/revision
     scalars, operator map state, catalog runbook and the ACTIVE
     learned-fact page (``limit``/``offset`` paginated)."""
+    await _require_session(request)
     knowledge_read = _knowledge_read(request)
     try:
         read = await knowledge_read.get_service_knowledge(
@@ -277,6 +278,7 @@ async def read_fact_history(
 ) -> JSONResponse:
     """The paginated append-only fact revision history, newest change
     first, optional ``fact_id`` filter."""
+    await _require_session(request)
     knowledge_read = _knowledge_read(request)
     refusal = await _ensure_scope(request, knowledge_read, server_id, application_id)
     if refusal is not None:
@@ -302,6 +304,7 @@ async def read_operations(
 ) -> JSONResponse:
     """The paginated durable preservation-operation receipts of THIS
     application, newest acceptance first, optional ``status`` filter."""
+    await _require_session(request)
     knowledge_read = _knowledge_read(request)
     # NOTE: no identity/map existence requirement here — a queued-only
     # application owns durable receipts; the (server, application)
@@ -333,11 +336,18 @@ async def retract_fact(
     refusal = await _ensure_scope(request, knowledge_read, server_id, application_id)
     if refusal is not None:
         return refusal
+    import asyncio
+
     coordinator = _coordinator(request)
     write = _knowledge_write(request)
 
-    leases = coordinator.lease_set(server_id, [application_id])
+    held: tuple[Any, ...] = ()
     try:
+        # The lease acquisition is a SYNC blocking call: offload it off
+        # the event loop like every other blocking seam.
+        held = await asyncio.to_thread(
+            coordinator.lease_set, server_id, (application_id,)
+        )
         result = await write.retract_fact(
             server_id=server_id,
             application_id=application_id,
@@ -347,18 +357,16 @@ async def retract_fact(
             reason=payload.reason,
         )
     except MetadataMutationError as error:
-        coordinator._release_acquired(leases)
         return _conflict(request, error.code.value, error.detail)
     except ScopeMismatchError as error:
-        coordinator._release_acquired(leases)
         return _not_found(request, f"scope mismatch: {error}")
     except ValueError as error:
-        coordinator._release_acquired(leases)
         return _bad_request(request, str(error))
-    else:
-        coordinator._release_acquired(leases)
+    finally:
+        if held:
+            await asyncio.to_thread(coordinator._release_acquired, held)
 
-    if result.status is not None and str(result.status.value) == "applied":
+    if result.status is OperationStatus.APPLIED:
         return JSONResponse(content=result.model_dump(mode="json"))
     # Refused by the seam (stale revision/generation): structured 409.
     code = result.error_code or "revision_conflict"
