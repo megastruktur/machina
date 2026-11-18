@@ -1808,6 +1808,10 @@ def test_cross_process_distinct_upserts_zero_lost_updates(tmp_path: Path) -> Non
         process.start()
     for process in processes:
         process.join(120)
+    for process in processes:
+        if process.is_alive():  # never hang pytest's atexit on a straggler
+            process.terminate()
+            process.join(5)
     assert all(process.exitcode == 0 for process in processes)
     entries = ServiceMapStore(root).list_entries(SERVER_A)
     assert len(entries) == 40  # 8 processes x 5 services, zero lost updates
@@ -1829,6 +1833,10 @@ def test_cross_process_same_service_updates_monotonic(tmp_path: Path) -> None:
         process.start()
     for process in processes:
         process.join(120)
+    for process in processes:
+        if process.is_alive():  # never hang pytest's atexit on a straggler
+            process.terminate()
+            process.join(5)
     assert all(process.exitcode == 0 for process in processes)
     final = ServiceMapStore(root).get_entry(
         SERVER_A, uuid.uuid5(SERVER_A, "service-map:traefik")
@@ -1865,6 +1873,7 @@ def test_concurrent_reader_never_observes_torn_json(tmp_path: Path) -> None:
                 entries = reader_store.list_entries(SERVER_A)
                 if not entries or entries[0].category != "system":
                     errors.append(AssertionError("torn or empty read observed"))
+                    break
                 if reader_store.get_entry(SERVER_A, uuid.UUID(entries[0].application_id)) is None:
                     errors.append(AssertionError("entry vanished mid-read"))
                 reads += 1
@@ -1951,6 +1960,9 @@ def test_server_lock_reentrant_and_blocks_other_processes(tmp_path: Path) -> Non
         )
         probe.start()
         probe.join(60)
+        if probe.is_alive():
+            probe.terminate()
+            probe.join(5)
         assert probe.exitcode == 0
         assert results.get() == 0
 
@@ -1963,5 +1975,39 @@ def test_server_lock_reentrant_and_blocks_other_processes(tmp_path: Path) -> Non
     )
     probe_after.start()
     probe_after.join(60)
+    if probe_after.is_alive():
+        probe_after.terminate()
+        probe_after.join(5)
     assert probe_after.exitcode == 0
     assert results_after.get() == 1
+
+
+def test_server_lock_acquire_failure_rolls_back_depth_and_rlock(
+    tmp_path: Path,
+) -> None:
+    """Fix 1 regression: an unusable root (``servers`` exists as a plain
+    file, so ``_ensure_root`` cannot create the lock file's parent) makes
+    ``acquire`` fail — and the failure MUST roll back ``_depth`` and
+    release the RLock, leaving the lock usable for later threads."""
+    from mai.applications import service_map as service_map_module
+
+    root = tmp_path / "service_map"
+    root.mkdir(parents=True)
+    (root / "servers").write_text("not a directory")
+    store = ServiceMapStore(root)
+    lock_path = (root / "servers" / f"{SERVER_A}.lock").resolve(strict=False)
+
+    with pytest.raises(OSError):  # FileExistsError from _ensure_root
+        with store.server_lock(SERVER_A):
+            pytest.fail("the lock must not be acquirable on an unusable root")
+
+    locked = service_map_module._FILE_LOCKS[str(lock_path)]
+    assert locked._depth == 0  # fully rolled back
+    assert locked._rlock.acquire(blocking=False) is True  # RLock is FREE
+    locked._rlock.release()
+
+    # The store remains usable for the happy path afterwards (a sibling
+    # root still works, proving the failure poisoned nothing).
+    healthy = ServiceMapStore(tmp_path / "healthy_map")
+    with healthy.server_lock(SERVER_A):
+        assert healthy.upsert_entry(SERVER_A, name="after", category="system")

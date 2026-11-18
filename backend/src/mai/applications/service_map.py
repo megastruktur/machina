@@ -586,13 +586,21 @@ class _ProcessFileLock:
         if self._depth == 1:
             # The confined tree (and the lock file's parent) must exist
             # before the lock file can be opened; only the outermost
-            # holder pays this cost.
-            self._ensure()
-            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+            # holder pays this cost. ANY failure in the outermost block
+            # (ensure, open, flock) must fully roll back the depth and
+            # the RLock — otherwise every later acquire in this process
+            # deadlocks forever.
+            fd: int | None = None
             try:
+                self._ensure()
+                fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
                 fcntl.flock(fd, fcntl.LOCK_EX)
             except BaseException:
-                os.close(fd)
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 self._depth -= 1
                 self._rlock.release()
                 raise
