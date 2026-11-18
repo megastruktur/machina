@@ -25,8 +25,11 @@ pure and need no database. No live provider, no real SSH, no browser.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import multiprocessing
 import os
+import threading
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -47,6 +50,7 @@ from mai.applications.service_map import (
     DEFAULT_SERVICE_CATEGORIES,
     MAP_ORIGINS,
     ServiceMapError,
+    ServiceMapErrorCode,
     ServiceMapStore,
     ServiceMapUpsertCapability,
     classify_service,
@@ -1744,3 +1748,220 @@ async def test_docs_agent_tools_crud_pagination_and_title_upsert(
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# ask_15-map-file-lock: cross-process locking, atomic rename, revision CAS
+# (pure filesystem; workers use the fork start method — Linux CI contract)
+# ---------------------------------------------------------------------------
+
+
+def _map_worker_upsert_distinct(root: str, server_id: str, worker: int) -> None:
+    """One OS process inserting five distinct services (cross-process
+    write contention on the same server map)."""
+    store = ServiceMapStore(root)
+    sid = uuid.UUID(server_id)
+    for index in range(5):
+        store.upsert_entry(
+            sid,
+            name=f"svc-{worker}-{index}",
+            category="system",
+            description=f"inserted by worker {worker}",
+        )
+
+
+def _map_worker_update_same(root: str, server_id: str, name: str, worker: int) -> None:
+    """One OS process updating the SAME service once (revision race)."""
+    store = ServiceMapStore(root)
+    store.upsert_entry(
+        uuid.UUID(server_id), name=name, category="system", description=f"update-{worker}"
+    )
+
+
+def _map_probe_lock(root: str, server_id: str, results) -> None:  # type: ignore[no-untyped-def]
+    """In a CHILD process: try a NON-BLOCKING exclusive flock on the
+    server lock file. Puts 0 when correctly blocked (EWOULDBLOCK), 1 when
+    wrongly acquired, 2 on any other failure."""
+    try:
+        path = Path(root) / "servers" / f"{server_id}.lock"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            results.put(1)
+        except BlockingIOError:
+            results.put(0)
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001 — the exit code IS the result channel
+        results.put(2)
+
+
+def test_cross_process_distinct_upserts_zero_lost_updates(tmp_path: Path) -> None:
+    root = tmp_path / "service_map"
+    root.mkdir(parents=True)
+    ctx = multiprocessing.get_context("fork")
+    processes = [
+        ctx.Process(target=_map_worker_upsert_distinct, args=(str(root), str(SERVER_A), w))
+        for w in range(8)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(120)
+    assert all(process.exitcode == 0 for process in processes)
+    entries = ServiceMapStore(root).list_entries(SERVER_A)
+    assert len(entries) == 40  # 8 processes x 5 services, zero lost updates
+    assert {e.name for e in entries} == {
+        f"svc-{w}-{i}" for w in range(8) for i in range(5)
+    }
+    assert all(e.revision == 1 for e in entries)
+
+
+def test_cross_process_same_service_updates_monotonic(tmp_path: Path) -> None:
+    root = tmp_path / "service_map"
+    root.mkdir(parents=True)
+    ctx = multiprocessing.get_context("fork")
+    processes = [
+        ctx.Process(target=_map_worker_update_same, args=(str(root), str(SERVER_A), "traefik", w))
+        for w in range(12)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(120)
+    assert all(process.exitcode == 0 for process in processes)
+    final = ServiceMapStore(root).get_entry(
+        SERVER_A, uuid.uuid5(SERVER_A, "service-map:traefik")
+    )
+    assert final is not None
+    assert final.revision == 12  # 1..12, no lost update
+    assert final.description.startswith("update-")
+
+
+def test_concurrent_reader_never_observes_torn_json(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_entry(SERVER_A, name="base", category="system")
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def writer(worker: int) -> None:
+        writer_store = ServiceMapStore(store.root)
+        try:
+            for index in range(40):
+                writer_store.upsert_entry(
+                    SERVER_A,
+                    name=f"svc-{worker}-{index}",
+                    category="system",
+                    description=f"from writer {worker}",
+                )
+        except Exception as exc:  # noqa: BLE001 — collected for the main thread
+            errors.append(exc)
+
+    def reader() -> None:
+        reader_store = ServiceMapStore(store.root)
+        reads = 0
+        try:
+            while reads < 120 and not stop.is_set():
+                entries = reader_store.list_entries(SERVER_A)
+                if not entries or entries[0].category != "system":
+                    errors.append(AssertionError("torn or empty read observed"))
+                if reader_store.get_entry(SERVER_A, uuid.UUID(entries[0].application_id)) is None:
+                    errors.append(AssertionError("entry vanished mid-read"))
+                reads += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    writers = [threading.Thread(target=writer, args=(w,)) for w in range(4)]
+    readers = [threading.Thread(target=reader) for _ in range(2)]
+    for thread in (*writers, *readers):
+        thread.start()
+    for thread in writers:
+        thread.join(120)
+    stop.set()
+    for thread in readers:
+        thread.join(120)
+    assert errors == []
+    assert len(store.list_entries(SERVER_A)) == 1 + 4 * 40
+
+
+def test_expected_revision_cas_upsert_and_delete(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    aid = uuid.uuid5(SERVER_A, "service-map:cas")
+
+    created = store.upsert_entry(
+        SERVER_A, name="cas", application_id=aid, expected_revision=0
+    )
+    assert created.revision == 1
+
+    with pytest.raises(ServiceMapError) as create_conflict:
+        store.upsert_entry(
+            SERVER_A, name="cas", application_id=aid, expected_revision=0
+        )
+    assert create_conflict.value.code is ServiceMapErrorCode.REVISION_CONFLICT
+
+    updated = store.upsert_entry(
+        SERVER_A, name="cas", application_id=aid, description="v2", expected_revision=1
+    )
+    assert updated.revision == 2
+
+    with pytest.raises(ServiceMapError) as stale_update:
+        store.upsert_entry(
+            SERVER_A, name="cas", application_id=aid, description="v3", expected_revision=1
+        )
+    assert stale_update.value.code is ServiceMapErrorCode.REVISION_CONFLICT
+    assert store.get_entry(SERVER_A, aid) is not None
+    assert store.get_entry(SERVER_A, aid).revision == 2  # untouched by the refusal
+
+    with pytest.raises(ServiceMapError) as stale_delete:
+        store.delete_entry(SERVER_A, aid, expected_revision=1)
+    assert stale_delete.value.code is ServiceMapErrorCode.REVISION_CONFLICT
+    assert store.get_entry(SERVER_A, aid) is not None  # NOT deleted
+
+    assert store.delete_entry(SERVER_A, aid, expected_revision=2) is True
+    assert store.get_entry(SERVER_A, aid) is None
+
+    # Type validation: bool and negative integers are INVALID_REQUEST.
+    with pytest.raises(ServiceMapError) as bad_type:
+        store.upsert_entry(SERVER_A, name="cas2", expected_revision=True)
+    assert bad_type.value.code is ServiceMapErrorCode.INVALID_REQUEST
+    with pytest.raises(ServiceMapError) as negative:
+        store.delete_entry(SERVER_A, uuid.uuid4(), expected_revision=-1)
+    assert negative.value.code is ServiceMapErrorCode.INVALID_REQUEST
+
+
+def test_server_lock_reentrant_and_blocks_other_processes(tmp_path: Path) -> None:
+    root = tmp_path / "service_map"
+    store = ServiceMapStore(root)
+    lock_path = root / "servers" / f"{SERVER_A}.lock"
+    ctx = multiprocessing.get_context("fork")
+
+    with store.server_lock(SERVER_A):
+        assert lock_path.exists()  # lock file materialized while held
+        # Nested re-entrant acquisition + a real mutation inside the held
+        # lock: must NOT deadlock (RLock re-entry, no second flock).
+        with store.server_lock(SERVER_A):
+            entry = store.upsert_entry(SERVER_A, name="locked", category="system")
+        assert entry.revision == 1
+
+        # Another PROCESS attempting a non-blocking exclusive flock on the
+        # SAME lock file gets BlockingIOError (EWOULDBLOCK).
+        results = ctx.SimpleQueue()
+        probe = ctx.Process(
+            target=_map_probe_lock, args=(str(root), str(SERVER_A), results)
+        )
+        probe.start()
+        probe.join(60)
+        assert probe.exitcode == 0
+        assert results.get() == 0
+
+    # The lock file is never unlinked on release...
+    assert lock_path.exists()
+    # ...and a fresh probe CAN acquire it once the holder released.
+    results_after = ctx.SimpleQueue()
+    probe_after = ctx.Process(
+        target=_map_probe_lock, args=(str(root), str(SERVER_A), results_after)
+    )
+    probe_after.start()
+    probe_after.join(60)
+    assert probe_after.exitcode == 0
+    assert results_after.get() == 1

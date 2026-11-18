@@ -35,12 +35,15 @@ is the reviewed producers', never re-implemented here.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -109,6 +112,7 @@ class ServiceMapErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     NOT_FOUND = "not_found"
     MALFORMED_RECORD = "malformed_record"
+    REVISION_CONFLICT = "revision_conflict"
 
 
 class ServiceMapError(ValueError):
@@ -483,6 +487,44 @@ def _wire_ts(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _validate_expected_revision(expected_revision: int | None) -> None:
+    """The CAS precondition type check (a bool is an int in Python but
+    never a valid revision)."""
+    if expected_revision is None:
+        return
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 0
+    ):
+        raise ServiceMapError(
+            ServiceMapErrorCode.INVALID_REQUEST,
+            "expected_revision must be a non-negative integer",
+        )
+
+
+def _revision_conflict_detail(
+    aid: str,
+    expected_revision: int,
+    previous: "ServiceMapEntry | None",
+) -> str:
+    """Value-free bounded conflict detail naming the expectation and the
+    observed state."""
+    if expected_revision == 0:
+        if previous is not None:
+            return (
+                f"service {aid} already exists at revision "
+                f"{previous.revision} (expected 0)"
+            )
+        return f"service {aid} does not exist (expected revision 0)"
+    if previous is None:
+        return f"service {aid} does not exist (expected revision {expected_revision})"
+    return (
+        f"service {aid} sits at revision {previous.revision} "
+        f"(expected {expected_revision})"
+    )
+
+
 def _fsync_directory(directory: Path) -> None:
     """Persist one directory entry change (rename durability)."""
     fd = os.open(directory, os.O_RDONLY)
@@ -493,8 +535,15 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """One durable atomic file replace (temp + fsync + replace + dir fsync)."""
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    """One durable atomic file replace (temp + fsync + replace + dir fsync).
+
+    The temp name carries a unique token behind a leading dot: two
+    writers in the same process (or across processes) can never collide
+    on the temp path, and ``os.replace`` is atomic on POSIX — concurrent
+    readers only ever observe the previous or the next complete file,
+    never torn JSON.
+    """
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
         with open(tmp, "wb") as handle:
             handle.write(data)
@@ -504,6 +553,79 @@ def _atomic_write(path: Path, data: bytes) -> None:
         _fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# cross-process + in-process file locking (ask_15, D4/C4)
+# ---------------------------------------------------------------------------
+
+
+class _ProcessFileLock:
+    """One re-entrant per-path lock: a ``threading.RLock`` serializes the
+    in-process critical section, and the OUTERMOST acquisition in the
+    current thread additionally opens the lock file and takes the
+    cross-process ``fcntl.flock`` exclusive lock. Nested acquisitions in
+    the same thread are pure RLock re-entries (never a second flock), so
+    ``with store.server_lock(s): store.upsert_entry(s, ...)`` cannot
+    deadlock against itself. The lock file is NEVER unlinked on release:
+    unlinking a flock file while another process is blocked on the open
+    inode would break ``flock`` mutual exclusion."""
+
+    __slots__ = ("_depth", "_ensure", "_fd", "_path", "_rlock")
+
+    def __init__(self, path: Path, ensure: Callable[[], None]) -> None:
+        self._path = path
+        self._ensure = ensure
+        self._rlock = threading.RLock()
+        self._fd: int | None = None
+        self._depth = 0
+
+    def acquire(self) -> None:
+        self._rlock.acquire()
+        self._depth += 1
+        if self._depth == 1:
+            # The confined tree (and the lock file's parent) must exist
+            # before the lock file can be opened; only the outermost
+            # holder pays this cost.
+            self._ensure()
+            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd)
+                self._depth -= 1
+                self._rlock.release()
+                raise
+            self._fd = fd
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0 and self._fd is not None:
+            fd, self._fd = self._fd, None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        self._rlock.release()
+
+
+#: Per-resolved-path lock registry shared by EVERY ServiceMapStore
+#: instance in this process (two instances rooted at the same directory
+#: must serialize against each other, not just against other processes).
+_FILE_LOCKS: Final[dict[str, _ProcessFileLock]] = {}
+
+#: Guards the registry itself (create-or-get under one process-wide lock).
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _registry_lock(lock_path: Path, ensure: Callable[[], None]) -> _ProcessFileLock:
+    resolved = str(lock_path.resolve(strict=False))
+    with _FILE_LOCKS_GUARD:
+        existing = _FILE_LOCKS.get(resolved)
+        if existing is None:
+            existing = _ProcessFileLock(Path(resolved), ensure)
+            _FILE_LOCKS[resolved] = existing
+        return existing
 
 
 def _entry_of(document: Mapping[str, object], *, server_id: str) -> ServiceMapEntry:
@@ -606,6 +728,38 @@ class ServiceMapStore:
     def _server_path(self, server_id: uuid.UUID) -> Path:
         return self._root / "servers" / f"{server_id}.json"
 
+    # -- cross-process + in-process locking (ask_15, D4/C4) ------------------
+
+    @contextmanager
+    def _file_lock(self, lock_path: Path) -> Iterator[None]:
+        """Re-entrant per-path critical section: the in-process RLock is
+        acquired first, then the OUTERMOST acquisition in the thread
+        ensures the confined tree, opens the lock file (``0o600``) and
+        takes the cross-process ``fcntl.flock`` exclusive lock. Released
+        in ``finally``: flock released, fd closed, RLock released. The
+        ``.lock`` file itself is never unlinked (an unlinked flock inode
+        would silently break cross-process mutual exclusion)."""
+        lock = _registry_lock(lock_path, self._ensure_root)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def server_lock(
+        self, server_id: uuid.UUID
+    ) -> AbstractContextManager[None]:
+        """The per-server map mutation lock (re-entrant context manager).
+
+        Serializes every read-modify-write critical section of
+        ``upsert_entry``/``delete_entry`` for ``server_id`` across
+        threads AND processes (``<root>/servers/<server_id>.lock``):
+        in-process via ``threading.RLock``, cross-process via exclusive
+        ``fcntl.flock`` taken on the outermost acquisition. Nested
+        acquisitions in the same thread never deadlock.
+        """
+        return self._file_lock(self._root / "servers" / f"{server_id}.lock")
+
     # -- categories ---------------------------------------------------------
 
     def list_categories(self) -> tuple[ServiceCategory, ...]:
@@ -640,18 +794,21 @@ class ServiceMapStore:
                 f"label must be a string of 1..{MAX_LABEL_CHARS} chars",
             )
         _validated_description(description, "description")
-        customs = [
-            item
-            for item in self._read_custom_categories()
-            if item.machine_id != machine_id
-        ]
-        customs.append(ServiceCategory(machine_id, label, description))
-        document = [item.to_json() for item in customs]
-        self._ensure_root()
-        _atomic_write(
-            self._root / "categories.json",
-            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
-        )
+        # All categories.json mutations serialize under one process-wide
+        # file lock (in-process RLock + cross-process flock).
+        with self._file_lock(self._root / "categories.lock"):
+            customs = [
+                item
+                for item in self._read_custom_categories()
+                if item.machine_id != machine_id
+            ]
+            customs.append(ServiceCategory(machine_id, label, description))
+            document = [item.to_json() for item in customs]
+            self._ensure_root()
+            _atomic_write(
+                self._root / "categories.json",
+                json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+            )
         return ServiceCategory(machine_id, label, description, built_in=False)
 
     def _read_custom_categories(self) -> list[ServiceCategory]:
@@ -693,6 +850,20 @@ class ServiceMapStore:
 
     def list_entries(self, server_id: uuid.UUID) -> tuple[ServiceMapEntry, ...]:
         """All map entries for one server (stable name order)."""
+        entries = self._read_server_entries_unlocked(server_id)
+        return tuple(
+            sorted(entries, key=lambda entry: (entry.name, entry.application_id))
+        )
+
+    def _read_server_entries_unlocked(
+        self, server_id: uuid.UUID
+    ) -> tuple[ServiceMapEntry, ...]:
+        """The strict on-disk server map read WITHOUT taking the server
+        lock — the primitive the locked read-replace critical sections
+        of ``upsert_entry``/``delete_entry`` build on. Plain reads stay
+        atomic because every writer replaces the whole file with
+        ``os.replace`` (a reader observes the previous or the next
+        complete document, never torn JSON)."""
         path = self._server_path(server_id)
         if not path.exists():
             return ()
@@ -709,12 +880,11 @@ class ServiceMapStore:
                 f"service map for server {server_id} must hold a JSON array",
             )
         sid = str(server_id)
-        entries = [
+        return tuple(
             _entry_of(item, server_id=sid)
             for item in raw
             if isinstance(item, Mapping)
-        ]
-        return tuple(sorted(entries, key=lambda entry: (entry.name, entry.application_id)))
+        )
 
     def get_entry(
         self, server_id: uuid.UUID, application_id: uuid.UUID
@@ -765,22 +935,34 @@ class ServiceMapStore:
         instructions: ServiceInstructions | Mapping[str, object] | None = None,
         custom_instructions: str | None = None,
         installed: bool | None = None,
+        expected_revision: int | None = None,
     ) -> ServiceMapEntry:
         """Add or update one service entry (revision-bumped, atomic).
 
         ``application_id`` omitted mints the deterministic UUID5 from
         ``(server_id, name)`` — the same service name converges on the
         same identity across upserts. The new revision is the previously
-        stored revision + 1 (or 1 on create). ``custom_instructions`` and
-        ``installed`` are the per-server overrides: ``None`` preserves the
-        previously stored value (or the ``""``/``True`` default on create),
-        so callers that do not name them never wipe server-local state.
+        stored revision + 1 (or 1 on create), computed from the FRESH
+        on-disk state inside the per-server lock, so concurrent writers
+        always produce monotone revisions without lost updates.
+        ``custom_instructions`` and ``installed`` are the per-server
+        overrides: ``None`` preserves the previously stored value (or
+        the ``""``/``True`` default on create), so callers that do not
+        name them never wipe server-local state.
+
+        ``expected_revision`` is an optional compare-and-set (D4/C4):
+        ``0`` demands a create (no stored entry may exist), a positive
+        value demands the stored entry to sit at exactly that revision;
+        a mismatch raises ``REVISION_CONFLICT`` and writes nothing. The
+        whole read-modify-write critical section runs under the
+        cross-process per-server file lock.
         """
         sid = _canonical_uuid(server_id, "server_id")
         name = _validated_name(name)
         category = _validated_category_id(category)
         origin = _validated_origin(origin)
         description = _validated_description(description)
+        _validate_expected_revision(expected_revision)
         if custom_instructions is not None:
             if (
                 not isinstance(custom_instructions, str)
@@ -818,70 +1000,109 @@ class ServiceMapStore:
             )
         aid = _canonical_uuid(application_id, "application_id")
 
-        entries = [
-            entry
-            for entry in self.list_entries(server_id)
-            if entry.application_id != aid
-        ]
-        if len(entries) >= MAX_ENTRIES_PER_SERVER:
-            raise ServiceMapError(
-                ServiceMapErrorCode.INVALID_REQUEST,
-                f"a server map holds at most {MAX_ENTRIES_PER_SERVER} entries",
+        # The ENTIRE read-modify-write critical section is serialized per
+        # server across threads and processes (D4: no lost updates).
+        with self.server_lock(server_id):
+            existing = self._read_server_entries_unlocked(server_id)
+            previous = next(
+                (item for item in existing if item.application_id == aid), None
             )
-        previous = self.get_entry(server_id, uuid.UUID(aid))
-        entry = ServiceMapEntry(
-            application_id=aid,
-            server_id=sid,
-            name=name,
-            origin=origin,
-            compose_project=compose_project,
-            working_dir=working_dir,
-            unit_name=unit_name,
-            category=category,
-            description=description,
-            instructions=parsed_instructions,
-            updated_at=_wire_ts(datetime.now(timezone.utc)),
-            revision=1 if previous is None else previous.revision + 1,
-            custom_instructions=(
-                custom_instructions
-                if custom_instructions is not None
-                else ("" if previous is None else previous.custom_instructions)
-            ),
-            installed=(
-                installed
-                if installed is not None
-                else (True if previous is None else previous.installed)
-            ),
-        )
-        document = [item.to_json() for item in entries] + [entry.to_json()]
-        self._ensure_root()
-        _atomic_write(
-            self._server_path(server_id),
-            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
-        )
+            if expected_revision is not None and (
+                (expected_revision == 0 and previous is not None)
+                or (
+                    expected_revision > 0
+                    and (
+                        previous is None
+                        or previous.revision != expected_revision
+                    )
+                )
+            ):
+                raise ServiceMapError(
+                    ServiceMapErrorCode.REVISION_CONFLICT,
+                    _revision_conflict_detail(aid, expected_revision, previous),
+                )
+            entries = [
+                item for item in existing if item.application_id != aid
+            ]
+            if len(entries) >= MAX_ENTRIES_PER_SERVER:
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    f"a server map holds at most {MAX_ENTRIES_PER_SERVER} entries",
+                )
+            entry = ServiceMapEntry(
+                application_id=aid,
+                server_id=sid,
+                name=name,
+                origin=origin,
+                compose_project=compose_project,
+                working_dir=working_dir,
+                unit_name=unit_name,
+                category=category,
+                description=description,
+                instructions=parsed_instructions,
+                updated_at=_wire_ts(datetime.now(timezone.utc)),
+                revision=1 if previous is None else previous.revision + 1,
+                custom_instructions=(
+                    custom_instructions
+                    if custom_instructions is not None
+                    else ("" if previous is None else previous.custom_instructions)
+                ),
+                installed=(
+                    installed
+                    if installed is not None
+                    else (True if previous is None else previous.installed)
+                ),
+            )
+            document = [item.to_json() for item in entries] + [entry.to_json()]
+            self._ensure_root()
+            _atomic_write(
+                self._server_path(server_id),
+                json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+            )
         return entry
 
     def delete_entry(
-        self, server_id: uuid.UUID, application_id: str | uuid.UUID
+        self,
+        server_id: uuid.UUID,
+        application_id: str | uuid.UUID,
+        *,
+        expected_revision: int | None = None,
     ) -> bool:
         """Remove one service entry by identity (atomic).
 
         Returns ``True`` when an existing entry was removed, ``False``
-        when no entry matched ``application_id``.
+        when no entry matched ``application_id``. With
+        ``expected_revision`` set, the stored entry must exist at
+        exactly that revision or the delete refuses with
+        ``REVISION_CONFLICT`` without touching the file. The whole
+        read-modify-write critical section runs under the cross-process
+        per-server file lock.
         """
         _canonical_uuid(server_id, "server_id")
         aid = _canonical_uuid(application_id, "application_id")
-        existing = self.list_entries(server_id)
-        remaining = [entry for entry in existing if entry.application_id != aid]
-        if len(remaining) == len(existing):
-            return False
-        document = [item.to_json() for item in remaining]
-        self._ensure_root()
-        _atomic_write(
-            self._server_path(server_id),
-            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
-        )
-        return True
+        _validate_expected_revision(expected_revision)
+        with self.server_lock(server_id):
+            existing = self._read_server_entries_unlocked(server_id)
+            previous = next(
+                (item for item in existing if item.application_id == aid), None
+            )
+            if expected_revision is not None and (
+                previous is None or previous.revision != expected_revision
+            ):
+                raise ServiceMapError(
+                    ServiceMapErrorCode.REVISION_CONFLICT,
+                    _revision_conflict_detail(aid, expected_revision, previous),
+                )
+            remaining = [entry for entry in existing if entry.application_id != aid]
+            if len(remaining) == len(existing):
+                return False
+            document = [item.to_json() for item in remaining]
+            self._ensure_root()
+            _atomic_write(
+                self._server_path(server_id),
+                json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+            )
+            return True
 
     # -- global runbook catalog ------------------------------------------------
 
@@ -1019,20 +1240,23 @@ class ServiceMapStore:
                 uuid.uuid5(uuid.UUID(int=0), f"runbook-catalog:{name.strip().lower()}")
             )
         )
-        existing = self._read_catalog()
-        runbooks = [item for item in existing if item.runbook_id != rid]
-        previous = next((item for item in existing if item.runbook_id == rid), None)
-        runbook = CatalogRunbook(
-            runbook_id=rid,
-            name=name,
-            category=category,
-            description=description,
-            instructions=parsed_instructions,
-            updated_at=_wire_ts(datetime.now(timezone.utc)),
-            revision=1 if previous is None else previous.revision + 1,
-        )
-        runbooks.append(runbook)
-        self._write_catalog(runbooks)
+        # All catalog.json mutations serialize under one process-wide
+        # file lock (in-process RLock + cross-process flock).
+        with self._file_lock(self._root / "catalog.lock"):
+            existing = self._read_catalog()
+            runbooks = [item for item in existing if item.runbook_id != rid]
+            previous = next((item for item in existing if item.runbook_id == rid), None)
+            runbook = CatalogRunbook(
+                runbook_id=rid,
+                name=name,
+                category=category,
+                description=description,
+                instructions=parsed_instructions,
+                updated_at=_wire_ts(datetime.now(timezone.utc)),
+                revision=1 if previous is None else previous.revision + 1,
+            )
+            runbooks.append(runbook)
+            self._write_catalog(runbooks)
         return runbook
 
     def delete_catalog_runbook(self, runbook_id: str | uuid.UUID) -> bool:
@@ -1045,12 +1269,13 @@ class ServiceMapStore:
         is not deletable from the catalog).
         """
         rid = _canonical_uuid(runbook_id, "runbook_id")
-        existing = self._read_catalog()
-        remaining = [item for item in existing if item.runbook_id != rid]
-        if len(remaining) == len(existing):
-            return False
-        self._write_catalog(remaining)
-        return True
+        with self._file_lock(self._root / "catalog.lock"):
+            existing = self._read_catalog()
+            remaining = [item for item in existing if item.runbook_id != rid]
+            if len(remaining) == len(existing):
+                return False
+            self._write_catalog(remaining)
+            return True
 
 
 # ---------------------------------------------------------------------------
