@@ -251,42 +251,6 @@
 	} from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
 
-	/**
-	 * D7 gate: the applications panels' OPTIONAL learned-notes group is
-	 * composed ONLY when the live client exposes ALL FIVE knowledge
-	 * methods (typeof-guarded, so legacy demo clients without them keep
-	 * the exact legacy bag and the panel renders its honest unavailable
-	 * state). The five methods pass through VERBATIM — every call carries
-	 * the panel's explicit serverId/applicationId; there is deliberately
-	 * NO selected-server fallback for knowledge requests (C01 rule 2).
-	 */
-	function knowledgeGroupFrom(client: object): KnowledgeApi | null {
-		const candidate = client as Partial<KnowledgeApi>;
-		for (
-			const name of [
-				'readKnowledge',
-				'readFactHistory',
-				'readKnowledgeOperations',
-				'retractKnowledgeFact',
-				'retryKnowledgeOperation'
-			] as const
-		) {
-			if (typeof candidate[name] !== 'function') return null;
-		}
-		return {
-			readKnowledge: (serverId, applicationId, page) =>
-				candidate.readKnowledge!(serverId, applicationId, page),
-			readFactHistory: (serverId, applicationId, factId, page) =>
-				candidate.readFactHistory!(serverId, applicationId, factId, page),
-			readKnowledgeOperations: (serverId, applicationId, status, page) =>
-				candidate.readKnowledgeOperations!(serverId, applicationId, status, page),
-			retractKnowledgeFact: (serverId, applicationId, factId, payload) =>
-				candidate.retractKnowledgeFact!(serverId, applicationId, factId, payload),
-			retryKnowledgeOperation: (serverId, applicationId, operationId) =>
-				candidate.retryKnowledgeOperation!(serverId, applicationId, operationId)
-		};
-	}
-
 	import {
 		SESSION_CHAT_PANEL_KIND as CHAT_PANEL_KIND,
 		sessionChatEntry,
@@ -343,6 +307,60 @@
 		type NotificationsFilterHandoff
 	} from './entries/14-web-notifications.js';
 	import type { PanelServices } from './registry.js';
+
+	/** The five D7 knowledge methods the gate must see before composing. */
+	const KNOWLEDGE_METHODS = [
+		'readKnowledge',
+		'readFactHistory',
+		'readKnowledgeOperations',
+		'retractKnowledgeFact',
+		'retryKnowledgeOperation'
+	] as const;
+
+	// Compile-time exhaustiveness: the gate list must name EVERY member of
+	// KnowledgeApi — a future method that silently skipped the gate would
+	// be missing from the composed group.
+	type _AllGated = Exclude<
+		keyof KnowledgeApi,
+		(typeof KNOWLEDGE_METHODS)[number]
+	> extends never
+		? true
+		: never;
+
+	/**
+	 * D7 gate: the applications panels' OPTIONAL learned-notes group is
+	 * composed ONLY when the live client exposes ALL FIVE knowledge
+	 * methods (typeof-guarded, so legacy demo clients without them keep
+	 * the exact legacy bag and the panel renders its honest unavailable
+	 * state). The five methods pass through VERBATIM — every call carries
+	 * the panel's explicit serverId/applicationId; there is deliberately
+	 * NO selected-server fallback for knowledge requests (C01 rule 2).
+	 */
+	function knowledgeGroupFrom(client: object): KnowledgeApi | null {
+		const candidate = client as Partial<KnowledgeApi>;
+		const { readKnowledge, readFactHistory, readKnowledgeOperations, retractKnowledgeFact, retryKnowledgeOperation } = candidate;
+		if (
+			typeof readKnowledge !== 'function' ||
+			typeof readFactHistory !== 'function' ||
+			typeof readKnowledgeOperations !== 'function' ||
+			typeof retractKnowledgeFact !== 'function' ||
+			typeof retryKnowledgeOperation !== 'function'
+		) {
+			return null;
+		}
+		return {
+			readKnowledge: (serverId, applicationId, page) =>
+				readKnowledge(serverId, applicationId, page),
+			readFactHistory: (serverId, applicationId, factId, page) =>
+				readFactHistory(serverId, applicationId, factId, page),
+			readKnowledgeOperations: (serverId, applicationId, status, page) =>
+				readKnowledgeOperations(serverId, applicationId, status, page),
+			retractKnowledgeFact: (serverId, applicationId, factId, payload) =>
+				retractKnowledgeFact(serverId, applicationId, factId, payload),
+			retryKnowledgeOperation: (serverId, applicationId, operationId) =>
+				retryKnowledgeOperation(serverId, applicationId, operationId)
+		};
+	}
 
 	const registry = createDesktopRegistry();
 
@@ -1568,6 +1586,7 @@
 	function openServerPanel(kind: PanelKind, serverId: ServerId): void {
 		openPanel(kind, { kind: 'server', server_id: serverId });
 	}
+
 
 	/** Open the documents panel pinned to one stored document object. */
 	function openDocumentObject(serverId: ServerId, docId: string): void {

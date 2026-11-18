@@ -1673,16 +1673,49 @@ test('live applications: the composed knowledge group keeps every request explic
 	// discipline. (The draft @service picker's limit=10 read is the chat
 	// dock's own explicitly scoped draft, not the panel's.)
 	const panelReads = () =>
-		applicationListRequests.filter((path) => path.endsWith('limit=50'));
+		applicationListRequests.filter((path) => {
+			const url = new URL(`http://fixture.local${path}`);
+			return url.pathname.endsWith('/applications') && url.searchParams.get('limit') === '50';
+		});
 	expect(panelReads(), `list requests: ${applicationListRequests.join(' | ')}`).toEqual([
 		`/api/v1/servers/${SERVER_ALPHA_ID}/applications?limit=50`
 	]);
 
+	// Switch the desktop's SELECTED server to Beta BEFORE refreshing: the
+	// open window keeps its pinned ALPHA scope, so its explicit Refresh
+	// re-read must still name ALPHA — a selectedServerId fallback would
+	// answer with Beta here. The change goes through the REAL select's
+	// event contract via DOM dispatch: playwright's selectOption retries
+	// actionability forever against the continuously re-rendering drawer
+	// select (the overlay + live badge loop), while a bubbling `change`
+	// is exactly what the shell's bind:value listens for.
+	await page.evaluate((id) => {
+		const select = document.querySelector(
+			'[data-testid="server-select"]'
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error('server-select missing');
+		select.value = id;
+		select.dispatchEvent(new Event('change', { bubbles: true }));
+	}, SERVER_BETA_ID);
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					(document.querySelector('[data-testid="server-select"]') as HTMLSelectElement)
+						.value
+			)
+		)
+		.toBe(SERVER_BETA_ID);
+	await expect(row.getByTestId('inventory-row-server')).toHaveText(SERVER_ALPHA_ID);
+	expect(panelReads()).toHaveLength(1);
+
 	// The panel's explicit Refresh re-read stays bound to the SAME pinned
-	// server identity (never the desktop's selected-server fallback).
+	// server identity even though the desktop selection has moved on.
 	await appsFrame.getByTestId('inventory-refresh').click();
-	await expect(panelReads()).toHaveLength(2);
-	expect(panelReads()[1]).toBe(`/api/v1/servers/${SERVER_ALPHA_ID}/applications?limit=50`);
+	await expect.poll(() => panelReads().length).toBe(2);
+	for (const path of panelReads()) {
+		expect(path.startsWith(`/api/v1/servers/${SERVER_ALPHA_ID}/applications`)).toBe(true);
+	}
 
 	// Crucially for D7: the knowledge group carries NO ambient scope —
 	// without a pinned application NOTHING may fire a knowledge read, and
