@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Final
 
@@ -259,6 +259,11 @@ class KnowledgeRead(_ReadModel):
     conflict_count: int = Field(
         description="Number of CONFLICT facts in the current generation",
     )
+    conflicts: list[FactRecord] = Field(
+        default_factory=list,
+        description="Current-generation CONFLICT facts (populated when "
+        "include_conflicts is requested; never part of the active page)",
+    )
     facts: FactPage = Field(
         description="The bounded ACTIVE learned-fact page for the current generation",
     )
@@ -475,12 +480,6 @@ class KnowledgeReadStore:
             "auto_adopt_suppressed": False,
         }
 
-    async def _scalar_count(
-        self, session: AsyncSession, where_sql: str, params: Mapping[str, Any]
-    ) -> int:
-        query = sa.text(f"SELECT COUNT(*) FROM {_FACT_TABLE} WHERE {where_sql}")
-        return int((await session.execute(query, dict(params))).scalar_one())
-
     # -- resolution (app.resolve_service foundation, D2/AC1) -----------------
 
     async def resolve_service(
@@ -634,7 +633,7 @@ class KnowledgeReadStore:
             manual_identity = bool(identity["manual_identity"])
             auto_adopt_suppressed = bool(identity["auto_adopt_suppressed"])
         elif entry is not None:
-            defaults = _identity_defaults(entry)
+            defaults = self._identity_defaults(entry)
             generation = defaults["generation"]
             service_revision = defaults["service_revision"]
             knowledge_revision = defaults["knowledge_revision"]
@@ -691,6 +690,21 @@ class KnowledgeReadStore:
                     )
                 ).scalar_one()
             )
+            conflict_rows: list[Any] = []
+            if include_conflicts:
+                conflict_rows = (
+                    await session.execute(
+                        sa.text(
+                            f"SELECT fact_id, category, key, statement, revision, "
+                            f"created_at, status, source_kind, source_ref, "
+                            f"verified_at, supersedes_fact_id FROM {_FACT_TABLE} "
+                            f"WHERE {conflict_where} "
+                            f"ORDER BY {_FACT_ORDER_SQL} LIMIT :limit"
+                        ),
+                        params,
+                    )
+                ).mappings().all()
+        conflicts = [_fact_record_of(row) for row in conflict_rows]
         facts = FactPage(
             items=[_fact_record_of(row) for row in rows],
             limit=limit,
@@ -730,9 +744,8 @@ class KnowledgeReadStore:
             installed=entry.installed if entry is not None else None,
             map_revision=entry.revision if entry is not None else None,
             catalog_runbook=catalog_runbook,
-            conflict_count=conflict_count if not include_conflicts else (
-                conflict_count
-            ),
+            conflict_count=conflict_count,
+            conflicts=conflicts,
             facts=facts,
         )
         enforce_envelope_bound(read)
@@ -910,3 +923,8 @@ class KnowledgeReadStore:
             target_server_id=target_server_id,
         )
         return page.items[0] if page.items else None
+
+
+#: Descriptive alias (both names are valid exports; the store is THE
+#: read service for the knowledge feature).
+ServiceKnowledgeReadService = KnowledgeReadStore

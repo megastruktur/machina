@@ -27,6 +27,7 @@ from alembic.config import Config as AlembicConfig
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from mai.applications.knowledge_contracts import (
+    FactStatus,
     MAX_PAGE_LIMIT,
     OperationStatus,
     SubEffectStatus,
@@ -106,6 +107,14 @@ def factory(
     migrated_url: str,
 ) -> async_sessionmaker:
     engine, sessions = create_app_engine(migrated_url)
+    # Per-test SQL isolation: every test starts with clean knowledge
+    # tables (the map store is file-scoped per test and unaffected).
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        conn.execute(
+            "TRUNCATE TABLE service_learned_fact_revision, "
+            "service_learned_fact, service_learning_operation, "
+            "service_knowledge_identity CASCADE"
+        )
     yield sessions
     _run(engine.dispose())
 
@@ -387,7 +396,7 @@ def test_resolution_priority_exact_id_then_selector_then_query(
 def test_ambiguous_query_paginates_deterministically(
     migrated_url: str, map_store: ServiceMapStore, factory
 ) -> None:
-    mapping = _seed_map_entries(map_store)
+    _seed_map_entries(map_store)
     store = KnowledgeReadStore(factory, map_store)
     first = _run(
         store.resolve_service(server_id=SERVER_A, query="redis", limit=2, offset=0)
@@ -488,6 +497,21 @@ def test_knowledge_read_filters_generation_and_status(
     assert all_ids == [0x701 + index for index in range(15)]
     enforce_envelope_bound(first)
     enforce_envelope_bound(first.facts)
+    # include_conflicts only populates the CONFLICT list: facts stays
+    # strictly ACTIVE (AC1).
+    with_conflicts = _run(
+        store.get_service_knowledge(
+            server_id=SERVER_A,
+            application_id=app_main,
+            include_conflicts=True,
+        )
+    )
+    assert with_conflicts.facts.total == 15
+    assert all(fact.status is FactStatus.ACTIVE for fact in with_conflicts.facts.items)
+    assert with_conflicts.conflict_count == 1
+    assert len(with_conflicts.conflicts) == 1
+    assert with_conflicts.conflicts[0].status is FactStatus.CONFLICT
+    assert with_conflicts.conflicts[0].key == "conflict-key"
 
 
 def test_knowledge_read_not_found(migrated_url: str, map_store: ServiceMapStore, factory) -> None:
@@ -501,6 +525,43 @@ def test_knowledge_read_not_found(migrated_url: str, map_store: ServiceMapStore,
             )
         )
     assert excinfo.value.code == "not_found"
+
+
+def test_knowledge_read_map_entry_without_identity_row_uses_frozen_defaults(
+    migrated_url: str, map_store: ServiceMapStore, factory
+) -> None:
+    """Regression (OCR fix1 critical): a map entry WITHOUT a
+    ``service_knowledge_identity`` row uses the frozen defaults
+    (generation 1, knowledge revision 0, compose origin is NOT a manual
+    identity) — and operator notes plus the catalog runbook still come
+    back."""
+    mapping = _seed_map_entries(map_store)
+    app_main = uuid.UUID(mapping["app-main"])
+    with psycopg.connect(migrated_url) as conn:
+        identity_rows = conn.execute(
+            "SELECT count(*) FROM service_knowledge_identity WHERE "
+            "application_id = %s",
+            (str(app_main),),
+        ).fetchone()[0]
+    assert identity_rows == 0
+
+    store = KnowledgeReadStore(factory, map_store)
+    read = _run(
+        store.get_service_knowledge(
+            server_id=SERVER_A, application_id=app_main, limit=5
+        )
+    )
+    assert read.found_in_map is True
+    assert read.generation == 1
+    assert read.service_revision == read.map_revision
+    assert read.knowledge_revision == 0
+    assert read.manual_identity is False
+    assert read.auto_adopt_suppressed is False
+    assert read.facts.total == 0
+    assert read.facts.items == []
+    assert read.custom_instructions == "operator notes for app-main"
+    assert read.catalog_runbook is not None
+    assert read.catalog_runbook["name"] == "app-main"
 
 
 # ---------------------------------------------------------------------------
@@ -565,8 +626,6 @@ def test_fact_history_paginates_newest_first(
 def test_operation_status_paginates_and_filters(
     migrated_url: str, map_store: ServiceMapStore, factory
 ) -> None:
-    import json
-
     mapping = _seed_map_entries(map_store)
     app_main = uuid.UUID(mapping["app-main"])
     cycle = [
