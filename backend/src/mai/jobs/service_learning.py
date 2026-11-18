@@ -535,8 +535,14 @@ class ServiceLearningHandler:
                 isinstance(contexts, dict)
                 and payload.request is not None
                 and payload.trusted is not None
+                and hasattr(self._operations, "_register_context")
             ):
-                contexts[operation_id] = (payload.request, payload.trusted)
+                # Register through the store's own seam so the bounded
+                # _CONTEXT_REGISTRY_LIMIT eviction discipline is
+                # preserved (a raw dict write would grow unbounded).
+                self._operations._register_context(
+                    operation_id, payload.request, payload.trusted
+                )
                 stored_request, stored_trusted = (
                     payload.request,
                     payload.trusted,
@@ -816,10 +822,13 @@ class ServiceLearningHandler:
                 fresh = await self._load_row(operation_id)
                 return self._serialize(fresh or row)
             sub_effects["facts"] = SubEffectStatus.APPLIED
-            # Applied OR idempotent: both prove the facts are durable.
+            # UNION of applied and idempotent (deduped, order-stable):
+            # a mixed request persists SOME new facts AND proves others
+            # already durable — every durable fact identity is kept.
             effective_fact_ids = tuple(
-                write_result.applied_fact_ids
-                or write_result.idempotent_fact_ids
+                dict.fromkeys(
+                    [*write_result.applied_fact_ids, *write_result.idempotent_fact_ids]
+                )
             )
             await self._operations.record_progress(
                 operation_id,
