@@ -905,6 +905,21 @@ def test_suppress_cancels_pending_blocks_admit_and_readopt_fences_old_generation
     )
     assert _row(migrated_url, queued_id)["error_code"] == "generation_superseded"
 
+    # Terminal-receipt immutability: begin_apply on the ALREADY-FAILED
+    # row refuses without mutating status or error_code (Fix 1).
+    with pytest.raises(OperationAdmissionError) as terminal_err:
+        _run(
+            store.begin_apply(
+                SERVER_A,
+                accepted.receipt.operation_id,
+                current_grants=set(grants),
+            )
+        )
+    assert terminal_err.value.code == "operation_not_runnable"
+    failed_row = _row(migrated_url, accepted.receipt.operation_id)
+    assert failed_row["status"] == "failed"
+    assert failed_row["error_code"] == "generation_superseded"
+
     with pytest.raises(ServiceAutoAdoptSuppressedError):
         _admit_on(
             store,
@@ -1289,30 +1304,36 @@ def test_recover_pending_batch_supersedes_stale_generation(
 ) -> None:
     store = LearningOperationStore(factory)
     run_id = uuid.uuid4()
+    # expected_generation=0 -> NULL generation: a new-service op that the
+    # frozen readopt cancel (generation < :g) deliberately leaves pending,
+    # so the SWEEP's tombstone/generation fence is what retires it.
     stale_live = _admit_on(
         store,
         trusted=_trusted(SERVER_A, tool_call_id="call-old", run_id=run_id),
-        request=_request([_delta("gen.old", "statement old")]),
+        request=_request([_delta("gen.old", "statement old")], expected_generation=0),
         engine=_RecordingEngine(),
     )
     _queued_op(factory, store, run_id, 5)
     first = _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))
     assert first.generation == 1  # explicit readopt on an absent identity starts at 1
     readopted = _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))
-    assert readopted.generation == 2  # the old operations now carry a stale generation
+    assert readopted.generation == 2
+    # Fix 2: the readopt itself cancels the stale-generation QUEUED row.
+    queued_stale_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-q5"
+    )
+    queued_row = _row(migrated_url, queued_stale_id)
+    assert queued_row["status"] == "failed"
+    assert queued_row["error_code"] == "generation_superseded"
 
     engine = _RecordingEngine()
     sweep = _run(store.recover_pending_batch(limit=10, engine_enqueue=engine))
-    assert sweep.superseded == 2
+    assert sweep.superseded == 1  # only the accepted stale row remains pending
     assert sweep.promoted == 0
-    assert engine.calls == []  # the queued stale row is NEVER enqueued
-    for operation_id in (
-        stale_live.receipt.operation_id,
-        uuid.uuid5(uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-q5"),
-    ):
-        row = _row(migrated_url, operation_id)
-        assert row["status"] == "failed"
-        assert row["error_code"] == "generation_superseded"
+    assert engine.calls == []  # stale work is NEVER enqueued
+    row = _row(migrated_url, stale_live.receipt.operation_id)
+    assert row["status"] == "failed"
+    assert row["error_code"] == "generation_superseded"
 
     # Server-scoped sweep: a different server owns no pending rows here.
     scoped = _run(
@@ -1320,3 +1341,108 @@ def test_recover_pending_batch_supersedes_stale_generation(
     )
     assert scoped.total == 0
     assert scoped.receipts == []
+
+
+# ---------------------------------------------------------------------------
+# 19 (fix1). terminal receipts are never mutated; generation advance fences
+# ---------------------------------------------------------------------------
+
+
+def test_begin_apply_never_mutates_terminal_and_fences_on_advance(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    grants = ["app.learn_service_facts"]
+    _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))  # identity at gen 1
+
+    applied_op = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-done", run_id=run_id, grants=grants),
+        request=_request([_delta("fix.done", "statement done")], expected_generation=1),
+        engine=_RecordingEngine(),
+    )
+    _run(
+        store.record_progress(
+            applied_op.receipt.operation_id,
+            sub_effects={"facts": SubEffectStatus.APPLIED},
+        )
+    )
+
+    # The identity advances to generation 2 while the receipt is APPLIED.
+    readopted = _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))
+    assert readopted.generation == 2
+
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(
+            store.begin_apply(
+                SERVER_A,
+                applied_op.receipt.operation_id,
+                current_grants=set(grants),
+            )
+        )
+    assert err.value.code == "operation_not_runnable"
+    row = _row(migrated_url, applied_op.receipt.operation_id)
+    assert row["status"] == "applied"  # NOT overwritten to failed
+    assert row["error_code"] is None
+
+    # A genuinely non-terminal (accepted, generation 1) row is fenced by a
+    # concurrent generation advance (simulated with a direct SQL bump so the
+    # row stays pending) and transitions to failed generation_superseded.
+    live = _admit_on(
+        store,
+        trusted=_trusted(SERVER_A, tool_call_id="call-adv", run_id=run_id, grants=grants),
+        request=_request([_delta("fix.adv", "statement advance")], expected_generation=1),
+        engine=_RecordingEngine(),
+    )
+    assert _row(migrated_url, live.receipt.operation_id)["status"] == "accepted"
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE service_knowledge_identity SET generation = 3, "
+            "updated_at = now() WHERE server_id = %s AND application_id = %s",
+            (str(SERVER_A), str(APP_MAIN_ID)),
+        )
+    with pytest.raises(OperationAdmissionError) as fence_err:
+        _run(
+            store.begin_apply(
+                SERVER_A,
+                live.receipt.operation_id,
+                current_grants=set(grants),
+            )
+        )
+    assert fence_err.value.code == "generation_superseded"
+    fenced_row = _row(migrated_url, live.receipt.operation_id)
+    assert fenced_row["status"] == "failed"
+    assert fenced_row["error_code"] == "generation_superseded"
+
+
+# ---------------------------------------------------------------------------
+# 20 (fix1). retry fences a stale-generation queued row before any enqueue
+# ---------------------------------------------------------------------------
+
+
+def test_retry_operation_fences_stale_generation_without_enqueue(
+    migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    run_id = uuid.uuid4()
+    _run(store.readopt_service_identity(SERVER_A, APP_MAIN_ID))  # identity at gen 1
+    _queued_op(factory, store, run_id, 7)  # queued, row generation 1
+    with psycopg.connect(migrated_url, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE service_knowledge_identity SET generation = 2, "
+            "updated_at = now() WHERE server_id = %s AND application_id = %s",
+            (str(SERVER_A), str(APP_MAIN_ID)),
+        )
+
+    engine = _RecordingEngine()
+    queued_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:call-q7"
+    )
+    with pytest.raises(OperationAdmissionError) as err:
+        _run(store.retry_operation(queued_id, engine_enqueue=engine))
+    assert err.value.code == "generation_superseded"
+    assert engine.calls == []  # fenced BEFORE any enqueue attempt
+    row = _row(migrated_url, queued_id)
+    assert row["status"] == "failed"
+    assert row["error_code"] == "generation_superseded"

@@ -841,9 +841,12 @@ class LearningOperationStore:
         """Explicit operator/trusted re-adoption (D4): starts a NEW
         generation (``+1``, or 1 when no prior row existed), clears the
         auto-adopt tombstone, resets ``knowledge_revision`` and bumps
-        ``service_revision``; prior-generation facts and operation
-        receipts stay intact as history while late operations carrying
-        the old generation are fenced out at ``begin_apply``."""
+        ``service_revision``; prior-generation facts and terminal
+        receipts stay intact as history. Pending (queued/accepted/
+        applying) operations of PRIOR generations are cancelled as
+        ``generation_superseded`` so a direct readopt never leaves
+        stale-generation work runnable; late operations carrying the old
+        generation are additionally fenced out at ``begin_apply``."""
         async with self._sessions() as session:
             async with session.begin():
                 current = (
@@ -856,6 +859,9 @@ class LearningOperationStore:
                         {"s": server_id, "a": application_id},
                     )
                 ).mappings().first()
+                new_generation = (
+                    1 if current is None else int(current["generation"]) + 1
+                )
                 if current is None:
                     await session.execute(
                         sa.text(
@@ -881,6 +887,25 @@ class LearningOperationStore:
                         ),
                         {"s": server_id, "a": application_id, "m": manual_identity},
                     )
+                # Cancel stale-generation pending rows (terminal receipts
+                # and NULL-generation new-service rows are NOT touched
+                # here; the apply-time fence owns those).
+                await session.execute(
+                    sa.text(
+                        "UPDATE service_learning_operation SET status = "
+                        "'failed', error_code = 'generation_superseded', "
+                        "error_detail = :ed, updated_at = now() WHERE "
+                        "server_id = :s AND application_id = :a AND status "
+                        "= ANY(:st) AND generation < :g"
+                    ),
+                    {
+                        "ed": _SUPERSEDED_DETAIL[:400],
+                        "s": server_id,
+                        "a": application_id,
+                        "st": _PENDING_STATUSES,
+                        "g": new_generation,
+                    },
+                )
                 state = (
                     await session.execute(
                         sa.text(
@@ -1319,50 +1344,103 @@ class LearningOperationStore:
         """Retry one UNACKNOWLEDGED (``queued``) operation through its
         same deterministic workflow id. An UNKNOWN outcome (status or
         any sub-effect) is FORBIDDEN to retry; cancelled and otherwise
-        terminal or in-flight rows are refused as not runnable."""
+        terminal or in-flight rows are refused as not runnable; a
+        tombstoned or newer-generation identity fails the row as
+        ``generation_superseded`` BEFORE any enqueue is attempted."""
+        refusal: OperationAdmissionError | None = None
+        workflow_id: str | None = None
         async with self._sessions() as session:
-            row = (
-                await session.execute(
-                    sa.text(
-                        f"SELECT {_RECEIPT_COLUMNS} FROM "
-                        "service_learning_operation WHERE operation_id = :o"
-                    ),
-                    {"o": operation_id},
+            async with session.begin():
+                row = (
+                    await session.execute(
+                        sa.text(
+                            f"SELECT {_RECEIPT_COLUMNS}, error_code FROM "
+                            "service_learning_operation WHERE operation_id "
+                            "= :o FOR UPDATE"
+                        ),
+                        {"o": operation_id},
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise OperationAdmissionError(
+                        "unknown_operation",
+                        "no durable operation exists under this identity",
+                    )
+                sub_effects = dict(row["sub_effects"] or {})
+                if str(row["status"]) == OperationStatus.UNKNOWN.value or any(
+                    value == SubEffectStatus.UNKNOWN.value for value in sub_effects.values()
+                ):
+                    raise UnknownOutcomeRetryForbiddenError(
+                        "the operation outcome is partially unknown; retry "
+                        "is forbidden until the authoritative state is "
+                        "reconciled"
+                    )
+                if str(row["error_code"] or "") == _CANCEL_ERROR_CODE:
+                    raise OperationAdmissionError(
+                        _CANCEL_ERROR_CODE,
+                        "a cancelled operation is never retried automatically",
+                    )
+                if str(row["status"]) != OperationStatus.QUEUED.value:
+                    raise OperationAdmissionError(
+                        "operation_not_runnable",
+                        f"only unacknowledged queued operations are "
+                        f"retryable here; the row is in status "
+                        f"'{row['status']}'",
+                    )
+                workflow_id = str(row["workflow_id"])
+                application_id = (
+                    uuid.UUID(str(row["application_id"]))
+                    if row["application_id"] is not None
+                    else None
                 )
-            ).mappings().first()
-        if row is None:
-            raise OperationAdmissionError(
-                "unknown_operation",
-                "no durable operation exists under this identity",
-            )
-        sub_effects = dict(row["sub_effects"] or {})
-        if str(row["status"]) == OperationStatus.UNKNOWN.value or any(
-            value == SubEffectStatus.UNKNOWN.value for value in sub_effects.values()
-        ):
-            raise UnknownOutcomeRetryForbiddenError(
-                "the operation outcome is partially unknown; retry is "
-                "forbidden until the authoritative state is reconciled"
-            )
-        if str(row["error_code"] or "") == _CANCEL_ERROR_CODE:
-            raise OperationAdmissionError(
-                _CANCEL_ERROR_CODE,
-                "a cancelled operation is never retried automatically",
-            )
-        if str(row["status"]) != OperationStatus.QUEUED.value:
-            raise OperationAdmissionError(
-                "operation_not_runnable",
-                f"only unacknowledged queued operations are retryable "
-                f"here; the row is in status '{row['status']}'",
-            )
+                row_generation = (
+                    int(row["generation"]) if row["generation"] is not None else None
+                )
+                if application_id is not None:
+                    identity = (
+                        await session.execute(
+                            sa.text(
+                                "SELECT generation, auto_adopt_suppressed FROM "
+                                "service_knowledge_identity WHERE server_id "
+                                "= :s AND application_id = :a"
+                            ),
+                            {
+                                "s": uuid.UUID(str(row["server_id"])),
+                                "a": application_id,
+                            },
+                        )
+                    ).mappings().first()
+                    if identity is not None and (
+                        bool(identity["auto_adopt_suppressed"])
+                        or row_generation != int(identity["generation"])
+                    ):
+                        # Fence BEFORE any enqueue: the row transitions to
+                        # terminal failed inside this committed transaction.
+                        await session.execute(
+                            sa.text(
+                                "UPDATE service_learning_operation SET "
+                                "status = 'failed', error_code = "
+                                "'generation_superseded', error_detail = "
+                                ":ed, updated_at = now() WHERE operation_id "
+                                "= :o AND status = 'queued'"
+                            ),
+                            {"ed": _SUPERSEDED_DETAIL[:400], "o": operation_id},
+                        )
+                        refusal = OperationAdmissionError(
+                            "generation_superseded", _SUPERSEDED_DETAIL
+                        )
+        if refusal is not None:
+            raise refusal
+        assert workflow_id is not None
         try:
-            await engine_enqueue(str(row["workflow_id"]))
+            await engine_enqueue(workflow_id)
         except RunIdInUseError:
             pass  # duplicate workflow id == already enqueued (ack)
         except Exception as exc:
             raise OperationAdmissionError(
                 "enqueue_failed",
                 f"the engine did not acknowledge the retry enqueue of "
-                f"workflow {row['workflow_id']}",
+                f"workflow {workflow_id}",
             ) from exc
         async with self._sessions() as session:
             async with session.begin():
