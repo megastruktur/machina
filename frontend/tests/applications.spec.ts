@@ -95,6 +95,7 @@ interface AppsWindowApi {
 	toggleHostA(): void;
 	switchPinnedApplication(applicationId: string): void;
 	armKnowledgeDefer(): void;
+	releaseKnowledgeFor(applicationId: string): void;
 	releaseKnowledgeAll(): void;
 	adoptSecondOnServerA(applicationId: string): Promise<unknown>;
 	registry: {
@@ -668,26 +669,31 @@ const APP_SOURCE = `
 		total: 1,
 		has_more: false
 	});
-	const parkedOr = (value) => {
+	const parkedOr = (applicationId, value) => {
 		if (!knowledgeDeferArmed) return Promise.resolve(value);
 		const gate = Promise.withResolvers();
-		// Park the RESOLVER with its value bound: releasing the gate later
-		// answers THIS call's own scope (stale gates answer stale scopes).
-		knowledgeGates.push(() => gate.resolve(value));
+		// Park the RESOLVER with its value AND SCOPE bound: a scope-aware
+		// release answers THIS call's own scope, so a test can release the
+		// NEW scope first and the STALE scope last (LIFO) — an unguarded
+		// component would repaint stale rows on that last release.
+		knowledgeGates.push({
+			applicationId,
+			release: () => gate.resolve(value)
+		});
 		return gate.promise;
 	};
 	const knowledgeApi = {
 		readKnowledge(serverId, applicationId, page) {
 			knowledgeCalls.push({ op: 'readKnowledge', serverId, applicationId, page });
-			return parkedOr(knowledgeReadDoc(serverId, applicationId, page));
+			return parkedOr(applicationId, knowledgeReadDoc(serverId, applicationId, page));
 		},
 		readFactHistory(serverId, applicationId, factId, page) {
 			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, factId, page });
-			return parkedOr(knowledgeHistoryDoc(applicationId, page));
+			return parkedOr(applicationId, knowledgeHistoryDoc(applicationId, page));
 		},
 		readKnowledgeOperations(serverId, applicationId, status, page) {
 			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, status, page });
-			return parkedOr(knowledgeOperationsDoc(applicationId, page));
+			return parkedOr(applicationId, knowledgeOperationsDoc(applicationId, page));
 		},
 		retractKnowledgeFact(serverId, applicationId, factId, payload) {
 			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, factId, payload });
@@ -825,6 +831,17 @@ const APP_SOURCE = `
 		},
 		armKnowledgeDefer() {
 			knowledgeDeferArmed = true;
+		},
+		releaseKnowledgeFor(applicationId) {
+			// Release ONLY the parked gates of ONE scope (LIFO release
+			// order is driven by the test, stale last).
+			for (let index = knowledgeGates.length - 1; index >= 0; index -= 1) {
+				const gate = knowledgeGates[index];
+				if (gate.applicationId === applicationId) {
+					knowledgeGates.splice(index, 1);
+					gate.release();
+				}
+			}
 		},
 		releaseKnowledgeAll() {
 			while (knowledgeGates.length > 0) knowledgeGates.shift()();
@@ -1106,18 +1123,18 @@ async function resetKnowledgeCalls(page: Page): Promise<void> {
 	});
 }
 
-async function apiCall(page: Page, method: string, args: unknown[] = []): Promise<void> {
+async function apiCall(page: Page, method: string, args: unknown[] = []): Promise<unknown> {
 	const pair: [string, unknown[]] = [method, args];
-	await page.evaluate(([name, callArgs]) => {
+	return page.evaluate(([name, callArgs]) => {
 		const value = window.__maiAppsApi;
 		if (!value) throw new Error('fixture api missing — app did not mount');
 		// Dynamic dispatch by serialized name: the fixture's own typed API
 		// viewed as a name→method table; the typeof guard still checks the
 		// lookup before any call.
-		const table = value as unknown as Record<string, (...a: never[]) => void>;
+		const table = value as unknown as Record<string, (...a: never[]) => unknown>;
 		const fn = table[name];
 		if (typeof fn !== 'function') throw new Error(`unknown fixture method ${name}`);
-		fn.apply(value, callArgs as never[]);
+		return fn.apply(value, callArgs as never[]);
 	}, pair);
 }
 
@@ -2459,14 +2476,16 @@ test('switching the selected service keeps the scope and the live epoch guard di
 	await pinned.getByTestId('knowledge-reload').click();
 	await apiCall(page, 'switchPinnedApplication', [SECOND_APP]);
 
-	// Release FIFO: the STALE old-scope answers arrive FIRST. The epoch
-	// guard must discard them (they never paint); only the new scope's
-	// rows may render.
-	await apiCall(page, 'releaseKnowledgeAll', []);
+	// Release LIFO-ordered by scope: the NEW-scope gates FIRST (the live
+	// instance paints its rows), then the STALE (APP_ADOPTED) gates LAST —
+	// an UNGUARDED component would overwrite the DOM with the stale rows
+	// on that last release; the live scope-epoch guard must discard them.
+	await apiCall(page, 'releaseKnowledgeFor', [SECOND_APP]);
 	await expect(pinned.getByTestId('knowledge-fact-row')).toHaveAttribute(
 		'data-fact-id',
 		`fact-learned-${SECOND_APP.slice(0, 8)}`
 	);
+	await apiCall(page, 'releaseKnowledgeFor', [APP_ADOPTED]);
 	const ids = await pinned
 		.getByTestId('knowledge-fact-row')
 		.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-fact-id')));

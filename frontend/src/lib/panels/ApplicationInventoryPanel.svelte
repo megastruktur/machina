@@ -1507,21 +1507,6 @@
 										</dl>
 									{/if}
 								</details>
-								{#if usable && serverScope !== null && row.application_id === pinnedApplicationId}
-									<!-- D7 learned operational notes for the SELECTED (pinned)
-										service only — one bounded instance per panel, fed the
-										explicit scope props; switching the pin re-keys the
-										component so stale in-flight reads never paint. The
-										knowledge group may be absent (legacy bag): the child
-										then renders its honest unavailable notice. -->
-									<div class="mai-apps__knowledge" data-testid="service-knowledge">
-										<ServiceKnowledge
-											serverId={serverScope}
-											applicationId={row.application_id}
-											{knowledge}
-										/>
-									</div>
-								{/if}
 								{#if editTarget?.application_id === row.application_id}
 									<div class="mai-apps__editor" data-testid="service-edit-form">
 										<Select
@@ -1644,6 +1629,23 @@
 							</li>
 						{/each}
 					</ul>
+					{#if usable && serverScope !== null && pinnedApplicationId !== null && filteredApplications.some((row) => row.application_id === pinnedApplicationId)}
+						<!-- D7 learned operational notes for the SELECTED (pinned)
+							service — mounted ONCE outside the keyed row loop so a pin
+							switch between two adopted rows of the same server UPDATES
+							this instance's applicationId prop in place (the child's
+							scope-epoch guard then discards its stale in-flight reads
+							instead of the remount destroying the investigation). The
+							knowledge group may be absent (legacy bag): the child
+							renders its honest unavailable notice. -->
+						<div class="mai-apps__knowledge" data-testid="service-knowledge">
+							<ServiceKnowledge
+								serverId={serverScope}
+								applicationId={pinnedApplicationId}
+								{knowledge}
+							/>
+						</div>
+					{/if}
 					{#if inventoryHasMore}
 						<div class="mai-apps__row-actions">
 							<Button
