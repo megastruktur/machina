@@ -83,21 +83,18 @@
 	let factsState = $state<SectionState>('loading');
 	let factsError = $state('');
 	let factItems = $state<FactRow[]>([]);
-	let factsTotal = $state(0);
 	let factsHasMore = $state(false);
 	let factsOffset = $state(0);
 
 	let historyState = $state<SectionState>('loading');
 	let historyError = $state('');
 	let historyItems = $state<HistoryRow[]>([]);
-	let historyTotal = $state(0);
 	let historyHasMore = $state(false);
 	let historyOffset = $state(0);
 
 	let operationsState = $state<SectionState>('loading');
 	let operationsError = $state('');
 	let operationItems = $state<OperationRow[]>([]);
-	let operationsTotal = $state(0);
 	let operationsHasMore = $state(false);
 	let operationsOffset = $state(0);
 
@@ -108,6 +105,10 @@
 	let retractReason = $state('');
 
 	const scopeKey = $derived(`${serverId}|${applicationId}`);
+	// SSR-safe unique id prefix: several panels may mount several notes
+	// surfaces on one page; static ids would collide (label/for pairs and
+	// aria-labelledby targets).
+	const uid = $props.id();
 
 	function dedupeById<T extends { key: string }>(existing: T[], incoming: T[]): T[] {
 		const known = new Set(existing.map((row) => row.key));
@@ -145,7 +146,6 @@
 						rows.map((row) => ({ key: row.fact_id, ...row }))
 					).map(({ key: _key, ...rest }) => rest)
 				: rows;
-			factsTotal = page.facts.total;
 			generation = page.generation;
 			factsHasMore = page.facts.has_more;
 			factsOffset = offset + rows.length;
@@ -181,7 +181,6 @@
 						rows.map((r) => ({ key: r.revision_id, ...r }))
 					).map(({ key: _key, ...rest }) => rest)
 				: rows;
-			historyTotal = page.total;
 			historyHasMore = page.has_more;
 			historyOffset = offset + rows.length;
 			historyState = historyItems.length === 0 ? 'empty' : 'ready';
@@ -215,7 +214,6 @@
 						rows.map((r) => ({ key: r.operation_id, ...r }))
 					).map(({ key: _key, ...rest }) => rest)
 				: rows;
-			operationsTotal = page.total;
 			operationsHasMore = page.has_more;
 			operationsOffset = offset + rows.length;
 			operationsState = operationItems.length === 0 ? 'empty' : 'ready';
@@ -231,6 +229,14 @@
 		busyFact = '';
 		busyOperation = '';
 		retractReason = '';
+		if (knowledge === null || knowledge === undefined) {
+			// No group: the sections repaint honest empties instead of
+			// staying stuck on a previous scope's loading state.
+			factsState = 'empty';
+			historyState = 'empty';
+			operationsState = 'empty';
+			return;
+		}
 		await Promise.all([
 			loadFacts(currentEpoch, 0, false),
 			loadHistory(currentEpoch, 0, false),
@@ -238,10 +244,12 @@
 		]);
 	}
 
-	// Scope-epoch guard: a server/application change invalidates every
-	// in-flight response of the previous scope.
+	// Scope-epoch guard: a server/application (or knowledge-group presence)
+	// change invalidates every in-flight response of the previous scope.
 	$effect(() => {
+		const hasKnowledge = knowledge !== null && knowledge !== undefined;
 		void scopeKey;
+		void hasKnowledge;
 		untrack(() => {
 			epoch += 1;
 			void reload(epoch);
@@ -257,12 +265,14 @@
 	function loadMoreOperations() {
 		void loadOperations(epoch, operationsOffset, true);
 	}
-	async function reloadAll() {
+	function reloadAll() {
+		epoch += 1;
 		void reload(epoch);
 	}
 
 	async function retractFact(fact: FactRow) {
 		if (knowledge === null || knowledge === undefined) return;
+		const currentEpoch = epoch;
 		const body: RetractBody = {
 			expected_revision: fact.revision,
 			expected_generation: generation,
@@ -279,20 +289,23 @@
 				fact.fact_id,
 				body
 			);
+			if (currentEpoch !== epoch) return; // stale scope: discard
 			if (result.status === 'applied') {
-				await reload(epoch);
+				await reload(currentEpoch);
 				return;
 			}
 			conflict = result.error_code ?? 'revision_conflict';
 		} catch (error) {
+			if (currentEpoch !== epoch) return; // stale scope: discard
 			conflict = errorMessage(error);
 		} finally {
-			busyFact = '';
+			if (currentEpoch === epoch) busyFact = '';
 		}
 	}
 
 	async function retryOperation(operation: OperationRow) {
 		if (knowledge === null || knowledge === undefined) return;
+		const currentEpoch = epoch;
 		busyOperation = operation.operation_id;
 		conflict = '';
 		try {
@@ -301,11 +314,13 @@
 				applicationId,
 				operation.operation_id
 			);
-			await reload(epoch);
+			if (currentEpoch !== epoch) return; // stale scope: discard
+			await reload(currentEpoch);
 		} catch (error) {
+			if (currentEpoch !== epoch) return; // stale scope: discard
 			conflict = errorMessage(error);
 		} finally {
-			busyOperation = '';
+			if (currentEpoch === epoch) busyOperation = '';
 		}
 	}
 
@@ -340,9 +355,9 @@
 		</p>
 	{/if}
 
-	<label class="knowledge-reason-label" for="knowledge-reason">Retraction reason (optional)</label>
+	<label class="knowledge-reason-label" for={`knowledge-reason-${uid}`}>Retraction reason (optional)</label>
 	<input
-		id="knowledge-reason"
+		id={`knowledge-reason-${uid}`}
 		data-testid="knowledge-reason"
 		class="knowledge-reason"
 		type="text"
@@ -360,8 +375,8 @@
 		Reload
 	</button>
 
-	<h3 id="knowledge-facts-heading" class="knowledge-heading">Learned facts</h3>
-	<div class="knowledge-scroll" data-testid="knowledge-facts" role="region" aria-labelledby="knowledge-facts-heading">
+	<h3 id={`knowledge-facts-heading-${uid}`} class="knowledge-heading">Learned facts</h3>
+	<div class="knowledge-scroll" data-testid="knowledge-facts" role="region" aria-labelledby={`knowledge-facts-heading-${uid}`}>
 		{#if factsState === 'loading'}
 			<p class="knowledge-note">Loading facts…</p>
 		{:else if factsState === 'empty'}
@@ -403,8 +418,8 @@
 		{/if}
 	</div>
 
-	<h3 id="knowledge-history-heading" class="knowledge-heading">Fact history</h3>
-	<div class="knowledge-scroll" data-testid="knowledge-history" role="region" aria-labelledby="knowledge-history-heading">
+	<h3 id={`knowledge-history-heading-${uid}`} class="knowledge-heading">Fact history</h3>
+	<div class="knowledge-scroll" data-testid="knowledge-history" role="region" aria-labelledby={`knowledge-history-heading-${uid}`}>
 		{#if historyState === 'loading'}
 			<p class="knowledge-note">Loading history…</p>
 		{:else if historyState === 'empty'}
@@ -434,8 +449,8 @@
 		{/if}
 	</div>
 
-	<h3 id="knowledge-operations-heading" class="knowledge-heading">Preservation operations</h3>
-	<div class="knowledge-scroll" data-testid="knowledge-operations" role="region" aria-labelledby="knowledge-operations-heading">
+	<h3 id={`knowledge-operations-heading-${uid}`} class="knowledge-heading">Preservation operations</h3>
+	<div class="knowledge-scroll" data-testid="knowledge-operations" role="region" aria-labelledby={`knowledge-operations-heading-${uid}`}>
 		{#if operationsState === 'loading'}
 			<p class="knowledge-note">Loading operations…</p>
 		{:else if operationsState === 'empty'}

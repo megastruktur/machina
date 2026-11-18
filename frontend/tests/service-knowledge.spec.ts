@@ -30,7 +30,7 @@ declare global {
 		}>;
 		__maiReleaseFirst(): number;
 		__maiReleaseAll(): number;
-		__maiSvkMount(scopeApplicationId: string): unknown;
+		__maiSvkSetApplicationId(applicationId: string): unknown;
 		__stale: Array<{
 			scope: string;
 			op: string;
@@ -40,6 +40,7 @@ declare global {
 	}
 }
 const VIRTUAL_ID = 'virtual:service-knowledge-fixture';
+const HOLDER_ID = 'virtual:service-knowledge-holder.svelte';
 const FIXTURE_URL = '/__mai_service_knowledge_fixture/';
 
 const SERVER_A = '5d5349b2-6a1d-4f0e-9c3a-1b2c3d4e5f60';
@@ -51,10 +52,37 @@ const VIEWPORT = { width: 360, height: 640 };
  * mock whose behavior the tests drive through window.__maiState / the
  * pending-response gate. Query parameters seed the initial behavior so
  * each test opens the fixture in its needed mode. */
+/** A one-instance holder: the component is mounted ONCE and its reactive
+ * applicationId prop is switched in place — the scope-epoch guard must
+ * discard stale in-flight reads WITHOUT any remount. */
+function holderSource(): string {
+	return `<script lang="ts">
+	import ServiceKnowledge from '$lib/components/ServiceKnowledge.svelte';
+
+	let {
+		serverId,
+		applicationId,
+		knowledge,
+		pageLimit,
+		reasonMaxLength,
+		register
+	} = $props();
+
+	register({
+		setApplicationId: (id) => {
+			applicationId = id;
+		}
+	});
+</script>
+
+<ServiceKnowledge {serverId} {applicationId} {knowledge} {pageLimit} {reasonMaxLength} />
+`;
+}
+
 function harnessEntry(): string {
 	return `
 	import { mount } from 'svelte';
-	import ServiceKnowledge from '$lib/components/ServiceKnowledge.svelte';
+	import Holder from '${HOLDER_ID}';
 
 	const query = new URLSearchParams(location.search);
 	const serverId = query.get('server') ?? '${SERVER_A}';
@@ -77,7 +105,10 @@ function harnessEntry(): string {
 		const offset = page?.offset ?? 0;
 		const total = state.empty ? 0 : 3;
 		const items = [];
-		for (let index = offset; index < Math.min(offset + limit, total); index += 1) {
+		// The producer's page window OVERLAPS by one record (offset-1): the
+		// client's dedupeById must genuinely drop a repeated fact_id when
+		// appending the next page.
+		for (let index = Math.max(0, offset - 1); index < Math.min(offset + limit, total); index += 1) {
 			items.push({
 				fact_id: 'f-' + scope + '-' + index,
 				category: 'deployment',
@@ -232,53 +263,58 @@ function harnessEntry(): string {
 		return window.__maiPending.length;
 	};
 
-	function mountFresh(scopeApplicationId) {
-		window.__maiCalls = [];
-		window.__maiPending = [];
-		// A remount must REPLACE the previous instance: Svelte's mount()
-		// appends to the target, and two live components would answer
-		// every testid query twice.
-		document.getElementById('app').replaceChildren();
-		return mount(ServiceKnowledge, {
-			target: document.getElementById('app'),
-			props: {
-				serverId,
-				applicationId: scopeApplicationId,
-				knowledge: state.noknowledge ? null : knowledge,
-				pageLimit: 2,
-				reasonMaxLength: 400
+	// ONE persistent instance for the whole page life: tests switch its
+	// reactive applicationId prop in place (no remount, no replaceChildren
+	// — two live components would answer every testid query twice).
+	window.__maiCalls = [];
+	window.__maiPending = [];
+	mount(Holder, {
+		target: document.getElementById('app'),
+		props: {
+			serverId,
+			applicationId,
+			knowledge: state.noknowledge ? null : knowledge,
+			pageLimit: 2,
+			reasonMaxLength: 400,
+			register: (api) => {
+				window.__maiSvkSetApplicationId = api.setApplicationId;
 			}
-		});
-	}
-
-	window.__maiSvkMount = mountFresh;
-	mountFresh(applicationId);
+		}
+	});
 	`;
 }
 
 let harnessJs = '';
 let harnessCss = '';
 
-function harnessPlugin(code: string): Plugin {
+function harnessPlugin(sources: Record<string, string>): Plugin {
 	return {
 		name: 'mai-service-knowledge-harness',
 		resolveId(id: string) {
-			if (id === VIRTUAL_ID) return `\0${VIRTUAL_ID}`;
+			if (id in sources) return `\0${id}`;
 			return undefined;
 		},
 		load(id: string) {
-			if (id === `\0${VIRTUAL_ID}`) return code;
+			const bare = id.startsWith('\0') ? id.slice(1) : id;
+			if (bare in sources) return sources[bare];
 			return undefined;
 		}
 	};
 }
 
 test.beforeAll(async () => {
+	// Fresh accumulation on every build (a retried beforeAll must not
+	// concatenate chunks from a previous attempt).
+	harnessJs = '';
+	harnessCss = '';
 	const result = await build({
 		configFile: false,
 		root: FRONTEND_ROOT,
 		logLevel: 'error',
-		plugins: [sveltePlugin({ inspector: false }), harnessPlugin(harnessEntry())],
+		plugins: [
+			sveltePlugin({ inspector: false }),
+			harnessPlugin({ [VIRTUAL_ID]: harnessEntry(), [HOLDER_ID]: holderSource() })
+		],
 		resolve: {
 			alias: {
 				// The component tree uses the SvelteKit `$lib` alias; the plain
@@ -390,18 +426,19 @@ test.describe('service-knowledge bounded notes (360x640, keyboard)', () => {
 		await expect(factRow).toContainText('ref-0');
 	});
 
-	test('scope epoch guard discards stale responses from a replaced application', async ({
+	test('scope epoch guard discards stale responses on a live application switch', async ({
 		page
 	}) => {
 		await openFixture(page, '?defer=1');
 		// The old scope's reads are parked on the deferred gate.
 
-		// Park the OLD scope's pending resolvers aside, then REPLACE the
-		// component with the new scope (fresh pending reads).
-		await page.evaluate(() => {
+		// Park the OLD scope's pending resolvers aside, then switch the
+		// holder's applicationId prop IN PLACE: the same live instance
+		// bumps its epoch and parks three fresh reads for the new scope.
+		await page.evaluate((app) => {
 			window.__stale = window.__maiPending.splice(0);
-			window.__maiSvkMount('0bbbbbbb-0000-4000-8000-000000000002');
-		});
+			window.__maiSvkSetApplicationId(app);
+		}, APP_TWO);
 		const parked = await page.evaluate(() => ({
 			staleCount: window.__stale.length,
 			pendingCount: window.__maiPending.length
@@ -409,8 +446,8 @@ test.describe('service-knowledge bounded notes (360x640, keyboard)', () => {
 		expect(parked.staleCount).toBe(3);
 		expect(parked.pendingCount).toBe(3);
 
-		// The STALE responses resolve into the DETACHED old component:
-		// they can never paint the new scope (epoch guard discards them).
+		// The STALE responses resolve into the LIVE component whose epoch
+		// has already moved on: the guard discards them before any paint.
 		await page.evaluate(() => {
 			for (const pending of window.__stale) {
 				if (pending.op === 'readKnowledge') {
@@ -466,12 +503,14 @@ test.describe('service-knowledge bounded notes (360x640, keyboard)', () => {
 		});
 		await expectReady(page);
 
-		// Error then explicit reload recovery on one section.
-		await page.evaluate(() => {
+		// Error then explicit reload recovery on one section: switching the
+		// application prop re-reads (the harness answers operations with
+		// the armed failure; facts and history stay healthy).
+		await page.evaluate((app) => {
 			window.__maiState.errorSection = 'operations';
 			window.__maiCalls = [];
-			window.__maiSvkMount('0aaaaaaa-0000-4000-8000-000000000001');
-		});
+			window.__maiSvkSetApplicationId(app);
+		}, APP_TWO);
 		await expect(page.getByTestId('knowledge-status')).toContainText(
 			'A knowledge read failed'
 		);
