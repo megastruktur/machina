@@ -36,6 +36,7 @@ is the reviewed producers', never re-implemented here.
 from __future__ import annotations
 
 import fcntl
+import gc
 import hashlib
 import json
 import os
@@ -637,6 +638,67 @@ def _registry_lock(lock_path: Path, ensure: Callable[[], None]) -> _ProcessFileL
             existing = _ProcessFileLock(Path(resolved), ensure)
             _FILE_LOCKS[resolved] = existing
         return existing
+
+
+def _discover_bound_coordinator(store: "ServiceMapStore") -> Any | None:
+    """Auto-discover an existing coordinator for ``store`` (ask_19 fix2).
+
+    Order: (a) an explicitly bound coordinator; (b) a garbage-collector
+    referrer scan for an ALREADY-COMPOSED coordinator whose ``_map_store``
+    IS this store (the ``worker.py``/``api.app.py`` composition pattern
+    constructs exactly one next to the store); (c) a coordinator built
+    from ``MAI_DATABASE_URL`` (NullPool engine, sync-driver DSN) for
+    out-of-app callers. Every discovery is cached via
+    ``store.bind_coordinator``. ``None`` = nothing discoverable: callers
+    apply their own fail-closed policy.
+    """
+    bound = store.metadata_coordinator
+    if bound is not None:
+        return bound
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+
+    for referrer in gc.get_referrers(store):
+        # The coordinator references the store as ``_map_store``; gc may
+        # surface the INSTANCE directly or its attribute ``__dict__``.
+        candidates: list[Any] = []
+        if isinstance(referrer, MetadataMutationCoordinator):
+            candidates.append(referrer)
+        elif isinstance(referrer, dict) and "_map_store" in referrer:
+            candidates.extend(
+                owner
+                for owner in gc.get_referrers(referrer)
+                if isinstance(owner, MetadataMutationCoordinator)
+            )
+        for owner in candidates:
+            if isinstance(getattr(owner, "_locks", None), _NoopLockService):
+                # A noop-locked coordinator adds no guard — never bind it
+                # as the discovered guard for this store.
+                continue
+            if getattr(owner, "_map_store", None) is store:
+                store.bind_coordinator(owner)
+                return owner
+    env_dsn = (os.environ.get("MAI_DATABASE_URL") or "").strip()
+    if not env_dsn:
+        return None
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.jobs.resource_locks import ResourceLockService
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(env_dsn, poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    pg_dsn = make_url(env_dsn).set(
+        drivername="postgresql"
+    ).render_as_string(hide_password=False)
+    candidate = MetadataMutationCoordinator(
+        locks=ResourceLockService(pg_dsn),
+        map_store=store,
+        learning=LearningOperationStore(sessions),
+        sessions=sessions,
+    )
+    store.bind_coordinator(candidate)
+    return candidate
 
 
 class _NoopLockService:
@@ -1503,7 +1565,7 @@ class ServiceMapUpsertCapability:
         check_suppression: bool = True,
         explicit_operator_write: bool = False,
         application_lease: Any = None,
-        allow_unguarded: bool = False,
+        allow_unguarded: bool | None = None,
     ) -> None:
         if not isinstance(store, ServiceMapStore):
             raise ServiceMapError(
@@ -1520,6 +1582,7 @@ class ServiceMapUpsertCapability:
         )
 
         effective_suppression = check_suppression
+        using_noop_fallback = False
         resolved: MetadataMutationCoordinator | Any = None
         if coordinator is not None:
             if not isinstance(coordinator, MetadataMutationCoordinator):
@@ -1585,10 +1648,11 @@ class ServiceMapUpsertCapability:
                 adoption=adoption,
                 sessions=session_factory,
             )
-        elif allow_unguarded:
-            # Explicit pure-filesystem unit wiring: the store's own
-            # slice-15 lock still serializes the leaf write; the C4
-            # Postgres lease set and the tombstone guard are OFF.
+        elif allow_unguarded is not False:
+            # Auto (None) or explicit True: pure-filesystem fallback. A
+            # noop-fallback capability re-checks for a discovered real
+            # coordinator at CALL time, so composition wiring that lands
+            # after construction always wins.
             resolved = MetadataMutationCoordinator(
                 locks=_NoopLockService(),
                 map_store=store,
@@ -1596,12 +1660,15 @@ class ServiceMapUpsertCapability:
                 adoption=adoption,
                 sessions=None,
             )
-            effective_suppression = False
-        # else: resolved stays None — every call FAILS CLOSED
-        # ("unavailable") until a coordinator is bound on the store
-        # (bind_coordinator) or proper wiring is passed.
+            using_noop_fallback = True
+            if allow_unguarded is True:
+                effective_suppression = False
+        # else (explicit allow_unguarded=False): resolved stays None —
+        # every call FAILS CLOSED ("unavailable") unless discovery finds
+        # a coordinator at call time.
         self._coordinator: MetadataMutationCoordinator | Any = resolved
         self._check_suppression = effective_suppression
+        self._using_noop_fallback = using_noop_fallback
 
     def __repr__(self) -> str:
         return f"<ServiceMapUpsertCapability root={self._store.root!s}>"
@@ -1655,13 +1722,17 @@ class ServiceMapUpsertCapability:
             raise ServiceMapError(
                 ServiceMapErrorCode.INVALID_REQUEST, "name is required"
             )
-        # Fail-closed default (AC 1): with no coordinator wired at
-        # construction, honor a LATER store.bind_coordinator(...) — and
-        # refuse with ``unavailable`` when neither exists. Invalid
+        # Resolve the coordinator: a noop-fallback capability re-checks
+        # for a DISCOVERED real coordinator at call time (composition
+        # wiring that landed after construction always wins), an absent
+        # coordinator discovers/binds one, and only when discovery finds
+        # nothing does the explicit fail-closed refusal apply. Invalid
         # payloads above still raise ServiceMapError pre-effect.
         coordinator = self._coordinator
-        if coordinator is None:
-            coordinator = self._store.metadata_coordinator
+        if coordinator is None or self._using_noop_fallback:
+            coordinator = (
+                _discover_bound_coordinator(self._store) or coordinator
+            )
         if coordinator is None:
             return ExecutorResult(
                 ok=False,

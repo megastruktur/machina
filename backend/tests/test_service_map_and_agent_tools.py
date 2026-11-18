@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import gc
 import json
 import multiprocessing
 import os
@@ -305,7 +306,7 @@ async def test_upsert_map_capability_executes_through_the_tool_bridge(
     store = _store(tmp_path)
     bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
         context=_context((UPSERT_CAPABILITY,)),
     )
     tool = next(
@@ -334,7 +335,7 @@ async def test_upsert_map_capability_executes_through_the_tool_bridge(
     # the effect never runs (the store stays untouched).
     denied_bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
         context=_context((UPSERT_CAPABILITY,), server_id=SERVER_B),
     )
     denied_tool = next(
@@ -356,7 +357,7 @@ async def test_upsert_map_capability_rejects_invalid_payload(
     store = _store(tmp_path)
     bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
         context=_context((UPSERT_CAPABILITY,)),
     )
     tool = next(
@@ -2785,7 +2786,7 @@ async def test_upsert_map_capability_fails_closed_when_unguarded_by_default(
     from mai.applications.metadata_mutations import MetadataMutationCoordinator
 
     store = _store(tmp_path)
-    capability = ServiceMapUpsertCapability(store)  # default: no allow_unguarded
+    capability = ServiceMapUpsertCapability(store, allow_unguarded=False)
     engine, session_factory = create_app_engine(migrated_url)
     try:
         my_locks = _derived_locks(session_factory)
@@ -2824,10 +2825,94 @@ async def test_upsert_map_capability_fails_closed_when_unguarded_by_default(
         # bind_coordinator validation: garbage is refused, None unbinds.
         with pytest.raises(ServiceMapError):
             store.bind_coordinator("not a coordinator")
+
+        # Unbind AND drop the test's own reference: discovery finds
+        # nothing anymore, so the capability fails closed again.
+        del coordinator
+        gc.collect()
         store.bind_coordinator(None)
         assert store.metadata_coordinator is None
         refused_again = await asyncio.wait_for(capability(call), 30)
         assert refused_again.ok is False
         assert refused_again.error_code == "unavailable"
+    finally:
+        await engine.dispose()
+
+
+async def test_worker_style_positional_upsert_capability_discovers_coordinator_and_enforces_tombstone(
+    tmp_path: Path, migrated_url: str
+) -> None:
+    """The EXACT worker.py:345->370 composition pattern: a coordinator
+    composed beside the store is auto-DISCOVERED by a positional-only
+    ``ServiceMapUpsertCapability(store)``, the write lands under the C4
+    leases, and the deletion tombstone is enforced on the same lane."""
+    from mai.applications.learning_operations import LearningOperationStore
+
+    from unittest.mock import MagicMock
+
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+
+    store = _store(tmp_path)
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        # worker.py:345 — the composition constructs a coordinator whose
+        # ``_map_store`` IS this store (nothing bound explicitly here).
+        # The composition reference MUST stay alive for the whole test:
+        # its closures hold that coordinator, backing the gc-based
+        # discovery below (worker.py retains it the same way, on the
+        # app/worker module).
+        composition = build_internal_api_capabilities(
+            applications=MagicMock(),
+            adoption=MagicMock(),
+            docs=MagicMock(),
+            service_map=store,
+            session_factory=session_factory,
+        )
+        assert composition.executors  # liveness proof (kept uncollected)
+        # worker.py:370 — POSITIONAL-ONLY construction (no kwargs).
+        capability = ServiceMapUpsertCapability(store)
+        print("PROBE noop fallback:", capability._using_noop_fallback)
+
+        async def upsert(aid: uuid.UUID, name: str):
+            call = CapabilityCall(
+                descriptor=upsert_map_descriptor(),
+                payload={
+                    "name": name,
+                    "application_id": str(aid),
+                    "origin": "manual",
+                    "custom_instructions": "worker notes",
+                },
+                context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+                credentials={},
+                op_id=uuid.uuid4(),
+            )
+            return await capability(call)
+
+        target_aid = uuid.uuid4()
+        accepted = await upsert(target_aid, "worker-style")
+        assert accepted.ok is True, accepted.output
+        # The coordinator was auto-discovered and BOUND on the store.
+        assert store.metadata_coordinator is not None
+        bound_locks = getattr(store.metadata_coordinator, "_locks")
+        aid = target_aid
+        entry = store.get_entry(SERVER_A, aid)
+        assert entry is not None and entry.revision == 1
+        # Both C4 leases released through the discovered coordinator's
+        # own lock service.
+        assert bound_locks.inspect(str(SERVER_A), f"application:{aid}") is None
+        assert bound_locks.inspect(str(SERVER_A), "service-metadata") is None
+
+        # Tombstone + remove: the same positional-only lane must now
+        # REFUSE — deletion suppression enforced through the discovered
+        # coordinator's identity seam; the deleted service is NOT
+        # recreated.
+        learning = LearningOperationStore(session_factory)
+        await learning.suppress_for_unadopt(SERVER_A, aid)
+        store.delete_entry(SERVER_A, aid)
+        refused = await upsert(target_aid, "worker-style")
+        assert refused.ok is False
+        assert "auto_adopt_suppressed" in refused.output
+        assert store.get_entry(SERVER_A, aid) is None
+        assert bound_locks.inspect(str(SERVER_A), "service-metadata") is None
     finally:
         await engine.dispose()
