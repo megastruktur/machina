@@ -1970,17 +1970,6 @@ async def revoke_application(
             except AdoptionError as error:
                 return _adoption_error(request, error)
             return Response(status_code=HTTP_204_NO_CONTENT)
-            await learning_store.suppress_for_unadopt(server_id, application_id)
-            try:
-                await adoption.revoke(
-                    store,
-                    server_id,
-                    application_id,
-                    expected_revision=payload.expected_revision,
-                )
-            except AdoptionError as error:
-                return _adoption_error(request, error)
-            return Response(status_code=HTTP_204_NO_CONTENT)
         manual_entry = map_store.get_entry(server_id, application_id)
         if manual_entry is not None and manual_entry.origin == "manual":
             if manual_entry.revision != payload.expected_revision:
