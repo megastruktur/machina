@@ -220,19 +220,19 @@ export interface ApplicationsApi {
 	readKnowledge?(
 		serverId: string,
 		applicationId: string,
-		page?: PageQuery
+		page?: KnowledgePageQuery
 	): Promise<KnowledgeRead>;
 	readFactHistory?(
 		serverId: string,
 		applicationId: string,
 		factId?: string,
-		page?: PageQuery
+		page?: KnowledgePageQuery
 	): Promise<FactRevisionPage>;
 	readKnowledgeOperations?(
 		serverId: string,
 		applicationId: string,
 		status?: KnowledgeOperationStatus,
-		page?: PageQuery
+		page?: KnowledgePageQuery
 	): Promise<OperationPage>;
 	/**
 	 * Operator retraction by exact compare-and-set (session + allowed-
@@ -255,47 +255,28 @@ export interface ApplicationsApi {
 	): Promise<OperationReceipt>;
 }
 
+/** Knowledge collection paging: ONLY limit/offset (C1 — the knowledge
+ * routes carry no search facets; PageQuery's runs-specific fields do not
+ * apply). */
+export type KnowledgePageQuery = Pick<PageQuery, 'limit' | 'offset'>;
+
 /**
- * The OPTIONAL knowledge capability group (D7): typed method surface
- * over the ask_26 scoped routes, consumed through the SAME seam as the
- * adoption reads. Panel code MUST treat the whole group as optional —
+ * The OPTIONAL knowledge capability group (D7): typed method surface over
+ * the ask_26 scoped routes, DERIVED from the ApplicationsApi declarations
+ * above (Required<Pick<…>>) — the five signatures are declared once and
+ * never duplicated. Panel code MUST treat the whole group as optional —
  * an absent group fails closed honestly (no fake reads/writes).
  */
-export interface KnowledgeApi {
-	/** GET …/knowledge — the bounded current knowledge read (paginated). */
-	readKnowledge(
-		serverId: string,
-		applicationId: string,
-		page?: PageQuery
-	): Promise<KnowledgeRead>;
-	/** GET …/knowledge/history — paginated fact revision history. */
-	readFactHistory(
-		serverId: string,
-		applicationId: string,
-		factId?: string,
-		page?: PageQuery
-	): Promise<FactRevisionPage>;
-	/** GET …/knowledge/operations — paginated preservation receipts. */
-	readKnowledgeOperations(
-		serverId: string,
-		applicationId: string,
-		status?: KnowledgeOperationStatus,
-		page?: PageQuery
-	): Promise<OperationPage>;
-	/** POST …/knowledge/facts/{fact_id}/retract — operator CAS retraction. */
-	retractKnowledgeFact(
-		serverId: string,
-		applicationId: string,
-		factId: string,
-		payload: RetractBody
-	): Promise<RetractionResult>;
-	/** POST …/knowledge/operations/{operation_id}/retry — authorized retry. */
-	retryKnowledgeOperation(
-		serverId: string,
-		applicationId: string,
-		operationId: string
-	): Promise<OperationReceipt>;
-}
+export type KnowledgeApi = Required<
+	Pick<
+		ApplicationsApi,
+		| 'readKnowledge'
+		| 'readFactHistory'
+		| 'readKnowledgeOperations'
+		| 'retractKnowledgeFact'
+		| 'retryKnowledgeOperation'
+	>
+>;
 
 /** Typed services bag the applications panel requires from its opener. */
 export interface ApplicationsServices {
@@ -356,5 +337,14 @@ export function applicationsServices(
 	docs: ApplicationsDocs | null = null,
 	knowledge: KnowledgeApi | null = null
 ): ApplicationsServices {
-	return Object.freeze({ api, lifecycle, docs, knowledge });
+	return Object.freeze({
+		api,
+		lifecycle,
+		docs,
+		// OCR 7e43fa93 (HIGH): legacy 3-arg bags keep their EXACT
+		// {api, lifecycle, docs} shape — the knowledge property is
+		// omitted entirely (never present-but-null) when no group is
+		// composed.
+		...(knowledge ? { knowledge } : {})
+	});
 }

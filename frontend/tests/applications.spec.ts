@@ -64,12 +64,16 @@ interface AppsWindowApi {
 	calls: Array<{ op: string; payload?: unknown; args?: unknown[] }>;
 	knowledgeLegacy: { readKnowledge?: unknown } | undefined;
 	knowledgeFull: unknown;
-	knowledgeGroup: unknown;
+	knowledgeGroup: import('../src/lib/workspace/entries/08-web-apps.js').KnowledgeApi;
 	knowledgeCalls: Array<{
 		op: string;
 		serverId: string;
 		applicationId: string;
 		page?: { limit?: number; offset?: number } | undefined;
+		factId?: string | undefined;
+		status?: string | undefined;
+		payload?: { expected_revision: number; expected_generation: number; reason?: string } | undefined;
+		operationId?: string | undefined;
 	}>;
 	knowledgeRead(
 		serverId: string,
@@ -631,15 +635,15 @@ const APP_SOURCE = `
 			});
 		},
 		readFactHistory(serverId, applicationId, factId, page) {
-			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, page });
+			knowledgeCalls.push({ op: 'readFactHistory', serverId, applicationId, factId, page });
 			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
 		},
 		readKnowledgeOperations(serverId, applicationId, status, page) {
-			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, page });
+			knowledgeCalls.push({ op: 'readKnowledgeOperations', serverId, applicationId, status, page });
 			return Promise.resolve({ items: [], limit: page?.limit ?? 0, offset: page?.offset ?? 0, total: 0, has_more: false });
 		},
 		retractKnowledgeFact(serverId, applicationId, factId, payload) {
-			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, payload });
+			knowledgeCalls.push({ op: 'retractKnowledgeFact', serverId, applicationId, factId, payload });
 			return Promise.resolve({ server_id: serverId, application_id: applicationId, fact_id: factId, new_revision: 2 });
 		},
 		retryKnowledgeOperation(serverId, applicationId, operationId) {
@@ -2199,8 +2203,6 @@ test('map-details editing re-adopts with the observed revision and a stale revis
 });
 
 test('the optional knowledge capability group fails closed for legacy bags and propagates the page query', async ({ page }) => {
-	await page.goto('/');
-
 	const state = await page.evaluate(([server, application]) => {
 		const api = window.__maiAppsApi;
 		if (!api) throw new Error('harness window API missing');
@@ -2214,15 +2216,12 @@ test('the optional knowledge capability group fails closed for legacy bags and p
 		// chaining answers undefined (the panel's honest fail-closed read).
 		const invokedThroughLegacy = api.knowledgeLegacy?.readKnowledge ?? 'unavailable';
 
-		return Promise.all([
-			Promise.resolve({
-				legacyAbsent,
-				fullIsInjected,
-				invokedThroughLegacy,
-				groupType: typeof api.knowledgeFull
-			}),
-			api.knowledgeRead(server, application, { limit: 7, offset: 2 }).then(() => api.knowledgeCalls)
-		]).then(([inspection, calls]) => ({ ...inspection, calls }));
+		return {
+			legacyAbsent,
+			fullIsInjected,
+			invokedThroughLegacy,
+			groupType: typeof api.knowledgeFull
+		};
 	}, [SERVER_A, APP_ADOPTED]);
 
 	expect(state.legacyAbsent).toBe(true);
@@ -2231,9 +2230,45 @@ test('the optional knowledge capability group fails closed for legacy bags and p
 	expect(state.groupType).toBe('object');
 
 	// Page query propagated VERBATIM on the collection read.
-	expect(state.calls).toHaveLength(1);
-	expect(state.calls[0].op).toBe('readKnowledge');
-	expect(state.calls[0].serverId).toBe(SERVER_A);
-	expect(state.calls[0].applicationId).toBe(APP_ADOPTED);
-	expect(state.calls[0].page).toEqual({ limit: 7, offset: 2 });
+	// Exercise ALL FIVE methods through the injected group (OCR 7e43fa93):
+	// every call records its distinctive argument (factId/status/payload/
+	// operationId) and the page query propagates on the collection reads.
+	await page.evaluate(([server, application]) => {
+		const api = window.__maiAppsApi;
+		if (!api) throw new Error('harness window API missing');
+		const group = api.knowledgeGroup;
+		if (!group) throw new Error('knowledge group not composed');
+		return Promise.all([
+			group.readKnowledge(server, application, { limit: 7, offset: 2 }),
+			group.readFactHistory(server, application, 'fact-9', { limit: 4 }),
+			group.readKnowledgeOperations(server, application, 'queued'),
+			group.retractKnowledgeFact(server, application, 'fact-9', {
+				expected_revision: 3,
+				expected_generation: 1,
+				reason: 'operator CAS retraction'
+			}),
+			group.retryKnowledgeOperation(server, application, 'op-77')
+		]);
+	}, [SERVER_A, APP_ADOPTED]);
+
+	const calls = await page.evaluate(() => window.__maiAppsApi?.knowledgeCalls ?? []);
+	expect(calls).toHaveLength(5);
+	expect(calls[0].op).toBe('readKnowledge');
+	expect(calls[0].serverId).toBe(SERVER_A);
+	expect(calls[0].applicationId).toBe(APP_ADOPTED);
+	expect(calls[0].page).toEqual({ limit: 7, offset: 2 });
+	expect(calls[1].op).toBe('readFactHistory');
+	expect(calls[1].factId).toBe('fact-9');
+	expect(calls[1].page).toEqual({ limit: 4 });
+	expect(calls[2].op).toBe('readKnowledgeOperations');
+	expect(calls[2].status).toBe('queued');
+	expect(calls[3].op).toBe('retractKnowledgeFact');
+	expect(calls[3].factId).toBe('fact-9');
+	expect(calls[3].payload).toEqual({
+		expected_revision: 3,
+		expected_generation: 1,
+		reason: 'operator CAS retraction'
+	});
+	expect(calls[4].op).toBe('retryKnowledgeOperation');
+	expect(calls[4].operationId).toBe('op-77');
 });
