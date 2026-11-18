@@ -1552,9 +1552,12 @@ class TestBuiltinOnepassword:
         _registry, _runtime, dispatcher = self._compose(
             tmp_path, monkeypatch, bin_dir=bin_dir
         )
+        # "cli-operator" is the explicit trusted non-agent principal
+        # (fail-closed classification): it keeps the full operator
+        # export contract for arbitrary non-protected reference names.
         outcome: DispatchOutcome = _run(
             dispatcher.dispatch(
-                context=self._context(),
+                context=self._context(principal="cli-operator"),
                 capability_id="secret.get",
                 payload={
                     "vault": OP_VAULT,
@@ -1816,6 +1819,63 @@ class TestBuiltinOnepassword:
             good_ref: _op_fixtures.SENTINEL,
             server_shared: _op_fixtures.SENTINEL,
         }
+
+        # Fail-closed classification: a realistic production agent
+        # session principal is a 64-char lowercase SHA-256 hex digest
+        # (hash_token(token) in api/agent_sessions.py). It is
+        # agent-scoped: unscoped names are refused, the reserved
+        # namespace works, and no-overwrite collisions hold.
+        hex_principal = "a1b2c3d4" * 8
+        assert len(hex_principal) == 64
+        hex_ref = f"MAI_AGENT_{server8}_{run8}_HEX_PASS"
+        for unscoped in ("EXPORTED_TOKEN", "OPERATOR_DB_PASS"):
+            outcome: DispatchOutcome = _run(
+                dispatcher.dispatch(
+                    context=self._context(principal=hex_principal),
+                    capability_id="secret.get",
+                    payload={
+                        "vault": OP_VAULT,
+                        "item": "test-item",
+                        "field": "api-key",
+                        "export_credential_ref": unscoped,
+                    },
+                )
+            )
+            assert outcome.executor_ok is False, unscoped
+            assert outcome.output is not None
+            assert "credential_ref_scope_mismatch" in outcome.output.text
+            assert _op_fixtures.SENTINEL not in outcome.output.text
+        hex_outcome: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal=hex_principal),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": hex_ref,
+                },
+            )
+        )
+        assert hex_outcome.executor_ok is True
+        assert parse_env_text(credentials_path.read_text(encoding="utf-8"))[
+            hex_ref
+        ] == _op_fixtures.SENTINEL
+        hex_collision: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal=hex_principal),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": hex_ref,
+                },
+            )
+        )
+        assert hex_collision.executor_ok is False
+        assert hex_collision.output is not None
+        assert "credential_ref_collision" in hex_collision.output.text
 
         # Store-side refusals (scope, protected bootstrap ref, collision)
         # happen BEFORE `op item create`.

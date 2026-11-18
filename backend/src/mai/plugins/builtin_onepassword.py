@@ -228,10 +228,14 @@ SECRET_GET_CAPABILITY: Final[dict[str, object]] = _descriptor(
         "secret.* capabilities are the EXCLUSIVE credential route: all "
         "credential operations must route through them — never the op "
         "CLI, provider HTTP APIs, environment variable dumps, or "
-        ".env/credential-file searches. Agent callers may export only "
-        "into their reserved MAI_AGENT_<SERVER8>[_<RUN8>]_ namespace; "
-        "bootstrap, SSH, model-provider and plugin operator refs are "
-        "protected and can never be overwritten."
+        ".env/credential-file searches. Caller classification is "
+        "fail-closed: agent session principals (including 64-hex "
+        "hash_token digests) may export only into their reserved "
+        "MAI_AGENT_<SERVER8>[_<RUN8>]_ namespace; bootstrap, SSH, "
+        "model-provider and plugin operator refs are protected and can "
+        "never be overwritten. Only explicit trusted non-agent "
+        "principals (e.g. `cli-operator`) may export arbitrary "
+        "non-protected operator reference names."
     ),
     {
         "vault": _VAULT_PROPERTY,
@@ -270,10 +274,14 @@ SECRET_STORE_CAPABILITY: Final[dict[str, object]] = _descriptor(
         "are the EXCLUSIVE credential route: all credential operations "
         "must route through them — never the op CLI, provider HTTP "
         "APIs, environment variable dumps, or .env/credential-file "
-        "searches. Agent callers may export only into their reserved "
+        "searches. Caller classification is "
+        "fail-closed: agent session principals (including 64-hex "
+        "hash_token digests) may export only into their reserved "
         "MAI_AGENT_<SERVER8>[_<RUN8>]_ namespace; bootstrap, SSH, "
         "model-provider and plugin operator refs are protected and can "
-        "never be overwritten."
+        "never be overwritten. Only explicit trusted non-agent "
+        "principals (e.g. `cli-operator`) may export arbitrary "
+        "non-protected operator reference names."
     ),
     {
         "vault": _VAULT_PROPERTY,
@@ -519,15 +527,32 @@ _AGENT_SERVER_RE: Final[re.Pattern[str]] = re.compile(
 _EXPORT_LOCK_SUFFIX: Final[str] = ".lock"
 
 
-def _is_agent_caller(context: object) -> bool:
-    """Whether the dispatch context is an AGENT run (D6/C6).
+#: Explicit trusted non-agent principals (fail-closed allowlist). Every
+#: other caller — including the 64-char lowercase SHA-256 hex digests
+#: that production agent sessions carry (``principal=hash_token(token)``
+#: in ``api/agent_sessions.py`` / ``api/applications.py`` /
+#: ``agents/session_delegate.py``) — is classified as an agent run and
+#: confined to the reserved ``MAI_AGENT_`` namespace.
+_TRUSTED_NON_AGENT_PRINCIPALS: Final[frozenset[str]] = frozenset(
+    {"cli-operator"}
+)
 
-    Trusted non-agent callers (operator tools, bootstrap provisioning)
-    keep the full ``export_credential_ref`` compatibility contract; agent
-    runs are confined to their reserved server/run-owned namespace.
+
+def _is_agent_caller(context: object) -> bool:
+    """FAIL-CLOSED caller classification (D6/C6).
+
+    ``True`` (agent-scoped: confined to the reserved
+    ``MAI_AGENT_<SERVER8>[_<RUN8>]_`` namespace with no-overwrite
+    collision protection) for every caller EXCEPT those whose principal
+    is explicitly listed in ``_TRUSTED_NON_AGENT_PRINCIPALS`` (e.g.
+    ``"cli-operator"``). Production agent sessions carry 64-char
+    lowercase SHA-256 hex principals (``hash_token(token)``) and empty
+    or missing principals — all default to agent-scoped. Only the
+    explicit trusted non-agent principals may export arbitrary
+    non-protected operator reference names.
     """
-    principal = str(getattr(context, "principal", "") or "").lower()
-    return principal.startswith(("agent", "session"))
+    principal = str(getattr(context, "principal", "") or "").strip()
+    return principal not in _TRUSTED_NON_AGENT_PRINCIPALS
 
 
 def _extract_yaml_credential_refs(node: object, out: set[str]) -> None:
