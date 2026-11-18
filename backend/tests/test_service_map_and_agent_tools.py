@@ -2011,3 +2011,185 @@ def test_server_lock_acquire_failure_rolls_back_depth_and_rlock(
     healthy = ServiceMapStore(tmp_path / "healthy_map")
     with healthy.server_lock(SERVER_A):
         assert healthy.upsert_entry(SERVER_A, name="after", category="system")
+
+
+# ---------------------------------------------------------------------------
+# ask_17-agent-writer-retrofit: the internal writer executors route their
+# mutation sections through the slice-16 coordinator guard (C4 lease set +
+# tombstone-before-removal) when the lease service is wired into the
+# composition; without it the legacy path stays byte-identical.
+# ---------------------------------------------------------------------------
+
+
+async def test_internal_api_writer_guard_tombstones_before_removal(
+    live_app: FastAPI,
+    bootstrapped_url: str,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+) -> None:
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.jobs.resource_locks import ResourceLockService
+
+    del jar
+    coordinator_locks = ResourceLockService(bootstrapped_url)
+    coordinator_locks.ensure_schema()
+    composition = build_internal_api_capabilities(
+        applications=live_app.state.applications,
+        adoption=live_app.state.app_adoption,
+        docs=live_app.state.app_docs,
+        service_map=live_app.state.service_map,
+        session_factory=live_app.state.session_factory,
+        locks=coordinator_locks,
+    )
+    desc_by_id = {
+        descriptor.identifier: descriptor for descriptor in composition.descriptors
+    }
+    recipe_locks = ResourceLockService(bootstrapped_url, boot_id=str(uuid.uuid4()))
+    recipe_locks.ensure_schema()
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    ctx = _context(("app.adopt", "app.unadopt"), server_id=server_a)
+    tag = uuid.uuid4().hex[:8]
+    aid = uuid.uuid5(server_a, f"service-map:guard-{tag}")
+    app_key = f"application:{aid}"
+
+    adopted = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"guard-{tag}",
+                "origin": "compose",
+                "compose_project": f"grd-{tag}",
+                "working_dir": f"/srv/grd-{tag}",
+                "custom_instructions": "guard notes",
+            },
+            ctx,
+        )
+    )
+    assert adopted.ok is True, adopted.output
+    assert json.loads(adopted.output)["revision"] == 1
+    # Both coordinator-owned leases are released after the adoption.
+    assert coordinator_locks.inspect(str(server_a), app_key) is None
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+    # Contention: another boot holding the metadata lease refuses the
+    # unadopt BEFORE any effect (no fence bypass, no tombstone written).
+    holder = recipe_locks.acquire(str(server_a), "service-metadata", owner_ref="other")
+    held = await composition.executors["app.unadopt"](
+        _call("app.unadopt", {"application_id": str(aid)}, ctx)
+    )
+    assert held.ok is False
+    assert json.loads(held.output)["code"] == "lease_conflict"
+    assert live_app.state.service_map.get_entry(server_a, aid) is not None
+    record = await live_app.state.app_adoption.read(server_a, aid)
+    assert record is not None
+    with psycopg.connect(bootstrapped_url) as conn:
+        absent = conn.execute(
+            "SELECT COUNT(*) FROM service_knowledge_identity WHERE "
+            "server_id = %s AND application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert absent is not None and absent[0] == 0
+    recipe_locks.release(holder)
+
+    # Healthy unadopt: the tombstone is persisted BEFORE the revoke and
+    # the map deletion; the response contract is unchanged.
+    removed = await composition.executors["app.unadopt"](
+        _call("app.unadopt", {"application_id": str(aid)}, ctx)
+    )
+    assert removed.ok is True, removed.output
+    payload_doc = json.loads(removed.output)
+    assert payload_doc["outcome"] == "applied"
+    assert live_app.state.service_map.get_entry(server_a, aid) is None
+    record = await live_app.state.app_adoption.read(server_a, aid)
+    assert record is None
+    with psycopg.connect(bootstrapped_url) as conn:
+        tombstone = conn.execute(
+            "SELECT auto_adopt_suppressed, generation FROM "
+            "service_knowledge_identity WHERE server_id = %s AND "
+            "application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert tombstone is not None
+    assert tombstone[0] is True and tombstone[1] == 1
+    assert coordinator_locks.inspect(str(server_a), app_key) is None
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+
+async def test_internal_api_delete_map_entry_guard_releases_leases(
+    live_app: FastAPI,
+    bootstrapped_url: str,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+) -> None:
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.jobs.resource_locks import ResourceLockService
+
+    del jar
+    coordinator_locks = ResourceLockService(bootstrapped_url)
+    coordinator_locks.ensure_schema()
+    composition = build_internal_api_capabilities(
+        applications=live_app.state.applications,
+        adoption=live_app.state.app_adoption,
+        docs=live_app.state.app_docs,
+        service_map=live_app.state.service_map,
+        session_factory=live_app.state.session_factory,
+        locks=coordinator_locks,
+    )
+    desc_by_id = {
+        descriptor.identifier: descriptor for descriptor in composition.descriptors
+    }
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    ctx = _context(("app.adopt", "app.delete_map_entry"), server_id=server_a)
+    tag = uuid.uuid4().hex[:8]
+    manual = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"manual-{tag}",
+                "origin": "manual",
+                "custom_instructions": "manual notes",
+            },
+            ctx,
+        )
+    )
+    assert manual.ok is True, manual.output
+    aid = uuid.uuid5(server_a, f"service-map:manual-{tag}")
+
+    delete_exec = composition.executors["app.delete_map_entry"]
+    removed = await delete_exec(
+        _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
+    )
+    assert removed.ok is True, removed.output
+    assert json.loads(removed.output)["removed"] is True
+    assert coordinator_locks.inspect(str(server_a), f"application:{aid}") is None
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+    # The second delete keeps the not_found contract and still releases.
+    missing = await delete_exec(
+        _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
+    )
+    assert missing.ok is False
+    assert json.loads(missing.output)["code"] == "not_found"
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None

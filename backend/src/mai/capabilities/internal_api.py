@@ -62,12 +62,11 @@ from pydantic import BaseModel, Field, ValidationError
 
 from mai.applications.service_map import (
     CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
-    ServiceMapUpsertCapability,
     upsert_map_descriptor,
 )
+from mai.jobs.resource_locks import ResourceLockService
 from mai.capabilities.chat_read import (
     CAPABILITY_ID as CHAT_READ_CAPABILITY,
-    ChatReadSessionCapability,
     chat_read_descriptor,
 )
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
@@ -1538,6 +1537,7 @@ def build_internal_api_capabilities(
     data_root: Any | None = None,
     env_resolver: Callable[[], Any] | None = None,
     doc_indexer: "ScopeIndexer | None" = None,
+    locks: "ResourceLockService | None" = None,
 ) -> InternalApiComposition:
     """Build every ``app.*`` descriptor + executor over the composed state.
 
@@ -1549,7 +1549,6 @@ def build_internal_api_capabilities(
     from dataclasses import asdict
     from pathlib import Path
     from mai.api.applications import (
-        ApplicationDocService,
         AdoptionRequest,
         ApplicationOrigin,
         _render_manual_record,
@@ -1560,7 +1559,6 @@ def build_internal_api_capabilities(
     from mai.applications.service_map import (
         INSTRUCTION_KEYS,
         ServiceMapError,
-        ServiceMapStore,
         classify_service,
         entry_digest,
     )
@@ -1585,7 +1583,48 @@ def build_internal_api_capabilities(
     #: the paths host.file_read hard-denies.
     from mai.capabilities.host_file_read import _DENY_PATH_PREFIXES
 
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.metadata_mutations import (
+        MetadataMutationCoordinator,
+        MetadataMutationError,
+    )
+    from mai.jobs.resource_locks import ResourceLockError
+
     operations: list[tuple[InternalApiSpec, InternalApiOperation]] = []
+
+    # -- ask_17 agent-writer retrofit: the common mutation guard -------------
+
+    #: The shared service-metadata coordinator (slice 16). Wired ONLY when
+    #: the lease service AND the identity session factory are present; the
+    #: absent-dependency default keeps the legacy (unguarded) mutation path
+    #: byte-identical for every existing caller.
+    coordinator = None
+    learning_store = None
+    if locks is not None and service_map is not None and session_factory is not None:
+        learning_store = LearningOperationStore(session_factory)  # type: ignore[arg-type]
+        coordinator = MetadataMutationCoordinator(
+            locks=locks,
+            map_store=service_map,
+            learning=learning_store,  # type: ignore[arg-type]
+            adoption=adoption,
+            sessions=session_factory,  # type: ignore[arg-type]
+        )
+
+    def _release_leases(held: Sequence[Any]) -> None:
+        """Release coordinator-acquired leases in reverse order (a lease
+        that lapsed mid-operation was already fenced by the touch)."""
+        for lease in reversed(tuple(held)):
+            try:
+                locks.release(lease)
+            except ResourceLockError:
+                pass
+
+    def _lease_guard_error(error: MetadataMutationError) -> InternalApiError:
+        """Map the coordinator's guard refusal onto the structured
+        internal-API envelope (new stable code, additive to the contract)."""
+        return InternalApiError(
+            error.code.value, f"metadata mutation refused: {error.detail}"
+        )
 
     # -- app.discover --------------------------------------------------------
 
@@ -1969,26 +2008,145 @@ def build_internal_api_capabilities(
                 if val:
                     merged_instructions[key] = str(val)
 
-        if payload.get("upsert_categories"):
-            for category in payload["upsert_categories"]:
-                service_map.upsert_category(
-                    str(category["machine_id"]),
-                    label=str(category.get("label", category["machine_id"])),
-                    description=str(category.get("description", "")),
-                )
+        # ask_17 common guard: the whole read-modify-write effect section
+        # (category upserts, map write, canonical adoption, stale-entry
+        # cleanup) runs under the C4 lease set for this application. Reads
+        # above stay lock-free (atomic, read-only). Without the lease
+        # service the legacy path runs unchanged.
+        held_leases: Sequence[Any] = ()
+        if coordinator is not None:
+            try:
+                held_leases = coordinator.lease_set(server_id, [application_id])
+            except MetadataMutationError as error:
+                raise _lease_guard_error(error) from None
+        try:
+            if payload.get("upsert_categories"):
+                for category in payload["upsert_categories"]:
+                    service_map.upsert_category(
+                        str(category["machine_id"]),
+                        label=str(category.get("label", category["machine_id"])),
+                        description=str(category.get("description", "")),
+                    )
 
-        if origin_value == "manual":
-            # The chat/manual addition: persist directly in the Service Map +
-            # canonical identity doc (the UI's `_adopt_manual_entry` flow).
-            entry = service_map.upsert_entry(
-                server_id,
+            if origin_value == "manual":
+                # The chat/manual addition: persist directly in the Service Map +
+                # canonical identity doc (the UI's `_adopt_manual_entry` flow).
+                entry = service_map.upsert_entry(
+                    server_id,
+                    name=name,
+                    category=effective_category,
+                    origin="manual",
+                    application_id=application_id,
+                    compose_project=compose_project,
+                    working_dir=working_dir,
+                    unit_name=unit_name,
+                    description=effective_description,
+                    instructions=merged_instructions,
+                    custom_instructions=payload.get("custom_instructions"),
+                    installed=payload.get("installed"),
+                )
+                if (
+                    existing_entry is not None
+                    and existing_entry.application_id != str(application_id)
+                    and existing_entry.origin == "manual"
+                ):
+                    service_map.delete_entry(server_id, existing_entry.application_id)
+                doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
+                if data_root is not None:
+                    try:
+                        doc_store = DocumentStore(Path(data_root))
+                        doc_id = record_doc_id(server_id, application_id)
+                        expected_revision = 0
+                        try:
+                            current = doc_store.read(
+                                doc_id, server_id=server_id, app_id=application_id
+                            )
+                            expected_revision = current.revision
+                        except DocumentStoreError as error:
+                            if error.code is not DocumentStoreErrorCode.NOT_FOUND:
+                                raise
+                        document = doc_store.write(
+                            doc_id,
+                            _render_manual_record(entry),
+                            server_id=server_id,
+                            app_id=application_id,
+                            namespace=DocumentNamespace.DOCS,
+                            expected_revision=expected_revision,
+                            source_kind=SourceKind.GENERATED,
+                            origin=f"service-map:{entry.revision}",
+                            origin_revision=str(entry.revision),
+                            verification=VerificationStatus.UNVERIFIED,
+                        )
+                        doc_outcome = {
+                            "status": "documented",
+                            "doc_id": str(document.doc_id),
+                            "reason": None,
+                        }
+                    except Exception as exc:
+                        doc_outcome["reason"] = type(exc).__name__
+                return {
+                    "application_id": str(application_id),
+                    "server_id": str(server_id),
+                    "name": entry.name,
+                    "origin": entry.origin,
+                    "category": entry.category,
+                    "description": entry.description,
+                    "custom_instructions": entry.custom_instructions,
+                    "installed": entry.installed,
+                    "instructions": entry.instructions.to_json(),
+                    "outcome": "reconciled",
+                    "revision": entry.revision,
+                    "sha256": entry_digest(entry),
+                    "record_doc": doc_outcome,
+                }
+
+            try:
+                origin = ApplicationOrigin(origin_value)
+            except ValueError:
+                raise InternalApiError(
+                    "invalid_request",
+                    f"origin must be one of {[o.value for o in ApplicationOrigin]}",
+                ) from None
+            expected_rev = payload.get("expected_revision")
+            if expected_rev is None:
+                try:
+                    live_rec = await adoption.read(server_id, application_id)
+                except Exception:
+                    live_rec = None
+                expected_rev = 0 if live_rec is None else live_rec.revision
+            request = AdoptionRequest(
+                server_id=server_id,
+                application_id=application_id,  # type: ignore[arg-type]
                 name=name,
-                category=effective_category,
-                origin="manual",
-                application_id=application_id,
+                origin=origin,
                 compose_project=compose_project,
                 working_dir=working_dir,
                 unit_name=unit_name,
+                external_working_dir=payload.get("external_working_dir"),
+                external_config_files=tuple(payload.get("external_config_files", [])),
+                external_environment_files=tuple(
+                    payload.get("external_environment_files", [])
+                ),
+                expected_revision=int(expected_rev),
+            )
+            try:
+                result = await adoption.adopt(
+                    store=applications, request=request  # type: ignore[arg-type]
+                )
+            except Exception as exc:
+                raise InternalApiError(
+                    "adoption_failed",
+                    f"adoption refused: {type(exc).__name__}",
+                ) from None
+            entry = service_map.upsert_entry(
+                server_id,
+                application_id=result.application_id,
+                name=name,
+                origin=origin.value,
+                compose_project=compose_project,
+                working_dir=working_dir,
+                unit_name=unit_name,
+                category=effective_category,
                 description=effective_description,
                 instructions=merged_instructions,
                 custom_instructions=payload.get("custom_instructions"),
@@ -1996,45 +2154,28 @@ def build_internal_api_capabilities(
             )
             if (
                 existing_entry is not None
-                and existing_entry.application_id != str(application_id)
+                and existing_entry.application_id != str(result.application_id)
                 and existing_entry.origin == "manual"
             ):
                 service_map.delete_entry(server_id, existing_entry.application_id)
+            # Canonical identity document (honest pending on doc-service gaps).
+            record = await adoption.read(server_id, result.application_id)
             doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
-            if data_root is not None:
+            if docs is not None and record is not None:
                 try:
-                    doc_store = DocumentStore(Path(data_root))
-                    doc_id = record_doc_id(server_id, application_id)
-                    expected_revision = 0
-                    try:
-                        current = doc_store.read(
-                            doc_id, server_id=server_id, app_id=application_id
-                        )
-                        expected_revision = current.revision
-                    except DocumentStoreError as error:
-                        if error.code is not DocumentStoreErrorCode.NOT_FOUND:
-                            raise
-                    document = doc_store.write(
-                        doc_id,
-                        _render_manual_record(entry),
-                        server_id=server_id,
-                        app_id=application_id,
-                        namespace=DocumentNamespace.DOCS,
-                        expected_revision=expected_revision,
-                        source_kind=SourceKind.GENERATED,
-                        origin=f"service-map:{entry.revision}",
-                        origin_revision=str(entry.revision),
-                        verification=VerificationStatus.UNVERIFIED,
-                    )
-                    doc_outcome = {
-                        "status": "documented",
-                        "doc_id": str(document.doc_id),
-                        "reason": None,
-                    }
+                    outcome = await docs.record_adoption(record)
+                    if outcome.document is not None and outcome.documented:
+                        doc_outcome = {
+                            "status": "documented",
+                            "doc_id": str(outcome.document.doc_id),
+                            "reason": None,
+                        }
+                    else:
+                        doc_outcome["reason"] = outcome.reason or "not_documented"
                 except Exception as exc:
                     doc_outcome["reason"] = type(exc).__name__
             return {
-                "application_id": str(application_id),
+                "application_id": str(result.application_id),
                 "server_id": str(server_id),
                 "name": entry.name,
                 "origin": entry.origin,
@@ -2043,101 +2184,13 @@ def build_internal_api_capabilities(
                 "custom_instructions": entry.custom_instructions,
                 "installed": entry.installed,
                 "instructions": entry.instructions.to_json(),
-                "outcome": "reconciled",
-                "revision": entry.revision,
-                "sha256": entry_digest(entry),
+                "outcome": result.outcome,
+                "revision": result.revision,
+                "sha256": result.sha256,
                 "record_doc": doc_outcome,
             }
-
-        try:
-            origin = ApplicationOrigin(origin_value)
-        except ValueError:
-            raise InternalApiError(
-                "invalid_request",
-                f"origin must be one of {[o.value for o in ApplicationOrigin]}",
-            ) from None
-        expected_rev = payload.get("expected_revision")
-        if expected_rev is None:
-            try:
-                live_rec = await adoption.read(server_id, application_id)
-            except Exception:
-                live_rec = None
-            expected_rev = 0 if live_rec is None else live_rec.revision
-        request = AdoptionRequest(
-            server_id=server_id,
-            application_id=application_id,  # type: ignore[arg-type]
-            name=name,
-            origin=origin,
-            compose_project=compose_project,
-            working_dir=working_dir,
-            unit_name=unit_name,
-            external_working_dir=payload.get("external_working_dir"),
-            external_config_files=tuple(payload.get("external_config_files", [])),
-            external_environment_files=tuple(
-                payload.get("external_environment_files", [])
-            ),
-            expected_revision=int(expected_rev),
-        )
-        try:
-            result = await adoption.adopt(
-                store=applications, request=request  # type: ignore[arg-type]
-            )
-        except Exception as exc:
-            raise InternalApiError(
-                "adoption_failed",
-                f"adoption refused: {type(exc).__name__}",
-            ) from None
-        entry = service_map.upsert_entry(
-            server_id,
-            application_id=result.application_id,
-            name=name,
-            origin=origin.value,
-            compose_project=compose_project,
-            working_dir=working_dir,
-            unit_name=unit_name,
-            category=effective_category,
-            description=effective_description,
-            instructions=merged_instructions,
-            custom_instructions=payload.get("custom_instructions"),
-            installed=payload.get("installed"),
-        )
-        if (
-            existing_entry is not None
-            and existing_entry.application_id != str(result.application_id)
-            and existing_entry.origin == "manual"
-        ):
-            service_map.delete_entry(server_id, existing_entry.application_id)
-        # Canonical identity document (honest pending on doc-service gaps).
-        record = await adoption.read(server_id, result.application_id)
-        doc_outcome = {"status": "pending", "doc_id": None, "reason": None}
-        if docs is not None and record is not None:
-            try:
-                outcome = await docs.record_adoption(record)
-                if outcome.document is not None and outcome.documented:
-                    doc_outcome = {
-                        "status": "documented",
-                        "doc_id": str(outcome.document.doc_id),
-                        "reason": None,
-                    }
-                else:
-                    doc_outcome["reason"] = outcome.reason or "not_documented"
-            except Exception as exc:
-                doc_outcome["reason"] = type(exc).__name__
-        return {
-            "application_id": str(result.application_id),
-            "server_id": str(server_id),
-            "name": entry.name,
-            "origin": entry.origin,
-            "category": entry.category,
-            "description": entry.description,
-            "custom_instructions": entry.custom_instructions,
-            "installed": entry.installed,
-            "instructions": entry.instructions.to_json(),
-            "outcome": result.outcome,
-            "revision": result.revision,
-            "sha256": result.sha256,
-            "record_doc": doc_outcome,
-        }
+        finally:
+            _release_leases(held_leases)
 
     operations.append(_app_adopt)
 
@@ -2174,27 +2227,45 @@ def build_internal_api_capabilities(
             except Exception:
                 record = None
             expected_revision = 0 if record is None else record.revision
+        # ask_17 common guard: under the C4 lease set the auto-adopt
+        # TOMBSTONE is persisted and stale pending preservation is
+        # cancelled BEFORE the canonical revoke and the map deletion
+        # (suppression-before-removal, D4). Without the lease service the
+        # legacy path runs unchanged.
+        held_leases: Sequence[Any] = ()
+        if coordinator is not None:
+            try:
+                held_leases = coordinator.lease_set(server_id, [application_id])
+            except MetadataMutationError as error:
+                raise _lease_guard_error(error) from None
         try:
-            result = await adoption.revoke(
-                store=applications,  # type: ignore[arg-type]
-                server_id=server_id,
-                application_id=application_id,
-                expected_revision=int(expected_revision),
-            )
-        except Exception as exc:
-            raise InternalApiError(
-                "revoke_failed",
-                f"revoke refused: {type(exc).__name__}",
-            ) from None
-        # Remove the Service Map entry (the UI's unadopt flow).
-        service_map.delete_entry(server_id, application_id)
-        return {
-            "application_id": str(application_id),
-            "server_id": str(server_id),
-            "outcome": result.outcome,
-            "revision": result.revision,
-            "sha256": result.sha256,
-        }
+            if learning_store is not None:
+                await learning_store.suppress_for_unadopt(
+                    server_id, application_id
+                )
+            try:
+                result = await adoption.revoke(
+                    store=applications,  # type: ignore[arg-type]
+                    server_id=server_id,
+                    application_id=application_id,
+                    expected_revision=int(expected_revision),
+                )
+            except Exception as exc:
+                raise InternalApiError(
+                    "revoke_failed",
+                    f"revoke refused: {type(exc).__name__}",
+                ) from None
+            # Remove the Service Map entry (the UI's unadopt flow).
+            service_map.delete_entry(server_id, application_id)
+            return {
+                "application_id": str(application_id),
+                "server_id": str(server_id),
+                "outcome": result.outcome,
+                "revision": result.revision,
+                "sha256": result.sha256,
+            }
+        finally:
+            _release_leases(held_leases)
 
     operations.append(_app_unadopt)
 
@@ -2222,17 +2293,27 @@ def build_internal_api_capabilities(
             )
         server_id = _resolve_server_id(call, payload, APP_DELETE_MAP_ENTRY_CAPABILITY)
         application_id = uuid.UUID(str(payload["application_id"]))
-        removed = service_map.delete_entry(server_id, application_id)
-        if not removed:
-            raise InternalApiError(
-                "not_found",
-                f"no service map entry stored for {application_id}",
-            )
-        return {
-            "application_id": str(application_id),
-            "server_id": str(server_id),
-            "removed": True,
-        }
+        # ask_17 common guard: the deletion runs under the C4 lease set.
+        held_leases: Sequence[Any] = ()
+        if coordinator is not None:
+            try:
+                held_leases = coordinator.lease_set(server_id, [application_id])
+            except MetadataMutationError as error:
+                raise _lease_guard_error(error) from None
+        try:
+            removed = service_map.delete_entry(server_id, application_id)
+            if not removed:
+                raise InternalApiError(
+                    "not_found",
+                    f"no service map entry stored for {application_id}",
+                )
+            return {
+                "application_id": str(application_id),
+                "server_id": str(server_id),
+                "removed": True,
+            }
+        finally:
+            _release_leases(held_leases)
 
     operations.append(_app_delete_map_entry)
 
