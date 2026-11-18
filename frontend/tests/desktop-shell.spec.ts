@@ -1498,3 +1498,196 @@ test('CCC S3 wiring: strip drives the shell selection; history opens stored scop
 	);
 	expect(composerFocused).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// ask_33: the shell composes the OPTIONAL learned-notes (D7) group from the
+// REAL client's five knowledge methods; every knowledge request carries the
+// panel's explicit server/application identity — never a selected-server
+// fallback — and legacy surfaces stay untouched when the group is absent.
+// ---------------------------------------------------------------------------
+
+test('live applications: the composed knowledge group keeps every request explicitly scoped', async ({
+	page
+}) => {
+	const SERVER_BETA_ID = 'b7e4c2a0-3f6d-4e8b-9c1a-5d8f2e7b4c60';
+	const APP_ID = '3c3c3c3c-3333-4222-8333-444455556666';
+	const profileFor = (serverId: string, name: string) => ({
+		schema_version: 1,
+		server_id: serverId,
+		name,
+		prompt_revision: 1,
+		prompt_text: 'fixture',
+		environment: 'linux_ssh',
+		ssh: { host: `${name}.example`, port: 22, user: 'mai', host_key: 'k', credential_ref: 'MAI_SSH_KEY' },
+		privilege: 'sudo',
+		capabilities: ['memory.recall'],
+		revision: 1,
+		sha256: 'f'.repeat(64),
+		projection: { revision: 1, stale: false }
+	});
+
+	// Node-side request journals: the exact paths the real client produced.
+	const applicationListRequests: string[] = [];
+	const knowledgeRequests: string[] = [];
+
+	await page.context().addCookies([
+		{ name: 'mai_csrf', value: 'fixture-csrf', url: 'http://127.0.0.1:4173' }
+	]);
+	await page.route('**/api/v1/servers', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				servers: [profileFor(SERVER_ALPHA_ID, 'Server Alpha'), profileFor(SERVER_BETA_ID, 'Server Beta')]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/profiles', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				profiles: [{ schema_version: 1, name: 'glm53flash', connection: 'litellm', model: 'z-ai-coding/glm-5.3-flash' }]
+			})
+		})
+	);
+	await page.route('**/api/v1/models/selection', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ schema_version: 1, connection: 'litellm', profile: 'glm53flash' })
+		})
+	);
+	// ONE handler for the applications family: the adopted page AND the
+	// scoped knowledge reads live under /servers/{id}/applications/...
+	await page.route('**/api/v1/servers/*/applications**', (route) => {
+		const url = new URL(route.request().url());
+		const segments = url.pathname.split('/');
+		const serverId = decodeURIComponent(segments[4] ?? '');
+		const knowledgeIndex = segments.indexOf('knowledge');
+		if (knowledgeIndex !== -1) {
+			// D7 scoped knowledge read: the path identities are the ONLY
+			// target — journal them and answer one bounded page each.
+			knowledgeRequests.push(url.pathname + url.search);
+			const fact = {
+				fact_id: 'fact-live-1',
+				revision: 1,
+				statement: 'Live learned note: restarts drift the compose project name.',
+				status: 'active',
+				source: { source_kind: 'user_statement', source_ref: 'session-live/turn-1' }
+			};
+			if (segments[knowledgeIndex + 1] === 'history') {
+				return route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({
+						items: [{ ...fact, revision_id: 'rev-live-1' }],
+						limit: 10,
+						offset: 0,
+						total: 1,
+						has_more: false
+					})
+				});
+			}
+			if (segments[knowledgeIndex + 1] === 'operations') {
+				return route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({
+						items: [
+							{
+								operation_id: 'op-live-1',
+								status: 'queued',
+								workflow_id: 'service.learn:op-live-1',
+								accepted_at: '2026-11-18T00:00:00Z'
+							}
+						],
+						limit: 10,
+						offset: 0,
+						total: 1,
+						has_more: false
+					})
+				});
+			}
+			return route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					status: 'ok',
+					server_id: serverId,
+					application_id: segments[6],
+					generation: 1,
+					facts: { items: [fact], limit: 10, offset: 0, total: 1, has_more: false }
+				})
+			});
+		}
+		// The adopted page (the panel's inventory mount read) — the FULL
+		// canonical record shape the panel's identity block renders.
+		applicationListRequests.push(url.pathname + url.search);
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				server_id: serverId,
+				applications: [
+					{
+						application_id: APP_ID,
+						server_id: serverId,
+						name: 'nginx-proxy',
+						origin: 'manual',
+						compose_project: null,
+						working_dir: null,
+						unit_name: null,
+						external_working_dir: null,
+						external_config_files: [],
+						external_environment_files: [],
+						revision: 1,
+						schema_revision: 1,
+						sha256: 'a'.repeat(64),
+						adopted_at: '2026-11-18T00:00:00Z',
+						reconciled_at: '2026-11-18T00:00:00Z',
+						stale: false
+					}
+				],
+				limit: 50,
+				offset: 0,
+				total: 1
+			})
+		});
+	});
+
+	await page.goto('/');
+	await expect(page.getByTestId('server-tree-nav')).toBeVisible();
+
+	// Open the desktop Applications window for the SELECTED fixture server.
+	await page.getByTestId('open-applications').click();
+	const appsFrame = frame(page, 'applications');
+	await expect(appsFrame).toHaveCount(1);
+	const row = appsFrame.getByTestId('inventory-row');
+	await expect(row).toHaveCount(1);
+	await expect(row.getByTestId('inventory-row-name')).toHaveText('nginx-proxy');
+	await expect(row.getByTestId('inventory-row-server')).toHaveText(SERVER_ALPHA_ID);
+
+	// The panel's own bounded collection read (PAGE_LIMIT 50) carries the
+	// EXACT server identity — the composed bag changes nothing about scope
+	// discipline. (The draft @service picker's limit=10 read is the chat
+	// dock's own explicitly scoped draft, not the panel's.)
+	const panelReads = () =>
+		applicationListRequests.filter((path) => path.endsWith('limit=50'));
+	expect(panelReads(), `list requests: ${applicationListRequests.join(' | ')}`).toEqual([
+		`/api/v1/servers/${SERVER_ALPHA_ID}/applications?limit=50`
+	]);
+
+	// The panel's explicit Refresh re-read stays bound to the SAME pinned
+	// server identity (never the desktop's selected-server fallback).
+	await appsFrame.getByTestId('inventory-refresh').click();
+	await expect(panelReads()).toHaveLength(2);
+	expect(panelReads()[1]).toBe(`/api/v1/servers/${SERVER_ALPHA_ID}/applications?limit=50`);
+
+	// Crucially for D7: the knowledge group carries NO ambient scope —
+	// without a pinned application NOTHING may fire a knowledge read, and
+	// nothing did (a selected-server fallback would have nowhere to hide:
+	// the group methods receive the panel's explicit ids per call, proven
+	// with the recording mock in tests/applications.spec.ts).
+	expect(knowledgeRequests).toHaveLength(0);
+});

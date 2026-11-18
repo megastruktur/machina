@@ -243,8 +243,50 @@
 	// below map this ONE client onto each panel's exact interface.
 	import { ApiError, createMaiApiClient, CSRF_COOKIE, type ProfileResponse, type TagPage } from '$lib/api/client.js';
 	import type { TagPageLoader } from '$lib/ui/HistoryTags.svelte';
-	import { APPLICATIONS_PANEL_KIND, applicationsServices, type ApplicationsApi } from './entries/08-web-apps.js';
+	import {
+		APPLICATIONS_PANEL_KIND,
+		applicationsServices,
+		type ApplicationsApi,
+		type KnowledgeApi
+	} from './entries/08-web-apps.js';
 	import { CAPABILITY_POLICY_PANEL_KIND, capabilityPolicyServices } from './entries/03-web-policy.js';
+
+	/**
+	 * D7 gate: the applications panels' OPTIONAL learned-notes group is
+	 * composed ONLY when the live client exposes ALL FIVE knowledge
+	 * methods (typeof-guarded, so legacy demo clients without them keep
+	 * the exact legacy bag and the panel renders its honest unavailable
+	 * state). The five methods pass through VERBATIM — every call carries
+	 * the panel's explicit serverId/applicationId; there is deliberately
+	 * NO selected-server fallback for knowledge requests (C01 rule 2).
+	 */
+	function knowledgeGroupFrom(client: object): KnowledgeApi | null {
+		const candidate = client as Partial<KnowledgeApi>;
+		for (
+			const name of [
+				'readKnowledge',
+				'readFactHistory',
+				'readKnowledgeOperations',
+				'retractKnowledgeFact',
+				'retryKnowledgeOperation'
+			] as const
+		) {
+			if (typeof candidate[name] !== 'function') return null;
+		}
+		return {
+			readKnowledge: (serverId, applicationId, page) =>
+				candidate.readKnowledge!(serverId, applicationId, page),
+			readFactHistory: (serverId, applicationId, factId, page) =>
+				candidate.readFactHistory!(serverId, applicationId, factId, page),
+			readKnowledgeOperations: (serverId, applicationId, status, page) =>
+				candidate.readKnowledgeOperations!(serverId, applicationId, status, page),
+			retractKnowledgeFact: (serverId, applicationId, factId, payload) =>
+				candidate.retractKnowledgeFact!(serverId, applicationId, factId, payload),
+			retryKnowledgeOperation: (serverId, applicationId, operationId) =>
+				candidate.retryKnowledgeOperation!(serverId, applicationId, operationId)
+		};
+	}
+
 	import {
 		SESSION_CHAT_PANEL_KIND as CHAT_PANEL_KIND,
 		sessionChatEntry,
@@ -1611,9 +1653,17 @@
 				const serverId =
 					descriptor.scope.kind === 'server' ? descriptor.scope.server_id : selectedServerId;
 				return asBag(
-					applicationsServices(appsApi, null, {
-						openDocument: (docId) => openDocumentObject(serverId, docId)
-					})
+					applicationsServices(
+						appsApi,
+						null,
+						{ openDocument: (docId) => openDocumentObject(serverId, docId) },
+						// D7: the optional learned-notes group rides only when the
+						// live client exposes all five methods; the methods pass
+						// through verbatim (explicit scope per call — the
+						// selectedServerId fallback above belongs to the documents
+						// seam opener only, never to a knowledge request).
+						knowledgeGroupFrom(api)
+					)
 				);
 			}
 			case OVERVIEW_PANEL_KIND:
