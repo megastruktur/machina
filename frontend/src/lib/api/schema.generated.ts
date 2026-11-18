@@ -3643,6 +3643,229 @@ export interface components {
          */
         ExecutionStatus: "succeeded" | "failed" | "outcome_unknown" | "cancelled";
         /**
+         * FactPage
+         * @description One bounded page of learned facts (D2): sliced window plus the
+         *     frozen derivation metadata. ``has_more = total > offset + len(items)``
+         *     (C1 frozen rule).
+         */
+        FactPage: {
+            /**
+             * Items
+             * @description The ordered fact records inside this page window
+             */
+            items: components["schemas"]["FactRecord"][];
+            /**
+             * Limit
+             * @description Requested maximum number of records in this page
+             * @default 10
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Zero-based offset of this page into the ordered collection
+             * @default 0
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Total number of records in the full matching collection
+             * @default 0
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when records exist beyond this page window
+             */
+            has_more: boolean;
+        };
+        /**
+         * FactRecord
+         * @description One durable learned fact (D3): identity, semantic key, bounded
+         *     statement, revision, provenance, supersession link and lifecycle
+         *     status.
+         */
+        FactRecord: {
+            /**
+             * Fact Id
+             * Format: uuid
+             * @description Canonical UUID identity of this learned fact
+             */
+            fact_id: string;
+            /**
+             * Category
+             * @description Bounded category grouping this fact with its peers
+             */
+            category: string;
+            /**
+             * Key
+             * @description Bounded semantic key identifying the fact inside its category
+             */
+            key: string;
+            /**
+             * Statement
+             * @description Bounded learned statement asserted for this service
+             */
+            statement: string;
+            /**
+             * Revision
+             * @description Non-negative compare-and-set revision of this fact
+             */
+            revision: number;
+            /**
+             * Created At
+             * Format: date-time
+             * @description Creation timestamp used for deterministic ordering
+             */
+            created_at: string;
+            /** @description Provenance of the learned fact (kind, reference, verification) */
+            source: components["schemas"]["FactSource"];
+            /**
+             * Supersedes Fact Id
+             * @description Prior fact identity this correction supersedes, when correcting
+             */
+            supersedes_fact_id?: string | null;
+            /** @description Lifecycle status of this learned fact */
+            status: components["schemas"]["FactStatus"];
+        };
+        /**
+         * FactRevisionPage
+         * @description One bounded page of fact-history rows (C3): the frozen paging
+         *     metadata plus the ordered rows.
+         */
+        FactRevisionPage: {
+            /**
+             * Items
+             * @description The ordered history rows inside this page window
+             */
+            items: components["schemas"]["FactRevisionRecord"][];
+            /**
+             * Limit
+             * @description Requested maximum number of history rows in this page
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Zero-based offset of this page into the history
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Total number of history rows matching the filter
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when history rows exist beyond this page window
+             */
+            has_more: boolean;
+        };
+        /**
+         * FactRevisionRecord
+         * @description One append-only fact-history row joined with its fact identity
+         *     (D3).
+         */
+        FactRevisionRecord: {
+            /**
+             * Revision Id
+             * Format: uuid
+             * @description Canonical UUID identity of the history row
+             */
+            revision_id: string;
+            /**
+             * Fact Id
+             * Format: uuid
+             * @description Learned fact this revision belongs to
+             */
+            fact_id: string;
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Authorized server identity the fact belongs to
+             */
+            server_id: string;
+            /**
+             * Application Id
+             * Format: uuid
+             * @description Canonical application identity of the service
+             */
+            application_id: string;
+            /**
+             * Generation
+             * @description Knowledge identity generation of the fact
+             */
+            generation: number;
+            /**
+             * Category
+             * @description Taxonomy category of the fact
+             */
+            category: string;
+            /**
+             * Key
+             * @description Semantic key of the fact
+             */
+            key: string;
+            /**
+             * Revision
+             * @description Fact revision recorded by this history row
+             */
+            revision: number;
+            /**
+             * Statement
+             * @description Historical statement value recorded for this revision
+             */
+            statement: string;
+            /** @description Lifecycle status recorded for this revision */
+            status: components["schemas"]["FactStatus"];
+            /** @description Provenance kind recorded for this revision */
+            source_kind: components["schemas"]["FactSourceKind"];
+            /**
+             * Source Ref
+             * @description Bounded persisted provenance reference for this revision
+             */
+            source_ref: string;
+            /**
+             * Changed At
+             * Format: date-time
+             * @description Trusted timestamp when this revision was recorded
+             */
+            changed_at: string;
+        };
+        /**
+         * FactSource
+         * @description Provenance of one learned fact: the accepted source kind, a
+         *     bounded persisted reference to the source artifact, and the
+         *     verification timestamp (D3: provenance must resolve to a persisted
+         *     successful tool result or an explicit user statement in the same
+         *     authorized scope).
+         */
+        FactSource: {
+            /** @description Accepted provenance kind of the learned fact */
+            source_kind: components["schemas"]["FactSourceKind"];
+            /**
+             * Source Ref
+             * @description Bounded persisted reference to the proving source artifact
+             */
+            source_ref: string;
+            /**
+             * Verified At
+             * Format: date-time
+             * @description Timestamp when the source evidence was verified
+             */
+            verified_at: string;
+        };
+        /**
+         * FactSourceKind
+         * @description Accepted provenance kinds for a learned fact (D3).
+         * @enum {string}
+         */
+        FactSourceKind: "tool_result" | "user_statement";
+        /**
+         * FactStatus
+         * @description Learned-fact lifecycle status (D3): exactly these four values.
+         * @enum {string}
+         */
+        FactStatus: "active" | "superseded" | "retracted" | "conflict";
+        /**
          * FindingPage
          * @description One bounded finding page for one explicitly named server.
          */
@@ -3974,6 +4197,117 @@ export interface components {
              * @description Association rows in deterministic name order
              */
             items?: components["schemas"]["EntityTagView"][];
+        };
+        /**
+         * KnowledgeRead
+         * @description The bounded per-service knowledge read (D2/D3): operator-curated
+         *     map state and catalog runbook CLEARLY SEPARATED from the active
+         *     learned-fact page and the conflict summary.
+         */
+        KnowledgeRead: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Authorized server identity the knowledge belongs to
+             */
+            server_id: string;
+            /**
+             * Application Id
+             * Format: uuid
+             * @description Canonical application identity of the service
+             */
+            application_id: string;
+            /**
+             * Found In Map
+             * @description Whether an operator-curated map entry exists for this service
+             */
+            found_in_map: boolean;
+            /**
+             * Generation
+             * @description Knowledge identity generation (1 when no SQL row exists)
+             */
+            generation: number;
+            /**
+             * Service Revision
+             * @description Observed service revision (map revision when no SQL row exists)
+             */
+            service_revision: number;
+            /**
+             * Knowledge Revision
+             * @description Knowledge revision (0 when no SQL row exists)
+             */
+            knowledge_revision: number;
+            /**
+             * Manual Identity
+             * @description Whether this is an evidenced map-only manual identity
+             */
+            manual_identity: boolean;
+            /**
+             * Auto Adopt Suppressed
+             * @description Whether auto-adoption is suppressed for this identity
+             */
+            auto_adopt_suppressed: boolean;
+            /**
+             * Name
+             * @description Operator-curated display name (map entries only)
+             */
+            name?: string | null;
+            /**
+             * Origin
+             * @description Adoptable discovery origin (map entries only)
+             */
+            origin?: string | null;
+            /**
+             * Category
+             * @description Taxonomy category (map entries only)
+             */
+            category?: string | null;
+            /**
+             * Description
+             * @description Operator-curated description (map entries only)
+             */
+            description?: string | null;
+            /**
+             * Custom Instructions
+             * @description Operator-curated custom instructions (map entries only, kept separate from learned facts)
+             */
+            custom_instructions?: string | null;
+            /**
+             * Instructions
+             * @description Catalog runbook slots (map entries only)
+             */
+            instructions?: {
+                [key: string]: string;
+            } | null;
+            /**
+             * Installed
+             * @description Whether the service is currently installed (map entries only)
+             */
+            installed?: boolean | null;
+            /**
+             * Map Revision
+             * @description Operator map revision (map entries only)
+             */
+            map_revision?: number | null;
+            /**
+             * Catalog Runbook
+             * @description Matching global catalog runbook document when one exists
+             */
+            catalog_runbook?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Conflict Count
+             * @description Number of CONFLICT facts in the current generation
+             */
+            conflict_count: number;
+            /**
+             * Conflicts
+             * @description Current-generation CONFLICT facts (populated when include_conflicts is requested; never part of the active page)
+             */
+            conflicts?: components["schemas"]["FactRecord"][];
+            /** @description The bounded ACTIVE learned-fact page for the current generation */
+            facts: components["schemas"]["FactPage"];
         };
         /**
          * LaneView
@@ -4636,6 +4970,81 @@ export interface components {
             probe_environment: components["schemas"]["OnboardingIdentityView"];
         };
         /**
+         * OperationPage
+         * @description One bounded page of durable operation receipts (D5), same frozen
+         *     paging derivation as :class:`FactPage`.
+         */
+        OperationPage: {
+            /**
+             * Items
+             * @description The ordered operation receipts inside this page window
+             */
+            items: components["schemas"]["OperationReceipt"][];
+            /**
+             * Limit
+             * @description Requested maximum number of receipts in this page
+             * @default 10
+             */
+            limit: number;
+            /**
+             * Offset
+             * @description Zero-based offset of this page into the ordered collection
+             * @default 0
+             */
+            offset: number;
+            /**
+             * Total
+             * @description Total number of receipts in the full matching collection
+             * @default 0
+             */
+            total: number;
+            /**
+             * Has More
+             * @description True when receipts exist beyond this page window
+             */
+            has_more: boolean;
+        };
+        /**
+         * OperationReceipt
+         * @description The durable receipt of one knowledge operation (D5): identity,
+         *     honest status progression, the bounded payload digest, per-effect
+         *     sub-statuses (partial vs unknown stay distinct) and the deterministic
+         *     workflow identity.
+         */
+        OperationReceipt: {
+            /**
+             * Operation Id
+             * Format: uuid
+             * @description Canonical UUID identity of the durable operation
+             */
+            operation_id: string;
+            /** @description Honest durable status of the operation (partial and unknown are distinct states) */
+            status: components["schemas"]["OperationStatus"];
+            /**
+             * Payload Digest
+             * @description SHA-256 hex digest of the accepted operation payload
+             */
+            payload_digest: string;
+            /**
+             * Sub Effects
+             * @description Per-effect durable status by effect name (adoption, map, docs, facts)
+             */
+            sub_effects: {
+                [key: string]: components["schemas"]["SubEffectStatus"];
+            };
+            /**
+             * Accepted At
+             * Format: date-time
+             * @description Trusted timestamp when the operation was accepted
+             */
+            accepted_at: string;
+            /**
+             * Workflow Id
+             * @description Deterministic workflow identity executing the operation
+             */
+            workflow_id: string;
+        };
+        /**
          * OperationStatus
          * @description Durable operation status progression (D5): accepted -> queued ->
          *     applying -> applied | failed | partial | unknown. ``partial`` and
@@ -5179,6 +5588,52 @@ export interface components {
              * @description Bounded value-free operator reason (not persisted)
              */
             reason?: string | null;
+        };
+        /**
+         * RetractionResult
+         * @description The frozen-shape result of one retraction through the seam.
+         */
+        RetractionResult: {
+            /**
+             * Server Id
+             * Format: uuid
+             * @description Authorized server identity the retraction applied to
+             */
+            server_id: string;
+            /**
+             * Application Id
+             * Format: uuid
+             * @description Canonical application identity the retraction applied to
+             */
+            application_id: string;
+            /**
+             * Generation
+             * @description Identity generation the retraction was set against (-1 when no identity exists yet)
+             */
+            generation: number;
+            /**
+             * Fact Id
+             * Format: uuid
+             * @description Retracted fact identity
+             */
+            fact_id: string;
+            /**
+             * New Revision
+             * @description Revision the fact carries after the retraction (0 when the retraction was refused)
+             */
+            new_revision: number;
+            /** @description Honest derived status of the retraction */
+            status: components["schemas"]["OperationStatus"];
+            /**
+             * Error Code
+             * @description Stable machine-readable refusal code when refused
+             */
+            error_code?: string | null;
+            /**
+             * Error Detail
+             * @description Value-free bounded refusal detail when refused
+             */
+            error_detail?: string | null;
         };
         /**
          * RetrievalBody
@@ -6435,6 +6890,16 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /**
+         * SubEffectStatus
+         * @description Per-effect state inside one durable knowledge operation.
+         *
+         *     ``partial`` and ``unknown`` are DISTINCT never-collapsed states:
+         *     ``partial`` = some sub-effects applied, others failed; ``unknown`` =
+         *     authoritative state not provable and needing reconciliation.
+         * @enum {string}
+         */
+        SubEffectStatus: "applied" | "failed" | "unknown" | "pending";
         /** SystemdUnitDetailView */
         SystemdUnitDetailView: {
             /**
@@ -11158,7 +11623,34 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["KnowledgeRead"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown scope or identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale CAS or refused transition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -11168,6 +11660,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description A composed dependency is absent or the enqueue failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -11194,7 +11695,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["FactRevisionPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown scope or identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -11204,6 +11723,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description A composed dependency is absent or the enqueue failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -11230,7 +11758,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["OperationPage"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown scope or identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -11240,6 +11786,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description A composed dependency is absent or the enqueue failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -11267,7 +11822,43 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["RetractionResult"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown scope or identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale CAS or refused transition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -11277,6 +11868,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description A composed dependency is absent or the enqueue failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -11300,7 +11900,43 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["OperationReceipt"];
+                };
+            };
+            /** @description No valid session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Origin not allowlisted or CSRF token mismatch */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown scope or identity */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Stale CAS or refused transition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -11310,6 +11946,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description A composed dependency is absent or the enqueue failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
