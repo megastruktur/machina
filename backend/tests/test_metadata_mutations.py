@@ -188,6 +188,7 @@ def _coordinator(
         map_store=map_store,
         learning=LearningOperationStore(factory),
         adoption=ApplicationAdoption(factory) if with_adoption else None,
+        sessions=factory,
     )
 
 
@@ -248,13 +249,15 @@ def _queued_learning_op(factory: async_sessionmaker) -> uuid.UUID:
     )
 
 
-def _identity_row(migrated_url: str) -> dict[str, object] | None:
+def _identity_row(
+    migrated_url: str, application_id: uuid.UUID = APP_MAIN_ID
+) -> dict[str, object] | None:
     with psycopg.connect(migrated_url) as conn:
         row = conn.execute(
             "SELECT generation, auto_adopt_suppressed FROM "
             "service_knowledge_identity WHERE server_id = %s AND "
             "application_id = %s",
-            (str(SERVER_A), str(APP_MAIN_ID)),
+            (str(SERVER_A), str(application_id)),
         ).fetchone()
     if row is None:
         return None
@@ -577,14 +580,210 @@ def test_adopt_delegation_is_canonical_with_no_fallback(
     # STRUCTURALLY refuses standalone containers at request construction
     # (before any lease is taken or any effect possible) — the
     # coordinator can never paper one over into a manual entry.
+    standalone_id = uuid.uuid4()
     with pytest.raises(AdoptionError) as unsupported:
         AdoptionRequest(
             server_id=SERVER_A,
-            application_id=uuid.uuid4(),
+            application_id=standalone_id,
             name="standalone",
             origin=ApplicationOrigin.DOCKER_CONTAINER,
             expected_revision=ABSENT_REVISION,
         )
     assert unsupported.value.code is AdoptionErrorCode.UNSUPPORTED_ORIGIN
     assert locks.inspect(str(SERVER_A), METADATA_LEASE_RESOURCE) is None
-    assert locks.inspect(str(SERVER_A), f"{APPLICATION_LEASE_PREFIX}{APP_MAIN_ID}") is None
+    assert (
+        locks.inspect(str(SERVER_A), f"{APPLICATION_LEASE_PREFIX}{APP_MAIN_ID}")
+        is None
+    )
+    assert (
+        locks.inspect(str(SERVER_A), f"{APPLICATION_LEASE_PREFIX}{standalone_id}")
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# fix1: origin/selector preservation through metadata updates
+# ---------------------------------------------------------------------------
+
+
+def test_update_metadata_preserves_origin_and_selectors(
+    tmp_path: Path, locks: ResourceLockService, factory: async_sessionmaker
+) -> None:
+    """A metadata update on an ADOPTED compose service must never demote
+    it to a ``manual`` entry or erase its selectors (Fix 1)."""
+    map_root = tmp_path / "service_map"
+    map_store = ServiceMapStore(map_root)
+    map_store.upsert_entry(
+        SERVER_A,
+        name="billing",
+        origin="compose",
+        compose_project="billing",
+        working_dir="/srv/billing",
+        category="dev",
+        description="old",
+        application_id=APP_MAIN_ID,
+        custom_instructions="operator notes",
+    )
+    coordinator = _coordinator(locks, factory, map_store)
+
+    outcome = _run(
+        coordinator.update_entry_metadata(
+            SERVER_A,
+            APP_MAIN_ID,
+            expected_revision=1,
+            description="coordinated description",
+            custom_instructions="renewed notes",
+        )
+    )
+    assert outcome.map_entry_revision == 2
+    entry = map_store.get_entry(SERVER_A, APP_MAIN_ID)
+    assert entry is not None
+    assert entry.origin == "compose"  # NEVER rewritten to manual
+    assert entry.compose_project == "billing"
+    assert entry.working_dir == "/srv/billing"
+    assert entry.unit_name is None
+    assert entry.description == "coordinated description"
+    assert entry.custom_instructions == "renewed notes"
+
+
+# ---------------------------------------------------------------------------
+# fix1: INVALID_REQUEST mapping for malformed lease batches
+# ---------------------------------------------------------------------------
+
+
+def test_lease_set_duplicate_application_ids_is_invalid_request(
+    locks: ResourceLockService, factory: async_sessionmaker
+) -> None:
+    coordinator = _coordinator(locks, factory, ServiceMapStore(Path("/nonexistent-map")))
+    with pytest.raises(MetadataMutationError) as err:
+        coordinator.lease_set(SERVER_A, [APP_MAIN_ID, APP_MAIN_ID])
+    assert err.value.code is MetadataMutationErrorCode.INVALID_REQUEST
+    # Nothing was acquired by the refused batch.
+    assert locks.inspect(str(SERVER_A), METADATA_LEASE_RESOURCE) is None
+    assert (
+        locks.inspect(str(SERVER_A), f"{APPLICATION_LEASE_PREFIX}{APP_MAIN_ID}")
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# fix1: tombstone guard on upsert_map_entry
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_map_entry_tombstone_guard(
+    tmp_path: Path, locks: ResourceLockService, factory: async_sessionmaker
+) -> None:
+    map_store = ServiceMapStore(tmp_path / "service_map")
+    coordinator = _coordinator(locks, factory, map_store)
+
+    # Tombstone the (not-yet-mapped) identity first.
+    _run(coordinator.unadopt(SERVER_A, APP_MAIN_ID))
+
+    with pytest.raises(MetadataMutationError) as background:
+        _run(
+            coordinator.upsert_map_entry(
+                SERVER_A, APP_MAIN_ID, name="ghost", category="system"
+            )
+        )
+    assert background.value.code is MetadataMutationErrorCode.INVALID_REQUEST
+    assert "auto_adopt_suppressed" in background.value.detail
+    assert map_store.get_entry(SERVER_A, APP_MAIN_ID) is None
+
+    # An operator-initiated write passes through the tombstone.
+    entry = _run(
+        coordinator.upsert_map_entry(
+            SERVER_A,
+            APP_MAIN_ID,
+            name="operator",
+            category="system",
+            explicit_operator_write=True,
+        )
+    )
+    assert entry.revision == 1
+
+    # Opting out of the check entirely also writes (apply-time fences own
+    # the case when the guard is off).
+    entry = _run(
+        coordinator.upsert_map_entry(
+            SERVER_A,
+            APP_MAIN_ID,
+            name="unchecked",
+            category="system",
+            check_suppression=False,
+            expected_revision=1,
+        )
+    )
+    assert entry.revision == 2
+
+
+# ---------------------------------------------------------------------------
+# fix1: unadopt with the canonical manifest revoke step
+# ---------------------------------------------------------------------------
+
+
+def test_unadopt_with_manifest_store_revokes_adoption(
+    tmp_path: Path,
+    migrated_url: str,
+    locks: ResourceLockService,
+    factory: async_sessionmaker,
+) -> None:
+    from mai.applications.adopt import canonical_manifest_relative_path
+
+    # A UNIQUE application identity AND unique selectors: the adoption
+    # projection is NOT truncated by the fixture, and a live adoption on
+    # the same server claiming the same compose project/working dir is a
+    # legitimate reference conflict.
+    aid = uuid.uuid4()
+    tag = aid.hex[:8]
+    manifest_root = tmp_path / "manifests"
+    manifest_store = ApplicationManifestStore(manifest_root)
+    map_store = ServiceMapStore(tmp_path / "service_map")
+    coordinator = _coordinator(locks, factory, map_store, with_adoption=True)
+
+    request = AdoptionRequest(
+        server_id=SERVER_A,
+        application_id=aid,
+        name="box",
+        origin=ApplicationOrigin.COMPOSE,
+        compose_project=f"box-{tag}",
+        working_dir=f"/srv/box-{tag}",
+        expected_revision=ABSENT_REVISION,
+    )
+    result = _run(coordinator.adopt(manifest_store, request))
+    assert result.revision == 1
+    manifest_path = manifest_root / canonical_manifest_relative_path(SERVER_A, aid)
+    assert manifest_path.exists()
+
+    # Suppression FIRST, then the canonical revoke, then the map delete.
+    outcome = _run(
+        coordinator.unadopt(
+            SERVER_A,
+            aid,
+            manifest_store=manifest_store,
+            expected_adoption_revision=1,
+        )
+    )
+    assert outcome.auto_adopt_suppressed is True
+    assert outcome.map_entry_deleted is False  # nothing mapped
+    assert not manifest_path.exists()  # canonical manifest revoked
+    identity = _identity_row(migrated_url, aid)
+    assert identity is not None and identity["auto_adopt_suppressed"] is True
+
+    # A second revoke on the gone record refuses through the canonical seam.
+    with pytest.raises(AdoptionError) as gone:
+        _run(
+            coordinator.unadopt(
+                SERVER_A,
+                aid,
+                manifest_store=manifest_store,
+                expected_adoption_revision=1,
+            )
+        )
+    assert gone.value.code is AdoptionErrorCode.NOT_ADOPTED
+
+    # Wiring without the adoption seam or revision is refused up front.
+    bare = _coordinator(locks, factory, map_store)
+    with pytest.raises(MetadataMutationError) as invalid:
+        _run(bare.unadopt(SERVER_A, aid, manifest_store=manifest_store))
+    assert invalid.value.code is MetadataMutationErrorCode.INVALID_REQUEST
