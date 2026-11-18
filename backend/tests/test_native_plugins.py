@@ -1597,18 +1597,18 @@ class TestBuiltinOnepassword:
 
     # -- ask_08-secret-export: protected agent-created exports (D6/C6) --
 
-    def _write_operator_refs(self, data_root: Path) -> tuple[str, str, str]:
+    def _write_operator_refs(self, data_root: Path) -> list[str]:
         """Seed SSH / model / plugin operator credential refs under the
-        data root (the operator surfaces an agent export must never
-        overwrite)."""
+        data root — including single-quoted, inline-commented and
+        flow-style YAML forms the scan must parse."""
         server_dir = data_root / "servers" / str(uuid.uuid4())
         server_dir.mkdir(parents=True)
         (server_dir / "profile.yaml").write_text(
-            'schema_version: 1\n'
+            "schema_version: 1\n"
             f'server_id: "{uuid.uuid4()}"\n'
             "privilege: none\n"
             "ssh:\n"
-            '  credential_ref: "MAI_SSH_KEY_PROD"\n',
+            "  credential_ref: 'MAI_SSH_KEY_PROD'  # ssh key\n",
             encoding="utf-8",
         )
         connections = data_root / "models" / "connections"
@@ -1623,17 +1623,26 @@ class TestBuiltinOnepassword:
             "schema_version: 1\n"
             "plugin: onepassword\n"
             "enabled: true\n"
-            "credential_refs:\n"
-            "  - PLUGIN_TOKEN\n",
+            "credential_refs: [PLUGIN_TOKEN, SECOND_PLUGIN_TOKEN]  # shared\n",
             encoding="utf-8",
         )
-        return "MAI_SSH_KEY_PROD", "MODEL_DB_PASS", "PLUGIN_TOKEN"
+        nested = plugins_dir / "mai-notify"
+        nested.mkdir()
+        (nested / "config.yaml").write_text(
+            "plugin: mai-notify\ncredential_refs:\n  - NESTED_PLUGIN_REF\n",
+            encoding="utf-8",
+        )
+        return [
+            "MAI_SSH_KEY_PROD",
+            "MODEL_DB_PASS",
+            "PLUGIN_TOKEN",
+            "SECOND_PLUGIN_TOKEN",
+            "NESTED_PLUGIN_REF",
+        ]
 
     def test_export_bootstrap_refs_refused_without_side_effects(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        from mai.credentials.env import parse_env_text
-
         data_root = tmp_path / "data"
         monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
         bin_dir = _op_fixtures._install_fake_op(tmp_path)
@@ -1667,19 +1676,18 @@ class TestBuiltinOnepassword:
         # Zero side effects: no op invocation, no credentials.env write.
         assert _op_fixtures._invocations(bin_dir) == []
         assert not (data_root / "credentials.env").exists()
-        parse_env_text  # noqa: B018 - asserted via read-back in sibling tests
 
     def test_export_operator_refs_refused(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         data_root = tmp_path / "data"
         monkeypatch.setenv("MAI_DATA_ROOT", str(data_root))
-        ssh_ref, model_ref, plugin_ref = self._write_operator_refs(data_root)
+        protected_refs = self._write_operator_refs(data_root)
         bin_dir = _op_fixtures._install_fake_op(tmp_path)
         _registry, _runtime, dispatcher = self._compose(
             tmp_path, monkeypatch, bin_dir=bin_dir
         )
-        for ref in (ssh_ref, model_ref, plugin_ref):
+        for ref in protected_refs:
             outcome: DispatchOutcome = _run(
                 dispatcher.dispatch(
                     context=self._context(),
@@ -1740,24 +1748,57 @@ class TestBuiltinOnepassword:
             _op_fixtures.SENTINEL
         )
 
-        # Unscoped operator ref, another server's and another run's
-        # namespace: refused BEFORE any op call or env write.
+        # Server-owned (no run segment) export also succeeds.
+        server_shared = f"MAI_AGENT_{server8}_SERVER_SHARED"
+        shared: DispatchOutcome = _run(
+            dispatcher.dispatch(
+                context=self._context(principal="agent"),
+                capability_id="secret.get",
+                payload={
+                    "vault": OP_VAULT,
+                    "item": "test-item",
+                    "field": "api-key",
+                    "export_credential_ref": server_shared,
+                },
+            )
+        )
+        assert shared.executor_ok is True
+        assert parse_env_text(credentials_path.read_text(encoding="utf-8"))[
+            server_shared
+        ] == _op_fixtures.SENTINEL
+
+        # Unscoped operator ref, another server's namespace (run-owned
+        # and server-shared shapes), another run's namespace, a
+        # session-principal unscoped export, and a collision: refused
+        # BEFORE any op call or env write.
         refusals = (
-            ("OPERATOR_DB_PASS", "credential_ref_scope_mismatch"),
+            ("agent", "OPERATOR_DB_PASS", "credential_ref_scope_mismatch"),
             (
+                "agent",
                 f"MAI_AGENT_{uuid.uuid4().hex[:8].upper()}_{run8}_DB_PASS",
                 "credential_ref_scope_mismatch",
             ),
             (
+                "agent",
                 f"MAI_AGENT_{server8}_{uuid.uuid4().hex[:8].upper()}_DB_PASS",
                 "credential_ref_scope_mismatch",
             ),
-            (good_ref, "credential_ref_collision"),
+            (
+                "agent",
+                f"MAI_AGENT_{uuid.uuid4().hex[:8].upper()}_SERVER_SHARED",
+                "credential_ref_scope_mismatch",
+            ),
+            (
+                "session-runner",
+                "OPERATOR_DB_PASS",
+                "credential_ref_scope_mismatch",
+            ),
+            ("agent", good_ref, "credential_ref_collision"),
         )
-        for ref, code in refusals:
+        for principal, ref, code in refusals:
             outcome: DispatchOutcome = _run(
                 dispatcher.dispatch(
-                    context=self._context(principal="agent"),
+                    context=self._context(principal=principal),
                     capability_id="secret.get",
                     payload={
                         "vault": OP_VAULT,
@@ -1772,25 +1813,33 @@ class TestBuiltinOnepassword:
             assert code in outcome.output.text, (ref, outcome.output.text)
             assert _op_fixtures.SENTINEL not in outcome.output.text
         assert parse_env_text(credentials_path.read_text(encoding="utf-8")) == {
-            good_ref: _op_fixtures.SENTINEL
+            good_ref: _op_fixtures.SENTINEL,
+            server_shared: _op_fixtures.SENTINEL,
         }
 
-        # Store-side refusals happen BEFORE `op item create`.
-        store_bad: DispatchOutcome = _run(
-            dispatcher.dispatch(
-                context=self._context(principal="agent"),
-                capability_id="secret.store",
-                payload={
-                    "vault": OP_VAULT,
-                    "title": "agent-item",
-                    "generate": True,
-                    "export_credential_ref": "OPERATOR_DB_PASS",
-                },
-            )
+        # Store-side refusals (scope, protected bootstrap ref, collision)
+        # happen BEFORE `op item create`.
+        store_bad_payloads = (
+            ("OPERATOR_DB_PASS", "credential_ref_scope_mismatch"),
+            ("OP_SERVICE_ACCOUNT_TOKEN", "credential_ref_protected"),
+            (good_ref, "credential_ref_collision"),
         )
-        assert store_bad.executor_ok is False
-        assert store_bad.output is not None
-        assert "credential_ref_scope_mismatch" in store_bad.output.text
+        for ref, code in store_bad_payloads:
+            store_bad: DispatchOutcome = _run(
+                dispatcher.dispatch(
+                    context=self._context(principal="agent"),
+                    capability_id="secret.store",
+                    payload={
+                        "vault": OP_VAULT,
+                        "title": "agent-item",
+                        "generate": True,
+                        "export_credential_ref": ref,
+                    },
+                )
+            )
+            assert store_bad.executor_ok is False, ref
+            assert store_bad.output is not None
+            assert code in store_bad.output.text, (ref, store_bad.output.text)
         assert not any(
             record["argv"][:2] == ["item", "create"]
             for record in _op_fixtures._invocations(bin_dir)

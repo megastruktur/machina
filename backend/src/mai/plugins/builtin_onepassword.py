@@ -35,9 +35,11 @@ references, vaults and classifications — never token or secret values.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
+import yaml
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
@@ -511,12 +513,10 @@ _AGENT_SERVER_RE: Final[re.Pattern[str]] = re.compile(
     r"^MAI_AGENT_([0-9A-F]{8})_[A-Z0-9_]+$"
 )
 
-_CREDENTIAL_REF_YAML_RE: Final[re.Pattern[str]] = re.compile(
-    r"^[ \t]*(?:-[\t ]+)?credential_refs?:[\t ]*\"?([A-Za-z0-9_]+)\"?[\t ]*$"
-)
-_CREDENTIAL_REF_LIST_RE: Final[re.Pattern[str]] = re.compile(
-    r"^[ \t]*-[\t ]*\"?([A-Za-z0-9_]+)\"?[\t ]*$"
-)
+#: Exclusive lock for the ``credentials.env`` no-overwrite check-then-act
+#: window (agent / ``MAI_AGENT_`` exports; fcntl, the repo's lock
+#: discipline).
+_EXPORT_LOCK_SUFFIX: Final[str] = ".lock"
 
 
 def _is_agent_caller(context: object) -> bool:
@@ -530,15 +530,47 @@ def _is_agent_caller(context: object) -> bool:
     return principal.startswith(("agent", "session"))
 
 
+def _extract_yaml_credential_refs(node: object, out: set[str]) -> None:
+    """Collect ``credential_ref``/``credential_refs`` values from parsed
+    YAML (bounded recursion over dicts and lists)."""
+    if isinstance(node, Mapping):
+        ref = node.get("credential_ref")
+        if isinstance(ref, str):
+            out.add(ref.strip())
+        refs = node.get("credential_refs")
+        if isinstance(refs, str):
+            out.add(refs.strip())
+        elif isinstance(refs, (list, tuple)):
+            for item in refs:
+                if isinstance(item, str):
+                    out.add(item.strip())
+        for value in node.values():
+            if isinstance(value, (Mapping, list, tuple)):
+                _extract_yaml_credential_refs(value, out)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            if isinstance(item, (Mapping, list, tuple)):
+                _extract_yaml_credential_refs(item, out)
+
+
+def _safe_load_yaml(path: Path) -> object | None:
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+
+
 def _configured_credential_refs(data_root: Path | None) -> frozenset[str]:
     """Operator/infrastructure refs configured under ``data_root``.
 
     Bounded, failure-tolerant scans of the canonical operator surfaces:
-    server SSH ``credential_ref`` lines (``servers/*/profile.yaml``),
-    model connection ``credential_ref`` fields
-    (``models/connections/*.json``), and plugin ``credential_refs`` list
-    entries (``plugins/*.yaml``). Unreadable or absent surfaces simply
-    contribute nothing.
+    server profiles (``servers/*/profile.yaml``, including nested
+    ``ssh.credential_ref``), model connection ``credential_ref`` fields
+    (``models/connections/*.json``), and plugin ``credential_refs``
+    (``plugins/*.yaml`` and ``plugins/*/*.yaml``; single/double quotes,
+    flow-style lists and inline comments all parse via
+    ``yaml.safe_load``). Unreadable or absent surfaces simply contribute
+    nothing.
     """
     if data_root is None:
         return frozenset()
@@ -547,14 +579,9 @@ def _configured_credential_refs(data_root: Path | None) -> frozenset[str]:
         servers_dir = data_root / "servers"
         if servers_dir.is_dir():
             for profile in sorted(servers_dir.glob("*/profile.yaml")):
-                try:
-                    text = profile.read_text(encoding="utf-8")
-                except OSError:
-                    continue
-                for line in text.splitlines():
-                    match = _CREDENTIAL_REF_YAML_RE.match(line)
-                    if match is not None:
-                        refs.add(match.group(1))
+                document = _safe_load_yaml(profile)
+                if document is not None:
+                    _extract_yaml_credential_refs(document, refs)
         connections_dir = data_root / "models" / "connections"
         if connections_dir.is_dir():
             for path in sorted(connections_dir.glob("*.json")):
@@ -563,34 +590,16 @@ def _configured_credential_refs(data_root: Path | None) -> frozenset[str]:
                 except (OSError, ValueError):
                     continue
                 if isinstance(document, Mapping):
-                    value = document.get("credential_ref")
-                    if isinstance(value, str):
-                        refs.add(value)
+                    _extract_yaml_credential_refs(document, refs)
         plugins_dir = data_root / "plugins"
         if plugins_dir.is_dir():
-            for path in sorted(plugins_dir.glob("*.yaml")):
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except OSError:
-                    continue
-                in_block = False
-                for line in text.splitlines():
-                    if _CREDENTIAL_REF_YAML_RE.match(line) is not None:
-                        match = _CREDENTIAL_REF_YAML_RE.match(line)
-                        if match is not None and match.group(0).strip().startswith(
-                            "credential_refs"
-                        ):
-                            refs.add(match.group(1))
-                            continue
-                    if re.match(r"^[ \t]*credential_refs:[ \t]*$", line):
-                        in_block = True
-                        continue
-                    if in_block:
-                        listed = _CREDENTIAL_REF_LIST_RE.match(line)
-                        if listed is not None:
-                            refs.add(listed.group(1))
-                        elif line.strip() and not line[:1] in (" ", "\t", "-"):
-                            in_block = False
+            yaml_paths: list[Path] = []
+            for pattern in ("*.yaml", "*/*.yaml"):
+                yaml_paths.extend(sorted(plugins_dir.glob(pattern)))
+            for path in yaml_paths:
+                document = _safe_load_yaml(path)
+                if document is not None:
+                    _extract_yaml_credential_refs(document, refs)
     except OSError:  # pragma: no cover - defensive: scans never crash export
         pass
     return frozenset(ref for ref in refs if ref)
@@ -716,21 +725,68 @@ def _validate_export_ref(
     return None
 
 
+def _export_to_env_file(
+    data_root: Path,
+    export: str,
+    value: str,
+    *,
+    disallow_overwrite: bool,
+) -> ExecutorResult | None:
+    """Write one export under the env-file lock (sync; runs in a thread).
+
+    The exclusive ``flock`` on ``<credentials.env>.lock`` closes the
+    check-then-act window: while holding it, a no-overwrite export that
+    collides with an existing entry fails BEFORE
+    ``upsert_env_credentials`` touches the file.
+    """
+    lock_path = (
+        data_root / f"{DATA_ROOT_CREDENTIALS_FILENAME}{_EXPORT_LOCK_SUFFIX}"
+    )
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if disallow_overwrite and _existing_env_collision(export, data_root):
+            return _failure(
+                "credential_ref_collision",
+                f"export_credential_ref {export!r} already exists in "
+                "credentials.env and was not created by this server/run",
+            )
+        upsert_env_credentials(
+            data_root / DATA_ROOT_CREDENTIALS_FILENAME, {export: value}
+        )
+        return None
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
 async def _perform_export(
     value: str,
     payload: Mapping[str, object],
     data_root: Path | None,
+    context: object,
 ) -> ExecutorResult | None:
-    """Persist the ALREADY-VALIDATED export into ``credentials.env``."""
+    """Persist the ALREADY-VALIDATED export into ``credentials.env``.
+
+    The disk write runs in a thread and re-checks the no-overwrite rule
+    under the env-file lock (TOCTOU backstop for concurrent runs).
+    """
     raw = payload.get("export_credential_ref")
     export = raw if isinstance(raw, str) and raw else None
     if export is None:
         return None
+    disallow_overwrite = _is_agent_caller(context) or raw.startswith(
+        _AGENT_EXPORT_PREFIX
+    )
     try:
-        await asyncio.to_thread(
-            upsert_env_credentials,
-            data_root / DATA_ROOT_CREDENTIALS_FILENAME,
-            {export: value},
+        return await asyncio.to_thread(
+            _export_to_env_file,
+            data_root,
+            export,
+            value,
+            disallow_overwrite=disallow_overwrite,
         )
     except Exception as error:  # value-free: classification only
         return _failure(
@@ -738,7 +794,6 @@ async def _perform_export(
             f"persisting credential reference {export!r} failed: "
             f"{type(error).__name__}",
         )
-    return None
 
 
 def _required_str(payload: Mapping[str, object], key: str) -> str:
@@ -816,13 +871,14 @@ async def _get_item(
     payload: Mapping[str, object],
     vault: str,
     data_root: Path | None,
+    context: object,
 ) -> ExecutorResult:
     item = _required_str(payload, "item")
     field = _optional_str(payload, "field") or "password"
     reference = f"op://{vault}/{item}/{field}"
     resolved = await asyncio.to_thread(resolver.resolve, reference)
     value = resolved.value
-    refusal = await _perform_export(value, payload, data_root)
+    refusal = await _perform_export(value, payload, data_root, context)
     if refusal is not None:
         return refusal
     document: dict[str, object] = {
@@ -846,6 +902,7 @@ async def _store_item(
     payload: Mapping[str, object],
     vault: str,
     data_root: Path | None,
+    context: object,
 ) -> ExecutorResult:
     title = _required_str(payload, "title")
     generate = _optional_bool(payload, "generate", False)
@@ -863,7 +920,7 @@ async def _store_item(
         notes=_optional_str(payload, "notes"),
     )
     secret_value = receipt.value.value
-    refusal = await _perform_export(secret_value, payload, data_root)
+    refusal = await _perform_export(secret_value, payload, data_root, context)
     if refusal is not None:
         return refusal
     document: dict[str, object] = {
@@ -903,7 +960,9 @@ async def execute(call: CapabilityCall) -> ExecutorResult:
     if refusal is not None:
         return refusal
     assert vault is not None  # _resolve_target_vault contract
-    export_refusal = _validate_export_ref(payload, data_root, call.context)
+    export_refusal = await asyncio.to_thread(
+        _validate_export_ref, payload, data_root, call.context
+    )
     if export_refusal is not None:
         return export_refusal
     resolver = _build_resolver(call)
@@ -911,9 +970,9 @@ async def execute(call: CapabilityCall) -> ExecutorResult:
         if capability == "secret.list":
             return await _list_items(resolver, payload, vault)
         if capability == "secret.get":
-            return await _get_item(resolver, payload, vault, data_root)
+            return await _get_item(resolver, payload, vault, data_root, call.context)
         if capability == "secret.store":
-            return await _store_item(resolver, payload, vault, data_root)
+            return await _store_item(resolver, payload, vault, data_root, call.context)
     except OnePasswordError as error:
         # Value-free by the resolver lane's contract (scrubbed stderr).
         return _failure(error.code.value, error.detail)
