@@ -1977,47 +1977,50 @@ class TestMetadataGuardLifecycle:
         lease = holder.acquire(
             str(server_a), f"application:{application_id}", owner_ref="recipe"
         )
+        try:
+            adopt_conflict = await call_app(
+                apps_app,
+                "POST",
+                _apps_root(server_a),
+                json_body=_adopt_body(
+                    application_id, name="contention", expected_revision=1
+                ),
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert adopt_conflict.status == 409, adopt_conflict.body
+            assert adopt_conflict.json()["error"]["code"] == "conflict"
 
-        adopt_conflict = await call_app(
-            apps_app,
-            "POST",
-            _apps_root(server_a),
-            json_body=_adopt_body(
-                application_id, name="contention", expected_revision=1
-            ),
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert adopt_conflict.status == 409, adopt_conflict.body
-        assert adopt_conflict.json()["error"]["code"] == "conflict"
+            delete_conflict = await call_app(
+                apps_app,
+                "DELETE",
+                f"{_apps_root(server_a)}/{application_id}",
+                json_body={"expected_revision": 1},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert delete_conflict.status == 409, delete_conflict.body
+            assert delete_conflict.json()["error"]["code"] == "conflict"
 
-        delete_conflict = await call_app(
-            apps_app,
-            "DELETE",
-            f"{_apps_root(server_a)}/{application_id}",
-            json_body={"expected_revision": 1},
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert delete_conflict.status == 409, delete_conflict.body
-        assert delete_conflict.json()["error"]["code"] == "conflict"
+            execute_conflict = await call_app(
+                apps_app,
+                "POST",
+                f"{_apps_root(server_a)}/{application_id}/execute",
+                json_body={"action": "verify", "custom_instructions": "notes"},
+                headers=_mutation_headers(jar),
+                cookies=jar,
+            )
+            assert execute_conflict.status == 409, execute_conflict.body
+            assert execute_conflict.json()["error"]["code"] == "conflict"
 
-        execute_conflict = await call_app(
-            apps_app,
-            "POST",
-            f"{_apps_root(server_a)}/{application_id}/execute",
-            json_body={"action": "verify", "custom_instructions": "notes"},
-            headers=_mutation_headers(jar),
-            cookies=jar,
-        )
-        assert execute_conflict.status == 409, execute_conflict.body
-        assert execute_conflict.json()["error"]["code"] == "conflict"
+            # The guarded refusals wrote NOTHING: revision stays 1.
+            entry = apps_app.state.service_map.get_entry(
+                server_a, application_id
+            )
+            assert entry is not None and entry.revision == 1
+        finally:
+            holder.release(lease)
 
-        # The guarded refusals wrote NOTHING: revision stays 1.
-        entry = apps_app.state.service_map.get_entry(server_a, application_id)
-        assert entry is not None and entry.revision == 1
-
-        holder.release(lease)
         notes_ok = await call_app(
             apps_app,
             "POST",

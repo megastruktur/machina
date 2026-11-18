@@ -119,10 +119,7 @@ from mai.agents.session_runner import (
 from mai.api.capability_defaults import resolve_default_capabilities
 from mai.auth.sessions import hash_token
 from mai.jobs.engine import RunIdInUseError
-from mai.jobs.resource_locks import (
-    ResourceLockError,
-    ResourceLockService,
-)
+from mai.jobs.resource_locks import ResourceLockService
 from mai.policy.evaluate import ExecutionContext, PolicyError, PolicyMode
 
 from dbos import error as dbos_error
@@ -813,21 +810,25 @@ def _metadata_coordinator(request: Request) -> MetadataMutationCoordinator:
     return coordinator
 
 
-def _release_leases(
+async def _acquire_leases_async(
+    coordinator: MetadataMutationCoordinator,
+    server_id: uuid.UUID,
+    application_ids: Sequence[uuid.UUID],
+) -> tuple[Any, ...]:
+    """The C4 lease set acquired OFF the event loop (``ResourceLockService``
+    uses synchronous psycopg connections; a blocking acquire must never
+    stall the running loop)."""
+    return await asyncio.to_thread(coordinator.lease_set, server_id, application_ids)
+
+
+async def _release_leases_async(
     coordinator: MetadataMutationCoordinator,
     held: Sequence[Any],
 ) -> None:
-    """Release coordinator-acquired leases in reverse order through the
-    coordinator's own lock service (a lease that lapsed mid-operation
-    was already fenced by the touch)."""
-    lock_service = getattr(coordinator, "_locks", None)
-    for lease in reversed(tuple(held)):
-        if lock_service is None:
-            return
-        try:
-            lock_service.release(lease)
-        except ResourceLockError:
-            pass
+    """Release off the event loop via the coordinator's own disciplined
+    release (reverse order; only ``LEASE_LOST`` is tolerated as
+    already-fenced)."""
+    await asyncio.to_thread(coordinator._release_acquired, tuple(held))
 
 
 def _metadata_error(request: Request, error: MetadataMutationError) -> Response:
@@ -1541,7 +1542,9 @@ async def adopt_application(
     coordinator = _metadata_coordinator(request)
     learning_store = _learning_store(request)
     try:
-        held_leases = coordinator.lease_set(server_id, [application_id])
+        held_leases = await _acquire_leases_async(
+            coordinator, server_id, [application_id]
+        )
     except MetadataMutationError as error:
         return _metadata_error(request, error)
     try:
@@ -1580,7 +1583,7 @@ async def adopt_application(
                 server_id, application_id, manual_identity=False
             )
     finally:
-        _release_leases(coordinator, held_leases)
+        await _release_leases_async(coordinator, held_leases)
     record = await adoption.read(server_id, application_id)
     assert record is not None  # the pipeline just reconciled it
     return AdoptionCreated(
@@ -1619,7 +1622,9 @@ async def _adopt_manual_entry(
     coordinator = _metadata_coordinator(request)
     learning_store = _learning_store(request)
     try:
-        held_leases = coordinator.lease_set(server_id, [application_id])
+        held_leases = await _acquire_leases_async(
+            coordinator, server_id, [application_id]
+        )
     except MetadataMutationError as error:
         return _metadata_error(request, error)
     try:
@@ -1651,7 +1656,7 @@ async def _adopt_manual_entry(
                 server_id, application_id, manual_identity=True
             )
     finally:
-        _release_leases(coordinator, held_leases)
+        await _release_leases_async(coordinator, held_leases)
     return AdoptionCreated(
         intent_id=str(uuid.uuid5(application_id, "service-map:manual-adoption")),
         application_id=entry.application_id,
@@ -1934,25 +1939,37 @@ async def revoke_application(
     learning_store = _learning_store(request)
     _canonical_profile(request, server_id)
     try:
-        held_leases = coordinator.lease_set(server_id, [application_id])
+        held_leases = await _acquire_leases_async(
+            coordinator, server_id, [application_id]
+        )
     except MetadataMutationError as error:
         return _metadata_error(request, error)
     try:
         record = await adoption.read(server_id, application_id)
         if record is not None:
             if record.revision != payload.expected_revision:
-                # Stale caller: revoke raises STALE_REVISION (409) and no
-                # tombstone has been set.
-                try:
-                    await adoption.revoke(
-                        store,
-                        server_id,
-                        application_id,
-                        expected_revision=payload.expected_revision,
-                    )
-                except AdoptionError as error:
-                    return _adoption_error(request, error)
-                return Response(status_code=HTTP_204_NO_CONTENT)
+                # Stale caller: refuse directly — no revoke attempt, and
+                # no tombstone has been set.
+                return render_error_envelope(
+                    request,
+                    HTTP_409_CONFLICT,
+                    "conflict",
+                    (
+                        f"expected revision {payload.expected_revision}, "
+                        f"current is {record.revision}"
+                    ),
+                )
+            await learning_store.suppress_for_unadopt(server_id, application_id)
+            try:
+                await adoption.revoke(
+                    store,
+                    server_id,
+                    application_id,
+                    expected_revision=payload.expected_revision,
+                )
+            except AdoptionError as error:
+                return _adoption_error(request, error)
+            return Response(status_code=HTTP_204_NO_CONTENT)
             await learning_store.suppress_for_unadopt(server_id, application_id)
             try:
                 await adoption.revoke(
@@ -1996,7 +2013,7 @@ async def revoke_application(
             return _adoption_error(request, error)
         return Response(status_code=HTTP_204_NO_CONTENT)
     finally:
-        _release_leases(coordinator, held_leases)
+        await _release_leases_async(coordinator, held_leases)
 
 
 @router.post(
@@ -2557,8 +2574,8 @@ async def execute_runbook(
                 )
                 entry = map_store.get_entry(server_id, application_id)
             else:
-                held_leases = coordinator.lease_set(
-                    server_id, [uuid.UUID(runbook.runbook_id)]
+                held_leases = await _acquire_leases_async(
+                    coordinator, server_id, [uuid.UUID(runbook.runbook_id)]
                 )
                 try:
                     # Stage the catalog runbook on this server: an explicit
@@ -2575,11 +2592,25 @@ async def execute_runbook(
                         installed=False,
                     )
                 finally:
-                    _release_leases(coordinator, held_leases)
+                    await _release_leases_async(coordinator, held_leases)
         except MetadataMutationError as error:
             return _metadata_error(request, error)
         except ServiceMapError as error:
+            if error.code is ServiceMapErrorCode.REVISION_CONFLICT:
+                return render_error_envelope(
+                    request, HTTP_409_CONFLICT, "conflict", error.detail
+                )
             return _validation_error(request, "custom_instructions", error.detail)
+
+    # A concurrent removal between the notes update and this read must
+    # refuse honestly instead of tripping the catalog assertion below.
+    if entry is None and runbook is None:
+        return render_error_envelope(
+            request,
+            HTTP_404_NOT_FOUND,
+            "not_found",
+            f"application {application_id} was not found",
+        )
 
     effective = entry
     if effective is None:
