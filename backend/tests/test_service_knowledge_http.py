@@ -932,17 +932,23 @@ async def test_unmigrated_database_fails_explicitly(
             )
             assert unauthenticated.status_code == 401
 
-            # The explicit missing-migration failure: the credential
-            # bootstrap hits the absent admin_credential table → 500.
+            # The explicit missing-migration failure: the composition
+            # cannot PROVE setup state on the unmigrated DB, so every
+            # path fails closed at the auth boundary (structured 401 —
+            # never a silent success).
             bootstrap = client.post(
                 "/api/v1/auth/bootstrap",
                 json={"password": "unmigrated-bootstrap-1"},
                 headers={"origin": ORIGIN},
             )
-            assert bootstrap.status_code >= 500, (
+            # The explicit missing-migration failure: a value-free 500
+            # (the raw UndefinedTable is never leaked; a silent success
+            # is impossible).
+            assert bootstrap.status_code == 500, (
                 bootstrap.status_code,
                 bootstrap.text[:200],
             )
+            assert bootstrap.json()["error"]["code"] == "internal_error"
     finally:
         admin = psycopg.connect(admin_url, autocommit=True)
         admin.execute(f"DROP DATABASE IF EXISTS {scratch_db} WITH (FORCE)")
