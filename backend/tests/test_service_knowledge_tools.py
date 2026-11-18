@@ -28,18 +28,22 @@ from mai.applications.knowledge_contracts import (
     OperationStatus,
 )
 from mai.applications.knowledge_read import KnowledgeReadStore
+from mai.applications.learning_operations import LearningOperationStore
 from mai.applications.service_map import (
     CAPABILITY_ID as UPSERT_MAP_CAPABILITY,
 )
 from mai.capabilities.service_knowledge import (
     GET_LEARNING_STATUS_CAPABILITY_ID,
     GET_SERVICE_KNOWLEDGE_CAPABILITY_ID,
+    LEARN_SERVICE_CAPABILITY_ID,
     GetLearningStatusCapability,
     GetServiceKnowledgeCapability,
+    LearnServiceCapability,
     RESOLVE_SERVICE_CAPABILITY_ID,
     ResolveServiceCapability,
     get_learning_status_descriptor,
     get_service_knowledge_descriptor,
+    learn_service_descriptor,
     resolve_service_descriptor,
 )
 from mai.applications.service_map import ServiceMapStore
@@ -915,3 +919,421 @@ def test_learning_status_envelope_matches_descriptor_keys(
         assert required <= emitted, (
             f"{descriptor_id}: missing required keys {required - emitted}"
         )
+
+
+# ---------------------------------------------------------------------------
+# ask_21: app.learn_service — the authorized durable admission tool
+# ---------------------------------------------------------------------------
+
+_LEARN_REF = "00000000-0000-4000-8000-000000000001"
+
+_LEARN_FACTS = [
+    {
+        "category": "deployment",
+        "key": "health-path",
+        "statement": "health lives at /healthz",
+        "source_kind": "tool_result",
+        "source_refs": [_LEARN_REF],
+    }
+]
+
+
+class _RecordingEngine:
+    """Engine seam fake that acknowledges every enqueue once."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(self, workflow_id: str) -> None:
+        self.calls.append(workflow_id)
+
+
+class _FailingEngine:
+    """Engine seam fake that never acknowledges an enqueue."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(self, workflow_id: str) -> None:
+        raise RuntimeError("simulated engine outage: no acknowledgment")
+
+
+_LEARN_DESCRIPTORS = {
+    descriptor.identifier: descriptor
+    for descriptor in (
+        resolve_service_descriptor(),
+        get_service_knowledge_descriptor(),
+        get_learning_status_descriptor(),
+        learn_service_descriptor(),
+    )
+}
+
+
+def _learn_capability(
+    factory: async_sessionmaker, engine: object
+) -> LearnServiceCapability:
+    return LearnServiceCapability(
+        LearningOperationStore(factory), engine_enqueue=engine
+    )
+
+
+def _learn_call(
+    payload: dict[str, object],
+    *,
+    op_id: uuid.UUID,
+    run_id: uuid.UUID | None = None,
+    server_id: uuid.UUID = SERVER_A,
+):
+    from mai.capabilities.dispatch import CapabilityCall
+    from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+    return CapabilityCall(
+        descriptor=learn_service_descriptor(),
+        payload=dict(payload),
+        context=ExecutionContext(
+            principal="principal",
+            server_id=server_id,
+            run_id=run_id if run_id is not None else uuid.uuid4(),
+            parent_scope=None,
+            profile_revision="1",
+            prompt_revision="1",
+            credential_references=(),
+            allowed_capabilities=("app.learn_service",),
+            mode=PolicyMode.DELEGATED,
+        ),
+        credentials={},
+        op_id=op_id,
+    )
+
+
+def _learning_op_row(migrated_url: str, operation_id: uuid.UUID) -> dict | None:
+    with psycopg.connect(migrated_url) as conn:
+        row = conn.execute(
+            "SELECT operation_id, status, source_tool_call_id, workflow_id "
+            "FROM service_learning_operation WHERE operation_id = %s",
+            (str(operation_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "operation_id": row[0],
+        "status": row[1],
+        "source_tool_call_id": row[2],
+        "workflow_id": row[3],
+    }
+
+
+def _op_rows_for_run(migrated_url: str, run_id: uuid.UUID) -> list[dict]:
+    with psycopg.connect(migrated_url) as conn:
+        rows = conn.execute(
+            "SELECT operation_id, status FROM service_learning_operation "
+            "WHERE source_run_id = %s",
+            (str(run_id),),
+        ).fetchall()
+    return [{"operation_id": r[0], "status": r[1]} for r in rows]
+
+
+def test_learn_descriptor_ready_and_ids_distinct() -> None:
+    from mai.applications.service_map import CAPABILITY_ID as UPSERT_ID
+    from mai.capabilities.internal_api import assert_agent_ready_descriptor
+
+    descriptor = learn_service_descriptor()
+    assert_agent_ready_descriptor(descriptor)
+    assert descriptor.identifier == LEARN_SERVICE_CAPABILITY_ID
+    assert descriptor.effect_class == "mutate"
+    ids = set(_LEARN_DESCRIPTORS)
+    assert len(ids) == 4
+    assert UPSERT_ID not in ids
+    assert LEARN_SERVICE_CAPABILITY_ID != UPSERT_ID
+
+
+def test_learn_happy_path_admission_and_db_row(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    engine = _RecordingEngine()
+    capability = _learn_capability(factory, engine)
+    run_id = uuid.uuid4()
+    op_id = uuid.uuid4()
+
+    result = _run(capability.__call__(_learn_call(
+        {
+            "application_id": str(APP_MAIN_ID),
+            "facts": _LEARN_FACTS,
+            "expected_generation": 1,
+        },
+        op_id=op_id,
+        run_id=run_id,
+    )))
+    assert result.ok is True, result.output
+    envelope = json.loads(result.output)
+    operation_id = uuid.UUID(envelope["operation_id"])
+    assert envelope["status"] == "ok"
+    assert envelope["receipt_status"] == "accepted"
+    assert envelope["workflow_id"] == f"service.learn:{operation_id}"
+    assert envelope["replayed"] is False
+    assert envelope["coalesced"] is False
+    assert envelope["budget_used"] == 1
+    assert envelope["budget_limit"] == 16
+    assert envelope["job_run_id"] is None  # honest: DBOS binding is slice 22/36
+    assert envelope["poll_operation_id"] == str(operation_id)
+    assert engine.calls == [envelope["workflow_id"]]
+
+    row = _learning_op_row(migrated_url, operation_id)
+    assert row is not None
+    assert row["status"] == "accepted"
+    assert row["source_tool_call_id"] == str(op_id)
+    assert row["workflow_id"] == envelope["workflow_id"]
+
+
+def test_learn_duplicate_same_call_replays_same_receipt(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    engine = _RecordingEngine()
+    capability = _learn_capability(factory, engine)
+    run_id = uuid.uuid4()
+    op_id = uuid.uuid4()
+    payload = {"facts": _LEARN_FACTS, "expected_generation": 1}
+
+    first = _run(capability.__call__(_learn_call(
+        payload, op_id=op_id, run_id=run_id
+    )))
+    assert first.ok is True
+    first_env = json.loads(first.output)
+
+    replay = _run(capability.__call__(_learn_call(
+        payload, op_id=op_id, run_id=run_id
+    )))
+    assert replay.ok is True, replay.output
+    replay_env = json.loads(replay.output)
+    assert replay_env["replayed"] is True
+    assert replay_env["coalesced"] is False
+    assert replay_env["operation_id"] == first_env["operation_id"]
+    assert replay_env["budget_used"] == 1  # duplicate never wastes budget
+    assert engine.calls == [first_env["workflow_id"]]  # enqueued only once
+
+
+def test_learn_changed_same_call_payload_conflicts(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    capability = _learn_capability(factory, _RecordingEngine())
+    run_id = uuid.uuid4()
+    op_id = uuid.uuid4()
+
+    first = _run(capability.__call__(_learn_call(
+        {"facts": _LEARN_FACTS, "expected_generation": 1},
+        op_id=op_id, run_id=run_id,
+    )))
+    assert first.ok is True
+
+    changed = [dict(_LEARN_FACTS[0])]
+    changed[0]["statement"] = "health moved to /health"
+    conflict = _run(capability.__call__(_learn_call(
+        {"facts": changed, "expected_generation": 1},
+        op_id=op_id, run_id=run_id,
+    )))
+    assert conflict.ok is False
+    assert json.loads(conflict.output)["code"] == "payload_conflict"
+    assert len(_op_rows_for_run(migrated_url, run_id)) == 1  # no new row
+
+
+def test_learn_budget_exhaustion_refuses_seventeenth(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    capability = _learn_capability(factory, _RecordingEngine())
+    run_id = uuid.uuid4()
+
+    budget_used_seen: list[int] = []
+    for index in range(16):
+        result = _run(capability.__call__(_learn_call(
+            {
+                "facts": [{
+                    "category": "budget",
+                    "key": f"k{index}",
+                    "statement": f"statement {index}",
+                    "source_kind": "tool_result",
+                    "source_refs": [_LEARN_REF],
+                }],
+                "expected_generation": 1,
+            },
+            op_id=uuid.uuid4(),
+            run_id=run_id,
+        )))
+        assert result.ok is True, result.output
+        budget_used_seen.append(json.loads(result.output)["budget_used"])
+    assert budget_used_seen == list(range(1, 17))
+
+    seventeenth = _run(capability.__call__(_learn_call(
+        {
+            "facts": [{
+                "category": "budget",
+                "key": "k-overflow",
+                "statement": "one too many",
+                "source_kind": "tool_result",
+                "source_refs": [_LEARN_REF],
+            }],
+            "expected_generation": 1,
+        },
+        op_id=uuid.uuid4(),
+        run_id=run_id,
+    )))
+    assert seventeenth.ok is False
+    envelope = json.loads(seventeenth.output)
+    assert envelope["code"] == "operation_budget_exceeded"
+    assert "16" in envelope["message"]
+
+
+def test_learn_enqueue_failure_queues_then_replay_reconciles(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    run_id = uuid.uuid4()
+    op_id = uuid.uuid4()
+    payload = {
+        "facts": [{
+            "category": "queue",
+            "key": "k1",
+            "statement": "queued statement",
+            "source_kind": "tool_result",
+            "source_refs": [_LEARN_REF],
+        }],
+        "expected_generation": 1,
+    }
+    operation_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:{op_id}"
+    )
+
+    failing = _learn_capability(factory, _FailingEngine())
+    refused = _run(failing.__call__(_learn_call(
+        payload, op_id=op_id, run_id=run_id
+    )))
+    assert refused.ok is False
+    assert json.loads(refused.output)["code"] == "enqueue_failed"
+
+    row = _learning_op_row(migrated_url, operation_id)
+    assert row is not None
+    assert row["status"] == "queued"  # honest durable request, not accepted
+
+    healthy = _RecordingEngine()
+    recovered = _run(_learn_capability(factory, healthy).__call__(_learn_call(
+        payload, op_id=op_id, run_id=run_id
+    )))
+    assert recovered.ok is True, recovered.output
+    envelope = json.loads(recovered.output)
+    assert envelope["replayed"] is True
+    assert envelope["receipt_status"] == "accepted"
+    assert healthy.calls == [f"service.learn:{operation_id}"]
+    assert _learning_op_row(migrated_url, operation_id)["status"] == "accepted"
+
+
+def test_learn_scope_confirm_mismatch_absent(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    capability = _learn_capability(factory, _RecordingEngine())
+
+    confirmed = _run(capability.__call__(_learn_call(
+        {"facts": _LEARN_FACTS, "expected_generation": 1,
+         "server_id": str(SERVER_A)},
+        op_id=uuid.uuid4(),
+    )))
+    assert confirmed.ok is True, confirmed.output
+
+    mismatched = _run(capability.__call__(_learn_call(
+        {"facts": _LEARN_FACTS, "expected_generation": 1,
+         "server_id": str(SERVER_B)},
+        op_id=uuid.uuid4(),
+    )))
+    assert mismatched.ok is False
+    assert json.loads(mismatched.output)["code"] == "scope_mismatch"
+
+    absent = _run(capability.__call__(_learn_call(
+        {"facts": _LEARN_FACTS, "expected_generation": 1},
+        op_id=uuid.uuid4(),
+    )))
+    assert absent.ok is True, absent.output
+    assert json.loads(absent.output)["budget_used"] == 1
+
+
+def test_learn_payload_validation_refusals(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    capability = _learn_capability(factory, _RecordingEngine())
+
+    invalid_payloads = [
+        {"facts": [], "expected_generation": 1},  # empty facts
+        {
+            "facts": [
+                {
+                    "category": "c",
+                    "key": f"k{i}",
+                    "statement": "s",
+                    "source_kind": "tool_result",
+                    "source_refs": [_LEARN_REF],
+                }
+                for i in range(9)
+            ],  # 9 facts
+            "expected_generation": 1,
+        },
+        {
+            "facts": [{
+                "category": "c",
+                "key": "k",
+                "statement": "s",
+                "source_kind": "tool_result",
+                "source_refs": [_LEARN_REF] * 5,  # 5 source refs
+            }],
+            "expected_generation": 1,
+        },
+        {
+            "facts": [{
+                "category": "c",
+                "key": "k",
+                "statement": "x" * 801,  # statement too long
+                "source_kind": "tool_result",
+                "source_refs": [_LEARN_REF],
+            }],
+            "expected_generation": 1,
+        },
+        {
+            "facts": _LEARN_FACTS,
+            "expected_generation": 1,
+            "unexpected_extra": True,  # extra field
+        },
+    ]
+    for payload in invalid_payloads:
+        result = _run(capability.__call__(_learn_call(
+            payload, op_id=uuid.uuid4()
+        )))
+        assert result.ok is False, result.output
+        assert json.loads(result.output)["code"] == "invalid_request"
+
+
+def test_learn_missing_engine_fails_closed_at_construction(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    store = LearningOperationStore(factory)
+    with pytest.raises(ValueError):
+        LearnServiceCapability(store)
+    with pytest.raises(ValueError):
+        LearnServiceCapability(store, engine_enqueue=None)
+    with pytest.raises(ValueError):
+        LearnServiceCapability(object(), engine_enqueue=_RecordingEngine())
+
+
+def test_learn_envelope_honesty_and_bound(
+    tmp_path: Path, migrated_url: str, factory: async_sessionmaker
+) -> None:
+    descriptor = learn_service_descriptor()
+    capability = _learn_capability(factory, _RecordingEngine())
+
+    result = _run(capability.__call__(_learn_call(
+        {"facts": _LEARN_FACTS, "expected_generation": 1},
+        op_id=uuid.uuid4(),
+    )))
+    assert result.ok is True, result.output
+    envelope = json.loads(result.output)
+    assert len(result.output.encode("utf-8")) < 65536
+
+    schema = descriptor.output_schema
+    declared = set(schema["properties"])
+    required = set(schema["required"])
+    assert required <= set(envelope)
+    assert set(envelope) <= declared
