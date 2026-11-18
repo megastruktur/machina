@@ -1609,26 +1609,35 @@ def build_internal_api_capabilities(
     effective_locks: ResourceLockService | None = locks
     if session_factory is not None and service_map is not None:
         learning_store = LearningOperationStore(session_factory)  # type: ignore[arg-type]
-        if effective_locks is None:
-            bind = getattr(session_factory, "kw", {}).get("bind")
-            bind_url = getattr(bind, "url", None)
-            if bind is not None and bind_url is not None:
-                dsn = (
-                    bind_url.render_as_string(hide_password=False)
-                    .replace("postgresql+asyncpg://", "postgresql://")
-                    .replace("postgres+asyncpg://", "postgresql://")
-                )
-                effective_locks = ResourceLockService(dsn)
-        if effective_locks is not None:
-            coordinator = metadata_coordinator or MetadataMutationCoordinator(
-                locks=effective_locks,
-                map_store=service_map,
-                learning=learning_store,
-                adoption=(
-                    adoption if isinstance(adoption, ApplicationAdoption) else None
-                ),
-                sessions=session_factory,  # type: ignore[arg-type]
+        if metadata_coordinator is not None:
+            # An explicitly injected coordinator is ALWAYS honored — even
+            # without (or with an underivable) locks service; its own
+            # lock service performs the releases.
+            coordinator = metadata_coordinator
+            effective_locks = locks or getattr(
+                metadata_coordinator, "_locks", None
             )
+        else:
+            if effective_locks is None:
+                bind = getattr(session_factory, "kw", {}).get("bind")
+                bind_url = getattr(bind, "url", None)
+                if bind is not None and bind_url is not None:
+                    dsn = (
+                        bind_url.render_as_string(hide_password=False)
+                        .replace("postgresql+asyncpg://", "postgresql://")
+                        .replace("postgres+asyncpg://", "postgresql://")
+                    )
+                    effective_locks = ResourceLockService(dsn)
+            if effective_locks is not None:
+                coordinator = metadata_coordinator or MetadataMutationCoordinator(
+                    locks=effective_locks,
+                    map_store=service_map,
+                    learning=learning_store,
+                    adoption=(
+                        adoption if isinstance(adoption, ApplicationAdoption) else None
+                    ),
+                    sessions=session_factory,  # type: ignore[arg-type]
+                )
 
     async def _identity_suppressed(
         session_factory: Callable[[], Any],
@@ -1654,12 +1663,15 @@ def build_internal_api_capabilities(
     def _release_leases(held: Sequence[Any]) -> None:
         """Release coordinator-acquired leases in reverse order (a lease
         that lapsed mid-operation was already fenced by the touch).
-        Releases through the SAME locks instance the coordinator used
-        (the auto-derived service when ``locks`` was omitted)."""
+        Releases through the coordinator's OWN lock service when one is
+        injected, else through the builder's (possibly auto-derived)
+        service."""
+        lock_svc = getattr(coordinator, "_locks", None) or effective_locks
         for lease in reversed(tuple(held)):
-            assert effective_locks is not None
+            if lock_svc is None:
+                return
             try:
-                effective_locks.release(lease)
+                lock_svc.release(lease)
             except ResourceLockError:
                 pass
 
@@ -2385,7 +2397,9 @@ def build_internal_api_capabilities(
                     f"no service map entry stored for {application_id}",
                 )
             # A canonically adopted entry is never deleted behind the
-            # adoption seam's back: app.unadopt owns that path.
+            # adoption seam's back: app.unadopt owns that path. A FAILED
+            # adoption read (unhealthy store) refuses the deletion — it
+            # must NEVER be treated as "no adoption record" (fail-closed).
             adoption_record = None
             if adoption is not None and isinstance(adoption, ApplicationAdoption):
                 try:
@@ -2393,7 +2407,10 @@ def build_internal_api_capabilities(
                         server_id, application_id
                     )
                 except Exception:
-                    adoption_record = None
+                    raise InternalApiError(
+                        "unavailable",
+                        "adoption state could not be verified; deletion refused",
+                    ) from None
             if existing.origin != "manual" or adoption_record is not None:
                 raise InternalApiError(
                     "conflict",

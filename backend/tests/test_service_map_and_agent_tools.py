@@ -2332,3 +2332,157 @@ async def test_internal_api_writers_fail_closed_when_coordinator_dependencies_ab
         )
     # Not a single byte was written to the map.
     assert map_store.list_entries(SERVER_A) == ()
+
+
+async def test_internal_api_delete_map_entry_fails_closed_on_adoption_read_error(
+    live_app: FastAPI,
+    bootstrapped_url: str,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+) -> None:
+    """An UNHEALTHY adoption store must refuse the deletion (fail-closed):
+    a failed ``adoption.read`` is never treated as "no adoption record"."""
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.jobs.resource_locks import ResourceLockService
+
+    coordinator_locks = ResourceLockService(bootstrapped_url)
+    coordinator_locks.ensure_schema()
+    composition = build_internal_api_capabilities(
+        applications=live_app.state.applications,
+        adoption=live_app.state.app_adoption,
+        docs=live_app.state.app_docs,
+        service_map=live_app.state.service_map,
+        session_factory=live_app.state.session_factory,
+        locks=coordinator_locks,
+    )
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+    ctx = _context(("app.adopt", "app.delete_map_entry"), server_id=server_a)
+    tag = uuid.uuid4().hex[:8]
+    manual = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"failclosed-{tag}",
+                "origin": "manual",
+                "custom_instructions": "notes",
+            },
+            ctx,
+        )
+    )
+    assert manual.ok is True, manual.output
+    aid = uuid.uuid5(server_a, f"service-map:failclosed-{tag}")
+
+    original_read = live_app.state.app_adoption.read
+
+    async def _failing_read(server_id: uuid.UUID, application_id: uuid.UUID):
+        raise RuntimeError("adoption store unavailable")
+
+    live_app.state.app_adoption.read = _failing_read  # type: ignore[method-assign]
+    try:
+        refused = await composition.executors["app.delete_map_entry"](
+            _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
+        )
+    finally:
+        live_app.state.app_adoption.read = original_read  # type: ignore[method-assign]
+
+    assert refused.ok is False
+    envelope = json.loads(refused.output)
+    assert envelope["code"] == "unavailable"
+    assert "adoption state could not be verified" in envelope["message"]
+
+    # Fail-closed: the entry is untouched and NO tombstone was fabricated.
+    assert live_app.state.service_map.get_entry(server_a, aid) is not None
+    with psycopg.connect(bootstrapped_url) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM service_knowledge_identity WHERE "
+            "server_id = %s AND application_id = %s",
+            (str(server_a), str(aid)),
+        ).fetchone()
+    assert row is not None and row[0] == 0
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+    # With the store healthy again the same delete succeeds honestly.
+    removed = await composition.executors["app.delete_map_entry"](
+        _call("app.delete_map_entry", {"application_id": str(aid)}, ctx)
+    )
+    assert removed.ok is True, removed.output
+    assert json.loads(removed.output)["removed"] is True
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
+
+
+async def test_internal_api_injected_metadata_coordinator_is_honored(
+    live_app: FastAPI,
+    bootstrapped_url: str,
+    jar: dict[str, str],
+    server_a: uuid.UUID,
+) -> None:
+    """An explicitly injected ``metadata_coordinator`` is honored EVEN with
+    ``locks=None``, and its own lock service performs the releases."""
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+    from mai.capabilities.internal_api import build_internal_api_capabilities
+    from mai.jobs.resource_locks import ResourceLockService
+
+    coordinator_locks = ResourceLockService(bootstrapped_url)
+    coordinator_locks.ensure_schema()
+    injected = MetadataMutationCoordinator(
+        locks=coordinator_locks,
+        map_store=live_app.state.service_map,
+        learning=LearningOperationStore(live_app.state.session_factory),
+        adoption=live_app.state.app_adoption,
+        sessions=live_app.state.session_factory,
+    )
+    composition = build_internal_api_capabilities(
+        applications=live_app.state.applications,
+        adoption=live_app.state.app_adoption,
+        docs=live_app.state.app_docs,
+        service_map=live_app.state.service_map,
+        session_factory=live_app.state.session_factory,
+        locks=None,
+        metadata_coordinator=injected,
+    )
+
+    def _call(
+        cap_id: str, payload: Mapping[str, Any], ctx: ExecutionContext
+    ) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=desc_by_id[cap_id],
+            payload=dict(payload),
+            context=ctx,
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    desc_by_id = {d.identifier: d for d in composition.descriptors}
+    ctx = _context(("app.adopt",), server_id=server_a)
+    tag = uuid.uuid4().hex[:8]
+    adopted = await composition.executors["app.adopt"](
+        _call(
+            "app.adopt",
+            {
+                "name": f"injected-{tag}",
+                "origin": "manual",
+                "custom_instructions": "injected notes",
+            },
+            ctx,
+        )
+    )
+    assert adopted.ok is True, adopted.output
+    aid = uuid.uuid5(server_a, f"service-map:injected-{tag}")
+    assert live_app.state.service_map.get_entry(server_a, aid) is not None
+    # The leases were taken AND released through the injected
+    # coordinator's own lock service.
+    assert coordinator_locks.inspect(str(server_a), f"application:{aid}") is None
+    assert coordinator_locks.inspect(str(server_a), "service-metadata") is None
