@@ -2930,13 +2930,19 @@ _KNOWLEDGE_CAPABILITY_IDS = (
 )
 
 
-async def test_knowledge_capabilities_compose_identically_and_never_autogrant() -> None:
-    """HTTP-style and worker-style compositions expose IDENTICAL
-    descriptor id sets (both call the ONE shared builder); the four
+async def test_knowledge_capabilities_compose_identically_and_never_autogrant(
+    tmp_path: Path,
+    migrated_url: str,
+) -> None:
+    """HTTP-style and worker-style compositions with DIFFERENT
+    dependency configurations (all-absent vs service_map + real
+    session factory over the fixture DB) expose IDENTICAL descriptor
+    id sets (both call the ONE shared builder); the four
     service-knowledge capabilities are registered + executor-backed in
-    both; every composed descriptor passes the fail-closed gate; the
-    ids stay OUT of the frozen grant vocabulary; and double
-    registration of the same capability line is refused."""
+    both — ALWAYS, regardless of dependency availability; every
+    composed descriptor passes the fail-closed gate; the ids stay OUT
+    of the frozen grant vocabulary; and double registration of the
+    same capability line is refused."""
     from mai.capabilities.internal_api import (
         INTERNAL_API_CAPABILITY_IDS,
         assert_agent_ready_descriptor,
@@ -2950,42 +2956,59 @@ async def test_knowledge_capabilities_compose_identically_and_never_autogrant() 
     )
     from mai.plugins.registry import CapabilityError
 
+    # HTTP-style: every dependency absent (fail-closed composition).
     http_comp = build_internal_api_capabilities(
         applications=None, adoption=None, docs=None, service_map=None
     )
-    worker_comp = build_internal_api_capabilities(
-        applications=None, adoption=None, docs=None, service_map=None
-    )
-    http_ids = {d.identifier for d in http_comp.descriptors}
-    worker_ids = {d.identifier for d in worker_comp.descriptors}
-    assert http_ids == worker_ids
 
-    for cap_id in _KNOWLEDGE_CAPABILITY_IDS:
-        assert cap_id in http_ids
-        assert cap_id in http_comp.executors
-        assert cap_id in worker_comp.executors
-        # Registered, NEVER auto-granted.
-        assert cap_id not in INTERNAL_API_CAPABILITY_IDS
-    for desc in http_comp.descriptors:
-        assert_agent_ready_descriptor(desc)
-    # The rich service_knowledge descriptors pass the SAME gate.
-    for desc in (
-        resolve_service_descriptor(),
-        get_service_knowledge_descriptor(),
-        get_learning_status_descriptor(),
-        learn_service_descriptor(),
-    ):
-        assert_agent_ready_descriptor(desc)
+    # Worker-style: a DIFFERENT dependency configuration — the Service
+    # Map store and a real session factory over the fixture DB (the
+    # read store derives from them). Identical descriptor ids must hold
+    # ACROSS the differing configurations: registration is
+    # availability-independent.
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        worker_comp = build_internal_api_capabilities(
+            applications=None,
+            adoption=None,
+            docs=None,
+            service_map=_store(tmp_path),
+            session_factory=session_factory,
+        )
+        http_ids = {d.identifier for d in http_comp.descriptors}
+        worker_ids = {d.identifier for d in worker_comp.descriptors}
+        assert http_ids == worker_ids
 
-    # Worker-side registration discipline (worker.py): every composed
-    # descriptor registers fail-closed; the SAME capability line cannot
-    # register twice (the internal-API projection and the native
-    # service_knowledge descriptor share identifier+version).
-    registry = CapabilityRegistry()
-    for desc in worker_comp.descriptors:
-        registry.register(desc)
-    with pytest.raises(CapabilityError):
-        registry.register(learn_service_descriptor())
+        for cap_id in _KNOWLEDGE_CAPABILITY_IDS:
+            # Descriptors and executors are ALWAYS registered — present
+            # in the all-absent HTTP-style composition too.
+            assert cap_id in http_ids
+            assert cap_id in http_comp.executors
+            assert cap_id in worker_comp.executors
+            # Registered, NEVER auto-granted.
+            assert cap_id not in INTERNAL_API_CAPABILITY_IDS
+        for desc in http_comp.descriptors:
+            assert_agent_ready_descriptor(desc)
+        # The rich service_knowledge descriptors pass the SAME gate.
+        for desc in (
+            resolve_service_descriptor(),
+            get_service_knowledge_descriptor(),
+            get_learning_status_descriptor(),
+            learn_service_descriptor(),
+        ):
+            assert_agent_ready_descriptor(desc)
+
+        # Worker-side registration discipline (worker.py): every composed
+        # descriptor registers fail-closed; the SAME capability line cannot
+        # register twice (the internal-API projection and the native
+        # service_knowledge descriptor share identifier+version).
+        registry = CapabilityRegistry()
+        for desc in worker_comp.descriptors:
+            registry.register(desc)
+        with pytest.raises(CapabilityError):
+            registry.register(learn_service_descriptor())
+    finally:
+        await engine.dispose()
 
 
 async def test_absent_knowledge_dependencies_answer_unavailable() -> None:
@@ -3027,9 +3050,13 @@ async def test_absent_knowledge_dependencies_answer_unavailable() -> None:
             op_id=uuid.uuid4(),
         )
         result = await comp.executors[cap_id](call)
+        assert result.ok is False, result.output
         envelope = json.loads(result.output)
-        assert envelope["status"] == "unavailable", envelope
-        assert envelope["code"] == "unavailable"
+        # Sibling discipline: the structured unavailable refusal
+        # (contract 2 — the jobs lane resolves it to FAILED, never
+        # status_unresolved).
+        assert envelope["status"] == "refused", envelope
+        assert envelope["code"] == "unavailable", envelope
 
 
 async def test_composed_knowledge_reads_execute_over_session_factory(
@@ -3104,7 +3131,7 @@ async def test_composed_knowledge_reads_execute_over_session_factory(
         learn_env = json.loads(
             (await comp.executors["app.learn_service"](learn_call)).output
         )
-        assert learn_env["status"] == "unavailable"
+        assert learn_env["status"] == "refused"
         assert learn_env["code"] == "unavailable"
     finally:
         await engine.dispose()
