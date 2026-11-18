@@ -84,6 +84,16 @@ When an operator tags `@service` in Chat (`service_tags`), `format_service_map_s
 
 ## 3. End-to-End Agent Workflow
 
+> **Read-only vs. authorized automation:** `app.discover` is READ-ONLY —
+> it observes the host and writes nothing, ever. Adoption (`app.adopt`)
+> and durable learning (`app.learn_service`) are **standing authorized
+> automation** (Section 4): the administrator who exposes those
+> capabilities authorizes the durable pipeline to apply metadata changes
+> for that scope without per-step interactive approval. It is not a
+> blanket grant — every call still passes policy/dispatcher checks and
+> every write is fenced on canonical identity, generation, and
+> tombstones.
+
 ### Step 1: Add Application to Global Runbook Catalog
 > *"Add <App> to the catalog (research docs + fill in the schema)."*
 1. The agent searches upstream documentation via `web.search` and reads authoritative install/upgrade/backup docs via `web.read`.
@@ -103,3 +113,159 @@ When an operator tags `@service` in Chat (`service_tags`), `format_service_map_s
    - `installed`: `true` (verified present on host) or `false` (staged from catalog, not yet installed)
    - `custom_instructions`: Host-specific ports, paths, `.env` files, domains, and local operational notes
    - (`category`, `description`, and `instructions` are inherited automatically from the catalog recipe created in Step 1).
+
+---
+
+## 4. Read-Only Discovery vs. Standing Authorized Automatic Adoption
+
+The **explicit-admin convention** (C09 rule 1, C4) is often misread as
+"nothing ever happens automatically." The accurate model:
+
+- **`app.discover` never writes.** It is a read-only observation of the
+  host (paginated `limit`/`offset`). A runbook execution or diagnostic
+  run can discover freely without producing any adoption, map entry, or
+  learned fact.
+- **`app.adopt` / `app.learn_service` are standing authorized
+  automation.** When an administrator exposes these capabilities to a
+  session/server, that exposure authorizes the durable pipeline —
+  admission → durable queue → DBOS workflow → metadata coordinator —
+  to apply the metadata change for the requested scope WITHOUT a human
+  approving each step. Examples: a runbook `install` execution may
+  complete with an adoption applied in the background; an
+  `app.learn_service` call enqueues a preservation operation that lands
+  after the chat turn ends (foreground completion leaves accepted work
+  running).
+- **It is not a blanket grant.** Standing authorization is bounded by:
+  1. *Scope:* every call names its `server_id`; a different server is
+     rejected, never substituted (C01 rule 2 — no hidden selected-server
+     fallback).
+  2. *Identity fencing:* writes bind to the canonical
+     `(server_id, application_id)` identity and its generation; a stale
+     or relocated identity is a conflict, not a silent rewrite.
+  3. *Per-call policy:* the CapabilityDispatcher policy/approval checks
+     still run per call; no direct invocation bypasses them (C5).
+  4. *Revocation:* `app.unadopt` tombstones the identity — the standing
+     authorization for THAT identity ends immediately (below).
+- Skills and prompts never widen this surface: guidance text is
+  advisory context; `requires_capabilities` in a skill is a
+  *declaration* checked against the run's allowed set, never a grant.
+
+### Canonical Origin Limits
+
+`origin` is exactly one of `"compose"`, `"systemd_unit"`, or `"manual"`:
+- `compose` requires `compose_project` + `working_dir`;
+- `systemd_unit` requires `unit_name` (`.service` / `.socket` / `.timer`);
+- `manual` records a map-only identity without workload selectors.
+Standalone containers are refused (C09 rule 1 — no arbitrary manual
+fallback for them).
+
+### Tombstone Suppression (`auto_adopt_suppressed`)
+
+`app.unadopt` calls `suppress_for_unadopt(server_id, application_id)`
+(learning_operations, D4) BEFORE any map removal:
+- the service identity row is tombstoned — generation bumped and
+  `auto_adopt_suppressed = true` (`suppressed_at`,
+  `suppressed_generation` recorded); a tombstone row is created even
+  for identities that never existed;
+- every pending (queued/accepted/applying) preservation operation of
+  that identity is cancelled as `generation_superseded`;
+- afterwards any auto-adoption attempt raises
+  `ServiceAutoAdoptSuppressedError` — background work can never
+  silently re-adopt the service. Re-adoption requires an explicit
+  operator action (`app.adopt`), which clears the suppression;
+- facts and receipts stay intact as history.
+
+---
+
+## 5. Durable Preservation Statuses, Recovery, and Rollback
+
+Learned-note operations are durable (D5). The canonical status
+progression (`OperationStatus` in `knowledge_contracts.py`):
+
+```
+accepted → queued → applying → applied
+                            ├→ failed
+                            ├→ partial
+                            └→ unknown
+```
+
+- **`partial` and `unknown` are DISTINCT states and are never collapsed**
+  into each other or into `failed`: `partial` = some sub-effects
+  applied, others failed (`SubEffectStatus` per effect); `unknown` =
+  authoritative outcome not provable and needing reconciliation.
+- **Refusal semantics** travel as terminal `failed` outcomes plus stable
+  error codes — `authority_revoked`, `generation_superseded`,
+  `source_cancelled`, `selector_conflict`, `fact_conflict`,
+  `revision_conflict` — never as invented statuses.
+- **Recovery is bounded and startup-driven**, not a polling scheduler:
+  startup pages unsettled receipts and re-enqueues them through the
+  existing EngineClient; the `service.learn` workflow handler accepts a
+  minimal recovery enqueue payload and resolves
+  request/trusted-context from the admission registry or the durable
+  row. Crash windows reconcile — ambiguous outcomes stay
+  `unknown`/`partial` until authoritative state proves them.
+- **Retry** is explicit and authorized:
+  `POST .../knowledge/operations/{operation_id}/retry` (and the
+  `app.*`/UI equivalents) re-runs a CONFIRMED retryable failure with the
+  original identity and payload; a conflict cannot rewrite the approved
+  payload, tombstoned work is not retried, and unknown effects
+  reconcile instead of blindly retrying.
+- **Rollback is provenance-preserving:** retracting a fact marks it
+  `retracted` (never `DELETE`) and bumps its revision; adoption rollback
+  keeps the canonical record and unadopt keeps facts/receipts as
+  history. Nothing is silently erased.
+
+---
+
+## 6. Learned Operational Notes vs. Operator `custom_instructions`
+
+Two different knowledge channels with different owners:
+
+| | **Learned notes (facts)** | **`custom_instructions`** |
+|---|---|---|
+| Author | The durable learn pipeline (`app.learn_service`) | The operator (via `app.adopt` / map-details editing) |
+| Provenance | Per-fact `source` (`FactSourceKind`: `tool_result` \| `user_statement`) + bounded `source_refs` (≤ 4 × 256 chars); run/tool-call identity comes from trusted server context, never the model payload | None — operator's own words, injected verbatim |
+| Mutation | CAS: `expected_revision` (fact) + `expected_generation` (service) | Full-text edit with the map record's `expected_revision` |
+| Removal | Retraction marks `retracted` + bumps revision (never delete) | Overwritten by the next explicit operator save |
+| Agent writes | Only via `app.learn_service` (bounded 1–8 facts, ≤ 8 facts/request) | Never directly — only through an explicit adoption/map edit carrying operator-intended text |
+
+UI separation (Applications window): the pinned service's learned
+notes render in a dedicated read-only notes surface (facts, fact
+history, preservation receipts with pending/conflict status, operator
+retract with a bounded reason, and authorized retry) **beside** — never
+merged into — the editable `custom_instructions` textarea. The `@service`
+prompt injection carries `custom_instructions` verbatim; learned notes
+are retrieved on demand (`app.get_service_knowledge`), keeping the two
+channels distinguishable in the prompt as well.
+
+---
+
+## 7. Generation-Only Agent Secret Path
+
+The agent NEVER handles raw secret values (D6, C6):
+
+- **`secret.store` is generation/reference-only for agents.** The
+  agent-facing descriptor projection removes every raw secret-value
+  input, makes `generate` a required `const: true` argument, and any
+  raw secret field is rejected fail-closed BEFORE dispatch and before
+  history/checkpoint persistence. The store GENERATES a fresh secret
+  inside the vault (read-back verified) and returns the vault/item
+  reference. The registered descriptor itself is never mutated, so
+  trusted non-agent dispatcher callers keep the full contract (raw
+  `value` input there).
+- **Secret-only credential routing is latched.** Once any `secret.*`
+  capability (`secret.list`, `secret.get`, `secret.store`) is exposed —
+  or any `secret.*` call has been made — the run latches into
+  secret-only credential handling until it ends: list through
+  `secret.list`, references through `secret.get`, generation and
+  storage through `secret.store` (never a locally invented password).
+  Administrator customization cannot relax the latch.
+- **Unsupported consumers are VISIBLE.** A consumer that cannot safely
+  use a secret reference stops with an actionable unsupported reason —
+  `host.shell`, for example, handles SSH identity refs only. There is
+  no plaintext fallback, no environment/file/op-CLI search for
+  credentials, and notes store authorized secret REFERENCES (handles)
+  only — never values, passwords, or password hashes.
+- Knowledge and adoption surfaces inherit the same rule: facts,
+  findings, and `custom_instructions` carry references, never secret
+  values.
