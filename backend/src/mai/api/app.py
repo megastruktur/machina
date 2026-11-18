@@ -114,7 +114,13 @@ from mai.applications.adopt import (
     ApplicationManifestStore,
 )
 from mai.applications.document import ApplicationDocService
+from mai.applications.knowledge_read import KnowledgeReadStore
+from mai.applications.learning_operations import LearningOperationStore
+from mai.applications.metadata_mutations import MetadataMutationCoordinator
 from mai.applications.service_map import ServiceMapStore
+from mai.jobs.engine import EngineClient, EngineError
+from mai.jobs.resource_locks import ResourceLockService
+from mai.jobs.service_learning import build_engine_enqueue
 from mai.skills.builtin import seed_builtin_skills
 from mai.auth.sessions import AuthError, SessionStore
 from mai.capabilities.dispatch import CapabilityDispatcher
@@ -344,6 +350,46 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         except OSError:
             app.state.service_map = None
+        # ask_24: the knowledge/coordinator/operation dependencies are
+        # created ONCE in this composition root and SHARED into the
+        # internal-API capability builder — the agent lane and the HTTP
+        # knowledge routes see the SAME instances (no module-level mutable
+        # singletons; everything hangs off ``app.state``). The coordinator
+        # is the slice-16 lease seam over the SAME map store, operation
+        # store and adoption service. The learn enqueue seam binds a BARE
+        # queue client (lazy connection, client-only) to the deterministic
+        # workflow-id derivation: the durable engine itself is launched by
+        # the worker process, NEVER here.
+        app.state.learning_operations = None
+        app.state.knowledge_read = None
+        app.state.metadata_coordinator = None
+        app.state.learn_engine_client = None
+        app.state.learn_engine_enqueue = None
+        if app.state.session_factory is not None:
+            app.state.learning_operations = LearningOperationStore(
+                app.state.session_factory
+            )
+            if app.state.service_map is not None:
+                app.state.knowledge_read = KnowledgeReadStore(
+                    app.state.session_factory, app.state.service_map
+                )
+                app.state.metadata_coordinator = MetadataMutationCoordinator(
+                    locks=ResourceLockService(url),
+                    map_store=app.state.service_map,
+                    learning=app.state.learning_operations,
+                    adoption=app.state.app_adoption,
+                    sessions=app.state.session_factory,
+                )
+        try:
+            app.state.learn_engine_client = EngineClient(url)
+            app.state.learn_engine_enqueue = build_engine_enqueue(
+                app.state.learn_engine_client
+            )
+        except EngineError:
+            # A non-queueable URL leaves the seam honestly absent: the
+            # learn capability answers the structured unavailable refusal.
+            app.state.learn_engine_client = None
+            app.state.learn_engine_enqueue = None
         # Internal API → Agent Tool surface (C09/C06): every declared
         # internal API operation (service adoption/unadoption, discovery,
         # inventory listing, Service Map CRUD) becomes a chat-agent tool
@@ -362,6 +408,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 if app.state.knowledge is not None
                 else None
             ),
+            metadata_coordinator=app.state.metadata_coordinator,
+            knowledge_read=app.state.knowledge_read,
+            learning_operations=app.state.learning_operations,
+            learn_engine_enqueue=app.state.learn_engine_enqueue,
         )
         # History-tag tools (W4D; D09 job-only): the composition seam —
         # the ``tags.*`` surface joins the one ``app.state.internal_api``
@@ -506,6 +556,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery = getattr(app.state, "job_recovery", None)
         if recovery is not None:
             recovery.close()
+        # The learn enqueue seam's bare queue client owns its own
+        # system-database pool (lazy): release it with the other
+        # client-owned facades, before the app engine goes away.
+        learn_client = getattr(app.state, "learn_engine_client", None)
+        if learn_client is not None:
+            learn_client.close()
         engine = getattr(app.state, "engine", None)
         if engine is not None:
             await engine.dispose()

@@ -2185,3 +2185,121 @@ async def test_delegation_narrows_the_admitted_surface(
     assert "secret.store" not in effective
     assert "secret.list" in effective
     assert "web.search" in effective
+
+
+# ---------------------------------------------------------------------------
+# ask_24: the API composition root shares the knowledge/learning
+# dependencies (one instance family; client-only queue seam)
+# ---------------------------------------------------------------------------
+
+
+async def test_api_composition_shares_knowledge_dependencies_and_queue_seam(
+    app_fixture: FastAPI, tmp_path: Path
+) -> None:
+    import json
+
+    from mai.applications.knowledge_read import KnowledgeReadStore
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+    from mai.capabilities.dispatch import CapabilityCall
+    from mai.jobs import engine as jobs_engine
+    from mai.jobs.engine import EngineClient
+    from mai.policy.evaluate import ExecutionContext, PolicyMode
+
+    app = app_fixture
+    # AC 1: the API process NEVER launches the durable engine — no
+    # launch-recovery scheduler, no stolen pending workflows.
+    assert jobs_engine._LAUNCHED is None
+
+    # The composition root created the shared dependency family.
+    assert isinstance(app.state.knowledge_read, KnowledgeReadStore)
+    assert isinstance(app.state.learning_operations, LearningOperationStore)
+    assert isinstance(app.state.metadata_coordinator, MetadataMutationCoordinator)
+    assert isinstance(app.state.learn_engine_client, EngineClient)
+    assert callable(app.state.learn_engine_enqueue)
+    # The coordinator SHARES the composition's own instances (identity,
+    # not copies): one map store, one operation store, one adoption seam.
+    assert (
+        app.state.metadata_coordinator._learning
+        is app.state.learning_operations
+    )
+    assert app.state.metadata_coordinator._map_store is app.state.service_map
+    assert app.state.metadata_coordinator._adoption is app.state.app_adoption
+
+    comp = app.state.internal_api
+    by_id = {d.identifier: d for d in comp.descriptors}
+    application_id = uuid.uuid4()
+
+    def _call(cap_id: str, payload: dict[str, object]) -> CapabilityCall:
+        return CapabilityCall(
+            descriptor=by_id[cap_id],
+            payload=dict(payload),
+            context=ExecutionContext(
+                principal="principal",
+                server_id=SERVER_A,
+                run_id=uuid.uuid4(),
+                parent_scope=None,
+                profile_revision="1",
+                prompt_revision="1",
+                credential_references=(),
+                allowed_capabilities=(cap_id,),
+                mode=PolicyMode.DELEGATED,
+            ),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+
+    with TestClient(app):  # lifespan runs the composition
+        learn_env = json.loads(
+            (
+                await comp.executors["app.learn_service"](
+                    _call(
+                        "app.learn_service",
+                        {
+                            "application_id": str(application_id),
+                            "facts": [
+                                {
+                                    "category": "deployment",
+                                    "key": "health-path",
+                                    "statement": "health lives at /healthz",
+                                    "source_kind": "tool_result",
+                                    "source_refs": [str(uuid.uuid4())],
+                                }
+                            ],
+                            "expected_generation": 1,
+                        },
+                    )
+                )
+            ).output
+        )
+        assert learn_env["status"] == "ok", learn_env
+        assert learn_env["accepted"] is True
+        assert learn_env["receipt_status"] == "accepted"
+        operation_id = learn_env["operation_id"]
+
+        # The REAL queue client recorded the deterministic workflow
+        # (client-only: enqueue without a launched scheduler).
+        assert (
+            app.state.learn_engine_client.run_state(str(operation_id))
+            is not None
+        )
+
+        # The SAME admission is readable through the lane's SHARED read
+        # store — one instance family across the API surface.
+        status_env = json.loads(
+            (
+                await comp.executors["app.get_learning_status"](
+                    _call(
+                        "app.get_learning_status",
+                        {"application_id": str(application_id)},
+                    )
+                )
+            ).output
+        )
+        assert status_env["found"] is True, status_env
+        assert status_env["operation_id"] == operation_id
+        assert status_env["receipt_status"] == "accepted"
+
+    # The learn client's system-database pool is released at shutdown.
+    assert app.state.learn_engine_client is not None
+    app.state.learn_engine_client.close()  # idempotent second close
