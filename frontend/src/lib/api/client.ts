@@ -85,89 +85,15 @@ type KnowledgeRetractBody = components['schemas']['RetractBody'];
 type KnowledgeOperationStatus = NonNullable<components['schemas']['OperationStatus']>;
 
 /**
- * Narrow document views over the knowledge routes' bodies. The routes
- * hand back plain JSONResponse documents, so the OpenAPI 200 content is
- * `unknown` by construction — the same discipline as `HealthOk` above:
- * these mirrors document the OBSERVED bodies, and everything
- * constraint-bearing (the CAS body, the status vocabulary) stays
- * schema-derived via `components`. The full document is the backend's;
- * these carry the fields the D7 surface reads today.
+ * The knowledge routes declare CONCRETE response models (ask_26 fix2),
+ * so every knowledge response type here is a PURE schema-derived alias
+ * over components — zero hand-written wire models.
  */
-export interface KnowledgeFactRecord {
-	fact_id: string;
-	category: string;
-	key: string;
-	statement: string;
-	status: string;
-}
-export interface KnowledgeFactPageView {
-	items: KnowledgeFactRecord[];
-	limit: number;
-	offset: number;
-	total: number;
-	has_more: boolean;
-}
-export interface KnowledgeReadView {
-	status: 'ok';
-	server_id: string;
-	application_id: string;
-	generation: number;
-	service_revision: number;
-	knowledge_revision: number;
-	found_in_map: boolean;
-	auto_adopt_suppressed: boolean;
-	facts: KnowledgeFactPageView;
-}
-export interface FactHistoryDocument {
-	status: 'ok';
-	items: Array<{
-		revision_id: string;
-		fact_id: string;
-		revision: number;
-		statement: string;
-		status: string;
-		changed_at: string;
-	}>;
-	limit: number;
-	offset: number;
-	total: number;
-	has_more: boolean;
-}
-export interface KnowledgeOperationsDocument {
-	status: 'ok';
-	items: Array<{
-		operation_id: string;
-		status: string;
-		workflow_id: string;
-		accepted_at: string;
-	}>;
-	limit: number;
-	offset: number;
-	total: number;
-	has_more: boolean;
-}
-export interface RetractionResultView {
-	status: 'ok';
-	server_id: string;
-	application_id: string;
-	fact_id: string;
-	new_revision: number;
-}
-export interface RetryReceiptView {
-	status: 'ok';
-	accepted: boolean;
-	operation_id: string;
-	workflow_id: string;
-	receipt_status: string;
-	replayed: boolean;
-	coalesced: boolean;
-	poll_reference: string;
-}
-type KnowledgeReadResponse = KnowledgeReadView;
-type FactHistoryResponse = FactHistoryDocument;
-type KnowledgeOperationsResponse = KnowledgeOperationsDocument;
-type RetractionResponse = RetractionResultView;
-type RetryResponse = RetryReceiptView;
+type KnowledgeReadResponse = components['schemas']['KnowledgeRead'];
+type FactHistoryResponse = components['schemas']['FactRevisionPage'];
+type KnowledgeOperationsResponse = components['schemas']['OperationPage'];
+type RetractionResponse = components['schemas']['RetractionResult'];
+type RetryResponse = components['schemas']['OperationReceipt'];
 import type {
 	CatalogPageQuery,
 	RunbookCatalogPage,
