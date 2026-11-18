@@ -39,15 +39,17 @@ sliced/truncated JSON document.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mai.applications.knowledge_contracts import (
+    MAX_FACTS_PER_LEARN_REQUEST,
     EnvelopeOverflowError,
     FactSourceKind,
     LearnRequest,
@@ -66,6 +68,7 @@ from mai.applications.learning_operations import (
     ServiceAutoAdoptSuppressedError,
 )
 from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
+from mai.jobs.engine import RunIdInUseError
 from mai.plugins.registry import CapabilityDescriptor, parse_descriptor
 from mai.policy.evaluate import ExecutionContext
 
@@ -841,105 +844,60 @@ class GetLearningStatusCapability:
 # app.learn_service (ask_21): the authorized durable admission tool
 # ---------------------------------------------------------------------------
 
-#: Maximum source references per proposed fact (C1; mirrors
-#: ``ProposedFactDelta``).
-_MAX_SOURCE_REFS_PER_FACT: Final[int] = 4
 
-#: Maximum proposed facts per learn request (C1; mirrors
-#: ``LearnRequest``).
-_MAX_FACTS_PER_LEARN_REQUEST: Final[int] = 8
-
-
-class FactProposalPayload(BaseModel):
-    """One proposed learned fact on the agent wire (strict; the
-    capability owns its shape and converts to the domain delta)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    category: str = Field(
-        min_length=1,
-        max_length=64,
-        description="Bounded category grouping the proposed fact",
-    )
-    key: str = Field(
-        min_length=1,
-        max_length=80,
-        description="Bounded semantic key identifying the proposed fact",
-    )
-    statement: str = Field(
-        min_length=1,
-        max_length=800,
-        description="Bounded learned statement asserted for this service",
-    )
-    source_kind: FactSourceKind = Field(
-        description="Provenance kind proving this proposal",
-    )
-    source_refs: list[str] = Field(
-        min_length=1,
-        max_length=_MAX_SOURCE_REFS_PER_FACT,
-        description=(
-            "Bounded persisted provenance references proving this proposal "
-            "(one to four, each at most 256 characters)"
-        ),
-    )
-
-    @field_validator("source_refs")
-    @classmethod
-    def _refs_bounded(cls, value: list[str]) -> list[str]:
-        for ref in value:
-            if not ref.strip():
-                raise ValueError("source_refs entries must be non-empty")
-            if len(ref) > 256:
-                raise ValueError(
-                    "source_refs entries must be at most 256 characters"
-                )
-        return value
-
-
-class LearnServicePayload(BaseModel):
+class LearnServicePayload(_Payload):
     """One durable learn admission request from the agent (strict; no
-    paging — a single admission, not a collection)."""
+    paging — a single admission, not a collection; no trusted runtime
+    fields: actor/run_id/tool_call_id/grants are rejected by
+    ``extra="forbid"``)."""
 
-    model_config = ConfigDict(extra="forbid")
-
-    application_id: uuid.UUID | None = Field(
-        default=None,
-        description=(
-            "Canonical application identity of the service; omit for an "
-            "admission without a known application identity"
-        ),
+    application_id: uuid.UUID = Field(
+        description="Canonical application identity of the service to "
+        "learn about"
     )
-    facts: list[FactProposalPayload] = Field(
+    facts: list[ProposedFactDelta] = Field(
         min_length=1,
-        max_length=_MAX_FACTS_PER_LEARN_REQUEST,
-        description=(
-            "Proposed learned facts for durable preservation (one to eight)"
-        ),
+        max_length=MAX_FACTS_PER_LEARN_REQUEST,
+        description="Bounded proposed fact deltas to persist for this "
+        "service",
     )
     expected_generation: int = Field(
         ge=0,
-        description="Observed knowledge generation for the admission CAS",
+        description="Required observed service generation for the identity "
+        "CAS",
     )
     server_id: str | None = Field(
         default=None,
-        description=(
-            "Scope confirmation: must equal the context server identity"
-        ),
+        description="Scope confirmation: must equal the context server "
+        "identity",
     )
 
-    @field_validator("facts")
-    @classmethod
-    def _bounded_fact_count(cls, value: list[FactProposalPayload]) -> list[FactProposalPayload]:
-        if len(value) > _MAX_FACTS_PER_LEARN_REQUEST:
-            raise ValueError(
-                f"a learn request carries at most "
-                f"{_MAX_FACTS_PER_LEARN_REQUEST} fact proposals"
-            )
-        return value
+
+def _durable_tool_call_id(run_id: uuid.UUID) -> str:
+    """Deterministic durable source-call identity for one learn run.
+
+    ``CapabilityCall.op_id`` is minted per dispatcher invocation and is
+    NOT stable across retries of the SAME logical call; the admission
+    identity must be. The derivation covers ``(run_id, capability_id)``
+    via canonical JSON + SHA-256 (truncated to the 64-char
+    ``source_tool_call_id`` column). The payload digest is deliberately
+    NOT part of the identity: a divergent payload on the same source
+    call must surface as the store's typed ``payload_conflict`` — never
+    silently fork a second operation.
+    """
+    seed = json.dumps(
+        {
+            "capability_id": LEARN_SERVICE_CAPABILITY_ID,
+            "run_id": str(run_id),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(seed).hexdigest()[:64]
 
 
 def learn_service_descriptor() -> CapabilityDescriptor:
-    """The validated ``app.learn_service`` descriptor (C3/C5, D3/D5)."""
+    """The validated ``app.learn_service`` descriptor (C2/C3/C5, D3/D5)."""
     descriptor = parse_descriptor(
         {
             "identifier": LEARN_SERVICE_CAPABILITY_ID,
@@ -954,24 +912,23 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                     "persisted with the trusted run/call identity and "
                     "enqueued for background application. Mutating."
                 ),
-                "required": ["facts", "expected_generation"],
+                "required": ["application_id", "facts", "expected_generation"],
                 "properties": {
                     "application_id": {
-                        "type": ["string", "null"],
+                        "type": "string",
                         "format": "uuid",
                         "description": (
-                            "Canonical application identity of the service; "
-                            "omit for an admission without a known "
-                            "application identity"
+                            "Canonical application identity of the service "
+                            "to learn about"
                         ),
                     },
                     "facts": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 8,
+                        "maxItems": MAX_FACTS_PER_LEARN_REQUEST,
                         "description": (
-                            "Proposed learned facts for durable preservation "
-                            "(one to eight per admission)"
+                            "Bounded proposed fact deltas to persist for "
+                            "this service (mirrors ProposedFactDelta)"
                         ),
                         "items": {
                             "type": "object",
@@ -989,7 +946,7 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                                     "minLength": 1,
                                     "maxLength": 64,
                                     "description": (
-                                        "Taxonomy category grouping the "
+                                        "Bounded category grouping the "
                                         "proposed fact"
                                     ),
                                 },
@@ -998,8 +955,8 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                                     "minLength": 1,
                                     "maxLength": 80,
                                     "description": (
-                                        "Semantic key identifying the "
-                                        "proposed fact"
+                                        "Bounded semantic key identifying "
+                                        "the proposed fact"
                                     ),
                                 },
                                 "statement": {
@@ -1007,8 +964,8 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                                     "minLength": 1,
                                     "maxLength": 800,
                                     "description": (
-                                        "Learned statement asserted for this "
-                                        "service"
+                                        "Bounded learned statement proposed "
+                                        "for persistence"
                                     ),
                                 },
                                 "source_kind": {
@@ -1017,8 +974,8 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                                         kind.value for kind in FactSourceKind
                                     ],
                                     "description": (
-                                        "Provenance kind proving this "
-                                        "proposal"
+                                        "Accepted provenance kind claimed "
+                                        "for the proposal"
                                     ),
                                 },
                                 "source_refs": {
@@ -1031,8 +988,8 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                                         "maxLength": 256,
                                     },
                                     "description": (
-                                        "Persisted provenance references "
-                                        "proving this proposal (one to four)"
+                                        "Bounded persisted provenance "
+                                        "references proving this proposal"
                                     ),
                                 },
                             },
@@ -1042,8 +999,8 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                         "type": "integer",
                         "minimum": 0,
                         "description": (
-                            "Observed knowledge generation for the admission "
-                            "compare-and-set"
+                            "Required observed service generation for the "
+                            "identity compare-and-set"
                         ),
                     },
                     "server_id": {
@@ -1061,33 +1018,26 @@ def learn_service_descriptor() -> CapabilityDescriptor:
                 "required": [
                     "status",
                     "operation_id",
-                    "receipt_status",
                     "workflow_id",
+                    "receipt_status",
+                    "accepted",
                     "replayed",
                     "coalesced",
                 ],
                 "properties": {
                     "status": {"type": "string", "enum": ["ok"]},
                     "operation_id": {"type": "string", "format": "uuid"},
-                    "receipt_status": {"type": "string"},
                     "workflow_id": {"type": "string"},
+                    "receipt_status": {"type": "string"},
+                    "accepted": {"type": "boolean"},
                     "replayed": {"type": "boolean"},
                     "coalesced": {"type": "boolean"},
-                    "payload_digest": {"type": "string"},
-                    "sub_effects": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
-                    },
-                    "accepted_at": {"type": "string"},
-                    "budget_used": {"type": "integer", "minimum": 1},
-                    "budget_limit": {"type": "integer", "minimum": 1},
-                    "job_run_id": {"type": ["string", "null"]},
-                    "poll_operation_id": {"type": ["string", "null"]},
+                    "poll_reference": {"type": "string"},
                 },
             },
             "execution_environments": ["controller"],
             "effect_class": "mutate",
-            "resource_scope": ["knowledge"],
+            "resource_scope": ["service_knowledge"],
             "required_grants": [LEARN_SERVICE_CAPABILITY_ID],
         }
     )
@@ -1103,24 +1053,20 @@ class LearnServiceCapability:
     Trusted run/call identity is built SERVER-SIDE from the capability
     context (C5: actor/grants/timestamps never come from the model
     payload). The durable queue enqueue seam is a REQUIRED constructor
-    dependency — an absent seam fails closed at construction (never a
-    fake success). The capability performs no grant checks, no adoption
-    writes and no map writes: it only admits a preservation operation.
+    dependency — composition slices bind the real EngineClient. The
+    capability performs no grant checks, no adoption writes and no map
+    writes: it only admits a preservation operation. The background
+    application of the admitted operation is slice 22's handler.
     """
 
     def __init__(
         self,
         store: LearningOperationStore,
         *,
-        engine_enqueue: Callable[[str], Awaitable[None]] | None = None,
+        engine_enqueue: Callable[[str], Awaitable[None]],
     ) -> None:
         if not isinstance(store, LearningOperationStore):
             raise ValueError("store must be a LearningOperationStore")
-        if engine_enqueue is None:
-            raise ValueError(
-                "engine_enqueue is required: the durable admission must be "
-                "enqueuable; composition slices bind the real EngineClient"
-            )
         self._store = store
         self._engine_enqueue = engine_enqueue
 
@@ -1142,27 +1088,20 @@ class LearnServiceCapability:
 
         # Trusted runtime identity — SERVER-SIDE ONLY (C5): actor,
         # grants and the timestamp come from the context and the host
-        # clock, never from the model payload.
+        # clock, never from the model payload. The source-call identity
+        # is the durable per-(run, capability) derivation so a retry of
+        # the SAME logical call replays instead of forking.
         trusted = TrustedSourceContext(
             server_id=server_id,
             run_id=call.context.run_id,
             session_id=None,
-            tool_call_id=str(call.op_id),
+            tool_call_id=_durable_tool_call_id(call.context.run_id),
             actor=str(call.context.principal),
             grants=[str(g) for g in call.context.allowed_capabilities],
             context_at=datetime.now(tz=timezone.utc),
         )
         request = LearnRequest(
-            facts=[
-                ProposedFactDelta(
-                    category=fact.category,
-                    key=fact.key,
-                    statement=fact.statement,
-                    source_kind=FactSourceKind(fact.source_kind),
-                    source_refs=list(fact.source_refs),
-                )
-                for fact in payload.facts
-            ],
+            facts=list(payload.facts),
             expected_generation=payload.expected_generation,
         )
         try:
@@ -1172,6 +1111,18 @@ class LearnServiceCapability:
                 application_id=payload.application_id,
                 engine_enqueue=self._engine_enqueue,
             )
+            receipt = outcome.receipt
+            envelope = {
+                "status": "ok",
+                "accepted": True,
+                "operation_id": str(receipt.operation_id),
+                "workflow_id": receipt.workflow_id,
+                "receipt_status": receipt.status.value,
+                "replayed": outcome.replayed,
+                "coalesced": outcome.coalesced,
+                "poll_reference": receipt.workflow_id,
+            }
+            return _ok_envelope(LEARN_SERVICE_CAPABILITY_ID, envelope)
         except OperationAdmissionError as error:
             message = error.detail
             if error.budget_used is not None and error.budget_limit is not None:
@@ -1186,26 +1137,18 @@ class LearnServiceCapability:
             )
         except ScopeMismatchError as error:
             return _refusal(LEARN_SERVICE_CAPABILITY_ID, "scope_mismatch", str(error))
+        except RunIdInUseError as error:
+            return _refusal(
+                LEARN_SERVICE_CAPABILITY_ID,
+                "operation_in_use",
+                f"the engine already holds workflow {error}",
+            )
+        except EnvelopeOverflowError as error:
+            return _refusal(
+                LEARN_SERVICE_CAPABILITY_ID,
+                "envelope_overflow",
+                f"the receipt envelope exceeded the dispatcher cap "
+                f"({error.actual_bytes} bytes)",
+            )
         except ValueError as error:
             return _refusal(LEARN_SERVICE_CAPABILITY_ID, "invalid_request", str(error))
-
-        receipt = outcome.receipt
-        envelope = {
-            "operation_id": str(receipt.operation_id),
-            "receipt_status": receipt.status.value,
-            "payload_digest": receipt.payload_digest,
-            "sub_effects": {
-                key: str(value) for key, value in receipt.sub_effects.items()
-            },
-            "accepted_at": receipt.accepted_at.isoformat(),
-            "workflow_id": receipt.workflow_id,
-            "job_run_id": None,
-            "poll_operation_id": str(receipt.operation_id),
-            "replayed": outcome.replayed,
-            "coalesced": outcome.coalesced,
-            "budget_used": outcome.budget_used,
-            "budget_limit": outcome.budget_limit,
-        }
-        return _ok_envelope(
-            LEARN_SERVICE_CAPABILITY_ID, {"status": "ok", **envelope}
-        )
