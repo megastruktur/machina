@@ -271,6 +271,7 @@ def _wire(
     LearningOperationStore,
     ServiceMapStore,
     KnowledgeWriteStore,
+    MetadataMutationCoordinator,
 ]:
     # A DBOS recovery re-executes through the SAME registered handler
     # instance, so the admission context registry (memory) survives;
@@ -307,11 +308,17 @@ class _AdmittedOutcome:
     — the operation identity is reconstructed from the store's frozen
     derivation."""
 
-    def __init__(self, operation_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        operation_id: uuid.UUID,
+        *,
+        replayed: bool = False,
+        coalesced: bool = False,
+    ) -> None:
         self.operation_id = operation_id
         self.workflow_id = f"service.learn:{operation_id}"
-        self.replayed = False
-        self.coalesced = False
+        self.replayed = replayed
+        self.coalesced = coalesced
         self.receipt = SimpleNamespace(
             operation_id=operation_id, workflow_id=self.workflow_id
         )
@@ -358,7 +365,7 @@ def _admit(
         uuid.NAMESPACE_URL, f"mai:learning-operation:{run_id}:{tool_call_id}"
     )
     try:
-        _run(
+        admit_result = _run(
             operations.admit(
                 request=request,
                 trusted=trusted,
@@ -369,7 +376,12 @@ def _admit(
     except OperationAdmissionError as error:
         # Deferred/unacknowledged engine: the row stays queued.
         assert error.code == "enqueue_failed", error.code
-    return _AdmittedOutcome(operation_id)
+        return _AdmittedOutcome(operation_id)
+    return _AdmittedOutcome(
+        operation_id,
+        replayed=admit_result.replayed,
+        coalesced=admit_result.coalesced,
+    )
 
 
 def _row(url: str, operation_id: uuid.UUID) -> dict[str, Any]:
@@ -411,6 +423,15 @@ def _fact_revision(url: str) -> int:
         ).fetchall()
     assert len(revisions) == 1
     return int(revisions[0][0])
+
+
+def _fact_ids(url: str) -> set[str]:
+    with psycopg.connect(url) as conn:
+        rows = conn.execute(
+            "SELECT fact_id FROM service_learned_fact WHERE "
+            "status = 'active'"
+        ).fetchall()
+    return {str(r[0]) for r in rows}
 
 
 def _revision_history_count(url: str) -> int:
@@ -883,14 +904,141 @@ def test_post_fact_crash_replay_is_idempotent(
     assert _fact_count(worker_url, str(_FACT["statement"])) == 1
     assert _fact_revision(worker_url) == 1
 
+    docs_seen: list[tuple[uuid.UUID | None, tuple[uuid.UUID, ...]]] = []
+
+    async def _capturing_docs(
+        server_id: uuid.UUID,
+        application_id: uuid.UUID | None,
+        applied_fact_ids: tuple[uuid.UUID, ...],
+    ) -> None:
+        docs_seen.append((application_id, applied_fact_ids))
+
     healthy, _operations, _map_store, _write, _coordinator = _wire(
-        worker_url, factory, tmp_path, operations=operations
+        worker_url,
+        factory,
+        tmp_path,
+        operations=operations,
+        docs_indexer=_capturing_docs,
     )
     receipt = _run(healthy(payload_json))
     assert receipt["status"] == "applied", (
             receipt.get("error_code"), receipt,
         )
     assert receipt["sub_effects"]["facts"] == "applied"
+    assert receipt["sub_effects"]["docs"] == "applied"
     assert _fact_count(worker_url, str(_FACT["statement"])) == 1
     assert _fact_revision(worker_url) == 1  # no duplicate revision
     assert _revision_history_count(worker_url) == 1
+    # Fix-2 contract: the docs/index effect receives the REAL durable
+    # fact identities on resume (the idempotent replay passes the
+    # idempotent ids — never an empty tuple).
+    assert len(docs_seen) == 1
+    seen_app, seen_ids = docs_seen[0]
+    assert seen_app == APP_MAIN_ID
+    assert len(seen_ids) == 1
+    assert _fact_ids(worker_url) == {str(fid) for fid in seen_ids}
+
+
+def test_docs_resume_reads_persisted_fact_ids(
+    worker_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: pathlib.Path,
+) -> None:
+    # Fix-2 row branch: a crash AFTER the facts checkpoint but BEFORE
+    # docs leaves `sub_effects.facts == "applied"` and the applied ids
+    # persisted on the row — the resume must feed the docs/index effect
+    # those PERSISTED ids (write_result is never re-computed), then
+    # finalize applied.
+    handler, operations, _map_store, write, _coordinator = _wire(
+        worker_url, factory, tmp_path
+    )
+    run_id = uuid.uuid4()
+    ref = _seed_foreground_run(worker_url, factory, run_id)
+    outcome = _admit(
+        operations, _DeferredEngine(), run_id=run_id, ref=ref
+    )
+    operation_id = outcome.operation_id
+
+    authorization = _run(
+        operations.begin_apply(
+            SERVER_A,
+            operation_id,
+            current_grants={"app.learn_service"},
+            required_grants={"app.learn_service"},
+        )
+    )
+    trusted = TrustedSourceContext(
+        server_id=SERVER_A,
+        run_id=run_id,
+        session_id=None,
+        tool_call_id="direct-apply",
+        actor="principal",
+        grants=["app.learn_service"],
+        context_at=datetime.now(tz=timezone.utc),
+    )
+    request = LearnRequest(
+        facts=[
+            ProposedFactDelta(
+                category=str(_FACT["category"]),
+                key=str(_FACT["key"]),
+                statement=str(_FACT["statement"]),
+                source_kind="tool_result",
+                source_refs=[str(ref)],
+            )
+        ],
+        expected_generation=authorization.generation,
+    )
+    write_result = _run(
+        write.apply_facts(
+            server_id=SERVER_A,
+            application_id=APP_MAIN_ID,
+            request=request,
+            trusted=trusted,
+            expected_generation=authorization.generation,
+        )
+    )
+    assert write_result.status.name == "APPLIED"
+    committed_ids = [str(fid) for fid in write_result.applied_fact_ids]
+
+    # The exact durable post-crash state: facts checkpointed applied,
+    # docs pending, applied ids persisted on the row.
+    with psycopg.connect(worker_url, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE service_learning_operation SET sub_effects = "
+            "'{\"facts\": \"applied\", \"docs\": \"pending\"}'::jsonb, "
+            "applied_fact_ids = %s::jsonb WHERE operation_id = %s",
+            (json.dumps(committed_ids), str(operation_id)),
+        )
+
+    docs_seen: list[tuple[uuid.UUID | None, tuple[uuid.UUID, ...]]] = []
+
+    async def _capturing_docs(
+        server_id: uuid.UUID,
+        application_id: uuid.UUID | None,
+        applied_fact_ids: tuple[uuid.UUID, ...],
+    ) -> None:
+        docs_seen.append((application_id, applied_fact_ids))
+
+    healthy, _operations, _map_store, _write, _coordinator = _wire(
+        worker_url,
+        factory,
+        tmp_path,
+        operations=operations,
+        docs_indexer=_capturing_docs,
+    )
+    payload_json = ServiceLearningPayload(
+        operation_id=operation_id,
+        server_id=SERVER_A,
+        application_id=APP_MAIN_ID,
+    ).model_dump_json()
+    receipt = _run(healthy(payload_json))
+    assert receipt["status"] == "applied", (
+            receipt.get("error_code"), receipt,
+        )
+    assert receipt["sub_effects"]["facts"] == "applied"
+    assert receipt["sub_effects"]["docs"] == "applied"
+    assert len(docs_seen) == 1
+    seen_app, seen_ids = docs_seen[0]
+    assert seen_app == APP_MAIN_ID
+    assert {str(fid) for fid in seen_ids} == set(committed_ids)
+    assert {str(fid) for fid in seen_ids} == _fact_ids(worker_url)

@@ -113,8 +113,8 @@ _RESUMABLE_STATUSES: Final[frozenset[str]] = frozenset({"applying"})
 #: ``error_code``/``actor``/``source_run_id``; the executor needs them).
 _ROW_COLUMNS: Final[str] = (
     "operation_id, server_id, application_id, generation, payload_digest, "
-    "workflow_id, status, sub_effects, accepted_at, error_code, actor, "
-    "source_run_id"
+    "workflow_id, status, sub_effects, applied_fact_ids, accepted_at, "
+    "error_code, actor, source_run_id"
 )
 
 
@@ -523,6 +523,24 @@ class ServiceLearningHandler:
                 return self._serialize(fresh or row)
 
         stored_request, stored_trusted = self._stored_context(operation_id)
+        if stored_request is None and stored_trusted is None:
+            # Cross-process worker: the admission context registry is
+            # empty (it is populated by admit in the API process). A
+            # FULL durable payload carries the admitted context —
+            # register it so begin_apply's store-side grant
+            # intersection (and this handler) see the real admitted
+            # grants instead of a fail-closed empty set.
+            contexts = getattr(self._operations, "_contexts", None)
+            if (
+                isinstance(contexts, dict)
+                and payload.request is not None
+                and payload.trusted is not None
+            ):
+                contexts[operation_id] = (payload.request, payload.trusted)
+                stored_request, stored_trusted = (
+                    payload.request,
+                    payload.trusted,
+                )
         request = payload.request or stored_request
         trusted = payload.trusted or stored_trusted
         admitted, current = await self._grant_sets(
@@ -688,6 +706,15 @@ class ServiceLearningHandler:
     ) -> dict[str, Any]:
         operation_id = uuid.UUID(str(row["operation_id"]))
 
+        # Boundary (d) input: the fact identities already durable on the
+        # receipt (crash AFTER the facts checkpoint, BEFORE docs) so the
+        # docs/index effect receives the real applied ids on resume.
+        effective_fact_ids: tuple[uuid.UUID, ...] = tuple(
+            uuid.UUID(str(fid))
+            for fid in (row.get("applied_fact_ids") or ())
+            if sub_effects.get("facts") is SubEffectStatus.APPLIED
+        )
+
         def _pending_markers() -> dict[str, SubEffectStatus]:
             """Planned-but-unapplied effects stay explicit ``pending`` so
             intermediate checkpoints derive a non-terminal status."""
@@ -701,10 +728,26 @@ class ServiceLearningHandler:
                 markers["docs"] = SubEffectStatus.PENDING
             return markers
 
-        # Boundary (b): adoption / map sub-effect.
+        # Boundary (b): adoption / map sub-effect. A proposal without a
+        # concrete application identity is an explicit refusal — never a
+        # silent skip.
         adoption = payload.adoption
         write_result = None
-        if adoption is not None and application_id is not None:
+        if adoption is not None and application_id is None:
+            sub_effects["adoption"] = SubEffectStatus.FAILED
+            if has_facts:
+                sub_effects["facts"] = SubEffectStatus.FAILED
+            await self._operations.record_progress(
+                operation_id,
+                sub_effects=sub_effects,
+                error_code=_CODE_INVALID_PAYLOAD,
+                error_detail=(
+                    "adoption proposal requires a concrete application_id"
+                ),
+            )
+            fresh = await self._load_row(operation_id)
+            return self._serialize(fresh or row)
+        if adoption is not None:
             if sub_effects.get("adoption") != SubEffectStatus.APPLIED:
                 outcome = await self._apply_adoption(
                     row=row,
@@ -773,10 +816,15 @@ class ServiceLearningHandler:
                 fresh = await self._load_row(operation_id)
                 return self._serialize(fresh or row)
             sub_effects["facts"] = SubEffectStatus.APPLIED
+            # Applied OR idempotent: both prove the facts are durable.
+            effective_fact_ids = tuple(
+                write_result.applied_fact_ids
+                or write_result.idempotent_fact_ids
+            )
             await self._operations.record_progress(
                 operation_id,
                 sub_effects={**sub_effects, **_pending_markers()},
-                applied_fact_ids=write_result.applied_fact_ids,
+                applied_fact_ids=list(effective_fact_ids),
             )
 
         # Boundary (d): optional docs/index sync; a failure NEVER loses
@@ -789,11 +837,7 @@ class ServiceLearningHandler:
                 await self._docs_indexer(
                     server_id,
                     application_id,
-                    (
-                        tuple(write_result.applied_fact_ids)
-                        if write_result is not None
-                        else ()
-                    ),
+                    effective_fact_ids,
                 )
                 sub_effects["docs"] = SubEffectStatus.APPLIED
             except Exception as error:  # noqa: BLE001 - recorded honestly
@@ -869,6 +913,12 @@ class ServiceLearningHandler:
                 and self._manifest_store is not None
                 and self._coordinator._adoption is not None
             ):
+                # The operation id IS the adoption intent id: a crash
+                # after the canonical adoption committed but before the
+                # map projection/checkpoint replays the SAME intent and
+                # converges through ApplicationAdoption's idempotent
+                # submit path (a fresh uuid4 would refuse with
+                # already_adopted).
                 await self._coordinator.adopt(
                     self._manifest_store,
                     AdoptionRequest(
@@ -881,6 +931,7 @@ class ServiceLearningHandler:
                         unit_name=adoption.unit_name,
                         expected_revision=ABSENT_REVISION,
                     ),
+                    intent_id=operation_id,
                 )
             await self._coordinator.upsert_map_entry(
                 server_id,
