@@ -3145,7 +3145,10 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                         "call_id": rejected.get("call_id"),
                         "state": StepState.FAILED.value,
                         "status": "denied",
-                        "error_code": SENSITIVE_CALL_REJECTED_CODE,
+                        "error_code": str(
+                            rejected.get("error_code")
+                            or SENSITIVE_CALL_REJECTED_CODE
+                        ),
                     }
                 )
             for call in calls:

@@ -3952,7 +3952,7 @@ def test_crash_replay_keeps_rejected_secret_undispatched(
             "gated begin marker",
         )
         # The rejected secret call produced NO executor activity.
-        assert _journal_count(scenario, "begin:secret.store") == 0
+        assert _journal_count(scenario, "begin:secret.store:?") == 0
         _kill9(worker1)
         worker1 = None
         assert _journal_count(scenario, "effect:fixture.read:m1") == 0
@@ -3984,8 +3984,10 @@ def test_crash_replay_keeps_rejected_secret_undispatched(
     lines = _journal_lines(scenario)
     assert lines.count("begin:fixture.read:m1") == 1
     assert lines.count("effect:fixture.read:m1") == 0  # never re-executed
-    assert "begin:secret.store" not in lines
-    assert "effect:secret.store" not in lines
+    assert "begin:secret.store:?" not in lines
+    assert "effect:secret.store:?" not in lines
+    assert not any(line.startswith("begin:secret.store") for line in lines), lines
+    assert not any(line.startswith("effect:secret.store") for line in lines), lines
     entries = _read_session_entries(agent_url, session_id)
     assistant_payloads = [
         entry["payload"]
