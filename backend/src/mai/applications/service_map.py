@@ -755,7 +755,17 @@ class ServiceMapStore:
     def bind_coordinator(self, coordinator: Any) -> None:
         """Bind a shared ``MetadataMutationCoordinator`` to this store so
         composed capabilities inherit the C4 lease order and the tombstone
-        guard from the same instance."""
+        guard from the same instance. ``None`` unbinds."""
+        if coordinator is not None:
+            from mai.applications.metadata_mutations import (
+                MetadataMutationCoordinator,
+            )
+
+            if not isinstance(coordinator, MetadataMutationCoordinator):
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    "coordinator must be a MetadataMutationCoordinator or None",
+                )
         self._metadata_coordinator = coordinator
 
     @property
@@ -1493,6 +1503,7 @@ class ServiceMapUpsertCapability:
         check_suppression: bool = True,
         explicit_operator_write: bool = False,
         application_lease: Any = None,
+        allow_unguarded: bool = False,
     ) -> None:
         if not isinstance(store, ServiceMapStore):
             raise ServiceMapError(
@@ -1500,7 +1511,6 @@ class ServiceMapUpsertCapability:
                 "store must be a ServiceMapStore",
             )
         self._store = store
-        self._check_suppression = check_suppression
         self._explicit_operator_write = explicit_operator_write
         self._application_lease = application_lease
         # Lazy import: mai.applications.metadata_mutations imports THIS
@@ -1509,7 +1519,8 @@ class ServiceMapUpsertCapability:
             MetadataMutationCoordinator,
         )
 
-        resolved: MetadataMutationCoordinator | Any
+        effective_suppression = check_suppression
+        resolved: MetadataMutationCoordinator | Any = None
         if coordinator is not None:
             if not isinstance(coordinator, MetadataMutationCoordinator):
                 raise ServiceMapError(
@@ -1534,19 +1545,37 @@ class ServiceMapUpsertCapability:
             if effective_locks is None and session_factory is not None:
                 bind = getattr(session_factory, "kw", {}).get("bind")
                 bind_url = getattr(bind, "url", None)
-                if bind is not None and bind_url is not None:
-                    dsn = (
-                        bind_url.render_as_string(hide_password=False)
-                        .replace("postgresql+asyncpg://", "postgresql://")
-                        .replace("postgres+asyncpg://", "postgresql://")
-                    )
+                if bind_url is not None:
+                    if hasattr(bind_url, "set"):
+                        dsn = bind_url.set(
+                            drivername="postgresql"
+                        ).render_as_string(hide_password=False)
+                    else:
+                        dsn = (
+                            str(bind_url)
+                            .replace("postgresql+asyncpg://", "postgresql://")
+                            .replace("postgres+asyncpg://", "postgresql://")
+                        )
                     effective_locks = ResourceLockService(dsn)
+            if effective_locks is None:
+                # A session factory without a derivable lease service can
+                # never provide the C4 guard — fail closed instead of
+                # silently degrading to the no-op lock stub.
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    "locks could not be derived from session_factory; "
+                    "pass a ResourceLockService explicitly",
+                )
+            if session_factory is None and check_suppression and not allow_unguarded:
+                # Locks without an identity seam cannot honor the tombstone
+                # guard; refuse unless the caller accepts an unguarded run.
+                raise ServiceMapError(
+                    ServiceMapErrorCode.INVALID_REQUEST,
+                    "session_factory is required when check_suppression=True "
+                    "unless a full coordinator is provided",
+                )
             resolved = MetadataMutationCoordinator(
-                locks=(
-                    effective_locks
-                    if effective_locks is not None
-                    else _NoopLockService()
-                ),
+                locks=effective_locks,
                 map_store=store,
                 learning=(
                     LearningOperationStore(session_factory)
@@ -1556,10 +1585,10 @@ class ServiceMapUpsertCapability:
                 adoption=adoption,
                 sessions=session_factory,
             )
-        else:
-            # Pure-filesystem unit wiring: the store's own slice-15 lock
-            # still serializes the leaf write; the C4 Postgres lease set
-            # and the tombstone guard require a wired session factory.
+        elif allow_unguarded:
+            # Explicit pure-filesystem unit wiring: the store's own
+            # slice-15 lock still serializes the leaf write; the C4
+            # Postgres lease set and the tombstone guard are OFF.
             resolved = MetadataMutationCoordinator(
                 locks=_NoopLockService(),
                 map_store=store,
@@ -1567,7 +1596,12 @@ class ServiceMapUpsertCapability:
                 adoption=adoption,
                 sessions=None,
             )
+            effective_suppression = False
+        # else: resolved stays None — every call FAILS CLOSED
+        # ("unavailable") until a coordinator is bound on the store
+        # (bind_coordinator) or proper wiring is passed.
         self._coordinator: MetadataMutationCoordinator | Any = resolved
+        self._check_suppression = effective_suppression
 
     def __repr__(self) -> str:
         return f"<ServiceMapUpsertCapability root={self._store.root!s}>"
@@ -1621,6 +1655,31 @@ class ServiceMapUpsertCapability:
             raise ServiceMapError(
                 ServiceMapErrorCode.INVALID_REQUEST, "name is required"
             )
+        # Fail-closed default (AC 1): with no coordinator wired at
+        # construction, honor a LATER store.bind_coordinator(...) — and
+        # refuse with ``unavailable`` when neither exists. Invalid
+        # payloads above still raise ServiceMapError pre-effect.
+        coordinator = self._coordinator
+        if coordinator is None:
+            coordinator = self._store.metadata_coordinator
+        if coordinator is None:
+            return ExecutorResult(
+                ok=False,
+                error_code="unavailable",
+                output=json.dumps(
+                    {
+                        "status": "unavailable",
+                        "code": "unavailable",
+                        "message": (
+                            "service metadata coordinator is unavailable; "
+                            "bind a coordinator on the store or pass "
+                            "coordinator/session_factory"
+                        ),
+                        "capability_id": CAPABILITY_ID,
+                    },
+                    sort_keys=True,
+                ),
+            )
         # Identity validation BEFORE any lease is touched: invalid
         # server/name/application ids are the caller's field errors.
         sid = _canonical_uuid(context.server_id, "server_id")
@@ -1637,7 +1696,7 @@ class ServiceMapUpsertCapability:
         from mai.applications.metadata_mutations import MetadataMutationError
 
         try:
-            entry: ServiceMapEntry = await self._coordinator.upsert_map_entry(
+            entry: ServiceMapEntry = await coordinator.upsert_map_entry(
                 server_uuid,
                 target_uuid,
                 name=payload["name"],

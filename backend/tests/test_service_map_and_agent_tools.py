@@ -305,7 +305,7 @@ async def test_upsert_map_capability_executes_through_the_tool_bridge(
     store = _store(tmp_path)
     bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
         context=_context((UPSERT_CAPABILITY,)),
     )
     tool = next(
@@ -334,7 +334,7 @@ async def test_upsert_map_capability_executes_through_the_tool_bridge(
     # the effect never runs (the store stays untouched).
     denied_bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
         context=_context((UPSERT_CAPABILITY,), server_id=SERVER_B),
     )
     denied_tool = next(
@@ -356,7 +356,7 @@ async def test_upsert_map_capability_rejects_invalid_payload(
     store = _store(tmp_path)
     bridge = CapabilityToolBridge(
         registry=registry,
-        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store)),
+        dispatcher=_dispatcher(registry, ServiceMapUpsertCapability(store, allow_unguarded=True)),
         context=_context((UPSERT_CAPABILITY,)),
     )
     tool = next(
@@ -2500,12 +2500,17 @@ def _derived_locks(session_factory: Any):
     from mai.jobs.resource_locks import ResourceLockService as _RLS
 
     bind = getattr(session_factory, "kw", {}).get("bind")
-    dsn = (
-        getattr(bind, "url")
-        .render_as_string(hide_password=False)
-        .replace("postgresql+asyncpg://", "postgresql://")
-        .replace("postgres+asyncpg://", "postgresql://")
-    )
+    bind_url = getattr(bind, "url")
+    if hasattr(bind_url, "set"):
+        dsn = bind_url.set(drivername="postgresql").render_as_string(
+            hide_password=False
+        )
+    else:
+        dsn = (
+            str(bind_url)
+            .replace("postgresql+asyncpg://", "postgresql://")
+            .replace("postgres+asyncpg://", "postgresql://")
+        )
     locks = _RLS(dsn)
     locks.ensure_schema()
     return locks
@@ -2514,8 +2519,6 @@ def _derived_locks(session_factory: Any):
 async def test_upsert_map_capability_delegates_to_coordinator_without_recursive_store_lock(
     tmp_path: Path, migrated_url: str
 ) -> None:
-    import asyncio
-
     store = _store(tmp_path)
     engine, session_factory = create_app_engine(migrated_url)
     try:
@@ -2660,8 +2663,6 @@ async def test_upsert_map_capability_refuses_under_lease_contention_and_concurre
     jar: dict[str, str],
     server_a: uuid.UUID,
 ) -> None:
-    import asyncio
-
     from mai.capabilities.dispatch import CapabilityCall, ExecutorResult
     from mai.jobs.resource_locks import ResourceLockService
 
@@ -2772,3 +2773,61 @@ async def test_upsert_map_capability_refuses_under_lease_contention_and_concurre
             my_locks.inspect(str(server_a), f"application:{application_id}")
             is None
         )
+
+
+async def test_upsert_map_capability_fails_closed_when_unguarded_by_default(
+    tmp_path: Path, migrated_url: str
+) -> None:
+    """AC 1 fail-closed: with no wiring at all, ``app.upsert_map_entry``
+    refuses ``unavailable`` and writes NOTHING; a coordinator bound on
+    the store AFTER capability construction dynamically enables it."""
+    from mai.applications.learning_operations import LearningOperationStore
+    from mai.applications.metadata_mutations import MetadataMutationCoordinator
+
+    store = _store(tmp_path)
+    capability = ServiceMapUpsertCapability(store)  # default: no allow_unguarded
+    engine, session_factory = create_app_engine(migrated_url)
+    try:
+        my_locks = _derived_locks(session_factory)
+        call = CapabilityCall(
+            descriptor=upsert_map_descriptor(),
+            payload={"name": "late-bound"},
+            context=_context((UPSERT_CAPABILITY,), server_id=SERVER_A),
+            credentials={},
+            op_id=uuid.uuid4(),
+        )
+        refused = await asyncio.wait_for(capability(call), 30)
+        assert refused.ok is False
+        assert refused.error_code == "unavailable"
+        envelope = json.loads(refused.output)
+        assert envelope["code"] == "unavailable"
+        assert "bind a coordinator" in envelope["message"]
+        assert store.list_entries(SERVER_A) == ()  # zero writes
+
+        # A LATER bind_coordinator on the SAME capability/store enables it.
+        coordinator = MetadataMutationCoordinator(
+            locks=my_locks,
+            map_store=store,
+            learning=LearningOperationStore(session_factory),
+            sessions=session_factory,
+        )
+        store.bind_coordinator(coordinator)
+        accepted = await asyncio.wait_for(capability(call), 30)
+        assert accepted.ok is True, accepted.output
+        aid = uuid.uuid5(SERVER_A, "service-map:late-bound")
+        entry = store.get_entry(SERVER_A, aid)
+        assert entry is not None and entry.revision == 1
+        # Released through the bound coordinator's own lock service.
+        assert my_locks.inspect(str(SERVER_A), f"application:{aid}") is None
+        assert my_locks.inspect(str(SERVER_A), "service-metadata") is None
+
+        # bind_coordinator validation: garbage is refused, None unbinds.
+        with pytest.raises(ServiceMapError):
+            store.bind_coordinator("not a coordinator")
+        store.bind_coordinator(None)
+        assert store.metadata_coordinator is None
+        refused_again = await asyncio.wait_for(capability(call), 30)
+        assert refused_again.ok is False
+        assert refused_again.error_code == "unavailable"
+    finally:
+        await engine.dispose()
