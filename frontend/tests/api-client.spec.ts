@@ -1240,10 +1240,12 @@ test.describe('service-knowledge client surface (injected fetch)', () => {
 		expect(calls).toHaveLength(4);
 		expect(calls[0].method).toBe('GET');
 		expect(calls[0].url).toBe(`${STUB_ORIGIN}${KB}?limit=5&offset=10`);
-		expect(calls[1].url).toBe(`${KB}/history?fact_id=${FACT_ID}&limit=3`);
-		expect(calls[2].url).toBe(`${KB}/history`);
+		expect(calls[1].url).toBe(
+			`${STUB_ORIGIN}${KB}/history?fact_id=${FACT_ID}&limit=3`
+		);
+		expect(calls[2].url).toBe(`${STUB_ORIGIN}${KB}/history`);
 		expect(calls[3].url).toBe(
-			`${KB}/operations?status=queued&limit=2&offset=4`
+			`${STUB_ORIGIN}${KB}/operations?status=queued&limit=2&offset=4`
 		);
 		for (const call of calls) {
 			expect(call.credentials).toBe('include');
