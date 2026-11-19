@@ -63,7 +63,7 @@ from mai.agents.models import build_model
 from mai.agents.model_store import ModelConfigStore
 from mai.agents.session_title import generate_session_title
 from mai.contracts.sessions import SERVICE_MAP_SECTION_HEADER
-from mai.credentials.env import EnvResolver, build_runtime_env_resolver
+from mai.credentials.env import build_runtime_env_resolver
 from mai.database import create_app_engine
 
 __all__ = ["main"]
@@ -94,13 +94,14 @@ def _default_generator() -> TitleGenerator:
     data_root = Path(os.environ["MAI_DATA_ROOT"])
     env_file = os.environ.get("MAI_ENV_FILE") or None
     primary = env_file if env_file and Path(env_file).is_file() else None
-    resolver: EnvResolver | None = build_runtime_env_resolver(primary, data_root)
-    if resolver is None:
-        fallback = data_root / ".env"
-        if not fallback.is_file():
-            fallback.write_text("", encoding="utf-8")
-            fallback.chmod(0o600)
-        resolver = EnvResolver(fallback)
+    # ZERO disk writes in this module — not even under --dry-run
+    # (ST-R4 §4 reads the write path). Unlike the worker's ``_resolve_env``
+    # this seam never fabricates a ``<data_root>/.env`` fallback file:
+    # ``resolver`` simply stays ``None`` when no credential source
+    # exists, and ``build_model`` then fails CLOSED with
+    # ``MISSING_RESOLVER`` if the selection needs a credential and runs
+    # placeholder-keyed otherwise (C03 rule 6).
+    resolver = build_runtime_env_resolver(primary, data_root)
     store = ModelConfigStore(data_root)
     binding = store.bind()
     resolved = build_model(binding.selection(), resolver=resolver)
