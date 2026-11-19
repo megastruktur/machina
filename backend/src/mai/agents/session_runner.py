@@ -3258,11 +3258,13 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                     _session_model_round, payload_json, pins_json, rounds
                 )
             )
-            if rounds == 0:
+            if rounds == 0 and intent.parent_run_id is None:
                 # ST (§4.3): the auto-title rides AFTER the first model
                 # round returned — the assistant answer is already durable
                 # and already delivered, so title latency never delays the
-                # visible answer. The step's guards make crash-replay and
+                # visible answer. A delegated child NEVER allocates the
+                # step checkpoint at all (Guard 1 inside the step stays as
+                # defense-in-depth). The guards make crash-replay and
                 # later turns no-ops; a failing title NEVER fails this run.
                 await asyncio.to_thread(_session_title, payload_json, pins_json)
             if str(round_record["status"]) == "final":
