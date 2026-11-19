@@ -64,7 +64,7 @@ from mai.agents.model_store import ModelConfigStore
 from mai.agents.session_title import generate_session_title
 from mai.contracts.sessions import SERVICE_MAP_SECTION_HEADER
 from mai.credentials.env import build_runtime_env_resolver
-from mai.database import create_app_engine
+from mai.database import classify_database_exception, create_app_engine
 
 __all__ = ["main"]
 
@@ -104,8 +104,8 @@ def _default_generator() -> TitleGenerator:
     resolver = build_runtime_env_resolver(primary, data_root)
     store = ModelConfigStore(data_root)
     binding = store.bind()
-    resolved = build_model(binding.selection(), resolver=resolver)
-    model = resolved.model if hasattr(resolved, "model") else resolved
+    # ``build_model`` always returns the ``ResolvedModel`` wrapper.
+    model = build_model(binding.selection(), resolver=resolver).model
 
     async def _generate(first_message: str) -> str | None:
         return await generate_session_title(model, first_message)
@@ -273,9 +273,11 @@ def main(
     ``generate`` is the documented seam: when supplied (tests, harnesses)
     it replaces :func:`_default_generator` wholesale — no provider
     configuration is touched. Returns 0 on a completed run (individual
-    failures are tallied in the summary, never fatal); setup errors
-    (missing env, unusable model resolution) print a value-free line to
-    stderr and return 2.
+    failures are tallied in the summary, never fatal). Setup errors
+    (missing env, unusable model resolution) and RUNTIME database
+    failures (unreachable server, refused connection) print ONE
+    value-free classified line to stderr — never a traceback, never the
+    DSN or bind parameters — and return 2.
     """
     parser = argparse.ArgumentParser(
         prog="python -m mai.scripts.backfill_session_titles",
@@ -335,15 +337,27 @@ def main(
                 file=sys.stderr,
             )
             return 2
-    summary = asyncio.run(
-        _run_backfill(
-            url,
-            generate,
-            dry_run=args.dry_run,
-            limit=args.limit,
-            verbose=args.verbose,
+    try:
+        summary = asyncio.run(
+            _run_backfill(
+                url,
+                generate,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                verbose=args.verbose,
+            )
         )
-    )
+    except Exception as error:  # noqa: BLE001 - value-free runtime failure
+        # An unreachable/failed database must NEVER surface a raw
+        # traceback (the engine's message carries the DSN and bind
+        # parameters): one value-free classified line instead.
+        status = classify_database_exception(error)
+        print(
+            f"backfill: database failure: {status.health.value} "
+            f"({type(error).__name__})",
+            file=sys.stderr,
+        )
+        return 2
     print(json.dumps(summary, sort_keys=True))
     return 0
 

@@ -362,3 +362,23 @@ def test_missing_database_url_is_a_value_free_setup_failure(
     monkeypatch.delenv("MAI_DATABASE_URL", raising=False)
     assert backfill_main([], generate=_ScriptedGenerator([])) == 2
     assert "st_fxt" not in capsys.readouterr().err  # value-free, no DSN echo
+
+
+def test_unreachable_database_is_a_value_free_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A REFUSED connection (nothing listens on port 1): main() must
+    # classify value-free and exit 2 — never an escaping traceback (the
+    # engine's message carries the DSN and bind parameters).
+    monkeypatch.setenv(
+        "MAI_DATABASE_URL",
+        "postgresql://invalid_user:secret_pass_canary@127.0.0.1:1/nonexistent",
+    )
+    generator = _ScriptedGenerator(["Never generated"])
+    assert backfill_main([], generate=generator) == 2
+    err = capsys.readouterr().err
+    assert "backfill: database failure:" in err
+    assert "secret_pass_canary" not in err
+    assert "127.0.0.1" not in err
+    assert "Traceback" not in err
