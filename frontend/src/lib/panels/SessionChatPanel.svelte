@@ -99,6 +99,15 @@
 		 */
 		optimisticRunState?: TurnRunState | null;
 		/**
+		 * ST: bumped by the shell when the active session's stored title
+		 * may have changed (a fresh terminal `run_state` landed, or a
+		 * manual rename committed). The header re-reads its bounded
+		 * session detail EXACTLY once per bump — never a polling loop;
+		 * a same-session refresh swaps in place (the shown detail never
+		 * flickers, and a session switch still clears it first).
+		 */
+		titleRefreshToken?: number;
+		/**
 		 * CCC S3: the shell's VISIBLE server selection — the SAME state the
 		 * HUD selector and the server tree use. Drives the hero strip's
 		 * interactive server chip; read-only scope in active comes from the
@@ -123,6 +132,7 @@
 		onsessionopened = () => {},
 		onturnsubmitted = () => {},
 		optimisticRunState = null,
+		titleRefreshToken = 0,
 		selectedServerId = null,
 		onserverchange = () => {}
 	}: Props = $props();
@@ -172,35 +182,65 @@
 	let sessionDetailState = $state<'idle' | 'loading' | 'ready' | 'error'>(
 		'idle'
 	);
+	/**
+	 * ST: the last (session|scope|token) trigger a detail read was
+	 * started for — every trigger reads EXACTLY once, duplicate effect
+	 * runs (identity churn of the api bag) never re-fetch.
+	 */
+	let loadedDetailKey = $state<string | null>(null);
 	$effect(() => {
 		const sid = sessionId;
 		const scope = serverId;
+		const refresh = titleRefreshToken;
 		if (!api || sid === null || typeof api.readAgentSession !== 'function') {
 			// No read seam (e.g. a minimal scripted bag): the chips fail
 			// closed to absent instead of throwing or fabricating a scope.
 			sessionDetail = null;
 			sessionDetailState = 'idle';
+			loadedDetailKey = null;
 			return;
 		}
-		let stale = false;
-		sessionDetailState = 'loading';
-		sessionDetail = null;
+		// A token bump on the SAME session refreshes IN PLACE: the
+		// already-shown detail stays visible until the fresh read lands
+		// (no flicker). A session SWITCH clears first — the header never
+		// shows the previous session's truth. The key decides freshness
+		// inside the callbacks (never a stale flag: writing the tracked
+		// key schedules exactly one extra dedup pass, and a cleanup would
+		// kill that pass's own in-flight read).
+		const switching = untrack(() => sessionDetail?.session_id !== sid);
+		const key = `${sid}|${String(scope)}|${refresh}`;
+		if (!switching && loadedDetailKey === key) return;
+		loadedDetailKey = key;
+		if (switching) {
+			sessionDetailState = 'loading';
+			sessionDetail = null;
+		}
 		untrack(() => {
 			void api
 				.readAgentSession(sid, scope)
 				.then((detail) => {
-					if (stale) return;
+					if (loadedDetailKey !== key) return;
 					sessionDetail = detail;
 					sessionDetailState = 'ready';
 				})
 				.catch(() => {
-					if (stale) return;
+					if (loadedDetailKey !== key) return;
 					sessionDetailState = 'error';
 				});
 		});
-		return () => {
-			stale = true;
-		};
+	});
+
+	/**
+	 * ST (C08 rule 6): the header title is the session's OWN stored title
+	 * verbatim when one exists; otherwise the honest id-based fallback —
+	 * never a fabricated or guessed label.
+	 */
+	const headerTitle = $derived.by(() => {
+		const stored = sessionDetail?.title;
+		if (typeof stored === 'string' && stored.trim() !== '') {
+			return stored.trim();
+		}
+		return sessionId === null ? 'new session' : `session ${sessionId.slice(0, 8)}…`;
 	});
 
 	/** The stored server id the chips render (never the drawer selection). */
@@ -801,6 +841,15 @@
 	     card, and the shell animates the card's growth (CHC H1). -->
 		{#if !isHero}
 		<header class="mai-session-chat__header">
+			<!-- ST: the session's OWN stored title (honest id fallback), the
+			     visible headline of the active chat. -->
+			<span
+				class="mai-session-chat__title"
+				data-testid="session-header-title"
+				title={headerTitle}
+			>
+				{headerTitle}
+			</span>
 			<!-- Refresh continuity (R2-3): the id stays in the DOM for the E2E
 			     assertions, visually silent — the chat is the surface now. -->
 			<span class="mai-session-chat__id" data-testid="session-header-id">
@@ -1690,6 +1739,20 @@
 		clip: rect(0 0 0 0);
 		white-space: nowrap;
 		border: 0;
+	}
+	/* ST: the active chat's headline — the stored title (or honest id
+	   fallback) on ONE line; a long title ellipsizes instead of pushing
+	   the scope chips wide. */
+	.mai-session-chat__title {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		text-align: left;
+		font-size: 0.9375rem;
+		font-weight: 600;
+		color: var(--mai-color-fg, var(--fg, inherit));
 	}
 	.mai-session-chat__resync {
 		color: var(--mai-color-warning, #b45309);

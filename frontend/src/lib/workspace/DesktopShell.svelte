@@ -1074,6 +1074,32 @@
 		state: SessionRunState;
 	} | null>(null);
 
+	// --- ST: generated-title freshness (header + drawer) ----------------------
+	/**
+	 * Bumped when the active chat's stored title may have changed: a NEW
+	 * terminal `run_state` committed, or a manual rename landed. The chat
+	 * panel re-reads its bounded session detail exactly once per bump —
+	 * never a polling loop.
+	 */
+	let titleRefreshToken = $state(0);
+	/**
+	 * The seq of the LAST processed terminal run_state entry: the trigger
+	 * fires exactly ONCE per new terminal run_state — subsequent
+	 * non-terminal entries (and channel snapshot replays) never re-trigger.
+	 */
+	let lastTerminalRunStateSeq = $state<number | null>(null);
+	/**
+	 * The frozen run states that settle a run, straight from the
+	 * generated schema's `SessionRunState` vocabulary (never hand-rolled
+	 * string literals).
+	 */
+	const TERMINAL_RUN_STATES: readonly SessionRunState[] = [
+		'succeeded',
+		'failed',
+		'cancelled',
+		'outcome_unknown'
+	];
+
 	/**
 	 * S3 optimistic turn feedback: the panel calls this right after
 	 * ``submitAgentSessionTurn`` resolves with the admitted turn's
@@ -1137,6 +1163,25 @@
 					if (entries.some((entry) => entry.payload.kind === 'run_state')) {
 						optimisticRunState = null;
 					}
+					// ST: exactly ONE title refresh per NEW terminal
+					// run_state — the drawer page reloads and the chat
+					// header re-reads its stored detail, so a generated
+					// title lands without a manual refresh. Snapshot
+					// replays (same seq) never re-trigger.
+					for (const entry of entries) {
+						const payload = entry.payload;
+						if (payload.kind !== 'run_state') continue;
+						const seq = Number(entry.seq);
+						if (
+							TERMINAL_RUN_STATES.includes(payload.state) &&
+							(lastTerminalRunStateSeq === null ||
+								seq > lastTerminalRunStateSeq)
+						) {
+							lastTerminalRunStateSeq = seq;
+							void loadSessionHistory();
+							titleRefreshToken += 1;
+						}
+					}
 				},
 				onStreamDraftChanged: () => {
 					sessionDrafts = [...(activeSessionChannel?.streamDrafts() ?? [])];
@@ -1159,6 +1204,8 @@
 		sessionDrafts = [];
 		optimisticRunState = null;
 		olderEntriesExhausted = false;
+		// ST: the next session's terminal tracking starts clean.
+		lastTerminalRunStateSeq = null;
 		try {
 			sessionStorage.removeItem(SESSION_POINTER_KEY);
 		} catch {
@@ -1916,6 +1963,9 @@
 				);
 				if (row !== undefined && typeof row.session_id === 'string' && row.session_id !== '') {
 					await renameSession(row.session_id, title);
+					// ST: the active chat header re-reads its stored detail
+					// once, so the manual rename shows immediately.
+					titleRefreshToken += 1;
 				}
 			}}
 			tagLoader={chatRowTagsLoader}
@@ -2125,9 +2175,14 @@
 				loadingOlder={loadingOlderEntries}
 				hasOlder={sessionHasOlder}
 				optimisticRunState={optimisticRunState}
+				titleRefreshToken={titleRefreshToken}
 				onloadolder={() => void loadOlderEntries()}
-				onsessionopened={(sessionId, serverId) =>
-					openActiveSession(sessionId, serverId)}
+				onsessionopened={(sessionId, serverId) => {
+					openActiveSession(sessionId, serverId);
+					// ST: the drawer picks up the freshly created session's
+					// row immediately (same refresh as attachToSession).
+					void loadSessionHistory();
+				}}
 				onturnsubmitted={handleTurnSubmitted}
 				selectedServerId={selectedServerId}
 				onserverchange={(serverId) => (selectedServerId = serverId)}
