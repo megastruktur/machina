@@ -391,7 +391,7 @@ function harnessEntry(): string {
 	// — two live components would answer every testid query twice).
 	window.__maiCalls = [];
 	window.__maiPending = [];
-	function resolveKnowledge(realMode, state, mockKnowledge) {
+	function resolveKnowledge(state, mockKnowledge) {
 		// Real mode: the production client group. Otherwise the scripted
 		// mock (or an explicit null for the honest unavailable state).
 		if (realMode) return knowledgeGroup;
@@ -403,7 +403,7 @@ function harnessEntry(): string {
 		props: {
 			serverId,
 			applicationId,
-			knowledge: resolveKnowledge(realMode, state, knowledge),
+			knowledge: resolveKnowledge(state, knowledge),
 			pageLimit: realMode ? 10 : 2,
 			reasonMaxLength: 400,
 			register: (api) => {
@@ -806,7 +806,9 @@ async function _waitForApiReady(deadlineMs: number): Promise<void> {
 	let lastError: unknown = 'never probed';
 	while (Date.now() < deadline) {
 		try {
-			const response = await fetch(`${API_BASE}/api/v1/health`);
+			const response = await fetch(`${API_BASE}/api/v1/health`, {
+				signal: AbortSignal.timeout(3_000)
+			});
 			if (response.status === 200) return;
 			lastError = `health ${response.status}`;
 		} catch (error) {
@@ -893,13 +895,11 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 			const exited = new Promise<void>((resolve) => {
 				server!.once('exit', () => resolve());
 			});
-			const fallback = new Promise<void>((resolve) => {
-				setTimeout(() => {
-					if (server && server.exitCode === null) server.kill('SIGKILL');
-					resolve();
-				}, 5_000);
-			});
-			await Promise.race([exited, fallback]);
+			const killTimer = setTimeout(() => {
+				if (server && server.exitCode === null) server.kill('SIGKILL');
+			}, 5_000);
+			await exited;
+			clearTimeout(killTimer);
 		}
 		const url = process.env[LIVE_URL_VAR];
 		if (url) {
@@ -908,7 +908,7 @@ test.describe('real api (fixture FastAPI + disposable Postgres)', () => {
 				{ MAI_DATABASE_URL: url }
 			);
 		}
-		fs.rmSync(dataRoot, { recursive: true, force: true });
+		if (dataRoot) fs.rmSync(dataRoot, { recursive: true, force: true });
 	});
 
 	function _seedSql(statements: string[]): void {
