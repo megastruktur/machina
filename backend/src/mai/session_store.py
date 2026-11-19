@@ -102,6 +102,7 @@ __all__ = [
     "alist_provider_artifacts",
     "alist_session_tags",
     "arename_session",
+    "aset_generated_session_title",
     "aremove_session_tag",
     "apreview_session_tags",
     "alist_sessions",
@@ -2029,6 +2030,85 @@ async def arename_session(
             ),
             {"title": trimmed, "sid": session_id},
         )
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT session_id, server_id, service_id, source, status,
+                           title, created_at, updated_at
+                    FROM sessions
+                    WHERE session_id = :sid
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).mappings().one()
+    return _session_row(row)
+
+
+async def aset_generated_session_title(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    server_id: uuid.UUID,
+    title: str,
+) -> SessionRow | None:
+    """Write ONE LLM-generated session title — never over an existing one.
+
+    The auto-title seam (ST-PLAN §4.2, decisions D2/D3). Two invariants:
+
+    - **Never overwrites an existing title (D2)** — the null-title guard
+      lives INSIDE the guarded ``UPDATE ... WHERE title IS NULL``, so a
+      manual rename that lands between the row lock and the write still
+      wins; the call then returns ``None`` instead of raising.
+    - **Never touches ``updated_at`` (D3)** — a generated (or backfilled)
+      title must not reorder the history list. The manual
+      :func:`arename_session` path stamps ``updated_at``; this seam does
+      not.
+
+    The trimmed title must stay in 1..120 characters — the exact
+    rename-path bound, the same ``FORBIDDEN_FIELD`` rejection pair. The
+    scope check runs on the locked row via :func:`_lock_session`, so a
+    foreign ``server_id`` fails with the SAME value-free not-found code
+    as the rename path. The updated row is re-read under the SAME lock
+    so the returned ``SessionRow`` is the committed truth.
+    """
+    if not isinstance(title, str):
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "title",
+                    "title must be a string",
+                )
+            ]
+        )
+    trimmed = title.strip()
+    if not 1 <= len(trimmed) <= 120:
+        raise SessionContractError(
+            [
+                SessionFieldError(
+                    SessionErrorCode.FORBIDDEN_FIELD,
+                    "title",
+                    "title must be 1..120 characters when set",
+                )
+            ]
+        )
+    async with sessions() as session, session.begin():
+        await _lock_session(session, session_id=session_id, server_id=server_id)
+        updated = await session.execute(
+            text(
+                """
+                UPDATE sessions
+                SET title = :title
+                WHERE session_id = :sid AND title IS NULL
+                """
+            ),
+            {"title": trimmed, "sid": session_id},
+        )
+        if updated.rowcount == 0:
+            # A title already exists: the manual rename wins (D2).
+            return None
         row = (
             await session.execute(
                 text(

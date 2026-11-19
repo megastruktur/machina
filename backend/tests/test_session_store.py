@@ -58,6 +58,7 @@ from mai.contracts.sessions import (
 from mai.database import create_app_engine
 from mai.session_store import (
     aappend_entry,
+    aset_generated_session_title,
     aattach_session_tag,
     acreate_root_run,
     acreate_run,
@@ -1291,3 +1292,139 @@ async def test_root_admission_validation_is_fail_closed_and_scope_blind(
         assert scope_err.fields == {"server_id": SessionErrorCode.SESSION_NOT_FOUND}
     finally:
         await _purge_root_facade_rows(factory, ROOT_RUN_1)
+
+
+# ---------------------------------------------------------------------------
+# 9. generated-title seam (ST-PLAN §4.2; decisions D2/D3)
+# ---------------------------------------------------------------------------
+
+
+async def test_generated_title_writes_null_title_and_returns_committed_row(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    assert session_row.title is None
+    written = await aset_generated_session_title(
+        factory,
+        session_id=session_row.session_id,
+        server_id=SERVER_A,
+        title="Deploy the stack",
+    )
+    assert written is not None
+    assert written.session_id == session_row.session_id
+    assert written.title == "Deploy the stack"
+    # The committed truth is visible to the read path too.
+    stored = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    assert stored.title == "Deploy the stack"
+    # The exact rename-path bound (120) is accepted as well.
+    at_bound = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    written_bound = await aset_generated_session_title(
+        factory,
+        session_id=at_bound.session_id,
+        server_id=SERVER_A,
+        title="B" * 120,
+    )
+    assert written_bound is not None and written_bound.title == "B" * 120
+
+
+async def test_generated_title_never_overwrites_existing_title(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory,
+        server_id=SERVER_A,
+        source=SessionSourceKind.INTERACTIVE,
+        title="Manual rename",
+    )
+    refused = await aset_generated_session_title(
+        factory,
+        session_id=session_row.session_id,
+        server_id=SERVER_A,
+        title="Generated",
+    )
+    # D2: the manual rename wins; the generator degrades, never raises.
+    assert refused is None
+    stored = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    assert stored.title == "Manual rename"
+
+
+async def test_generated_title_leaves_updated_at_untouched(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    before = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    await asyncio.sleep(0.05)  # a stamped now() would move past `before`
+    written = await aset_generated_session_title(
+        factory,
+        session_id=session_row.session_id,
+        server_id=SERVER_A,
+        title="Deploy the stack",
+    )
+    assert written is not None
+    # D3: the write carries no updated_at stamp — the history list order
+    # is untouched by a generated (or backfilled) title.
+    assert written.updated_at == before.updated_at
+    after = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    assert after.updated_at == before.updated_at
+    assert after.title == "Deploy the stack"
+
+
+async def test_generated_title_cross_server_is_value_free_absent(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    with pytest.raises(SessionContractError) as err:
+        await aset_generated_session_title(
+            factory,
+            session_id=session_row.session_id,
+            server_id=SERVER_B,
+            title="Deploy the stack",
+        )
+    # Scope blindness: the SAME value-free not-found code as the rename
+    # path; neither the session id nor the would-be title leaks.
+    assert set(err.value.fields.values()) == {SessionErrorCode.SESSION_NOT_FOUND}
+    assert "Deploy" not in str(err.value)
+    assert str(session_row.session_id) not in str(err.value)
+    stored = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    assert stored.title is None
+
+
+async def test_generated_title_rejects_invalid_title_before_any_write(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await acreate_session(
+        factory, server_id=SERVER_A, source=SessionSourceKind.INTERACTIVE
+    )
+    for bad in ("", "   ", "x" * 121, None):
+        with pytest.raises(SessionContractError) as err:
+            await aset_generated_session_title(
+                factory,
+                session_id=session_row.session_id,
+                server_id=SERVER_A,
+                title=bad,  # type: ignore[arg-type]
+            )
+        # The contract rejection (never a database error), rename shape.
+        assert err.value.fields == {"title": SessionErrorCode.FORBIDDEN_FIELD}
+    # Nothing from the rejected calls reached the database.
+    stored = await aget_session(
+        factory, session_row.session_id, server_id=SERVER_A
+    )
+    assert stored.title is None
