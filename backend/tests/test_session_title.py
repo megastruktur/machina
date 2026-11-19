@@ -146,6 +146,24 @@ def test_normalize_accepts(raw, expected):
     assert normalize_generated_title(raw) == expected
 
 
+def test_normalize_preserves_leading_decimal_semver_ipv4_numbers():
+    # A leading decimal/semver/IPv4 number is CONTENT, not list numbering:
+    # the marker must never swallow the digits after its dot.
+    for raw, expected in (
+        ("1.5x speed improvement", "1.5x speed improvement"),
+        ("0.18.0 migration failure", "0.18.0 migration failure"),
+        ("192.168.3.23 unreachable", "192.168.3.23 unreachable"),
+    ):
+        assert normalize_generated_title(raw) == expected
+
+
+def test_normalize_strips_dot_numbering_without_space():
+    # The marker itself still clears without a following space, as long as
+    # it is not a digit (that shape is a number, see the test above).
+    assert normalize_generated_title("1.Title") == "Title"
+    assert normalize_generated_title("12) Title") == "Title"
+
+
 # --- normalization: rejections --------------------------------------------
 
 

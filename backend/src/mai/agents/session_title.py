@@ -85,9 +85,11 @@ _TITLE_INSTRUCTIONS: Final[str] = (
 
 #: Leading list numbering (``1.``/``12)`` marker or a ``-``/``*``/``•``
 #: bullet) the model sometimes wraps its answer in despite the
-#: instruction.
+#: instruction. The ``(?!\d)`` lookahead keeps leading decimal, semver
+#: and IPv4 numbers ("1.5x", "0.18.0", "192.168.3.23") intact: a dot
+#: immediately followed by a digit is content, never a numbering marker.
 _LEADING_NUMBERING: Final[re.Pattern[str]] = re.compile(
-    r"^(?:\d{1,3}[.)]\s*|[-*•]\s+)"
+    r"^(?:\d{1,3}[.)](?!\d)\s*|[-*•]\s+)"
 )
 
 #: Surrounding quote pairs, stripped outermost first so «"Title"» unwraps
