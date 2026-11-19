@@ -70,6 +70,7 @@ from mai.jobs.resource_locks import ResourceLockService
 from mai.plugins.registry import CapabilityRegistry
 from mai.policy.approvals import ApprovalStore
 from mai.policy.evaluate import ExecutionContext, Policy, PolicyMode
+from mai.contracts.sessions import SERVICE_MAP_SECTION_HEADER
 from mai.session_store import acreate_session
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
@@ -345,9 +346,22 @@ def _write_policy_files(
     )
 
 
-def _script(scenario: pathlib.Path, entries: list[dict]) -> None:
+def _script(
+    scenario: pathlib.Path,
+    entries: list[dict],
+    *,
+    title: dict | None = None,
+) -> None:
+    """Write the scripted FunctionModel document.
+
+    ST: an optional dedicated ``title`` entry serves the auto-title
+    agent's bare requests (the title agent would otherwise re-read the
+    FIRST round script entry — both requests carry a single message).
+    A plain list keeps the legacy shape every existing scenario uses.
+    """
+    document: object = entries if title is None else {"rounds": entries, "title": title}
     (scenario / "model-script.json").write_text(
-        json.dumps(entries), encoding="utf-8"
+        json.dumps(document), encoding="utf-8"
     )
 
 
@@ -484,6 +498,14 @@ class FixtureExecutor:
 def _script_model():
     script = json.loads(os.environ["MAI_FX_MODEL_SCRIPT"])
     journal = os.environ["MAI_FX_JOURNAL"]
+    # ST: {"rounds": [...], "title": {...}} — the dedicated title entry
+    # is served to the auto-title agent's requests; a plain list keeps
+    # the legacy round-only shape.
+    rounds_script: list = script
+    title_entry: dict | None = None
+    if isinstance(script, dict):
+        rounds_script = script["rounds"]
+        title_entry = script.get("title")
 
     def _mark(line):
         with open(journal, "a", encoding="utf-8") as handle:
@@ -528,17 +550,27 @@ def _script_model():
         return ModelResponse(parts=[TextPart(content=inner.get("text", "done"))])
 
     def _model_fn(messages, info):
+        req_instructions = (
+            str(getattr(messages[-1], "instructions", "") or "")
+            if messages
+            else ""
+        )
+        if req_instructions.startswith("You generate chat session titles"):
+            # ST: the auto-title agent's BARE request (single message, no
+            # tools, title instructions) — journaled as its OWN marker
+            # ONLY. The round-level model_call/policy markers belong to
+            # the chat rounds; existing journal counts must not move, and
+            # a title request would otherwise re-read round index 0.
+            _mark("title_model_call")
+            if title_entry is None:
+                raise AssertionError("title script entry missing")
+            return _entry_payload(title_entry)
         _mark("model_call")
         _mark(f"history_len:{len(messages)}")
         # ask_03-runtime-policy seam: capture the CURRENT request's
         # instructions (the composed operating policy) and prove the
         # history carries exactly ONE instructions-bearing request and
         # zero system-prompt parts (per-request injection, no duplicates).
-        req_instructions = (
-            str(getattr(messages[-1], "instructions", "") or "")
-            if messages
-            else ""
-        )
         _mark(f"has_instructions:{bool(req_instructions)}")
         _mark(f"policy_latched:{'Secret routing status: ACTIVE' in req_instructions}")
         _mark(f"policy_role_root:{'Run role: ROOT run' in req_instructions}")
@@ -580,9 +612,9 @@ def _script_model():
         if steering:
             _mark("saw_steering")
         index = (len(messages) - 1) // 2
-        if index >= len(script):
+        if index >= len(rounds_script):
             raise AssertionError("model script exhausted")
-        return _entry_payload(script[index])
+        return _entry_payload(rounds_script[index])
 
     return FunctionModel(_model_fn)
 
@@ -4007,3 +4039,318 @@ def test_crash_replay_keeps_rejected_secret_undispatched(
     assert rejected_results[0]["error_code"] == "sensitive_call_rejected"
     blobs = _whole_table_blobs(agent_url)
     _assert_secret_absent(blobs, _CRASH_CANARY)
+
+
+# ---------------------------------------------------------------------------
+# ST: the generated session-title step (ST-PLAN §4.3; D1/D2/D3/D7/D8)
+# ---------------------------------------------------------------------------
+
+
+def _read_title_row(url: str, session_id: str) -> dict:
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            "SELECT title, created_at, updated_at FROM sessions "
+            "WHERE session_id = %s",
+            (uuid.UUID(session_id),),
+        ).fetchone()
+    assert row is not None, "session row missing"
+    return row
+
+
+def test_title_source_strips_service_map_section() -> None:
+    """The title prompt source is the user's RAW first message: anything
+    from the Service Map marker onward never enters it (ST-PLAN §4.3)."""
+    raw = "Fix nginx" + "\n\n" + SERVICE_MAP_SECTION_HEADER + "\nmaterial"
+    assert sr._title_source_text(raw) == "Fix nginx"
+    assert sr._title_source_text("plain first message") == "plain first message"
+
+
+def test_generated_title_guards_run_before_any_model_call(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+    monkeypatch,
+) -> None:
+    """Every guard degrades value-free BEFORE the model runs; only the
+    clean path reaches the model once and lands the store write."""
+    roots = composition()
+    captured: list[list[object]] = []
+    executor = _inproc_executor(
+        agent_url, factory, scenario, roots, allowed=(READ_CAP,), captured=captured
+    )
+
+    # Guard 1: a delegated child NEVER titles (before any DB/model work).
+    child_session = _run(_make_session(factory))
+    child_intent = _inproc_intent(
+        str(uuid.uuid4()),
+        child_session,
+        allowed=(READ_CAP,),
+        parent_run_id=str(uuid.uuid4()),
+    )
+    assert _run(
+        sr._generated_session_title_document(executor, child_intent, _INPROC_PINS)
+    ) == {"titled": False, "reason": "delegated_child"}
+    assert captured == []
+
+    # Guard 2: a later root run of the same session does not own the
+    # FIRST user entry (exact identity, not a counter).
+    later_session = _run(_make_session(factory))
+    owner_run = str(uuid.uuid4())
+    _run(insert_run(owner_run))
+    owner_intent = _inproc_intent(owner_run, later_session, allowed=(READ_CAP,))
+    _run(sr._ensure_run_row(executor, owner_intent))
+    _run(sr._append_user_turn(executor, owner_intent))
+    later_intent = _inproc_intent(
+        str(uuid.uuid4()), later_session, allowed=(READ_CAP,)
+    )
+    assert _run(
+        sr._generated_session_title_document(executor, later_intent, _INPROC_PINS)
+    ) == {"titled": False, "reason": "not_the_first_user_turn"}
+    assert captured == []
+
+    # Guard 3: an existing (manual) title wins before the model runs.
+    titled_session = str(
+        uuid.UUID(int=int(uuid.uuid4().int) % (2**63) | (1 << 62))
+    )
+    _run(
+        acreate_session(
+            factory,
+            server_id=uuid.UUID(SERVER_ID),
+            source=SessionSourceKind.INTERACTIVE,
+            session_id=uuid.UUID(titled_session),
+            title="Manual rename",
+        )
+    )
+    titled_run = str(uuid.uuid4())
+    _run(insert_run(titled_run))
+    titled_intent = _inproc_intent(titled_run, titled_session, allowed=(READ_CAP,))
+    _run(sr._ensure_run_row(executor, titled_intent))
+    _run(sr._append_user_turn(executor, titled_intent))
+    manual_before = _read_title_row(agent_url, titled_session)
+    assert _run(
+        sr._generated_session_title_document(executor, titled_intent, _INPROC_PINS)
+    ) == {"titled": False, "reason": "title_already_present"}
+    assert captured == []
+    manual_after = _read_title_row(agent_url, titled_session)
+    assert manual_after["title"] == "Manual rename"
+    assert manual_after["updated_at"] == manual_before["updated_at"]
+
+    # Guard 4 (D7): the kill-switch disables generation entirely.
+    kill_session = _run(_make_session(factory))
+    kill_run = str(uuid.uuid4())
+    _run(insert_run(kill_run))
+    kill_intent = _inproc_intent(kill_run, kill_session, allowed=(READ_CAP,))
+    _run(sr._ensure_run_row(executor, kill_intent))
+    _run(sr._append_user_turn(executor, kill_intent))
+    monkeypatch.setenv("MAI_SESSION_TITLE", "0")
+    assert _run(
+        sr._generated_session_title_document(executor, kill_intent, _INPROC_PINS)
+    ) == {"titled": False, "reason": "disabled"}
+    assert captured == []
+    monkeypatch.undo()  # the kill-switch must not leak into the clean path
+
+    # Clean path: the model runs ONCE and the store write lands (D2/D3).
+    happy_session = _run(_make_session(factory))
+    happy_run = str(uuid.uuid4())
+    _run(insert_run(happy_run))
+    happy_intent = _inproc_intent(happy_run, happy_session, allowed=(READ_CAP,))
+    _run(sr._ensure_run_row(executor, happy_intent))
+    _run(sr._append_user_turn(executor, happy_intent))
+    happy_before = _read_title_row(agent_url, happy_session)["updated_at"]
+    assert _run(
+        sr._generated_session_title_document(executor, happy_intent, _INPROC_PINS)
+    ) == {"titled": True}
+    assert len(captured) == 1
+    written = _read_title_row(agent_url, happy_session)
+    assert written["title"] == "done"  # the scripted FunctionModel's answer
+    # D3 at the runner seam: the title write never moves updated_at.
+    assert written["updated_at"] == happy_before
+
+
+def test_first_run_titles_the_session(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [{"text": "run finished"}],
+        title={"text": "**Deploy the stack**"},
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "title run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    assert _journal_count(scenario, "title_model_call") == 1
+    row = _read_title_row(agent_url, session_id)
+    assert row["title"] == "Deploy the stack"  # markdown stripped end-to-end
+    assert _run(_run_states(factory, run_id))[-1] == "succeeded"
+
+
+def test_failing_generator_leaves_title_null_and_run_succeeds(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [{"text": "the answer"}],
+        title={"error": "provider exploded"},
+    )
+    session_id = _run(_make_session(factory))
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "failing title run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The generator failed, the model WAS called once — and the run still
+    # settled succeeded with title NULL (a failed title never fails a run).
+    assert _journal_count(scenario, "title_model_call") == 1
+    row = _read_title_row(agent_url, session_id)
+    assert row["title"] is None
+    assert _run(_run_states(factory, run_id))[-1] == "succeeded"
+
+
+def test_second_turn_never_retitles_the_session(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [{"text": "run one finished"}, {"text": "run two finished"}],
+        title={"text": "Deploy the stack"},
+    )
+    session_id = _run(_make_session(factory))
+    run_id_1 = str(uuid.uuid4())
+    run_id_2 = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        for tag, run_id in (("run 1", run_id_1), ("run 2", run_id_2)):
+            _run(insert_run(run_id))
+            client.enqueue_run(
+                run_id,
+                SESSION_HANDLER_NAME,
+                _canonical(
+                    _intent_document(
+                        run_id, session_id, client_request_id=str(uuid.uuid4())
+                    )
+                ),
+            )
+            _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, tag)
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # The SECOND turn's title guard fired before the model: exactly ONE
+    # title model call across both runs, and the original title stands.
+    assert _journal_count(scenario, "title_model_call") == 1
+    row = _read_title_row(agent_url, session_id)
+    assert row["title"] == "Deploy the stack"
+    assert _run(_run_states(factory, run_id_1))[-1] == "succeeded"
+    assert _run(_run_states(factory, run_id_2))[-1] == "succeeded"
+
+
+def test_manual_title_survives_the_auto_title_run(
+    agent_url: str,
+    factory: async_sessionmaker[AsyncSession],
+    insert_run,
+    scenario: pathlib.Path,
+    composition,
+) -> None:
+    composition()
+    _write_policy_files(scenario, grants=[{READ_CAP: True}])
+    _script(
+        scenario,
+        [{"text": "the answer"}],
+        title={"text": "Unwanted generated title"},
+    )
+    session_id = str(
+        uuid.UUID(int=int(uuid.uuid4().int) % (2**63) | (1 << 62))
+    )
+    _run(
+        acreate_session(
+            factory,
+            server_id=uuid.UUID(SERVER_ID),
+            source=SessionSourceKind.INTERACTIVE,
+            session_id=uuid.UUID(session_id),
+            title="Manual rename",
+        )
+    )
+    run_id = str(uuid.uuid4())
+    client = EngineClient(agent_url)
+    worker = None
+    try:
+        worker = _spawn_worker(agent_url, scenario / "handlers", scenario, "w1")
+        _run(insert_run(run_id))
+        client.enqueue_run(
+            run_id,
+            SESSION_HANDLER_NAME,
+            _canonical(
+                _intent_document(
+                    run_id, session_id, client_request_id=str(uuid.uuid4())
+                )
+            ),
+        )
+        _await_terminal(client, run_id, "succeeded", RUN_TIMEOUT, "manual title run")
+    finally:
+        if worker is not None:
+            _stop(worker)
+        client.close()
+
+    # Guard 3 fired BEFORE the model: the title entry was never consumed.
+    assert _journal_count(scenario, "title_model_call") == 0
+    row = _read_title_row(agent_url, session_id)
+    assert row["title"] == "Manual rename"
+    assert _run(_run_states(factory, run_id))[-1] == "succeeded"

@@ -92,12 +92,14 @@ from mai.agents.session_history import (
     assert_tool_result_honesty,
     is_rejected_sensitive_tool_call,
 )
+from mai.agents.session_title import generate_session_title
 from mai.agents.tools import BridgeError, CapabilityToolBridge, ToolResult
 from mai.contracts.sessions import (
     MAX_DETAIL_CHARS,
     MAX_ENTRY_TEXT_CHARS,
     MAX_ERROR_DETAIL_CHARS,
     MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+    SERVICE_MAP_SECTION_HEADER,
     AssistantMessageEntry,
     ControlActionKind,
     DocumentAttachRef,
@@ -2943,6 +2945,134 @@ def _session_compaction_checkpoint(payload_json: str, pins_json: str) -> str:
         }
     return json.dumps(document)
 
+
+async def _first_user_entry_run_id(
+    sessions: async_sessionmaker[AsyncSession], *, session_id: uuid.UUID
+) -> uuid.UUID | None:
+    """The run owning the session's FIRST user entry (exact, lowest seq).
+
+    The EXACT identity check (not a count heuristic): a generated title
+    belongs to the run that APPENDED the first user turn; any later run
+    in the same session observes a different owner and must not re-title.
+    """
+    async with sessions() as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    """
+                    SELECT run_id FROM session_entries
+                    WHERE session_id = :sid AND kind = 'user_message'
+                    ORDER BY seq ASC
+                    LIMIT 1
+                    """
+                ),
+                {"sid": session_id},
+            )
+        ).first()
+    if row is None or row[0] is None:
+        return None
+    return uuid.UUID(str(row[0]))
+
+
+def _title_source_text(prompt: str) -> str:
+    """The RAW first message for the title prompt (ST-PLAN §4.3).
+
+    The durable user entry of a service-bound first turn may carry the
+    appended Service Map section; anything from
+    ``SERVICE_MAP_SECTION_HEADER`` onward is cut BEFORE it can enter the
+    bounded title prompt — the title is generated from the user's own
+    words only.
+    """
+    cut = prompt.find(SERVICE_MAP_SECTION_HEADER)
+    return prompt[:cut].rstrip() if cut >= 0 else prompt
+
+
+async def _generated_session_title_document(
+    executor: SessionRunExecutor,
+    intent: SessionRunIntent,
+    pins: Mapping[str, object],
+) -> dict[str, object]:
+    """The auto-title body (ST-PLAN §4.3; decisions D1/D7/D8): guards →
+    ONE bounded generate → the guarded store write.
+
+    EVERY guard runs BEFORE any LLM call; every failure degrades to a
+    value-free document (the step wrapper catches whatever escapes — a
+    title failure NEVER fails the chat run). The model's output is
+    untrusted DATA (D8): :func:`generate_session_title` redacts and
+    normalizes it before anything reaches the store seam.
+    """
+    from mai.session_store import aget_session, aset_generated_session_title
+
+    # Guard 1: only a ROOT run titles the session — a delegated child never.
+    if intent.parent_run_id is not None:
+        return {"titled": False, "reason": "delegated_child"}
+    # Guard 2: THIS run owns the session's FIRST user entry (exact
+    # identity check) — a later turn of the same session never re-titles.
+    owner = await _first_user_entry_run_id(
+        executor.sessions, session_id=uuid.UUID(intent.session_id)
+    )
+    if owner != uuid.UUID(intent.run_id):
+        return {"titled": False, "reason": "not_the_first_user_turn"}
+    # Guard 3: the title must still be NULL right now — a manual rename
+    # (or a previous title) wins and the LLM is never even called.
+    stored = await aget_session(
+        executor.sessions,
+        uuid.UUID(intent.session_id),
+        server_id=uuid.UUID(intent.server_id),
+    )
+    if stored.title is not None:
+        return {"titled": False, "reason": "title_already_present"}
+    # Guard 4 (D7): the kill-switch disables generation entirely
+    # (unset or any other value keeps the default-on behavior).
+    if os.environ.get("MAI_SESSION_TITLE") == "0":
+        return {"titled": False, "reason": "disabled"}
+    title = await generate_session_title(
+        executor.build_model_for(pins),
+        _title_source_text(intent.prompt),
+    )
+    if not title:
+        # Provider error / deadline / garbage / echoed secret: no title.
+        return {"titled": False, "reason": "no_title_generated"}
+    written = await aset_generated_session_title(
+        executor.sessions,
+        session_id=uuid.UUID(intent.session_id),
+        server_id=uuid.UUID(intent.server_id),
+        title=title,
+    )
+    if written is None:
+        # A title landed between the guard and the write: rename wins (D2).
+        return {"titled": False, "reason": "title_already_present"}
+    return {"titled": True}
+
+
+@DBOS.step(name="agents.session.title")
+@_safe_step_errors
+def _session_title(payload_json: str, pins_json: str) -> str:
+    """Generate + write the session title after the first model round
+    (ST-PLAN §4.3).
+
+    Failure policy: EVERY exception inside this step — provider, store,
+    guard plumbing — degrades to a value-free ``{"titled": false}``
+    document instead of escaping. ``_safe_step_errors`` would turn an
+    escaping exception into a FAILED session; a failed title must never
+    fail a chat run (the visible answer is already durable and already
+    delivered when this step runs). Idempotent under crash-replay: the
+    guards (root run, first-user-entry ownership, ``title IS NULL``,
+    kill-switch) make a re-execution a no-op.
+    """
+    try:
+        intent = parse_session_run_intent(payload_json)
+        executor = _resolve_session_run()
+        document = executor.run(
+            _generated_session_title_document(
+                executor, intent, json.loads(pins_json)
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - degrade, never fail the run
+        document = {"titled": False, "reason": _safe_error_identity(error)}
+    return json.dumps(document)
+
+
 def _missing_facade_detail(summary: Mapping[str, object], error: Exception) -> str:
     """The bounded run-state detail for a missing-facade settlement (S5).
 
@@ -3128,6 +3258,13 @@ async def run_agent_session(payload_json: str) -> dict[str, object]:
                     _session_model_round, payload_json, pins_json, rounds
                 )
             )
+            if rounds == 0:
+                # ST (§4.3): the auto-title rides AFTER the first model
+                # round returned — the assistant answer is already durable
+                # and already delivered, so title latency never delays the
+                # visible answer. The step's guards make crash-replay and
+                # later turns no-ops; a failing title NEVER fails this run.
+                await asyncio.to_thread(_session_title, payload_json, pins_json)
             if str(round_record["status"]) == "final":
                 output_text = str(round_record.get("output_text", ""))
                 break
